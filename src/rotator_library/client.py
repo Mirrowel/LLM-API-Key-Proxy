@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Any, AsyncGenerator
 
 from src.rotator_library.usage_manager import UsageManager
+from src.rotator_library.failure_logger import log_failure
 from src.rotator_library.error_handler import (
     is_authentication_error,
     is_rate_limit_error,
@@ -54,22 +55,22 @@ class RotatingClient:
         Performs a completion call with smart key rotation and retry logic.
         Handles both streaming and non-streaming requests.
         """
-        failed_keys_for_this_request = []
         model = kwargs.get("model")
         is_streaming = kwargs.get("stream", False)
 
         if not model:
             raise ValueError("'model' is a required parameter.")
 
-        while len(failed_keys_for_this_request) < len(self.api_keys):
+        while True: # Loop until a key succeeds or we decide to give up
             current_key = self.usage_manager.get_next_smart_key(
                 available_keys=self.api_keys,
-                model=model,
-                excluded_keys=failed_keys_for_this_request
+                model=model
             )
 
             if not current_key:
-                raise Exception("All available API keys have failed for this request.")
+                print("All keys are currently on cooldown. Waiting...")
+                await asyncio.sleep(5) # Wait 5 seconds before checking for an available key again
+                continue
 
             for attempt in range(self.max_retries):
                 try:
@@ -85,27 +86,25 @@ class RotatingClient:
                         return response
 
                 except Exception as e:
-                    error_message = str(e)
-                    print(f"Key ...{current_key[-4:]} failed with error: {error_message}")
-
-                    if is_authentication_error(e) or is_rate_limit_error(e):
-                        self.usage_manager.record_rotation_error(current_key, model, error_message)
-                        failed_keys_for_this_request.append(current_key)
-                        break
-
-                    elif is_server_error(e):
-                        if attempt == self.max_retries - 1:
-                            self.usage_manager.record_rotation_error(current_key, model, f"Failed after max retries with error: {error_message}")
-                            failed_keys_for_this_request.append(current_key)
-                            break
-                        else:
-                            await asyncio.sleep(1 * (attempt + 1))
-                            continue
-
-                    elif is_unrecoverable_error(e):
+                    log_failure(
+                        api_key=current_key,
+                        model=model,
+                        attempt=attempt + 1,
+                        error=e,
+                        request_data=kwargs
+                    )
+                    
+                    # For any retriable server error, we just continue the attempt loop
+                    if is_server_error(e) and attempt < self.max_retries - 1:
+                        print(f"Key ...{current_key[-4:]} failed with server error. Retrying...")
+                        await asyncio.sleep(1 * (attempt + 1))
+                        continue
+                    
+                    # For unrecoverable errors, fail fast
+                    if is_unrecoverable_error(e):
                         raise e
 
-                    else:
-                        raise e
-
-        raise Exception("All API keys failed after multiple retries.")
+                    # For all other errors (Auth, RateLimit, or final Server error), record it and break to get a new key
+                    print(f"Key ...{current_key[-4:]} failed permanently. Rotating...")
+                    self.usage_manager.record_rotation_error(current_key, model, e)
+                    break

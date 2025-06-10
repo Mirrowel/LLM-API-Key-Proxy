@@ -7,6 +7,9 @@ import logging
 from pathlib import Path
 import sys
 
+# This is necessary for the app to find the rotator_library module
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
+
 from src.rotator_library.client import RotatingClient
 
 # Configure logging
@@ -24,22 +27,20 @@ if not PROXY_API_KEY:
 gemini_keys = []
 i = 1
 while True:
+    # Start with GEMINI_API_KEY_1, then GEMINI_API_KEY_2, etc.
     key = os.getenv(f"GEMINI_API_KEY_{i}")
+    if not key and i == 1:
+        # Fallback for a single key named just GEMINI_API_KEY
+        key = os.getenv("GEMINI_API_KEY")
+    
     if key:
         gemini_keys.append(key)
         i += 1
     else:
-        # Also check for the key without a number for the first one
-        if i == 1:
-            key = os.getenv("GEMINI_API_KEY")
-            if key:
-                gemini_keys.append(key)
-                i += 1
-                continue
         break
 
 if not gemini_keys:
-    raise ValueError("No GEMINI_API_KEY environment variables found.")
+    raise ValueError("No GEMINI_API_KEY or GEMINI_API_KEY_n environment variables found.")
 
 # Initialize the rotating client
 rotating_client = RotatingClient(api_keys=gemini_keys)
@@ -67,11 +68,8 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         response = await rotating_client.acompletion(**data)
 
         if is_streaming:
-            # For streaming responses, we return a StreamingResponse.
-            # The client's wrapper ensures usage is logged upon completion.
             return StreamingResponse(response, media_type="text/event-stream")
         else:
-            # For non-streaming, the response is a regular JSON object.
             return response
 
     except Exception as e:
