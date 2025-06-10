@@ -1,74 +1,138 @@
-# API Key Proxy and Rotator [![License](https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png)](https://creativecommons.org/licenses/by-nc-sa/4.0/) [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
+# API Key Proxy with Rotating Key Library
 
-This project provides a simple and effective solution for managing and rotating API keys for services like Google Gemini, while exposing an OpenAI-compatible endpoint. It's designed to be a lightweight, self-hosted proxy that can help you:
+This project provides two main components:
 
-- **Secure your API keys**: Instead of embedding your keys directly in client-side applications, you can keep them on the server where they are more secure.
-- **Rotate keys to avoid rate limits**: The proxy can automatically rotate through a pool of API keys, reducing the chance of hitting rate limits on any single key.
-- **Monitor key usage**: The system tracks the usage of each key, providing insights into your API consumption.
-- **Provide a unified endpoint**: Exposes an OpenAI-compatible `/v1/chat/completions` endpoint, allowing you to use it with a wide range of existing tools and libraries.
+1.  A reusable Python library (`rotating-api-key-client`) for intelligently rotating API keys.
+2.  A FastAPI proxy application that uses this library to provide an OpenAI-compatible endpoint for various LLM providers.
 
 ## Features
 
-- **OpenAI-Compatible Endpoint**: Drop-in replacement for OpenAI's API.
-- **Smart Key Rotation**: Rotates keys based on usage to minimize errors.
-- **Usage Tracking**: Logs successes and failures for each key.
-- **Streaming and Non-Streaming Support**: Handles both response types seamlessly.
-- **Easy to Deploy**: Can be run with a simple `uvicorn` command.
+-   **Smart Key Rotation**: The library automatically uses the least-used key to distribute load.
+-   **Automatic Retries**: Retries requests on transient server errors.
+-   **Cooldowns**: Puts keys on a temporary cooldown after rate limit or authentication errors.
+-   **Usage Tracking**: Tracks daily and global usage for each key.
+-   **Provider Agnostic**: Works with any provider supported by `litellm`.
+-   **OpenAI-Compatible Proxy**: The proxy provides a familiar API for interacting with different models.
 
-## Getting Started
+## Project Structure
 
-### Prerequisites
+```
+.
+├── logs/                     # Logs for failed requests
+├── src/
+│   ├── proxy_app/            # The FastAPI proxy application
+│   │   └── main.py
+│   └── rotator_library/      # The rotating-api-key-client library
+│       ├── __init__.py
+│       ├── client.py
+│       ├── error_handler.py
+│       ├── failure_logger.py
+│       ├── usage_manager.py
+│       ├── pyproject.toml
+│       └── README.md
+├── .env.example
+├── .gitignore
+├── README.md
+└── requirements.txt
+```
 
-- Python 3.8+
-- An `.env` file with your API keys (see `.env.example`).
-
-### Installation
+## Setup and Installation
 
 1.  **Clone the repository:**
+
     ```bash
-    git clone <your-repo-url>
-    cd <your-repo-name>
+    git clone <repository-url>
+    cd <repository-name>
     ```
 
-2.  **Install dependencies:**
+2.  **Create a virtual environment:**
+
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+    ```
+
+3.  **Install the dependencies:**
+
+    The `requirements.txt` file includes the proxy's dependencies and installs the `rotator_library` in editable mode (`-e`), so you can develop both simultaneously.
+
     ```bash
     pip install -r requirements.txt
     ```
 
-3.  **Configure your API keys:**
+4.  **Configure environment variables:**
 
-    Create a `.env` file in the project root and add your keys. You'll need a `PROXY_API_KEY` to secure your proxy and at least one `GEMINI_API_KEY`.
+    Create a `.env` file by copying the `.env.example`:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    Edit the `.env` file with your API keys:
 
     ```
-    # .env
+    # A secret key for your proxy to prevent unauthorized access
     PROXY_API_KEY="your-secret-proxy-key"
-    GEMINI_API_KEY_1="your-gemini-key-1"
-    GEMINI_API_KEY_2="your-gemini-key-2"
-    # Add more Gemini keys as needed
+
+    # Add one or more API keys from your chosen provider (e.g., Gemini)
+    # The keys will be tried in order.
+    GEMINI_API_KEY_1="your-gemini-api-key-1"
+    GEMINI_API_KEY_2="your-gemini-api-key-2"
+    # ...and so on
     ```
 
-### Running the Proxy
+## Running the Proxy
 
-You can run the proxy using `uvicorn`:
+To run the proxy application:
 
 ```bash
-uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+uvicorn src.proxy_app.main:app --reload
 ```
 
-The proxy will now be running and accessible at `http://localhost:8000`.
+The proxy will be available at `http://127.0.0.1:8000`.
 
-## How to Use
+## Using the Proxy
 
-To use the proxy, make a POST request to the `/v1/chat/completions` endpoint, making sure to include your `PROXY_API_KEY` in the `Authorization` header.
+You can make requests to the proxy as if it were the OpenAI API. Make sure to include your `PROXY_API_KEY` in the `Authorization` header.
 
-Here's an example using `curl`:
+### Example with `curl`:
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer your-secret-proxy-key" \
 -d '{
-  "model": "gemini-pro",
-  "messages": [{"role": "user", "content": "Hello, how are you?"}]
+    "model": "gemini/gemini-pro",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "stream": false
 }'
 ```
+
+### Example with Python `requests`:
+
+```python
+import requests
+import json
+
+proxy_url = "http://127.0.0.1:8000/v1/chat/completions"
+proxy_key = "your-secret-proxy-key"
+
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {proxy_key}"
+}
+
+data = {
+    "model": "gemini/gemini-pro",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "stream": False
+}
+
+response = requests.post(proxy_url, headers=headers, data=json.dumps(data))
+
+print(response.json())
+```
+
+## Using the Library in Other Projects
+
+The `rotating-api-key-client` library is designed to be reusable. You can find more information on how to use it in its own `README.md` file located at `src/rotator_library/README.md`.

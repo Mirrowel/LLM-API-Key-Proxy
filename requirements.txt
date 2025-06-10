@@ -1,6 +1,4 @@
 fastapi
 uvicorn
 python-dotenv
-litellm
-requests
-filelock
+-e src/rotator_library

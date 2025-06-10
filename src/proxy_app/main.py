@@ -7,10 +7,10 @@ import logging
 from pathlib import Path
 import sys
 
-# This is necessary for the app to find the rotator_library module
-sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
+# Add the 'src' directory to the Python path to allow importing 'rotating_api_key_client'
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.rotator_library.client import RotatingClient
+from rotator_library import RotatingClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
