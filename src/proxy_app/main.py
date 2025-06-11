@@ -10,10 +10,10 @@ import sys
 # Add the 'src' directory to the Python path to allow importing 'rotating_api_key_client'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from rotator_library import RotatingClient
+from rotator_library import RotatingClient, PROVIDER_PLUGINS
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) #-> moved to the rotator_library
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,27 +23,21 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
 
-# Load all Gemini keys from environment variables
-gemini_keys = []
-i = 1
-while True:
-    # Start with GEMINI_API_KEY_1, then GEMINI_API_KEY_2, etc.
-    key = os.getenv(f"GEMINI_API_KEY_{i}")
-    if not key and i == 1:
-        # Fallback for a single key named just GEMINI_API_KEY
-        key = os.getenv("GEMINI_API_KEY")
-    
-    if key:
-        gemini_keys.append(key)
-        i += 1
-    else:
-        break
+# Load all provider API keys from environment variables
+api_keys = {}
+for key, value in os.environ.items():
+    if key.endswith("_API_KEY") or "_API_KEY_" in key:
+        parts = key.split("_API_KEY")
+        provider = parts[0].lower()
+        if provider not in api_keys:
+            api_keys[provider] = []
+        api_keys[provider].append(value)
 
-if not gemini_keys:
-    raise ValueError("No GEMINI_API_KEY or GEMINI_API_KEY_n environment variables found.")
+if not api_keys:
+    raise ValueError("No provider API keys found in environment variables.")
 
 # Initialize the rotating client
-rotating_client = RotatingClient(api_keys=gemini_keys)
+rotating_client = RotatingClient(api_keys=api_keys)
 
 # --- FastAPI App Setup ---
 app = FastAPI()
@@ -79,3 +73,38 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
 @app.get("/")
 def read_root():
     return {"Status": "API Key Proxy is running"}
+
+@app.get("/v1/models")
+async def list_models(_=Depends(verify_api_key)):
+    """
+    Returns a list of available models from all configured providers.
+    """
+    models = await rotating_client.get_all_available_models()
+    return {"data": models}
+
+@app.get("/v1/providers")
+async def list_providers(_=Depends(verify_api_key)):
+    """
+    Returns a list of all available providers.
+    """
+    return {"data": list(PROVIDER_PLUGINS.keys())}
+
+@app.post("/v1/token-count")
+async def token_count(request: Request, _=Depends(verify_api_key)):
+    """
+    Calculates the token count for a given list of messages and a model.
+    """
+    try:
+        data = await request.json()
+        model = data.get("model")
+        messages = data.get("messages")
+
+        if not model or not messages:
+            raise HTTPException(status_code=400, detail="'model' and 'messages' are required.")
+
+        count = rotating_client.token_count(model=model, messages=messages)
+        return {"token_count": count}
+
+    except Exception as e:
+        logging.error(f"Token count failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

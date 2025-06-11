@@ -1,29 +1,31 @@
 import asyncio
 import json
 import litellm
+from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from typing import List, Dict, Any, AsyncGenerator
 
 from src.rotator_library.usage_manager import UsageManager
 from src.rotator_library.failure_logger import log_failure
-from src.rotator_library.error_handler import (
-    is_authentication_error,
-    is_rate_limit_error,
-    is_server_error,
-    is_unrecoverable_error,
-)
+from src.rotator_library.error_handler import is_server_error, is_unrecoverable_error
+from src.rotator_library.providers import PROVIDER_PLUGINS
 
 class RotatingClient:
     """
     A client that intelligently rotates and retries API keys using LiteLLM,
     with support for both streaming and non-streaming responses.
     """
-    def __init__(self, api_keys: List[str], max_retries: int = 2, usage_file_path: str = "key_usage.json"):
+    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json"):
+        litellm.set_verbose = False
         if not api_keys:
-            raise ValueError("API keys list cannot be empty.")
+            raise ValueError("API keys dictionary cannot be empty.")
         self.api_keys = api_keys
         self.max_retries = max_retries
         self.usage_manager = UsageManager(file_path=usage_file_path)
+        self._model_list_cache = {}
+        self._provider_instances = {
+            name: plugin() for name, plugin in PROVIDER_PLUGINS.items()
+        }
 
     async def _streaming_wrapper(self, stream: Any, key: str, model: str) -> AsyncGenerator[Any, None]:
         """
@@ -42,7 +44,7 @@ class RotatingClient:
                 # Safely check for usage data in the chunk
                 if hasattr(chunk, 'usage') and chunk.usage:
                     logging.info(f"Usage found in chunk for key ...{key[-4:]}: {chunk.usage}")
-                    self.usage_manager.record_success(key, model, chunk.usage)
+                    self.usage_manager.record_success(key, model, chunk)
 
         finally:
             # Signal the end of the stream
@@ -61,9 +63,13 @@ class RotatingClient:
         if not model:
             raise ValueError("'model' is a required parameter.")
 
+        provider = model.split('/')[0]
+        if provider not in self.api_keys:
+            raise ValueError(f"No API keys configured for provider: {provider}")
+
         while True: # Loop until a key succeeds or we decide to give up
             current_key = self.usage_manager.get_next_smart_key(
-                available_keys=self.api_keys,
+                available_keys=self.api_keys[provider],
                 model=model
             )
 
@@ -82,7 +88,7 @@ class RotatingClient:
                         return self._streaming_wrapper(response, current_key, model)
                     else:
                         # For non-streams, we can log usage immediately.
-                        self.usage_manager.record_success(current_key, model, response.usage)
+                        self.usage_manager.record_success(current_key, model, response)
                         return response
 
                 except Exception as e:
@@ -108,3 +114,42 @@ class RotatingClient:
                     print(f"Key ...{current_key[-4:]} failed permanently. Rotating...")
                     self.usage_manager.record_rotation_error(current_key, model, e)
                     break
+
+    def token_count(self, model: str, text: str = None, messages: List[Dict[str, str]] = None) -> int:
+        """
+        Calculates the number of tokens for a given text or list of messages.
+        """
+        if messages:
+            return token_counter(model=model, messages=messages)
+        elif text:
+            return token_counter(model=model, text=text)
+        else:
+            raise ValueError("Either 'text' or 'messages' must be provided.")
+
+    async def get_available_models(self, provider: str) -> List[str]:
+        """
+        Returns a list of available models for a specific provider, with caching.
+        """
+        if provider in self._model_list_cache:
+            return self._model_list_cache[provider]
+
+        api_key = self.api_keys.get(provider, [None])[0]
+        if not api_key:
+            return []
+
+        if provider in self._provider_instances:
+            models = await self._provider_instances[provider].get_models(api_key)
+            self._model_list_cache[provider] = models
+            return models
+        else:
+            logging.warning(f"Model list fetching not implemented for provider: {provider}")
+            return []
+
+    async def get_all_available_models(self) -> Dict[str, List[str]]:
+        """
+        Returns a dictionary of all available models, grouped by provider.
+        """
+        all_provider_models = {}
+        for provider in self.api_keys.keys():
+            all_provider_models[provider] = await self.get_available_models(provider)
+        return all_provider_models

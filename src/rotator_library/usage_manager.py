@@ -4,6 +4,7 @@ import time
 from datetime import date, datetime
 from typing import Dict, List, Optional, Any
 from filelock import FileLock
+import litellm
 
 class UsageManager:
     """
@@ -42,10 +43,11 @@ class UsageManager:
                 # Add yesterday's daily stats to global stats
                 global_data = data.setdefault("global", {"models": {}})
                 for model, stats in daily_data.get("models", {}).items():
-                    global_model_stats = global_data["models"].setdefault(model, {"success_count": 0, "prompt_tokens": 0, "completion_tokens": 0})
+                    global_model_stats = global_data["models"].setdefault(model, {"success_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "approx_cost": 0.0})
                     global_model_stats["success_count"] += stats.get("success_count", 0)
                     global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
                     global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
+                    global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
                 
                 # Reset daily stats
                 data["daily"] = {"date": today_str, "models": {}}
@@ -82,7 +84,7 @@ class UsageManager:
         
         return best_key if best_key else active_keys[0]
 
-    def record_success(self, key: str, model: str, usage: Dict):
+    def record_success(self, key: str, model: str, completion_response: litellm.ModelResponse):
         key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "cooldown_until": None})
         
         # Ensure daily stats are for today
@@ -90,12 +92,22 @@ class UsageManager:
             self._reset_daily_stats_if_needed() # Should be rare, but as a safeguard
             key_data = self.usage_data[key]
 
-        daily_model_data = key_data["daily"]["models"].setdefault(model, {"success_count": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        daily_model_data = key_data["daily"]["models"].setdefault(model, {"success_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "approx_cost": 0.0})
         
+        usage = completion_response.usage
         daily_model_data["success_count"] += 1
-        daily_model_data["prompt_tokens"] += usage.get("prompt_tokens", 0)
-        daily_model_data["completion_tokens"] += usage.get("completion_tokens", 0)
+        daily_model_data["prompt_tokens"] += usage.prompt_tokens
+        daily_model_data["completion_tokens"] += usage.completion_tokens
         
+        # Calculate approximate cost using LiteLLM
+        try:
+            cost = litellm.completion_cost(
+                completion_response=completion_response
+            )
+            daily_model_data["approx_cost"] += cost
+        except Exception as e:
+            print(f"Warning: Could not calculate cost for model {model}: {e}")
+
         key_data["last_used_ts"] = time.time()
         self._save_usage()
 
