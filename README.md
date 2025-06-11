@@ -1,4 +1,4 @@
-# API Key Proxy with Rotating Key Library
+# API Key Proxy with Rotating Key Library [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
 
 This project provides a robust solution for managing and rotating API keys for various Large Language Model (LLM) providers. It consists of two main components:
 
