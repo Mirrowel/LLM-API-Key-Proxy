@@ -6,7 +6,7 @@ A simple, thread-safe client that intelligently rotates and retries API keys for
 
 -   **Smart Key Rotation**: Automatically uses the least-used key to distribute load.
 -   **Automatic Retries**: Retries requests on transient server errors.
--   **Cooldowns**: Puts keys on a temporary cooldown after rate limit or authentication errors.
+-   **Per-Model Cooldowns**: If a key fails for a specific model (e.g., due to rate limits), it is only put on cooldown for that model, allowing it to be used with other models.
 -   **Usage Tracking**: Tracks daily and global usage for each key.
 -   **Provider Agnostic**: Works with any provider supported by `litellm`.
 -   **Extensible**: Easily add support for new providers through a plugin-based architecture.
@@ -97,10 +97,10 @@ Fetches a dictionary of all available models, grouped by provider.
 The client is designed to handle errors gracefully:
 
 -   **Server Errors (`5xx`)**: The client will retry the request with the *same key* up to `max_retries` times.
--   **Rate Limit / Auth Errors**: These are considered "rotation" errors. The client will immediately place the failing key on a temporary cooldown and try the request again with a different key.
+-   **Rate Limit / Auth Errors**: These are considered "rotation" errors. The client will immediately place the failing key on a temporary cooldown for that specific model and retry the request with a different key. This ensures that a single model failure does not sideline a key for all other models.
 -   **Unrecoverable Errors**: For critical errors, the client will fail fast and raise the exception.
 
-Cooldowns are managed by the `UsageManager` and prevent failing keys from being used repeatedly.
+Cooldowns are managed by the `UsageManager` on a per-model basis, preventing failing keys from being used repeatedly for models they have recently failed with. Upon a successful call, any existing cooldown for that key-model pair is cleared.
 
 ## Extending with Provider Plugins
 

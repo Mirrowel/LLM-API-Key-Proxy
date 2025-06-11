@@ -9,7 +9,7 @@ This project provides a robust solution for managing and rotating API keys for v
 
 -   **Smart Key Rotation**: Intelligently selects the least-used API key to distribute request loads evenly.
 -   **Automatic Retries**: Automatically retries requests on transient server errors (e.g., 5xx status codes).
--   **Key Cooldowns**: Temporarily disables keys that encounter rate limits or authentication errors to prevent further issues.
+-   **Per-Model Cooldowns**: If a key fails for a specific model (e.g., due to rate limits), it is only put on cooldown for that model, allowing it to be used with other models.
 -   **Usage Tracking**: Monitors daily and global usage for each API key.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface for seamless interaction with different models.

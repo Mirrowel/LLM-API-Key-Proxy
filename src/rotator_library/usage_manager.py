@@ -57,15 +57,17 @@ class UsageManager:
 
     def get_next_smart_key(self, available_keys: List[str], model: str) -> Optional[str]:
         """
-        Gets the least-used, available key based on daily stats.
+        Gets the least-used, available key for a specific model, considering model-specific cooldowns.
         """
         best_key = None
         min_usage = float('inf')
-        
-        # Filter for keys that are not on cooldown
+
         active_keys = []
         for key in available_keys:
-            cooldown_until = self.usage_data.get(key, {}).get("cooldown_until")
+            key_data = self.usage_data.get(key, {})
+            model_cooldowns = key_data.get("model_cooldowns", {})
+            cooldown_until = model_cooldowns.get(model)
+
             if not cooldown_until or time.time() > cooldown_until:
                 active_keys.append(key)
 
@@ -74,7 +76,7 @@ class UsageManager:
 
         # Find the key with the minimum daily success_count for the given model
         for key in active_keys:
-            key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "cooldown_until": None})
+            key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}})
             daily_model_usage = key_data.get("daily", {}).get("models", {}).get(model, {})
             usage_count = daily_model_usage.get("success_count", 0)
 
@@ -85,11 +87,15 @@ class UsageManager:
         return best_key if best_key else active_keys[0]
 
     def record_success(self, key: str, model: str, completion_response: litellm.ModelResponse):
-        key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "cooldown_until": None})
+        key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}})
         
+        # Clear any cooldown for this specific model on success
+        if model in key_data.get("model_cooldowns", {}):
+            del key_data["model_cooldowns"][model]
+
         # Ensure daily stats are for today
         if key_data["daily"].get("date") != date.today().isoformat():
-            self._reset_daily_stats_if_needed() # Should be rare, but as a safeguard
+            self._reset_daily_stats_if_needed()
             key_data = self.usage_data[key]
 
         daily_model_data = key_data["daily"]["models"].setdefault(model, {"success_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "approx_cost": 0.0})
@@ -99,11 +105,8 @@ class UsageManager:
         daily_model_data["prompt_tokens"] += usage.prompt_tokens
         daily_model_data["completion_tokens"] += usage.completion_tokens
         
-        # Calculate approximate cost using LiteLLM
         try:
-            cost = litellm.completion_cost(
-                completion_response=completion_response
-            )
+            cost = litellm.completion_cost(completion_response=completion_response)
             daily_model_data["approx_cost"] += cost
         except Exception as e:
             print(f"Warning: Could not calculate cost for model {model}: {e}")
@@ -112,22 +115,21 @@ class UsageManager:
         self._save_usage()
 
     def record_rotation_error(self, key: str, model: str, error: Exception):
-        key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "cooldown_until": None})
+        key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}})
         
-        # Default cooldown of 24 hours
-        cooldown_seconds = 86400 
+        cooldown_seconds = 86400  # Default cooldown of 24 hours
         
-        # Try to parse retry_delay from the error message (very provider-specific)
         error_str = str(error).lower()
         if "retry_delay" in error_str:
             try:
-                # A simple way to parse, might need to be more robust
                 delay_str = error_str.split("retry_delay")[1].split("seconds:")[1].strip().split("}")[0]
                 cooldown_seconds = int(delay_str)
             except (IndexError, ValueError):
-                pass # Stick to default
+                pass
 
-        key_data["cooldown_until"] = time.time() + cooldown_seconds
+        model_cooldowns = key_data.setdefault("model_cooldowns", {})
+        model_cooldowns[model] = time.time() + cooldown_seconds
+
         key_data["last_rotation_error"] = {
             "timestamp": time.time(),
             "model": model,
