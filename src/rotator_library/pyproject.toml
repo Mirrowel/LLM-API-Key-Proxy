@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotating-api-key-client"
-version = "0.1.0"
+version = "0.5.0"
 authors = [
-    { name="Mirrowel", email="you@example.com" },
+    { name="Mirrowel", email="nuh@uh.com" },
 ]
-description = "A client that intelligently rotates and retries API keys using LiteLLM."
+description = "A robust Python client for intelligent API key rotation and retry logic, leveraging LiteLLM. It manages usage, handles various API errors (rate limits, server errors, authentication), and supports dynamic model discovery across multiple LLM providers."
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
     "litellm",
     "filelock",
+    "requests",
 ]
 
 [project.urls]
