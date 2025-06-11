@@ -145,11 +145,19 @@ class RotatingClient:
             logging.warning(f"Model list fetching not implemented for provider: {provider}")
             return []
 
-    async def get_all_available_models(self) -> Dict[str, List[str]]:
+    async def get_all_available_models(self, grouped: bool = True) -> Any:
         """
-        Returns a dictionary of all available models, grouped by provider.
+        Returns a list of all available models, either grouped by provider or as a flat list.
         """
         all_provider_models = {}
         for provider in self.api_keys.keys():
             all_provider_models[provider] = await self.get_available_models(provider)
-        return all_provider_models
+        
+        if grouped:
+            return all_provider_models
+        else:
+            flat_models = []
+            for provider, models in all_provider_models.items():
+                for model in models:
+                    flat_models.append(f"{model}")
+            return flat_models

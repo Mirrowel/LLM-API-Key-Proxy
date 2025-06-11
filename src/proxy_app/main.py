@@ -26,7 +26,8 @@ if not PROXY_API_KEY:
 # Load all provider API keys from environment variables
 api_keys = {}
 for key, value in os.environ.items():
-    if key.endswith("_API_KEY") or "_API_KEY_" in key:
+    # Exclude PROXY_API_KEY from being treated as a provider API key
+    if (key.endswith("_API_KEY") or "_API_KEY_" in key) and key != "PROXY_API_KEY":
         parts = key.split("_API_KEY")
         provider = parts[0].lower()
         if provider not in api_keys:
@@ -75,19 +76,20 @@ def read_root():
     return {"Status": "API Key Proxy is running"}
 
 @app.get("/v1/models")
-async def list_models(_=Depends(verify_api_key)):
+async def list_models(grouped: bool = False, _=Depends(verify_api_key)):
     """
     Returns a list of available models from all configured providers.
+    Optionally returns them as a flat list if grouped=False.
     """
-    models = await rotating_client.get_all_available_models()
-    return {"data": models}
+    models = await rotating_client.get_all_available_models(grouped=grouped)
+    return models
 
 @app.get("/v1/providers")
 async def list_providers(_=Depends(verify_api_key)):
     """
     Returns a list of all available providers.
     """
-    return {"data": list(PROVIDER_PLUGINS.keys())}
+    return list(PROVIDER_PLUGINS.keys())
 
 @app.post("/v1/token-count")
 async def token_count(request: Request, _=Depends(verify_api_key)):
