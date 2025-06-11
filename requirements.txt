@@ -1,4 +1,14 @@
+# FastAPI framework for building the proxy server
 fastapi
+
+# ASGI server for running the FastAPI application
 uvicorn
+
+# For loading environment variables from a .env file
 python-dotenv
+
+# Installs the local rotator_library in editable mode
 -e src/rotator_library
+
+# A library for calling LLM APIs with a consistent format
+litellm
