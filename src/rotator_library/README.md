@@ -46,7 +46,7 @@ client = RotatingClient(
 
 This is the primary method for making API calls. It's a wrapper around `litellm.acompletion` that adds key rotation and retry logic.
 
--   **Parameters**: Accepts the same keyword arguments as `litellm.acompletion` (e.g., `messages`, `stream`). The `model` parameter is required and must be a string in the format `provider/model_name` (e.g., `"gemini/gemini-2.5-flash-preview-05-20"`).
+-   **Parameters**: Accepts the same keyword arguments as `litellm.acompletion` (e.g., `messages`, `stream`). The `model` parameter is required and must be a string in the format `provider/model_name` (e.g., `"gemini/gemini-2.5-flash-preview-05-20"`, `"openrouter/google/gemini-flash-1.5"`, `"chutes/deepseek-ai/DeepSeek-R1-0528"`).
 -   **Returns**:
     -   For non-streaming requests, it returns the `litellm` response object.
     -   For streaming requests, it returns an async generator that yields OpenAI-compatible Server-Sent Events (SSE).
@@ -104,39 +104,29 @@ Cooldowns are managed by the `UsageManager` on a per-model basis, preventing fai
 
 ## Extending with Provider Plugins
 
-You can add support for fetching model lists from new providers by creating a custom provider plugin.
+The library uses a dynamic plugin system. To add support for a new provider, you only need to do two things:
 
-1.  **Create a new provider file** in `src/rotator_library/providers/`, for example, `my_provider.py`.
-2.  **Implement the `ProviderPlugin` interface**:
+1.  **Create a new provider file** in `src/rotator_library/providers/` (e.g., `my_provider.py`). The name of the file (without `_provider.py`) will be used as the provider name (e.g., `my_provider`).
+2.  **Implement the `ProviderInterface`**: Inside your new file, create a class that inherits from `ProviderInterface` and implements the `get_models` method.
 
-    ```python
-    # src/rotator_library/providers/my_provider.py
-    from .provider_interface import ProviderPlugin
-    from typing import List
+```python
+# src/rotator_library/providers/my_provider.py
+from .provider_interface import ProviderInterface
+from typing import List
 
-    class MyProvider(ProviderPlugin):
-        async def get_models(self, api_key: str) -> List[str]:
-            # Logic to fetch and return a list of model names
-            # e.g., ["my-provider/model-1", "my-provider/model-2"]
-            pass
-    ```
+class MyProvider(ProviderInterface):
+    async def get_models(self, api_key: str) -> List[str]:
+        # Logic to fetch and return a list of model names
+        # The model names should be prefixed with the provider name.
+        # e.g., ["my-provider/model-1", "my-provider/model-2"]
+        pass
+```
 
-3.  **Register the plugin** in `src/rotator_library/providers/__init__.py`:
+The system will automatically discover and register your new provider when the library is imported.
 
-    ```python
-    # src/rotator_library/providers/__init__.py
-    from .openai_provider import OpenAIProvider
-    from .gemini_provider import GeminiProvider
-    from .my_provider import MyProvider # Import your new provider
+### Special Case: `chutes.ai`
 
-    PROVIDER_PLUGINS = {
-        "openai": OpenAIProvider,
-        "gemini": GeminiProvider,
-        "my_provider": MyProvider, # Add it to the dictionary
-    }
-    ```
-
-The `RotatingClient` will automatically use your new plugin when `get_available_models` is called for `"my_provider"`.
+The `chutes` provider is handled as a special case. Since `litellm` does not support it directly, the `RotatingClient` modifies the request by setting the `api_base` to `https://llm.chutes.ai/v1` and remapping the model from `chutes/model-name` to `openai/model-name`. This allows `chutes.ai` to be used as a custom OpenAI-compatible endpoint.
 
 ## Detailed Documentation
 

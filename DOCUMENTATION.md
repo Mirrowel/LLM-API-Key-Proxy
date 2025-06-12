@@ -78,4 +78,13 @@ The provider plugin system allows for easy extension to support model list fetch
 
 -   **`provider_interface.py`**: Defines the abstract base class `ProviderPlugin` with a single abstract method, `get_models`. Any new provider plugin must inherit from this class and implement this method.
 -   **Implementations**: Each provider (e.g., `openai_provider.py`, `gemini_provider.py`) has its own file containing a class that implements the `ProviderPlugin` interface. The `get_models` method contains the specific logic to call the provider's API and return a list of their available models.
--   **`__init__.py`**: This file acts as a registry for the available plugins. The `PROVIDER_PLUGINS` dictionary maps provider names to their corresponding plugin classes. The `RotatingClient` uses this dictionary to instantiate the correct plugin at runtime.
+-   **`__init__.py`**: This file contains a dynamic plugin system that automatically discovers and registers any provider implementation placed in the `providers/` directory.
+
+### Special Provider: `chutes.ai`
+
+The `chutes` provider is handled as a special case within the `RotatingClient`. Since `litellm` does not have native support for `chutes.ai`, the client performs the following modifications at runtime:
+
+1.  **Sets `api_base`**: It sets the `api_base` to `https://llm.chutes.ai/v1`.
+2.  **Remaps the Model**: It changes the model name from `chutes/some-model` to `openai/some-model` before passing the request to `litellm`.
+
+This allows the system to use `chutes.ai` as if it were a custom OpenAI endpoint, while still leveraging the library's key rotation and management features.

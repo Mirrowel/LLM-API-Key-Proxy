@@ -84,6 +84,11 @@ The FastAPI proxy application exposes this functionality through an API endpoint
     GEMINI_API_KEY_2="your-gemini-api-key-2"
 
     OPENAI_API_KEY_1="your-openai-api-key-1"
+    
+    OPENROUTER_API_KEY_1="your-openrouter-api-key-1"
+
+    # chutes.ai is used as a custom OpenAI endpoint
+    CHUTES_API_KEY_1="your-chutes-api-key-1"
     ```
 
 ## Running the Proxy
@@ -98,7 +103,7 @@ The proxy will be available at `http://127.0.0.1:8000`.
 
 You can make requests to the proxy as if it were the OpenAI API. Remember to include your `PROXY_API_KEY` in the `Authorization` header.
 
-The `model` parameter must be specified in the format `provider/model_name` (e.g., `gemini/gemini-2.5-flash-preview-05-20`, `openai/gpt-4`).
+The `model` parameter must be specified in the format `provider/model_name` (e.g., `gemini/gemini-2.5-flash-preview-05-20`, `openai/gpt-4`, `openrouter/google/gemini-flash-1.5`, `chutes/deepseek-ai/DeepSeek-R1-0528`).
 
 ### Example with `curl` (Non-Streaming):
 ```bash

@@ -81,7 +81,16 @@ class RotatingClient:
             for attempt in range(self.max_retries):
                 try:
                     print(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                    response = await litellm.acompletion(api_key=current_key, **kwargs)
+                    
+                    # Create a copy of kwargs to modify for the litellm call
+                    litellm_kwargs = kwargs.copy()
+                    
+                    # Handle chutes.ai as a special case
+                    if provider == "chutes":
+                        litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
+                        litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
+
+                    response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
                     if is_streaming:
                         # For streams, we return a wrapper generator that logs usage on completion.
