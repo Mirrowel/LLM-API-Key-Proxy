@@ -5,10 +5,10 @@ from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from typing import List, Dict, Any, AsyncGenerator
 
-from src.rotator_library.usage_manager import UsageManager
-from src.rotator_library.failure_logger import log_failure
-from src.rotator_library.error_handler import is_server_error, is_unrecoverable_error
-from src.rotator_library.providers import PROVIDER_PLUGINS
+from .usage_manager import UsageManager
+from .failure_logger import log_failure
+from .error_handler import is_server_error, is_unrecoverable_error
+from .providers import PROVIDER_PLUGINS
 
 class RotatingClient:
     """
