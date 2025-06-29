@@ -69,7 +69,7 @@ class RotatingClient:
     async def acompletion(self, **kwargs) -> Any:
         """
         Performs a completion call with smart key rotation and retry logic.
-        Handles both streaming and non-streaming requests.
+        Handles both streaming and non-streaming requests with thread-safe key acquisition.
         """
         model = kwargs.get("model")
         is_streaming = kwargs.get("stream", False)
@@ -81,74 +81,60 @@ class RotatingClient:
         if provider not in self.api_keys:
             raise ValueError(f"No API keys configured for provider: {provider}")
 
-        while True: # Loop until a key succeeds or we decide to give up
-            current_key = self.usage_manager.get_next_smart_key(
-                available_keys=self.api_keys[provider],
-                model=model
-            )
+        current_key = None
+        try:
+            while True: # Loop to acquire a key and make the call
+                current_key = await self.usage_manager.acquire_key(
+                    available_keys=self.api_keys[provider],
+                    model=model
+                )
 
-            if not current_key:
-                print("All keys are currently on cooldown. Waiting...")
-                await asyncio.sleep(5) # Wait 5 seconds before checking for an available key again
-                continue
-
-            for attempt in range(self.max_retries):
-                try:
-                    print(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                    
-                    # Create a copy of kwargs to modify for the litellm call
-                    litellm_kwargs = kwargs.copy()
-
-                    # For gemma-3, convert all system messages to user messages
-                    if "gemma-3" in model:
-                        if "messages" in litellm_kwargs:
-                            # Create a new list to avoid modifying the original
-                            new_messages = []
-                            for message in litellm_kwargs["messages"]:
-                                if message.get("role") == "system":
-                                    new_messages.append({"role": "user", "content": message.get("content", "")})
-                                else:
-                                    new_messages.append(message)
+                for attempt in range(self.max_retries):
+                    try:
+                        lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                        
+                        litellm_kwargs = kwargs.copy()
+                        if "gemma-3" in model and "messages" in litellm_kwargs:
+                            new_messages = [
+                                {"role": "user", "content": m["content"]} if m.get("role") == "system" else m
+                                for m in litellm_kwargs["messages"]
+                            ]
                             litellm_kwargs["messages"] = new_messages
-                    
-                    # Handle chutes.ai as a special case
-                    if provider == "chutes":
-                        litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-                        litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
+                        
+                        if provider == "chutes":
+                            litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
+                            litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
 
-                    response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
+                        response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
-                    if is_streaming:
-                        # For streams, we return a wrapper generator that logs usage on completion.
-                        return self._streaming_wrapper(response, current_key, model)
-                    else:
-                        # For non-streams, we can log usage immediately.
-                        self.usage_manager.record_success(current_key, model, response)
-                        return response
+                        if is_streaming:
+                            return self._streaming_wrapper(response, current_key, model)
+                        else:
+                            self.usage_manager.record_success(current_key, model, response)
+                            return response
 
-                except Exception as e:
-                    log_failure(
-                        api_key=current_key,
-                        model=model,
-                        attempt=attempt + 1,
-                        error=e,
-                        request_data=kwargs
-                    )
-                    
-                    # For any retriable server error, we just continue the attempt loop
-                    if is_server_error(e) or is_rate_limit_error(e) and attempt < self.max_retries - 1:
-                        print(f"Key ...{current_key[-4:]} failed with server error or rate limit error. Retrying...")
-                        await asyncio.sleep(1 * (attempt + 1))
-                        continue
-                    
-                    # For unrecoverable errors, fail fast
-                    if is_unrecoverable_error(e):
-                        raise e
+                    except Exception as e:
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        
+                        if is_server_error(e) or (is_rate_limit_error(e) and attempt < self.max_retries - 1):
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with retriable error. Retrying...")
+                            await asyncio.sleep(1 * (attempt + 1))
+                            continue
+                        
+                        if is_unrecoverable_error(e):
+                            raise e
 
-                    # For all other errors (Auth, RateLimit, or final Server error), record it and break to get a new key
-                    print(f"Key ...{current_key[-4:]} failed permanently. Rotating...")
-                    self.usage_manager.record_rotation_error(current_key, model, e)
-                    break
+                        lib_logger.error(f"Key ...{current_key[-4:]} failed permanently. Rotating...")
+                        self.usage_manager.record_rotation_error(current_key, model, e)
+                        break # Break from retry loop to acquire a new key
+                
+                # If we exit the retry loop due to failure, release the key and try to get a new one.
+                await self.usage_manager.release_key(current_key)
+                current_key = None # Ensure key is not released again in finally
+
+        finally:
+            if current_key:
+                await self.usage_manager.release_key(current_key)
 
     def token_count(self, model: str, text: str = None, messages: List[Dict[str, str]] = None) -> int:
         """

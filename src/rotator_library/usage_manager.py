@@ -2,6 +2,7 @@ import json
 import os
 import time
 import logging
+import asyncio
 from datetime import date, datetime
 from typing import Dict, List, Optional, Any
 from filelock import FileLock
@@ -15,16 +16,19 @@ if not lib_logger.handlers:
 
 class UsageManager:
     """
-    Manages daily and global usage statistics and cooldowns for API keys.
+    Manages usage statistics and cooldowns for API keys with asyncio-safe locking.
     """
-    def __init__(self, file_path: str = "key_usage.json"):
+    def __init__(self, file_path: str = "key_usage.json", wait_timeout: int = 5):
         self.file_path = file_path
-        self.lock = FileLock(f"{self.file_path}.lock")
+        self.file_lock = FileLock(f"{self.file_path}.lock")
+        self.key_locks: Dict[str, asyncio.Lock] = {}
+        self.condition = asyncio.Condition()
+        self.wait_timeout = wait_timeout
         self.usage_data = self._load_usage()
         self._reset_daily_stats_if_needed()
 
     def _load_usage(self) -> Dict:
-        with self.lock:
+        with self.file_lock:
             if not os.path.exists(self.file_path):
                 return {}
             try:
@@ -34,7 +38,7 @@ class UsageManager:
                 return {}
 
     def _save_usage(self):
-        with self.lock:
+        with self.file_lock:
             with open(self.file_path, 'w') as f:
                 json.dump(self.usage_data, f, indent=2)
 
@@ -62,36 +66,67 @@ class UsageManager:
         if needs_saving:
             self._save_usage()
 
-    def get_next_smart_key(self, available_keys: List[str], model: str) -> Optional[str]:
+    def _initialize_locks(self, keys: List[str]):
+        """Initializes asyncio locks for all provided keys if not already present."""
+        for key in keys:
+            if key not in self.key_locks:
+                self.key_locks[key] = asyncio.Lock()
+
+    async def acquire_key(self, available_keys: List[str], model: str) -> str:
         """
-        Gets the least-used, available key for a specific model, considering model-specific cooldowns.
+        Acquires the best available key. If all are locked, waits for one to be
+        released or times out and returns the best-ranked key anyway.
         """
-        best_key = None
-        min_usage = float('inf')
+        self._initialize_locks(available_keys)
 
-        active_keys = []
-        for key in available_keys:
-            key_data = self.usage_data.get(key, {})
-            model_cooldowns = key_data.get("model_cooldowns", {})
-            cooldown_until = model_cooldowns.get(model)
+        async with self.condition:
+            while True:
+                # Rank all keys that are not on cooldown
+                eligible_keys = []
+                for key in available_keys:
+                    key_data = self.usage_data.get(key, {})
+                    cooldown_until = key_data.get("model_cooldowns", {}).get(model)
+                    if not cooldown_until or time.time() > cooldown_until:
+                        usage_count = key_data.get("daily", {}).get("models", {}).get(model, {}).get("success_count", 0)
+                        eligible_keys.append((key, usage_count))
+                
+                if not eligible_keys:
+                    lib_logger.warning("All keys are on cooldown. Waiting...")
+                    await asyncio.sleep(5)
+                    continue
 
-            if not cooldown_until or time.time() > cooldown_until:
-                active_keys.append(key)
+                # Sort by usage count (ascending)
+                eligible_keys.sort(key=lambda x: x[1])
+                
+                # Try to acquire the lock for the first unlocked key in the ranked list
+                for key, _ in eligible_keys:
+                    lock = self.key_locks[key]
+                    if not lock.locked():
+                        await lock.acquire()
+                        lib_logger.info(f"Acquired lock for available key: ...{key[-4:]}")
+                        return key
 
-        if not active_keys:
-            return None
+                # If all eligible keys are locked, wait for a notification or timeout
+                best_locked_key = eligible_keys[0][0]
+                lib_logger.info(f"All eligible keys are locked. Waiting for a key to be released. Best candidate: ...{best_locked_key[-4:]}")
+                
+                try:
+                    await asyncio.wait_for(self.condition.wait(), timeout=self.wait_timeout)
+                    # If wait() returns, it means we were notified, so we re-run the loop
+                    lib_logger.info("Notified that a key was released. Re-evaluating...")
+                    continue
+                except asyncio.TimeoutError:
+                    # If we time out, we take the best-ranked key, even if it's locked
+                    lib_logger.warning(f"Wait timed out. Proceeding with best-ranked locked key: ...{best_locked_key[-4:]}")
+                    return best_locked_key
 
-        # Find the key with the minimum daily success_count for the given model
-        for key in active_keys:
-            key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}})
-            daily_model_usage = key_data.get("daily", {}).get("models", {}).get(model, {})
-            usage_count = daily_model_usage.get("success_count", 0)
-
-            if usage_count < min_usage:
-                min_usage = usage_count
-                best_key = key
-        
-        return best_key if best_key else active_keys[0]
+    async def release_key(self, key: str):
+        """Releases the lock for a given key and notifies waiting tasks."""
+        async with self.condition:
+            if key in self.key_locks and self.key_locks[key].locked():
+                self.key_locks[key].release()
+                lib_logger.info(f"Released lock for key ...{key[-4:]}")
+                self.condition.notify() # Notify one waiting task
 
     def record_success(self, key: str, model: str, completion_response: litellm.ModelResponse):
         key_data = self.usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}})
