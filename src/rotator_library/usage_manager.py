@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Any
 from filelock import FileLock
 import litellm
+import re
 
 lib_logger = logging.getLogger('rotator_library')
 lib_logger.propagate = False # Ensure this logger doesn't propagate to root
@@ -128,7 +129,44 @@ class UsageManager:
         error_str = str(error).lower()
         if "retry_delay" in error_str:
             try:
-                delay_str = error_str.split("retry_delay")[1].split("seconds:")[1].strip().split("}")[0]
+                # Try multiple patterns to extract delay from error message
+                delay_str = None
+                
+                # Pattern 1: retry_delay...seconds format
+                if "retry_delay" in error_str and "seconds:" in error_str:
+                    try:
+                        delay_str = error_str.split("retry_delay")[1].split("seconds:")[1].strip().split("}")[0]
+                    except (IndexError, AttributeError):
+                        pass
+                
+                # Pattern 2: retryDelay with 's' suffix (Gemini format)
+                if not delay_str and "retrydelay" in error_str:
+                    try:
+                        match = re.search(r'"retrydelay":\s*"(\d+)s"', error_str)
+                        if match:
+                            delay_str = match.group(1)
+                    except Exception:
+                        pass
+                
+                # Pattern 3: Generic numeric extraction for retry/delay contexts
+                if not delay_str:
+                    try:
+                        # Look for numbers followed by 's' or 'seconds' in retry/delay context
+                        patterns = [
+                            r'retry.*?(\d+)s',
+                            r'delay.*?(\d+)s', 
+                            r'wait.*?(\d+)\s*seconds?'
+                        ]
+                        for pattern in patterns:
+                            match = re.search(pattern, error_str, re.IGNORECASE)
+                            if match:
+                                delay_str = match.group(1)
+                                break
+                    except Exception:
+                        pass
+                
+                if delay_str:
+                    cooldown_seconds = int(delay_str)
                 cooldown_seconds = int(delay_str)
             except (IndexError, ValueError):
                 pass

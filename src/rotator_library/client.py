@@ -19,7 +19,7 @@ if not lib_logger.handlers:
 
 from .usage_manager import UsageManager
 from .failure_logger import log_failure
-from .error_handler import is_server_error, is_unrecoverable_error
+from .error_handler import is_rate_limit_error, is_server_error, is_unrecoverable_error
 from .providers import PROVIDER_PLUGINS
 
 class RotatingClient:
@@ -136,8 +136,8 @@ class RotatingClient:
                     )
                     
                     # For any retriable server error, we just continue the attempt loop
-                    if is_server_error(e) and attempt < self.max_retries - 1:
-                        print(f"Key ...{current_key[-4:]} failed with server error. Retrying...")
+                    if is_server_error(e) or is_rate_limit_error(e) and attempt < self.max_retries - 1:
+                        print(f"Key ...{current_key[-4:]} failed with server error or rate limit error. Retrying...")
                         await asyncio.sleep(1 * (attempt + 1))
                         continue
                     
