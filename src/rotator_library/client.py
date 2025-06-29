@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import httpx
 import litellm
 from litellm.litellm_core_utils.token_counter import token_counter
@@ -27,6 +28,7 @@ class RotatingClient:
     with support for both streaming and non-streaming responses.
     """
     def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json"):
+        os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         if not api_keys:
             raise ValueError("API keys dictionary cannot be empty.")
