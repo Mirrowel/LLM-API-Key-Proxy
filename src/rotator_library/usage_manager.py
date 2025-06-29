@@ -1,10 +1,16 @@
 import json
 import os
 import time
+import logging
 from datetime import date, datetime
 from typing import Dict, List, Optional, Any
 from filelock import FileLock
 import litellm
+
+lib_logger = logging.getLogger('rotator_library')
+lib_logger.propagate = False # Ensure this logger doesn't propagate to root
+if not lib_logger.handlers:
+    lib_logger.addHandler(logging.NullHandler())
 
 class UsageManager:
     """
@@ -109,7 +115,7 @@ class UsageManager:
             cost = litellm.completion_cost(completion_response=completion_response)
             daily_model_data["approx_cost"] += cost
         except Exception as e:
-            print(f"Warning: Could not calculate cost for model {model}: {e}")
+            lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
 
         key_data["last_used_ts"] = time.time()
         self._save_usage()

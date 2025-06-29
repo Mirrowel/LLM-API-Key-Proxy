@@ -1,9 +1,20 @@
 import asyncio
 import json
+import httpx
 import litellm
 from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from typing import List, Dict, Any, AsyncGenerator
+
+# Set up a dedicated logger for the library
+lib_logger = logging.getLogger('rotator_library')
+lib_logger.propagate = False
+
+# You might want to add a handler if you want to see these logs specifically
+# For example, a NullHandler to avoid "No handler found" warnings if the
+# main app doesn't configure this logger.
+if not lib_logger.handlers:
+    lib_logger.addHandler(logging.NullHandler())
 
 from .usage_manager import UsageManager
 from .failure_logger import log_failure
@@ -26,6 +37,7 @@ class RotatingClient:
         self._provider_instances = {
             name: plugin() for name, plugin in PROVIDER_PLUGINS.items()
         }
+        self.http_client = httpx.AsyncClient()
 
     async def _streaming_wrapper(self, stream: Any, key: str, model: str) -> AsyncGenerator[Any, None]:
         """
@@ -34,7 +46,7 @@ class RotatingClient:
         """
         try:
             async for chunk in stream:
-                #logging.info(f"STREAM CHUNK: {chunk}")
+                #lib_logger.info(f"STREAM CHUNK: {chunk}")
                 # Convert the litellm chunk object to a dictionary
                 chunk_dict = chunk.dict()
                 
@@ -43,13 +55,13 @@ class RotatingClient:
 
                 # Safely check for usage data in the chunk
                 if hasattr(chunk, 'usage') and chunk.usage:
-                    logging.info(f"Usage found in chunk for key ...{key[-4:]}: {chunk.usage}")
+                    lib_logger.info(f"Usage found in chunk for key ...{key[-4:]}: {chunk.usage}")
                     self.usage_manager.record_success(key, model, chunk)
 
         finally:
             # Signal the end of the stream
             yield "data: [DONE]\n\n"
-            logging.info("STREAM FINISHED and [DONE] signal sent.")
+            lib_logger.info("STREAM FINISHED and [DONE] signal sent.")
 
 
     async def acompletion(self, **kwargs) -> Any:
@@ -139,29 +151,37 @@ class RotatingClient:
         """
         Returns a list of available models for a specific provider, with caching.
         """
+        lib_logger.info(f"Getting available models for provider: {provider}")
         if provider in self._model_list_cache:
+            lib_logger.info(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
         api_key = self.api_keys.get(provider, [None])[0]
         if not api_key:
+            lib_logger.warning(f"No API key for provider: {provider}")
             return []
 
         if provider in self._provider_instances:
-            models = await self._provider_instances[provider].get_models(api_key)
+            lib_logger.info(f"Calling get_models for provider: {provider}")
+            models = await self._provider_instances[provider].get_models(api_key, self.http_client)
+            lib_logger.info(f"Got {len(models)} models for provider: {provider}")
             self._model_list_cache[provider] = models
             return models
         else:
-            logging.warning(f"Model list fetching not implemented for provider: {provider}")
+            lib_logger.warning(f"Model list fetching not implemented for provider: {provider}")
             return []
 
     async def get_all_available_models(self, grouped: bool = True) -> Any:
         """
         Returns a list of all available models, either grouped by provider or as a flat list.
         """
+        lib_logger.info("Getting all available models...")
         all_provider_models = {}
         for provider in self.api_keys.keys():
+            lib_logger.info(f"Getting models for provider: {provider}")
             all_provider_models[provider] = await self.get_available_models(provider)
         
+        lib_logger.info("Finished getting all available models.")
         if grouped:
             return all_provider_models
         else:

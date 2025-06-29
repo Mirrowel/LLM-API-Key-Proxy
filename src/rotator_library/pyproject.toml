@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotating-api-key-client"
-version = "0.5.2"
+version = "0.5.5"
 authors = [
     { name="Mirrowel", email="nuh@uh.com" },
 ]
@@ -19,7 +19,7 @@ classifiers = [
 dependencies = [
     "litellm",
     "filelock",
-    "requests",
+    "httpx"
 ]
 
 [project.urls]

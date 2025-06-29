@@ -9,8 +9,9 @@ def setup_failure_logger():
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    logger = logging.getLogger('failure_logger')
-    logger.setLevel(logging.ERROR)
+    # Use the same named logger as the rest of the library
+    logger = logging.getLogger('rotator_library')
+    logger.setLevel(logging.INFO) # Set to INFO to capture all levels
     
     # Prevent logs from propagating to the root logger
     logger.propagate = False
@@ -34,12 +35,13 @@ def setup_failure_logger():
 
     handler.setFormatter(JsonFormatter())
     
-    # Add handler only if it hasn't been added before
-    if not logger.handlers:
+    # Add handler only if it hasn't been added before, and is not a NullHandler
+    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
         logger.addHandler(handler)
 
     return logger
 
+# Initialize the logger for failures
 failure_logger = setup_failure_logger()
 
 def log_failure(api_key: str, model: str, attempt: int, error: Exception, request_data: dict):

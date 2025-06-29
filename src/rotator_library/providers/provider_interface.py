@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List, Any
+from typing import List
+import httpx
 
 class ProviderInterface(ABC):
     """
@@ -8,12 +9,13 @@ class ProviderInterface(ABC):
     """
 
     @abstractmethod
-    async def get_models(self, api_key: str) -> List[str]:
+    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
         Fetches the list of available model names from the provider's API.
 
         Args:
             api_key: The API key required for authentication.
+            client: An httpx.AsyncClient instance for making requests.
 
         Returns:
             A list of model name strings.
