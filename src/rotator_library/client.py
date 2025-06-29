@@ -96,6 +96,18 @@ class RotatingClient:
                     
                     # Create a copy of kwargs to modify for the litellm call
                     litellm_kwargs = kwargs.copy()
+
+                    # For gemma-3, convert all system messages to user messages
+                    if "gemma-3" in model:
+                        if "messages" in litellm_kwargs:
+                            # Create a new list to avoid modifying the original
+                            new_messages = []
+                            for message in litellm_kwargs["messages"]:
+                                if message.get("role") == "system":
+                                    new_messages.append({"role": "user", "content": message.get("content", "")})
+                                else:
+                                    new_messages.append(message)
+                            litellm_kwargs["messages"] = new_messages
                     
                     # Handle chutes.ai as a special case
                     if provider == "chutes":
