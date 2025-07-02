@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import httpx
 import litellm
 from litellm.litellm_core_utils.token_counter import token_counter
@@ -66,7 +67,7 @@ class RotatingClient:
             lib_logger.info("STREAM FINISHED and [DONE] signal sent.")
 
 
-    async def acompletion(self, **kwargs) -> Any:
+    async def acompletion(self, pre_request_callback: callable = None, **kwargs) -> Any:
         """
         Performs a completion call with smart key rotation and retry logic.
         Handles both streaming and non-streaming requests with thread-safe key acquisition.
@@ -104,6 +105,9 @@ class RotatingClient:
                         if provider == "chutes":
                             litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
                             litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
+                        
+                        if pre_request_callback:
+                            await pre_request_callback()
 
                         response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
@@ -127,8 +131,9 @@ class RotatingClient:
 
                         if is_server_error(e):
                             if attempt < self.max_retries - 1:
-                                lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error. Retrying (attempt {attempt + 2}/{self.max_retries})...")
-                                await asyncio.sleep(1.5 * (attempt + 1))
+                                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                                lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error. Retrying in {wait_time:.2f} seconds...")
+                                await asyncio.sleep(wait_time)
                                 continue
                             else:
                                 lib_logger.error(f"Key ...{current_key[-4:]} failed after max retries on a server error. Rotating key.")
