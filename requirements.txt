@@ -1,9 +1,7 @@
 # FastAPI framework for building the proxy server
 fastapi
-
 # ASGI server for running the FastAPI application
 uvicorn
-
 # For loading environment variables from a .env file
 python-dotenv
 
@@ -12,3 +10,7 @@ python-dotenv
 
 # A library for calling LLM APIs with a consistent format
 litellm
+
+filelock
+httpx
+aiofiles

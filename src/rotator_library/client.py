@@ -58,7 +58,7 @@ class RotatingClient:
                 # Safely check for usage data in the chunk
                 if hasattr(chunk, 'usage') and chunk.usage:
                     lib_logger.info(f"Usage found in chunk for key ...{key[-4:]}: {chunk.usage}")
-                    self.usage_manager.record_success(key, model, chunk)
+                    await self.usage_manager.record_success(key, model, chunk)
 
         finally:
             # Signal the end of the stream
@@ -110,23 +110,35 @@ class RotatingClient:
                         if is_streaming:
                             return self._streaming_wrapper(response, current_key, model)
                         else:
-                            self.usage_manager.record_success(current_key, model, response)
+                            await self.usage_manager.record_success(current_key, model, response)
                             return response
 
                     except Exception as e:
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        
-                        if is_server_error(e) or (is_rate_limit_error(e) and attempt < self.max_retries - 1):
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with retriable error. Retrying...")
-                            await asyncio.sleep(1 * (attempt + 1))
-                            continue
-                        
+
                         if is_unrecoverable_error(e):
+                            lib_logger.error(f"Key ...{current_key[-4:]} failed with unrecoverable error: {e}. Raising exception.")
                             raise e
 
-                        lib_logger.error(f"Key ...{current_key[-4:]} failed permanently. Rotating...")
-                        self.usage_manager.record_rotation_error(current_key, model, e)
-                        break # Break from retry loop to acquire a new key
+                        if is_rate_limit_error(e):
+                            lib_logger.warning(f"Key ...{current_key[-4:]} hit a rate limit for model {model}. Rotating key and setting cooldown.")
+                            await self.usage_manager.record_rotation_error(current_key, model, e)
+                            break  # Break from retries to get a new key
+
+                        if is_server_error(e):
+                            if attempt < self.max_retries - 1:
+                                lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error. Retrying (attempt {attempt + 2}/{self.max_retries})...")
+                                await asyncio.sleep(1.5 * (attempt + 1))
+                                continue
+                            else:
+                                lib_logger.error(f"Key ...{current_key[-4:]} failed after max retries on a server error. Rotating key.")
+                                await self.usage_manager.record_rotation_error(current_key, model, e)
+                                break
+                        
+                        # Fallback for any other unexpected errors
+                        lib_logger.error(f"Key ...{current_key[-4:]} failed with an unexpected error: {e}. Rotating key.")
+                        await self.usage_manager.record_rotation_error(current_key, model, e)
+                        break
                 
                 # If we exit the retry loop due to failure, release the key and try to get a new one.
                 await self.usage_manager.release_key(current_key)
