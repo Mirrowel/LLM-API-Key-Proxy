@@ -104,7 +104,27 @@ class RotatingClient:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
                         
                         litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
-                        
+
+                        if provider in self._provider_instances:
+                            provider_instance = self._provider_instances[provider]
+                            
+                            # Ensure safety_settings are present, defaulting to lowest if not provided
+                            if "safety_settings" not in litellm_kwargs:
+                                litellm_kwargs["safety_settings"] = {
+                                    "harassment": "BLOCK_NONE",
+                                    "hate_speech": "BLOCK_NONE",
+                                    "sexually_explicit": "BLOCK_NONE",
+                                    "dangerous_content": "BLOCK_NONE",
+                                }
+
+                            converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
+                            
+                            if converted_settings is not None:
+                                litellm_kwargs["safety_settings"] = converted_settings
+                            else:
+                                # If conversion returns None, remove it to avoid sending empty settings
+                                del litellm_kwargs["safety_settings"]
+
                         if "gemma-3" in model and "messages" in litellm_kwargs:
                             new_messages = [
                                 {"role": "user", "content": m["content"]} if m.get("role") == "system" else m
