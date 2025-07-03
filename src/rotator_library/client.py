@@ -99,42 +99,43 @@ class RotatingClient:
                 )
                 tried_keys.add(current_key)
 
+                # Prepare litellm_kwargs once per key, not on every retry
+                litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+
+                if provider in self._provider_instances:
+                    provider_instance = self._provider_instances[provider]
+                    
+                    # Ensure safety_settings are present, defaulting to lowest if not provided
+                    if "safety_settings" not in litellm_kwargs:
+                        litellm_kwargs["safety_settings"] = {
+                            "harassment": "BLOCK_NONE",
+                            "hate_speech": "BLOCK_NONE",
+                            "sexually_explicit": "BLOCK_NONE",
+                            "dangerous_content": "BLOCK_NONE",
+                        }
+
+                    converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
+                    
+                    if converted_settings is not None:
+                        litellm_kwargs["safety_settings"] = converted_settings
+                    else:
+                        # If conversion returns None, remove it to avoid sending empty settings
+                        del litellm_kwargs["safety_settings"]
+
+                if "gemma-3" in model and "messages" in litellm_kwargs:
+                    new_messages = [
+                        {"role": "user", "content": m["content"]} if m.get("role") == "system" else m
+                        for m in litellm_kwargs["messages"]
+                    ]
+                    litellm_kwargs["messages"] = new_messages
+                
+                if provider == "chutes":
+                    litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
+                    litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
+
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        
-                        litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
-
-                        if provider in self._provider_instances:
-                            provider_instance = self._provider_instances[provider]
-                            
-                            # Ensure safety_settings are present, defaulting to lowest if not provided
-                            if "safety_settings" not in litellm_kwargs:
-                                litellm_kwargs["safety_settings"] = {
-                                    "harassment": "BLOCK_NONE",
-                                    "hate_speech": "BLOCK_NONE",
-                                    "sexually_explicit": "BLOCK_NONE",
-                                    "dangerous_content": "BLOCK_NONE",
-                                }
-
-                            converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
-                            
-                            if converted_settings is not None:
-                                litellm_kwargs["safety_settings"] = converted_settings
-                            else:
-                                # If conversion returns None, remove it to avoid sending empty settings
-                                del litellm_kwargs["safety_settings"]
-
-                        if "gemma-3" in model and "messages" in litellm_kwargs:
-                            new_messages = [
-                                {"role": "user", "content": m["content"]} if m.get("role") == "system" else m
-                                for m in litellm_kwargs["messages"]
-                            ]
-                            litellm_kwargs["messages"] = new_messages
-                        
-                        if provider == "chutes":
-                            litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-                            litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
                         
                         if pre_request_callback:
                             await pre_request_callback()
