@@ -39,61 +39,29 @@ class RotatingClient:
         self.http_client = httpx.AsyncClient()
         self.all_providers = AllProviders()
 
-    async def _gemini_stream_wrapper(self, stream: Any, key: str, model: str) -> AsyncGenerator[Any, None]:
-        """
-        A wrapper specifically for Gemini streams to handle potential JSON chunking issues.
-        It buffers and reassembles chunks before yielding them.
-        """
-        lib_logger.warning("Using Gemini stream wrapper to reassemble JSON chunks.")
-        buffer = ""
-        usage_recorded = False
-        try:
-            async for chunk in stream:
-                buffer += chunk.choices[0].delta.content or ""
-                try:
-                    # Try to parse the buffer as a complete JSON object
-                    parsed_chunk = json.loads(buffer)
-                    # If successful, yield it and clear the buffer
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': json.dumps(parsed_chunk)}}]})}"
-                    buffer = ""
-                    
-                    # Record usage if present in the parsed chunk
-                    if not usage_recorded and isinstance(parsed_chunk, dict) and parsed_chunk.get('usage'):
-                        await self.usage_manager.record_success(key, model, parsed_chunk)
-                        usage_recorded = True
-                        lib_logger.info(f"Recorded usage from reassembled Gemini chunk for key ...{key[-4:]}")
-
-                except json.JSONDecodeError:
-                    # If it fails, it's an incomplete chunk, so we continue buffering
-                    lib_logger.debug("Incomplete JSON chunk received from Gemini, buffering...")
-                    continue
-        finally:
-            if not usage_recorded:
-                await self.usage_manager.record_success(key, model, stream)
-                lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
-            
-            await self.usage_manager.release_key(key, model)
-            lib_logger.info(f"GEMINI STREAM FINISHED and lock released for key ...{key[-4:]}.")
-            yield "data: [DONE]\n\n"
-
     async def _safe_streaming_wrapper(self, stream: Any, key: str, model: str) -> AsyncGenerator[Any, None]:
         """
         A definitive hybrid wrapper for streaming responses that ensures usage is recorded
         and the key lock is released only after the stream is fully consumed.
+        It exhaustively checks for usage data in all possible locations.
         """
         usage_recorded = False
         try:
             async for chunk in stream:
                 yield f"data: {json.dumps(chunk.dict())}\n\n"
+                # 1. First, try to find usage in a chunk (for providers that send it mid-stream)
                 if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
                     await self.usage_manager.record_success(key, model, chunk)
                     usage_recorded = True
                     lib_logger.info(f"Recorded usage from stream chunk for key ...{key[-4:]}")
         finally:
+            # 2. If not found in a chunk, try the final stream object itself (for other providers)
             if not usage_recorded:
+                # This call is now safe because record_success is robust
                 await self.usage_manager.record_success(key, model, stream)
                 lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
 
+            # 3. Release the key only after all attempts to record usage are complete
             await self.usage_manager.release_key(key, model)
             lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
             yield "data: [DONE]\n\n"
@@ -154,9 +122,7 @@ class RotatingClient:
                         response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
                         if is_streaming:
-                            # Special handling for Gemini streams due to chunking issues
-                            if provider == "gemini":
-                                return self._gemini_stream_wrapper(response, current_key, model)
+                            # The wrapper is now responsible for releasing the key.
                             return self._safe_streaming_wrapper(response, current_key, model)
                         else:
                             # For non-streaming, record and release here.
