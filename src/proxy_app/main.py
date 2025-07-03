@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -13,7 +14,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
 
 # Configure logging
-logging.basicConfig(level=logging.INFO) #-> moved to the rotator_library
+logging.basicConfig(level=logging.INFO)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -37,12 +38,23 @@ for key, value in os.environ.items():
 if not api_keys:
     raise ValueError("No provider API keys found in environment variables.")
 
-# Initialize the rotating client
-rotating_client = RotatingClient(api_keys=api_keys)
+# --- Lifespan Management ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    app.state.rotating_client = RotatingClient(api_keys=api_keys)
+    print("RotatingClient initialized.")
+    yield
+    await app.state.rotating_client.close()
+    print("RotatingClient closed.")
 
 # --- FastAPI App Setup ---
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+def get_rotating_client(request: Request) -> RotatingClient:
+    """Dependency to get the rotating client instance from the app state."""
+    return request.app.state.rotating_client
 
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
@@ -51,7 +63,11 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
     return auth
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, _=Depends(verify_api_key)):
+async def chat_completions(
+    request: Request, 
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key)
+):
     """
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses.
@@ -60,7 +76,7 @@ async def chat_completions(request: Request, _=Depends(verify_api_key)):
         data = await request.json()
         is_streaming = data.get("stream", False)
         
-        response = await rotating_client.acompletion(**data)
+        response = await client.acompletion(**data)
 
         if is_streaming:
             return StreamingResponse(response, media_type="text/event-stream")
@@ -76,12 +92,16 @@ def read_root():
     return {"Status": "API Key Proxy is running"}
 
 @app.get("/v1/models")
-async def list_models(grouped: bool = False, _=Depends(verify_api_key)):
+async def list_models(
+    grouped: bool = False, 
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key)
+):
     """
     Returns a list of available models from all configured providers.
     Optionally returns them as a flat list if grouped=False.
     """
-    models = await rotating_client.get_all_available_models(grouped=grouped)
+    models = await client.get_all_available_models(grouped=grouped)
     return models
 
 @app.get("/v1/providers")
@@ -92,7 +112,11 @@ async def list_providers(_=Depends(verify_api_key)):
     return list(PROVIDER_PLUGINS.keys())
 
 @app.post("/v1/token-count")
-async def token_count(request: Request, _=Depends(verify_api_key)):
+async def token_count(
+    request: Request, 
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key)
+):
     """
     Calculates the token count for a given list of messages and a model.
     """
@@ -104,7 +128,7 @@ async def token_count(request: Request, _=Depends(verify_api_key)):
         if not model or not messages:
             raise HTTPException(status_code=400, detail="'model' and 'messages' are required.")
 
-        count = rotating_client.token_count(model=model, messages=messages)
+        count = client.token_count(model=model, messages=messages)
         return {"token_count": count}
 
     except Exception as e:
