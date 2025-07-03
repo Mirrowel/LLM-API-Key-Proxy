@@ -21,11 +21,10 @@ class UsageManager:
     Manages usage statistics and cooldowns for API keys with asyncio-safe locking,
     asynchronous file I/O, and a lazy-loading mechanism for usage data.
     """
-    def __init__(self, file_path: str = "key_usage.json", wait_timeout: int = 5, daily_reset_time_utc: Optional[str] = "00:00"):
+    def __init__(self, file_path: str = "key_usage.json", wait_timeout: int = 13, daily_reset_time_utc: Optional[str] = "03:00"):
         self.file_path = file_path
         self.file_lock = FileLock(f"{self.file_path}.lock")
-        self.key_locks: Dict[str, asyncio.Lock] = {}
-        self.condition = asyncio.Condition()
+        self.key_states: Dict[str, Dict[str, Any]] = {}
         self.wait_timeout = wait_timeout
         
         self._data_lock = asyncio.Lock()
@@ -120,80 +119,103 @@ class UsageManager:
         if needs_saving:
             await self._save_usage()
 
-    def _initialize_locks(self, keys: List[str]):
-        """Initializes asyncio locks for all provided keys if not already present."""
+    def _initialize_key_states(self, keys: List[str]):
+        """Initializes state tracking for all provided keys if not already present."""
         for key in keys:
-            if key not in self.key_locks:
-                self.key_locks[key] = asyncio.Lock()
+            if key not in self.key_states:
+                self.key_states[key] = {
+                    "lock": asyncio.Lock(),
+                    "condition": asyncio.Condition(),
+                    "models_in_use": set()
+                }
 
     async def acquire_key(self, available_keys: List[str], model: str) -> str:
-        """Acquires the best available key with robust locking and a fair timeout mechanism."""
+        """
+        Acquires the best available key using a tiered, model-aware locking strategy.
+        """
         await self._lazy_init()
-        self._initialize_locks(available_keys)
+        self._initialize_key_states(available_keys)
 
-        async with self.condition:
-            while True:
-                eligible_keys = []
-                async with self._data_lock:
-                    now = time.time()
-                    for key in available_keys:
-                        key_data = self._usage_data.get(key, {})
-                        
-                        # Check for key-level lockout
-                        key_cooldown = key_data.get("key_cooldown_until")
-                        if key_cooldown and now < key_cooldown:
-                            continue
+        while True:
+            tier1_keys, tier2_keys = [], []
+            async with self._data_lock:
+                now = time.time()
+                for key in available_keys:
+                    key_data = self._usage_data.get(key, {})
+                    
+                    # Skip keys on global or model-specific cooldown
+                    if key_data.get("key_cooldown_until", 0) > now or \
+                       key_data.get("model_cooldowns", {}).get(model, 0) > now:
+                        continue
 
-                        # Check for model-specific cooldown
-                        model_cooldown = key_data.get("model_cooldowns", {}).get(model)
-                        if model_cooldown and now < model_cooldown:
-                            continue
-                        
-                        usage_count = key_data.get("daily", {}).get("models", {}).get(model, {}).get("success_count", 0)
-                        eligible_keys.append((key, usage_count))
-                
-                if not eligible_keys:
-                    lib_logger.warning("All keys are on cooldown. Waiting...")
-                    await asyncio.sleep(5)
-                    continue
+                    usage_count = key_data.get("daily", {}).get("models", {}).get(model, {}).get("success_count", 0)
+                    key_state = self.key_states[key]
 
-                eligible_keys.sort(key=lambda x: x[1])
-                
-                for key, _ in eligible_keys:
-                    lock = self.key_locks[key]
-                    if not lock.locked():
-                        await lock.acquire()
-                        lib_logger.info(f"Acquired lock for available key: ...{key[-4:]}")
+                    if not key_state["models_in_use"]:
+                        tier1_keys.append((key, usage_count))
+                    elif model not in key_state["models_in_use"]:
+                        tier2_keys.append((key, usage_count))
+
+            # Sort keys by usage count (ascending)
+            tier1_keys.sort(key=lambda x: x[1])
+            tier2_keys.sort(key=lambda x: x[1])
+
+            # Attempt to acquire from Tier 1 (completely free)
+            for key, _ in tier1_keys:
+                state = self.key_states[key]
+                async with state["lock"]:
+                    if not state["models_in_use"]:
+                        state["models_in_use"].add(model)
+                        lib_logger.info(f"Acquired Tier 1 key ...{key[-4:]} for model {model}")
                         return key
 
-                lib_logger.info("All eligible keys are locked. Waiting for a key to be released.")
-                
-                try:
-                    await asyncio.wait_for(self.condition.wait(), timeout=self.wait_timeout)
-                    lib_logger.info("Notified that a key was released. Re-evaluating...")
-                    continue
-                except asyncio.TimeoutError:
-                    lib_logger.warning("Wait timed out. Attempting to acquire a key via fair timeout logic.")
-                    async with self._timeout_lock:
-                        for key, _ in eligible_keys:
-                            if key not in self._claimed_on_timeout:
-                                self._claimed_on_timeout.add(key)
-                                lib_logger.info(f"Acquired key ...{key[-4:]} via timeout claim.")
-                                return key
-                    lib_logger.error("Timeout occurred, but all eligible keys were already claimed by other timed-out tasks.")
-                    await asyncio.sleep(1)
+            # Attempt to acquire from Tier 2 (in use by other models)
+            for key, _ in tier2_keys:
+                state = self.key_states[key]
+                async with state["lock"]:
+                    if model not in state["models_in_use"]:
+                        state["models_in_use"].add(model)
+                        lib_logger.info(f"Acquired Tier 2 key ...{key[-4:]} for model {model}")
+                        return key
 
-    async def release_key(self, key: str):
-        """Releases the lock for a given key and notifies waiting tasks."""
-        async with self.condition:
-            async with self._timeout_lock:
-                if key in self._claimed_on_timeout:
-                    self._claimed_on_timeout.remove(key)
+            # If no key is available, wait for one to be released
+            lib_logger.info("All eligible keys are currently locked for this model. Waiting...")
+            
+            # Create a combined list of all potentially usable keys to wait on
+            all_potential_keys = tier1_keys + tier2_keys
+            if not all_potential_keys:
+                lib_logger.warning("No keys are eligible at all (all on cooldown). Waiting before re-evaluating.")
+                await asyncio.sleep(5)
+                continue
 
-            if key in self.key_locks and self.key_locks[key].locked():
-                self.key_locks[key].release()
-                lib_logger.info(f"Released lock for key ...{key[-4:]}")
-                self.condition.notify()
+            # Wait on the condition of the best available key
+            best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
+            wait_condition = self.key_states[best_wait_key]["condition"]
+            
+            try:
+                async with wait_condition:
+                    await asyncio.wait_for(wait_condition.wait(), timeout=self.wait_timeout)
+                lib_logger.info("Notified that a key was released. Re-evaluating...")
+            except asyncio.TimeoutError:
+                lib_logger.warning("Wait timed out. Re-evaluating for any available key.")
+
+
+    async def release_key(self, key: str, model: str):
+        """Releases a key's lock for a specific model and notifies waiting tasks."""
+        if key not in self.key_states:
+            return
+
+        state = self.key_states[key]
+        async with state["lock"]:
+            if model in state["models_in_use"]:
+                state["models_in_use"].remove(model)
+                lib_logger.info(f"Released key ...{key[-4:]} from model {model}")
+            else:
+                lib_logger.warning(f"Attempted to release key ...{key[-4:]} for model {model}, but it was not in use.")
+
+        # Notify all tasks waiting on this key's condition
+        async with state["condition"]:
+            state["condition"].notify_all()
 
     async def record_success(self, key: str, model: str, completion_response: Optional[litellm.ModelResponse] = None):
         """

@@ -62,7 +62,7 @@ class RotatingClient:
                 lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
 
             # 3. Release the key only after all attempts to record usage are complete
-            await self.usage_manager.release_key(key)
+            await self.usage_manager.release_key(key, model)
             lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
             yield "data: [DONE]\n\n"
 
@@ -127,7 +127,7 @@ class RotatingClient:
                         else:
                             # For non-streaming, record and release here.
                             await self.usage_manager.record_success(current_key, model, response)
-                            await self.usage_manager.release_key(current_key)
+                            await self.usage_manager.release_key(current_key, model)
                             return response
 
                     except Exception as e:
