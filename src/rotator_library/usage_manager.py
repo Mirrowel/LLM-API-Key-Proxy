@@ -144,8 +144,8 @@ class UsageManager:
                     key_data = self._usage_data.get(key, {})
                     
                     # Skip keys on global or model-specific cooldown
-                    if key_data.get("key_cooldown_until", 0) > now or \
-                       key_data.get("model_cooldowns", {}).get(model, 0) > now:
+                    if (key_data.get("key_cooldown_until") or 0) > now or \
+                       (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
                         continue
 
                     usage_count = key_data.get("daily", {}).get("models", {}).get(model, {}).get("success_count", 0)
