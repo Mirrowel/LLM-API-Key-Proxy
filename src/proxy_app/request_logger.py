@@ -22,8 +22,8 @@ def log_request_response(request_data: dict, response_data: dict, is_streaming: 
             "is_streaming": is_streaming
         }
 
-        with open(filename, "w") as f:
-            json.dump(log_content, f, indent=4)
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(log_content, f, indent=4, ensure_ascii=False)
             
     except Exception as e:
         # In case of logging failure, we don't want to crash the main application
