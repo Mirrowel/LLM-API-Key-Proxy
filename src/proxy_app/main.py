@@ -7,11 +7,14 @@ from dotenv import load_dotenv
 import logging
 from pathlib import Path
 import sys
+import json
+from typing import AsyncGenerator, Any
 
 # Add the 'src' directory to the Python path to allow importing 'rotating_api_key_client'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
+from .request_logger import log_request_response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --- Configuration ---
+ENABLE_REQUEST_LOGGING = False  # Set to False to disable request/response logging
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
@@ -62,29 +66,111 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
 
+async def streaming_response_wrapper(
+    request_data: dict,
+    response_stream: AsyncGenerator[str, None]
+) -> AsyncGenerator[str, None]:
+    """
+    Wraps a streaming response to log the full response after completion.
+    """
+    response_chunks = []
+    full_response = {}
+    try:
+        async for chunk_str in response_stream:
+            yield chunk_str
+            # Process chunk for logging
+            if chunk_str.strip() and chunk_str.startswith("data:"):
+                content = chunk_str[len("data:"):].strip()
+                if content != "[DONE]":
+                    try:
+                        chunk_data = json.loads(content)
+                        response_chunks.append(chunk_data)
+                    except json.JSONDecodeError:
+                        # Ignore non-json chunks if any
+                        pass
+    finally:
+        # Reconstruct the full response object from chunks
+        if response_chunks:
+            full_content = "".join(
+                choice["delta"]["content"]
+                for chunk in response_chunks
+                if "choices" in chunk and chunk["choices"]
+                for choice in chunk["choices"]
+                if "delta" in choice and "content" in choice["delta"] and choice["delta"]["content"]
+            )
+
+            # Take metadata from the first chunk and construct a single choice object
+            first_chunk = response_chunks[0]
+            final_choice = {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_content,
+                },
+                "finish_reason": "stop",  # Assuming 'stop' as stream ended
+            }
+            
+            full_response = {
+                "id": first_chunk.get("id"),
+                "object": "chat.completion", # Final object is a completion, not a chunk
+                "created": first_chunk.get("created"),
+                "model": first_chunk.get("model"),
+                "choices": [final_choice],
+                "usage": None # Usage is not typically available in the stream itself
+            }
+        
+        if ENABLE_REQUEST_LOGGING:
+            log_request_response(
+                request_data=request_data,
+                response_data=full_response,
+                is_streaming=True
+            )
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
-    request: Request, 
+    request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key)
+    _ = Depends(verify_api_key)
 ):
     """
     OpenAI-compatible endpoint powered by the RotatingClient.
-    Handles both streaming and non-streaming responses.
+    Handles both streaming and non-streaming responses and logs them.
     """
     try:
-        data = await request.json()
-        is_streaming = data.get("stream", False)
-        
-        response = await client.acompletion(**data)
+        request_data = await request.json()
+        is_streaming = request_data.get("stream", False)
+
+        response = await client.acompletion(**request_data)
 
         if is_streaming:
-            return StreamingResponse(response, media_type="text/event-stream")
+            # Wrap the streaming response to enable logging after it's complete
+            return StreamingResponse(
+                streaming_response_wrapper(request_data, response),
+                media_type="text/event-stream"
+            )
         else:
+            # For non-streaming, log immediately
+            if ENABLE_REQUEST_LOGGING:
+                log_request_response(
+                    request_data=request_data,
+                    response_data=response.dict(),
+                    is_streaming=False
+                )
             return response
 
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
+        # Optionally log the failed request
+        if ENABLE_REQUEST_LOGGING:
+            try:
+                request_data = await request.json()
+            except json.JSONDecodeError:
+                request_data = {"error": "Could not parse request body"}
+            log_request_response(
+                request_data=request_data,
+                response_data={"error": str(e)},
+                is_streaming=request_data.get("stream", False)
+            )
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
