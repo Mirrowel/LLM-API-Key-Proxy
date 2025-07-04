@@ -5,7 +5,6 @@ import logging
 import asyncio
 from datetime import date, datetime, timezone, time as dt_time
 from typing import Dict, List, Optional, Set
-from filelock import FileLock
 import aiofiles
 import litellm
 
@@ -23,7 +22,6 @@ class UsageManager:
     """
     def __init__(self, file_path: str = "key_usage.json", wait_timeout: int = 13, daily_reset_time_utc: Optional[str] = "03:00"):
         self.file_path = file_path
-        self.file_lock = FileLock(f"{self.file_path}.lock")
         self.key_states: Dict[str, Dict[str, Any]] = {}
         self.wait_timeout = wait_timeout
         
@@ -67,9 +65,8 @@ class UsageManager:
         if self._usage_data is None:
             return
         async with self._data_lock:
-            with self.file_lock:
-                async with aiofiles.open(self.file_path, 'w') as f:
-                    await f.write(json.dumps(self._usage_data, indent=2))
+            async with aiofiles.open(self.file_path, 'w') as f:
+                await f.write(json.dumps(self._usage_data, indent=2))
 
     async def _reset_daily_stats_if_needed(self):
         """Checks if daily stats need to be reset for any key."""
