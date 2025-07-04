@@ -27,6 +27,7 @@ class RotatingClient:
     def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json"):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
+        litellm.drop_params = True
         if not api_keys:
             raise ValueError("API keys dictionary cannot be empty.")
         self.api_keys = api_keys
@@ -139,6 +140,10 @@ class RotatingClient:
                     else:
                         # If conversion returns None, remove it to avoid sending empty settings
                         del litellm_kwargs["safety_settings"]
+                
+                if provider == "gemini":
+                    provider_instance = self._provider_instances[provider]
+                    provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
                 if "gemma-3" in model and "messages" in litellm_kwargs:
                     new_messages = [
