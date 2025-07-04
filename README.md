@@ -1,5 +1,20 @@
 # API Key Proxy with Rotating Key Library [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
 
+## Easy Setup for Beginners (Windows)
+
+This is the fastest way to get started.
+
+1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases).
+2.  Unzip the downloaded file.
+3.  **Double-click `setup_env.bat`**. A window will open to help you add your API keys. Follow the on-screen instructions.
+4.  **Double-click `start_proxy.bat`**. This will start the proxy server.
+
+Your proxy is now running! You can now use it in your applications.
+
+---
+
+## Detailed Setup and Features
+
 This project provides a robust solution for managing and rotating API keys for various Large Language Model (LLM) providers. It consists of two main components:
 
 1.  A reusable Python library (`rotating-api-key-client`) for intelligently rotating API keys.
@@ -101,7 +116,9 @@ You can run the proxy in two ways:
 
 **A) Using the Compiled Executable (Recommended)**
 
-A pre-compiled, standalone executable for Windows is available in the [GitHub Releases](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases). This is the easiest way to get started as it requires no setup. Simply download the `proxy_app.exe` file and run it.
+A pre-compiled, standalone executable for Windows is available in the [GitHub Releases](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases). This is the easiest way to get started as it requires no setup.
+
+For the simplest experience, follow the **Easy Setup for Beginners** guide at the top of this document.
 
 **B) Running from Source**
 
