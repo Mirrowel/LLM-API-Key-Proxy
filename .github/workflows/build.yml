@@ -40,15 +40,25 @@ jobs:
       run: echo "sha=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
+    - name: Archive release files
+      shell: pwsh
+      run: |
+        $archiveName = "LLM-API-Key-Proxy-Build-${{ steps.sha.outputs.sha }}.zip"
+        $filesToArchive = @(
+          "src/proxy_app/dist/proxy_app.exe",
+          "setup_env.bat",
+          ".env.example"
+        )
+        Compress-Archive -Path $filesToArchive -DestinationPath $archiveName
+        echo "ASSET_PATH=$archiveName" >> $env:GITHUB_OUTPUT
+      id: archive
+
     - name: Create Release and Upload Asset
       uses: softprops/action-gh-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        files: |
-          src/proxy_app/dist/proxy_app.exe
-          setup_env.bat
-          .env.example
+        files: ${{ steps.archive.outputs.ASSET_PATH }}
         tag_name: ${{ steps.sha.outputs.sha }}
         name: Build ${{ steps.sha.outputs.sha }}
         target_commitish: ${{ github.sha }}
