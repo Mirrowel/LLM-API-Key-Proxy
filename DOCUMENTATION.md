@@ -1,90 +1,119 @@
 # Technical Documentation: `rotating-api-key-client`
 
-This document provides a detailed technical explanation of the `rotating-api-key-client` library, its components, and its internal workings.
+This document provides a detailed technical explanation of the `rotating-api-key-client` library, its components, and its internal workings. The library has evolved into a sophisticated, asynchronous client for managing LLM API keys with a strong focus on concurrency, resilience, and state management.
 
 ## 1. `client.py` - The `RotatingClient`
 
-The `RotatingClient` is the central component of the library, orchestrating API calls, key rotation, and error handling.
+The `RotatingClient` is the central component, orchestrating API calls, key management, and error handling. It is designed as a long-lived, async-native object.
+
+### Core Responsibilities
+-   Managing an `httpx.AsyncClient` for non-blocking HTTP requests.
+-   Interfacing with the `UsageManager` to acquire and release API keys.
+-   Handling provider-specific request modifications.
+-   Executing API calls via `litellm` with a robust retry and rotation strategy.
+-   Providing a safe wrapper for streaming responses.
 
 ### Request Lifecycle (`acompletion`)
 
 When `acompletion` is called, it follows these steps:
 
-1.  **Model and Provider Validation**: It first checks that a `model` is specified and extracts the provider name from it (e.g., `"gemini"` from `"gemini/gemini-2.5-flash-preview-05-20"`). It ensures that API keys for this provider are available.
+1.  **Provider and Key Validation**: It extracts the provider from the `model` name and ensures keys are configured for it.
 
-2.  **Key Selection Loop**: The client enters a loop to find a valid key and complete the request.
-    a.  **Get Next Smart Key**: It calls `self.usage_manager.get_next_smart_key()` to get the least-used key for the given model that is not currently on cooldown.
-    b.  **No Key Available**: If all keys for the provider are on cooldown, it waits for 5 seconds before restarting the loop.
+2.  **Key Acquisition Loop**: The client enters a loop to find a valid key and complete the request. It iterates through all keys for the provider until one succeeds or all have been tried.
+    a.  **Acquire Best Key**: It calls `self.usage_manager.acquire_key()`. This is a blocking call that waits until a suitable key is available, based on the manager's tiered locking strategy (see `UsageManager` section).
+    b.  **Prepare Request**: It prepares the `litellm` keyword arguments. This includes:
+        -   **Request Sanitization**: Calling `sanitize_request_payload()` to remove parameters that might be unsupported by the target model, preventing errors.
+        -   **Provider-Specific Logic**: Applying special handling for providers like Gemini (safety settings), Gemma (system prompts), and Chutes.ai (`api_base` and model name remapping).
 
-3.  **Attempt Loop**: Once a key is selected, it enters a retry loop (`for attempt in range(self.max_retries)`):
-    a.  **API Call**: It calls `litellm.acompletion` with the selected key and the user-provided arguments.
-    b.  **Success**:
-        -   If the call is successful and **non-streaming**, it calls `self.usage_manager.record_success()`, returns the response, and the process ends.
-        -   If the call is successful and **streaming**, it returns a `_streaming_wrapper` async generator. This wrapper formats the response chunks as Server-Sent Events (SSE) and calls `self.usage_manager.record_success()` only when the stream is fully consumed.
-    c.  **Failure**: If an exception occurs:
-        -   The failure is logged using `log_failure()`.
-        -   **Server Error**: If `is_server_error()` returns `True` and there are retries left, it waits for a moment and continues to the next attempt with the *same key*.
-        -   **Unrecoverable Error**: If `is_unrecoverable_error()` returns `True`, the exception is immediately raised, terminating the process.
-        -   **Other Errors (Rate Limit, Auth, etc.)**: For any other error, it's considered a "rotation" error. `self.usage_manager.record_rotation_error()` is called to put the key on cooldown, and the inner `attempt` loop is broken. The outer `while` loop then continues, fetching a new key.
+3.  **Retry Loop**: Once a key is acquired, it enters an inner retry loop (`for attempt in range(self.max_retries)`):
+    a.  **API Call**: It calls `litellm.acompletion` with the acquired key.
+    b.  **Success (Non-Streaming)**:
+        -   It calls `self.usage_manager.record_success()` to update usage stats and clear any cooldowns for the key-model pair.
+        -   It calls `self.usage_manager.release_key()` to release the lock on the key for this model.
+        -   It returns the response, and the process ends.
+    c.  **Success (Streaming)**:
+        -   It returns a `_safe_streaming_wrapper` async generator. This wrapper is critical:
+            -   It yields SSE-formatted chunks to the consumer.
+            -   After the stream is fully consumed, its `finally` block ensures that `record_success()` and `release_key()` are called. This guarantees that the key lock is held for the entire duration of the stream and released correctly, even if the consumer abandons the stream.
+    d.  **Failure**: If an exception occurs:
+        -   The failure is logged in detail by `log_failure()`.
+        -   The exception is passed to `classify_error()` to get a structured `ClassifiedError` object.
+        -   **Server Error**: If the error type is `server_error`, it waits with exponential backoff and retries the request with the *same key*.
+        -   **Rotation Error (Rate Limit, Auth, etc.)**: For any other error, it's considered a rotation trigger. `self.usage_manager.record_failure()` is called to apply an escalating cooldown, and `self.usage_manager.release_key()` releases the lock. The inner `attempt` loop is broken, and the outer `while` loop continues, acquiring a new key.
 
-## 2. `usage_manager.py` - The `UsageManager`
+## 2. `usage_manager.py` - Stateful Concurrency & Usage Management
 
-This class is responsible for all logic related to tracking and selecting API keys.
+This class is the heart of the library's state management and concurrency control. It is a stateful, async-native service that ensures keys are used efficiently and safely across multiple concurrent requests.
 
-### Key Data Structure
+### Key Concepts
 
-Usage data is stored in a JSON file (e.g., `key_usage.json`). Here's a conceptual view of its structure:
+-   **Asynchronous Design & Lazy Loading**: The entire class is asynchronous, using `aiofiles` for non-blocking file I/O and a `_lazy_init` pattern. The usage data from the JSON file is loaded only when the first request is made.
+-   **Concurrency Primitives**:
+    -   **`filelock`**: A file-level lock (`.json.lock`) prevents race conditions if multiple *processes* are running and sharing the same usage file.
+    -   **`asyncio.Lock` & `asyncio.Condition`**: Each key has its own `asyncio.Lock` and `asyncio.Condition` object. This enables the fine-grained, model-aware locking strategy.
 
+### Tiered Key Acquisition (`acquire_key`)
+
+This method implements the core logic for selecting a key. It is a "smart" blocking call.
+
+1.  **Filtering**: It first filters out any keys that are on a global or model-specific cooldown.
+2.  **Tiering**: It categorizes the remaining, valid keys into two tiers:
+    -   **Tier 1 (Ideal)**: Keys that are completely free (not being used by any model).
+    -   **Tier 2 (Acceptable)**: Keys that are currently in use, but for *different models* than the one being requested.
+3.  **Selection**: It attempts to acquire a lock on a key, prioritizing Tier 1 over Tier 2. Within each tier, it prioritizes the least-used key.
+4.  **Waiting**: If no keys in Tier 1 or Tier 2 can be locked, it means all eligible keys are currently handling requests for the *same model*. The method then `await`s on the `asyncio.Condition` of the best available key, waiting until it is notified that the key has been released.
+
+### Failure Handling & Cooldowns (`record_failure`)
+
+-   **Escalating Backoff**: When a failure is recorded, it applies a cooldown that increases with the number of consecutive failures for a specific key-model pair (e.g., 10s, 30s, 60s, up to 2 hours).
+-   **Authentication Errors**: These are treated more severely, applying an immediate 5-minute key-level lockout.
+-   **Key-Level Lockouts**: If a single key accumulates 3 or more long-term (2-hour) cooldowns across different models, the manager assumes the key is compromised or disabled and applies a 5-minute global lockout on the key.
+
+### Data Structure
+
+The `key_usage.json` file has a more complex structure to store this detailed state:
 ```json
 {
-  "api_key_1_hash": {
-    "last_used": "timestamp",
-    "cooldown_until": "timestamp",
-    "global_usage": 150,
-    "daily_usage": {
-      "YYYY-MM-DD": 100
+  "api_key_hash": {
+    "daily": {
+      "date": "YYYY-MM-DD",
+      "models": {
+        "gemini/gemini-1.5-pro": {
+          "success_count": 10,
+          "prompt_tokens": 5000,
+          "completion_tokens": 10000,
+          "approx_cost": 0.075
+        }
+      }
     },
-    "model_usage": {
-      "gemini/gemini-2.5-flash-preview-05-20": 50
-    }
+    "global": { /* ... similar to daily, but accumulates over time ... */ },
+    "model_cooldowns": {
+      "gemini/gemini-1.5-flash": 1719987600.0
+    },
+    "failures": {
+      "gemini/gemini-1.5-flash": {
+        "consecutive_failures": 2
+      }
+    },
+    "key_cooldown_until": null,
+    "last_daily_reset": "YYYY-MM-DD"
   }
 }
 ```
 
--   **Key Hashing**: Keys are stored by their SHA256 hash to avoid exposing sensitive keys in logs or files.
--   `cooldown_until`: If a key fails, this timestamp is set. The key will not be selected until the current time is past this timestamp.
--   `model_usage`: Tracks the usage count for each specific model, which is the primary metric for the "smart" key selection.
-
-### Core Methods
-
--   `get_next_smart_key()`: This is the key selection logic. It filters out any keys that are on cooldown and then finds the key with the lowest usage count for the requested `model`.
--   `record_success()`: Increments the usage counters (`global_usage`, `daily_usage`, `model_usage`) for the given key.
--   `record_rotation_error()`: Sets the `cooldown_until` timestamp for the given key, effectively taking it out of rotation for a short period.
-
 ## 3. `error_handler.py`
 
-This module contains functions to classify exceptions returned by `litellm`.
+This module provides a centralized function, `classify_error`, which is a significant improvement over the previous boolean checks.
 
--   `is_server_error(e)`: Checks if the exception is a transient server-side error (typically a `5xx` status code) that is worth retrying with the same key.
--   `is_unrecoverable_error(e)`: Checks for critical errors (e.g., invalid request parameters) that should immediately stop the process. Any error that is not a server error or an unrecoverable error is treated as a "rotation" error by the client.
+-   It takes a raw exception from `litellm` and returns a `ClassifiedError` data object.
+-   This object contains the `error_type` (e.g., `'rate_limit'`, `'authentication'`, `'server_error'`), the original exception, the status code, and any `retry_after` information extracted from the error message.
+-   This structured classification allows the `RotatingClient` to make more intelligent decisions about whether to retry with the same key or rotate to a new one.
 
-## 4. `failure_logger.py`
+## 4. `request_sanitizer.py` (New Module)
 
--   `log_failure()`: This function logs detailed information about a failed API request to a file in the `logs/` directory. This is crucial for debugging issues with specific keys or providers. The log includes the hashed API key, the model, the error message, and the request data.
+-   This module's purpose is to prevent `InvalidRequestError` exceptions from `litellm` that occur when a payload contains parameters not supported by the target model (e.g., sending a `thinking` parameter to a model that doesn't support it).
+-   The `sanitize_request_payload` function is called just before `litellm.acompletion` to strip out any such unsupported parameters, making the system more robust.
 
 ## 5. `providers/` - Provider Plugins
 
-The provider plugin system allows for easy extension to support model list fetching from new LLM providers.
-
--   **`provider_interface.py`**: Defines the abstract base class `ProviderPlugin` with a single abstract method, `get_models`. Any new provider plugin must inherit from this class and implement this method.
--   **Implementations**: Each provider (e.g., `openai_provider.py`, `gemini_provider.py`) has its own file containing a class that implements the `ProviderPlugin` interface. The `get_models` method contains the specific logic to call the provider's API and return a list of their available models.
--   **`__init__.py`**: This file contains a dynamic plugin system that automatically discovers and registers any provider implementation placed in the `providers/` directory.
-
-### Special Provider: `chutes.ai`
-
-The `chutes` provider is handled as a special case within the `RotatingClient`. Since `litellm` does not have native support for `chutes.ai`, the client performs the following modifications at runtime:
-
-1.  **Sets `api_base`**: It sets the `api_base` to `https://llm.chutes.ai/v1`.
-2.  **Remaps the Model**: It changes the model name from `chutes/some-model` to `openai/some-model` before passing the request to `litellm`.
-
-This allows the system to use `chutes.ai` as if it were a custom OpenAI endpoint, while still leveraging the library's key rotation and management features.
+The provider plugin system remains for fetching model lists. The interface now correctly specifies that the `get_models` method receives an `httpx.AsyncClient` instance, which it should use to make its API calls. This ensures all HTTP traffic goes through the client's managed session.
