@@ -18,6 +18,7 @@ from .usage_manager import UsageManager
 from .failure_logger import log_failure
 from .error_handler import classify_error, AllProviders
 from .providers import PROVIDER_PLUGINS
+from .request_sanitizer import sanitize_request_payload
 
 class RotatingClient:
     """
@@ -155,6 +156,8 @@ class RotatingClient:
                 if provider == "chutes":
                     litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
                     litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
+
+                litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
 
                 for attempt in range(self.max_retries):
                     try:
