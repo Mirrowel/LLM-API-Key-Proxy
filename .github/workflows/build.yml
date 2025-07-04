@@ -44,7 +44,10 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        files: src/proxy_app/dist/proxy_app.exe
+        files: |
+          src/proxy_app/dist/proxy_app.exe
+          setup_env.bat
+          .env.example
         tag_name: ${{ steps.sha.outputs.sha }}
         name: Build ${{ steps.sha.outputs.sha }}
         target_commitish: ${{ github.sha }}
