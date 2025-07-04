@@ -4,7 +4,7 @@
 
 This is the fastest way to get started.
 
-1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases).
+1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest).
 2.  Unzip the downloaded file.
 3.  **Double-click `setup_env.bat`**. A window will open to help you add your API keys. Follow the on-screen instructions.
 4.  **Double-click `start_proxy.bat`**. This will start the proxy server.
@@ -116,7 +116,7 @@ You can run the proxy in two ways:
 
 **A) Using the Compiled Executable (Recommended)**
 
-A pre-compiled, standalone executable for Windows is available in the [GitHub Releases](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases). This is the easiest way to get started as it requires no setup.
+A pre-compiled, standalone executable for Windows is available on the [latest GitHub Release](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest). This is the easiest way to get started as it requires no setup.
 
 For the simplest experience, follow the **Easy Setup for Beginners** guide at the top of this document.
 
