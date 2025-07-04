@@ -97,6 +97,14 @@ CHUTES_API_KEY_1="YOUR_CHUTES_API_KEY_1"
 
 ### 3. Run the Proxy
 
+You can run the proxy in two ways:
+
+**A) Using the Compiled Executable (Recommended)**
+
+A pre-compiled, standalone executable for Windows is available in the [GitHub Releases](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases). This is the easiest way to get started as it requires no setup. Simply download the `proxy_app.exe` file and run it.
+
+**B) Running from Source**
+
 Start the FastAPI server with `uvicorn`. The `--reload` flag will automatically restart the server when you make code changes.
 
 ```bash
@@ -161,12 +169,18 @@ print(response.choices[0].message.content)
 
 ### Enabling Request Logging
 
-For debugging purposes, you can log the full request and response for every API call. To enable this, open `src/proxy_app/main.py` and change the following line:
+For debugging purposes, you can log the full request and response for every API call. To enable this, start the proxy with the `--enable-request-logging` flag:
 
-```python
-# Set to True to enable request/response logging
-ENABLE_REQUEST_LOGGING = True
+**When running from source:**
+```bash
+uvicorn src.proxy_app.main:app --reload -- --enable-request-logging
 ```
+
+**When running the executable:**
+```powershell
+./proxy_app.exe --enable-request-logging
+```
+
 Logs will be saved in the `logs/` directory.
 
 ## How It Works

@@ -1,0 +1,47 @@
+name: Build and Release Executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/proxy_app/**'
+      - 'src/rotator_library/**'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Build executable
+      working-directory: src/proxy_app
+      run: ./build.bat
+
+    - name: Get short SHA
+      id: sha
+      run: echo "sha=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+
+    - name: Create Release and Upload Asset
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        files: src/proxy_app/dist/proxy_app.exe
+        tag_name: ${{ steps.sha.outputs.sha }}
+        name: Build ${{ steps.sha.outputs.sha }}
+        target_commitish: ${{ github.sha }}

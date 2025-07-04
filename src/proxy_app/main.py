@@ -14,7 +14,7 @@ from typing import AsyncGenerator, Any
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
-from .request_logger import log_request_response
+from proxy_app.request_logger import log_request_response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --- Configuration ---
-ENABLE_REQUEST_LOGGING = False  # Set to False to disable request/response logging
+ENABLE_REQUEST_LOGGING = '--enable-request-logging' in sys.argv
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
@@ -220,3 +220,7 @@ async def token_count(
     except Exception as e:
         logging.error(f"Token count failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

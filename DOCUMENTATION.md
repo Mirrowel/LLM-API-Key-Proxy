@@ -117,3 +117,15 @@ This module provides a centralized function, `classify_error`, which is a signif
 ## 5. `providers/` - Provider Plugins
 
 The provider plugin system remains for fetching model lists. The interface now correctly specifies that the `get_models` method receives an `httpx.AsyncClient` instance, which it should use to make its API calls. This ensures all HTTP traffic goes through the client's managed session.
+
+## 6. `proxy_app/` - The Proxy Application
+
+The `proxy_app` directory contains the FastAPI application that serves the rotating client.
+
+### `main.py` - The FastAPI App
+
+This file contains the FastAPI application that exposes the `RotatingClient` through an OpenAI-compatible API.
+
+#### Command-Line Arguments
+
+-   `--enable-request-logging`: This flag enables logging of all incoming requests and outgoing responses to the `logs/` directory. This is useful for debugging and monitoring the proxy's activity. By default, this is disabled.
