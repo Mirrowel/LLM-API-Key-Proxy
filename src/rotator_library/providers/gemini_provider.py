@@ -53,7 +53,7 @@ class GeminiProvider(ProviderInterface):
 
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
-        Adds a default thinking parameter for specific Gemini models if not already present (To show reasoning output).
+        Adds a default thinking parameter for specific Gemini models if not already present.
         """
-        if model in ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash"] and "thinking" not in payload:
+        if model in ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash"] and "thinking" not in payload and "reasoning_effort" not in payload:
             payload["thinking"] = {"type": "enabled", "budget_tokens": -1}
