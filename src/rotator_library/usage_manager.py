@@ -84,8 +84,11 @@ class UsageManager:
             last_reset_str = data.get("last_daily_reset", "")
             
             if last_reset_str != today_str:
-                last_reset_dt = datetime.fromisoformat(last_reset_str) if last_reset_str else None
-                
+                last_reset_dt = None
+                if last_reset_str:
+                    # Ensure the parsed datetime is timezone-aware (UTC)
+                    last_reset_dt = datetime.fromisoformat(last_reset_str).replace(tzinfo=timezone.utc)
+
                 # Determine the reset threshold for today
                 reset_threshold_today = datetime.combine(now_utc.date(), self.daily_reset_time_utc)
 
@@ -224,11 +227,12 @@ class UsageManager:
         """
         await self._lazy_init()
         async with self._data_lock:
-            key_data = self._usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
+            today_utc_str = datetime.now(timezone.utc).date().isoformat()
+            key_data = self._usage_data.setdefault(key, {"daily": {"date": today_utc_str, "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
             
             # Perform a just-in-time daily reset if the date has changed.
-            if key_data["daily"].get("date") != date.today().isoformat():
-                key_data["daily"] = {"date": date.today().isoformat(), "models": {}}
+            if key_data["daily"].get("date") != today_utc_str:
+                key_data["daily"] = {"date": today_utc_str, "models": {}}
 
             # Always record a success and reset failures
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
@@ -261,7 +265,8 @@ class UsageManager:
         """Records a failure and applies cooldowns based on an escalating backoff strategy."""
         await self._lazy_init()
         async with self._data_lock:
-            key_data = self._usage_data.setdefault(key, {"daily": {"date": date.today().isoformat(), "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
+            today_utc_str = datetime.now(timezone.utc).date().isoformat()
+            key_data = self._usage_data.setdefault(key, {"daily": {"date": today_utc_str, "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
             
             # Handle specific error types first
             if classified_error.error_type == 'rate_limit' and classified_error.retry_after:
