@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Dict, Any
 import httpx
 
 class ProviderInterface(ABC):
@@ -21,3 +21,15 @@ class ProviderInterface(ABC):
             A list of model name strings.
         """
         pass
+
+    def convert_safety_settings(self, settings: Dict[str, str]) -> List[Dict[str, Any]]:
+        """
+        Converts a generic safety settings dictionary to the provider-specific format.
+        
+        Args:
+            settings: A dictionary with generic harm categories and thresholds.
+            
+        Returns:
+            A list of provider-specific safety setting objects or None.
+        """
+        return None
