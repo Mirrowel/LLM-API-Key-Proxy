@@ -10,17 +10,18 @@ on:
       - 'src/rotator_library/**'
       - 'setup_env.bat'
       - '.github/workflows/build.yml'
-      - '.github/workflows/release-drafter.yml'
+      - '.github/release-drafter.yml'
 
 jobs:
   build:
     runs-on: windows-latest
     permissions:
       contents: write
+      pull-requests: read
 
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
@@ -38,15 +39,21 @@ jobs:
     - name: Build executable
       run: python src/proxy_app/build.py
 
-    - name: Get short SHA
-      id: sha
-      run: echo "sha=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
-      shell: pwsh
-
-    - name: Archive release files
+    - name: Generate Build Version
+      id: version
       shell: pwsh
       run: |
-        $archiveName = "LLM-API-Key-Proxy-Build-${{ steps.sha.outputs.sha }}.zip"
+        $date = Get-Date -Format 'yyyyMMdd'
+        $sha = git rev-parse --short HEAD
+        $version = "$date-$sha"
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+        echo "sha=$sha" >> $env:GITHUB_OUTPUT
+
+    - name: Archive release files
+      id: archive
+      shell: pwsh
+      run: |
+        $archiveName = "LLM-API-Key-Proxy-Build-${{ steps.version.outputs.sha }}.zip"
         $filesToArchive = @(
           "src/proxy_app/dist/proxy_app.exe",
           "setup_env.bat",
@@ -54,23 +61,33 @@ jobs:
         )
         Compress-Archive -Path $filesToArchive -DestinationPath $archiveName
         echo "ASSET_PATH=$archiveName" >> $env:GITHUB_OUTPUT
-      id: archive
 
-    - name: Draft and Publish Release
-      id: create_release
+    - name: Draft Release
+      id: release_drafter
       uses: release-drafter/release-drafter@v6
       with:
-        publish: true
-        commitish: ${{ github.sha }}
+        publish: false
+        commitish: ${{ github.ref_name }}
+        version: ${{ steps.version.outputs.version }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ steps.archive.outputs.ASSET_PATH }}
-        asset_name: ${{ steps.archive.outputs.ASSET_PATH }}
-        asset_content_type: application/zip
+    - name: Publish Release and Upload Asset
+      shell: pwsh
+      run: |
+        $releaseId = "${{ steps.release_drafter.outputs.id }}"
+        $assetPath = "${{ steps.archive.outputs.ASSET_PATH }}"
+        $tagName = "build-${{ steps.version.outputs.version }}"
+
+        if (-not $releaseId) {
+          Write-Host "Release drafter failed to create a draft. Creating a new release."
+          gh release create $tagName --title "Build ${{ steps.version.outputs.version }}" --notes "Automated build release."
+        } else {
+          Write-Host "Publishing release draft..."
+          gh api repos/${{ github.repository }}/releases/$releaseId -X PATCH -f draft=false
+        }
+
+        Write-Host "Uploading asset to release $tagName..."
+        gh release upload $tagName $assetPath --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

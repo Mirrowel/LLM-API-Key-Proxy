@@ -1,38 +1,38 @@
 # Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
 
-# Name template for the new release
-name-template: 'v$NEXT_PATCH_VERSION'
+# Name and tag template for the new build release
+name-template: 'Build $RESOLVED_VERSION'
+tag-template: 'build-$RESOLVED_VERSION'
 
-# Tag template for the new release
-tag-template: 'v$NEXT_PATCH_VERSION'
+# Version resolver - uses patch for all changes since this is build-focused
+version-resolver:
+  default: patch
 
 # Labels to exclude from changelog
 exclude-labels:
   - 'skip-changelog'
-  
-# Automatically determine version bump based on PR labels
-version-resolver:
-  major:
-    labels:
-      - 'major'
-      - 'breaking'
-  minor:
-    labels:
-      - 'minor'
-      - 'feature'
-      - 'enhancement'
-  patch:
-    labels:
-      - 'patch'
-      - 'fix'
-      - 'bug'
-      - 'chore'
-      - 'docs'
-  default: patch
+  - 'duplicate'
+  - 'invalid'
+  - 'wontfix'
+
+# Auto-labeler for direct commits (basic pattern matching)
+autolabeler:
+  - label: 'fix'
+    title:
+      - '/fix|bug|issue/i'
+  - label: 'feature'
+    title:
+      - '/feat|feature|add/i'
+  - label: 'docs'
+    title:
+      - '/doc|readme|comment/i'
+  - label: 'chore'
+    title:
+      - '/chore|update|bump|build/i'
 
 # Categories for changes, based on PR labels
 categories:
-  - title: '🚀 Features'
+  - title: '🚀 New Features'
     labels:
       - 'feature'
       - 'enhancement'
@@ -40,45 +40,52 @@ categories:
     labels:
       - 'fix'
       - 'bug'
-  - title: '📄 Documentation'
+  - title: '📖 Documentation'
     labels:
       - 'docs'
       - 'documentation'
-  - title: '🎨 Code Style'
+  - title: '🎨 Code Style & Formatting'
     labels:
       - 'style'
   - title: '♻️ Code Refactoring'
     labels:
       - 'refactor'
-  - title: '⚡️ Performance Improvements'
+  - title: '⚡ Performance Improvements'
     labels:
       - 'performance'
-  - title: '✅ Testing'
+  - title: '✅ Tests'
     labels:
       - 'test'
       - 'testing'
-  - title: '🔧 Build System & CI'
+  - title: '🔧 Build System & CI/CD'
     labels:
       - 'build'
       - 'ci'
-  - title: '🧰 Maintenance'
+  - title: '📦 Dependencies'
+    labels:
+      - 'dependencies'
+  - title: '🧹 Maintenance & Chores'
     labels:
       - 'chore'
   - title: '⏪ Reverts'
     labels:
       - 'revert'
-  - title: 'Other Changes'
+  - title: '💥 Breaking Changes'
+    labels:
+      - 'breaking'
+  - title: '📝 Other Changes'
     labels: []
 
-# Template for the release notes body
+# Template for the release notes body (simplified to avoid $COMMITS issues)
 template: |
-  ## What's Changed
+  ## What's Changed in this Build
 
   $CHANGES
 
-  ## All Commits
+  ## Contributors
 
-  $COMMITS
+  $CONTRIBUTORS
 
-  ---
-  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$NEXT_PATCH_VERSION
+# Change template for individual changes
+change-template: '- $TITLE @$AUTHOR'
+change-title-escapes: '\<*_&'
