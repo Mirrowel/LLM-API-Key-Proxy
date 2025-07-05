@@ -1,11 +1,18 @@
 # Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
+# Universal template for both direct commits and PR-based workflows
 
-# Name and tag template for the new build release
+# Name and tag template for releases
 name-template: 'Build $RESOLVED_VERSION'
 tag-template: 'build-$RESOLVED_VERSION'
 
-# Version resolver - uses patch for all changes since this is build-focused
+# Version resolver - handles both PR labels and direct commits
 version-resolver:
+  major:
+    labels: ['breaking', 'major']
+  minor:
+    labels: ['feature', 'enhancement', 'minor']
+  patch:
+    labels: ['fix', 'bug', 'chore', 'docs', 'style', 'refactor', 'performance', 'test', 'build', 'ci', 'dependencies']
   default: patch
 
 # Labels to exclude from changelog
@@ -14,32 +21,57 @@ exclude-labels:
   - 'duplicate'
   - 'invalid'
   - 'wontfix'
+  - 'question'
+  - 'help wanted'
 
-# Auto-labeler for direct commits (basic pattern matching)
+# Auto-labeler for direct commits (pattern matching on titles)
 autolabeler:
-  - label: 'fix'
+  - label: 'breaking'
     title:
-      - '/fix|bug|issue/i'
+      - '/breaking|major/i'
   - label: 'feature'
     title:
-      - '/feat|feature|add/i'
+      - '/feat|feature|add|implement/i'
+  - label: 'fix'
+    title:
+      - '/fix|bug|issue|resolve/i'
   - label: 'docs'
     title:
-      - '/doc|readme|comment/i'
+      - '/doc|readme|comment|documentation/i'
   - label: 'chore'
     title:
-      - '/chore|update|bump|build/i'
+      - '/chore|update|bump|build|maintenance/i'
+  - label: 'refactor'
+    title:
+      - '/refactor|cleanup|reorganize/i'
+  - label: 'test'
+    title:
+      - '/test|testing|spec/i'
+  - label: 'style'
+    title:
+      - '/style|format|lint/i'
+  - label: 'performance'
+    title:
+      - '/perf|performance|optimize/i'
+  - label: 'ci'
+    title:
+      - '/ci|workflow|action|github/i'
+  - label: 'dependencies'
+    title:
+      - '/dep|dependencies|upgrade|package/i'
 
-# Categories for changes, based on PR labels
+# Categories for changes (works for both PRs and auto-labeled commits)
 categories:
   - title: '🚀 New Features'
     labels:
       - 'feature'
       - 'enhancement'
+      - 'new-feature'
   - title: '🐛 Bug Fixes'
     labels:
       - 'fix'
       - 'bug'
+      - 'bugfix'
   - title: '📖 Documentation'
     labels:
       - 'docs'
@@ -47,12 +79,15 @@ categories:
   - title: '🎨 Code Style & Formatting'
     labels:
       - 'style'
+      - 'formatting'
   - title: '♻️ Code Refactoring'
     labels:
       - 'refactor'
+      - 'refactoring'
   - title: '⚡ Performance Improvements'
     labels:
       - 'performance'
+      - 'optimization'
   - title: '✅ Tests'
     labels:
       - 'test'
@@ -61,22 +96,31 @@ categories:
     labels:
       - 'build'
       - 'ci'
+      - 'cd'
+      - 'workflow'
   - title: '📦 Dependencies'
     labels:
       - 'dependencies'
+      - 'deps'
   - title: '🧹 Maintenance & Chores'
     labels:
       - 'chore'
+      - 'maintenance'
   - title: '⏪ Reverts'
     labels:
       - 'revert'
   - title: '💥 Breaking Changes'
     labels:
       - 'breaking'
+      - 'breaking-change'
+      - 'major'
+  - title: '🔒 Security'
+    labels:
+      - 'security'
   - title: '📝 Other Changes'
     labels: []
 
-# Template for the release notes body (simplified to avoid $COMMITS issues)
+# Template that works for both workflows
 template: |
   ## What's Changed in this Build
 
@@ -86,6 +130,24 @@ template: |
 
   $CONTRIBUTORS
 
-# Change template for individual changes
-change-template: '- $TITLE @$AUTHOR'
+  ---
+  
+  **Build Information:**
+  - Generated: ${{ DATE }}
+  - Full Changelog: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...build-$RESOLVED_VERSION
+
+# Change template that handles both PRs and direct commits
+change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+
+# Fallback template for commits without PR numbers
+no-changes-template: |
+  - No labeled changes in this release
+
+# Character escaping
 change-title-escapes: '\<*_&'
+
+# Include pre-releases in version calculation
+include-pre-releases: false
+
+# Sort direction
+sort-direction: ascending

@@ -11,6 +11,10 @@ on:
       - 'setup_env.bat'
       - '.github/workflows/build.yml'
       - '.github/release-drafter.yml'
+  pull_request:
+    types: [closed]
+    branches:
+      - main
 
 jobs:
   build:
@@ -18,6 +22,9 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    
+    # Only run on main branch pushes or merged PRs
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event.pull_request.merged == true)
 
     steps:
     - name: Check out repository
