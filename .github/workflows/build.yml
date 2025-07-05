@@ -18,7 +18,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: read # Needed for release-drafter to access PR data if available
-
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -40,80 +41,79 @@ jobs:
     - name: Build executable
       run: python src/proxy_app/build.py
 
-    - name: Generate Build Version
+    - name: Get short SHA
       id: version
       shell: pwsh
       run: |
-        $date = Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC'
         $sha = git rev-parse --short HEAD
-        $baseVersion = "$(Get-Date -Format 'yyyyMMdd')-$sha"
-        
-        # Append run attempt for manual runs to ensure unique tags for testing
-        if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-          $version = "$baseVersion-${{ github.run_attempt }}"
-        } else {
-          $version = $baseVersion
-        }
-        
-        echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "sha=$sha" >> $env:GITHUB_OUTPUT
-        echo "timestamp=$date" >> $env:GITHUB_OUTPUT
+
+    - name: Archive build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: proxy-app-build-${{ steps.version.outputs.sha }}
+        path: |
+          src/proxy_app/dist/proxy_app.exe
+          setup_env.bat
+          .env.example
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate Build Version
+      id: version
+      shell: bash
+      run: |
+        VERSION=$(date +'%Y%m%d')-${{ needs.build.outputs.sha }}
+        TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: proxy-app-build-${{ needs.build.outputs.sha }}
+        path: release-assets
 
     - name: Archive release files
       id: archive
-      shell: pwsh
+      shell: bash
       run: |
-        $archiveName = "LLM-API-Key-Proxy-Build-${{ steps.version.outputs.sha }}.zip"
-        $filesToArchive = @(
-          "src/proxy_app/dist/proxy_app.exe",
-          "setup_env.bat",
-          ".env.example"
-        )
-        Compress-Archive -Path $filesToArchive -DestinationPath $archiveName
-        echo "ASSET_PATH=$archiveName" >> $env:GITHUB_OUTPUT
+        ARCHIVE_NAME="LLM-API-Key-Proxy-Build-${{ needs.build.outputs.sha }}.zip"
+        cd release-assets
+        zip ../$ARCHIVE_NAME *
+        cd ..
+        echo "ASSET_PATH=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
-    - name: Draft Release Notes
+    - name: Create Release with Release-Drafter
       id: release_drafter
       uses: release-drafter/release-drafter@v6
       with:
-        # Use release-drafter to generate changelog, but don't publish
-        publish: false
+        publish: true
+        prerelease: false
         commitish: ${{ github.sha }}
         tag: build-${{ steps.version.outputs.version }}
         name: Build ${{ steps.version.outputs.version }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Create Final Release
-      id: final_release
-      shell: pwsh
-      run: |
-        $tagName = "build-${{ steps.version.outputs.version }}"
-        $releaseName = "Build ${{ steps.version.outputs.version }}"
-        $drafterBody = "${{ steps.release_drafter.outputs.body }}"
-        
-        # Prepend custom build information to the generated changelog
-        $header = @"
-        ## Build Information
-        - **Commit**: `${{ github.sha }}`
-        - **Date**: `${{ steps.version.outputs.timestamp }}`
-        - **Trigger**: `${{ github.event_name }}`
-        "@
-
-        $finalBody = "$header`n`n$drafterBody"
-
-        # Create the final release using the GitHub CLI
-        gh release create $tagName --title $releaseName --notes $finalBody --latest
+        header: |
+          ## Build Information
+          - **Commit**: ${{ needs.build.outputs.sha }}
+          - **Date**: ${{ steps.version.outputs.timestamp }}
+          - **Trigger**: ${{ github.event_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Upload Release Asset
-      shell: pwsh
+      shell: bash
       run: |
-        $tagName = "build-${{ steps.version.outputs.version }}"
-        $assetPath = "${{ steps.archive.outputs.ASSET_PATH }}"
-        
-        # Upload the zipped build artifact to the release
-        gh release upload $tagName $assetPath --clobber
+        gh release upload build-${{ steps.version.outputs.version }} ${{ steps.archive.outputs.ASSET_PATH }} --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
