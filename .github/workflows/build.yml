@@ -1,31 +1,23 @@
 name: Build and Release Executable
 
 on:
-  # Allows manual runs from the Actions tab
   workflow_dispatch:
-  # Triggers on pushes to any branch with this workflow file
   push:
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
       - 'setup_env.bat'
       - '.github/workflows/build.yml'
-      - '.github/release-drafter.yml'
+      - 'cliff.toml'
 
 jobs:
   build:
     runs-on: windows-latest
-    permissions:
-      contents: write
-      pull-requests: read # Needed for release-drafter to access PR data if available
     outputs:
       sha: ${{ steps.version.outputs.sha }}
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
-      with:
-        # Fetch all history for release-drafter to work correctly
-        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -62,7 +54,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: read
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -73,15 +64,28 @@ jobs:
       id: version
       shell: bash
       run: |
-        VERSION=$(date +'%Y.%m.%d')-${{ needs.build.outputs.sha }}
+        BASE_VERSION=$(date +'%Y.%m.%d')-${{ needs.build.outputs.sha }}
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          VERSION="$BASE_VERSION-${{ github.run_attempt }}"
+        else
+          VERSION="$BASE_VERSION"
+        fi
         TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
 
-    - name: Debug Release Drafter Inputs
-      run: |
-        echo "Tag: build-${{ steps.version.outputs.version }}"
-        echo "Version: ${{ steps.version.outputs.version }}"
+    - name: Get Previous Tag
+      id: previoustag
+      uses: "WyriHaximus/github-action-get-previous-tag@v1"
+
+    - name: Generate Changelog
+      id: changelog
+      uses: orhun/git-cliff-action@v2
+      with:
+        config: cliff.toml
+        args: --latest --strip all
+      env:
+        GIT_CLIFF_TAG: build-${{ steps.version.outputs.version }}
 
     - name: Download build artifact
       uses: actions/download-artifact@v4
@@ -99,28 +103,73 @@ jobs:
         cd ..
         echo "ASSET_PATH=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
-    - name: Create Release with Release-Drafter
-      id: release_drafter
-      uses: release-drafter/release-drafter@v6
-      with:
-        publish: true
-        prerelease: false
-        commitish: ${{ github.sha }}
-        tag: build-${{ steps.version.outputs.version }}
-        name: Build ${{ steps.version.outputs.version }}
-        version: ${{ steps.version.outputs.version }}
-        header: |
-          ## Build Information
-          - **Commit**: ${{ needs.build.outputs.sha }}
-          - **Date**: ${{ steps.version.outputs.timestamp }}
-          - **Trigger**: ${{ github.event_name }}
-
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload Release Asset
+    - name: Generate Build Metadata
+      id: metadata
       shell: bash
       run: |
-        gh release upload build-${{ steps.version.outputs.version }} ${{ steps.archive.outputs.ASSET_PATH }} --clobber
+        BUILD_SIZE=$(du -sh release-assets/proxy_app.exe | cut -f1)
+        COMMIT_COUNT=$(git rev-list --count HEAD)
+        CONTRIBUTORS=$(git log --format='%an' | sort -u | wc -l)
+        
+        echo "build_size=$BUILD_SIZE" >> $GITHUB_OUTPUT
+        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+        echo "contributors=$CONTRIBUTORS" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      shell: bash
+      run: |
+        NOTES="## 🏗️ Build Information
+        | Field | Value |
+        |-------|-------|
+        | 📦 **Version** | \`${{ steps.version.outputs.version }}\` |
+        | 💾 **Binary Size** | \`${{ steps.metadata.outputs.build_size }}\` |
+        | 🔗 **Commit** | [\`${{ needs.build.outputs.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
+        | 📅 **Build Date** | \`${{ steps.version.outputs.timestamp }}\` |
+        | ⚡ **Trigger** | \`${{ github.event_name }}\` |
+        | 👥 **Total Contributors** | \`${{ steps.metadata.outputs.contributors }}\` |
+        | 📊 **Total Commits** | \`${{ steps.metadata.outputs.commit_count }}\` |
+
+        ## 📋 What's Changed
+
+        ${{ steps.changelog.outputs.changelog }}
+
+        ## 📦 Assets & Installation
+        
+        ### Quick Start
+        \`\`\`bash
+        # Download and extract
+        wget https://github.com/${{ github.repository }}/releases/download/build-${{ steps.version.outputs.version }}/${{ steps.archive.outputs.ASSET_PATH }}
+        unzip ${{ steps.archive.outputs.ASSET_PATH }}
+        
+        # Setup and run
+        ./setup_env.bat
+        cp .env.example .env
+        # Edit .env with your API keys
+        ./proxy_app.exe
+        \`\`\`
+
+        ### 📁 Included Files
+        | File | Description | Size |
+        |------|-------------|------|
+        | 🚀 \`proxy_app.exe\` | Main application executable | Primary |
+        | ⚙️ \`setup_env.bat\` | Environment setup script | Helper |
+        | 📝 \`.env.example\` | Configuration template | Template |
+
+        ## 🔗 Useful Links
+        - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
+        - 🐛 [Report Issues](https://github.com/${{ github.repository }}/issues)
+        - 💬 [Discussions](https://github.com/${{ github.repository }}/discussions)
+        - 🌟 [Star this repo](https://github.com/${{ github.repository }}) if you find it useful!
+
+        ---
+        
+        > **Note**: This is an automated build release. For stable releases, check our [main releases](https://github.com/${{ github.repository }}/releases)."
+
+        gh release create build-${{ steps.version.outputs.version }} \
+          --title "🚀 Build ${{ steps.version.outputs.version }}" \
+          --notes "$NOTES" \
+          --latest \
+          --discussion-category "Releases" \
+          ${{ steps.archive.outputs.ASSET_PATH }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
