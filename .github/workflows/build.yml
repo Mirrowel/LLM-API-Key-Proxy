@@ -3,7 +3,8 @@ name: Build and Release Executable
 on:
   workflow_dispatch:
   push:
-    # No branch restriction, will run on any branch with this file
+    branches:
+      - main # Restrict to main branch
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
@@ -16,7 +17,7 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-      pull-requests: read # Still needed for release-drafter to read PRs if they exist
+      pull-requests: read
 
     steps:
     - name: Check out repository
@@ -42,9 +43,9 @@ jobs:
       id: version
       shell: pwsh
       run: |
-        $date = Get-Date -Format 'yyyyMMdd'
+        $date = Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC'
         $sha = git rev-parse --short HEAD
-        $baseVersion = "$date-$sha"
+        $baseVersion = "$(Get-Date -Format 'yyyyMMdd')-$sha"
         
         # Append run attempt for manual runs to ensure unique tags
         if ("${{ github.event_name }}" -eq "workflow_dispatch") {
@@ -55,6 +56,7 @@ jobs:
         
         echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "sha=$sha" >> $env:GITHUB_OUTPUT
+        echo "timestamp=$date" >> $env:GITHUB_OUTPUT
 
     - name: Archive release files
       id: archive
@@ -69,25 +71,46 @@ jobs:
         Compress-Archive -Path $filesToArchive -DestinationPath $archiveName
         echo "ASSET_PATH=$archiveName" >> $env:GITHUB_OUTPUT
 
-    - name: Draft and Publish Release
+    - name: Draft Release Notes
       id: release_drafter
       uses: release-drafter/release-drafter@v6
       with:
-        # This will create a release, or update an existing one
-        publish: true
-        # Marks the release as a pre-release
-        prerelease: true
-        commitish: ${{ github.ref_name }}
-        version: ${{ steps.version.outputs.version }}
+        # Only create a draft, don't publish
+        publish: false
+        commitish: ${{ github.sha }}
+        tag: build-${{ steps.version.outputs.version }}
+        name: Build ${{ steps.version.outputs.version }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create Final Release
+      id: final_release
+      shell: pwsh
+      run: |
+        $tagName = "build-${{ steps.version.outputs.version }}"
+        $releaseName = "Build ${{ steps.version.outputs.version }}"
+        $drafterBody = "${{ steps.release_drafter.outputs.body }}"
+        
+        $header = @"
+        ## Build Information
+        - **Commit**: `${{ github.sha }}`
+        - **Date**: `${{ steps.version.outputs.timestamp }}`
+        - **Trigger**: `${{ github.event_name }}`
+        "@
+
+        $finalBody = "$header`n`n$drafterBody"
+
+        gh release create $tagName --title $releaseName --notes $finalBody --latest
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      with:
-        upload_url: ${{ steps.release_drafter.outputs.upload_url }}
-        asset_path: ${{ steps.archive.outputs.ASSET_PATH }}
-        asset_name: ${{ steps.archive.outputs.ASSET_PATH }}
-        asset_content_type: application/zip
+      shell: pwsh
+      run: |
+        $tagName = "build-${{ steps.version.outputs.version }}"
+        $assetPath = "${{ steps.archive.outputs.ASSET_PATH }}"
+        
+        # Upload using GitHub CLI (more reliable)
+        gh release upload $tagName $assetPath --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

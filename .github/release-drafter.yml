@@ -1,7 +1,7 @@
 # Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
 # Universal template for both direct commits and PR-based workflows
 
-# Name and tag template for releases
+# Disable automatic name/tag generation since we're setting them manually
 name-template: 'Build $RESOLVED_VERSION'
 tag-template: 'build-$RESOLVED_VERSION'
 
@@ -21,10 +21,8 @@ exclude-labels:
   - 'duplicate'
   - 'invalid'
   - 'wontfix'
-  - 'question'
-  - 'help wanted'
 
-# Auto-labeler for direct commits (pattern matching on titles)
+# Auto-labeler for direct commits (enhanced patterns)
 autolabeler:
   - label: 'breaking'
     title:
@@ -120,7 +118,7 @@ categories:
   - title: '📝 Other Changes'
     labels: []
 
-# Template that works for both workflows
+# Template for the release notes
 template: |
   ## What's Changed in this Build
 
@@ -132,22 +130,18 @@ template: |
 
   ---
   
-  **Build Information:**
-  - Generated: ${{ DATE }}
-  - Full Changelog: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...build-$RESOLVED_VERSION
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...build-$RESOLVED_VERSION
 
-# Change template that handles both PRs and direct commits
-change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+# Change template
+change-template: '- $TITLE @$AUTHOR'
+change-title-escapes: '\<*_&'
 
 # Fallback template for commits without PR numbers
 no-changes-template: |
   - No labeled changes in this release
 
-# Character escaping
-change-title-escapes: '\<*_&'
-
 # Include pre-releases in version calculation
-include-pre-releases: false
+include-pre-releases: true
 
 # Sort direction
 sort-direction: ascending
