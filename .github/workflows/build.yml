@@ -1,10 +1,10 @@
 name: Build and Release Executable
 
 on:
+  # Allows manual runs from the Actions tab
   workflow_dispatch:
+  # Triggers on pushes to any branch with this workflow file
   push:
-    branches:
-      - main # Restrict to main branch
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
@@ -17,12 +17,13 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-      pull-requests: read
+      pull-requests: read # Needed for release-drafter to access PR data if available
 
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
       with:
+        # Fetch all history for release-drafter to work correctly
         fetch-depth: 0
 
     - name: Set up Python
@@ -47,7 +48,7 @@ jobs:
         $sha = git rev-parse --short HEAD
         $baseVersion = "$(Get-Date -Format 'yyyyMMdd')-$sha"
         
-        # Append run attempt for manual runs to ensure unique tags
+        # Append run attempt for manual runs to ensure unique tags for testing
         if ("${{ github.event_name }}" -eq "workflow_dispatch") {
           $version = "$baseVersion-${{ github.run_attempt }}"
         } else {
@@ -75,7 +76,7 @@ jobs:
       id: release_drafter
       uses: release-drafter/release-drafter@v6
       with:
-        # Only create a draft, don't publish
+        # Use release-drafter to generate changelog, but don't publish
         publish: false
         commitish: ${{ github.sha }}
         tag: build-${{ steps.version.outputs.version }}
@@ -91,6 +92,7 @@ jobs:
         $releaseName = "Build ${{ steps.version.outputs.version }}"
         $drafterBody = "${{ steps.release_drafter.outputs.body }}"
         
+        # Prepend custom build information to the generated changelog
         $header = @"
         ## Build Information
         - **Commit**: `${{ github.sha }}`
@@ -100,6 +102,7 @@ jobs:
 
         $finalBody = "$header`n`n$drafterBody"
 
+        # Create the final release using the GitHub CLI
         gh release create $tagName --title $releaseName --notes $finalBody --latest
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -110,7 +113,7 @@ jobs:
         $tagName = "build-${{ steps.version.outputs.version }}"
         $assetPath = "${{ steps.archive.outputs.ASSET_PATH }}"
         
-        # Upload using GitHub CLI (more reliable)
+        # Upload the zipped build artifact to the release
         gh release upload $tagName $assetPath --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

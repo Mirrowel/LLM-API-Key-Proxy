@@ -1,11 +1,13 @@
-# Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
-# Universal template for both direct commits and PR-based workflows
+# This file configures the Release Drafter action.
+# It automatically generates release notes based on commit messages and PR labels.
+# The autolabeler is key for direct commits, as it assigns labels based on commit titles.
 
-# Disable automatic name/tag generation since we're setting them manually
+# The version and name for the release are set in the main workflow file.
 name-template: 'Build $RESOLVED_VERSION'
 tag-template: 'build-$RESOLVED_VERSION'
 
-# Version resolver - handles both PR labels and direct commits
+# This section is required for release-drafter to analyze commits.
+# 'default: patch' ensures all changes are processed without bumping semantic versions.
 version-resolver:
   major:
     labels: ['breaking', 'major']
@@ -15,14 +17,15 @@ version-resolver:
     labels: ['fix', 'bug', 'chore', 'docs', 'style', 'refactor', 'performance', 'test', 'build', 'ci', 'dependencies']
   default: patch
 
-# Labels to exclude from changelog
+# Labels to ignore when generating release notes.
 exclude-labels:
   - 'skip-changelog'
   - 'duplicate'
   - 'invalid'
   - 'wontfix'
 
-# Auto-labeler for direct commits (enhanced patterns)
+# Automatically assigns labels to commits based on their title.
+# This is crucial for categorizing changes from direct commits.
 autolabeler:
   - label: 'breaking'
     title:
@@ -58,7 +61,7 @@ autolabeler:
     title:
       - '/dep|dependencies|upgrade|package/i'
 
-# Categories for changes (works for both PRs and auto-labeled commits)
+# Defines the sections in the release notes based on labels.
 categories:
   - title: '🚀 New Features'
     labels:
@@ -118,7 +121,8 @@ categories:
   - title: '📝 Other Changes'
     labels: []
 
-# Template for the release notes
+# The main template for the body of the release notes.
+# The workflow file prepends the "Build Information" section.
 template: |
   ## What's Changed in this Build
 
@@ -132,16 +136,16 @@ template: |
   
   **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...build-$RESOLVED_VERSION
 
-# Change template
+# How each line item in the changelog is formatted.
 change-template: '- $TITLE @$AUTHOR'
 change-title-escapes: '\<*_&'
 
-# Fallback template for commits without PR numbers
+# The message to display if no categorizable changes are found.
 no-changes-template: |
   - No labeled changes in this release
 
-# Include pre-releases in version calculation
+# This is critical for ensuring the changelog is based on the previous build-* tag.
 include-pre-releases: true
 
-# Sort direction
+# Sorts the changes in ascending order (oldest first).
 sort-direction: ascending
