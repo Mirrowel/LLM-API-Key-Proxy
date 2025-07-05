@@ -103,6 +103,7 @@ jobs:
         commitish: ${{ github.sha }}
         tag: build-${{ steps.version.outputs.version }}
         name: Build ${{ steps.version.outputs.version }}
+        version: ${{ steps.version.outputs.version }}
         header: |
           ## Build Information
           - **Commit**: ${{ needs.build.outputs.sha }}
