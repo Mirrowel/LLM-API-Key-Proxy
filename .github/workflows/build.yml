@@ -73,10 +73,15 @@ jobs:
       id: version
       shell: bash
       run: |
-        VERSION=$(date +'%Y%m%d')-${{ needs.build.outputs.sha }}
+        VERSION=$(date +'%Y.%m.%d')-${{ needs.build.outputs.sha }}
         TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+    - name: Debug Release Drafter Inputs
+      run: |
+        echo "Tag: build-${{ steps.version.outputs.version }}"
+        echo "Version: ${{ steps.version.outputs.version }}"
 
     - name: Download build artifact
       uses: actions/download-artifact@v4
@@ -103,7 +108,7 @@ jobs:
         commitish: ${{ github.sha }}
         tag: build-${{ steps.version.outputs.version }}
         name: Build ${{ steps.version.outputs.version }}
-        version: build-${{ steps.version.outputs.version }}
+        version: ${{ steps.version.outputs.version }}
         header: |
           ## Build Information
           - **Commit**: ${{ needs.build.outputs.sha }}

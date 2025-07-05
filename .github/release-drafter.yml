@@ -134,7 +134,7 @@ template: |
 
   ---
   
-  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...build-$RESOLVED_VERSION
 
 # How each line item in the changelog is formatted.
 change-template: '- $TITLE @$AUTHOR'
