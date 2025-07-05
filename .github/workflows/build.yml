@@ -74,19 +74,6 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
 
-    - name: Get Previous Tag
-      id: previoustag
-      uses: "WyriHaximus/github-action-get-previous-tag@v1"
-
-    - name: Generate Changelog
-      id: changelog
-      uses: orhun/git-cliff-action@v2
-      with:
-        config: cliff.toml
-        args: --latest --strip all
-      env:
-        GIT_CLIFF_TAG: build-${{ steps.version.outputs.version }}
-
     - name: Download build artifact
       uses: actions/download-artifact@v4
       with:
@@ -103,6 +90,27 @@ jobs:
         cd ..
         echo "ASSET_PATH=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
+    - name: Install git-cliff
+      shell: bash
+      run: |
+        curl -L https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-2.6.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
+        sudo mv git-cliff-2.6.1-x86_64-unknown-linux-gnu/git-cliff /usr/local/bin/
+
+    - name: Generate Changelog
+      id: changelog
+      shell: bash
+      run: |
+        export GIT_CLIFF_TAG="build-${{ steps.version.outputs.version }}"
+        git-cliff --config cliff.toml --latest --strip all --output changelog.md
+        if [ -f "changelog.md" ] && [ -s "changelog.md" ]; then
+          CHANGELOG_B64=$(base64 -w 0 changelog.md)
+          echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
+          echo "has_changelog=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_changelog=false" >> $GITHUB_OUTPUT
+          echo "No changes found for this release" > changelog.md
+        fi
+
     - name: Generate Build Metadata
       id: metadata
       shell: bash
@@ -118,6 +126,13 @@ jobs:
     - name: Create Release
       shell: bash
       run: |
+        if [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
+          echo "${{ steps.changelog.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
+          CHANGELOG_CONTENT=$(cat decoded_changelog.md)
+        else
+          CHANGELOG_CONTENT="No significant changes detected in this release."
+        fi
+        
         NOTES="## 🏗️ Build Information
         | Field | Value |
         |-------|-------|
@@ -131,7 +146,7 @@ jobs:
 
         ## 📋 What's Changed
 
-        ${{ steps.changelog.outputs.changelog }}
+        $CHANGELOG_CONTENT
 
         ## 📦 Assets & Installation
         
@@ -169,7 +184,6 @@ jobs:
           --title "🚀 Build ${{ steps.version.outputs.version }}" \
           --notes "$NOTES" \
           --latest \
-          --discussion-category "Releases" \
           ${{ steps.archive.outputs.ASSET_PATH }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

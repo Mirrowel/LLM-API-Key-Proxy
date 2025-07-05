@@ -1,44 +1,3 @@
-[changelog]
-header = """
-# 🚀 LLM API Key Proxy - Build Changelog
-
-"""
-body = """
-{% if version %}
-## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
-{% else %}
-## [Unreleased]
-{% endif %}
-
-{% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | striptags | trim | upper_first }}
-{% for commit in commits 
-   | filter(attribute="conventional", value=true) 
-   | filter(attribute="merge_commit", value=false) %}
-- **{{ commit.scope | default(value="") }}{% if commit.scope %}:** {% endif %}{{ commit.description | upper_first }}** {% if commit.breaking %}🔥 **BREAKING** {% endif %}([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.owner }}/{{ remote.repo }}/commit/{{ commit.id }})){% if commit.author.name %} by [@{{ commit.author.name }}](https://github.com/{{ commit.author.name }}){% endif %}
-{% if commit.body %}  
-  > {{ commit.body | trim | replace(from="\n", to=" ") | truncate(length=100) }}
-{% endif %}
-{% endfor %}
-{% endfor %}
-
----
-"""
-
-footer = """
-**Installation Instructions:**
-1. 📥 Download the ZIP file from the assets below
-2. 📂 Extract to your preferred directory  
-3. ⚙️ Run `setup_env.bat` to configure environment
-4. 📝 Copy `.env.example` to `.env` and add your API keys
-5. 🚀 Launch `proxy_app.exe`
-
-**Need Help?** Check our [documentation](https://github.com/{{ remote.owner }}/{{ remote.repo }}/wiki) or [open an issue](https://github.com/{{ remote.owner }}/{{ remote.repo }}/issues)!
-
----
-*Generated automatically by [git-cliff](https://github.com/orhun/git-cliff)* 🏔️
-"""
-
 [git]
 conventional_commits = true
 filter_unconventional = false
@@ -60,12 +19,13 @@ commit_parsers = [
     { message = "^build", group = "🔨 Build System"},
     { message = "^ci", group = "🤖 Continuous Integration"},
     { body = ".*security", group = "🔒 Security"},
+    { message = ".*", group = "📝 Other Changes"},  # Catch-all for non-conventional commits
 ]
 
 protect_breaking_commits = true
 filter_commits = false
-tag_pattern = "build-[0-9]*"
-skip_tags = "v0.1.0-beta.1"
+tag_pattern = "build-*"  # More flexible pattern
+skip_tags = ""
 ignore_tags = ""
 topo_order = false
-sort_commits = "oldest"
+sort_commits = "newest"  # Show newest first
