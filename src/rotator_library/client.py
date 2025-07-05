@@ -191,6 +191,13 @@ class RotatingClient:
                             key_acquired = False # Key has been released
                             break 
 
+                        if classified_error.error_type == 'rate_limit':
+                            if attempt < self.max_retries - 1:
+                                wait_time = classified_error.retry_after or (2 ** attempt) + random.uniform(0, 1)
+                                lib_logger.warning(f"Key ...{current_key[-4:]} was rate-limited. Retrying in {wait_time:.2f} seconds...")
+                                await asyncio.sleep(wait_time)
+                                continue
+
                         if classified_error.error_type == 'server_error':
                             if attempt < self.max_retries - 1:
                                 wait_time = (2 ** attempt) + random.uniform(0, 1)
@@ -244,7 +251,8 @@ class RotatingClient:
                 self._model_list_cache[provider] = models
                 return models
             except Exception as e:
-                lib_logger.error(f"Failed to get models for provider {provider}: {e}")
+                classified_error = classify_error(e)
+                lib_logger.error(f"Failed to get models for provider {provider}: {classified_error}")
                 return []
         else:
             lib_logger.warning(f"Model list fetching not implemented for provider: {provider}")
