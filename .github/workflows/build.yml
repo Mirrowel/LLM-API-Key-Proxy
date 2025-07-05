@@ -108,6 +108,7 @@ jobs:
           - **Commit**: ${{ needs.build.outputs.sha }}
           - **Date**: ${{ steps.version.outputs.timestamp }}
           - **Trigger**: ${{ github.event_name }}
+
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
