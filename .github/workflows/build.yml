@@ -9,6 +9,8 @@ on:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
       - 'setup_env.bat'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/release-drafter.yml'
 
 jobs:
   build:
@@ -19,6 +21,8 @@ jobs:
     steps:
     - name: Check out repository
       uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -32,8 +36,7 @@ jobs:
         pip install pyinstaller
 
     - name: Build executable
-      working-directory: src/proxy_app
-      run: ./build.bat
+      run: python src/proxy_app/build.py
 
     - name: Get short SHA
       id: sha
@@ -53,12 +56,21 @@ jobs:
         echo "ASSET_PATH=$archiveName" >> $env:GITHUB_OUTPUT
       id: archive
 
-    - name: Create Release and Upload Asset
-      uses: softprops/action-gh-release@v1
+    - name: Draft and Publish Release
+      id: create_release
+      uses: release-drafter/release-drafter@v6
+      with:
+        publish: true
+        commitish: ${{ github.sha }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
       with:
-        files: ${{ steps.archive.outputs.ASSET_PATH }}
-        tag_name: ${{ steps.sha.outputs.sha }}
-        name: Build ${{ steps.sha.outputs.sha }}
-        target_commitish: ${{ github.sha }}
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ${{ steps.archive.outputs.ASSET_PATH }}
+        asset_name: ${{ steps.archive.outputs.ASSET_PATH }}
+        asset_content_type: application/zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,84 @@
+# Configuration for Release Drafter: https://github.com/release-drafter/release-drafter
+
+# Name template for the new release
+name-template: 'v$NEXT_PATCH_VERSION'
+
+# Tag template for the new release
+tag-template: 'v$NEXT_PATCH_VERSION'
+
+# Labels to exclude from changelog
+exclude-labels:
+  - 'skip-changelog'
+  
+# Automatically determine version bump based on PR labels
+version-resolver:
+  major:
+    labels:
+      - 'major'
+      - 'breaking'
+  minor:
+    labels:
+      - 'minor'
+      - 'feature'
+      - 'enhancement'
+  patch:
+    labels:
+      - 'patch'
+      - 'fix'
+      - 'bug'
+      - 'chore'
+      - 'docs'
+  default: patch
+
+# Categories for changes, based on PR labels
+categories:
+  - title: '🚀 Features'
+    labels:
+      - 'feature'
+      - 'enhancement'
+  - title: '🐛 Bug Fixes'
+    labels:
+      - 'fix'
+      - 'bug'
+  - title: '📄 Documentation'
+    labels:
+      - 'docs'
+      - 'documentation'
+  - title: '🎨 Code Style'
+    labels:
+      - 'style'
+  - title: '♻️ Code Refactoring'
+    labels:
+      - 'refactor'
+  - title: '⚡️ Performance Improvements'
+    labels:
+      - 'performance'
+  - title: '✅ Testing'
+    labels:
+      - 'test'
+      - 'testing'
+  - title: '🔧 Build System & CI'
+    labels:
+      - 'build'
+      - 'ci'
+  - title: '🧰 Maintenance'
+    labels:
+      - 'chore'
+  - title: '⏪ Reverts'
+    labels:
+      - 'revert'
+  - title: 'Other Changes'
+    labels: []
+
+# Template for the release notes body
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  ## All Commits
+
+  $COMMITS
+
+  ---
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$NEXT_PATCH_VERSION
