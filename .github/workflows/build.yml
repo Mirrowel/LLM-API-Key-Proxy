@@ -93,7 +93,7 @@ jobs:
     - name: Install git-cliff
       shell: bash
       run: |
-        LATEST_CLIFF_URL=$(curl -s https://api.github.com/repos/orhun/git-cliff/releases/latest | grep "browser_download_url.*-x86_64-unknown-linux-gnu.tar.gz" | cut -d '"' -f 4)
+        LATEST_CLIFF_URL=$(curl -s https://api.github.com/repos/orhun/git-cliff/releases/latest | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
         curl -L $LATEST_CLIFF_URL | tar xz
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
 
