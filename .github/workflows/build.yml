@@ -134,6 +134,7 @@ jobs:
           CHANGELOG_B64=$(base64 -w 0 changelog.md)
           echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
           echo "has_changelog=true" >> $GITHUB_OUTPUT
+          echo "previous_tag=$LAST_TAG" >> $GITHUB_OUTPUT
         else
           echo "⚠️ git-cliff produced empty output, creating manual changelog"
           
@@ -248,6 +249,8 @@ jobs:
         ---
         
         > **Note**: This is an automated build release."
+
+        NOTES="$NOTES\n\n**Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...build-${{ steps.version.outputs.version }}"
 
         gh release create build-${{ steps.version.outputs.version }} \
           --title "Build ${{ steps.version.outputs.version }}" \
