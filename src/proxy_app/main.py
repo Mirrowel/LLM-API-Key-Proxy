@@ -1,3 +1,5 @@
+print("Proxy starting...")
+print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -9,6 +11,15 @@ from pathlib import Path
 import sys
 import json
 from typing import AsyncGenerator, Any
+import argparse
+
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(description="API Key Proxy Server")
+parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
+parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
+parser.add_argument("--enable-request-logging", action="store_true", help="Enable request logging.")
+args, _ = parser.parse_known_args()
+
 
 # Add the 'src' directory to the Python path to allow importing 'rotating_api_key_client'
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -23,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --- Configuration ---
-ENABLE_REQUEST_LOGGING = '--enable-request-logging' in sys.argv
+ENABLE_REQUEST_LOGGING = args.enable_request_logging
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
@@ -223,4 +234,4 @@ async def token_count(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=args.host, port=args.port)

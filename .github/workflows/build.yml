@@ -266,8 +266,8 @@ jobs:
         $CHANGELOG_CONTENT
 
         ### 📁 Included Files
-        | File | Description | Size |
-        |------|-------------|------|
+        | File | Description |
+        |------|-------------|
         | \`proxy_app.exe\` | Main application executable |
         | \`setup_env.bat\` | Environment setup script |
         | \`.env.example\` | Configuration template |

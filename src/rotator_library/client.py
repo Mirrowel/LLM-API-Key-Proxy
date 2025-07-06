@@ -35,9 +35,8 @@ class RotatingClient:
         self.max_retries = max_retries
         self.usage_manager = UsageManager(file_path=usage_file_path)
         self._model_list_cache = {}
-        self._provider_instances = {
-            name: plugin() for name, plugin in PROVIDER_PLUGINS.items()
-        }
+        self._provider_plugins = PROVIDER_PLUGINS
+        self._provider_instances = {}
         self.http_client = httpx.AsyncClient()
         self.all_providers = AllProviders()
 
@@ -51,6 +50,15 @@ class RotatingClient:
         """Close the HTTP client to prevent resource leaks."""
         if hasattr(self, 'http_client') and self.http_client:
             await self.http_client.aclose()
+
+    def _get_provider_instance(self, provider_name: str):
+        """Lazily initializes and returns a provider instance."""
+        if provider_name not in self._provider_instances:
+            if provider_name in self._provider_plugins:
+                self._provider_instances[provider_name] = self._provider_plugins[provider_name]()
+            else:
+                return None
+        return self._provider_instances[provider_name]
 
     async def _safe_streaming_wrapper(self, stream: Any, key: str, model: str) -> AsyncGenerator[Any, None]:
         """
@@ -122,8 +130,8 @@ class RotatingClient:
                 # Prepare litellm_kwargs once per key, not on every retry
                 litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
 
-                if provider in self._provider_instances:
-                    provider_instance = self._provider_instances[provider]
+                provider_instance = self._get_provider_instance(provider)
+                if provider_instance:
                     
                     # Ensure safety_settings are present, defaulting to lowest if not provided
                     if "safety_settings" not in litellm_kwargs:
@@ -143,8 +151,8 @@ class RotatingClient:
                         del litellm_kwargs["safety_settings"]
                 
                 if provider == "gemini":
-                    provider_instance = self._provider_instances[provider]
-                    provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+                    if provider_instance:
+                        provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
                 if "gemma-3" in model and "messages" in litellm_kwargs:
                     new_messages = [
@@ -240,10 +248,11 @@ class RotatingClient:
             lib_logger.warning(f"No API key for provider: {provider}")
             return []
 
-        if provider in self._provider_instances:
+        provider_instance = self._get_provider_instance(provider)
+        if provider_instance:
             lib_logger.info(f"Calling get_models for provider: {provider}")
             try:
-                models = await self._provider_instances[provider].get_models(api_key, self.http_client)
+                models = await provider_instance.get_models(api_key, self.http_client)
                 lib_logger.info(f"Got {len(models)} models for provider: {provider}")
                 self._model_list_cache[provider] = models
                 return models
@@ -258,14 +267,16 @@ class RotatingClient:
     async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:
         """Returns a list of all available models, either grouped by provider or as a flat list."""
         lib_logger.info("Getting all available models...")
+        tasks = [self.get_available_models(provider) for provider in self.api_keys.keys()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
         all_provider_models = {}
-        for provider in self.api_keys.keys():
-            lib_logger.info(f"Getting models for provider: {provider}")
-            try:
-                all_provider_models[provider] = await self.get_available_models(provider)
-            except Exception as e:
-                lib_logger.error(f"Failed to get models for provider {provider}: {e}")
+        for provider, result in zip(self.api_keys.keys(), results):
+            if isinstance(result, Exception):
+                lib_logger.error(f"Failed to get models for provider {provider}: {result}")
                 all_provider_models[provider] = []
+            else:
+                all_provider_models[provider] = result
         
         lib_logger.info("Finished getting all available models.")
         if grouped:

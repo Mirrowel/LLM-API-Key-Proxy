@@ -29,7 +29,7 @@ def _register_providers():
                 # The provider name is derived from the module name (e.g., 'openai_provider' -> 'openai')
                 provider_name = module_name.replace("_provider", "")
                 PROVIDER_PLUGINS[provider_name] = attribute
-                print(f"Registered provider: {provider_name}")
+                #print(f"Registered provider: {provider_name}")
 
 # Discover and register providers when the package is imported
 _register_providers()

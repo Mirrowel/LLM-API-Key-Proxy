@@ -53,7 +53,31 @@ class GeminiProvider(ProviderInterface):
 
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
-        Adds a default thinking parameter for specific Gemini models if not already present.
+        Handles the 'reasoning_effort' parameter and translates it to the Gemini-specific
+        'thinking' parameter with a token budget. Supports a 'custom_reasoning_budget'
+        flag to enable higher, model-specific token budgets.
         """
-        if model in ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash"] and "thinking" not in payload and "reasoning_effort" not in payload:
+        custom_reasoning_budget = payload.pop("custom_reasoning_budget", False)
+        reasoning_effort = payload.pop("reasoning_effort", None)
+
+        if "thinking" in payload:
+            return  # Do nothing if 'thinking' is already explicitly set
+
+        if custom_reasoning_budget and reasoning_effort:
+            if "gemini-2.5-pro" in model:
+                budgets = {"low": 8192, "medium": 16384, "high": 32768}
+            elif "gemini-2.5-flash" in model:
+                budgets = {"low": 6144, "medium": 12288, "high": 24576}
+            else:
+                # Fallback to LiteLLM defaults for other models
+                budgets = {"low": 1024, "medium": 2048, "high": 4096}
+            
+            budget = budgets.get(reasoning_effort)
+            if budget is not None:
+                payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            elif reasoning_effort == "disable":
+                payload["thinking"] = {"type": "enabled", "budget_tokens": 0}
+
+        elif "gemini-2.5-pro" in model or "gemini-2.5-flash" in model:
+            # Default behavior if no reasoning_effort is specified
             payload["thinking"] = {"type": "enabled", "budget_tokens": -1}
