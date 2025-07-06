@@ -206,7 +206,13 @@ jobs:
         COMMIT_COUNT=$(git rev-list --count HEAD)
         
         # Generate rich contributor list
-        CONTRIBUTOR_LOG=$(git log ${{ steps.changelog.outputs.previous_tag }}..HEAD --format='%ae' | sort -u)
+        if [ -n "${{ steps.changelog.outputs.previous_tag }}" ]; then
+          echo "✅ Found previous tag, getting contributors since ${{ steps.changelog.outputs.previous_tag }}"
+          CONTRIBUTOR_LOG=$(git log ${{ steps.changelog.outputs.previous_tag }}..HEAD --format='%ae' | sort -u)
+        else
+          echo "⚠️ No previous tag found, getting author of the last commit."
+          CONTRIBUTOR_LOG=$(git log -1 --format='%ae')
+        fi
         CONTRIBUTORS_LIST=""
         while read -r email; do
           # Find user by email
@@ -239,6 +245,12 @@ jobs:
         fi
 
         # Prepare the full release notes in a temporary file
+        if [ -n "${{ steps.changelog.outputs.previous_tag }}" ]; then
+          CHANGELOG_URL="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.release_tag }}"
+        else
+          CHANGELOG_URL=""
+        fi
+
         cat > releasenotes.md <<-EOF
         ## Build Information
         | Field | Value |
@@ -270,7 +282,7 @@ jobs:
         
         > **Note**: This is an automated build release.
 
-        **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.release_tag }}
+        $CHANGELOG_URL
         EOF
 
         # Create the release using the notes file
