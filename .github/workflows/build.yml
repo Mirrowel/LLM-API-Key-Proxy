@@ -2,6 +2,11 @@ name: Build and Release Executable
 
 on:
   workflow_dispatch:
+    inputs:
+      manual_previous_tag:
+        description: 'Optional: Manually set the previous tag to generate the changelog from.'
+        required: false
+        default: ''
   push:
     paths:
       - 'src/proxy_app/**'
@@ -105,7 +110,7 @@ jobs:
       shell: bash
       run: |
         # Inject the GitHub repo URL into your template
-        sed -i "s|{{ repository_url }}|https://github.com/${GITHUB_REPOSITORY}|g" cliff.toml
+        sed -i "s|{{ repository_url }}|https://github.com/${GITHUB_REPOSITORY}|g" .github/cliff.toml
         echo "✅ cliff.toml:"
         head -20 cliff.toml
 
@@ -113,15 +118,21 @@ jobs:
       id: changelog
       shell: bash
       run: |
-        echo "▶️ All build-* tags found:"; git tag --list 'build-*'
-        LAST_TAG="1d97578"
-        echo "✅ Detected most recent ancestor tag: $LAST_TAG"
+        if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
+          echo "Manual tag provided: ${{ github.event.inputs.manual_previous_tag }}"
+          LAST_TAG="${{ github.event.inputs.manual_previous_tag }}"
+        else
+          echo "No manual tag provided, searching for the latest build-* tag..."
+          LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+        fi
+        
+        echo "✅ Using tag: $LAST_TAG"
         
         if [ -n "$LAST_TAG" ]; then
           # Standard run: A previous tag was found.
           echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
-          git-cliff \
-            --config cliff.toml \
+        git-cliff \
+          --config .github/cliff.toml \
             --strip all \
             --output changelog.md \
             "$LAST_TAG..HEAD"
@@ -185,28 +196,43 @@ jobs:
         fi
         
         COMMIT_COUNT=$(git rev-list --count HEAD)
-        CONTRIBUTORS=$(git log --format='%an' | sort -u | wc -l)
+        
+        # Generate rich contributor list
+        CONTRIBUTOR_LOG=$(git log ${{ steps.changelog.outputs.previous_tag }}..HEAD --format='%ae' | sort -u)
+        CONTRIBUTORS_LIST=""
+        while read -r email; do
+          # Find user by email
+          USER_INFO=$(gh api "search/users?q=$email+in:email" --jq '.items[0]')
+          if [ -n "$USER_INFO" ]; then
+            USERNAME=$(echo "$USER_INFO" | jq -r '.login')
+            AVATAR_URL=$(echo "$USER_INFO" | jq -r '.avatar_url')
+            CONTRIBUTORS_LIST="$CONTRIBUTORS_LIST [![$USERNAME](https://images.weserv.nl/?url=$AVATAR_URL&w=32&h=32&fit=cover&mask=circle)](https://github.com/$USERNAME) "
+          fi
+        done <<< "$CONTRIBUTOR_LOG"
         
         echo "build_size=$BUILD_SIZE" >> $GITHUB_OUTPUT
         echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-        echo "contributors=$CONTRIBUTORS" >> $GITHUB_OUTPUT
+        echo "contributors_list=$CONTRIBUTORS_LIST" >> $GITHUB_OUTPUT
         
         echo "📊 Build metadata:"
         echo "  - Size: $BUILD_SIZE"
         echo "  - Commits: $COMMIT_COUNT"
-        echo "  - Contributors: $CONTRIBUTORS"
+        echo "  - Contributors: $CONTRIBUTORS_LIST"
 
     - name: Create Release
       shell: bash
       run: |
+        # Prepare changelog content
         if [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
           echo "${{ steps.changelog.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
           CHANGELOG_CONTENT=$(cat decoded_changelog.md)
         else
           CHANGELOG_CONTENT="No significant changes detected in this release."
         fi
-        
-        NOTES="## Build Information
+
+        # Prepare the full release notes in a temporary file
+        cat > releasenotes.md <<-EOF
+        ## Build Information
         | Field | Value |
         |-------|-------|
         | 📦 **Version** | \`${{ steps.version.outputs.version }}\` |
@@ -214,8 +240,6 @@ jobs:
         | 🔗 **Commit** | [\`${{ needs.build.outputs.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
         | 📅 **Build Date** | \`${{ steps.version.outputs.timestamp }}\` |
         | ⚡ **Trigger** | \`${{ github.event_name }}\` |
-        | 👥 **Total Contributors** | \`${{ steps.metadata.outputs.contributors }}\` |
-        | 📊 **Total Commits** | \`${{ steps.metadata.outputs.commit_count }}\` |
 
         ## 📋 What's Changed
 
@@ -224,9 +248,9 @@ jobs:
         ### 📁 Included Files
         | File | Description | Size |
         |------|-------------|------|
-        | \`proxy_app.exe\` | Main application executable | Primary |
-        | \`setup_env.bat\` | Environment setup script | Helper |
-        | \`.env.example\` | Configuration template | Template |
+        | \`proxy_app.exe\` | Main application executable |
+        | \`setup_env.bat\` | Environment setup script |
+        | \`.env.example\` | Configuration template |
 
         ## 🔗 Useful Links
         - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
@@ -236,13 +260,15 @@ jobs:
 
         ---
         
-        > **Note**: This is an automated build release."
+        > **Note**: This is an automated build release.
 
-        NOTES="$NOTES\n\n**Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...build-${{ steps.version.outputs.version }}"
+        **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...build-${{ steps.version.outputs.version }}
+        EOF
 
+        # Create the release using the notes file
         gh release create build-${{ steps.version.outputs.version }} \
           --title "Build ${{ steps.version.outputs.version }}" \
-          --notes "$NOTES" \
+          --notes-file releasenotes.md \
           --latest \
           ${{ steps.archive.outputs.ASSET_PATH }}
       env:

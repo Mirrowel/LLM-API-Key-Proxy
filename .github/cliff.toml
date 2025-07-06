@@ -1,0 +1,79 @@
+[changelog]
+header = """
+"""
+body = """
+{% if version -%}
+  {% if previous.version -%}
+    ## Changes in {{ version }}
+  {% else -%}
+    ## Initial Release
+  {% endif -%}
+{% else -%}
+  ## Recent Changes
+{% endif -%}
+
+{% if breaking_commits %}
+### 💥 Breaking Changes
+{% for commit in breaking_commits -%}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})) by @{{ commit.author.name }}
+{% endfor -%}
+{% endif -%}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits -%}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})) by @{{ commit.author.name }}
+{% endfor -%}
+{% endfor -%}
+"""
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_preprocessors = [
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}]({{ repository_url }}/issues/${2}))"},
+]
+
+commit_parsers = [
+    # Scoped commits (most specific)
+    { message = "^\\w+\\(ci\\)", group = "🤖 Continuous Integration" },
+    { message = "^\\w+\\(build\\)", group = "📦 Build System" },
+    { message = "^\\w+\\(docs\\)", group = "📚 Documentation" },
+    { message = "^\\w+\\(test\\)", group = "✅ Testing" },
+    { message = "^\\w+\\(style\\)", group = "🎨 Styling" },
+    { message = "^\\w+\\(perf\\)", group = "⚡ Performance Improvements" },
+    { message = "^\\w+\\(refactor\\)", group = "♻️ Code Refactoring" },
+    { message = "^\\w+\\(security\\)", group = "🔒 Security" },
+
+    # Conventional commits (less specific)
+    { message = "^feat", group = "🚀 Features" },
+    { message = "^feature", group = "🚀 Features" },
+    { message = "^fix", group = "🐛 Bug Fixes" },
+    { message = "^bug", group = "🐛 Bug Fixes" },
+    { message = "^patch", group = "🐛 Bug Fixes" },
+    { message = "^perf", group = "⚡ Performance Improvements" },
+    { message = "^refactor", group = "♻️ Code Refactoring" },
+    { message = "^revert", group = "⏪ Reverts" },
+    { message = "^style", group = "🎨 Styling" },
+    { message = "^test", group = "✅ Testing" },
+    { message = "^tests", group = "✅ Testing" },
+    { message = "^doc", group = "📚 Documentation" },
+    { message = "^docs", group = "📚 Documentation" },
+    { message = "^build", group = "📦 Build System" },
+    { message = "^ci", group = "🤖 Continuous Integration" },
+    { message = "^chore", group = "🧹 Miscellaneous Chores" },
+
+    # Other
+    { body = ".*security", group = "🔒 Security" },
+    { message = ".*", group = "🔧 Other Changes" },
+]
+
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "build-*"
+skip_tags = ""
+ignore_tags = ""
+topo_order = false
+sort_commits = "newest"
