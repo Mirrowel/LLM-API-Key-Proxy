@@ -96,6 +96,7 @@ jobs:
         LATEST_CLIFF_URL=$(curl -s https://api.github.com/repos/orhun/git-cliff/releases/latest | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
         curl -L $LATEST_CLIFF_URL | tar xz
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
+        git-cliff --version
 
     - name: Generate Changelog
       id: changelog
