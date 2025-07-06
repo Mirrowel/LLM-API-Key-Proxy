@@ -117,15 +117,23 @@ jobs:
         LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
         echo "✅ Detected most recent ancestor tag: $LAST_TAG"
         
-        RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
-        echo "🔍 Generating changelog for range: $RANGE"
+        if [ -n "$LAST_TAG" ]; then
+          # Standard run: A previous tag was found.
+          echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
+          git-cliff \
+            --config cliff.toml \
+            --strip all \
+            --output changelog.md \
+            "$LAST_TAG..HEAD"
+        else
+          # First run: No previous tag found.
+          echo "⚠️ No previous build tag found. Generating initial release changelog."
+          echo "## Initial Release" > changelog.md
+          echo "" >> changelog.md
+          echo "This is the first automated build release using this format. Future releases will contain a detailed list of changes." >> changelog.md
+        fi
 
-        git-cliff \
-          --config cliff.toml \
-          --strip all \
-          --output changelog.md \
-          ${RANGE:---unreleased}
-
+        # This part of the script remains to handle the output
         if [ -s changelog.md ]; then
           echo "✅ Changelog generated successfully"
           CHANGELOG_B64=$(base64 -w 0 changelog.md)
@@ -133,26 +141,9 @@ jobs:
           echo "has_changelog=true" >> $GITHUB_OUTPUT
           echo "previous_tag=$LAST_TAG" >> $GITHUB_OUTPUT
         else
-          echo "⚠️ Empty changelog — falling back to manual list"
-          
-          # Manual fallback
-          echo "## Recent Changes" > changelog.md
-          echo "" >> changelog.md
-          
-          if [ -n "$LAST_TAG" ]; then
-            echo "### 📝 Commits since $LAST_TAG:" >> changelog.md
-            git log --oneline --pretty=format:"- %s (\`%h\`)" "$LAST_TAG..HEAD" >> changelog.md
-          else
-            echo "### 📝 Recent commits:" >> changelog.md
-            git log --oneline --pretty=format:"- %s (\`%h\`)" -10 >> changelog.md
-          fi
-          
-          echo "" >> changelog.md
-          echo "> This changelog was generated manually due to git-cliff issues." >> changelog.md
-          
-          CHANGELOG_B64=$(base64 -w 0 changelog.md)
-          echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
-          echo "has_changelog=true" >> $GITHUB_OUTPUT
+          # This is now a true error condition
+          echo "❌ Critical error: Changelog is empty after generation."
+          echo "has_changelog=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Debug artifact contents
