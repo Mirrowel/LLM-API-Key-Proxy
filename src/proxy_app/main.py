@@ -83,13 +83,15 @@ async def streaming_response_wrapper(
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion.
+    This function aggregates all data from the stream, including content,
+    tool calls, function calls, and any other provider-specific fields.
     """
     response_chunks = []
     full_response = {}
+    
     try:
         async for chunk_str in response_stream:
             yield chunk_str
-            # Process chunk for logging
             if chunk_str.strip() and chunk_str.startswith("data:"):
                 content = chunk_str[len("data:"):].strip()
                 if content != "[DONE]":
@@ -97,39 +99,91 @@ async def streaming_response_wrapper(
                         chunk_data = json.loads(content)
                         response_chunks.append(chunk_data)
                     except json.JSONDecodeError:
-                        # Ignore non-json chunks if any
-                        pass
+                        pass  # Ignore non-JSON chunks
     finally:
-        # Reconstruct the full response object from chunks
         if response_chunks:
-            full_content = "".join(
-                choice["delta"]["content"]
-                for chunk in response_chunks
-                if "choices" in chunk and chunk["choices"]
-                for choice in chunk["choices"]
-                if "delta" in choice and "content" in choice["delta"] and choice["delta"]["content"]
-            )
+            # --- Aggregation Logic ---
+            final_message = {"role": "assistant"}
+            aggregated_tool_calls = {}
+            usage_data = None
+            finish_reason = None
 
-            # Take metadata from the first chunk and construct a single choice object
+            for chunk in response_chunks:
+                if "choices" in chunk and chunk["choices"]:
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
+
+                    # Dynamically aggregate all fields from the delta
+                    for key, value in delta.items():
+                        if value is None:
+                            continue
+
+                        if key == "content":
+                            if "content" not in final_message:
+                                final_message["content"] = ""
+                            if value:
+                                final_message["content"] += value
+                        
+                        elif key == "tool_calls":
+                            for tc_chunk in value:
+                                index = tc_chunk["index"]
+                                if index not in aggregated_tool_calls:
+                                    aggregated_tool_calls[index] = {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                                if tc_chunk.get("id"):
+                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                                if "function" in tc_chunk:
+                                    if "name" in tc_chunk["function"]:
+                                        aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
+                                    if "arguments" in tc_chunk["function"]:
+                                        aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
+                        
+                        elif key == "function_call":
+                            if "function_call" not in final_message:
+                                final_message["function_call"] = {"name": "", "arguments": ""}
+                            if "name" in value:
+                                final_message["function_call"]["name"] += value["name"]
+                            if "arguments" in value:
+                                final_message["function_call"]["arguments"] += value["arguments"]
+                        
+                        else: # Generic key handling for other data like 'reasoning'
+                            if key not in final_message:
+                                final_message[key] = value
+                            elif isinstance(final_message.get(key), str):
+                                final_message[key] += value
+                            else:
+                                final_message[key] = value
+
+                    if "finish_reason" in choice and choice["finish_reason"]:
+                        finish_reason = choice["finish_reason"]
+
+                if "usage" in chunk and chunk["usage"]:
+                    usage_data = chunk["usage"]
+
+            # --- Final Response Construction ---
+            if aggregated_tool_calls:
+                final_message["tool_calls"] = list(aggregated_tool_calls.values())
+
+            # Ensure standard fields are present for consistent logging
+            for field in ["content", "tool_calls", "function_call"]:
+                if field not in final_message:
+                    final_message[field] = None
+
             first_chunk = response_chunks[0]
             final_choice = {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": full_content,
-                },
-                "finish_reason": "stop",  # Assuming 'stop' as stream ended
+                "message": final_message,
+                "finish_reason": finish_reason
             }
-            
+
             full_response = {
                 "id": first_chunk.get("id"),
-                "object": "chat.completion", # Final object is a completion, not a chunk
+                "object": "chat.completion",
                 "created": first_chunk.get("created"),
                 "model": first_chunk.get("model"),
                 "choices": [final_choice],
-                "usage": None # Usage is not typically available in the stream itself
+                "usage": usage_data
             }
-        
+
         if ENABLE_REQUEST_LOGGING:
             log_request_response(
                 request_data=request_data,
