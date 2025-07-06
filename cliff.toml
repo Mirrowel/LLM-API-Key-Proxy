@@ -1,3 +1,21 @@
+[changelog]
+header = """
+"""
+body = """
+{% if version -%}
+## Changes in {{ version }}
+{% else -%}
+## Recent Changes
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits -%}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.owner }}/{{ remote.repo }}/commit/{{ commit.id }}))
+{% endfor -%}
+{% endfor -%}
+"""
+footer = ""
+
 [git]
 conventional_commits = true
 filter_unconventional = false
@@ -7,25 +25,25 @@ commit_preprocessors = [
 ]
 
 commit_parsers = [
-    { message = "^feat", group = "🚀 Features"},
-    { message = "^fix", group = "🐛 Bug Fixes"},
-    { message = "^doc", group = "📚 Documentation"},
-    { message = "^perf", group = "⚡ Performance"},
-    { message = "^refactor", group = "♻️ Refactor"},
-    { message = "^style", group = "🎨 Styling"},
-    { message = "^test", group = "🧪 Testing"},
+    { message = "^feat", group = "Features"},
+    { message = "^fix", group = "Bug Fixes"},
+    { message = "^doc", group = "Documentation"},
+    { message = "^perf", group = "Performance"},
+    { message = "^refactor", group = "Refactor"},
+    { message = "^style", group = "Styling"},
+    { message = "^test", group = "Testing"},
     { message = "^chore\\(release\\):", skip = true},
-    { message = "^chore", group = "⚙️ Miscellaneous Tasks"},
-    { message = "^build", group = "🔨 Build System"},
-    { message = "^ci", group = "🤖 Continuous Integration"},
-    { body = ".*security", group = "🔒 Security"},
-    { message = ".*", group = "📝 Other Changes"},  # Catch-all for non-conventional commits
+    { message = "^chore", group = "Miscellaneous Tasks"},
+    { message = "^build", group = "Build System"},
+    { message = "^ci", group = "Continuous Integration"},
+    { body = ".*security", group = "Security"},
+    { message = ".*", group = "Other Changes"},
 ]
 
 protect_breaking_commits = true
 filter_commits = false
-tag_pattern = "build-*"  # More flexible pattern
+tag_pattern = "build-*"
 skip_tags = ""
 ignore_tags = ""
 topo_order = false
-sort_commits = "newest"  # Show newest first
+sort_commits = "newest"

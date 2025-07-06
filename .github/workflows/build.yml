@@ -101,15 +101,60 @@ jobs:
       id: changelog
       shell: bash
       run: |
-        export GIT_CLIFF_TAG="build-${{ steps.version.outputs.version }}"
-        git-cliff --config cliff.toml --latest --strip all --output changelog.md
+        echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }}"
+        
+        # Find the last build tag
+        LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+        CURRENT_TAG="build-${{ steps.version.outputs.version }}"
+        
+        echo "Last tag: ${LAST_TAG:-'None found'}"
+        echo "Current tag: $CURRENT_TAG"
+        
+        # Set environment for git-cliff
+        export GIT_CLIFF_TAG="$CURRENT_TAG"
+        
+        if [ -n "$LAST_TAG" ]; then
+          echo "📊 Generating changelog from $LAST_TAG to HEAD"
+          # Generate changelog for specific range
+          git-cliff --config cliff.toml --strip all --output changelog.md "$LAST_TAG..HEAD"
+        else
+          echo "📊 No previous build tag found, showing recent commits"
+          # First release - show last 10 commits
+          git-cliff --config cliff.toml --strip all --output changelog.md --unreleased
+        fi
+        
+        # Check if changelog was generated successfully
         if [ -f "changelog.md" ] && [ -s "changelog.md" ]; then
+          echo "✅ Changelog generated successfully"
+          echo "📄 Changelog content:"
+          echo "===================="
+          cat changelog.md
+          echo "===================="
+          
           CHANGELOG_B64=$(base64 -w 0 changelog.md)
           echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
           echo "has_changelog=true" >> $GITHUB_OUTPUT
         else
-          echo "has_changelog=false" >> $GITHUB_OUTPUT
-          echo "No changes found for this release" > changelog.md
+          echo "⚠️ git-cliff produced empty output, creating manual changelog"
+          
+          # Manual fallback
+          echo "## Recent Changes" > changelog.md
+          echo "" >> changelog.md
+          
+          if [ -n "$LAST_TAG" ]; then
+            echo "### 📝 Commits since $LAST_TAG:" >> changelog.md
+            git log --oneline --pretty=format:"- %s (\`%h\`)" "$LAST_TAG..HEAD" >> changelog.md
+          else
+            echo "### 📝 Recent commits:" >> changelog.md
+            git log --oneline --pretty=format:"- %s (\`%h\`)" -10 >> changelog.md
+          fi
+          
+          echo "" >> changelog.md
+          echo "> This changelog was generated manually due to git-cliff issues." >> changelog.md
+          
+          CHANGELOG_B64=$(base64 -w 0 changelog.md)
+          echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
+          echo "has_changelog=true" >> $GITHUB_OUTPUT
         fi
 
     - name: Debug artifact contents
@@ -172,7 +217,7 @@ jobs:
           CHANGELOG_CONTENT="No significant changes detected in this release."
         fi
         
-        NOTES="## 🏗️ Build Information
+        NOTES="## Build Information
         | Field | Value |
         |-------|-------|
         | 📦 **Version** | \`${{ steps.version.outputs.version }}\` |
@@ -187,27 +232,12 @@ jobs:
 
         $CHANGELOG_CONTENT
 
-        ## 📦 Assets & Installation
-        
-        ### Quick Start
-        \`\`\`bash
-        # Download and extract
-        wget https://github.com/${{ github.repository }}/releases/download/build-${{ steps.version.outputs.version }}/${{ steps.archive.outputs.ASSET_PATH }}
-        unzip ${{ steps.archive.outputs.ASSET_PATH }}
-        
-        # Setup and run
-        ./setup_env.bat
-        cp .env.example .env
-        # Edit .env with your API keys
-        ./proxy_app.exe
-        \`\`\`
-
         ### 📁 Included Files
         | File | Description | Size |
         |------|-------------|------|
-        | 🚀 \`proxy_app.exe\` | Main application executable | Primary |
-        | ⚙️ \`setup_env.bat\` | Environment setup script | Helper |
-        | 📝 \`.env.example\` | Configuration template | Template |
+        | \`proxy_app.exe\` | Main application executable | Primary |
+        | \`setup_env.bat\` | Environment setup script | Helper |
+        | \`.env.example\` | Configuration template | Template |
 
         ## 🔗 Useful Links
         - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
@@ -217,10 +247,10 @@ jobs:
 
         ---
         
-        > **Note**: This is an automated build release. For stable releases, check our [main releases](https://github.com/${{ github.repository }}/releases)."
+        > **Note**: This is an automated build release."
 
         gh release create build-${{ steps.version.outputs.version }} \
-          --title "🚀 Build ${{ steps.version.outputs.version }}" \
+          --title "Build ${{ steps.version.outputs.version }}" \
           --notes "$NOTES" \
           --latest \
           ${{ steps.archive.outputs.ASSET_PATH }}

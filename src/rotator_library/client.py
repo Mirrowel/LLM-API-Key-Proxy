@@ -186,32 +186,29 @@ class RotatingClient:
                         classified_error = classify_error(e)
                         
                         if classified_error.error_type in ['invalid_request', 'authentication']:
+                            # These are permanent failures for this key, so record and move on.
                             await self.usage_manager.record_failure(current_key, model, classified_error)
-                            await self.usage_manager.release_key(current_key, model)
-                            key_acquired = False # Key has been released
                             break 
 
-                        if classified_error.error_type == 'rate_limit':
-                            if attempt < self.max_retries - 1:
-                                wait_time = classified_error.retry_after or (2 ** attempt) + random.uniform(0, 1)
-                                lib_logger.warning(f"Key ...{current_key[-4:]} was rate-limited. Retrying in {wait_time:.2f} seconds...")
-                                await asyncio.sleep(wait_time)
-                                continue
+                        if classified_error.error_type in ['rate_limit', 'server_error']:
+                            # These are temporary, so record the failure with a potential retry time.
+                            await self.usage_manager.record_failure(current_key, model, classified_error)
+                            
+                            # If it's the last attempt for this key, we break to try the next key.
+                            if attempt >= self.max_retries - 1:
+                                break
 
-                        if classified_error.error_type == 'server_error':
-                            if attempt < self.max_retries - 1:
-                                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                                lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error. Retrying in {wait_time:.2f} seconds...")
-                                await asyncio.sleep(wait_time)
-                                continue
+                            # Otherwise, wait and retry with the same key.
+                            wait_time = classified_error.retry_after or (2 ** attempt) + random.uniform(0, 1)
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a {classified_error.error_type}. Retrying in {wait_time:.2f} seconds...")
+                            await asyncio.sleep(wait_time)
+                            continue
                         
+                        # For any other classified errors, record failure and try the next key.
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        await self.usage_manager.release_key(current_key, model)
-                        key_acquired = False # Key has been released
                         break
             finally:
-                # This block is now only for handling failures where the key needs to be released
-                # without a successful response. The wrapper handles the success case for streams.
+                # This block ensures the key is always released if it was acquired but not passed to the wrapper.
                 if key_acquired and current_key:
                     await self.usage_manager.release_key(current_key, model)
 

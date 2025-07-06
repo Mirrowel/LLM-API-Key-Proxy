@@ -14,19 +14,41 @@ class ClassifiedError:
     def __str__(self):
         return f"ClassifiedError(type={self.error_type}, status={self.status_code}, retry_after={self.retry_after}, original_exc={self.original_exception})"
 
+import json
+
 def get_retry_after(error: Exception) -> Optional[int]:
     """
     Extracts the 'retry-after' duration in seconds from an exception message.
-    Handles both integer and string representations of the duration.
+    Handles both integer and string representations of the duration, as well as JSON bodies.
     """
     error_str = str(error).lower()
-    
-    # Common patterns for 'retry-after'
+
+    # 1. Try to parse JSON from the error string to find 'retryDelay'
+    try:
+        # It's common for the actual JSON to be embedded in the string representation
+        json_match = re.search(r'(\{.*\})', error_str)
+        if json_match:
+            error_json = json.loads(json_match.group(1))
+            retry_info = error_json.get('error', {}).get('details', [{}])[0]
+            if retry_info.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
+                delay_str = retry_info.get('retryDelay', {}).get('seconds')
+                if delay_str:
+                    return int(delay_str)
+                # Fallback for the other format
+                delay_str = retry_info.get('retryDelay')
+                if isinstance(delay_str, str) and delay_str.endswith('s'):
+                    return int(delay_str[:-1])
+
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        pass # If JSON parsing fails, proceed to regex and attribute checks
+
+    # 2. Common regex patterns for 'retry-after'
     patterns = [
         r'retry after:?\s*(\d+)',
         r'retry_after:?\s*(\d+)',
         r'retry in\s*(\d+)\s*seconds',
         r'wait for\s*(\d+)\s*seconds',
+        r'"retryDelay":\s*"(\d+)s"',
     ]
     
     for pattern in patterns:
@@ -37,7 +59,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, IndexError):
                 continue
     
-    # Handle cases where the error object itself has the attribute
+    # 3. Handle cases where the error object itself has the attribute
     if hasattr(error, 'retry_after'):
         value = getattr(error, 'retry_after')
         if isinstance(value, int):
