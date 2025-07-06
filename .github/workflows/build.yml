@@ -108,7 +108,6 @@ jobs:
         git-cliff \
           --config cliff.toml \
           --strip all \
-          --repository "${{ github.repository }}" \
           --output changelog.md \
           ${RANGE:---unreleased}
         
