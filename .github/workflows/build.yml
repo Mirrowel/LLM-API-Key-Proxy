@@ -60,6 +60,10 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Fetch all tags and history
+      shell: bash
+      run: git fetch --prune --unshallow --tags
+
     - name: Generate Build Version
       id: version
       shell: bash
@@ -109,11 +113,12 @@ jobs:
       id: changelog
       shell: bash
       run: |
-        # Fetch the latest release tag directly from the GitHub API
-        LAST_TAG=$(gh release list --limit 1 --json tagName --jq .[0].tagName 2>/dev/null || echo "")
-
+        echo "▶️ All build-* tags found:"; git tag --list 'build-*'
+        LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+        echo "✅ Detected most recent ancestor tag: $LAST_TAG"
+        
         RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
-        echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }} ($RANGE)"
+        echo "🔍 Generating changelog for range: $RANGE"
 
         git-cliff \
           --config cliff.toml \
