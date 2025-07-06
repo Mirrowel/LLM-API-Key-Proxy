@@ -109,7 +109,9 @@ jobs:
       id: changelog
       shell: bash
       run: |
-        LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+        # Fetch the latest release tag directly from the GitHub API
+        LAST_TAG=$(gh release list --limit 1 --json tagName --jq .[0].tagName 2>/dev/null || echo "")
+
         RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
         echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }} ($RANGE)"
 
