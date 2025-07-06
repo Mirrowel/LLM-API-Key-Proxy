@@ -10,7 +10,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group }}
 {% for commit in commits -%}
-- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.owner }}/{{ remote.repo }}/commit/{{ commit.id }}))
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/${{ github.repository }}/commit/{{ commit.id }}))
 {% endfor -%}
 {% endfor -%}
 """
@@ -21,7 +21,7 @@ conventional_commits = true
 filter_unconventional = false
 split_commits = false
 commit_preprocessors = [
-    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/{{ remote.owner }}/{{ remote.repo }}/issues/${2}))"},
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/${{ github.repository }}/issues/${2}))"},
 ]
 
 commit_parsers = [
