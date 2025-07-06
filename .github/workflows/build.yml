@@ -112,17 +112,55 @@ jobs:
           echo "No changes found for this release" > changelog.md
         fi
 
+    - name: Debug artifact contents
+      shell: bash
+      run: |
+        echo "🔍 Debugging artifact contents..."
+        echo "Current directory:"
+        pwd
+        echo ""
+        echo "Release assets directory contents:"
+        ls -la release-assets/ || echo "release-assets directory not found"
+        echo ""
+        echo "All files in current directory:"
+        find . -name "*.exe" -o -name "*.bat" -o -name ".env*" | head -20
+        echo ""
+        echo "Directory structure:"
+        find release-assets -type f 2>/dev/null || echo "No files found in release-assets"
+
     - name: Generate Build Metadata
       id: metadata
       shell: bash
       run: |
-        BUILD_SIZE=$(du -sh release-assets/proxy_app.exe | cut -f1)
+        # Find the executable file
+        EXE_FILE=$(find release-assets -name "proxy_app.exe" -type f | head -1)
+        
+        if [ -n "$EXE_FILE" ]; then
+          BUILD_SIZE=$(du -sh "$EXE_FILE" | cut -f1)
+          echo "✅ Found executable at: $EXE_FILE (Size: $BUILD_SIZE)"
+        else
+          # Fallback: look for any .exe file
+          EXE_FILE=$(find release-assets -name "*.exe" -type f | head -1)
+          if [ -n "$EXE_FILE" ]; then
+            BUILD_SIZE=$(du -sh "$EXE_FILE" | cut -f1)
+            echo "✅ Found executable at: $EXE_FILE (Size: $BUILD_SIZE)"
+          else
+            BUILD_SIZE="Unknown"
+            echo "⚠️ No executable file found"
+          fi
+        fi
+        
         COMMIT_COUNT=$(git rev-list --count HEAD)
         CONTRIBUTORS=$(git log --format='%an' | sort -u | wc -l)
         
         echo "build_size=$BUILD_SIZE" >> $GITHUB_OUTPUT
         echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
         echo "contributors=$CONTRIBUTORS" >> $GITHUB_OUTPUT
+        
+        echo "📊 Build metadata:"
+        echo "  - Size: $BUILD_SIZE"
+        echo "  - Commits: $COMMIT_COUNT"
+        echo "  - Contributors: $CONTRIBUTORS"
 
     - name: Create Release
       shell: bash
