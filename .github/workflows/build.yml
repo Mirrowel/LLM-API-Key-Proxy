@@ -96,7 +96,14 @@ jobs:
         LATEST_CLIFF_URL=$(curl -s https://api.github.com/repos/orhun/git-cliff/releases/latest | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
         curl -L $LATEST_CLIFF_URL | tar xz
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
-        git-cliff --version
+
+    - name: Prepare git-cliff config
+      shell: bash
+      run: |
+        # Inject the GitHub repo URL into your template
+        sed -i "s|{{ repository_url }}|https://github.com/${GITHUB_REPOSITORY}|g" cliff.toml
+        echo "✅ cliff.toml:"
+        head -20 cliff.toml
 
     - name: Generate Changelog
       id: changelog
@@ -105,26 +112,15 @@ jobs:
         LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
         RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
         echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }} ($RANGE)"
-        
-        # split owner and repo for git-cliff
-        OWNER="${GITHUB_REPOSITORY%%/*}"
-        REPO="${GITHUB_REPOSITORY#*/}"
 
         git-cliff \
           --config cliff.toml \
           --strip all \
-          --owner "$OWNER" \
-          --repository "$REPO" \
           --output changelog.md \
           ${RANGE:---unreleased}
 
         if [ -s changelog.md ]; then
           echo "✅ Changelog generated successfully"
-          echo "📄 Changelog content:"
-          echo "===================="
-          cat changelog.md
-          echo "===================="
-          
           CHANGELOG_B64=$(base64 -w 0 changelog.md)
           echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
           echo "has_changelog=true" >> $GITHUB_OUTPUT
