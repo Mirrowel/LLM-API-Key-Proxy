@@ -112,7 +112,7 @@ jobs:
         # Inject the GitHub repo URL into your template
         sed -i "s|{{ repository_url }}|https://github.com/${GITHUB_REPOSITORY}|g" .github/cliff.toml
         echo "✅ cliff.toml:"
-        head -20 cliff.toml
+        head -20 .github/cliff.toml
 
     - name: Generate Changelog
       id: changelog
