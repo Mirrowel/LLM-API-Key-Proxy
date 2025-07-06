@@ -105,14 +105,19 @@ jobs:
         RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
         echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }} ($RANGE)"
         
+        # split owner and repo for git-cliff
+        OWNER="${GITHUB_REPOSITORY%%/*}"
+        REPO="${GITHUB_REPOSITORY#*/}"
+
         git-cliff \
           --config cliff.toml \
           --strip all \
+          --owner "$OWNER" \
+          --repository "$REPO" \
           --output changelog.md \
           ${RANGE:---unreleased}
-        
-        # Check if changelog was generated successfully
-        if [ -f "changelog.md" ] && [ -s "changelog.md" ]; then
+
+        if [ -s changelog.md ]; then
           echo "✅ Changelog generated successfully"
           echo "📄 Changelog content:"
           echo "===================="
@@ -124,7 +129,7 @@ jobs:
           echo "has_changelog=true" >> $GITHUB_OUTPUT
           echo "previous_tag=$LAST_TAG" >> $GITHUB_OUTPUT
         else
-          echo "⚠️ git-cliff produced empty output, creating manual changelog"
+          echo "⚠️ Empty changelog — falling back to manual list"
           
           # Manual fallback
           echo "## Recent Changes" > changelog.md
