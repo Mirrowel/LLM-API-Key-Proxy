@@ -73,15 +73,20 @@ jobs:
       id: version
       shell: bash
       run: |
+        BRANCH_NAME=${{ github.ref_name }}
         BASE_VERSION=$(date +'%Y.%m.%d')-${{ needs.build.outputs.sha }}
         if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
           VERSION="$BASE_VERSION-${{ github.run_attempt }}"
         else
           VERSION="$BASE_VERSION"
         fi
-        TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        
+        # Define all naming components
+        echo "release_title=Build ($BRANCH_NAME): $VERSION" >> $GITHUB_OUTPUT
+        echo "release_tag=$BRANCH_NAME/build-$VERSION" >> $GITHUB_OUTPUT
+        echo "archive_version_part=$BRANCH_NAME-$VERSION" >> $GITHUB_OUTPUT
         echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
 
     - name: Download build artifact
       uses: actions/download-artifact@v4
@@ -93,7 +98,7 @@ jobs:
       id: archive
       shell: bash
       run: |
-        ARCHIVE_NAME="LLM-API-Key-Proxy-Build-${{ needs.build.outputs.sha }}.zip"
+        ARCHIVE_NAME="LLM-API-Key-Proxy-${{ steps.version.outputs.archive_version_part }}.zip"
         cd release-assets
         zip ../$ARCHIVE_NAME *
         cd ..
@@ -118,12 +123,13 @@ jobs:
       id: changelog
       shell: bash
       run: |
+        BRANCH_NAME=${{ github.ref_name }}
         if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
           echo "Manual tag provided: ${{ github.event.inputs.manual_previous_tag }}"
           LAST_TAG="${{ github.event.inputs.manual_previous_tag }}"
         else
-          echo "No manual tag provided, searching for the latest build-* tag..."
-          LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+          echo "No manual tag, searching for latest tag on branch '$BRANCH_NAME'..."
+          LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
         fi
         
         echo "✅ Using tag: $LAST_TAG"
@@ -176,6 +182,8 @@ jobs:
     - name: Generate Build Metadata
       id: metadata
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         # Find the executable file
         EXE_FILE=$(find release-assets -name "proxy_app.exe" -type f | head -1)
@@ -262,12 +270,12 @@ jobs:
         
         > **Note**: This is an automated build release.
 
-        **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...build-${{ steps.version.outputs.version }}
+        **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.release_tag }}
         EOF
 
         # Create the release using the notes file
-        gh release create build-${{ steps.version.outputs.version }} \
-          --title "Build ${{ steps.version.outputs.version }}" \
+        gh release create ${{ steps.version.outputs.release_tag }} \
+          --title "${{ steps.version.outputs.release_title }}" \
           --notes-file releasenotes.md \
           --latest \
           ${{ steps.archive.outputs.ASSET_PATH }}
