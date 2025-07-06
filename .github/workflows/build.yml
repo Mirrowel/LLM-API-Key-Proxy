@@ -114,7 +114,7 @@ jobs:
       shell: bash
       run: |
         echo "▶️ All build-* tags found:"; git tag --list 'build-*'
-        LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
+        LAST_TAG="1d97578"
         echo "✅ Detected most recent ancestor tag: $LAST_TAG"
         
         if [ -n "$LAST_TAG" ]; then
