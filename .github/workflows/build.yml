@@ -101,27 +101,16 @@ jobs:
       id: changelog
       shell: bash
       run: |
-        echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }}"
-        
-        # Find the last build tag
         LAST_TAG=$(git describe --tags --abbrev=0 --match="build-*" 2>/dev/null || echo "")
-        CURRENT_TAG="build-${{ steps.version.outputs.version }}"
+        RANGE="${LAST_TAG:+$LAST_TAG..HEAD}"
+        echo "🔍 Generating changelog for build-${{ steps.version.outputs.version }} ($RANGE)"
         
-        echo "Last tag: ${LAST_TAG:-'None found'}"
-        echo "Current tag: $CURRENT_TAG"
-        
-        # Set environment for git-cliff
-        export GIT_CLIFF_TAG="$CURRENT_TAG"
-        
-        if [ -n "$LAST_TAG" ]; then
-          echo "📊 Generating changelog from $LAST_TAG to HEAD"
-          # Generate changelog for specific range
-          git-cliff --config cliff.toml --strip all --output changelog.md "$LAST_TAG..HEAD"
-        else
-          echo "📊 No previous build tag found, showing recent commits"
-          # First release - show last 10 commits
-          git-cliff --config cliff.toml --strip all --output changelog.md --unreleased
-        fi
+        git-cliff \
+          --config cliff.toml \
+          --strip all \
+          --repository-url "https://github.com/${{ github.repository }}" \
+          --output changelog.md \
+          ${RANGE:---unreleased}
         
         # Check if changelog was generated successfully
         if [ -f "changelog.md" ] && [ -s "changelog.md" ]; then
