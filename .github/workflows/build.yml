@@ -72,14 +72,21 @@ jobs:
     - name: Generate Build Version
       id: version
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BRANCH_NAME=${{ github.ref_name }}
-        BASE_VERSION=$(date +'%Y.%m.%d')-${{ needs.build.outputs.sha }}
-        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-          VERSION="$BASE_VERSION-${{ github.run_attempt }}"
-        else
-          VERSION="$BASE_VERSION"
-        fi
+        DATE_STAMP=$(date +'%Y.%m.%d')
+        
+        # Find the number of releases already created today for this branch
+        # We list releases and filter for tags matching "branch/build-YYYY.MM.DD"
+        BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | grep "^$BRANCH_NAME/build-$DATE_STAMP" | wc -l)
+        
+        # Increment the build number for the new release
+        BUILD_NUMBER=$((BUILD_COUNT + 1))
+        
+        # Create the new, sortable version string
+        VERSION="$DATE_STAMP.$BUILD_NUMBER-${{ needs.build.outputs.sha }}"
         
         # Define all naming components
         echo "release_title=Build ($BRANCH_NAME): $VERSION" >> $GITHUB_OUTPUT
