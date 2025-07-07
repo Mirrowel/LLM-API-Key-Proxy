@@ -142,7 +142,7 @@ The application uses FastAPI's `lifespan` context manager to manage the `Rotatin
 #### Endpoints
 
 *   `POST /v1/chat/completions`: The main endpoint for chat requests.
-*   `POST /v1/embeddings`: The endpoint for creating embeddings.
+*   `POST /v1/embeddings`: The endpoint for creating embeddings. - Not fully functional yet.
 *   `GET /v1/models`: Returns a list of all available models from configured providers.
 *   `GET /v1/providers`: Returns a list of all configured providers.
 *   `POST /v1/token-count`: Calculates the token count for a given message payload.

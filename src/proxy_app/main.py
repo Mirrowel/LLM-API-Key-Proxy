@@ -36,6 +36,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
 from proxy_app.request_logger import log_request_response
+from proxy_app.batch_manager import EmbeddingBatcher
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -67,11 +68,15 @@ if not api_keys:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
-    app.state.rotating_client = RotatingClient(api_keys=api_keys)
-    print("RotatingClient initialized.")
+    client = RotatingClient(api_keys=api_keys)
+    batcher = EmbeddingBatcher(client=client)
+    app.state.rotating_client = client
+    app.state.embedding_batcher = batcher
+    print("RotatingClient and EmbeddingBatcher initialized.")
     yield
-    await app.state.rotating_client.close()
-    print("RotatingClient closed.")
+    await batcher.stop()
+    await client.close()
+    print("RotatingClient and EmbeddingBatcher closed.")
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
@@ -80,6 +85,10 @@ api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
     return request.app.state.rotating_client
+
+def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
+    """Dependency to get the embedding batcher instance from the app state."""
+    return request.app.state.embedding_batcher
 
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
@@ -267,21 +276,27 @@ async def chat_completions(
 async def embeddings(
     request: Request,
     body: EmbeddingRequest,
-    client: RotatingClient = Depends(get_rotating_client),
+    batcher: EmbeddingBatcher = Depends(get_embedding_batcher),
     _ = Depends(verify_api_key)
 ):
     """
     OpenAI-compatible endpoint for creating embeddings.
+    This endpoint uses a batching manager to group requests for efficiency.
     """
     try:
         request_data = body.model_dump(exclude_none=True)
         
-        # Ensure input is always a list for the client
-        if isinstance(request_data.get("input"), str):
-            request_data["input"] = [request_data["input"]]
+        # The batcher expects a single string input per request
+        if isinstance(request_data.get("input"), list):
+            if len(request_data["input"]) > 1:
+                raise HTTPException(status_code=400, detail="Batching multiple inputs in a single request is not supported when using the server-side batcher. Please send one input string per request.")
+            request_data["input"] = request_data["input"][0]
 
-        response = await client.aembedding(**request_data)
+        response_data = await batcher.add_request(request_data)
         
+        # The batcher returns a dict, not a Pydantic model, so we construct it
+        response = litellm.EmbeddingResponse(**response_data)
+
         if ENABLE_REQUEST_LOGGING:
             response_summary = {
                 "model": response.model,
