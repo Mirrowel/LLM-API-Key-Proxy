@@ -245,7 +245,7 @@ class UsageManager:
                 usage = completion_response.usage
                 daily_model_data["prompt_tokens"] += usage.prompt_tokens
                 daily_model_data["completion_tokens"] += usage.completion_tokens
-                
+                lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
                 try:
                     cost = litellm.completion_cost(completion_response=completion_response)
                     daily_model_data["approx_cost"] += cost
