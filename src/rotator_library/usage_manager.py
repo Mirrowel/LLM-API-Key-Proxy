@@ -244,11 +244,17 @@ class UsageManager:
             if completion_response and hasattr(completion_response, 'usage') and completion_response.usage:
                 usage = completion_response.usage
                 daily_model_data["prompt_tokens"] += usage.prompt_tokens
-                daily_model_data["completion_tokens"] += usage.completion_tokens
+                daily_model_data["completion_tokens"] += getattr(usage, 'completion_tokens', 0) # Not present in embedding responses
                 lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
                 try:
-                    cost = litellm.completion_cost(completion_response=completion_response)
-                    daily_model_data["approx_cost"] += cost
+                    # Differentiate cost calculation based on response type
+                    if isinstance(completion_response, litellm.EmbeddingResponse):
+                        cost = litellm.embedding_cost(embedding_response=completion_response)
+                    else:
+                        cost = litellm.completion_cost(completion_response=completion_response)
+                    
+                    if cost is not None:
+                        daily_model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
             else:

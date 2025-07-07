@@ -10,8 +10,17 @@ import logging
 from pathlib import Path
 import sys
 import json
-from typing import AsyncGenerator, Any
+from typing import AsyncGenerator, Any, List, Optional
+from pydantic import BaseModel
 import argparse
+
+# --- Pydantic Models ---
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: List[str]
+    input_type: Optional[str] = None
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
 
 # --- Argument Parsing ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -188,7 +197,8 @@ async def streaming_response_wrapper(
             log_request_response(
                 request_data=request_data,
                 response_data=full_response,
-                is_streaming=True
+                is_streaming=True,
+                log_type="completion"
             )
 
 @app.post("/v1/chat/completions")
@@ -219,7 +229,8 @@ async def chat_completions(
                 log_request_response(
                     request_data=request_data,
                     response_data=response.dict(),
-                    is_streaming=False
+                    is_streaming=False,
+                    log_type="completion"
                 )
             return response
 
@@ -234,7 +245,53 @@ async def chat_completions(
             log_request_response(
                 request_data=request_data,
                 response_data={"error": str(e)},
-                is_streaming=request_data.get("stream", False)
+                is_streaming=request_data.get("stream", False),
+                log_type="completion"
+            )
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/embeddings")
+async def embeddings(
+    request: Request,
+    body: EmbeddingRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _ = Depends(verify_api_key)
+):
+    """
+    OpenAI-compatible endpoint for creating embeddings.
+    """
+    try:
+        request_data = body.dict(exclude_none=True)
+        response = await client.aembedding(**request_data)
+        
+        if ENABLE_REQUEST_LOGGING:
+            response_summary = {
+                "model": response.model,
+                "object": response.object,
+                "usage": response.usage.dict(),
+                "data_count": len(response.data),
+                "embedding_dimensions": len(response.data[0].embedding) if response.data else 0
+            }
+            log_request_response(
+                request_data=request_data,
+                response_data=response_summary,
+                is_streaming=False,
+                log_type="embedding"
+            )
+        return response
+
+    except Exception as e:
+        logging.error(f"Embedding request failed: {e}")
+        if ENABLE_REQUEST_LOGGING:
+            try:
+                request_data = await request.json()
+            except json.JSONDecodeError:
+                request_data = {"error": "Could not parse request body"}
+            log_request_response(
+                request_data=request_data,
+                response_data={"error": str(e)},
+                is_streaming=False,
+                log_type="embedding"
             )
         raise HTTPException(status_code=500, detail=str(e))
 
