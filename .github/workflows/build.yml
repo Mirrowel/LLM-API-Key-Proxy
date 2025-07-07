@@ -52,8 +52,7 @@ jobs:
         mkdir $stagingDir
         $sourceFiles = @(
             "src/proxy_app/dist/proxy_app.exe",
-            "setup_env.bat",
-            ".env.example"
+            "setup_env.bat"
         )
         foreach ($file in $sourceFiles) {
             if (Test-Path $file) {
@@ -75,7 +74,6 @@ jobs:
         path: |
           staging/proxy_app.exe
           staging/setup_env.bat
-          staging/.env.example
 
   release:
     needs: build
@@ -320,7 +318,6 @@ jobs:
         |------|-------------|
         | \`proxy_app.exe\` | Main application executable |
         | \`setup_env.bat\` | Environment setup script |
-        | \`.env.example\` | Configuration template |
 
         ## 🔗 Useful Links
         - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
