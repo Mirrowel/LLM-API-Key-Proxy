@@ -225,8 +225,11 @@ class RotatingClient:
                         response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
                         if is_streaming:
-                            key_acquired = False
-                            return self._safe_streaming_wrapper(response, current_key, model, request)
+                            key_acquired = False # The wrapper will handle the key release
+                            stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
+                            async for chunk in stream_generator:
+                                yield chunk
+                            return
                         else:
                             await self.usage_manager.record_success(current_key, model, response)
                             await self.usage_manager.release_key(current_key, model)
