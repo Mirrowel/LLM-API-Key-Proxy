@@ -106,9 +106,19 @@ jobs:
 
     - name: Install git-cliff
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        LATEST_CLIFF_URL=$(curl -s https://api.github.com/repos/orhun/git-cliff/releases/latest | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
-        curl -L $LATEST_CLIFF_URL | tar xz
+        API_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/orhun/git-cliff/releases/latest)
+        LATEST_CLIFF_URL=$(echo "$API_RESPONSE" | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
+
+        if [ -z "$LATEST_CLIFF_URL" ]; then
+          echo "::error::Could not find git-cliff asset URL."
+          echo "API Response: $API_RESPONSE"
+          exit 1
+        fi
+
+        curl -L "$LATEST_CLIFF_URL" | tar xz
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
 
     - name: Prepare git-cliff config
