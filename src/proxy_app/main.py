@@ -13,6 +13,7 @@ import json
 from typing import AsyncGenerator, Any, List, Optional
 from pydantic import BaseModel
 import argparse
+import litellm
 
 # --- Pydantic Models ---
 class EmbeddingRequest(BaseModel):
@@ -234,6 +235,18 @@ async def chat_completions(
                 )
             return response
 
+    except (litellm.InvalidRequestError, ValueError, litellm.ContextWindowExceededError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+    except litellm.AuthenticationError as e:
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+    except litellm.RateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+    except litellm.Timeout as e:
+        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+    except (litellm.InternalServerError, litellm.OpenAIError) as e:
+        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
         # Optionally log the failed request
@@ -280,6 +293,18 @@ async def embeddings(
             )
         return response
 
+    except (litellm.InvalidRequestError, ValueError, litellm.ContextWindowExceededError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+    except litellm.AuthenticationError as e:
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+    except litellm.RateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+    except litellm.Timeout as e:
+        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+    except (litellm.InternalServerError, litellm.OpenAIError) as e:
+        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
         if ENABLE_REQUEST_LOGGING:
