@@ -144,7 +144,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer your-super-secret-proxy-key" \
 -d '{
-    "model": "gemini/gemini-2.5-flash-preview-05-20",
+    "model": "gemini/gemini-2.5-flash",
     "messages": [{"role": "user", "content": "What is the capital of France?"}]
 }'
 ```
@@ -168,7 +168,7 @@ client = openai.OpenAI(
 
 # Make a request
 response = client.chat.completions.create(
-    model="gemini/gemini-2.5-flash-preview-05-20", # Specify provider and model
+    model="gemini/gemini-2.5-flash-preview", # Specify provider and model
     messages=[
         {"role": "user", "content": "Write a short poem about space."}
     ]
@@ -180,6 +180,7 @@ print(response.choices[0].message.content)
 ### Available API Endpoints
 
 -   `POST /v1/chat/completions`: The main endpoint for making chat requests.
+-   `POST /v1/embeddings`: The endpoint for creating embeddings.
 -   `GET /v1/models`: Returns a list of all available models from your configured providers.
 -   `GET /v1/providers`: Returns a list of all configured providers.
 -   `POST /v1/token-count`: Calculates the token count for a given message payload.
