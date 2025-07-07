@@ -76,19 +76,18 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BRANCH_NAME=${{ github.ref_name }}
-        DATE_STAMP=$(date +'%Y.%m.%d')
+        DATE_STAMP_NEW=$(date +'%Y%m%d')
+        DATE_STAMP_OLD=$(date +'%Y.%m.%d')
         
-        # Find the number of releases already created today for this branch
-        # We list releases and filter for tags matching "branch/build-YYYY.MM.DD"
-        # The grep pattern is corrected and wrapped in a block with `|| true`
-        # to prevent its exit code from failing the step when no matches are found.
-        BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | { grep "$BRANCH_NAME/build-$DATE_STAMP" || true; } | wc -l)
+        # Find the number of releases already created today for this branch, matching either old or new format.
+        # We use grep -E for an OR condition and wrap it to prevent failures when no matches are found.
+        BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | { grep -E "$BRANCH_NAME/build-($DATE_STAMP_NEW|$DATE_STAMP_OLD)" || true; } | wc -l)
         
         # Increment the build number for the new release
         BUILD_NUMBER=$((BUILD_COUNT + 1))
         
-        # Create the new, sortable version string
-        VERSION="$DATE_STAMP.$BUILD_NUMBER-${{ needs.build.outputs.sha }}"
+        # Create the new, sortable version string using the new format
+        VERSION="$DATE_STAMP_NEW-$BUILD_NUMBER-${{ needs.build.outputs.sha }}"
         
         # Define all naming components
         echo "release_title=Build ($BRANCH_NAME): $VERSION" >> $GITHUB_OUTPUT
@@ -148,7 +147,16 @@ jobs:
           LAST_TAG="${{ github.event.inputs.manual_previous_tag }}"
         else
           echo "No manual tag, searching for latest tag on branch '$BRANCH_NAME'..."
-          LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
+          
+          # Prioritize finding the latest tag with the new format (e.g., build-20250707-1-...).
+          echo "Attempting to find latest tag with new format..."
+          LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*" 2>/dev/null)
+          
+          # If no new format tag is found, fall back to the old, more generic pattern.
+          if [ -z "$LAST_TAG" ]; then
+            echo "No new format tag found. Falling back to search for any older build tag..."
+            LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
+          fi
         fi
         
         echo "✅ Using tag: $LAST_TAG"
