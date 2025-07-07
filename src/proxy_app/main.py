@@ -116,9 +116,8 @@ async def streaming_response_wrapper(
     response_stream: AsyncGenerator[str, None]
 ) -> AsyncGenerator[str, None]:
     """
-    Wraps a streaming response to log the full response after completion.
-    This function aggregates all data from the stream, including content,
-    tool calls, function calls, and any other provider-specific fields.
+    Wraps a streaming response to log the full response after completion
+    and ensures any errors during the stream are sent to the client.
     """
     response_chunks = []
     full_response = {}
@@ -137,6 +136,27 @@ async def streaming_response_wrapper(
                         response_chunks.append(chunk_data)
                     except json.JSONDecodeError:
                         pass  # Ignore non-JSON chunks
+    except Exception as e:
+        logging.error(f"An error occurred during the response stream: {e}")
+        # Yield a final error message to the client to ensure they are not left hanging.
+        error_payload = {
+            "error": {
+                "message": f"An unexpected error occurred during the stream: {str(e)}",
+                "type": "proxy_internal_error",
+                "code": 500
+            }
+        }
+        yield f"data: {json.dumps(error_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+        # Also log this as a failed request
+        if ENABLE_REQUEST_LOGGING:
+            log_request_response(
+                request_data=request_data,
+                response_data={"error": str(e)},
+                is_streaming=True,
+                log_type="completion"
+            )
+        return # Stop further processing
     finally:
         if response_chunks:
             # --- Aggregation Logic ---
@@ -244,7 +264,7 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = await client.acompletion(request=request, **request_data)
+            response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
                 streaming_response_wrapper(request, request_data, response_generator),
                 media_type="text/event-stream"

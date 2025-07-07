@@ -172,11 +172,9 @@ class RotatingClient:
             if stream_completed:
                 yield "data: [DONE]\n\n"
 
-    async def acompletion(self, request: Optional[Any] = None, pre_request_callback: Optional[callable] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
-        kwargs = self._convert_model_params(**kwargs)
+    async def _execute_with_retry(self, api_call: callable, request: Optional[Any], **kwargs) -> Any:
+        """A generic retry mechanism for non-streaming API calls."""
         model = kwargs.get("model")
-        is_streaming = kwargs.get("stream", False)
-
         if not model:
             raise ValueError("'model' is a required parameter.")
 
@@ -187,7 +185,7 @@ class RotatingClient:
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
-        
+
         while len(tried_keys) < len(keys_for_provider):
             current_key = None
             key_acquired = False
@@ -208,14 +206,15 @@ class RotatingClient:
                 litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
                 provider_instance = self._get_provider_instance(provider)
                 if provider_instance:
-                    if "safety_settings" not in litellm_kwargs:
-                        litellm_kwargs["safety_settings"] = {"harassment": "BLOCK_NONE", "hate_speech": "BLOCK_NONE", "sexually_explicit": "BLOCK_NONE", "dangerous_content": "BLOCK_NONE"}
-                    converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
-                    if converted_settings is not None: litellm_kwargs["safety_settings"] = converted_settings
-                    else: del litellm_kwargs["safety_settings"]
+                    if "safety_settings" in litellm_kwargs:
+                        converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
+                        if converted_settings is not None:
+                            litellm_kwargs["safety_settings"] = converted_settings
+                        else:
+                            del litellm_kwargs["safety_settings"]
                 
-                if provider == "gemini":
-                    if provider_instance: provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+                if provider == "gemini" and provider_instance:
+                    provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
                 if "gemma-3" in model and "messages" in litellm_kwargs:
                     litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
@@ -225,37 +224,41 @@ class RotatingClient:
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                        response = await api_call(api_key=current_key, **litellm_kwargs)
                         
-                        if pre_request_callback:
-                            await pre_request_callback()
+                        await self.usage_manager.record_success(current_key, model, response)
+                        await self.usage_manager.release_key(current_key, model)
+                        key_acquired = False
+                        return response
 
-                        response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
-
-                        if is_streaming:
-                            key_acquired = False # The wrapper will handle the key release
-                            stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
-                            async for chunk in stream_generator:
-                                yield chunk
-                            return
-                        else:
-                            await self.usage_manager.record_success(current_key, model, response)
-                            await self.usage_manager.release_key(current_key, model)
-                            key_acquired = False
-                            return response
-
-                    except (StreamedAPIError, APIConnectionError, litellm.RateLimitError) as e:
+                    except litellm.RateLimitError as e:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
 
-                        if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
+                        if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
                             lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                         
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered '{classified_error.error_type}'. Trying next key.")
-                        break
+                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
+                        break # Move to the next key
+
+                    except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
+                        last_exception = e
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        classified_error = classify_error(e)
+                        await self.usage_manager.record_failure(current_key, model, classified_error)
+                        
+                        if attempt >= self.max_retries - 1:
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
+                            break # Move to the next key
+                        
+                        wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                        lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
+                        await asyncio.sleep(wait_time)
+                        continue # Retry with the same key
 
                     except Exception as e:
                         last_exception = e
@@ -266,19 +269,12 @@ class RotatingClient:
                             raise last_exception
 
                         classified_error = classify_error(e)
-                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
+                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
+                            # For these errors, we should not retry with other keys.
                             raise last_exception
 
-                        if classified_error.error_type in ['server_error', 'api_connection']:
-                            await self.usage_manager.record_failure(current_key, model, classified_error)
-                            if attempt >= self.max_retries - 1:
-                                break
-                            wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
-                            await asyncio.sleep(wait_time)
-                            continue
-
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        break
+                        break # Try next key for other errors
             finally:
                 if key_acquired and current_key:
                     await self.usage_manager.release_key(current_key, model)
@@ -288,16 +284,10 @@ class RotatingClient:
         
         raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
 
-    async def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
-        kwargs = self._convert_model_params(**kwargs)
+    async def _streaming_acompletion_with_retry(self, request: Optional[Any], **kwargs) -> AsyncGenerator[str, None]:
+        """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
         model = kwargs.get("model")
-        if not model:
-            raise ValueError("'model' is a required parameter.")
-
         provider = model.split('/')[0]
-        if provider not in self.api_keys:
-            raise ValueError(f"No API keys configured for provider: {provider}")
-
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
@@ -306,6 +296,11 @@ class RotatingClient:
             current_key = None
             key_acquired = False
             try:
+                if await self.cooldown_manager.is_cooling_down(provider):
+                    remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
+                    lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
+                    await asyncio.sleep(remaining_time)
+
                 keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
                 if not keys_to_try:
                     break
@@ -314,55 +309,104 @@ class RotatingClient:
                 key_acquired = True
                 tried_keys.add(current_key)
 
+                # --- Full Request Preparation Logic ---
                 litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+                provider_instance = self._get_provider_instance(provider)
+                if provider_instance:
+                    if "safety_settings" in litellm_kwargs:
+                        converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
+                        if converted_settings is not None:
+                            litellm_kwargs["safety_settings"] = converted_settings
+                        else:
+                            del litellm_kwargs["safety_settings"]
+                
+                if provider == "gemini" and provider_instance:
+                    provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+
+                if "gemma-3" in model and "messages" in litellm_kwargs:
+                    litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
+                
                 litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                # --- End of Request Preparation ---
 
                 for attempt in range(self.max_retries):
                     try:
-                        lib_logger.info(f"Attempting embedding call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        response = await litellm.aembedding(api_key=current_key, **litellm_kwargs)
+                        lib_logger.info(f"Attempting stream with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                        response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
                         
-                        await self.usage_manager.record_success(current_key, model, response)
-                        return response
+                        key_acquired = False # Wrapper now handles the key release
+                        stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
+                        
+                        async for chunk in stream_generator:
+                            yield chunk
+                        return # Successful stream, exit the entire retry mechanism
+
+                    except (StreamedAPIError, litellm.RateLimitError) as e:
+                        last_exception = e
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        classified_error = classify_error(e)
+                        
+                        if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
+                            cooldown_duration = classified_error.retry_after or 60
+                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+
+                        await self.usage_manager.record_failure(current_key, model, classified_error)
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
+                        break # Break inner loop to try next key
+
+                    except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
+                        last_exception = e
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        classified_error = classify_error(e)
+                        await self.usage_manager.record_failure(current_key, model, classified_error)
+
+                        if attempt >= self.max_retries - 1:
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
+                            break # Move to the next key
+                        
+                        wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                        lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
+                        await asyncio.sleep(wait_time)
+                        continue # Retry with the same key
 
                     except Exception as e:
                         last_exception = e
-                        if isinstance(e, asyncio.CancelledError): raise e
-
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
-
-                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
-                            raise last_exception
-                        
-                        if request and await request.is_disconnected():
-                            lib_logger.warning(f"Client disconnected during embedding. Aborting retries for key ...{current_key[-4:]}.")
-                            raise last_exception
-
-                        if classified_error.error_type in ['server_error', 'api_connection']:
-                            await self.usage_manager.record_failure(current_key, model, classified_error)
-                            if attempt >= self.max_retries - 1: break
-                            wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
-                            await asyncio.sleep(wait_time)
-                            continue
+                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
+                            raise last_exception # Do not retry for these errors
                         
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        break
-            
-            except (litellm.InvalidRequestError, litellm.ContextWindowExceededError, asyncio.CancelledError) as e:
-                raise e
-            except Exception as e:
-                last_exception = e
-                lib_logger.error(f"An unexpected error occurred with key ...{current_key[-4:] if current_key else 'N/A'}: {e}")
-                continue
+                        break # Try next key for other errors
+
             finally:
                 if key_acquired and current_key:
                     await self.usage_manager.release_key(current_key, model)
-
-        if last_exception:
-            raise last_exception
         
-        raise Exception("Failed to complete the request: No available API keys or all keys failed.")
+        if last_exception:
+            # After trying all keys, if an exception was caught, we need to inform the client.
+            # We can't raise it directly as the stream is already open.
+            # Instead, we yield a final error message.
+            error_data = {"error": {"message": f"Failed to complete the streaming request after trying all keys. Last error: {str(last_exception)}", "type": "proxy_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+        else:
+            # If all keys were tried and none succeeded (e.g., all were busy), raise a generic error.
+            raise Exception("Failed to complete the streaming request: No available API keys for the provider or all keys failed.")
+
+    def acompletion(self, request: Optional[Any] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
+        """Dispatcher for completion requests."""
+        kwargs = self._convert_model_params(**kwargs)
+        if kwargs.get("stream"):
+            return self._streaming_acompletion_with_retry(request, **kwargs)
+        else:
+            return self._execute_with_retry(litellm.acompletion, request, **kwargs)
+
+    def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
+        """Executes an embedding request with retry logic."""
+        kwargs = self._convert_model_params(**kwargs)
+        return self._execute_with_retry(litellm.aembedding, request, **kwargs)
 
     def token_count(self, **kwargs) -> int:
         """Calculates the number of tokens for a given text or list of messages."""
