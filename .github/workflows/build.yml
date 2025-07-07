@@ -72,7 +72,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: proxy-app-build-${{ steps.version.outputs.sha }}
-        path: staging/
+        path: |
+          staging/proxy_app.exe
+          staging/setup_env.bat
+          staging/.env.example
 
   release:
     needs: build
