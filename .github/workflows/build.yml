@@ -48,10 +48,25 @@ jobs:
     - name: Prepare files for artifact
       shell: pwsh
       run: |
-        mkdir staging
-        copy src/proxy_app/dist/proxy_app.exe staging/
-        copy setup_env.bat staging/
-        copy .env.example staging/
+        $stagingDir = "staging"
+        mkdir $stagingDir
+        $sourceFiles = @(
+            "src/proxy_app/dist/proxy_app.exe",
+            "setup_env.bat",
+            ".env.example"
+        )
+        foreach ($file in $sourceFiles) {
+            if (Test-Path $file) {
+                echo "Copying '$file' to '$stagingDir'"
+                Copy-Item -Path $file -Destination $stagingDir
+            } else {
+                echo "::error::File not found: $file"
+                exit 1
+            }
+        }
+        echo "--- Staging directory contents ---"
+        Get-ChildItem -Path $stagingDir -Recurse
+        echo "------------------------------------"
 
     - name: Archive build artifact
       uses: actions/upload-artifact@v4
@@ -113,7 +128,7 @@ jobs:
       run: |
         ARCHIVE_NAME="LLM-API-Key-Proxy-${{ steps.version.outputs.archive_version_part }}.zip"
         cd release-assets
-        zip ../$ARCHIVE_NAME *
+        zip -r ../$ARCHIVE_NAME .
         cd ..
         echo "ASSET_PATH=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
 
