@@ -428,7 +428,7 @@ async def token_count(
         if not model or not messages:
             raise HTTPException(status_code=400, detail="'model' and 'messages' are required.")
 
-        count = client.token_count(model=model, messages=messages)
+        count = client.token_count(**data)
         return {"token_count": count}
 
     except Exception as e:

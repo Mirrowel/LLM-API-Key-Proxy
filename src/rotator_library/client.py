@@ -58,6 +58,23 @@ class RotatingClient:
         if hasattr(self, 'http_client') and self.http_client:
             await self.http_client.aclose()
 
+    def _convert_model_params(self, **kwargs) -> Dict[str, Any]:
+        """
+        Converts model parameters for specific providers.
+        For example, the 'chutes' provider requires the model name to be prepended
+        with 'openai/' and a specific 'api_base'.
+        """
+        model = kwargs.get("model")
+        if not model:
+            return kwargs
+
+        provider = model.split('/')[0]
+        if provider == "chutes":
+            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
+            kwargs["api_base"] = "https://llm.chutes.ai/v1"
+        
+        return kwargs
+
     def _get_provider_instance(self, provider_name: str):
         """Lazily initializes and returns a provider instance."""
         if provider_name not in self._provider_instances:
@@ -164,13 +181,14 @@ class RotatingClient:
         Performs a completion call with smart key rotation and retry logic.
         It will try each available key in sequence if the previous one fails.
         """
+        kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         is_streaming = kwargs.get("stream", False)
 
         if not model:
             raise ValueError("'model' is a required parameter.")
 
-        provider = model.split('/')[0]
+        provider = kwargs.get("model").split('/')[0]
         if provider not in self.api_keys:
             raise ValueError(f"No API keys configured for provider: {provider}")
 
@@ -227,10 +245,6 @@ class RotatingClient:
                     ]
                     litellm_kwargs["messages"] = new_messages
                 
-                if provider == "chutes":
-                    litellm_kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-                    litellm_kwargs["api_base"] = "https://llm.chutes.ai/v1"
-
                 litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
 
                 for attempt in range(self.max_retries):
@@ -300,6 +314,7 @@ class RotatingClient:
         """
         Performs an embedding call with smart key rotation and retry logic.
         """
+        kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         if not model:
             raise ValueError("'model' is a required parameter.")
@@ -377,8 +392,13 @@ class RotatingClient:
         
         raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
 
-    def token_count(self, model: str, text: str = None, messages: List[Dict[str, str]] = None) -> int:
+    def token_count(self, **kwargs) -> int:
         """Calculates the number of tokens for a given text or list of messages."""
+        kwargs = self._convert_model_params(**kwargs)
+        model = kwargs.get("model")
+        text = kwargs.get("text")
+        messages = kwargs.get("messages")
+
         if not model:
             raise ValueError("'model' is a required parameter.")
         if messages:
