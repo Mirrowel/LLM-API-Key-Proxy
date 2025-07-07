@@ -64,19 +64,35 @@ class RotatingClient:
         """
         A definitive hybrid wrapper for streaming responses that ensures usage is recorded
         and the key lock is released only after the stream is fully consumed.
-        It exhaustively checks for usage data in all possible locations.
+        It exhaustively checks for usage data in all possible locations and gracefully
+        handles JSON decoding errors from the stream.
         """
         usage_recorded = False
         stream_completed = False
+        stream_iterator = stream.__aiter__()
+        
         try:
-            async for chunk in stream:
-                yield f"data: {json.dumps(chunk.dict())}\n\n"
-                # 1. First, try to find usage in a chunk (for providers that send it mid-stream)
-                if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
-                    await self.usage_manager.record_success(key, model, chunk)
-                    usage_recorded = True
-                    lib_logger.info(f"Recorded usage from stream chunk for key ...{key[-4:]}")
-            stream_completed = True
+            while True:
+                try:
+                    chunk = await stream_iterator.__anext__()
+                    yield f"data: {json.dumps(chunk.dict())}\n\n"
+                    
+                    # 1. First, try to find usage in a chunk (for providers that send it mid-stream)
+                    if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
+                        await self.usage_manager.record_success(key, model, chunk)
+                        usage_recorded = True
+                        lib_logger.info(f"Recorded usage from stream chunk for key ...{key[-4:]}")
+                
+                except StopAsyncIteration:
+                    # The stream finished successfully.
+                    stream_completed = True
+                    break
+                
+                except Exception as e:
+                    # This will catch JSONDecodeError and other potential issues with a chunk
+                    lib_logger.warning(f"Skipping a malformed chunk for key ...{key[-4:]}: {e}")
+                    continue # Skip to the next chunk
+
         finally:
             # 2. If not found in a chunk, try the final stream object itself (for other providers)
             if not usage_recorded:
