@@ -208,7 +208,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 ### Available API Endpoints
 
 -   `POST /v1/chat/completions`: The main endpoint for making chat requests.
--   `POST /v1/embeddings`: The endpoint for creating embeddings. - Not fully functional yet.
+-   `POST /v1/embeddings`: The endpoint for creating embeddings.
 -   `GET /v1/models`: Returns a list of all available models from your configured providers.
 -   `GET /v1/providers`: Returns a list of all configured providers.
 -   `POST /v1/token-count`: Calculates the token count for a given message payload.
