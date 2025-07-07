@@ -15,10 +15,10 @@ Your proxy is now running! You can now use it in your applications.
 
 ## Detailed Setup and Features
 
-This project provides a robust solution for managing and rotating API keys for various Large Language Model (LLM) providers. It consists of two main components:
+This project provides a robust, self-hosted solution for managing and rotating API keys for various Large Language Model (LLM) providers. It consists of two main components:
 
-1.  A reusable Python library (`rotating-api-key-client`) for intelligently rotating API keys.
-2.  A FastAPI proxy application that uses this library to provide an OpenAI-compatible endpoint.
+1.  A reusable Python library (`rotating-api-key-client`) for intelligently rotating API keys with advanced concurrency and error handling.
+2.  A FastAPI proxy application that uses this library to provide a single, unified, and OpenAI-compatible endpoint for all your LLM requests.
 
 ## Features
 
@@ -31,15 +31,30 @@ This project provides a robust solution for managing and rotating API keys for v
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 
-## Quick Start Guide
+---
 
-This guide will get you up and running in just a few minutes.
+## 1. Quick Start (Windows Executable)
 
-### 1. Setup
+This is the fastest way to get started for most users on Windows.
 
-First, clone the repository and install the required dependencies.
+1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest).
+2.  Unzip the downloaded file.
+3.  **Run `setup_env.bat`**. A window will open to help you add your API keys. Follow the on-screen instructions.
+4.  **Run `proxy_app.exe`**. This will start the proxy server in a new terminal window.
 
-**For Linux/macOS:**
+Your proxy is now running and ready to use at `http://127.0.0.1:8000`.
+
+---
+
+## 2. Detailed Setup (From Source)
+
+This guide is for users who want to run the proxy from the source code on any operating system.
+
+### Step 1: Clone and Install
+
+First, clone the repository and install the required dependencies into a virtual environment.
+
+**Linux/macOS:**
 ```bash
 # Clone the repository
 git clone https://github.com/Mirrowel/LLM-API-Key-Proxy.git
@@ -53,7 +68,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**For Windows:**
+**Windows:**
 ```powershell
 # Clone the repository
 git clone https://github.com/Mirrowel/LLM-API-Key-Proxy.git
@@ -67,34 +82,32 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-### 2. Configure API Keys
+### Step 2: Configure API Keys
 
-Next, create your `.env` file by copying the provided example. This file is where you will store all your secret keys.
+Create a `.env` file to store your secret keys. You can do this by copying the example file.
 
-**For Linux/macOS:**
+**Linux/macOS:**
 ```bash
 cp .env.example .env
 ```
 
-**For Windows:**
+**Windows:**
 ```powershell
 copy .env.example .env
 ```
 
-Now, open the new `.env` file and replace the placeholder values with your actual API keys.
+Now, open the new `.env` file and add your keys.
 
 **Refer to the `.env.example` file for the correct format and a full list of supported providers.**
 
-The two main types of keys are:
-
-1.  **`PROXY_API_KEY`**: This is a secret key *you create*. It is used to authorize requests to *your* proxy, preventing unauthorized use.
+1.  **`PROXY_API_KEY`**: This is a secret key **you create**. It is used to authorize requests to *your* proxy, preventing unauthorized use.
 2.  **Provider Keys**: These are the API keys you get from LLM providers (like Gemini, OpenAI, etc.). The proxy automatically finds them based on their name (e.g., `GEMINI_API_KEY_1`).
 
 **Example `.env` configuration:**
 ```env
 # A secret key for your proxy server to authenticate requests.
 # This can be any secret string you choose.
-PROXY_API_KEY="YOUR_PROXY_API_KEY"
+PROXY_API_KEY="a-very-secret-and-unique-key"
 
 # --- Provider API Keys ---
 # Add your keys from various providers below.
@@ -153,9 +166,9 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ## Advanced Usage
 
-### Using with the OpenAI Python Library
+### Using with the OpenAI Python Library (Recommended)
 
-The proxy is OpenAI-compatible, so you can use it directly with the `openai` Python client. This is the recommended way to integrate the proxy into your applications.
+The proxy is OpenAI-compatible, so you can use it directly with the `openai` Python client.
 
 ```python
 import openai
@@ -163,18 +176,33 @@ import openai
 # Point the client to your local proxy
 client = openai.OpenAI(
     base_url="http://127.0.0.1:8000/v1",
-    api_key="your-super-secret-proxy-key" # Use your proxy key here
+    api_key="a-very-secret-and-unique-key" # Use your PROXY_API_KEY here
 )
 
 # Make a request
 response = client.chat.completions.create(
-    model="gemini/gemini-2.5-flash-preview", # Specify provider and model
+    model="gemini/gemini-2.5-flash", # Specify provider and model
     messages=[
         {"role": "user", "content": "Write a short poem about space."}
     ]
 )
 
 print(response.choices[0].message.content)
+```
+
+### Using with `curl`
+
+```bash
+You can also send requests directly using tools like `curl`.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer a-very-secret-and-unique-key" \
+-d '{
+    "model": "gemini/gemini-2.5-flash",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}]
+}'
 ```
 
 ### Available API Endpoints
@@ -184,6 +212,22 @@ print(response.choices[0].message.content)
 -   `GET /v1/models`: Returns a list of all available models from your configured providers.
 -   `GET /v1/providers`: Returns a list of all configured providers.
 -   `POST /v1/token-count`: Calculates the token count for a given message payload.
+
+---
+
+## 4. Advanced Topics
+
+### How It Works
+
+The core of this project is the `RotatingClient` library. When a request is made, the client:
+
+1.  **Acquires the Best Key**: It requests the best available key from the `UsageManager`. The manager uses a tiered locking strategy to find a key that is not on cooldown and preferably not in use. If a key is busy with another request for the *same model*, it waits. Otherwise, it allows concurrent use for *different models*.
+2.  **Makes the Request**: It uses the acquired key to make the API call via `litellm`.
+3.  **Handles Errors**:
+    -   It uses a `classify_error` function to determine the failure type.
+    -   For **server errors**, it retries the request with the same key using exponential backoff.
+    -   For **rate-limit or auth errors**, it records the failure, applies an escalating cooldown for that specific key-model pair, and the client immediately tries the next available key.
+4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key's lock is then released, notifying any waiting requests that it is available.
 
 ### Enabling Request Logging
 
@@ -199,25 +243,15 @@ uvicorn src.proxy_app.main:app --reload -- --enable-request-logging
 ./proxy_app.exe --enable-request-logging
 ```
 
-Logs will be saved in the `logs/` directory.
+Logs will be saved as JSON files in the `logs/` directory.
 
-## How It Works
+### Troubleshooting
 
-The core of this project is the `RotatingClient` library, which manages a pool of API keys with a sophisticated concurrency model. When a request is made, the client:
+-   **`401 Unauthorized`**: Ensure your `PROXY_API_KEY` is set correctly in the `.env` file and included in the `Authorization: Bearer <key>` header of your request.
+-   **`500 Internal Server Error`**: Check the console logs of the `uvicorn` server for detailed error messages. This could indicate an issue with one of your provider API keys (e.g., it's invalid or has been revoked) or a problem with the provider's service.
+-   **All keys on cooldown**: If you see a message that all keys are on cooldown, it means all your keys for a specific provider have recently failed. Check the `logs/` directory (if enabled) or the `key_usage.json` file for details on why the failures occurred.
 
-1.  **Acquires the Best Key**: It requests the best available key from the `UsageManager`. The manager uses a tiered locking strategy to find a key that is not on cooldown and preferably not in use. If a key is busy with another request for the *same model*, it waits. Otherwise, it allows concurrent use for *different models*.
-2.  **Makes the Request**: It uses the acquired key to make the API call via `litellm`.
-3.  **Handles Errors**:
-    -   It uses a `classify_error` function to determine the failure type.
-    -   For **server errors**, it retries the request with the same key using exponential backoff.
-    -   For **rate-limit or auth errors**, it records the failure, applies an escalating cooldown for that specific key-model pair, and the client immediately tries the next available key.
-4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key's lock is then released, notifying any waiting requests that it is available.
-
-## Troubleshooting
-
--   **`401 Unauthorized`**: Ensure your `PROXY_API_KEY` is set correctly in the `.env` file and included in the `Authorization` header of your request.
--   **`500 Internal Server Error`**: Check the console logs of the `uvicorn` server for detailed error messages. This could indicate an issue with one of your provider API keys or a problem with the provider's service.
--   **All keys on cooldown**: If you see a message that all keys are on cooldown, it means all your keys for a specific provider have recently failed. Check the `logs/` directory for details on why the failures occurred.
+---
 
 ## Library and Technical Docs
 
