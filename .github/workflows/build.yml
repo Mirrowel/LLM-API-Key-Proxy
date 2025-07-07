@@ -45,14 +45,19 @@ jobs:
         $sha = git rev-parse --short HEAD
         echo "sha=$sha" >> $env:GITHUB_OUTPUT
 
+    - name: Prepare files for artifact
+      shell: pwsh
+      run: |
+        mkdir staging
+        copy src/proxy_app/dist/proxy_app.exe staging/
+        copy setup_env.bat staging/
+        copy .env.example staging/
+
     - name: Archive build artifact
       uses: actions/upload-artifact@v4
       with:
         name: proxy-app-build-${{ steps.version.outputs.sha }}
-        path: |
-          src/proxy_app/dist/proxy_app.exe
-          setup_env.bat
-          .env.example
+        path: staging/
 
   release:
     needs: build
