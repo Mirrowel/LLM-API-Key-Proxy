@@ -64,47 +64,85 @@ class RotatingClient:
         """
         A definitive hybrid wrapper for streaming responses that ensures usage is recorded
         and the key lock is released only after the stream is fully consumed.
-        It exhaustively checks for usage data in all possible locations and gracefully
-        handles JSON decoding errors from the stream.
+        It gracefully handles JSON decoding errors by buffering and attempting to
+        reassemble fragmented JSON objects only when an error is detected.
         """
         usage_recorded = False
         stream_completed = False
         stream_iterator = stream.__aiter__()
-        
+        json_buffer = ""
+
         try:
             while True:
                 try:
+                    # 1. Await the next item from the stream iterator.
                     chunk = await stream_iterator.__anext__()
+
+                    # 2. If we receive a valid chunk while the buffer has content,
+                    #    it implies the buffered data was an unrecoverable fragment.
+                    #    Log it, discard the buffer, and proceed with the valid chunk.
+                    if json_buffer:
+                        lib_logger.warning(f"Discarding incomplete JSON buffer because a valid chunk was received: {json_buffer}")
+                        json_buffer = ""
+
+                    # 3. This is the "happy path" where the chunk is valid.
+                    #    Yield it in the Server-Sent Events (SSE) format.
                     yield f"data: {json.dumps(chunk.dict())}\n\n"
-                    
-                    # 1. First, try to find usage in a chunk (for providers that send it mid-stream)
+
+                    # 4. Try to record usage from the valid chunk itself.
                     if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
                         await self.usage_manager.record_success(key, model, chunk)
                         usage_recorded = True
                         lib_logger.info(f"Recorded usage from stream chunk for key ...{key[-4:]}")
-                
-                except StopAsyncIteration:
-                    # The stream finished successfully.
-                    stream_completed = True
-                    break
-                
-                except Exception as e:
-                    # This will catch JSONDecodeError and other potential issues with a chunk
-                    lib_logger.warning(f"Skipping a malformed chunk for key ...{key[-4:]}: {e}")
-                    continue # Skip to the next chunk
 
+                except StopAsyncIteration:
+                    # 5. The stream has ended successfully.
+                    stream_completed = True
+                    if json_buffer:
+                        lib_logger.warning(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                    break
+
+                except Exception as e:
+                    # 6. An exception occurred, indicating a potentially malformed or fragmented chunk.
+                    #    This is where we enter our robust buffering and reassembly logic.
+                    lib_logger.info(f"Malformed chunk detected for key ...{key[-4:]}. Attempting to buffer and reassemble.")
+                    
+                    try:
+                        # 6a. The raw chunk string is usually in the exception message from litellm.
+                        #     We extract it here. This is fragile but necessary.
+                        raw_chunk = str(e).split("Received chunk:")[-1].strip()
+                        json_buffer += raw_chunk
+
+                        # 6b. Try to parse the entire buffer.
+                        try:
+                            parsed_data = json.loads(json_buffer)
+                            # Success! The buffer now contains a complete JSON object.
+                            lib_logger.info(f"Successfully reassembled JSON from buffer: {json_buffer}")
+                            yield f"data: {json.dumps(parsed_data)}\n\n"
+                            json_buffer = ""  # Clear the buffer to start fresh.
+                        except json.JSONDecodeError:
+                            # The buffer is still not a complete JSON object.
+                            # We'll continue to the next loop iteration to get more chunks.
+                            lib_logger.info(f"Buffer is still not a complete JSON object. Waiting for more chunks.")
+                            continue
+                    except Exception as buffer_exc:
+                        # If our own buffering logic fails, log it and reset to prevent getting stuck.
+                        lib_logger.error(f"Error during stream buffering logic: {buffer_exc}. Discarding buffer.")
+                        json_buffer = ""
+                        continue
         finally:
-            # 2. If not found in a chunk, try the final stream object itself (for other providers)
+            # 7. This block ensures that usage is recorded and the key is released,
+            #    no matter how the stream terminates.
             if not usage_recorded:
-                # This call is now safe because record_success is robust
+                # If usage wasn't found in any chunk, try to get it from the final stream object.
                 await self.usage_manager.record_success(key, model, stream)
                 lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
 
-            # 3. Release the key only after all attempts to record usage are complete
+            # 8. Release the key so it can be used by other requests.
             await self.usage_manager.release_key(key, model)
             lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
             
-            # Only yield [DONE] if the stream completed successfully
+            # 9. Only send the [DONE] message if the stream completed without being aborted.
             if stream_completed:
                 yield "data: [DONE]\n\n"
 
