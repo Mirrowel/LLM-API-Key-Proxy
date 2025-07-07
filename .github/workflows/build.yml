@@ -80,7 +80,9 @@ jobs:
         
         # Find the number of releases already created today for this branch
         # We list releases and filter for tags matching "branch/build-YYYY.MM.DD"
-        BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | grep "^$BRANCH_NAME/build-$DATE_STAMP" | wc -l)
+        # The grep pattern is corrected and wrapped in a block with `|| true`
+        # to prevent its exit code from failing the step when no matches are found.
+        BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | { grep "$BRANCH_NAME/build-$DATE_STAMP" || true; } | wc -l)
         
         # Increment the build number for the new release
         BUILD_NUMBER=$((BUILD_COUNT + 1))
