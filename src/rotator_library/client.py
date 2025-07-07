@@ -176,7 +176,7 @@ class RotatingClient:
                 yield "data: [DONE]\n\n"
 
 
-    async def acompletion(self, pre_request_callback: Optional[callable] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
+    async def acompletion(self, request: Optional[Any] = None, pre_request_callback: Optional[callable] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
         """
         Performs a completion call with smart key rotation and retry logic.
         It will try each available key in sequence if the previous one fails.
@@ -275,9 +275,15 @@ class RotatingClient:
                         
                         classified_error = classify_error(e)
 
+                        classified_error = classify_error(e)
+
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
                             # These errors are not recoverable by rotating keys, so fail fast.
                             lib_logger.error(f"Unrecoverable error '{classified_error.error_type}' with key ...{current_key[-4:]}. Failing request.")
+                            raise last_exception
+
+                        if request and await request.is_disconnected():
+                            lib_logger.warning(f"Client disconnected. Aborting retries for key ...{current_key[-4:]}.")
                             raise last_exception
 
                         if classified_error.error_type in ['server_error', 'api_connection']:
@@ -310,7 +316,7 @@ class RotatingClient:
         
         raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
 
-    async def aembedding(self, **kwargs) -> Any:
+    async def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
         """
         Performs an embedding call with smart key rotation and retry logic.
         """
@@ -364,6 +370,10 @@ class RotatingClient:
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
                             lib_logger.error(f"Unrecoverable error '{classified_error.error_type}' with key ...{current_key[-4:]}. Failing request.")
+                            raise last_exception
+
+                        if request and await request.is_disconnected():
+                            lib_logger.warning(f"Client disconnected during embedding. Aborting retries for key ...{current_key[-4:]}.")
                             raise last_exception
 
                         if classified_error.error_type in ['server_error', 'api_connection']:

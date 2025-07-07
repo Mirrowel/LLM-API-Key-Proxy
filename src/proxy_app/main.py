@@ -239,7 +239,7 @@ async def chat_completions(
         request_data = await request.json()
         is_streaming = request_data.get("stream", False)
 
-        response = await client.acompletion(**request_data)
+        response = await client.acompletion(request=request, **request_data)
 
         if is_streaming:
             # Wrap the streaming response to enable logging after it's complete
@@ -339,7 +339,7 @@ async def embeddings(
             if isinstance(request_data.get("input"), str):
                 request_data["input"] = [request_data["input"]]
             
-            response = await client.aembedding(**request_data)
+            response = await client.aembedding(request=request, **request_data)
 
         if ENABLE_REQUEST_LOGGING:
             response_summary = {
