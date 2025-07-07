@@ -192,28 +192,28 @@ class RotatingClient:
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         
                         classified_error = classify_error(e)
-                        
-                        if classified_error.error_type in ['invalid_request', 'authentication']:
-                            # These are permanent failures for this key, so record and move on.
-                            await self.usage_manager.record_failure(current_key, model, classified_error)
-                            break 
 
-                        if classified_error.error_type in ['rate_limit', 'server_error']:
-                            # These are temporary, so record the failure with a potential retry time.
+                        if classified_error.error_type == 'server_error':
+                            # This is a temporary error, so record the failure and retry.
                             await self.usage_manager.record_failure(current_key, model, classified_error)
                             
                             # If it's the last attempt for this key, we break to try the next key.
                             if attempt >= self.max_retries - 1:
+                                lib_logger.warning(f"Key ...{current_key[-4:]} failed on final retry for server_error. Trying next key.")
                                 break
 
                             # Otherwise, wait and retry with the same key.
                             wait_time = classified_error.retry_after or (2 ** attempt) + random.uniform(0, 1)
-                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a {classified_error.error_type}. Retrying in {wait_time:.2f} seconds...")
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server_error. Retrying in {wait_time:.2f} seconds...")
                             await asyncio.sleep(wait_time)
                             continue
-                        
-                        # For any other classified errors, record failure and try the next key.
+
+                        # For rate limits or other permanent errors, record the failure and break to try the next key.
                         await self.usage_manager.record_failure(current_key, model, classified_error)
+                        if classified_error.error_type == 'rate_limit':
+                            lib_logger.warning(f"Key ...{current_key[-4:]} rate limited. Trying next key.")
+                        else:
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a permanent {classified_error.error_type}. Trying next key.")
                         break
             finally:
                 # This block ensures the key is always released if it was acquired but not passed to the wrapper.
@@ -243,26 +243,31 @@ class RotatingClient:
             lib_logger.info(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
-        api_key = self.api_keys.get(provider, [None])[0]
-        if not api_key:
+        keys_for_provider = self.api_keys.get(provider)
+        if not keys_for_provider:
             lib_logger.warning(f"No API key for provider: {provider}")
             return []
 
+        # Create a copy and shuffle it to randomize the starting key
+        shuffled_keys = list(keys_for_provider)
+        random.shuffle(shuffled_keys)
+
         provider_instance = self._get_provider_instance(provider)
         if provider_instance:
-            lib_logger.info(f"Calling get_models for provider: {provider}")
-            try:
-                models = await provider_instance.get_models(api_key, self.http_client)
-                lib_logger.info(f"Got {len(models)} models for provider: {provider}")
-                self._model_list_cache[provider] = models
-                return models
-            except Exception as e:
-                classified_error = classify_error(e)
-                lib_logger.error(f"Failed to get models for provider {provider}: {classified_error}")
-                return []
-        else:
-            lib_logger.warning(f"Model list fetching not implemented for provider: {provider}")
-            return []
+            for api_key in shuffled_keys:
+                try:
+                    lib_logger.info(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
+                    models = await provider_instance.get_models(api_key, self.http_client)
+                    lib_logger.info(f"Got {len(models)} models for provider: {provider}")
+                    self._model_list_cache[provider] = models
+                    return models
+                except Exception as e:
+                    classified_error = classify_error(e)
+                    lib_logger.warning(f"Failed to get models for provider {provider} with key ...{api_key[-4:]}: {classified_error.error_type}. Trying next key.")
+                    continue # Try the next key
+        
+        lib_logger.error(f"Failed to get models for provider {provider} after trying all keys.")
+        return []
 
     async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:
         """Returns a list of all available models, either grouped by provider or as a flat list."""
