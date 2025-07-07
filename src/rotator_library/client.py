@@ -84,6 +84,92 @@ class RotatingClient:
                 return None
         return self._provider_instances[provider_name]
 
+    async def _safe_streaming_wrapper(self, stream: Any, key: str, model: str, request: Optional[Any] = None) -> AsyncGenerator[Any, None]:
+        """
+        A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
+        and distinguishes between content and streamed errors.
+        """
+        usage_recorded = False
+        stream_completed = False
+        stream_iterator = stream.__aiter__()
+        json_buffer = ""
+
+        try:
+            while True:
+                if request and await request.is_disconnected():
+                    lib_logger.warning(f"Client disconnected. Aborting stream for key ...{key[-4:]}.")
+                    # Do not yield [DONE] because the client is gone.
+                    # The 'finally' block will handle key release.
+                    break
+
+                try:
+                    chunk = await stream_iterator.__anext__()
+                    if json_buffer:
+                        lib_logger.warning(f"Discarding incomplete JSON buffer: {json_buffer}")
+                        json_buffer = ""
+                    
+                    yield f"data: {json.dumps(chunk.dict())}\n\n"
+
+                    if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
+                        await self.usage_manager.record_success(key, model, chunk)
+                        usage_recorded = True
+
+                except StopAsyncIteration:
+                    stream_completed = True
+                    if json_buffer:
+                        lib_logger.warning(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                    break
+
+                except Exception as e:
+                    try:
+                        raw_chunk = str(e).split("Received chunk:")[-1].strip()
+                        json_buffer += raw_chunk
+                        parsed_data = json.loads(json_buffer)
+                        
+                        lib_logger.info(f"Successfully reassembled JSON from buffer: {json_buffer}")
+                        
+                        if "error" in parsed_data:
+                            lib_logger.warning(f"Reassembled object is an API error. Passing it to the client and raising internally.")
+                            yield f"data: {json.dumps(parsed_data)}\n\n"
+                            # Signal the error to the outer retry loop so it can try the next key.
+                            raise StreamedAPIError("Provider error received in stream", data=parsed_data)
+                        else:
+                            yield f"data: {json.dumps(parsed_data)}\n\n"
+                        
+                        json_buffer = ""
+                    except json.JSONDecodeError:
+                        lib_logger.info(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
+                        continue
+                    except StreamedAPIError:
+                        # Re-raise to be caught by the outer handler
+                        raise
+                    except Exception as buffer_exc:
+                        lib_logger.error(f"Error during stream buffering logic: {buffer_exc}. Discarding buffer.")
+                        json_buffer = ""
+                        continue
+        
+        except StreamedAPIError:
+            # This is caught by the acompletion retry logic.
+            # We re-raise it to ensure it's not caught by the generic 'except Exception'.
+            raise
+
+        except Exception as e:
+            # Catch any other unexpected errors during streaming.
+            lib_logger.error(f"An unexpected error occurred during the stream for key ...{key[-4:]}: {e}")
+            # We still need to raise it so the client knows something went wrong.
+            raise
+
+        finally:
+            # Only record usage if the stream completed successfully and usage wasn't already recorded.
+            if stream_completed and not usage_recorded:
+                await self.usage_manager.record_success(key, model, stream)
+            
+            await self.usage_manager.release_key(key, model)
+            lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
+            
+            if stream_completed:
+                yield "data: [DONE]\n\n"
+
     async def acompletion(self, request: Optional[Any] = None, pre_request_callback: Optional[callable] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
         kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
@@ -96,25 +182,10 @@ class RotatingClient:
         if provider not in self.api_keys:
             raise ValueError(f"No API keys configured for provider: {provider}")
 
-        async def _streaming_generator(_stream, _key, _model):
-            """Generator that yields stream chunks and handles key release."""
-            try:
-                async for chunk in _stream:
-                    if request and await request.is_disconnected():
-                        lib_logger.warning("Client disconnected, cancelling stream.")
-                        raise asyncio.CancelledError("Client disconnected")
-                    yield f"data: {json.dumps(chunk.dict())}\n\n"
-                
-                await self.usage_manager.record_success(_key, _model, _stream)
-                yield "data: [DONE]\n\n"
-            finally:
-                await self.usage_manager.release_key(_key, _model)
-                lib_logger.info(f"STREAM FINISHED and lock released for key ...{_key[-4:]}.")
-
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
-
+        
         while len(tried_keys) < len(keys_for_provider):
             current_key = None
             key_acquired = False
@@ -135,58 +206,64 @@ class RotatingClient:
                     converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
                     if converted_settings is not None: litellm_kwargs["safety_settings"] = converted_settings
                     else: del litellm_kwargs["safety_settings"]
+                
                 if provider == "gemini":
                     if provider_instance: provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+
                 if "gemma-3" in model and "messages" in litellm_kwargs:
                     litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
+                
                 litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
 
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        if pre_request_callback: await pre_request_callback()
+                        
+                        if pre_request_callback:
+                            await pre_request_callback()
 
                         response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
 
                         if is_streaming:
                             key_acquired = False
-                            return _streaming_generator(response, current_key, model)
+                            return self._safe_streaming_wrapper(response, current_key, model, request)
                         else:
                             await self.usage_manager.record_success(current_key, model, response)
-                            key_acquired = False
                             await self.usage_manager.release_key(current_key, model)
+                            key_acquired = False
                             return response
+
+                    except (StreamedAPIError, APIConnectionError) as e:
+                        # These errors are caught to allow retrying with the next key.
+                        last_exception = e
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        classified_error = classify_error(e)
+                        await self.usage_manager.record_failure(current_key, model, classified_error)
+                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered '{classified_error.error_type}'. Trying next key.")
+                        break # Break from retry loop, try next key
 
                     except Exception as e:
                         last_exception = e
-                        if isinstance(e, asyncio.CancelledError): raise e
-                        
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        classified_error = classify_error(e)
-
-                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
-                            raise last_exception
                         
                         if request and await request.is_disconnected():
                             lib_logger.warning(f"Client disconnected. Aborting retries for key ...{current_key[-4:]}.")
                             raise last_exception
 
+                        classified_error = classify_error(e)
+                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
+                            raise last_exception
+
                         if classified_error.error_type in ['server_error', 'api_connection']:
                             await self.usage_manager.record_failure(current_key, model, classified_error)
-                            if attempt >= self.max_retries - 1: break
+                            if attempt >= self.max_retries - 1:
+                                break
                             wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
                             await asyncio.sleep(wait_time)
                             continue
-                        
+
                         await self.usage_manager.record_failure(current_key, model, classified_error)
                         break
-            
-            except (litellm.InvalidRequestError, litellm.ContextWindowExceededError, asyncio.CancelledError) as e:
-                raise e
-            except Exception as e:
-                last_exception = e
-                lib_logger.error(f"An unexpected error occurred with key ...{current_key[-4:] if current_key else 'N/A'}: {e}")
-                continue
             finally:
                 if key_acquired and current_key:
                     await self.usage_manager.release_key(current_key, model)
@@ -194,7 +271,7 @@ class RotatingClient:
         if last_exception:
             raise last_exception
         
-        raise Exception("Failed to complete the request: No available API keys or all keys failed.")
+        raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
 
     async def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
         kwargs = self._convert_model_params(**kwargs)
