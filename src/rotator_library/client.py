@@ -127,9 +127,9 @@ class RotatingClient:
                             
                             # 6b. INTELLIGENTLY INSPECT the reassembled object.
                             if "error" in parsed_data:
-                                # This is a provider error. Raise it to trigger the retry logic.
-                                lib_logger.warning(f"Reassembled object is an API error.")
-                                raise StreamedAPIError("API error received in stream", data=parsed_data)
+                                # This is a provider error. Log it and pass it through the stream.
+                                lib_logger.warning(f"Reassembled object is an API error. Passing it to the client.")
+                                yield f"data: {json.dumps(parsed_data)}\n\n"
                             else:
                                 # This is a valid content chunk that was fragmented.
                                 lib_logger.info("Reassembled object is a valid content chunk.")
@@ -141,8 +141,6 @@ class RotatingClient:
                             # We'll continue to the next loop iteration to get more chunks.
                             lib_logger.info(f"Buffer is still not a complete JSON object. Waiting for more chunks.")
                             continue
-                    except StreamedAPIError:
-                        raise # Re-raise the error to be caught by acompletion
                     except Exception as buffer_exc:
                         # If our own buffering logic fails, log it and reset to prevent getting stuck.
                         lib_logger.error(f"Error during stream buffering logic: {buffer_exc}. Discarding buffer.")
@@ -247,16 +245,9 @@ class RotatingClient:
                         if is_streaming:
                             # For streaming, the wrapper takes responsibility for the key.
                             key_acquired = False
-                            try:
-                                # The wrapper will yield chunks and handle reassembly.
-                                # It raises StreamedAPIError if it reassembles a provider error.
-                                return self._safe_streaming_wrapper(response, current_key, model)
-                            except StreamedAPIError as e:
-                                # The wrapper has detected a streamed error.
-                                # We now translate it into a litellm exception that the main
-                                # retry loop can classify and handle correctly.
-                                lib_logger.error(f"Streamed error caught, triggering retry logic: {e.data}")
-                                raise APIConnectionError(f"Streamed API Error: {e.data.get('error', {}).get('message', 'Unknown')}")
+                            # The wrapper will now yield all chunks, including any provider errors,
+                            # and will handle releasing the key internally.
+                            return self._safe_streaming_wrapper(response, current_key, model)
                         else:
                             # For non-streaming, record and release here.
                             await self.usage_manager.record_success(current_key, model, response)
