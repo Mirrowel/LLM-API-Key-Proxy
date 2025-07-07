@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 import sys
 import json
-from typing import AsyncGenerator, Any, List, Optional
+from typing import AsyncGenerator, Any, List, Optional, Union
 from pydantic import BaseModel
 import argparse
 import litellm
@@ -18,7 +18,7 @@ import litellm
 # --- Pydantic Models ---
 class EmbeddingRequest(BaseModel):
     model: str
-    input: List[str]
+    input: Union[str, List[str]]
     input_type: Optional[str] = None
     dimensions: Optional[int] = None
     user: Optional[str] = None
@@ -229,7 +229,7 @@ async def chat_completions(
             if ENABLE_REQUEST_LOGGING:
                 log_request_response(
                     request_data=request_data,
-                    response_data=response.dict(),
+                    response_data=response.model_dump(),
                     is_streaming=False,
                     log_type="completion"
                 )
@@ -274,14 +274,19 @@ async def embeddings(
     OpenAI-compatible endpoint for creating embeddings.
     """
     try:
-        request_data = body.dict(exclude_none=True)
+        request_data = body.model_dump(exclude_none=True)
+        
+        # Ensure input is always a list for the client
+        if isinstance(request_data.get("input"), str):
+            request_data["input"] = [request_data["input"]]
+
         response = await client.aembedding(**request_data)
         
         if ENABLE_REQUEST_LOGGING:
             response_summary = {
                 "model": response.model,
                 "object": response.object,
-                "usage": response.usage.dict(),
+                "usage": response.usage.model_dump(),
                 "data_count": len(response.data),
                 "embedding_dimensions": len(response.data[0].embedding) if response.data else 0
             }
