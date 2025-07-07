@@ -135,10 +135,10 @@ For the simplest experience, follow the **Easy Setup for Beginners** guide at th
 
 **B) Running from Source**
 
-Start the FastAPI server with `uvicorn`. The `--reload` flag will automatically restart the server when you make code changes.
+Start the server by running the `main.py` script directly.
 
 ```bash
-uvicorn src.proxy_app.main:app --reload
+python src/proxy_app/main.py
 ```
 
 The proxy is now running and available at `http://127.0.0.1:8000`.
@@ -229,21 +229,25 @@ The core of this project is the `RotatingClient` library. When a request is made
     -   For **rate-limit or auth errors**, it records the failure, applies an escalating cooldown for that specific key-model pair, and the client immediately tries the next available key.
 4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key's lock is then released, notifying any waiting requests that it is available.
 
-### Enabling Request Logging
+### Command-Line Arguments and Scripts
 
-For debugging purposes, you can log the full request and response for every API call. To enable this, start the proxy with the `--enable-request-logging` flag:
+The proxy server can be configured at runtime using the following command-line arguments:
 
-**When running from source:**
+-   `--host`: The IP address to bind the server to. Defaults to `0.0.0.0` (accessible from your local network).
+-   `--port`: The port to run the server on. Defaults to `8000`.
+-   `--enable-request-logging`: A flag to enable logging of full request and response payloads to the `logs/` directory. This is useful for debugging.
+
+**Example:**
 ```bash
-uvicorn src.proxy_app.main:app --reload -- --enable-request-logging
+python src/proxy_app/main.py --host 127.0.0.1 --port 9999 --enable-request-logging
 ```
 
-**When running the executable:**
-```powershell
-./proxy_app.exe --enable-request-logging
-```
+#### Windows Batch Scripts
 
-Logs will be saved as JSON files in the `logs/` directory.
+For convenience on Windows, you can use the provided `.bat` scripts in the root directory to run the proxy with common configurations:
+
+-   **`start_proxy.bat`**: Starts the proxy on `0.0.0.0:8000` with default settings.
+-   **`start_proxy_debug_logging.bat`**: Starts the proxy and automatically enables request logging.
 
 ### Troubleshooting
 

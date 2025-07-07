@@ -32,14 +32,26 @@ This is the main class for interacting with the library. It is designed to be a 
 ### Initialization
 
 ```python
+import os
+from dotenv import load_dotenv
 from rotating_api_key_client import RotatingClient
-from typing import Dict, List
 
-# Define your API keys, grouped by provider
-api_keys: Dict[str, List[str]] = {
-    "gemini": ["your_gemini_key_1", "your_gemini_key_2"],
-    "openai": ["your_openai_key_1"],
-}
+# Load environment variables from .env file
+load_dotenv()
+
+# Dynamically load all provider API keys from environment variables
+api_keys = {}
+for key, value in os.environ.items():
+    # This pattern finds keys like "GEMINI_API_KEY_1" or "OPENAI_API_KEY"
+    if (key.endswith("_API_KEY") or "_API_KEY_" in key) and key != "PROXY_API_KEY":
+        # Extracts "gemini" from "GEMINI_API_KEY_1"
+        provider = key.split("_API_KEY")[0].lower()
+        if provider not in api_keys:
+            api_keys[provider] = []
+        api_keys[provider].append(value)
+
+if not api_keys:
+    raise ValueError("No provider API keys found in environment variables.")
 
 client = RotatingClient(
     api_keys=api_keys,
