@@ -197,9 +197,6 @@ class RotatingClient:
         raise Exception("Failed to complete the request: No available API keys or all keys failed.")
 
     async def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
-        """
-        Performs an embedding call with smart key rotation and retry logic.
-        """
         kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         if not model:
@@ -221,10 +218,7 @@ class RotatingClient:
                 if not keys_to_try:
                     break
 
-                current_key = await self.usage_manager.acquire_key(
-                    available_keys=keys_to_try,
-                    model=model
-                )
+                current_key = await self.usage_manager.acquire_key(available_keys=keys_to_try, model=model)
                 key_acquired = True
                 tried_keys.add(current_key)
 
@@ -234,45 +228,41 @@ class RotatingClient:
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting embedding call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        
                         response = await litellm.aembedding(api_key=current_key, **litellm_kwargs)
                         
                         await self.usage_manager.record_success(current_key, model, response)
-                        await self.usage_manager.release_key(current_key, model)
-                        key_acquired = False
                         return response
 
                     except Exception as e:
                         last_exception = e
+                        if isinstance(e, asyncio.CancelledError): raise e
+
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        
                         classified_error = classify_error(e)
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
-                            lib_logger.error(f"Unrecoverable error '{classified_error.error_type}' with key ...{current_key[-4:]}. Failing request.")
                             raise last_exception
-
+                        
                         if request and await request.is_disconnected():
                             lib_logger.warning(f"Client disconnected during embedding. Aborting retries for key ...{current_key[-4:]}.")
                             raise last_exception
 
                         if classified_error.error_type in ['server_error', 'api_connection']:
                             await self.usage_manager.record_failure(current_key, model, classified_error)
-                            
-                            if attempt >= self.max_retries - 1:
-                                lib_logger.warning(f"Key ...{current_key[-4:]} failed on final retry for {classified_error.error_type}. Trying next key.")
-                                break
-
-                            base_wait = 5 if classified_error.error_type == 'api_connection' else 1
-                            wait_time = classified_error.retry_after or (base_wait * (2 ** attempt)) + random.uniform(0, 1)
-                            
-                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a {classified_error.error_type}. Retrying in {wait_time:.2f} seconds...")
+                            if attempt >= self.max_retries - 1: break
+                            wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
                             await asyncio.sleep(wait_time)
                             continue
-
+                        
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered '{classified_error.error_type}'. Trying next key.")
                         break
+            
+            except (litellm.InvalidRequestError, litellm.ContextWindowExceededError, asyncio.CancelledError) as e:
+                raise e
+            except Exception as e:
+                last_exception = e
+                lib_logger.error(f"An unexpected error occurred with key ...{current_key[-4:] if current_key else 'N/A'}: {e}")
+                continue
             finally:
                 if key_acquired and current_key:
                     await self.usage_manager.release_key(current_key, model)
@@ -280,7 +270,7 @@ class RotatingClient:
         if last_exception:
             raise last_exception
         
-        raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
+        raise Exception("Failed to complete the request: No available API keys or all keys failed.")
 
     def token_count(self, **kwargs) -> int:
         """Calculates the number of tokens for a given text or list of messages."""

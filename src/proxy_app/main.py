@@ -243,16 +243,14 @@ async def chat_completions(
         request_data = await request.json()
         is_streaming = request_data.get("stream", False)
 
-        response = await client.acompletion(request=request, **request_data)
-
         if is_streaming:
-            # For streaming, the response is the generator.
+            response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
-                streaming_response_wrapper(request, request_data, response),
+                streaming_response_wrapper(request, request_data, response_generator),
                 media_type="text/event-stream"
             )
         else:
-            # For non-streaming, the response is the completed object.
+            response = await client.acompletion(request=request, **request_data)
             if ENABLE_REQUEST_LOGGING:
                 log_request_response(
                     request_data=request_data,
