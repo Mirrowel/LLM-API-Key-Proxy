@@ -193,27 +193,30 @@ class RotatingClient:
                         
                         classified_error = classify_error(e)
 
-                        if classified_error.error_type == 'server_error':
-                            # This is a temporary error, so record the failure and retry.
+                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded']:
+                            # These errors are not recoverable by rotating keys, so fail fast.
+                            lib_logger.error(f"Unrecoverable error '{classified_error.error_type}' with key ...{current_key[-4:]}. Failing request.")
+                            raise last_exception
+
+                        if classified_error.error_type in ['server_error', 'api_connection']:
+                            # These are temporary, so record the failure and retry with backoff.
                             await self.usage_manager.record_failure(current_key, model, classified_error)
                             
-                            # If it's the last attempt for this key, we break to try the next key.
                             if attempt >= self.max_retries - 1:
-                                lib_logger.warning(f"Key ...{current_key[-4:]} failed on final retry for server_error. Trying next key.")
+                                lib_logger.warning(f"Key ...{current_key[-4:]} failed on final retry for {classified_error.error_type}. Trying next key.")
                                 break
 
-                            # Otherwise, wait and retry with the same key.
-                            wait_time = classified_error.retry_after or (2 ** attempt) + random.uniform(0, 1)
-                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server_error. Retrying in {wait_time:.2f} seconds...")
+                            # Use a longer cooldown for API connection errors
+                            base_wait = 5 if classified_error.error_type == 'api_connection' else 1
+                            wait_time = classified_error.retry_after or (base_wait * (2 ** attempt)) + random.uniform(0, 1)
+                            
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a {classified_error.error_type}. Retrying in {wait_time:.2f} seconds...")
                             await asyncio.sleep(wait_time)
                             continue
 
-                        # For rate limits or other permanent errors, record the failure and break to try the next key.
+                        # For other errors (rate_limit, authentication, unknown), record failure and try the next key.
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        if classified_error.error_type == 'rate_limit':
-                            lib_logger.warning(f"Key ...{current_key[-4:]} rate limited. Trying next key.")
-                        else:
-                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a permanent {classified_error.error_type}. Trying next key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered '{classified_error.error_type}'. Trying next key.")
                         break
             finally:
                 # This block ensures the key is always released if it was acquired but not passed to the wrapper.

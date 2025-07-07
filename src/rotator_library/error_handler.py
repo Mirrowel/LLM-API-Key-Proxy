@@ -1,7 +1,7 @@
 import re
 from typing import Optional, Dict, Any
 
-from litellm.exceptions import APIConnectionError, RateLimitError, ServiceUnavailableError, AuthenticationError, InvalidRequestError, BadRequestError, OpenAIError, InternalServerError
+from litellm.exceptions import APIConnectionError, RateLimitError, ServiceUnavailableError, AuthenticationError, InvalidRequestError, BadRequestError, OpenAIError, InternalServerError, Timeout, ContextWindowExceededError
 
 class ClassifiedError:
     """A structured representation of a classified error."""
@@ -97,8 +97,22 @@ def classify_error(e: Exception) -> ClassifiedError:
             original_exception=e,
             status_code=status_code or 400
         )
+    
+    if isinstance(e, ContextWindowExceededError):
+        return ClassifiedError(
+            error_type='context_window_exceeded',
+            original_exception=e,
+            status_code=status_code or 400
+        )
 
-    if isinstance(e, (ServiceUnavailableError, APIConnectionError, OpenAIError, InternalServerError)):
+    if isinstance(e, (APIConnectionError, Timeout)):
+        return ClassifiedError(
+            error_type='api_connection',
+            original_exception=e,
+            status_code=status_code or 503 # Treat like a server error
+        )
+
+    if isinstance(e, (ServiceUnavailableError, InternalServerError, OpenAIError)):
         # These are often temporary server-side issues
         return ClassifiedError(
             error_type='server_error',
