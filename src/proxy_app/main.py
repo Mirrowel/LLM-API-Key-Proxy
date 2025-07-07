@@ -1,5 +1,6 @@
 print("Proxy starting...")
 print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -45,6 +46,7 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --- Configuration ---
+USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
@@ -69,14 +71,26 @@ if not api_keys:
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
     client = RotatingClient(api_keys=api_keys)
-    batcher = EmbeddingBatcher(client=client)
     app.state.rotating_client = client
-    app.state.embedding_batcher = batcher
-    print("RotatingClient and EmbeddingBatcher initialized.")
+    
+    if USE_EMBEDDING_BATCHER:
+        batcher = EmbeddingBatcher(client=client)
+        app.state.embedding_batcher = batcher
+        print("RotatingClient and EmbeddingBatcher initialized.")
+    else:
+        app.state.embedding_batcher = None
+        print("RotatingClient initialized (EmbeddingBatcher disabled).")
+        
     yield
-    await batcher.stop()
+    
+    if app.state.embedding_batcher:
+        await app.state.embedding_batcher.stop()
     await client.close()
-    print("RotatingClient and EmbeddingBatcher closed.")
+    
+    if app.state.embedding_batcher:
+        print("RotatingClient and EmbeddingBatcher closed.")
+    else:
+        print("RotatingClient closed.")
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
@@ -276,26 +290,56 @@ async def chat_completions(
 async def embeddings(
     request: Request,
     body: EmbeddingRequest,
-    batcher: EmbeddingBatcher = Depends(get_embedding_batcher),
+    client: RotatingClient = Depends(get_rotating_client),
+    batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
     _ = Depends(verify_api_key)
 ):
     """
     OpenAI-compatible endpoint for creating embeddings.
-    This endpoint uses a batching manager to group requests for efficiency.
+    Supports two modes based on the USE_EMBEDDING_BATCHER flag:
+    - True: Uses a server-side batcher for high throughput.
+    - False: Passes requests directly to the provider.
     """
     try:
-        request_data = body.model_dump(exclude_none=True)
-        
-        # The batcher expects a single string input per request
-        if isinstance(request_data.get("input"), list):
-            if len(request_data["input"]) > 1:
-                raise HTTPException(status_code=400, detail="Batching multiple inputs in a single request is not supported when using the server-side batcher. Please send one input string per request.")
-            request_data["input"] = request_data["input"][0]
+        if USE_EMBEDDING_BATCHER and batcher:
+            # --- Server-Side Batching Logic ---
+            request_data = body.model_dump(exclude_none=True)
+            inputs = request_data.get("input", [])
+            if isinstance(inputs, str):
+                inputs = [inputs]
 
-        response_data = await batcher.add_request(request_data)
+            tasks = []
+            for single_input in inputs:
+                individual_request = request_data.copy()
+                individual_request["input"] = single_input
+                tasks.append(batcher.add_request(individual_request))
+            
+            results = await asyncio.gather(*tasks)
+
+            all_data = []
+            total_prompt_tokens = 0
+            total_tokens = 0
+            for i, result in enumerate(results):
+                result["data"][0]["index"] = i
+                all_data.extend(result["data"])
+                total_prompt_tokens += result["usage"]["prompt_tokens"]
+                total_tokens += result["usage"]["total_tokens"]
+
+            final_response_data = {
+                "object": "list",
+                "model": results[0]["model"],
+                "data": all_data,
+                "usage": { "prompt_tokens": total_prompt_tokens, "total_tokens": total_tokens },
+            }
+            response = litellm.EmbeddingResponse(**final_response_data)
         
-        # The batcher returns a dict, not a Pydantic model, so we construct it
-        response = litellm.EmbeddingResponse(**response_data)
+        else:
+            # --- Direct Pass-Through Logic ---
+            request_data = body.model_dump(exclude_none=True)
+            if isinstance(request_data.get("input"), str):
+                request_data["input"] = [request_data["input"]]
+            
+            response = await client.aembedding(**request_data)
 
         if ENABLE_REQUEST_LOGGING:
             response_summary = {
@@ -306,13 +350,16 @@ async def embeddings(
                 "embedding_dimensions": len(response.data[0].embedding) if response.data else 0
             }
             log_request_response(
-                request_data=request_data,
+                request_data=body.model_dump(exclude_none=True),
                 response_data=response_summary,
                 is_streaming=False,
                 log_type="embedding"
             )
         return response
 
+    except HTTPException as e:
+        # Re-raise HTTPException to ensure it's not caught by the generic Exception handler
+        raise e
     except (litellm.InvalidRequestError, ValueError, litellm.ContextWindowExceededError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
     except litellm.AuthenticationError as e:
