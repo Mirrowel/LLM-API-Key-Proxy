@@ -20,6 +20,7 @@ from .failure_logger import log_failure
 from .error_handler import classify_error, AllProviders
 from .providers import PROVIDER_PLUGINS
 from .request_sanitizer import sanitize_request_payload
+from .cooldown_manager import CooldownManager
 
 class StreamedAPIError(Exception):
     """Custom exception to signal an API error received over a stream."""
@@ -46,6 +47,7 @@ class RotatingClient:
         self._provider_instances = {}
         self.http_client = httpx.AsyncClient()
         self.all_providers = AllProviders()
+        self.cooldown_manager = CooldownManager()
 
     async def __aenter__(self):
         return self
@@ -190,6 +192,11 @@ class RotatingClient:
             current_key = None
             key_acquired = False
             try:
+                if await self.cooldown_manager.is_cooling_down(provider):
+                    remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
+                    lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
+                    await asyncio.sleep(remaining_time)
+
                 keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
                 if not keys_to_try:
                     break
@@ -236,14 +243,19 @@ class RotatingClient:
                             key_acquired = False
                             return response
 
-                    except (StreamedAPIError, APIConnectionError) as e:
-                        # These errors are caught to allow retrying with the next key.
+                    except (StreamedAPIError, APIConnectionError, litellm.RateLimitError) as e:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
+
+                        if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
+                            cooldown_duration = classified_error.retry_after or 60
+                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+                        
                         await self.usage_manager.record_failure(current_key, model, classified_error)
                         lib_logger.warning(f"Key ...{current_key[-4:]} encountered '{classified_error.error_type}'. Trying next key.")
-                        break # Break from retry loop, try next key
+                        break
 
                     except Exception as e:
                         last_exception = e
