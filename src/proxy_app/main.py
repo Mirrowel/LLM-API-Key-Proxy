@@ -111,6 +111,7 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
     return auth
 
 async def streaming_response_wrapper(
+    request: Request,
     request_data: dict,
     response_stream: AsyncGenerator[str, None]
 ) -> AsyncGenerator[str, None]:
@@ -124,6 +125,9 @@ async def streaming_response_wrapper(
     
     try:
         async for chunk_str in response_stream:
+            if await request.is_disconnected():
+                logging.warning("Client disconnected, stopping stream.")
+                break
             yield chunk_str
             if chunk_str.strip() and chunk_str.startswith("data:"):
                 content = chunk_str[len("data:"):].strip()
@@ -242,13 +246,13 @@ async def chat_completions(
         response = await client.acompletion(request=request, **request_data)
 
         if is_streaming:
-            # Wrap the streaming response to enable logging after it's complete
+            # For streaming, the response is the generator.
             return StreamingResponse(
-                streaming_response_wrapper(request_data, response),
+                streaming_response_wrapper(request, request_data, response),
                 media_type="text/event-stream"
             )
         else:
-            # For non-streaming, log immediately
+            # For non-streaming, the response is the completed object.
             if ENABLE_REQUEST_LOGGING:
                 log_request_response(
                     request_data=request_data,
