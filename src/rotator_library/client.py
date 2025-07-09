@@ -367,6 +367,19 @@ class RotatingClient:
                             last_exception = e
                             log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                             classified_error = classify_error(e)
+                            
+                            # Inform the client about the temporary failure before rotating.
+                            # This keeps the connection alive.
+                            error_message = f"Provider API key failed with {classified_error.error_type}. Rotating to a new key."
+                            error_data = {
+                                "error": {
+                                    "message": error_message,
+                                    "type": "proxy_key_rotation_error",
+                                    "code": classified_error.status_code
+                                }
+                            }
+                            yield f"data: {json.dumps(error_data)}\n\n"
+
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
                             
                             if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
@@ -385,6 +398,16 @@ class RotatingClient:
 
                             if attempt >= self.max_retries - 1:
                                 lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type}. Rotating key.")
+                                # Inform the client about the temporary failure before rotating.
+                                error_message = f"Key ...{current_key[-4:]} failed after multiple retries. Rotating to a new key."
+                                error_data = {
+                                    "error": {
+                                        "message": error_message,
+                                        "type": "proxy_key_rotation_error",
+                                        "code": classified_error.status_code
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_data)}\n\n"
                                 break
                             
                             wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
@@ -396,6 +419,19 @@ class RotatingClient:
                             last_exception = e
                             log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                             classified_error = classify_error(e)
+
+                            # For most exceptions, we notify the client and rotate the key.
+                            if classified_error.error_type not in ['invalid_request', 'context_window_exceeded', 'authentication']:
+                                error_message = f"An unexpected error occurred with key ...{current_key[-4:]}. Rotating to a new key."
+                                error_data = {
+                                    "error": {
+                                        "message": error_message,
+                                        "type": "proxy_key_rotation_error",
+                                        "code": classified_error.status_code
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_data)}\n\n"
+
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
 
                             if classified_error.status_code == 429:
