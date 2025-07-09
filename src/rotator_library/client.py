@@ -34,6 +34,9 @@ class RotatingClient:
     with support for both streaming and non-streaming responses.
     """
     def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True):
+        os.environ["LITELLM_LOG"] = "ERROR"
+        litellm.set_verbose = False
+        litellm.drop_params = True
         if configure_logging:
             # When True, this allows logs from this library to be handled
             # by the parent application's logging configuration.

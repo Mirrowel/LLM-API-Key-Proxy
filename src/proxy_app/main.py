@@ -96,7 +96,9 @@ async def lifespan(app: FastAPI):
     # The client now uses the root logger configuration
     client = RotatingClient(api_keys=api_keys, configure_logging=True)
     app.state.rotating_client = client
-    
+    os.environ["LITELLM_LOG"] = "ERROR"
+    litellm.set_verbose = False
+    litellm.drop_params = True
     if USE_EMBEDDING_BATCHER:
         batcher = EmbeddingBatcher(client=client)
         app.state.embedding_batcher = batcher
