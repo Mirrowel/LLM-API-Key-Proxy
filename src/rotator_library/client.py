@@ -235,13 +235,17 @@ class RotatingClient:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
 
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            print(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                             lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                         
                         await self.usage_manager.record_failure(current_key, model, classified_error)
+                        print(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
                         lib_logger.warning(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
                         break # Move to the next key
 
@@ -252,10 +256,14 @@ class RotatingClient:
                         await self.usage_manager.record_failure(current_key, model, classified_error)
                         
                         if attempt >= self.max_retries - 1:
+                            error_message = str(e).split('\n')[0]
+                            print(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
                             break # Move to the next key
                         
                         wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
                         lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
                         await asyncio.sleep(wait_time)
                         continue # Retry with the same key
@@ -269,9 +277,12 @@ class RotatingClient:
                             raise last_exception
 
                         classified_error = classify_error(e)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            print(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
                             lib_logger.error(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
@@ -350,13 +361,17 @@ class RotatingClient:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                         
                         if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            print(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                             lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
 
                         await self.usage_manager.record_failure(current_key, model, classified_error)
+                        print(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
                         lib_logger.warning(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
                         break # Break inner loop to try next key
 
@@ -367,10 +382,14 @@ class RotatingClient:
                         await self.usage_manager.record_failure(current_key, model, classified_error)
 
                         if attempt >= self.max_retries - 1:
+                            error_message = str(e).split('\n')[0]
+                            print(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
                             break # Move to the next key
                         
                         wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
                         lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
                         await asyncio.sleep(wait_time)
                         continue # Retry with the same key
@@ -379,10 +398,13 @@ class RotatingClient:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
+                        error_message = str(e).split('\n')[0]
+                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
 
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            print(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
                             lib_logger.error(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
