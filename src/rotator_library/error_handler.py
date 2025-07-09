@@ -3,6 +3,10 @@ from typing import Optional, Dict, Any
 
 from litellm.exceptions import APIConnectionError, RateLimitError, ServiceUnavailableError, AuthenticationError, InvalidRequestError, BadRequestError, OpenAIError, InternalServerError, Timeout, ContextWindowExceededError
 
+class NoAvailableKeysError(Exception):
+    """Raised when no API keys are available for a request after waiting."""
+    pass
+
 class ClassifiedError:
     """A structured representation of a classified error."""
     def __init__(self, error_type: str, original_exception: Exception, status_code: Optional[int] = None, retry_after: Optional[int] = None):

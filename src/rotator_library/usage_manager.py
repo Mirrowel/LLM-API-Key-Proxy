@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set
 import aiofiles
 import litellm
 
-from .error_handler import ClassifiedError
+from .error_handler import ClassifiedError, NoAvailableKeysError
 
 lib_logger = logging.getLogger('rotator_library')
 lib_logger.propagate = False
@@ -136,14 +136,14 @@ class UsageManager:
         await self._lazy_init()
         self._initialize_key_states(available_keys)
 
-        while True:
+        start_time = time.time()
+        while time.time() - start_time < self.wait_timeout:
             tier1_keys, tier2_keys = [], []
             async with self._data_lock:
                 now = time.time()
                 for key in available_keys:
                     key_data = self._usage_data.get(key, {})
                     
-                    # Skip keys on global or model-specific cooldown
                     if (key_data.get("key_cooldown_until") or 0) > now or \
                        (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
                         continue
@@ -156,11 +156,9 @@ class UsageManager:
                     elif model not in key_state["models_in_use"]:
                         tier2_keys.append((key, usage_count))
 
-            # Sort keys by usage count (ascending)
             tier1_keys.sort(key=lambda x: x[1])
             tier2_keys.sort(key=lambda x: x[1])
 
-            # Attempt to acquire from Tier 1 (completely free)
             for key, _ in tier1_keys:
                 state = self.key_states[key]
                 async with state["lock"]:
@@ -169,7 +167,6 @@ class UsageManager:
                         lib_logger.info(f"Acquired Tier 1 key ...{key[-4:]} for model {model}")
                         return key
 
-            # Attempt to acquire from Tier 2 (in use by other models)
             for key, _ in tier2_keys:
                 state = self.key_states[key]
                 async with state["lock"]:
@@ -178,26 +175,28 @@ class UsageManager:
                         lib_logger.info(f"Acquired Tier 2 key ...{key[-4:]} for model {model}")
                         return key
 
-            # If no key is available, wait for one to be released
             lib_logger.info("All eligible keys are currently locked for this model. Waiting...")
             
-            # Create a combined list of all potentially usable keys to wait on
             all_potential_keys = tier1_keys + tier2_keys
             if not all_potential_keys:
-                lib_logger.warning("No keys are eligible at all (all on cooldown). Waiting before re-evaluating.")
-                await asyncio.sleep(5)
+                lib_logger.warning("No keys are eligible (all on cooldown). Waiting before re-evaluating.")
+                await asyncio.sleep(1)
                 continue
 
-            # Wait on the condition of the best available key
             best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
             wait_condition = self.key_states[best_wait_key]["condition"]
             
             try:
                 async with wait_condition:
-                    await asyncio.wait_for(wait_condition.wait(), timeout=self.wait_timeout)
+                    remaining_timeout = self.wait_timeout - (time.time() - start_time)
+                    if remaining_timeout <= 0:
+                        break
+                    await asyncio.wait_for(wait_condition.wait(), timeout=min(1, remaining_timeout))
                 lib_logger.info("Notified that a key was released. Re-evaluating...")
             except asyncio.TimeoutError:
-                lib_logger.warning("Wait timed out. Re-evaluating for any available key.")
+                lib_logger.debug("Wait timed out. Re-evaluating for any available key.")
+        
+        raise NoAvailableKeysError(f"Could not acquire a key for model {model} within the {self.wait_timeout}s timeout.")
 
 
     async def release_key(self, key: str, model: str):

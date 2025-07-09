@@ -17,7 +17,7 @@ lib_logger.propagate = False
 
 from .usage_manager import UsageManager
 from .failure_logger import log_failure
-from .error_handler import classify_error, AllProviders
+from .error_handler import classify_error, AllProviders, NoAvailableKeysError
 from .providers import PROVIDER_PLUGINS
 from .request_sanitizer import sanitize_request_payload
 from .cooldown_manager import CooldownManager
@@ -313,121 +313,125 @@ class RotatingClient:
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
+        try:
+            while len(tried_keys) < len(keys_for_provider):
+                current_key = None
+                key_acquired = False
+                try:
+                    if await self.cooldown_manager.is_cooling_down(provider):
+                        remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
+                        lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
+                        await asyncio.sleep(remaining_time)
 
-        while len(tried_keys) < len(keys_for_provider):
-            current_key = None
-            key_acquired = False
-            try:
-                if await self.cooldown_manager.is_cooling_down(provider):
-                    remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
-                    lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
-                    await asyncio.sleep(remaining_time)
+                    keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
+                    if not keys_to_try:
+                        lib_logger.warning(f"All keys for provider {provider} have been tried. No more keys to rotate to.")
+                        break
 
-                keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
-                if not keys_to_try:
-                    break
+                    lib_logger.info(f"Acquiring key for model {model}. Tried keys: {len(tried_keys)}/{len(keys_for_provider)}")
+                    current_key = await self.usage_manager.acquire_key(available_keys=keys_to_try, model=model)
+                    key_acquired = True
+                    tried_keys.add(current_key)
 
-                current_key = await self.usage_manager.acquire_key(available_keys=keys_to_try, model=model)
-                key_acquired = True
-                tried_keys.add(current_key)
+                    litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+                    provider_instance = self._get_provider_instance(provider)
+                    if provider_instance:
+                        if "safety_settings" in litellm_kwargs:
+                            converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
+                            if converted_settings is not None:
+                                litellm_kwargs["safety_settings"] = converted_settings
+                            else:
+                                del litellm_kwargs["safety_settings"]
+                    
+                    if provider == "gemini" and provider_instance:
+                        provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
-                # --- Full Request Preparation Logic ---
-                litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
-                provider_instance = self._get_provider_instance(provider)
-                if provider_instance:
-                    if "safety_settings" in litellm_kwargs:
-                        converted_settings = provider_instance.convert_safety_settings(litellm_kwargs["safety_settings"])
-                        if converted_settings is not None:
-                            litellm_kwargs["safety_settings"] = converted_settings
-                        else:
-                            del litellm_kwargs["safety_settings"]
-                
-                if provider == "gemini" and provider_instance:
-                    provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+                    if "gemma-3" in model and "messages" in litellm_kwargs:
+                        litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
+                    
+                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
 
-                if "gemma-3" in model and "messages" in litellm_kwargs:
-                    litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
-                
-                litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
-                # --- End of Request Preparation ---
+                    for attempt in range(self.max_retries):
+                        try:
+                            lib_logger.info(f"Attempting stream with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                            response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
+                            
+                            key_acquired = False
+                            stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
+                            
+                            async for chunk in stream_generator:
+                                yield chunk
+                            return
 
-                for attempt in range(self.max_retries):
-                    try:
-                        lib_logger.info(f"Attempting stream with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
-                        
-                        key_acquired = False # Wrapper now handles the key release
-                        stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
-                        
-                        async for chunk in stream_generator:
-                            yield chunk
-                        return # Successful stream, exit the entire retry mechanism
+                        except (StreamedAPIError, litellm.RateLimitError) as e:
+                            last_exception = e
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            classified_error = classify_error(e)
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
+                            
+                            if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
+                                cooldown_duration = classified_error.retry_after or 60
+                                await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                                lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
 
-                    except (StreamedAPIError, litellm.RateLimitError) as e:
-                        last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        classified_error = classify_error(e)
-                        error_message = str(e).split('\n')[0]
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
-                        
-                        if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
-                            cooldown_duration = classified_error.retry_after or 60
-                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+                            await self.usage_manager.record_failure(current_key, model, classified_error)
+                            break
 
-                        await self.usage_manager.record_failure(current_key, model, classified_error)
-                        lib_logger.info(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
-                        break # Break inner loop to try next key
+                        except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
+                            last_exception = e
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            classified_error = classify_error(e)
+                            await self.usage_manager.record_failure(current_key, model, classified_error)
 
-                    except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
-                        last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        classified_error = classify_error(e)
-                        await self.usage_manager.record_failure(current_key, model, classified_error)
+                            if attempt >= self.max_retries - 1:
+                                lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type}. Rotating key.")
+                                break
+                            
+                            wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type}. Retrying in {wait_time:.2f} seconds.")
+                            await asyncio.sleep(wait_time)
+                            continue
 
-                        if attempt >= self.max_retries - 1:
-                            error_message = str(e).split('\n')[0]
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
-                            break # Move to the next key
-                        
-                        wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
-                        error_message = str(e).split('\n')[0]
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
-                        await asyncio.sleep(wait_time)
-                        continue # Retry with the same key
+                        except Exception as e:
+                            last_exception = e
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            classified_error = classify_error(e)
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
 
-                    except Exception as e:
-                        last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
-                        classified_error = classify_error(e)
-                        error_message = str(e).split('\n')[0]
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                            if classified_error.status_code == 429:
+                                cooldown_duration = classified_error.retry_after or 60
+                                await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                                lib_logger.warning(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
 
-                        if classified_error.status_code == 429:
-                            cooldown_duration = classified_error.retry_after or 60
-                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            lib_logger.warning(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
+                            if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
+                                raise last_exception
+                            
+                            await self.usage_manager.record_failure(current_key, model, classified_error)
+                            break
 
-                        if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
-                            raise last_exception # Do not retry for these errors
-                        
-                        await self.usage_manager.record_failure(current_key, model, classified_error)
-                        break # Try next key for other errors
+                finally:
+                    if key_acquired and current_key:
+                        await self.usage_manager.release_key(current_key, model)
+            
+            if last_exception:
+                error_data = {"error": {"message": f"Failed to complete the streaming request. Last error: {str(last_exception)}", "type": "proxy_error"}}
+                yield f"data: {json.dumps(error_data)}\n\n"
+            else:
+                error_data = {"error": {"message": "Failed to complete the streaming request: No available API keys after rotation.", "type": "proxy_error"}}
+                yield f"data: {json.dumps(error_data)}\n\n"
+            
+            yield "data: [DONE]\n\n"
 
-            finally:
-                if key_acquired and current_key:
-                    await self.usage_manager.release_key(current_key, model)
-        
-        if last_exception:
-            # After trying all keys, if an exception was caught, we need to inform the client.
-            # We can't raise it directly as the stream is already open.
-            # Instead, we yield a final error message.
-            error_data = {"error": {"message": f"Failed to complete the streaming request after trying all keys. Last error: {str(last_exception)}", "type": "proxy_error"}}
+        except NoAvailableKeysError as e:
+            lib_logger.error(f"A streaming request failed because no keys were available: {e}")
+            error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
-        else:
-            # If all keys were tried and none succeeded (e.g., all were busy), raise a generic error.
-            raise Exception("Failed to complete the streaming request: No available API keys for the provider or all keys failed.")
+        except Exception as e:
+            lib_logger.error(f"An unhandled exception occurred in streaming retry logic: {e}")
+            error_data = {"error": {"message": f"An unexpected error occurred: {str(e)}", "type": "proxy_internal_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
 
     def acompletion(self, request: Optional[Any] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
         """Dispatcher for completion requests."""
