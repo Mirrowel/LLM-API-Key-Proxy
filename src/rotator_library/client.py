@@ -196,7 +196,8 @@ class RotatingClient:
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
-
+        kwargs = self._convert_model_params(**kwargs)
+        
         while len(tried_keys) < len(keys_for_provider):
             current_key = None
             key_acquired = False
@@ -313,6 +314,7 @@ class RotatingClient:
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
+        kwargs = self._convert_model_params(**kwargs)
         try:
             while len(tried_keys) < len(keys_for_provider):
                 current_key = None
@@ -471,7 +473,6 @@ class RotatingClient:
 
     def acompletion(self, request: Optional[Any] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
         """Dispatcher for completion requests."""
-        kwargs = self._convert_model_params(**kwargs)
         if kwargs.get("stream"):
             return self._streaming_acompletion_with_retry(request, **kwargs)
         else:
@@ -479,7 +480,6 @@ class RotatingClient:
 
     def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
         """Executes an embedding request with retry logic."""
-        kwargs = self._convert_model_params(**kwargs)
         return self._execute_with_retry(litellm.aembedding, request, **kwargs)
 
     def token_count(self, **kwargs) -> int:
