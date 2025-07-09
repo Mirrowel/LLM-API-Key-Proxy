@@ -10,10 +10,10 @@ import logging
 from typing import List, Dict, Any, AsyncGenerator, Optional, Union
 
 lib_logger = logging.getLogger('rotator_library')
+# Ensure the logger is configured to propagate to the root logger
+# which is set up in main.py. This allows the main app to control
+# log levels and handlers centrally.
 lib_logger.propagate = False
-
-if not lib_logger.handlers:
-    lib_logger.addHandler(logging.NullHandler())
 
 from .usage_manager import UsageManager
 from .failure_logger import log_failure
@@ -34,13 +34,17 @@ class RotatingClient:
     with support for both streaming and non-streaming responses.
     """
     def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True):
-        os.environ["LITELLM_LOG"] = "ERROR"
-        litellm.set_verbose = False
-        litellm.drop_params = True
         if configure_logging:
+            # When True, this allows logs from this library to be handled
+            # by the parent application's logging configuration.
             lib_logger.propagate = True
-            if any(isinstance(h, logging.NullHandler) for h in lib_logger.handlers):
-                lib_logger.handlers = [h for h in lib_logger.handlers if not isinstance(h, logging.NullHandler)]
+            # Remove any default handlers to prevent duplicate logging
+            if lib_logger.hasHandlers():
+                lib_logger.handlers.clear()
+                lib_logger.addHandler(logging.NullHandler())
+        else:
+            lib_logger.propagate = False
+
         if not api_keys:
             raise ValueError("API keys dictionary cannot be empty.")
         self.api_keys = api_keys
@@ -103,7 +107,7 @@ class RotatingClient:
         try:
             while True:
                 if request and await request.is_disconnected():
-                    lib_logger.warning(f"Client disconnected. Aborting stream for key ...{key[-4:]}.")
+                    lib_logger.info(f"Client disconnected. Aborting stream for key ...{key[-4:]}.")
                     # Do not yield [DONE] because the client is gone.
                     # The 'finally' block will handle key release.
                     break
@@ -111,7 +115,7 @@ class RotatingClient:
                 try:
                     chunk = await stream_iterator.__anext__()
                     if json_buffer:
-                        lib_logger.warning(f"Discarding incomplete JSON buffer: {json_buffer}")
+                        lib_logger.debug(f"Discarding incomplete JSON buffer: {json_buffer}")
                         json_buffer = ""
                     
                     yield f"data: {json.dumps(chunk.dict())}\n\n"
@@ -123,7 +127,7 @@ class RotatingClient:
                 except StopAsyncIteration:
                     stream_completed = True
                     if json_buffer:
-                        lib_logger.warning(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                        lib_logger.debug(f"Stream ended with incomplete data in buffer: {json_buffer}")
                     break
 
                 except Exception as e:
@@ -132,7 +136,7 @@ class RotatingClient:
                         json_buffer += raw_chunk
                         parsed_data = json.loads(json_buffer)
                         
-                        lib_logger.info(f"Successfully reassembled JSON from buffer: {json_buffer}")
+                        lib_logger.debug(f"Successfully reassembled JSON from buffer: {json_buffer}")
                         
                         if "error" in parsed_data:
                             lib_logger.warning(f"Reassembled object is an API error. Passing it to the client and raising internally.")
@@ -144,7 +148,7 @@ class RotatingClient:
                         
                         json_buffer = ""
                     except json.JSONDecodeError:
-                        lib_logger.info(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
+                        lib_logger.debug(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
                         continue
                     except StreamedAPIError:
                         # Re-raise to be caught by the outer handler
@@ -240,17 +244,15 @@ class RotatingClient:
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
 
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            print(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
-                            lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+                            lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                         
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        print(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
-                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
+                        lib_logger.info(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
                         break # Move to the next key
 
                     except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
@@ -261,14 +263,12 @@ class RotatingClient:
                         
                         if attempt >= self.max_retries - 1:
                             error_message = str(e).split('\n')[0]
-                            print(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                             break # Move to the next key
                         
                         wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
-                        lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
                         await asyncio.sleep(wait_time)
                         continue # Retry with the same key
 
@@ -282,12 +282,11 @@ class RotatingClient:
 
                         classified_error = classify_error(e)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            print(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
-                            lib_logger.error(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
+                            lib_logger.warning(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
                             # For these errors, we should not retry with other keys.
@@ -366,17 +365,15 @@ class RotatingClient:
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                         
                         if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            print(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
-                            lib_logger.error(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+                            lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
 
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        print(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
+                        lib_logger.info(f"Key ...{current_key[-4:]} failed during stream initiation. Trying next key.")
                         break # Break inner loop to try next key
 
                     except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
@@ -387,14 +384,12 @@ class RotatingClient:
 
                         if attempt >= self.max_retries - 1:
                             error_message = str(e).split('\n')[0]
-                            print(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries for a server-side error. Trying next key.")
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                             break # Move to the next key
                         
                         wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
-                        lib_logger.info(f"Server-side error with key ...{current_key[-4:]}. Retrying in {wait_time:.2f} seconds.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
                         await asyncio.sleep(wait_time)
                         continue # Retry with the same key
 
@@ -403,13 +398,12 @@ class RotatingClient:
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
                         error_message = str(e).split('\n')[0]
-                        print(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
 
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
                             await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                            print(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
-                            lib_logger.error(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
+                            lib_logger.warning(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
 
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
                             raise last_exception # Do not retry for these errors
@@ -463,9 +457,9 @@ class RotatingClient:
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""
-        lib_logger.info(f"Getting available models for provider: {provider}")
+        lib_logger.debug(f"Getting available models for provider: {provider}")
         if provider in self._model_list_cache:
-            lib_logger.info(f"Returning cached models for provider: {provider}")
+            lib_logger.debug(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
         keys_for_provider = self.api_keys.get(provider)
@@ -481,9 +475,9 @@ class RotatingClient:
         if provider_instance:
             for api_key in shuffled_keys:
                 try:
-                    lib_logger.info(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
+                    lib_logger.debug(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
                     models = await provider_instance.get_models(api_key, self.http_client)
-                    lib_logger.info(f"Got {len(models)} models for provider: {provider}")
+                    lib_logger.debug(f"Got {len(models)} models for provider: {provider}")
                     self._model_list_cache[provider] = models
                     return models
                 except Exception as e:

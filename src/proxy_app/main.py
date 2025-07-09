@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import argparse
 import litellm
 
+
 # --- Pydantic Models ---
 class EmbeddingRequest(BaseModel):
     model: str
@@ -36,12 +37,34 @@ args, _ = parser.parse_known_args()
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
-from proxy_app.request_logger import log_request_response
+from proxy_app.request_logger import log_request_response, log_request_to_console
 from proxy_app.batch_manager import EmbeddingBatcher
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# --- Logging Configuration ---
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
+# Configure a file handler for detailed debug logs
+# Configure a file handler for detailed debug logs
+file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Configure a console handler for concise, high-level info
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(message)s'))
+
+# Get the root logger and add the handlers
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO) # Set root to INFO
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Silence other noisy loggers by setting their level higher than root
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("litellm").setLevel(logging.WARNING)
 # Load environment variables from .env file
 load_dotenv()
 
@@ -70,16 +93,17 @@ if not api_keys:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    # The client now uses the root logger configuration
     client = RotatingClient(api_keys=api_keys, configure_logging=True)
     app.state.rotating_client = client
     
     if USE_EMBEDDING_BATCHER:
         batcher = EmbeddingBatcher(client=client)
         app.state.embedding_batcher = batcher
-        print("RotatingClient and EmbeddingBatcher initialized.")
+        logging.info("RotatingClient and EmbeddingBatcher initialized.")
     else:
         app.state.embedding_batcher = None
-        print("RotatingClient initialized (EmbeddingBatcher disabled).")
+        logging.info("RotatingClient initialized (EmbeddingBatcher disabled).")
         
     yield
     
@@ -88,9 +112,9 @@ async def lifespan(app: FastAPI):
     await client.close()
     
     if app.state.embedding_batcher:
-        print("RotatingClient and EmbeddingBatcher closed.")
+        logging.info("RotatingClient and EmbeddingBatcher closed.")
     else:
-        print("RotatingClient closed.")
+        logging.info("RotatingClient closed.")
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
@@ -261,6 +285,12 @@ async def chat_completions(
     """
     try:
         request_data = await request.json()
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(request.client.host, request.client.port),
+            request_data=request_data
+        )
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
@@ -323,6 +353,13 @@ async def embeddings(
     - False: Passes requests directly to the provider.
     """
     try:
+        request_data = body.model_dump(exclude_none=True)
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(request.client.host, request.client.port),
+            request_data=request_data
+        )
         if USE_EMBEDDING_BATCHER and batcher:
             # --- Server-Side Batching Logic ---
             request_data = body.model_dump(exclude_none=True)
