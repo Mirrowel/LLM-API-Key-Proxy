@@ -70,7 +70,7 @@ if not api_keys:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
-    client = RotatingClient(api_keys=api_keys)
+    client = RotatingClient(api_keys=api_keys, configure_logging=True)
     app.state.rotating_client = client
     
     if USE_EMBEDDING_BATCHER:

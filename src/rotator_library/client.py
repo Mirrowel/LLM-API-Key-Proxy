@@ -33,10 +33,14 @@ class RotatingClient:
     A client that intelligently rotates and retries API keys using LiteLLM,
     with support for both streaming and non-streaming responses.
     """
-    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json"):
+    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
+        if configure_logging:
+            lib_logger.propagate = True
+            if any(isinstance(h, logging.NullHandler) for h in lib_logger.handlers):
+                lib_logger.handlers = [h for h in lib_logger.handlers if not isinstance(h, logging.NullHandler)]
         if not api_keys:
             raise ValueError("API keys dictionary cannot be empty.")
         self.api_keys = api_keys
