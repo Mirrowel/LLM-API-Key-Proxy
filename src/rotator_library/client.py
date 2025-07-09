@@ -269,6 +269,11 @@ class RotatingClient:
                             raise last_exception
 
                         classified_error = classify_error(e)
+                        if classified_error.status_code == 429:
+                            cooldown_duration = classified_error.retry_after or 60
+                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            lib_logger.error(f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown.")
+
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
                             # For these errors, we should not retry with other keys.
                             raise last_exception
@@ -374,6 +379,12 @@ class RotatingClient:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
                         classified_error = classify_error(e)
+
+                        if classified_error.status_code == 429:
+                            cooldown_duration = classified_error.retry_after or 60
+                            await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                            lib_logger.error(f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown.")
+
                         if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
                             raise last_exception # Do not retry for these errors
                         

@@ -7,13 +7,13 @@ on:
         description: 'Optional: Manually set the previous tag to generate the changelog from.'
         required: false
         default: ''
-  # push:
-  #   paths:
-  #     - 'src/proxy_app/**'
-  #     - 'src/rotator_library/**'
-  #     - 'setup_env.bat'
-  #     - '.github/workflows/build.yml'
-  #     - 'cliff.toml'
+  push:
+    paths:
+      - 'src/proxy_app/**'
+      - 'src/rotator_library/**'
+      - 'setup_env.bat'
+      - '.github/workflows/build.yml'
+      - 'cliff.toml'
 
 jobs:
   build:
