@@ -21,39 +21,46 @@ This library is the heart of the project, containing all the logic for key rotat
 
 The `RotatingClient` is the central class that orchestrates all operations. It is designed as a long-lived, async-native object.
 
+#### Initialization
+
+The client is initialized with your provider API keys, retry settings, and a new `global_timeout`.
+
+```python
+client = RotatingClient(
+    api_keys=api_keys,
+    max_retries=2,
+    global_timeout=30  # in seconds
+)
+```
+
+-   `global_timeout`: A crucial new parameter that sets a hard time limit for the entire request lifecycle, from the moment `acompletion` is called until a response is returned or the timeout is exceeded.
+
 #### Core Responsibilities
 
 *   Managing a shared `httpx.AsyncClient` for all non-blocking HTTP requests.
 *   Interfacing with the `UsageManager` to acquire and release API keys.
 *   Dynamically loading and using provider-specific plugins from the `providers/` directory.
-*   Executing API calls via `litellm` with a robust retry and rotation strategy.
+*   Executing API calls via `litellm` with a robust, **deadline-driven** retry and rotation strategy.
 *   Providing a safe, stateful wrapper for handling streaming responses.
 
-#### Request Lifecycle (`acompletion` & `aembedding`)
+#### Request Lifecycle: A Deadline-Driven Approach
 
-When `acompletion` or `aembedding` is called, it follows a sophisticated, multi-layered process:
+The request lifecycle has been redesigned around a single, authoritative time budget to ensure predictable performance and prevent requests from hanging indefinitely.
 
-1.  **Provider & Key Validation**: It extracts the provider from the `model` name (e.g., `"gemini/gemini-1.5-pro"` -> `"gemini"`) and ensures keys are configured for it.
+1.  **Deadline Establishment**: The moment `acompletion` or `aembedding` is called, a `deadline` is calculated: `time.time() + self.global_timeout`. This `deadline` is the absolute point in time by which the entire operation must complete.
 
-2.  **Key Acquisition Loop**: The client enters a `while` loop that attempts to find a valid key and complete the request. It iterates until one key succeeds or all have been tried.
-    a.  **Acquire Best Key**: It calls `self.usage_manager.acquire_key()`. This is a crucial, potentially blocking call that waits until a suitable key is available, based on the manager's tiered locking strategy (see `UsageManager` section).
-    b.  **Prepare Request**: It prepares the `litellm` keyword arguments. This includes applying provider-specific logic (e.g., remapping safety settings for Gemini, handling `api_base` for Chutes.ai) and sanitizing the payload to remove unsupported parameters.
+2.  **Deadline-Aware Key Rotation Loop**: The main `while` loop now has a critical secondary condition: `while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:`. The loop will exit immediately if the `deadline` is reached, regardless of how many keys are left to try.
 
-3.  **Retry Loop**: Once a key is acquired, it enters an inner `for` loop (`for attempt in range(self.max_retries)`):
-    a.  **API Call**: It calls `litellm.acompletion` or `litellm.aembedding`.
-    b.  **Success (Non-Streaming)**:
-        -   It calls `self.usage_manager.record_success()` to update usage stats and clear any cooldowns.
-        -   It calls `self.usage_manager.release_key()` to release the lock.
-        -   It returns the response, and the process ends.
-    c.  **Success (Streaming)**:
-        -   It returns the `_safe_streaming_wrapper` async generator. This wrapper is critical:
-            -   It yields SSE-formatted chunks to the consumer.
-            -   It can reassemble fragmented JSON chunks and detect errors mid-stream.
-            -   Its `finally` block ensures that `record_success()` and `release_key()` are called *only after the stream is fully consumed or closed*. This guarantees the key lock is held for the entire duration of the stream.
-    d.  **Failure**: If an exception occurs:
-        -   The exception is passed to `classify_error()` to get a structured `ClassifiedError` object.
-        -   **Server Error**: If the error is temporary (e.g., 5xx), it waits with exponential backoff and retries the request with the *same key*.
-        -   **Rotation Error (Rate Limit, Auth, etc.)**: For any other error, it's a trigger to rotate. `self.usage_manager.record_failure()` is called to apply a cooldown, and the lock is released. The inner `attempt` loop is broken, and the outer `while` loop continues, acquiring a new key.
+3.  **Deadline-Aware Key Acquisition**: The `self.usage_manager.acquire_key()` method now accepts the `deadline`. The `UsageManager` will not wait indefinitely for a key; if it cannot acquire one before the `deadline` is met, it will raise a `NoAvailableKeysError`, causing the request to fail fast with a "busy" error.
+
+4.  **Deadline-Aware Retries**: When a transient error occurs, the client calculates the necessary `wait_time` for an exponential backoff. It then checks if this wait time fits within the remaining budget (`deadline - time.time()`).
+    -   **If it fits**: It waits (`asyncio.sleep`) and retries with the same key.
+    -   **If it exceeds the budget**: It skips the wait entirely, logs a warning, and immediately rotates to the next key to avoid wasting time.
+
+5.  **Refined Error Propagation**:
+    -   **Fatal Errors**: Invalid requests or authentication errors are raised immediately to the client.
+    -   **Intermittent Errors**: Rate limits, server errors, and other temporary issues are now handled internally. The error is logged, the key is rotated, but the exception is **not** propagated to the end client. This prevents the client from seeing disruptive, intermittent failures.
+    -   **Final Failure**: A non-streaming request will only return `None` (indicating failure) if either a) the global `deadline` is exceeded, or b) all keys for the provider have been tried and have failed. A streaming request will yield a final `[DONE]` with an error message in the same scenarios.
 
 ### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management
 
@@ -66,14 +73,15 @@ This class is the stateful core of the library, managing concurrency, usage, and
 
 #### Tiered Key Acquisition (`acquire_key`)
 
-This method implements the intelligent logic for selecting the best key for a job.
+This method implements the intelligent logic for selecting the best key for a job, now with deadline awareness.
 
-1.  **Filtering**: It first filters out any keys that are on a global or model-specific cooldown.
-2.  **Tiering**: It categorizes the remaining, valid keys into two tiers:
+1.  **Deadline Enforcement**: The entire acquisition process runs in a `while time.time() < deadline:` loop. If a key cannot be found before the deadline, the method raises `NoAvailableKeysError`.
+2.  **Filtering**: It first filters out any keys that are on a global or model-specific cooldown.
+3.  **Tiering**: It categorizes the remaining, valid keys into two tiers:
     -   **Tier 1 (Ideal)**: Keys that are completely free (not being used by any model).
     -   **Tier 2 (Acceptable)**: Keys that are currently in use, but for *different models* than the one being requested. This allows a single key to be used for concurrent calls to, for example, `gemini-1.5-pro` and `gemini-1.5-flash`.
-3.  **Selection**: It attempts to acquire a lock on a key, prioritizing Tier 1 over Tier 2. Within each tier, it prioritizes the key with the lowest usage count.
-4.  **Waiting**: If no keys in Tier 1 or Tier 2 can be locked, it means all eligible keys are currently handling requests for the *same model*. The method then `await`s on the `asyncio.Condition` of the best available key, waiting efficiently until it is notified that a key has been released.
+4.  **Selection**: It attempts to acquire a lock on a key, prioritizing Tier 1 over Tier 2. Within each tier, it prioritizes the key with the lowest usage count.
+5.  **Waiting**: If no keys in Tier 1 or Tier 2 can be locked, it means all eligible keys are currently handling requests for the *same model*. The method then `await`s on the `asyncio.Condition` of the best available key. Crucially, this wait is itself timed out by the remaining request budget, preventing indefinite waits.
 
 #### Failure Handling & Cooldowns (`record_failure`)
 

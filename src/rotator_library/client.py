@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import os
 import random
 import httpx
@@ -33,7 +34,7 @@ class RotatingClient:
     A client that intelligently rotates and retries API keys using LiteLLM,
     with support for both streaming and non-streaming responses.
     """
-    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True):
+    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True, global_timeout: int = 30):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -52,6 +53,7 @@ class RotatingClient:
             raise ValueError("API keys dictionary cannot be empty.")
         self.api_keys = api_keys
         self.max_retries = max_retries
+        self.global_timeout = global_timeout
         self.usage_manager = UsageManager(file_path=usage_file_path)
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
@@ -227,25 +229,40 @@ class RotatingClient:
         if provider not in self.api_keys:
             raise ValueError(f"No API keys configured for provider: {provider}")
 
+        # Establish a global deadline for the entire request lifecycle.
+        deadline = time.time() + self.global_timeout
         keys_for_provider = self.api_keys[provider]
         tried_keys = set()
         last_exception = None
         kwargs = self._convert_model_params(**kwargs)
         
-        while len(tried_keys) < len(keys_for_provider):
+        # The main rotation loop. It continues as long as there are untried keys and the global deadline has not been exceeded.
+        while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:
             current_key = None
             key_acquired = False
             try:
+                # Check for a provider-wide cooldown first.
                 if await self.cooldown_manager.is_cooling_down(provider):
-                    remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
-                    lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
-                    await asyncio.sleep(remaining_time)
+                    remaining_cooldown = await self.cooldown_manager.get_cooldown_remaining(provider)
+                    remaining_budget = deadline - time.time()
+                    
+                    # If the cooldown is longer than the remaining time budget, fail fast.
+                    if remaining_cooldown > remaining_budget:
+                        lib_logger.warning(f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early.")
+                        break
+
+                    lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_cooldown:.2f} seconds.")
+                    await asyncio.sleep(remaining_cooldown)
 
                 keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
                 if not keys_to_try:
                     break
 
-                current_key = await self.usage_manager.acquire_key(available_keys=keys_to_try, model=model)
+                current_key = await self.usage_manager.acquire_key(
+                    available_keys=keys_to_try, 
+                    model=model,
+                    deadline=deadline
+                )
                 key_acquired = True
                 tried_keys.add(current_key)
 
@@ -308,7 +325,15 @@ class RotatingClient:
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
                             break # Move to the next key
                         
+                        # For temporary errors, wait before retrying with the same key.
                         wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                        remaining_budget = deadline - time.time()
+                        
+                        # If the required wait time exceeds the budget, don't wait; rotate to the next key immediately.
+                        if wait_time > remaining_budget:
+                            lib_logger.warning(f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early.")
+                            break
+
                         error_message = str(e).split('\n')[0]
                         lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
                         await asyncio.sleep(wait_time)
@@ -341,27 +366,35 @@ class RotatingClient:
                     await self.usage_manager.release_key(current_key, model)
 
         if last_exception:
-            raise last_exception
+            # Log the final error but do not raise it, as per the new requirement.
+            # The client should not see intermittent failures.
+            lib_logger.error(f"Request failed after trying all keys or exceeding global timeout. Last error: {last_exception}")
         
-        raise Exception("Failed to complete the request: No available API keys for the provider or all keys failed.")
+        # Return None to indicate failure without propagating a disruptive exception.
+        return None
 
     async def _streaming_acompletion_with_retry(self, request: Optional[Any], **kwargs) -> AsyncGenerator[str, None]:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
         model = kwargs.get("model")
         provider = model.split('/')[0]
         keys_for_provider = self.api_keys[provider]
+        deadline = time.time() + self.global_timeout
         tried_keys = set()
         last_exception = None
         kwargs = self._convert_model_params(**kwargs)
         try:
-            while len(tried_keys) < len(keys_for_provider):
+            while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:
                 current_key = None
                 key_acquired = False
                 try:
                     if await self.cooldown_manager.is_cooling_down(provider):
-                        remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
-                        lib_logger.warning(f"Provider {provider} is in a global cooldown. All requests to this provider will be paused for {remaining_time:.2f} seconds.")
-                        await asyncio.sleep(remaining_time)
+                        remaining_cooldown = await self.cooldown_manager.get_cooldown_remaining(provider)
+                        remaining_budget = deadline - time.time()
+                        if remaining_cooldown > remaining_budget:
+                            lib_logger.warning(f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early.")
+                            break
+                        lib_logger.warning(f"Provider {provider} is in a global cooldown. All requests to this provider will be paused for {remaining_cooldown:.2f} seconds.")
+                        await asyncio.sleep(remaining_cooldown)
 
                     keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
                     if not keys_to_try:
@@ -369,7 +402,11 @@ class RotatingClient:
                         break
 
                     lib_logger.info(f"Acquiring key for model {model}. Tried keys: {len(tried_keys)}/{len(keys_for_provider)}")
-                    current_key = await self.usage_manager.acquire_key(available_keys=keys_to_try, model=model)
+                    current_key = await self.usage_manager.acquire_key(
+                        available_keys=keys_to_try, 
+                        model=model,
+                        deadline=deadline
+                    )
                     key_acquired = True
                     tried_keys.add(current_key)
 
@@ -455,6 +492,11 @@ class RotatingClient:
                                 break
                             
                             wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                            remaining_budget = deadline - time.time()
+                            if wait_time > remaining_budget:
+                                lib_logger.warning(f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early.")
+                                break
+                            
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type}. Retrying in {wait_time:.2f} seconds.")
                             await asyncio.sleep(wait_time)
                             continue
@@ -493,22 +535,23 @@ class RotatingClient:
                     if key_acquired and current_key:
                         await self.usage_manager.release_key(current_key, model)
             
+            final_error_message = "Failed to complete the streaming request: No available API keys after rotation or global timeout exceeded."
             if last_exception:
-                error_data = {"error": {"message": f"Failed to complete the streaming request. Last error: {str(last_exception)}", "type": "proxy_error"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-            else:
-                error_data = {"error": {"message": "Failed to complete the streaming request: No available API keys after rotation.", "type": "proxy_error"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-            
+                final_error_message = f"Failed to complete the streaming request. Last error: {str(last_exception)}"
+                lib_logger.error(f"Streaming request failed after trying all keys. Last error: {last_exception}")
+
+            error_data = {"error": {"message": final_error_message, "type": "proxy_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
 
         except NoAvailableKeysError as e:
-            lib_logger.error(f"A streaming request failed because no keys were available: {e}")
+            lib_logger.error(f"A streaming request failed because no keys were available within the time budget: {e}")
             error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            lib_logger.error(f"An unhandled exception occurred in streaming retry logic: {e}")
+            # This will now only catch fatal errors that should be raised, like invalid requests.
+            lib_logger.error(f"An unhandled exception occurred in streaming retry logic: {e}", exc_info=True)
             error_data = {"error": {"message": f"An unexpected error occurred: {str(e)}", "type": "proxy_internal_error"}}
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"

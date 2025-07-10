@@ -22,10 +22,11 @@ This project provides a robust, self-hosted solution for managing and rotating A
 
 ## Features
 
+-   **Predictable Performance**: A new **global timeout** ensures that requests complete within a set time, preventing your application from hanging on slow or failing provider responses.
+-   **Resilient Error Handling**: The proxy now shields your application from transient backend errors. It handles rate limits and temporary provider issues internally by rotating keys, so your client only sees a failure if all options are exhausted or the timeout is hit.
 -   **Advanced Concurrency Control**: A single API key can handle multiple concurrent requests to different models, maximizing throughput.
 -   **Smart Key Rotation**: Intelligently selects the least-used, available API key to distribute request loads evenly.
--   **Escalating Per-Model Cooldowns**: If a key fails for a specific model (e.g., due to rate limits), it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
--   **Automatic Retries**: Automatically retries requests on transient server errors (e.g., 5xx status codes) with exponential backoff.
+-   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
 -   **Request Logging**: Optional logging of full request and response payloads for easy debugging.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.

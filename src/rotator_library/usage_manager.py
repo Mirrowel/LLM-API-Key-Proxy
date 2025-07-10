@@ -20,10 +20,9 @@ class UsageManager:
     Manages usage statistics and cooldowns for API keys with asyncio-safe locking,
     asynchronous file I/O, and a lazy-loading mechanism for usage data.
     """
-    def __init__(self, file_path: str = "key_usage.json", wait_timeout: int = 13, daily_reset_time_utc: Optional[str] = "03:00"):
+    def __init__(self, file_path: str = "key_usage.json", daily_reset_time_utc: Optional[str] = "03:00"):
         self.file_path = file_path
         self.key_states: Dict[str, Dict[str, Any]] = {}
-        self.wait_timeout = wait_timeout
         
         self._data_lock = asyncio.Lock()
         self._usage_data: Optional[Dict] = None
@@ -129,18 +128,21 @@ class UsageManager:
                     "models_in_use": set()
                 }
 
-    async def acquire_key(self, available_keys: List[str], model: str) -> str:
+    async def acquire_key(self, available_keys: List[str], model: str, deadline: float) -> str:
         """
-        Acquires the best available key using a tiered, model-aware locking strategy.
+        Acquires the best available key using a tiered, model-aware locking strategy,
+        respecting a global deadline.
         """
         await self._lazy_init()
         self._initialize_key_states(available_keys)
 
-        start_time = time.time()
-        while time.time() - start_time < self.wait_timeout:
+        # This loop continues as long as the global deadline has not been met.
+        while time.time() < deadline:
             tier1_keys, tier2_keys = [], []
+            now = time.time()
+            
+            # First, filter the list of available keys to exclude any on cooldown.
             async with self._data_lock:
-                now = time.time()
                 for key in available_keys:
                     key_data = self._usage_data.get(key, {})
                     
@@ -148,17 +150,21 @@ class UsageManager:
                        (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
                         continue
 
+                    # Prioritize keys based on their current usage to ensure load balancing.
                     usage_count = key_data.get("daily", {}).get("models", {}).get(model, {}).get("success_count", 0)
                     key_state = self.key_states[key]
 
+                    # Tier 1: Completely idle keys (preferred).
                     if not key_state["models_in_use"]:
                         tier1_keys.append((key, usage_count))
+                    # Tier 2: Keys busy with other models, but free for this one.
                     elif model not in key_state["models_in_use"]:
                         tier2_keys.append((key, usage_count))
 
             tier1_keys.sort(key=lambda x: x[1])
             tier2_keys.sort(key=lambda x: x[1])
 
+            # Attempt to acquire a key from Tier 1 first.
             for key, _ in tier1_keys:
                 state = self.key_states[key]
                 async with state["lock"]:
@@ -167,6 +173,7 @@ class UsageManager:
                         lib_logger.info(f"Acquired Tier 1 key ...{key[-4:]} for model {model}")
                         return key
 
+            # If no Tier 1 keys are available, try Tier 2.
             for key, _ in tier2_keys:
                 state = self.key_states[key]
                 async with state["lock"]:
@@ -175,6 +182,7 @@ class UsageManager:
                         lib_logger.info(f"Acquired Tier 2 key ...{key[-4:]} for model {model}")
                         return key
 
+            # If all eligible keys are locked, wait for a key to be released.
             lib_logger.info("All eligible keys are currently locked for this model. Waiting...")
             
             all_potential_keys = tier1_keys + tier2_keys
@@ -183,20 +191,24 @@ class UsageManager:
                 await asyncio.sleep(1)
                 continue
 
+            # Wait on the condition of the key with the lowest current usage.
             best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
             wait_condition = self.key_states[best_wait_key]["condition"]
             
             try:
                 async with wait_condition:
-                    remaining_timeout = self.wait_timeout - (time.time() - start_time)
-                    if remaining_timeout <= 0:
-                        break
-                    await asyncio.wait_for(wait_condition.wait(), timeout=min(1, remaining_timeout))
+                    remaining_budget = deadline - time.time()
+                    if remaining_budget <= 0:
+                        break # Exit if the budget has already been exceeded.
+                    # Wait for a notification, but no longer than the remaining budget or 1 second.
+                    await asyncio.wait_for(wait_condition.wait(), timeout=min(1, remaining_budget))
                 lib_logger.info("Notified that a key was released. Re-evaluating...")
             except asyncio.TimeoutError:
+                # This is not an error, just a timeout for the wait. The main loop will re-evaluate.
                 lib_logger.info("Wait timed out. Re-evaluating for any available key.")
         
-        raise NoAvailableKeysError(f"Could not acquire a key for model {model} within the {self.wait_timeout}s timeout.")
+        # If the loop exits, it means the deadline was exceeded.
+        raise NoAvailableKeysError(f"Could not acquire a key for model {model} within the global time budget.")
 
 
     async def release_key(self, key: str, model: str):
