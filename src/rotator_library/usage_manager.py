@@ -194,7 +194,7 @@ class UsageManager:
                     await asyncio.wait_for(wait_condition.wait(), timeout=min(1, remaining_timeout))
                 lib_logger.info("Notified that a key was released. Re-evaluating...")
             except asyncio.TimeoutError:
-                lib_logger.debug("Wait timed out. Re-evaluating for any available key.")
+                lib_logger.info("Wait timed out. Re-evaluating for any available key.")
         
         raise NoAvailableKeysError(f"Could not acquire a key for model {model} within the {self.wait_timeout}s timeout.")
 

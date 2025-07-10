@@ -60,6 +60,39 @@ class RotatingClient:
         self.all_providers = AllProviders()
         self.cooldown_manager = CooldownManager()
 
+    def _sanitize_litellm_log(self, log_data: dict) -> dict:
+        """
+        Removes large data fields from litellm log dictionaries to keep debug logs clean.
+        """
+        if not isinstance(log_data, dict):
+            return log_data
+
+        clean_data = log_data.copy()
+
+        # These keys often contain the full request/response payload.
+        keys_to_pop = ["messages", "input", "response", "data"]
+        
+        # The actual log data from litellm is often nested inside 'kwargs'
+        if 'kwargs' in clean_data and isinstance(clean_data['kwargs'], dict):
+            for key in keys_to_pop:
+                clean_data['kwargs'].pop(key, None)
+        
+        # Sometimes they are at the top level
+        for key in keys_to_pop:
+            clean_data.pop(key, None)
+
+        return clean_data
+
+    def _litellm_logger_callback(self, log_data: dict):
+        """
+        Callback function to redirect litellm's logs to the library's logger.
+        This allows us to control the log level and destination of litellm's output.
+        """
+        sanitized_log = self._sanitize_litellm_log(log_data)
+        # We log it at the DEBUG level to ensure it goes to the debug file
+        # and not the console, based on the main.py configuration.
+        lib_logger.debug(f"LiteLLM Log: {sanitized_log}")
+
     async def __aenter__(self):
         return self
 
@@ -159,7 +192,8 @@ class RotatingClient:
                     except Exception as buffer_exc:
                         lib_logger.error(f"Error during stream buffering logic: {buffer_exc}. Discarding buffer.")
                         json_buffer = ""
-                        continue
+                        # This is an internal error, not a provider one. Re-raise it to terminate the stream gracefully.
+                        raise buffer_exc
         
         except StreamedAPIError:
             # This is caught by the acompletion retry logic.
@@ -236,7 +270,11 @@ class RotatingClient:
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                        response = await api_call(api_key=current_key, **litellm_kwargs)
+                        response = await api_call(
+                            api_key=current_key,
+                            **litellm_kwargs,
+                            logger_fn=self._litellm_logger_callback
+                        )
                         
                         await self.usage_manager.record_success(current_key, model, response)
                         await self.usage_manager.release_key(current_key, model)
@@ -322,7 +360,7 @@ class RotatingClient:
                 try:
                     if await self.cooldown_manager.is_cooling_down(provider):
                         remaining_time = await self.cooldown_manager.get_cooldown_remaining(provider)
-                        lib_logger.warning(f"Provider {provider} is in cooldown. Waiting for {remaining_time:.2f} seconds.")
+                        lib_logger.warning(f"Provider {provider} is in a global cooldown. All requests to this provider will be paused for {remaining_time:.2f} seconds.")
                         await asyncio.sleep(remaining_time)
 
                     keys_to_try = [k for k in keys_for_provider if k not in tried_keys]
@@ -356,7 +394,11 @@ class RotatingClient:
                     for attempt in range(self.max_retries):
                         try:
                             lib_logger.info(f"Attempting stream with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
-                            response = await litellm.acompletion(api_key=current_key, **litellm_kwargs)
+                            response = await litellm.acompletion(
+                                api_key=current_key,
+                                **litellm_kwargs,
+                                logger_fn=self._litellm_logger_callback
+                            )
                             
                             key_acquired = False
                             stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
@@ -500,9 +542,9 @@ class RotatingClient:
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""
-        lib_logger.debug(f"Getting available models for provider: {provider}")
+        lib_logger.info(f"Getting available models for provider: {provider}")
         if provider in self._model_list_cache:
-            lib_logger.debug(f"Returning cached models for provider: {provider}")
+            lib_logger.info(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
         keys_for_provider = self.api_keys.get(provider)
@@ -518,9 +560,9 @@ class RotatingClient:
         if provider_instance:
             for api_key in shuffled_keys:
                 try:
-                    lib_logger.debug(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
+                    lib_logger.info(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
                     models = await provider_instance.get_models(api_key, self.http_client)
-                    lib_logger.debug(f"Got {len(models)} models for provider: {provider}")
+                    lib_logger.info(f"Got {len(models)} models for provider: {provider}")
                     self._model_list_cache[provider] = models
                     return models
                 except Exception as e:

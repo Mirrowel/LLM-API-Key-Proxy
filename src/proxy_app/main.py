@@ -44,27 +44,51 @@ from proxy_app.batch_manager import EmbeddingBatcher
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# Configure a file handler for detailed debug logs
-# Configure a file handler for detailed debug logs
-file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+# Configure a file handler for INFO-level logs and higher
+info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
+info_file_handler.setLevel(logging.INFO)
+info_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Configure a dedicated file handler for all DEBUG-level logs
+debug_file_handler = logging.FileHandler(LOG_DIR / "proxy_debug.log", encoding="utf-8")
+debug_file_handler.setLevel(logging.DEBUG)
+debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Create a filter to ensure the debug handler ONLY gets DEBUG messages from the rotator_library
+class RotatorDebugFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno == logging.DEBUG and record.name.startswith('rotator_library')
+debug_file_handler.addFilter(RotatorDebugFilter())
 
 # Configure a console handler for concise, high-level info
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(message)s'))
 
-# Get the root logger and add the handlers
+# Add a filter to prevent any LiteLLM logs from cluttering the console
+class NoLiteLLMLogFilter(logging.Filter):
+    def filter(self, record):
+        return not record.name.startswith('LiteLLM')
+console_handler.addFilter(NoLiteLLMLogFilter())
+
+# Get the root logger and set it to DEBUG to capture all messages
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO) # Set root to INFO
-root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.DEBUG)
+
+# Add all handlers to the root logger
+root_logger.addHandler(info_file_handler)
 root_logger.addHandler(console_handler)
+root_logger.addHandler(debug_file_handler)
 
 # Silence other noisy loggers by setting their level higher than root
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
+
+# Isolate LiteLLM's logger to prevent it from reaching the console.
+# We will capture its logs via the logger_fn callback in the client instead.
+litellm_logger = logging.getLogger("LiteLLM")
+litellm_logger.handlers = []
+litellm_logger.propagate = False
 # Load environment variables from .env file
 load_dotenv()
 
