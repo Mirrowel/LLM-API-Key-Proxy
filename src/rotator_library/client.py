@@ -245,7 +245,7 @@ class RotatingClient:
 
                     except litellm.RateLimitError as e:
                         last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                         classified_error = classify_error(e)
                         error_message = str(e).split('\n')[0]
                         lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
@@ -261,7 +261,7 @@ class RotatingClient:
 
                     except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
                         last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                         classified_error = classify_error(e)
                         await self.usage_manager.record_failure(current_key, model, classified_error)
                         
@@ -278,7 +278,7 @@ class RotatingClient:
 
                     except Exception as e:
                         last_exception = e
-                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                        log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                         
                         if request and await request.is_disconnected():
                             lib_logger.warning(f"Client disconnected. Aborting retries for key ...{current_key[-4:]}.")
@@ -367,7 +367,7 @@ class RotatingClient:
 
                         except (StreamedAPIError, litellm.RateLimitError) as e:
                             last_exception = e
-                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
                             
                             # Inform the client about the temporary failure before rotating.
@@ -394,7 +394,7 @@ class RotatingClient:
 
                         except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
                             last_exception = e
-                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
                             await self.usage_manager.record_failure(current_key, model, classified_error)
 
@@ -419,7 +419,7 @@ class RotatingClient:
 
                         except Exception as e:
                             last_exception = e
-                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_data=kwargs)
+                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
 
                             # For most exceptions, we notify the client and rotate the key.

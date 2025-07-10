@@ -43,7 +43,7 @@ failure_logger = setup_failure_logger()
 # Get the main library logger for concise, propagated messages
 main_lib_logger = logging.getLogger('rotator_library')
 
-def log_failure(api_key: str, model: str, attempt: int, error: Exception, request_data: dict):
+def log_failure(api_key: str, model: str, attempt: int, error: Exception, request_headers: dict):
     """
     Logs a detailed failure message to a file and a concise summary to the main logger.
     """
@@ -60,7 +60,7 @@ def log_failure(api_key: str, model: str, attempt: int, error: Exception, reques
         "error_type": type(error).__name__,
         "error_message": str(error),
         "raw_response": raw_response,
-        "request_data": request_data,
+        "request_headers": request_headers,
     }
     failure_logger.error(detailed_log_data)
 
