@@ -64,25 +64,43 @@ class RotatingClient:
 
     def _sanitize_litellm_log(self, log_data: dict) -> dict:
         """
-        Removes large data fields from litellm log dictionaries to keep debug logs clean.
+        Recursively removes large data fields and sensitive information from litellm log
+        dictionaries to keep debug logs clean and secure.
         """
         if not isinstance(log_data, dict):
             return log_data
 
-        clean_data = log_data.copy()
-
-        # These keys often contain the full request/response payload.
-        keys_to_pop = ["messages", "input", "response", "data"]
+        # Keys to remove at any level of the dictionary
+        keys_to_pop = [
+            "messages", "input", "response", "data", "api_key",
+            "api_base", "original_response", "additional_args"
+        ]
         
-        # The actual log data from litellm is often nested inside 'kwargs'
-        if 'kwargs' in clean_data and isinstance(clean_data['kwargs'], dict):
+        # Keys that might contain nested dictionaries to clean
+        nested_keys = ["kwargs", "litellm_params", "model_info", "proxy_server_request"]
+
+        # Create a deep copy to avoid modifying the original log object in memory
+        clean_data = json.loads(json.dumps(log_data, default=str))
+
+        def clean_recursively(data_dict):
+            if not isinstance(data_dict, dict):
+                return
+
+            # Remove sensitive/large keys
             for key in keys_to_pop:
-                clean_data['kwargs'].pop(key, None)
-        
-        # Sometimes they are at the top level
-        for key in keys_to_pop:
-            clean_data.pop(key, None)
+                data_dict.pop(key, None)
+            
+            # Recursively clean nested dictionaries
+            for key in nested_keys:
+                if key in data_dict and isinstance(data_dict[key], dict):
+                    clean_recursively(data_dict[key])
+            
+            # Also iterate through all values to find any other nested dicts
+            for key, value in list(data_dict.items()):
+                if isinstance(value, dict):
+                    clean_recursively(value)
 
+        clean_recursively(clean_data)
         return clean_data
 
     def _litellm_logger_callback(self, log_data: dict):
