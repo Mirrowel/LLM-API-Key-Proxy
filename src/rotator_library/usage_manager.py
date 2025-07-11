@@ -134,6 +134,7 @@ class UsageManager:
         respecting a global deadline.
         """
         await self._lazy_init()
+        await self._reset_daily_stats_if_needed()
         self._initialize_key_states(available_keys)
 
         # This loop continues as long as the global deadline has not been met.
@@ -238,10 +239,6 @@ class UsageManager:
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
             key_data = self._usage_data.setdefault(key, {"daily": {"date": today_utc_str, "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
             
-            # Perform a just-in-time daily reset if the date has changed.
-            if key_data["daily"].get("date") != today_utc_str:
-                key_data["daily"] = {"date": today_utc_str, "models": {}}
-
             # Always record a success and reset failures
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
             model_failures["consecutive_failures"] = 0

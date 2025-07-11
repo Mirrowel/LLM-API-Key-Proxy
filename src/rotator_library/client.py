@@ -291,7 +291,13 @@ class RotatingClient:
 
         # Establish a global deadline for the entire request lifecycle.
         deadline = time.time() + self.global_timeout
-        keys_for_provider = self.api_keys[provider]
+        
+        # Create a mutable copy of the keys and shuffle it to ensure
+        # that the key selection is randomized, which is crucial when
+        # multiple keys have the same usage stats.
+        keys_for_provider = list(self.api_keys[provider])
+        random.shuffle(keys_for_provider)
+        
         tried_keys = set()
         last_exception = None
         kwargs = self._convert_model_params(**kwargs)
@@ -439,7 +445,11 @@ class RotatingClient:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
         model = kwargs.get("model")
         provider = model.split('/')[0]
-        keys_for_provider = self.api_keys[provider]
+        
+        # Create a mutable copy of the keys and shuffle it.
+        keys_for_provider = list(self.api_keys[provider])
+        random.shuffle(keys_for_provider)
+        
         deadline = time.time() + self.global_timeout
         tried_keys = set()
         last_exception = None
@@ -465,7 +475,7 @@ class RotatingClient:
 
                     lib_logger.info(f"Acquiring key for model {model}. Tried keys: {len(tried_keys)}/{len(keys_for_provider)}")
                     current_key = await self.usage_manager.acquire_key(
-                        available_keys=keys_to_try, 
+                        available_keys=keys_to_try,
                         model=model,
                         deadline=deadline
                     )
