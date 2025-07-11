@@ -269,14 +269,35 @@ class RotatingClient:
             raise
 
         finally:
-            # Only record usage if the stream completed successfully and usage wasn't already recorded.
-            if stream_completed and not usage_recorded:
+            # This block now runs regardless of how the stream terminates (completion, client disconnect, etc.).
+            # The primary goal is to ensure usage is always logged internally.
+            if not usage_recorded:
+                # This will be triggered if the stream is exhausted OR if the client disconnects early.
+                # It ensures that we always attempt to log usage from the final stream object.
                 await self.usage_manager.record_success(key, model, stream)
-            
+                
+                # We still attempt to send the final usage to the client, but only if they are still connected.
+                if request and not await request.is_disconnected() and hasattr(stream, 'usage') and stream.usage:
+                    try:
+                        final_usage_chunk = {
+                            "id": getattr(stream, 'id', None),
+                            "model": getattr(stream, 'model', None),
+                            "object": "chat.completion.chunk",
+                            "created": getattr(stream, 'created', None),
+                            "choices": [],
+                            "usage": stream.usage.dict() if hasattr(stream.usage, 'dict') else vars(stream.usage)
+                        }
+                        yield f"data: {json.dumps(final_usage_chunk)}\n\n"
+                        lib_logger.info(f"Yielded final usage chunk for key ...{key[-4:]}.")
+                    except Exception as e:
+                        lib_logger.error(f"Failed to create or yield final usage chunk: {e}")
+
             await self.usage_manager.release_key(key, model)
             lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
             
-            if stream_completed:
+            # Only send [DONE] if the stream completed naturally and the client is still there.
+            # This prevents sending [DONE] to a disconnected client or after an error.
+            if stream_completed and (not request or not await request.is_disconnected()):
                 yield "data: [DONE]\n\n"
 
     async def _execute_with_retry(self, api_call: callable, request: Optional[Any], **kwargs) -> Any:
