@@ -28,6 +28,9 @@ def _register_providers():
             if isinstance(attribute, type) and issubclass(attribute, ProviderInterface) and attribute is not ProviderInterface:
                 # The provider name is derived from the module name (e.g., 'openai_provider' -> 'openai')
                 provider_name = module_name.replace("_provider", "")
+                # Remap 'nvidia' to 'nvidia_nim' to align with litellm's provider name
+                if provider_name == "nvidia":
+                    provider_name = "nvidia_nim"
                 PROVIDER_PLUGINS[provider_name] = attribute
                 #print(f"Registered provider: {provider_name}")
 
