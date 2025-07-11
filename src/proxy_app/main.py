@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 import logging
+import colorlog
 from pathlib import Path
 import sys
 import json
@@ -60,10 +61,20 @@ class RotatorDebugFilter(logging.Filter):
         return record.levelno == logging.DEBUG and record.name.startswith('rotator_library')
 debug_file_handler.addFilter(RotatorDebugFilter())
 
-# Configure a console handler for concise, high-level info
-console_handler = logging.StreamHandler(sys.stdout)
+# Configure a console handler with color
+console_handler = colorlog.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(message)s'))
+formatter = colorlog.ColoredFormatter(
+    '%(log_color)s%(message)s',
+    log_colors={
+        'DEBUG':    'cyan',
+        'INFO':     'green',
+        'WARNING':  'yellow',
+        'ERROR':    'red',
+        'CRITICAL': 'red,bg_white',
+    }
+)
+console_handler.setFormatter(formatter)
 
 # Add a filter to prevent any LiteLLM logs from cluttering the console
 class NoLiteLLMLogFilter(logging.Filter):

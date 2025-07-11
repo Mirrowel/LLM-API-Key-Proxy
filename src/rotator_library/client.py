@@ -454,6 +454,9 @@ class RotatingClient:
         tried_keys = set()
         last_exception = None
         kwargs = self._convert_model_params(**kwargs)
+        
+        consecutive_quota_failures = 0
+
         try:
             while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:
                 current_key = None
@@ -545,7 +548,9 @@ class RotatingClient:
                             error_message_text = error_details.get("message", str(original_exc))
 
                             if "quota" in error_message_text.lower() or "resource_exhausted" in error_status.lower():
-                                # This is a fatal quota error. Terminate the stream with a clear message.
+                                consecutive_quota_failures += 1
+                                lib_logger.warning(f"Key ...{current_key[-4:]} hit a quota limit. This is consecutive failure #{consecutive_quota_failures} for this request.")
+
                                 quota_value = "N/A"
                                 quota_id = "N/A"
                                 if "details" in error_details and isinstance(error_details.get("details"), list):
@@ -559,58 +564,52 @@ class RotatingClient:
                                                 if quota_value != "N/A" and quota_id != "N/A":
                                                     break
                                 
-                                # 1. Detailed message for the end client
-                                client_error_message = (
-                                    f"FATAL: You have exceeded your API quota. "
-                                    f"Message: '{error_message_text}'. "
-                                    f"Limit: {quota_value} (Quota ID: {quota_id})."
-                                )
+                                await self.usage_manager.record_failure(current_key, model, classified_error)
 
-                                # 2. Concise message for the console log
-                                console_log_message = (
-                                    f"Terminating stream for key ...{current_key[-4:]} due to fatal quota error. "
-                                    f"ID: {quota_id}, Limit: {quota_value}."
-                                )
-                                lib_logger.warning(console_log_message)
-
-                                # 3. Yield the detailed message to the client and terminate
-                                yield f"data: {json.dumps({'error': {'message': client_error_message, 'type': 'proxy_quota_error'}})}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return # Exit the generator completely.
-
-                            # --- NON-QUOTA ERROR: Fallback to key rotation ---
-                            rotation_error_message = f"Provider API key failed with {classified_error.error_type}. Rotating to a new key."
-                            yield f"data: {json.dumps({'error': {'message': rotation_error_message, 'type': 'proxy_key_rotation_error', 'code': classified_error.status_code}})}\n\n"
+                                if consecutive_quota_failures >= 3:
+                                    console_log_message = (
+                                        f"Terminating stream for key ...{current_key[-4:]} due to 3rd consecutive quota error. "
+                                        f"This is now considered a fatal input data error. ID: {quota_id}, Limit: {quota_value}."
+                                    )
+                                    client_error_message = (
+                                        "FATAL: Request failed after 3 consecutive quota errors, "
+                                        "indicating the input data is too large for the model's per-request limit. "
+                                        f"Last Error Message: '{error_message_text}'. Limit: {quota_value} (Quota ID: {quota_id})."
+                                    )
+                                    lib_logger.error(console_log_message)
+                                    
+                                    yield f"data: {json.dumps({'error': {'message': client_error_message, 'type': 'proxy_fatal_quota_error'}})}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
+                                
+                                else:
+                                    # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
+                                    lib_logger.warning(f"Quota error on key ...{current_key[-4:]} (failure {consecutive_quota_failures}/3). Rotating key silently.")
+                                    break
                             
-                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a recoverable error during stream for model {model}. Rotating key.")
-                            
-                            # Only apply global cooldown for non-quota 429s.
-                            if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
-                                cooldown_duration = classified_error.retry_after or 60
-                                await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
-                                lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
+                            else:
+                                consecutive_quota_failures = 0
+                                # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
+                                lib_logger.warning(f"Key ...{current_key[-4:]} encountered a recoverable error ({classified_error.error_type}) during stream. Rotating key silently.")
+                                
+                                if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
+                                    cooldown_duration = classified_error.retry_after or 60
+                                    await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
+                                    lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
 
-                            await self.usage_manager.record_failure(current_key, model, classified_error)
-                            break # Break to try the next key
+                                await self.usage_manager.record_failure(current_key, model, classified_error)
+                                break
 
                         except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
+                            consecutive_quota_failures = 0
                             last_exception = e
                             log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
                             await self.usage_manager.record_failure(current_key, model, classified_error)
 
                             if attempt >= self.max_retries - 1:
-                                lib_logger.warning(f"Key ...{current_key[-4:]} failed after max retries for model {model} due to a server error. Rotating key.")
-                                # Inform the client about the temporary failure before rotating.
-                                error_message = f"Key ...{current_key[-4:]} failed after multiple retries. Rotating to a new key."
-                                error_data = {
-                                    "error": {
-                                        "message": error_message,
-                                        "type": "proxy_key_rotation_error",
-                                        "code": classified_error.status_code
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_data)}\n\n"
+                                lib_logger.warning(f"Key ...{current_key[-4:]} failed after max retries for model {model} due to a server error. Rotating key silently.")
+                                # [MODIFIED] Do not yield to the client here.
                                 break
                             
                             wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
@@ -625,21 +624,10 @@ class RotatingClient:
                             continue
 
                         except Exception as e:
+                            consecutive_quota_failures = 0
                             last_exception = e
                             log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
-
-                            # For most exceptions, we notify the client and rotate the key.
-                            if classified_error.error_type not in ['invalid_request', 'context_window_exceeded', 'authentication']:
-                                error_message = f"An unexpected error occurred with key ...{current_key[-4:]}. Rotating to a new key."
-                                error_data = {
-                                    "error": {
-                                        "message": error_message,
-                                        "type": "proxy_key_rotation_error",
-                                        "code": classified_error.status_code
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_data)}\n\n"
 
                             lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
 
@@ -651,6 +639,7 @@ class RotatingClient:
                             if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
                                 raise last_exception
                             
+                            # [MODIFIED] Do not yield to the client here.
                             await self.usage_manager.record_failure(current_key, model, classified_error)
                             break
 
