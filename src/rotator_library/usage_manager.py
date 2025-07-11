@@ -239,6 +239,10 @@ class UsageManager:
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
             key_data = self._usage_data.setdefault(key, {"daily": {"date": today_utc_str, "models": {}}, "global": {"models": {}}, "model_cooldowns": {}, "failures": {}})
             
+            # If the key is new, ensure its reset date is initialized to prevent an immediate reset.
+            if "last_daily_reset" not in key_data:
+                key_data["last_daily_reset"] = today_utc_str
+            
             # Always record a success and reset failures
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
             model_failures["consecutive_failures"] = 0
