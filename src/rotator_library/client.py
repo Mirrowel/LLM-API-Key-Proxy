@@ -207,6 +207,13 @@ class RotatingClient:
                         lib_logger.debug(f"Stream ended with incomplete data in buffer: {json_buffer}")
                     break
 
+                except (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.InternalServerError, APIConnectionError) as e:
+                    # This is a critical, typed error from litellm that signals a key failure.
+                    # We do not try to parse it here. We wrap it and raise it immediately
+                    # for the outer retry loop to handle.
+                    lib_logger.warning(f"Caught a critical API error mid-stream: {type(e).__name__}. Signaling for key rotation.")
+                    raise StreamedAPIError("Provider error received in stream", data=e)
+
                 except Exception as e:
                     try:
                         raw_chunk = ""
@@ -234,15 +241,8 @@ class RotatingClient:
                         # If parsing succeeds, we have the complete object.
                         lib_logger.debug(f"Successfully reassembled JSON from stream: {json_buffer}")
                         
-                        if "error" in parsed_data:
-                            # Yield the error to the client, then raise internally to trigger rotation.
-                            yield f"data: {json.dumps(parsed_data)}\n\n"
-                            raise StreamedAPIError("Provider error received in stream", data=parsed_data)
-                        else:
-                            # This is an unexpected case, but we handle it by yielding the data.
-                            yield f"data: {json.dumps(parsed_data)}\n\n"
-                        
-                        json_buffer = "" # Clear the buffer on success
+                        # Wrap the complete error object and raise it. The outer function will decide how to handle it.
+                        raise StreamedAPIError("Provider error received in stream", data=parsed_data)
 
                     except json.JSONDecodeError:
                         # This is the expected outcome if the JSON in the buffer is not yet complete.
@@ -499,6 +499,8 @@ class RotatingClient:
                                 logger_fn=self._litellm_logger_callback
                             )
                             
+                            lib_logger.info(f"Stream connection established for key ...{current_key[-4:]}. Processing response.")
+
                             key_acquired = False
                             stream_generator = self._safe_streaming_wrapper(response, current_key, model, request)
                             
@@ -511,27 +513,75 @@ class RotatingClient:
                             log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             classified_error = classify_error(e)
                             
-                            # Inform the client about the temporary failure before rotating.
-                            # This keeps the connection alive.
-                            error_message = f"Provider API key failed with {classified_error.error_type}. Rotating to a new key."
-                            error_data = {
-                                "error": {
-                                    "message": error_message,
-                                    "type": "proxy_key_rotation_error",
-                                    "code": classified_error.status_code
-                                }
-                            }
-                            yield f"data: {json.dumps(error_data)}\n\n"
+                            # This is the final, robust handler for streamed errors.
+                            error_payload = {}
+                            # The actual exception might be wrapped in our StreamedAPIError.
+                            original_exc = getattr(e, 'data', e)
+
+                            try:
+                                # The full error JSON is in the string representation of the exception.
+                                json_str_match = re.search(r'(\{.*\})', str(original_exc), re.DOTALL)
+                                if json_str_match:
+                                    # The string may contain byte-escaped characters (e.g., \\n).
+                                    cleaned_str = codecs.decode(json_str_match.group(1), 'unicode_escape')
+                                    error_payload = json.loads(cleaned_str)
+                            except (json.JSONDecodeError, TypeError):
+                                lib_logger.warning("Could not parse JSON details from streamed error exception.")
+                                error_payload = {}
+
+                            error_details = error_payload.get("error", {})
+                            error_status = error_details.get("status", "")
+                            # Fallback to the full string if parsing fails.
+                            error_message_text = error_details.get("message", str(original_exc))
+
+                            if "quota" in error_message_text.lower() or "resource_exhausted" in error_status.lower():
+                                # This is a fatal quota error. Terminate the stream with a clear message.
+                                quota_value = "N/A"
+                                quota_id = "N/A"
+                                if "details" in error_details and isinstance(error_details.get("details"), list):
+                                    for detail in error_details["details"]:
+                                        if isinstance(detail.get("violations"), list):
+                                            for violation in detail["violations"]:
+                                                if "quotaValue" in violation:
+                                                    quota_value = violation["quotaValue"]
+                                                if "quotaId" in violation:
+                                                    quota_id = violation["quotaId"]
+                                                if quota_value != "N/A" and quota_id != "N/A":
+                                                    break
+                                
+                                # 1. Detailed message for the end client
+                                client_error_message = (
+                                    f"FATAL: You have exceeded your API quota. "
+                                    f"Message: '{error_message_text}'. "
+                                    f"Limit: {quota_value} (Quota ID: {quota_id})."
+                                )
+
+                                # 2. Concise message for the console log
+                                console_log_message = (
+                                    f"Terminating stream for key ...{current_key[-4:]} due to fatal quota error. "
+                                    f"ID: {quota_id}, Limit: {quota_value}."
+                                )
+                                lib_logger.warning(console_log_message)
+
+                                # 3. Yield the detailed message to the client and terminate
+                                yield f"data: {json.dumps({'error': {'message': client_error_message, 'type': 'proxy_quota_error'}})}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return # Exit the generator completely.
+
+                            # --- NON-QUOTA ERROR: Fallback to key rotation ---
+                            rotation_error_message = f"Provider API key failed with {classified_error.error_type}. Rotating to a new key."
+                            yield f"data: {json.dumps({'error': {'message': rotation_error_message, 'type': 'proxy_key_rotation_error', 'code': classified_error.status_code}})}\n\n"
                             
-                            lib_logger.warning(f"Key ...{current_key[-4:]} hit rate limit during stream for model {model}. Reason: '{str(e).split('\n')[0]}'. Rotating key.")
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a recoverable error during stream for model {model}. Rotating key.")
                             
+                            # Only apply global cooldown for non-quota 429s.
                             if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(provider, cooldown_duration)
                                 lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
 
                             await self.usage_manager.record_failure(current_key, model, classified_error)
-                            break
+                            break # Break to try the next key
 
                         except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
                             last_exception = e
@@ -650,7 +700,7 @@ class RotatingClient:
         """Returns a list of available models for a specific provider, with caching."""
         lib_logger.info(f"Getting available models for provider: {provider}")
         if provider in self._model_list_cache:
-            lib_logger.info(f"Returning cached models for provider: {provider}")
+            lib_logger.debug(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
         keys_for_provider = self.api_keys.get(provider)
@@ -666,14 +716,14 @@ class RotatingClient:
         if provider_instance:
             for api_key in shuffled_keys:
                 try:
-                    lib_logger.info(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
+                    lib_logger.debug(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
                     models = await provider_instance.get_models(api_key, self.http_client)
                     lib_logger.info(f"Got {len(models)} models for provider: {provider}")
                     self._model_list_cache[provider] = models
                     return models
                 except Exception as e:
                     classified_error = classify_error(e)
-                    lib_logger.warning(f"Failed to get models for provider {provider} with key ...{api_key[-4:]}: {classified_error.error_type}. Trying next key.")
+                    lib_logger.debug(f"Failed to get models for provider {provider} with key ...{api_key[-4:]}: {classified_error.error_type}. Trying next key.")
                     continue # Try the next key
         
         lib_logger.error(f"Failed to get models for provider {provider} after trying all keys.")
