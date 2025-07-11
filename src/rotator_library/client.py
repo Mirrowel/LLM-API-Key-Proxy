@@ -1,5 +1,7 @@
 import asyncio
 import json
+import re
+import codecs
 import time
 import os
 import random
@@ -107,11 +109,28 @@ class RotatingClient:
         """
         Callback function to redirect litellm's logs to the library's logger.
         This allows us to control the log level and destination of litellm's output.
+        It also cleans up error logs for better readability in debug files.
         """
-        sanitized_log = self._sanitize_litellm_log(log_data)
-        # We log it at the DEBUG level to ensure it goes to the debug file
+        # For successful calls or pre-call logs, a simple debug message is enough.
+        if not log_data.get("exception"):
+            sanitized_log = self._sanitize_litellm_log(log_data)
+            # We log it at the DEBUG level to ensure it goes to the debug file
         # and not the console, based on the main.py configuration.
-        lib_logger.debug(f"LiteLLM Log: {sanitized_log}")
+            lib_logger.debug(f"LiteLLM Log: {sanitized_log}")
+            return
+
+        # For failures, extract key info to make debug logs more readable.
+        model = log_data.get("model", "N/A")
+        call_id = log_data.get("litellm_call_id", "N/A")
+        error_info = log_data.get("standard_logging_object", {}).get("error_information", {})
+        error_class = error_info.get("error_class", "UnknownError")
+        error_message = error_info.get("error_message", str(log_data.get("exception", "")))
+        error_message = ' '.join(error_message.split()) # Sanitize
+
+        lib_logger.debug(
+            f"LiteLLM Callback Handled Error: Model={model} | "
+            f"Type={error_class} | Message='{error_message}'"
+        )
 
     async def __aenter__(self):
         return self
@@ -171,7 +190,9 @@ class RotatingClient:
                 try:
                     chunk = await stream_iterator.__anext__()
                     if json_buffer:
-                        lib_logger.debug(f"Discarding incomplete JSON buffer: {json_buffer}")
+                        # If we are about to discard a buffer, it means data was likely lost.
+                        # Log this as a warning to make it visible.
+                        lib_logger.warning(f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}")
                         json_buffer = ""
                     
                     yield f"data: {json.dumps(chunk.dict())}\n\n"
@@ -188,31 +209,52 @@ class RotatingClient:
 
                 except Exception as e:
                     try:
-                        raw_chunk = str(e).split("Received chunk:")[-1].strip()
+                        raw_chunk = ""
+                        # Google streams errors inside a bytes representation (b'{...}').
+                        # We use regex to extract the content, which is more reliable than splitting.
+                        match = re.search(r"b'(\{.*\})'", str(e), re.DOTALL)
+                        if match:
+                            # The extracted string is unicode-escaped (e.g., '\\n'). We must decode it.
+                            raw_chunk = codecs.decode(match.group(1), 'unicode_escape')
+                        else:
+                            # Fallback for other potential error formats that use "Received chunk:".
+                            chunk_from_split = str(e).split("Received chunk:")[-1].strip()
+                            if chunk_from_split != str(e): # Ensure the split actually did something
+                                raw_chunk = chunk_from_split
+                        
+                        if not raw_chunk:
+                            # If we could not extract a valid chunk, we cannot proceed with reassembly.
+                            # This indicates a different, unexpected error type. Re-raise it.
+                            raise e
+
+                        # Append the clean chunk to the buffer and try to parse.
                         json_buffer += raw_chunk
                         parsed_data = json.loads(json_buffer)
                         
-                        lib_logger.debug(f"Successfully reassembled JSON from buffer: {json_buffer}")
+                        # If parsing succeeds, we have the complete object.
+                        lib_logger.debug(f"Successfully reassembled JSON from stream: {json_buffer}")
                         
                         if "error" in parsed_data:
-                            lib_logger.warning(f"Reassembled object is an API error. Passing it to the client and raising internally.")
+                            # Yield the error to the client, then raise internally to trigger rotation.
                             yield f"data: {json.dumps(parsed_data)}\n\n"
-                            # Signal the error to the outer retry loop so it can try the next key.
                             raise StreamedAPIError("Provider error received in stream", data=parsed_data)
                         else:
+                            # This is an unexpected case, but we handle it by yielding the data.
                             yield f"data: {json.dumps(parsed_data)}\n\n"
                         
-                        json_buffer = ""
+                        json_buffer = "" # Clear the buffer on success
+
                     except json.JSONDecodeError:
+                        # This is the expected outcome if the JSON in the buffer is not yet complete.
                         lib_logger.debug(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
-                        continue
+                        continue # Continue to the next loop to get the next chunk.
                     except StreamedAPIError:
-                        # Re-raise to be caught by the outer handler
+                        # Re-raise to be caught by the outer retry handler.
                         raise
                     except Exception as buffer_exc:
+                        # If the error was not a JSONDecodeError, it's an unexpected internal error.
                         lib_logger.error(f"Error during stream buffering logic: {buffer_exc}. Discarding buffer.")
-                        json_buffer = ""
-                        # This is an internal error, not a provider one. Re-raise it to terminate the stream gracefully.
+                        json_buffer = "" # Clear the corrupted buffer to prevent further issues.
                         raise buffer_exc
         
         except StreamedAPIError:
@@ -320,8 +362,10 @@ class RotatingClient:
                         last_exception = e
                         log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                         classified_error = classify_error(e)
+                        
+                        # Extract a clean error message for the user-facing log
                         error_message = str(e).split('\n')[0]
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                        lib_logger.info(f"Key ...{current_key[-4:]} hit rate limit for model {model}. Reason: '{error_message}'. Rotating key.")
 
                         if classified_error.status_code == 429:
                             cooldown_duration = classified_error.retry_after or 60
@@ -329,7 +373,7 @@ class RotatingClient:
                             lib_logger.warning(f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown.")
                         
                         await self.usage_manager.record_failure(current_key, model, classified_error)
-                        lib_logger.info(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered a rate limit. Trying next key.")
                         break # Move to the next key
 
                     except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
@@ -340,7 +384,7 @@ class RotatingClient:
                         
                         if attempt >= self.max_retries - 1:
                             error_message = str(e).split('\n')[0]
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key.")
+                            lib_logger.warning(f"Key ...{current_key[-4:]} failed after max retries for model {model} due to a server error. Reason: '{error_message}'. Rotating key.")
                             break # Move to the next key
                         
                         # For temporary errors, wait before retrying with the same key.
@@ -353,7 +397,7 @@ class RotatingClient:
                             break
 
                         error_message = str(e).split('\n')[0]
-                        lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Retrying in {wait_time:.2f} seconds.")
+                        lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s.")
                         await asyncio.sleep(wait_time)
                         continue # Retry with the same key
 
@@ -478,8 +522,8 @@ class RotatingClient:
                                 }
                             }
                             yield f"data: {json.dumps(error_data)}\n\n"
-
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
+                            
+                            lib_logger.warning(f"Key ...{current_key[-4:]} hit rate limit during stream for model {model}. Reason: '{str(e).split('\n')[0]}'. Rotating key.")
                             
                             if classified_error.error_type == 'rate_limit' and classified_error.status_code == 429:
                                 cooldown_duration = classified_error.retry_after or 60
@@ -496,7 +540,7 @@ class RotatingClient:
                             await self.usage_manager.record_failure(current_key, model, classified_error)
 
                             if attempt >= self.max_retries - 1:
-                                lib_logger.warning(f"Key ...{current_key[-4:]} failed after {self.max_retries} retries with {classified_error.error_type}. Rotating key.")
+                                lib_logger.warning(f"Key ...{current_key[-4:]} failed after max retries for model {model} due to a server error. Rotating key.")
                                 # Inform the client about the temporary failure before rotating.
                                 error_message = f"Key ...{current_key[-4:]} failed after multiple retries. Rotating to a new key."
                                 error_data = {
@@ -515,7 +559,8 @@ class RotatingClient:
                                 lib_logger.warning(f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early.")
                                 break
                             
-                            lib_logger.warning(f"Key ...{current_key[-4:]} failed with {classified_error.error_type}. Retrying in {wait_time:.2f} seconds.")
+                            error_message = str(e).split('\n')[0]
+                            lib_logger.warning(f"Key ...{current_key[-4:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s.")
                             await asyncio.sleep(wait_time)
                             continue
 
