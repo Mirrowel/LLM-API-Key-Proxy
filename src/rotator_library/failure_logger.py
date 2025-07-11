@@ -43,13 +43,15 @@ failure_logger = setup_failure_logger()
 # Get the main library logger for concise, propagated messages
 main_lib_logger = logging.getLogger('rotator_library')
 
-def log_failure(api_key: str, model: str, attempt: int, error: Exception, request_headers: dict):
+def log_failure(api_key: str, model: str, attempt: int, error: Exception, request_headers: dict, raw_response_text: str = None):
     """
     Logs a detailed failure message to a file and a concise summary to the main logger.
     """
     # 1. Log the full, detailed error to the dedicated failures.log file
-    raw_response = None
-    if hasattr(error, 'response') and hasattr(error.response, 'text'):
+    # Prioritize the explicitly passed raw response text, as it may contain
+    # reassembled data from a stream that is not available on the exception object.
+    raw_response = raw_response_text
+    if not raw_response and hasattr(error, 'response') and hasattr(error.response, 'text'):
         raw_response = error.response.text
 
     detailed_log_data = {

@@ -544,11 +544,12 @@ class RotatingClient:
 
                         except (StreamedAPIError, litellm.RateLimitError) as e:
                             last_exception = e
-                            log_failure(api_key=current_key, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
+                            
                             classified_error = classify_error(e)
                             
                             # This is the final, robust handler for streamed errors.
                             error_payload = {}
+                            cleaned_str = None
                             # The actual exception might be wrapped in our StreamedAPIError.
                             original_exc = getattr(e, 'data', e)
 
@@ -562,6 +563,16 @@ class RotatingClient:
                             except (json.JSONDecodeError, TypeError):
                                 lib_logger.warning("Could not parse JSON details from streamed error exception.")
                                 error_payload = {}
+                            
+                            # Now, log the failure with the extracted raw response.
+                            log_failure(
+                                api_key=current_key,
+                                model=model,
+                                attempt=attempt + 1,
+                                error=e,
+                                request_headers=dict(request.headers) if request else {},
+                                raw_response_text=cleaned_str
+                            )
 
                             error_details = error_payload.get("error", {})
                             error_status = error_details.get("status", "")
