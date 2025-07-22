@@ -204,7 +204,7 @@ class RotatingClient:
                 except StopAsyncIteration:
                     stream_completed = True
                     if json_buffer:
-                        lib_logger.debug(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                        lib_logger.info(f"Stream ended with incomplete data in buffer: {json_buffer}")
                     break
 
                 except (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.InternalServerError, APIConnectionError) as e:
@@ -239,14 +239,14 @@ class RotatingClient:
                         parsed_data = json.loads(json_buffer)
                         
                         # If parsing succeeds, we have the complete object.
-                        lib_logger.debug(f"Successfully reassembled JSON from stream: {json_buffer}")
+                        lib_logger.info(f"Successfully reassembled JSON from stream: {json_buffer}")
                         
                         # Wrap the complete error object and raise it. The outer function will decide how to handle it.
                         raise StreamedAPIError("Provider error received in stream", data=parsed_data)
 
                     except json.JSONDecodeError:
                         # This is the expected outcome if the JSON in the buffer is not yet complete.
-                        lib_logger.debug(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
+                        lib_logger.info(f"Buffer still incomplete. Waiting for more chunks: {json_buffer}")
                         continue # Continue to the next loop to get the next chunk.
                     except StreamedAPIError:
                         # Re-raise to be caught by the outer retry handler.

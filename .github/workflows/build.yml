@@ -334,6 +334,7 @@ jobs:
 
         # Create the release using the notes file
         gh release create ${{ steps.version.outputs.release_tag }} \
+          --target ${{ github.sha }} \
           --title "${{ steps.version.outputs.release_title }}" \
           --notes-file releasenotes.md \
           --latest \
