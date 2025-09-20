@@ -346,8 +346,9 @@ class RotatingClient:
                 if not keys_to_try:
                     break
 
+                lib_logger.info(f"Acquiring key for model {model}. Tried keys: {len(tried_keys)}/{len(keys_for_provider)}")
                 current_key = await self.usage_manager.acquire_key(
-                    available_keys=keys_to_try, 
+                    available_keys=keys_to_try,
                     model=model,
                     deadline=deadline
                 )
