@@ -20,7 +20,7 @@ lib_logger.propagate = False
 
 from .usage_manager import UsageManager
 from .failure_logger import log_failure
-from .error_handler import classify_error, AllProviders, NoAvailableKeysError
+from .error_handler import PreRequestCallbackError, classify_error, AllProviders, NoAvailableKeysError
 from .providers import PROVIDER_PLUGINS
 from .request_sanitizer import sanitize_request_payload
 from .cooldown_manager import CooldownManager
@@ -36,7 +36,7 @@ class RotatingClient:
     A client that intelligently rotates and retries API keys using LiteLLM,
     with support for both streaming and non-streaming responses.
     """
-    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True, global_timeout: int = 30):
+    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True, global_timeout: int = 30, abort_on_callback_error: bool = True):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -56,6 +56,7 @@ class RotatingClient:
         self.api_keys = api_keys
         self.max_retries = max_retries
         self.global_timeout = global_timeout
+        self.abort_on_callback_error = abort_on_callback_error
         self.usage_manager = UsageManager(file_path=usage_file_path)
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
@@ -300,7 +301,7 @@ class RotatingClient:
             if stream_completed and (not request or not await request.is_disconnected()):
                 yield "data: [DONE]\n\n"
 
-    async def _execute_with_retry(self, api_call: callable, request: Optional[Any], **kwargs) -> Any:
+    async def _execute_with_retry(self, api_call: callable, request: Optional[Any], pre_request_callback: Optional[callable] = None, **kwargs) -> Any:
         """A generic retry mechanism for non-streaming API calls."""
         model = kwargs.get("model")
         if not model:
@@ -374,6 +375,16 @@ class RotatingClient:
                 for attempt in range(self.max_retries):
                     try:
                         lib_logger.info(f"Attempting call with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                        
+                        if pre_request_callback:
+                            try:
+                                await pre_request_callback(request, litellm_kwargs)
+                            except Exception as e:
+                                if self.abort_on_callback_error:
+                                    raise PreRequestCallbackError(f"Pre-request callback failed: {e}") from e
+                                else:
+                                    lib_logger.warning(f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}")
+                        
                         response = await api_call(
                             api_key=current_key,
                             **litellm_kwargs,
@@ -462,7 +473,7 @@ class RotatingClient:
         # Return None to indicate failure without propagating a disruptive exception.
         return None
 
-    async def _streaming_acompletion_with_retry(self, request: Optional[Any], **kwargs) -> AsyncGenerator[str, None]:
+    async def _streaming_acompletion_with_retry(self, request: Optional[Any], pre_request_callback: Optional[callable] = None, **kwargs) -> AsyncGenerator[str, None]:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
         model = kwargs.get("model")
         provider = model.split('/')[0]
@@ -527,6 +538,16 @@ class RotatingClient:
                     for attempt in range(self.max_retries):
                         try:
                             lib_logger.info(f"Attempting stream with key ...{current_key[-4:]} (Attempt {attempt + 1}/{self.max_retries})")
+                            
+                            if pre_request_callback:
+                                try:
+                                    await pre_request_callback(request, litellm_kwargs)
+                                except Exception as e:
+                                    if self.abort_on_callback_error:
+                                        raise PreRequestCallbackError(f"Pre-request callback failed: {e}") from e
+                                    else:
+                                        lib_logger.warning(f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}")
+                            
                             response = await litellm.acompletion(
                                 api_key=current_key,
                                 **litellm_kwargs,
@@ -700,16 +721,40 @@ class RotatingClient:
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
 
-    def acompletion(self, request: Optional[Any] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
-        """Dispatcher for completion requests."""
-        if kwargs.get("stream"):
-            return self._streaming_acompletion_with_retry(request, **kwargs)
-        else:
-            return self._execute_with_retry(litellm.acompletion, request, **kwargs)
+    def acompletion(self, request: Optional[Any] = None, pre_request_callback: Optional[callable] = None, **kwargs) -> Union[Any, AsyncGenerator[str, None]]:
+        """
+        Dispatcher for completion requests.
 
-    def aembedding(self, request: Optional[Any] = None, **kwargs) -> Any:
-        """Executes an embedding request with retry logic."""
-        return self._execute_with_retry(litellm.aembedding, request, **kwargs)
+        Args:
+            request: Optional request object, used for client disconnect checks and logging.
+            pre_request_callback: Optional async callback function to be called before each API request attempt.
+                The callback will receive the `request` object and the prepared request `kwargs` as arguments.
+                This can be used for custom logic such as request validation, logging, or rate limiting.
+                If the callback raises an exception, the completion request will be aborted and the exception will propagate.
+
+        Returns:
+            The completion response object, or an async generator for streaming responses, or None if all retries fail.
+        """
+        if kwargs.get("stream"):
+            return self._streaming_acompletion_with_retry(request=request, pre_request_callback=pre_request_callback, **kwargs)
+        else:
+            return self._execute_with_retry(litellm.acompletion, request=request, pre_request_callback=pre_request_callback, **kwargs)
+
+    def aembedding(self, request: Optional[Any] = None, pre_request_callback: Optional[callable] = None, **kwargs) -> Any:
+        """
+        Executes an embedding request with retry logic.
+
+        Args:
+            request: Optional request object, used for client disconnect checks and logging.
+            pre_request_callback: Optional async callback function to be called before each API request attempt.
+                The callback will receive the `request` object and the prepared request `kwargs` as arguments.
+                This can be used for custom logic such as request validation, logging, or rate limiting.
+                If the callback raises an exception, the embedding request will be aborted and the exception will propagate.
+
+        Returns:
+            The embedding response object, or None if all retries fail.
+        """
+        return self._execute_with_retry(litellm.aembedding, request=request, pre_request_callback=pre_request_callback, **kwargs)
 
     def token_count(self, **kwargs) -> int:
         """Calculates the number of tokens for a given text or list of messages."""

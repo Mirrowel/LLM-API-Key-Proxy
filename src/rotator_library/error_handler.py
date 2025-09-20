@@ -7,6 +7,10 @@ class NoAvailableKeysError(Exception):
     """Raised when no API keys are available for a request after waiting."""
     pass
 
+class PreRequestCallbackError(Exception):
+    """Raised when a pre-request callback fails."""
+    pass
+
 class ClassifiedError:
     """A structured representation of a classified error."""
     def __init__(self, error_type: str, original_exception: Exception, status_code: Optional[int] = None, retry_after: Optional[int] = None):
@@ -79,6 +83,13 @@ def classify_error(e: Exception) -> ClassifiedError:
     """
     status_code = getattr(e, 'status_code', None)
     
+    if isinstance(e, PreRequestCallbackError):
+        return ClassifiedError(
+            error_type='pre_request_callback_error',
+            original_exception=e,
+            status_code=400  # Treat as a bad request
+        )
+
     if isinstance(e, RateLimitError):
         retry_after = get_retry_after(e)
         return ClassifiedError(
