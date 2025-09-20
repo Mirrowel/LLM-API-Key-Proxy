@@ -1,21 +1,21 @@
-# Technical Documentation: API Key Proxy & Rotator Library
+# Technical Documentation: Universal LLM API Proxy & Resilience Library
 
-This document provides a detailed technical explanation of the API Key Proxy and the `rotating-api-key-client` library, covering their architecture, components, and internal workings.
+This document provides a detailed technical explanation of the project's two main components: the Universal LLM API Proxy and the Resilience Library that powers it.
 
 ## 1. Architecture Overview
 
 The project is a monorepo containing two primary components:
 
-1.  **`rotator_library`**: A standalone, reusable Python library for intelligent API key rotation and management.
-2.  **`proxy_app`**: A FastAPI application that consumes the `rotator_library` and exposes its functionality through an OpenAI-compatible web API.
+1.  **The Proxy Application (`proxy_app`)**: This is the user-facing component. It's a FastAPI application that uses `litellm` to create a universal, OpenAI-compatible API. Its primary role is to abstract away the complexity of dealing with multiple LLM providers, offering a single point of entry for applications like agentic coders.
+2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
 
-This architecture separates the core rotation logic from the web-serving layer, making the library portable and the proxy a clean implementation of its features.
+This architecture cleanly separates the API interface from the resilience logic, making the library a portable and powerful tool for any application needing robust API key management.
 
 ---
 
-## 2. `rotator_library` - The Core Engine
+## 2. `rotator_library` - The Resilience Engine
 
-This library is the heart of the project, containing all the logic for key rotation, usage tracking, and provider management.
+This library is the heart of the project, containing all the logic for managing a pool of API keys, tracking their usage, and handling provider interactions to ensure application resilience.
 
 ### 2.1. `client.py` - The `RotatingClient`
 
@@ -40,7 +40,7 @@ client = RotatingClient(
 *   Managing a shared `httpx.AsyncClient` for all non-blocking HTTP requests.
 *   Interfacing with the `UsageManager` to acquire and release API keys.
 *   Dynamically loading and using provider-specific plugins from the `providers/` directory.
-*   Executing API calls via `litellm` with a robust, **deadline-driven** retry and rotation strategy.
+*   Executing API calls via `litellm` with a robust, **deadline-driven** retry and key selection strategy.
 *   Providing a safe, stateful wrapper for handling streaming responses.
 
 #### Request Lifecycle: A Deadline-Driven Approach
@@ -49,7 +49,7 @@ The request lifecycle has been redesigned around a single, authoritative time bu
 
 1.  **Deadline Establishment**: The moment `acompletion` or `aembedding` is called, a `deadline` is calculated: `time.time() + self.global_timeout`. This `deadline` is the absolute point in time by which the entire operation must complete.
 
-2.  **Deadline-Aware Key Rotation Loop**: The main `while` loop now has a critical secondary condition: `while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:`. The loop will exit immediately if the `deadline` is reached, regardless of how many keys are left to try.
+2.  **Deadline-Aware Key Selection Loop**: The main `while` loop now has a critical secondary condition: `while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:`. The loop will exit immediately if the `deadline` is reached, regardless of how many keys are left to try.
 
 3.  **Deadline-Aware Key Acquisition**: The `self.usage_manager.acquire_key()` method now accepts the `deadline`. The `UsageManager` will not wait indefinitely for a key; if it cannot acquire one before the `deadline` is met, it will raise a `NoAvailableKeysError`, causing the request to fail fast with a "busy" error.
 
@@ -59,7 +59,7 @@ The request lifecycle has been redesigned around a single, authoritative time bu
 
 5.  **Refined Error Propagation**:
     -   **Fatal Errors**: Invalid requests or authentication errors are raised immediately to the client.
-    -   **Intermittent Errors**: Rate limits, server errors, and other temporary issues are now handled internally. The error is logged, the key is rotated, but the exception is **not** propagated to the end client. This prevents the client from seeing disruptive, intermittent failures.
+    -   **Intermittent Errors**: Temporary issues like server errors and provider-side capacity limits are now handled internally. The error is logged, the key is rotated, but the exception is **not** propagated to the end client. This prevents the client from seeing disruptive, intermittent failures.
     -   **Final Failure**: A non-streaming request will only return `None` (indicating failure) if either a) the global `deadline` is exceeded, or b) all keys for the provider have been tried and have failed. A streaming request will yield a final `[DONE]` with an error message in the same scenarios.
 
 ### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management

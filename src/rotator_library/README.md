@@ -1,13 +1,13 @@
-# Rotating API Key Client
+# Resilience & API Key Management Library
 
-A robust, asynchronous, and thread-safe client that intelligently rotates and retries API keys for use with `litellm`. This library is designed to make your interactions with LLM providers more resilient, concurrent, and efficient.
+A robust, asynchronous, and thread-safe Python library for managing a pool of API keys. It is designed to be integrated into applications (such as the Universal LLM API Proxy included in this project) to provide a powerful layer of resilience and high availability when interacting with multiple LLM providers.
 
 ## Key Features
 
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
 -   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests to *different* models, maximizing throughput while ensuring thread safety. Requests for the *same model* using the same key are queued, preventing conflicts.
--   **Smart Key Rotation**: Acquires the least-used, available key using a tiered, model-aware locking strategy to distribute load evenly.
--   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key rotations, exceeds a specified time limit, preventing indefinite hangs.
+-   **Smart Key Management**: Selects the optimal key for each request using a tiered, model-aware locking strategy to distribute load evenly and maximize availability.
+-   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit, preventing indefinite hangs.
 -   **Intelligent Error Handling**:
     -   **Escalating Per-Model Cooldowns**: If a key fails, it's placed on a temporary, escalating cooldown for that specific model, allowing it to continue being used for others.
     -   **Deadline-Aware Retries**: Retries requests on transient server errors with exponential backoff, but only if the wait time fits within the global request budget.
@@ -28,7 +28,7 @@ pip install -e .
 
 ## `RotatingClient` Class
 
-This is the main class for interacting with the library. It is designed to be a long-lived object that manages its own HTTP client and key usage state.
+This is the main class for interacting with the library. It is designed to be a long-lived object that manages the state of your API key pool.
 
 ### Initialization
 
@@ -90,7 +90,7 @@ asyncio.run(main())
 
 #### `async def acompletion(self, **kwargs) -> Any:`
 
-This is the primary method for making API calls. It's a wrapper around `litellm.acompletion` that adds the core logic for key acquisition, rotation, and retries.
+This is the primary method for making API calls. It's a wrapper around `litellm.acompletion` that adds the core logic for key acquisition, selection, and retries.
 
 -   **Parameters**: Accepts the same keyword arguments as `litellm.acompletion`. The `model` parameter is required and must be a string in the format `provider/model_name`.
 -   **Returns**:
@@ -115,7 +115,7 @@ asyncio.run(stream_example())
 
 #### `async def aembedding(self, **kwargs) -> Any:`
 
-A wrapper around `litellm.aembedding` that provides the same key rotation and retry logic for embedding requests.
+A wrapper around `litellm.aembedding` that provides the same key management and retry logic for embedding requests.
 
 #### `def token_count(self, model: str, text: str = None, messages: List[Dict[str, str]] = None) -> int:`
 
@@ -135,7 +135,7 @@ The client uses a sophisticated error handling mechanism:
 
 -   **Error Classification**: All exceptions from `litellm` are passed through a `classify_error` function to determine their type (`rate_limit`, `authentication`, `server_error`, etc.).
 -   **Server Errors**: The client will retry the request with the *same key* up to `max_retries` times, using an exponential backoff strategy.
--   **Rotation Errors (Rate Limit, Auth, etc.)**: The client records the failure in the `UsageManager`, which applies an escalating cooldown to the key for that specific model. The client then immediately acquires a new key and continues its attempt to complete the request.
+-   **Key-Specific Errors (Authentication, Quota, etc.)**: The client records the failure in the `UsageManager`, which applies an escalating cooldown to the key for that specific model. The client then immediately acquires a new key and continues its attempt to complete the request.
 -   **Key-Level Lockouts**: If a key fails on multiple different models, the `UsageManager` can apply a key-level lockout, taking it out of rotation entirely for a short period.
 
 ### Global Timeout and Deadline-Driven Logic
@@ -144,7 +144,7 @@ To ensure predictable performance, the client now operates on a strict time budg
 
 -   **Deadline Enforcement**: When a request starts, a `deadline` is set. The entire process, including all key rotations and retries, must complete before this deadline.
 -   **Deadline-Aware Retries**: If a retry requires a wait time that would exceed the remaining budget, the wait is skipped, and the client immediately rotates to the next key.
--   **Silent Internal Errors**: Intermittent failures like rate limits or temporary server errors are logged internally but are **not raised** to the caller. The client will simply rotate to the next key. A non-streaming request will only return `None` (or a streaming request will end) if the global timeout is exceeded or all keys have been exhausted. This creates a more stable experience for the end-user, as they are shielded from transient backend issues.
+-   **Silent Internal Errors**: Intermittent failures like provider capacity limits or temporary server errors are logged internally but are **not raised** to the caller. The client will simply rotate to the next key. A non-streaming request will only return `None` (or a streaming request will end) if the global timeout is exceeded or all keys have been exhausted. This creates a more stable experience for the end-user, as they are shielded from transient backend issues.
 
 ## Extending with Provider Plugins
 

@@ -1,4 +1,4 @@
-# API Key Proxy with Rotating Key Library [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
+# Universal LLM API Proxy & Resilience Library [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
 
 ## Easy Setup for Beginners (Windows)
 
@@ -15,17 +15,18 @@ Your proxy is now running! You can now use it in your applications.
 
 ## Detailed Setup and Features
 
-This project provides a robust, self-hosted solution for managing and rotating API keys for various Large Language Model (LLM) providers. It consists of two main components:
+This project provides a powerful solution for developers building complex applications, such as agentic systems, that interact with multiple Large Language Model (LLM) providers. It consists of two distinct but complementary components:
 
-1.  A reusable Python library (`rotating-api-key-client`) for intelligently rotating API keys with advanced concurrency and error handling.
-2.  A FastAPI proxy application that uses this library to provide a single, unified, and OpenAI-compatible endpoint for all your LLM requests.
+1.  **A Universal API Proxy**: A self-hosted FastAPI application that provides a single, OpenAI-compatible endpoint for all your LLM requests. Powered by `litellm`, it allows you to seamlessly switch between different providers and models without altering your application's code.
+2.  **A Resilience & Key Management Library**: The core engine that powers the proxy. This reusable Python library intelligently manages a pool of API keys to ensure your application is highly available and resilient to transient provider errors or performance issues.
 
 ## Features
 
--   **Predictable Performance**: A new **global timeout** ensures that requests complete within a set time, preventing your application from hanging on slow or failing provider responses.
--   **Resilient Error Handling**: The proxy now shields your application from transient backend errors. It handles rate limits and temporary provider issues internally by rotating keys, so your client only sees a failure if all options are exhausted or the timeout is hit.
--   **Advanced Concurrency Control**: A single API key can handle multiple concurrent requests to different models, maximizing throughput.
--   **Smart Key Rotation**: Intelligently selects the least-used, available API key to distribute request loads evenly.
+-   **Universal API Endpoint**: Simplifies development by providing a single, OpenAI-compatible interface for diverse LLM providers.
+-   **High Availability**: The underlying library ensures your application remains operational by gracefully handling transient provider errors and API key-specific issues.
+-   **Resilient Performance**: A global timeout on all requests prevents your application from hanging on unresponsive provider APIs.
+-   **Efficient Concurrency**: Maximizes throughput by allowing a single API key to handle multiple concurrent requests to different models.
+-   **Intelligent Key Management**: Optimizes request distribution across your pool of keys by selecting the best available one for each call.
 -   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
 -   **Request Logging**: Optional logging of full request and response payloads for easy debugging.
@@ -220,15 +221,15 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ### How It Works
 
-The core of this project is the `RotatingClient` library. When a request is made, the client:
+When a request is made to the proxy, the application uses its core resilience library to ensure the request is handled reliably:
 
-1.  **Acquires the Best Key**: It requests the best available key from the `UsageManager`. The manager uses a tiered locking strategy to find a key that is not on cooldown and preferably not in use. If a key is busy with another request for the *same model*, it waits. Otherwise, it allows concurrent use for *different models*.
-2.  **Makes the Request**: It uses the acquired key to make the API call via `litellm`.
-3.  **Handles Errors**:
+1.  **Selects an Optimal Key**: The `UsageManager` selects the best available key from your pool. It uses a tiered locking strategy to find a healthy, available key, prioritizing those with the least recent usage. This allows for concurrent requests to different models using the same key, maximizing efficiency.
+2.  **Makes the Request**: The proxy uses the acquired key to make the API call to the target provider via `litellm`.
+3.  **Manages Errors Gracefully**:
     -   It uses a `classify_error` function to determine the failure type.
-    -   For **server errors**, it retries the request with the same key using exponential backoff.
-    -   For **rate-limit or auth errors**, it records the failure, applies an escalating cooldown for that specific key-model pair, and the client immediately tries the next available key.
-4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key's lock is then released, notifying any waiting requests that it is available.
+    -   For **transient server errors**, it retries the request with the same key using exponential backoff.
+    -   For **key-specific issues (e.g., authentication or provider-side limits)**, it temporarily places that key on a cooldown for the specific model and seamlessly retries the request with the next available key from the pool.
+4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key is then released back into the available pool, ready for the next request.
 
 ### Command-Line Arguments and Scripts
 
@@ -260,5 +261,5 @@ For convenience on Windows, you can use the provided `.bat` scripts in the root 
 
 ## Library and Technical Docs
 
--   **Using the Library**: For documentation on how to use the `rotating-api-key-client` library directly in your own Python projects, please refer to its [README.md](src/rotator_library/README.md).
+-   **Using the Library**: For documentation on how to use the `api-key-manager` library directly in your own Python projects, please refer to its [README.md](src/rotator_library/README.md).
 -   **Technical Details**: For a more in-depth technical explanation of the library's architecture, components, and internal workings, please refer to the [Technical Documentation](DOCUMENTATION.md).
