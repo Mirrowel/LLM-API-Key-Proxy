@@ -737,6 +737,10 @@ class RotatingClient:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
         if kwargs.get("stream"):
+            if "stream_options" not in kwargs:
+                kwargs["stream_options"] = {}
+            if "include_usage" not in kwargs["stream_options"]:
+                kwargs["stream_options"]["include_usage"] = True
             return self._streaming_acompletion_with_retry(request=request, pre_request_callback=pre_request_callback, **kwargs)
         else:
             return self._execute_with_retry(litellm.acompletion, request=request, pre_request_callback=pre_request_callback, **kwargs)
