@@ -4,6 +4,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
@@ -155,6 +156,15 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware to allow all origins, methods, and headers
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 def get_rotating_client(request: Request) -> RotatingClient:
