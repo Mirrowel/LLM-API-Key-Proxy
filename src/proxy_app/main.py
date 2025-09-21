@@ -507,6 +507,9 @@ async def list_models(
     """
     Returns a list of available models from all configured providers.
     Waits for the background cache to be ready before returning.
+
+    If grouped=True, returns a dict of models grouped by provider.
+    If grouped=False, returns a flat list of provider/model strings.
     """
     models = await client.get_all_available_models(grouped=grouped)
     return models

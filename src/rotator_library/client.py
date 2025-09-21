@@ -204,7 +204,11 @@ class RotatingClient:
             # In a synchronous context, we can't await. The design relies on
             # the public methods to handle the await logic.
             # Returning None might be safer than blocking.
-            return None
+            raise RuntimeError(
+                f"Provider instance for {provider_name} requested before model cache was ready. "
+                "Please ensure the model cache is populated before requesting a provider instance. "
+                "Consider awaiting the cache readiness event or using public methods that handle this."
+            )
 
         if provider_name not in self._provider_instances:
             if provider_name in self._provider_plugins:
@@ -860,11 +864,14 @@ class RotatingClient:
         """
         if not self._model_list_cache_ready.is_set():
             lib_logger.info("Waiting for model list cache to be populated...")
+            # If the task hasn't been started, start it.
+            if self._model_list_cache_task is None or self._model_list_cache_task.done():
+                self.start_model_cache_population()
             await self._model_list_cache_ready.wait()
             lib_logger.info("Model list cache is ready.")
 
         if grouped:
-            return self._model_list_cache
+            return dict(self._model_list_cache)
         else:
             flat_models = []
             for provider, models in self._model_list_cache.items():
