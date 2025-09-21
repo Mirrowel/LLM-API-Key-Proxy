@@ -129,8 +129,9 @@ if not api_keys:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
-    # The client now uses the root logger configuration
+     # The client now uses the root logger configuration
     client = RotatingClient(api_keys=api_keys, configure_logging=True)
+    client.start_model_cache_population()  # Start the background task
     app.state.rotating_client = client
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
@@ -505,7 +506,7 @@ async def list_models(
 ):
     """
     Returns a list of available models from all configured providers.
-    Optionally returns them as a flat list if grouped=False.
+    Waits for the background cache to be ready before returning.
     """
     models = await client.get_all_available_models(grouped=grouped)
     return models
