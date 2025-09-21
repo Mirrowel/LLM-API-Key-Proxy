@@ -31,7 +31,7 @@ jobs:
           # Build and write opencode.json with secrets
           CONFIG='{
             "$schema": "https://opencode.ai/config.json",
-            "providers": {
+            "provider": {
               "llm-proxy": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Proxy",
