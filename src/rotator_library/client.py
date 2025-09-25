@@ -36,7 +36,16 @@ class RotatingClient:
     A client that intelligently rotates and retries API keys using LiteLLM,
     with support for both streaming and non-streaming responses.
     """
-    def __init__(self, api_keys: Dict[str, List[str]], max_retries: int = 2, usage_file_path: str = "key_usage.json", configure_logging: bool = True, global_timeout: int = 30, abort_on_callback_error: bool = True):
+    def __init__(
+        self,
+        api_keys: Dict[str, List[str]],
+        max_retries: int = 2,
+        usage_file_path: str = "key_usage.json",
+        configure_logging: bool = True,
+        global_timeout: int = 30,
+        abort_on_callback_error: bool = True,
+        ignore_models: Optional[Dict[str, List[str]]] = None
+    ):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -64,6 +73,27 @@ class RotatingClient:
         self.http_client = httpx.AsyncClient()
         self.all_providers = AllProviders()
         self.cooldown_manager = CooldownManager()
+        self.ignore_models = ignore_models or {}
+
+    def _is_model_ignored(self, provider: str, model_id: str) -> bool:
+        """
+        Checks if a model should be ignored based on the ignore list.
+        Supports exact and partial matching.
+        """
+        if provider not in self.ignore_models:
+            return False
+
+        ignore_list = self.ignore_models[provider]
+        for ignored_model in ignore_list:
+            if ignored_model.endswith('*'):
+                # Partial match
+                if ignored_model[:-1] in model_id:
+                    return True
+            else:
+                # Exact match (ignoring provider prefix)
+                if model_id.endswith(ignored_model):
+                    return True
+        return False
 
     def _sanitize_litellm_log(self, log_data: dict) -> dict:
         """
@@ -800,8 +830,14 @@ class RotatingClient:
                     lib_logger.debug(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
                     models = await provider_instance.get_models(api_key, self.http_client)
                     lib_logger.info(f"Got {len(models)} models for provider: {provider}")
-                    self._model_list_cache[provider] = models
-                    return models
+
+                    # Filter models based on the ignore list
+                    filtered_models = [m for m in models if not self._is_model_ignored(provider, m)]
+                    if len(filtered_models) != len(models):
+                        lib_logger.info(f"Filtered out {len(models) - len(filtered_models)} models for provider {provider}.")
+
+                    self._model_list_cache[provider] = filtered_models
+                    return filtered_models
                 except Exception as e:
                     classified_error = classify_error(e)
                     lib_logger.debug(f"Failed to get models for provider {provider} with key ...{api_key[-4:]}: {classified_error.error_type}. Trying next key.")
@@ -829,7 +865,6 @@ class RotatingClient:
             return all_provider_models
         else:
             flat_models = []
-            for provider, models in all_provider_models.items():
-                for model in models:
-                    flat_models.append(f"{provider}/{model}")
+            for models in all_provider_models.values():
+                flat_models.extend(models)
             return flat_models

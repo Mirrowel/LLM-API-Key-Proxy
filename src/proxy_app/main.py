@@ -13,8 +13,9 @@ import colorlog
 from pathlib import Path
 import sys
 import json
+import time
 from typing import AsyncGenerator, Any, List, Optional, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import argparse
 import litellm
 
@@ -26,6 +27,18 @@ class EmbeddingRequest(BaseModel):
     input_type: Optional[str] = None
     dimensions: Optional[int] = None
     user: Optional[str] = None
+
+
+# --- Pydantic Models for Model Endpoints ---
+class ModelCard(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "Mirro-Proxy"
+
+class ModelList(BaseModel):
+    object: str = "list"
+    data: List[ModelCard]
 
 # --- Argument Parsing ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -125,12 +138,21 @@ for key, value in os.environ.items():
 if not api_keys:
     raise ValueError("No provider API keys found in environment variables.")
 
+# Load model ignore lists from environment variables
+ignore_models = {}
+for key, value in os.environ.items():
+    if key.startswith("IGNORE_MODELS_"):
+        provider = key.replace("IGNORE_MODELS_", "").lower()
+        models_to_ignore = [model.strip() for model in value.split(',')]
+        ignore_models[provider] = models_to_ignore
+        logging.debug(f"Loaded ignore list for provider '{provider}': {models_to_ignore}")
+
 # --- Lifespan Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
     # The client now uses the root logger configuration
-    client = RotatingClient(api_keys=api_keys, configure_logging=True)
+    client = RotatingClient(api_keys=api_keys, configure_logging=True, ignore_models=ignore_models)
     app.state.rotating_client = client
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
@@ -504,18 +526,18 @@ async def embeddings(
 def read_root():
     return {"Status": "API Key Proxy is running"}
 
-@app.get("/v1/models")
+@app.get("/v1/models", response_model=ModelList)
 async def list_models(
-    grouped: bool = False, 
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_api_key)
 ):
     """
-    Returns a list of available models from all configured providers.
-    Optionally returns them as a flat list if grouped=False.
+    Returns a list of available models in the OpenAI-compatible format.
     """
-    models = await client.get_all_available_models(grouped=grouped)
-    return models
+    model_ids = await client.get_all_available_models(grouped=False)
+    model_cards = [ModelCard(id=model_id) for model_id in model_ids]
+    return ModelList(data=model_cards)
+
 
 @app.get("/v1/providers")
 async def list_providers(_=Depends(verify_api_key)):
