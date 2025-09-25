@@ -256,22 +256,29 @@ async def streaming_response_wrapper(
                             for tc_chunk in value:
                                 index = tc_chunk["index"]
                                 if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                                    aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}} # Initialize with minimal required keys
+                                # Ensure 'function' key exists for this index before accessing its sub-keys
+                                if "function" not in aggregated_tool_calls[index]:
+                                    aggregated_tool_calls[index]["function"] = {"name": "", "arguments": ""}
                                 if tc_chunk.get("id"):
                                     aggregated_tool_calls[index]["id"] = tc_chunk["id"]
                                 if "function" in tc_chunk:
                                     if "name" in tc_chunk["function"]:
-                                        aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
+                                        if tc_chunk["function"]["name"] is not None:
+                                            aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
                                     if "arguments" in tc_chunk["function"]:
-                                        aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
+                                        if tc_chunk["function"]["arguments"] is not None:
+                                            aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
                         
                         elif key == "function_call":
                             if "function_call" not in final_message:
                                 final_message["function_call"] = {"name": "", "arguments": ""}
                             if "name" in value:
-                                final_message["function_call"]["name"] += value["name"]
+                                if value["name"] is not None:
+                                    final_message["function_call"]["name"] += value["name"]
                             if "arguments" in value:
-                                final_message["function_call"]["arguments"] += value["arguments"]
+                                if value["arguments"] is not None:
+                                    final_message["function_call"]["arguments"] += value["arguments"]
                         
                         else: # Generic key handling for other data like 'reasoning'
                             if key not in final_message:
