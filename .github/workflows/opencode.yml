@@ -7,10 +7,14 @@ on:
 jobs:
   opencode:
     if: |
+      (
       contains(github.event.comment.body, ' /oc') ||
-      startsWith(github.event.comment.body, '/oc') ||
-      contains(github.event.comment.body, ' /opencode') ||
-      startsWith(github.event.comment.body, '/opencode')
+      contains(github.event.comment.body, ' /opencode')
+      ) && (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,26 +44,40 @@ jobs:
                   }
                 },
                 "models": {
-                  "gemini/gemini-2.5-pro": {
-                    "name": "Gemini 2.5 pro via Proxy"
+                  "${{ secrets.OPENCODE_MODEL }}": {
+                    "name": "Custom Model"
                   }
                 }
               }
             },
-            "model": "gemini/gemini-2.5-pro",
             "autoupdate": true
           }'
           echo "$CONFIG" > ~/.config/opencode/opencode.json
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          # This path is where pip stores its cache on the runner
+          path: ~/.cache/pip
+          # The key is crucial. It's created from the OS, Python version, and a hash of your requirements file.
+          # A new cache is only created when the requirements.txt file changes.
+          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+          # The restore-key provides a fallback to the most recent cache for this Python version.
+          restore-keys: |
+            ${{ runner.os }}-pip-3.12
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run opencode
         uses: sst/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
         with:
-          model: llm-proxy/gemini/gemini-2.5-pro
+          model: llm-proxy/${{ secrets.OPENCODE_MODEL }}
           share: true
