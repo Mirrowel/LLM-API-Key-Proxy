@@ -9,7 +9,9 @@ jobs:
     if: |
       (
       contains(github.event.comment.body, ' /oc') ||
-      contains(github.event.comment.body, ' /opencode')
+      startsWith(github.event.comment.body, '/oc') ||
+      contains(github.event.comment.body, ' /opencode') ||
+      startsWith(github.event.comment.body, '/opencode')
       ) && (
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
