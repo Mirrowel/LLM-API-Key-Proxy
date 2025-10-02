@@ -52,6 +52,8 @@ args, _ = parser.parse_known_args()
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
+from rotator_library.credential_manager import CredentialManager
+from rotator_library.background_refresher import BackgroundRefresher
 from proxy_app.request_logger import log_request_to_console
 from proxy_app.batch_manager import EmbeddingBatcher
 from proxy_app.detailed_logger import DetailedLogger
@@ -125,19 +127,28 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
 
-# Load all provider API keys from environment variables
+# Split API keys and OAuth config loading
 api_keys = {}
+oauth_credentials = {}
 for key, value in os.environ.items():
-    # Exclude PROXY_API_KEY from being treated as a provider API key
-    if (key.endswith("_API_KEY") or "_API_KEY_" in key) and key != "PROXY_API_KEY":
-        parts = key.split("_API_KEY")
-        provider = parts[0].lower()
+    if key == "PROXY_API_KEY":
+        continue
+    
+    # Handles GEMINI_CLI_OAUTH_1, QWEN_CODE_OAUTH_1, etc.
+    if "_OAUTH_" in key:
+        provider = key.split("_OAUTH_")[0].lower()
+        if provider not in oauth_credentials:
+            oauth_credentials[provider] = []
+        oauth_credentials[provider].append(value)
+    # Handles GEMINI_API_KEY_1, etc.
+    elif "_API_KEY" in key:
+        provider = key.split("_API_KEY")[0].lower()
         if provider not in api_keys:
             api_keys[provider] = []
         api_keys[provider].append(value)
 
-if not api_keys:
-    raise ValueError("No provider API keys found in environment variables.")
+if not api_keys and not oauth_credentials:
+    raise ValueError("No provider API keys or OAuth credentials found in environment variables.")
 
 # Load model ignore lists from environment variables
 ignore_models = {}
@@ -152,8 +163,20 @@ for key, value in os.environ.items():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    # [NEW] Load provider-specific params
+    litellm_provider_params = {
+        "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
+    }
+
     # The client now uses the root logger configuration
-    client = RotatingClient(api_keys=api_keys, configure_logging=True, ignore_models=ignore_models)
+    client = RotatingClient(
+        api_keys=api_keys,
+        oauth_credentials=oauth_credentials, # Pass OAuth config
+        configure_logging=True,
+        litellm_provider_params=litellm_provider_params, # [NEW]
+        ignore_models=ignore_models
+    )
+    client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
@@ -168,6 +191,7 @@ async def lifespan(app: FastAPI):
         
     yield
     
+    await client.background_refresher.stop() # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
     await client.close()
@@ -477,20 +501,6 @@ async def embeddings(
             
             response = await client.aembedding(request=request, **request_data)
 
-        if ENABLE_REQUEST_LOGGING:
-            response_summary = {
-                "model": response.model,
-                "object": response.object,
-                "usage": response.usage.model_dump(),
-                "data_count": len(response.data),
-                "embedding_dimensions": len(response.data[0].embedding) if response.data else 0
-            }
-            log_request_response(
-                request_data=body.model_dump(exclude_none=True),
-                response_data=response_summary,
-                is_streaming=False,
-                log_type="embedding"
-            )
         return response
 
     except HTTPException as e:
@@ -510,17 +520,6 @@ async def embeddings(
         raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
-        if ENABLE_REQUEST_LOGGING:
-            try:
-                request_data = await request.json()
-            except json.JSONDecodeError:
-                request_data = {"error": "Could not parse request body"}
-            log_request_response(
-                request_data=request_data,
-                response_data={"error": str(e)},
-                is_streaming=False,
-                log_type="embedding"
-            )
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")

@@ -1,5 +1,7 @@
 import re
+import json
 from typing import Optional, Dict, Any
+import httpx
 
 from litellm.exceptions import APIConnectionError, RateLimitError, ServiceUnavailableError, AuthenticationError, InvalidRequestError, BadRequestError, OpenAIError, InternalServerError, Timeout, ContextWindowExceededError
 
@@ -21,8 +23,6 @@ class ClassifiedError:
 
     def __str__(self):
         return f"ClassifiedError(type={self.error_type}, status={self.status_code}, retry_after={self.retry_after}, original_exc={self.original_exception})"
-
-import json
 
 def get_retry_after(error: Exception) -> Optional[int]:
     """
@@ -80,9 +80,24 @@ def get_retry_after(error: Exception) -> Optional[int]:
 def classify_error(e: Exception) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
+    Now handles both litellm and httpx exceptions.
     """
     status_code = getattr(e, 'status_code', None)
+    if isinstance(e, httpx.HTTPStatusError): # [NEW] Handle httpx errors first
+        status_code = e.response.status_code
+        if status_code == 401:
+            return ClassifiedError(error_type='authentication', original_exception=e, status_code=status_code)
+        if status_code == 429:
+            retry_after = get_retry_after(e)
+            return ClassifiedError(error_type='rate_limit', original_exception=e, status_code=status_code, retry_after=retry_after)
+        if 400 <= status_code < 500:
+            return ClassifiedError(error_type='invalid_request', original_exception=e, status_code=status_code)
+        if 500 <= status_code:
+            return ClassifiedError(error_type='server_error', original_exception=e, status_code=status_code)
     
+    if isinstance(e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)): # [NEW]
+        return ClassifiedError(error_type='api_connection', original_exception=e, status_code=status_code)
+
     if isinstance(e, PreRequestCallbackError):
         return ClassifiedError(
             error_type='pre_request_callback_error',

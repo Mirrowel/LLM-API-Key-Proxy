@@ -26,9 +26,9 @@ def _register_providers():
         for attribute_name in dir(module):
             attribute = getattr(module, attribute_name)
             if isinstance(attribute, type) and issubclass(attribute, ProviderInterface) and attribute is not ProviderInterface:
-                # The provider name is derived from the module name (e.g., 'openai_provider' -> 'openai')
-                provider_name = module_name.replace("_provider", "")
+                # Derives 'gemini_cli' from 'gemini_cli_provider.py'
                 # Remap 'nvidia' to 'nvidia_nim' to align with litellm's provider name
+                provider_name = module_name.replace("_provider", "")
                 if provider_name == "nvidia":
                     provider_name = "nvidia_nim"
                 PROVIDER_PLUGINS[provider_name] = attribute
