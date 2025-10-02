@@ -30,7 +30,7 @@ This project provides a powerful solution for developers building complex applic
 -   **Intelligent Key Management**: Optimizes request distribution across your pool of keys by selecting the best available one for each call.
 -   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
--   **Request Logging**: Optional logging of full request and response payloads for easy debugging.
+-   **Detailed Request Logging**: Enable comprehensive logging for debugging. Each request gets its own directory with full request/response details, streaming chunks, and performance metadata.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 
@@ -238,7 +238,7 @@ The proxy server can be configured at runtime using the following command-line a
 
 -   `--host`: The IP address to bind the server to. Defaults to `0.0.0.0` (accessible from your local network).
 -   `--port`: The port to run the server on. Defaults to `8000`.
--   `--enable-request-logging`: A flag to enable logging of full request and response payloads to the `logs/` directory. This is useful for debugging.
+-   `--enable-request-logging`: A flag to enable detailed, per-request logging. When active, the proxy creates a unique directory for each transaction in the `logs/detailed_logs/` folder, containing the full request, response, streaming chunks, and performance metadata. This is highly recommended for debugging.
 
 **Example:**
 ```bash
@@ -255,8 +255,8 @@ For convenience on Windows, you can use the provided `.bat` scripts in the root 
 ### Troubleshooting
 
 -   **`401 Unauthorized`**: Ensure your `PROXY_API_KEY` is set correctly in the `.env` file and included in the `Authorization: Bearer <key>` header of your request.
--   **`500 Internal Server Error`**: Check the console logs of the `uvicorn` server for detailed error messages. This could indicate an issue with one of your provider API keys (e.g., it's invalid or has been revoked) or a problem with the provider's service.
--   **All keys on cooldown**: If you see a message that all keys are on cooldown, it means all your keys for a specific provider have recently failed. Check the `logs/` directory (if enabled) or the `key_usage.json` file for details on why the failures occurred.
+-   **`500 Internal Server Error`**: Check the console logs of the `uvicorn` server for detailed error messages. This could indicate an issue with one of your provider API keys (e.g., it's invalid or has been revoked) or a problem with the provider's service. If you have logging enabled (`--enable-request-logging`), inspect the `final_response.json` and `metadata.json` files in the corresponding log directory under `logs/detailed_logs/` for the specific error returned by the upstream provider.
+-   **All keys on cooldown**: If you see a message that all keys are on cooldown, it means all your keys for a specific provider have recently failed. If you have logging enabled (`--enable-request-logging`), check the `logs/detailed_logs/` directory to find the logs for the failed requests and inspect the `final_response.json` to see the underlying error from the provider.
 
 ---
 

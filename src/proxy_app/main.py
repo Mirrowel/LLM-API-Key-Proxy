@@ -52,8 +52,9 @@ args, _ = parser.parse_known_args()
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
-from proxy_app.request_logger import log_request_response, log_request_to_console
+from proxy_app.request_logger import log_request_to_console
 from proxy_app.batch_manager import EmbeddingBatcher
+from proxy_app.detailed_logger import DetailedLogger
 
 # --- Logging Configuration ---
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
@@ -206,7 +207,8 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
-    response_stream: AsyncGenerator[str, None]
+    response_stream: AsyncGenerator[str, None],
+    logger: Optional[DetailedLogger] = None
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion
@@ -227,8 +229,10 @@ async def streaming_response_wrapper(
                     try:
                         chunk_data = json.loads(content)
                         response_chunks.append(chunk_data)
+                        if logger:
+                            logger.log_stream_chunk(chunk_data)
                     except json.JSONDecodeError:
-                        pass  # Ignore non-JSON chunks
+                        pass
     except Exception as e:
         logging.error(f"An error occurred during the response stream: {e}")
         # Yield a final error message to the client to ensure they are not left hanging.
@@ -242,13 +246,8 @@ async def streaming_response_wrapper(
         yield f"data: {json.dumps(error_payload)}\n\n"
         yield "data: [DONE]\n\n"
         # Also log this as a failed request
-        if ENABLE_REQUEST_LOGGING:
-            log_request_response(
-                request_data=request_data,
-                response_data={"error": str(e)},
-                is_streaming=True,
-                log_type="completion"
-            )
+        if logger:
+            logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
         return # Stop further processing
     finally:
         if response_chunks:
@@ -341,12 +340,11 @@ async def streaming_response_wrapper(
                 "usage": usage_data
             }
 
-        if ENABLE_REQUEST_LOGGING:
-            log_request_response(
-                request_data=request_data,
-                response_data=full_response,
-                is_streaming=True,
-                log_type="completion"
+        if logger:
+            logger.log_final_response(
+                status_code=200,
+                headers=None,  # Headers are not available at this stage
+                body=full_response
             )
 
 @app.post("/v1/chat/completions")
@@ -359,8 +357,12 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
+    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
     try:
         request_data = await request.json()
+        if logger:
+            logger.log_request(headers=request.headers, body=request_data)
+
         log_request_to_console(
             url=str(request.url),
             headers=dict(request.headers),
@@ -372,17 +374,20 @@ async def chat_completions(
         if is_streaming:
             response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
-                streaming_response_wrapper(request, request_data, response_generator),
+                streaming_response_wrapper(request, request_data, response_generator, logger),
                 media_type="text/event-stream"
             )
         else:
             response = await client.acompletion(request=request, **request_data)
-            if ENABLE_REQUEST_LOGGING:
-                log_request_response(
-                    request_data=request_data,
-                    response_data=response.model_dump(),
-                    is_streaming=False,
-                    log_type="completion"
+            if logger:
+                # Assuming response has status_code and headers attributes
+                # This might need adjustment based on the actual response object
+                response_headers = response.headers if hasattr(response, 'headers') else None
+                status_code = response.status_code if hasattr(response, 'status_code') else 200
+                logger.log_final_response(
+                    status_code=status_code,
+                    headers=response_headers,
+                    body=response.model_dump()
                 )
             return response
 
@@ -406,12 +411,8 @@ async def chat_completions(
                 request_data = await request.json()
             except json.JSONDecodeError:
                 request_data = {"error": "Could not parse request body"}
-            log_request_response(
-                request_data=request_data,
-                response_data={"error": str(e)},
-                is_streaming=request_data.get("stream", False),
-                log_type="completion"
-            )
+            if logger:
+                logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/embeddings")

@@ -38,39 +38,3 @@ def log_request_to_console(url: str, headers: dict, client_info: tuple, request_
     log_message = f"{time_str} - {client_info[0]}:{client_info[1]} - provider: {provider}, model: {model_name} - {endpoint_url}"
     logging.info(log_message)
 
-def log_request_response(
-    request_data: dict,
-    response_data: dict,
-    is_streaming: bool,
-    log_type: Literal["completion", "embedding"]
-):
-    """
-    Logs the request and response data to a file in the appropriate log directory.
-    """
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = uuid.uuid4()
-        
-        if log_type == "completion":
-            target_dir = COMPLETIONS_LOGS_DIR
-        elif log_type == "embedding":
-            target_dir = EMBEDDINGS_LOGS_DIR
-        else:
-            # Fallback to the main logs directory if log_type is invalid
-            target_dir = LOGS_DIR
-
-        filename = target_dir / f"{timestamp}_{unique_id}.json"
-
-        log_content = {
-            "request": request_data,
-            "response": response_data,
-            "is_streaming": is_streaming
-        }
-
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(log_content, f, indent=4, ensure_ascii=False)
-            
-    except Exception as e:
-        # In case of logging failure, we don't want to crash the main application
-        # Use the root logger to log the error to the file.
-        logging.error(f"Error logging request/response to file: {e}")

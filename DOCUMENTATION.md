@@ -165,9 +165,28 @@ For streaming requests, the `chat_completions` endpoint returns a `StreamingResp
 1.  It passes the chunks from the `RotatingClient`'s stream directly to the user.
 2.  It aggregates the full response in the background so that it can be logged completely once the stream is finished.
 
-### 3.2. `request_logger.py`
+### 3.2. `detailed_logger.py` - Comprehensive Transaction Logging
 
-This module provides the `log_request_response` function, which writes the request and response data to a timestamped JSON file in the `logs/` directory. It handles creating separate directories for `completions` and `embeddings`.
+To facilitate robust debugging and performance analysis, the proxy includes a powerful detailed logging system, enabled by the `--enable-request-logging` command-line flag. This system is managed by the `DetailedLogger` class in `detailed_logger.py`.
+
+Unlike simple logging, this system creates a **unique directory for every single transaction**, ensuring that all related data is isolated and easy to analyze.
+
+#### Log Directory Structure
+
+When logging is enabled, each request will generate a new directory inside `logs/detailed_logs/` with a name like `YYYYMMDD_HHMMSS_unique-uuid`. Inside this directory, you will find a complete record of the transaction:
+
+-   **`request.json`**: Contains the full incoming request, including HTTP headers and the JSON body.
+-   **`streaming_chunks.jsonl`**: For streaming requests, this file contains a timestamped log of every individual data chunk received from the provider. This is invaluable for debugging malformed streams or partial responses.
+-   **`final_response.json`**: Contains the complete final response from the provider, including the status code, headers, and full JSON body. For streaming requests, this body is the fully reassembled message.
+-   **`metadata.json`**: A summary file for quick analysis, containing:
+    -   `request_id`: The unique identifier for the transaction.
+    -   `duration_ms`: The total time taken for the request to complete.
+    -   `status_code`: The final HTTP status code returned by the provider.
+    -   `model`: The model used for the request.
+    -   `usage`: Token usage statistics (`prompt`, `completion`, `total`).
+    -   `finish_reason`: The reason the model stopped generating tokens.
+    -   `reasoning_found`: A boolean indicating if a `reasoning` field was detected in the response.
+    -   `reasoning_content`: The extracted content of the `reasoning` field, if found.
 
 ### 3.3. `build.py`
 
