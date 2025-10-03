@@ -48,7 +48,8 @@ class RotatingClient:
         global_timeout: int = 30,
         abort_on_callback_error: bool = True,
         litellm_provider_params: Optional[Dict[str, Any]] = None, # [NEW]
-        ignore_models: Optional[Dict[str, List[str]]] = None
+        ignore_models: Optional[Dict[str, List[str]]] = None,
+        whitelist_models: Optional[Dict[str, List[str]]] = None
     ):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
@@ -91,6 +92,7 @@ class RotatingClient:
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
         self.ignore_models = ignore_models or {}
+        self.whitelist_models = whitelist_models or {}
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
@@ -101,6 +103,8 @@ class RotatingClient:
             return False
 
         ignore_list = self.ignore_models[provider]
+        if ignore_list == ['*']:
+            return True
         for ignored_model in ignore_list:
             if ignored_model.endswith('*'):
                 # Partial match
@@ -109,6 +113,26 @@ class RotatingClient:
             else:
                 # Exact match (ignoring provider prefix)
                 if model_id.endswith(ignored_model):
+                    return True
+        return False
+
+    def _is_model_whitelisted(self, provider: str, model_id: str) -> bool:
+        """
+        Checks if a model is explicitly whitelisted.
+        Supports exact and partial matching.
+        """
+        if provider not in self.whitelist_models:
+            return False
+
+        whitelist = self.whitelist_models[provider]
+        for whitelisted_model in whitelist:
+            if whitelisted_model == '*':
+                return True
+            if whitelisted_model.endswith('*'):
+                if whitelisted_model[:-1] in model_id:
+                    return True
+            else:
+                if model_id.endswith(whitelisted_model):
                     return True
         return False
 
@@ -911,13 +935,24 @@ class RotatingClient:
                     models = await provider_instance.get_models(api_key, self.http_client)
                     lib_logger.info(f"Got {len(models)} models for provider: {provider}")
 
-                    # Filter models based on the ignore list
-                    filtered_models = [m for m in models if not self._is_model_ignored(provider, m)]
-                    if len(filtered_models) != len(models):
-                        lib_logger.info(f"Filtered out {len(models) - len(filtered_models)} models for provider {provider}.")
+                    # Whitelist and blacklist logic
+                    final_models = []
+                    for m in models:
+                        is_whitelisted = self._is_model_whitelisted(provider, m)
+                        is_blacklisted = self._is_model_ignored(provider, m)
 
-                    self._model_list_cache[provider] = filtered_models
-                    return filtered_models
+                        if is_whitelisted:
+                            final_models.append(m)
+                            continue
+
+                        if not is_blacklisted:
+                            final_models.append(m)
+
+                    if len(final_models) != len(models):
+                        lib_logger.info(f"Filtered out {len(models) - len(final_models)} models for provider {provider}.")
+
+                    self._model_list_cache[provider] = final_models
+                    return final_models
                 except Exception as e:
                     classified_error = classify_error(e)
                     lib_logger.debug(f"Failed to get models for provider {provider} with credential ...{api_key[-6:]}: {classified_error.error_type}. Trying next credential.")

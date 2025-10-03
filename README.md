@@ -35,6 +35,7 @@ This project provides a powerful solution for developers building complex applic
 -   **Detailed Request Logging**: Enable comprehensive logging for debugging. Each request gets its own directory with full request/response details, streaming chunks, and performance metadata.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
+-   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
 
 ---
 
@@ -275,3 +276,43 @@ For convenience on Windows, you can use the provided `.bat` scripts in the root 
 
 -   **Using the Library**: For documentation on how to use the `api-key-manager` library directly in your own Python projects, please refer to its [README.md](src/rotator_library/README.md).
 -   **Technical Details**: For a more in-depth technical explanation of the library's architecture, components, and internal workings, please refer to the [Technical Documentation](DOCUMENTATION.md).
+
+### Advanced Model Filtering (Whitelists & Blacklists)
+
+The proxy provides a powerful way to control which models are available to your applications using environment variables in your `.env` file.
+
+#### How It Works
+
+The filtering logic is applied in this order:
+
+1.  **Whitelist Check**: If a provider has a whitelist defined (`WHITELIST_MODELS_<PROVIDER>`), any model on that list will **always be available**, even if it's on the blacklist.
+2.  **Blacklist Check**: For any model *not* on the whitelist, the proxy checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model is on the blacklist, it will be hidden.
+3.  **Default**: If a model is on neither list, it will be available.
+
+This allows for two powerful patterns:
+
+#### Use Case 1: Pure Whitelist Mode
+
+You can expose *only* the specific models you want. To do this, set the blacklist to `*` to block all models by default, and then add the desired models to the whitelist.
+
+**Example `.env`:**
+```env
+# Block all Gemini models by default
+IGNORE_MODELS_GEMINI="*"
+
+# Only allow gemini-1.5-pro and gemini-1.5-flash
+WHITELIST_MODELS_GEMINI="gemini-1.5-pro-latest,gemini-1.5-flash-latest"
+```
+
+#### Use Case 2: Exemption Mode
+
+You can block a broad category of models and then use the whitelist to make specific exceptions.
+
+**Example `.env`:**
+```env
+# Block all preview models from OpenAI
+IGNORE_MODELS_OPENAI="*-preview*"
+
+# But make an exception for a specific preview model you want to test
+WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
+```

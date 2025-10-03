@@ -143,9 +143,18 @@ ignore_models = {}
 for key, value in os.environ.items():
     if key.startswith("IGNORE_MODELS_"):
         provider = key.replace("IGNORE_MODELS_", "").lower()
-        models_to_ignore = [model.strip() for model in value.split(',')]
+        models_to_ignore = [model.strip() for model in value.split(',') if model.strip()]
         ignore_models[provider] = models_to_ignore
         logging.debug(f"Loaded ignore list for provider '{provider}': {models_to_ignore}")
+
+# Load model whitelist from environment variables
+whitelist_models = {}
+for key, value in os.environ.items():
+    if key.startswith("WHITELIST_MODELS_"):
+        provider = key.replace("WHITELIST_MODELS_", "").lower()
+        models_to_whitelist = [model.strip() for model in value.split(',') if model.strip()]
+        whitelist_models[provider] = models_to_whitelist
+        logging.debug(f"Loaded whitelist for provider '{provider}': {models_to_whitelist}")
 
 # --- Lifespan Management ---
 @asynccontextmanager
@@ -267,7 +276,8 @@ async def lifespan(app: FastAPI):
         oauth_credentials=oauth_credentials, # Pass OAuth config
         configure_logging=True,
         litellm_provider_params=litellm_provider_params, # [NEW]
-        ignore_models=ignore_models
+        ignore_models=ignore_models,
+        whitelist_models=whitelist_models
     )
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
