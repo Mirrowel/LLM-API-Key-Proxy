@@ -26,6 +26,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def __init__(self):
         super().__init__()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
+        for model_id in HARDCODED_MODELS:
+            litellm.register_model({
+                f"gemini_cli/{model_id}": {
+                    "input_cost_per_token": 0.0,
+                    "output_cost_per_token": 0.0
+                }
+            })
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
         """Discovers the Google Cloud Project ID, with caching."""
@@ -205,7 +212,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     }
                 }]
             elif 'text' in part:
-                if part.get('thought') is True:
+                # Use a lenient check for the 'thought' flag, as its type can be inconsistent
+                if str(part.get('thought')).lower() == 'true':
                     delta['reasoning_content'] = part['text']
                 else:
                     delta['content'] = part['text']
