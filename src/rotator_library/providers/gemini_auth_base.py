@@ -1,8 +1,7 @@
 # src/rotator_library/providers/gemini_auth_base.py
 
-import subprocess
 import webbrowser
-from typing import Optional
+from typing import Union
 import json
 import time
 import asyncio
@@ -11,13 +10,19 @@ from pathlib import Path
 from typing import Dict, Any
 
 import httpx
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 lib_logger = logging.getLogger('rotator_library')
 
-CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com" ##https://api.kilocode.ai/extension-config.json
-CLIENT_SECRET = "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" ##https://api.kilocode.ai/extension-config.json
+CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com" #https://api.kilocode.ai/extension-config.json
+CLIENT_SECRET = "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" #https://api.kilocode.ai/extension-config.json
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+USER_INFO_URI = "https://www.googleapis.com/oauth2/v1/userinfo"
 REFRESH_EXPIRY_BUFFER_SECONDS = 300
+
+console = Console()
 
 class GeminiAuthBase:
     def __init__(self):
@@ -60,7 +65,6 @@ class GeminiAuthBase:
              expiry_timestamp = creds.get("expiry_date", 0) / 1000
         else:
             expiry_timestamp = time.mktime(time.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ"))
-
         return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
 
     async def _refresh_token(self, path: str, creds: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
@@ -87,8 +91,10 @@ class GeminiAuthBase:
             creds["access_token"] = new_token_data["access_token"]
             expiry_timestamp = time.time() + new_token_data["expires_in"]
             creds["expiry_date"] = expiry_timestamp * 1000 # gemini-cli format
-            creds["token_expiry"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry_timestamp)) # gcloud format
             
+            if creds.get("_proxy_metadata"):
+                creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
             await self._save_credentials(path, creds)
             lib_logger.info(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.")
             return creds
@@ -103,12 +109,12 @@ class GeminiAuthBase:
             self._refresh_locks[path] = asyncio.Lock()
         return self._refresh_locks[path]
 
-    # [NEW] Add init flow for invalid/expired tokens
-    async def initialize_token(self, path: str) -> Dict[str, Any]:
-        """Initiates OAuth flow if tokens are missing or invalid."""
-        lib_logger.debug(f"Initializing Gemini token at '{path}'...")
+    async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+        path = creds_or_path if isinstance(creds_or_path, str) else None
+        file_name = Path(path).name if path else "in-memory object"
+        lib_logger.debug(f"Initializing Gemini token for '{file_name}'...")
         try:
-            creds = await self._load_credentials(path)
+            creds = await self._load_credentials(creds_or_path) if path else creds_or_path
             
             reason = ""
             if not creds.get("refresh_token"):
@@ -117,42 +123,28 @@ class GeminiAuthBase:
                 reason = "token is expired"
 
             if reason:
-                lib_logger.warning(f"Gemini OAuth token for '{Path(path).name}' needs setup: {reason}.")
-                # Use subprocess to run gemini-cli setup or simulate web flow
-                # Based on CLIProxyAPI-main/gemini/gemini_auth.go: Use web flow with local server
-                # Automated web flow for OAuth
+                lib_logger.warning(f"Gemini OAuth token for '{file_name}' needs setup: {reason}.")
                 auth_code_future = asyncio.get_event_loop().create_future()
                 server = None
 
                 async def handle_callback(reader, writer):
                     try:
                         request_line_bytes = await reader.readline()
-                        if not request_line_bytes:
-                            return
-                        request_line = request_line_bytes.decode('utf-8').strip()
-                        path = request_line.split(' ')[1]
-                        
-                        # Consume headers
-                        while await reader.readline() != b'\r\n':
-                            pass
-
+                        if not request_line_bytes: return
+                        path = request_line_bytes.decode('utf-8').strip().split(' ')[1]
+                        while await reader.readline() != b'\r\n': pass
                         from urllib.parse import urlparse, parse_qs
                         query_params = parse_qs(urlparse(path).query)
-                        
-                        writer.write(b"HTTP/1.1 200 OK\r\n")
-                        writer.write(b"Content-Type: text/html\r\n\r\n")
-                        
+                        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
                         if 'code' in query_params:
-                            auth_code = query_params['code'][0]
                             if not auth_code_future.done():
-                                auth_code_future.set_result(auth_code)
+                                auth_code_future.set_result(query_params['code'][0])
                             writer.write(b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
                         else:
                             error = query_params.get('error', ['Unknown error'])[0]
                             if not auth_code_future.done():
                                 auth_code_future.set_exception(Exception(f"OAuth failed: {error}"))
                             writer.write(f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode())
-                        
                         await writer.drain()
                     except Exception as e:
                         lib_logger.error(f"Error in OAuth callback handler: {e}")
@@ -161,23 +153,19 @@ class GeminiAuthBase:
 
                 try:
                     server = await asyncio.start_server(handle_callback, '127.0.0.1', 8085)
-                    
                     from urllib.parse import urlencode
                     auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
                         "client_id": CLIENT_ID,
                         "redirect_uri": "http://localhost:8085/oauth2callback",
                         "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
-                        "access_type": "offline",
-                        "response_type": "code",
-                        "prompt": "consent"
+                        "access_type": "offline", "response_type": "code", "prompt": "consent"
                     })
-
-                    print(f"\n--- Gemini OAuth Setup Required for {Path(path).name} ---")
-                    print("Your browser will now open for you to log in and authorize the application.")
-                    print(f"If it doesn't, please open this URL manually:\n\n{auth_url}\n")
+                    auth_panel_text = Text.from_markup("1. Your browser will now open to log in and authorize the application.\n2. If it doesn't, please open the URL below manually.")
+                    console.print(Panel(auth_panel_text, title=f"Gemini OAuth Setup for [bold yellow]{file_name}[/bold yellow]", style="bold blue"))
+                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
                     webbrowser.open(auth_url)
-
-                    auth_code = await asyncio.wait_for(auth_code_future, timeout=300) # 5-minute timeout
+                    with console.status("[bold green]Waiting for you to complete authentication in the browser...[/bold green]", spinner="dots"):
+                        auth_code = await asyncio.wait_for(auth_code_future, timeout=300)
                 except asyncio.TimeoutError:
                     raise Exception("OAuth flow timed out. Please try again.")
                 finally:
@@ -188,26 +176,32 @@ class GeminiAuthBase:
                 lib_logger.info(f"Attempting to exchange authorization code for tokens...")
                 async with httpx.AsyncClient() as client:
                     response = await client.post(TOKEN_URI, data={
-                        "code": auth_code.strip(),
-                        "client_id": CLIENT_ID,
-                        "client_secret": CLIENT_SECRET,
-                        "redirect_uri": "http://localhost:8085/oauth2callback",
-                        "grant_type": "authorization_code"
+                        "code": auth_code.strip(), "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+                        "redirect_uri": "http://localhost:8085/oauth2callback", "grant_type": "authorization_code"
                     })
                     response.raise_for_status()
                     token_data = response.json()
                     creds = {
-                        "access_token": token_data["access_token"],
-                        "refresh_token": token_data["refresh_token"],
+                        "access_token": token_data["access_token"], "refresh_token": token_data["refresh_token"],
                         "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
-                        "client_id": CLIENT_ID,
-                        "client_secret": CLIENT_SECRET
+                        "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET
                     }
-                    await self._save_credentials(path, creds)
-                    lib_logger.info(f"Gemini OAuth initialized successfully for '{Path(path).name}'.")
+                    
+                    # Fetch user info and add metadata
+                    user_info_response = await client.get(USER_INFO_URI, headers={"Authorization": f"Bearer {creds['access_token']}"})
+                    user_info_response.raise_for_status()
+                    user_info = user_info_response.json()
+                    creds["_proxy_metadata"] = {
+                        "email": user_info.get("email"),
+                        "last_check_timestamp": time.time()
+                    }
+
+                    if path:
+                        await self._save_credentials(path, creds)
+                    lib_logger.info(f"Gemini OAuth initialized successfully for '{file_name}'.")
                 return creds
             
-            lib_logger.info(f"Gemini OAuth token at '{Path(path).name}' is valid.")
+            lib_logger.info(f"Gemini OAuth token at '{file_name}' is valid.")
             return creds
         except Exception as e:
             raise ValueError(f"Failed to initialize Gemini OAuth for '{path}': {e}")
@@ -218,14 +212,32 @@ class GeminiAuthBase:
             creds = await self._refresh_token(credential_path, creds)
         return {"Authorization": f"Bearer {creds['access_token']}"}
 
-    async def get_user_info(self, credential_path: str) -> Dict[str, Any]:
-        """Fetches user info from Google's userinfo endpoint."""
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path, creds)
+    async def get_user_info(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+        path = creds_or_path if isinstance(creds_or_path, str) else None
+        creds = await self._load_credentials(creds_or_path) if path else creds_or_path
+
+        if path and self._is_token_expired(creds):
+            creds = await self._refresh_token(path, creds)
         
+        # Prefer locally stored metadata
+        if creds.get("_proxy_metadata", {}).get("email"):
+            if path:
+                creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+                await self._save_credentials(path, creds)
+            return {"email": creds["_proxy_metadata"]["email"]}
+
+        # Fallback to API call if metadata is missing
         headers = {"Authorization": f"Bearer {creds['access_token']}"}
         async with httpx.AsyncClient() as client:
-            response = await client.get("https://www.googleapis.com/oauth2/v1/userinfo", headers=headers)
+            response = await client.get(USER_INFO_URI, headers=headers)
             response.raise_for_status()
-            return response.json()
+            user_info = response.json()
+            
+            # Save the retrieved info for future use
+            creds["_proxy_metadata"] = {
+                "email": user_info.get("email"),
+                "last_check_timestamp": time.time()
+            }
+            if path:
+                await self._save_credentials(path, creds)
+            return {"email": user_info.get("email")}
