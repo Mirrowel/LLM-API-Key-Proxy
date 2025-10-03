@@ -164,7 +164,7 @@ async def lifespan(app: FastAPI):
 
     if not skip_oauth_init and oauth_credentials:
         logging.info("Validating OAuth credentials and checking for duplicates...")
-        processed_emails = {}
+        processed_emails = {} # email -> {provider: path}
         for provider, paths in oauth_credentials.items():
             provider_plugin_class = PROVIDER_PLUGINS.get(provider)
             if not provider_plugin_class: continue
@@ -189,10 +189,13 @@ async def lifespan(app: FastAPI):
                             
                             email = metadata.get("email")
                             if email:
-                                if email in processed_emails:
-                                    logging.warning(f"Duplicate credential for user '{email}' found at '{Path(path).name}'. Original at '{Path(processed_emails[email]).name}'.")
+                                if email not in processed_emails:
+                                    processed_emails[email] = {}
+                                if provider in processed_emails[email]:
+                                    original_path = processed_emails[email][provider]
+                                    logging.warning(f"Duplicate credential for user '{email}' on provider '{provider}' found at '{Path(path).name}'. Original at '{Path(original_path).name}'.")
                                 else:
-                                    processed_emails[email] = path
+                                    processed_emails[email][provider] = path
                 except Exception as e:
                     logging.error(f"Failed to process OAuth token for {provider} at '{path}': {e}")
         logging.info("OAuth credential processing complete.")

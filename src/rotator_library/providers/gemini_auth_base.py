@@ -115,7 +115,6 @@ class GeminiAuthBase:
         lib_logger.debug(f"Initializing Gemini token for '{file_name}'...")
         try:
             creds = await self._load_credentials(creds_or_path) if path else creds_or_path
-            
             reason = ""
             if not creds.get("refresh_token"):
                 reason = "refresh token is missing"
