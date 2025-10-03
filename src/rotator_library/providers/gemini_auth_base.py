@@ -186,11 +186,19 @@ class GeminiAuthBase:
                     })
                     response.raise_for_status()
                     token_data = response.json()
-                    creds = {
-                        "access_token": token_data["access_token"], "refresh_token": token_data["refresh_token"],
-                        "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
-                        "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET
-                    }
+                    # Start with the full token data from the exchange
+                    creds = token_data.copy()
+                    
+                    # Convert 'expires_in' to 'expiry_date' in milliseconds
+                    creds["expiry_date"] = (time.time() + creds.pop("expires_in")) * 1000
+                    
+                    # Ensure client_id and client_secret are present
+                    creds["client_id"] = CLIENT_ID
+                    creds["client_secret"] = CLIENT_SECRET
+                    
+                    # Add additional fields for compatibility with the Go implementation
+                    creds["token_uri"] = TOKEN_URI
+                    creds["universe_domain"] = "googleapis.com"
                     
                     # Fetch user info and add metadata
                     user_info_response = await client.get(USER_INFO_URI, headers={"Authorization": f"Bearer {creds['access_token']}"})
