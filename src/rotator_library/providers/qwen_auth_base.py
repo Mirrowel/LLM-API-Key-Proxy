@@ -161,7 +161,7 @@ class QwenAuthBase:
             raise ValueError(f"Failed to initialize Qwen OAuth: {e}")
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self.initialize_token(credential_path)  # [NEW] Call init if needed
+        creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
             creds = await self._refresh_token(credential_path)
         return {"Authorization": f"Bearer {creds['access_token']}"}

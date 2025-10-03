@@ -172,16 +172,18 @@ async def lifespan(app: FastAPI):
         discovered_creds = temp_cred_manager.discover_and_prepare()
         
         init_tasks = []
+        failed_inits = []
         for provider, paths in discovered_creds.items():
             provider_plugin_class = PROVIDER_PLUGINS.get(provider)
-            if provider_plugin_class:
+            if provider_plugin_class and hasattr(provider_plugin_class(), 'initialize_token'):
                 provider_instance = provider_plugin_class()
-                if hasattr(provider_instance, 'initialize_token'):
-                    for path in paths:
-                        init_tasks.append(provider_instance.initialize_token(path))
+                for path in paths:
+                    init_tasks.append(provider_instance.initialize_token(path))
         
         if init_tasks:
-            await asyncio.gather(*init_tasks)
+            # Run sequentially to allow for user input without overlap
+            for task in init_tasks:
+                await task
         logging.info("OAuth credential validation complete.")
 
     # [NEW] Load provider-specific params

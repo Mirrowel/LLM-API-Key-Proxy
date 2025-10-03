@@ -36,7 +36,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         # 1. Try Gemini-specific discovery endpoint
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist", headers=headers, json={"metadata": {"pluginType": "GEMINI"}})
+                response = await client.post(f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist", headers=headers, json={"metadata": {"pluginType": "GEMINI"}}, timeout=20)
                 response.raise_for_status()
                 data = response.json()
                 if data.get('cloudaicompanionProject'):
@@ -50,7 +50,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         # 2. Fallback to listing all available GCP projects
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers)
+                response = await client.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers, timeout=20)
                 response.raise_for_status()
                 projects = response.json().get('projects', [])
                 active_projects = [p for p in projects if p.get('lifecycleState') == 'ACTIVE']
@@ -59,6 +59,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     lib_logger.info(f"Discovered Gemini project ID from active projects list: {project_id}")
                     self.project_id_cache[credential_path] = project_id
                     return project_id
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                lib_logger.warning(
+                    "Failed to list GCP projects due to a 403 Forbidden error. "
+                    "The OAuth token may lack the 'cloud-platform' scope. "
+                    "Please set GEMINI_CLI_PROJECT_ID in your .env file."
+                )
+            else:
+                lib_logger.error(f"Failed to list GCP projects: {e}")
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to list GCP projects: {e}")
 
@@ -129,7 +138,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         async def do_call():
             auth_header = await self.get_auth_header(credential_path)
-            project_id = await self._discover_project_id(credential_path, auth_header['Authorization'].split(' ')[1], kwargs.get("litellm_params", {}))
+            access_token = auth_header['Authorization'].split(' ')[1]
+            project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
             
             # Handle :thinking suffix from Kilo example
             model_name = model.split('/')[-1]
@@ -174,7 +184,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 lib_logger.warning("Gemini CLI returned 401. Forcing token refresh and retrying once.")
-                await self._refresh_token(credential_path, force=True)
+                creds = await self._load_credentials(credential_path)
+                await self._refresh_token(credential_path, creds, force=True)
                 response_gen = await do_call()
             else:
                 raise e

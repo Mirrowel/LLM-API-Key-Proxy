@@ -58,12 +58,13 @@ class GeminiAuthBase:
 
         return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
 
-    async def _refresh_token(self, path: str, creds: Dict[str, Any]) -> Dict[str, Any]:
+    async def _refresh_token(self, path: str, creds: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
         async with self._get_lock(path):
-            if not self._is_token_expired(self._credentials_cache.get(path, creds)):
+            # Skip the expiry check if a refresh is being forced
+            if not force and not self._is_token_expired(self._credentials_cache.get(path, creds)):
                 return self._credentials_cache.get(path, creds)
 
-            lib_logger.info(f"Refreshing Gemini OAuth token for '{Path(path).name}'...")
+            lib_logger.info(f"Refreshing Gemini OAuth token for '{Path(path).name}' (forced: {force})...")
             refresh_token = creds.get("refresh_token")
             if not refresh_token:
                 raise ValueError("No refresh_token found in credentials file.")
@@ -110,7 +111,7 @@ class GeminiAuthBase:
                 print("Gemini CLI OAuth setup required. Please visit the authorization URL and paste the code.")
                 # Simulate getTokenFromWeb logic
                 from urllib.parse import urlencode
-                auth_url = "https://accounts.google.com/oauth2/v2/auth?" + urlencode({
+                auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
                     "client_id": CLIENT_ID,
                     "redirect_uri": "http://localhost:8085/oauth2callback",
                     "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
@@ -147,7 +148,7 @@ class GeminiAuthBase:
             raise ValueError(f"Failed to initialize Gemini OAuth: {e}")
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self.initialize_token(credential_path)  # [NEW] Call init if needed
+        creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
             creds = await self._refresh_token(credential_path, creds)
         return {"Authorization": f"Bearer {creds['access_token']}"}
