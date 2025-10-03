@@ -233,7 +233,7 @@ class RotatingClient:
         try:
             while True:
                 if request and await request.is_disconnected():
-                    lib_logger.info(f"Client disconnected. Aborting stream for key ...{key[-4:]}.")
+                    lib_logger.info(f"Client disconnected. Aborting stream for credential ...{key[-6:]}.")
                     # Do not yield [DONE] because the client is gone.
                     # The 'finally' block will handle key release.
                     break
@@ -262,7 +262,7 @@ class RotatingClient:
                     # This is a critical, typed error from litellm that signals a key failure.
                     # We do not try to parse it here. We wrap it and raise it immediately
                     # for the outer retry loop to handle.
-                    lib_logger.warning(f"Caught a critical API error mid-stream: {type(e).__name__}. Signaling for key rotation.")
+                    lib_logger.warning(f"Caught a critical API error mid-stream: {type(e).__name__}. Signaling for credential rotation.")
                     raise StreamedAPIError("Provider error received in stream", data=e)
 
                 except Exception as e:
@@ -315,7 +315,7 @@ class RotatingClient:
 
         except Exception as e:
             # Catch any other unexpected errors during streaming.
-            lib_logger.error(f"An unexpected error occurred during the stream for key ...{key[-4:]}: {e}")
+            lib_logger.error(f"An unexpected error occurred during the stream for credential ...{key[-6:]}: {e}")
             # We still need to raise it so the client knows something went wrong.
             raise
 
@@ -339,12 +339,12 @@ class RotatingClient:
                             "usage": stream.usage.dict() if hasattr(stream.usage, 'dict') else vars(stream.usage)
                         }
                         yield f"data: {json.dumps(final_usage_chunk)}\n\n"
-                        lib_logger.info(f"Yielded final usage chunk for key ...{key[-4:]}.")
+                        lib_logger.info(f"Yielded final usage chunk for credential ...{key[-6:]}.")
                     except Exception as e:
                         lib_logger.error(f"Failed to create or yield final usage chunk: {e}")
 
             await self.usage_manager.release_key(key, model)
-            lib_logger.info(f"STREAM FINISHED and lock released for key ...{key[-4:]}.")
+            lib_logger.info(f"STREAM FINISHED and lock released for credential ...{key[-6:]}.")
             
             # Only send [DONE] if the stream completed naturally and the client is still there.
             # This prevents sending [DONE] to a disconnected client or after an error.
@@ -525,7 +525,7 @@ class RotatingClient:
                             log_failure(api_key=current_cred, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
                             
                             if request and await request.is_disconnected():
-                                lib_logger.warning(f"Client disconnected. Aborting retries for key ...{current_cred[-6:]}.")
+                                lib_logger.warning(f"Client disconnected. Aborting retries for credential ...{current_cred[-6:]}.")
                                 raise last_exception
 
                             classified_error = classify_error(e)
@@ -907,7 +907,7 @@ class RotatingClient:
         if provider_instance:
             for api_key in shuffled_keys:
                 try:
-                    lib_logger.debug(f"Attempting to get models for {provider} with key ...{api_key[-4:]}")
+                    lib_logger.debug(f"Attempting to get models for {provider} with credential ...{api_key[-6:]}")
                     models = await provider_instance.get_models(api_key, self.http_client)
                     lib_logger.info(f"Got {len(models)} models for provider: {provider}")
 
@@ -920,10 +920,10 @@ class RotatingClient:
                     return filtered_models
                 except Exception as e:
                     classified_error = classify_error(e)
-                    lib_logger.debug(f"Failed to get models for provider {provider} with key ...{api_key[-4:]}: {classified_error.error_type}. Trying next key.")
-                    continue # Try the next key
-        
-        lib_logger.error(f"Failed to get models for provider {provider} after trying all keys.")
+                    lib_logger.debug(f"Failed to get models for provider {provider} with credential ...{api_key[-6:]}: {classified_error.error_type}. Trying next credential.")
+                    continue # Try the next credential
+
+        lib_logger.error(f"Failed to get models for provider {provider} after trying all credentials.")
         return []
 
     async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:

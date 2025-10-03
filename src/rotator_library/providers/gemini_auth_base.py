@@ -31,6 +31,7 @@ class GeminiAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
             try:
+                lib_logger.debug(f"Loading Gemini credentials from file: {path}")
                 with open(path, 'r') as f:
                     creds = json.load(f)
                 # Handle gcloud-style creds file which nest tokens under "credential"
@@ -38,6 +39,8 @@ class GeminiAuthBase:
                     creds = creds["credential"]
                 self._credentials_cache[path] = creds
                 return creds
+            except FileNotFoundError:
+                raise IOError(f"Gemini OAuth credential file not found at '{path}'")
             except Exception as e:
                 raise IOError(f"Failed to load Gemini OAuth credentials from '{path}': {e}")
 
@@ -46,6 +49,7 @@ class GeminiAuthBase:
         try:
             with open(path, 'w') as f:
                 json.dump(creds, f, indent=2)
+            lib_logger.debug(f"Saved updated Gemini OAuth credentials to '{path}'.")
         except Exception as e:
             lib_logger.error(f"Failed to save updated Gemini OAuth credentials to '{path}': {e}")
 
@@ -101,10 +105,18 @@ class GeminiAuthBase:
     # [NEW] Add init flow for invalid/expired tokens
     async def initialize_token(self, path: str) -> Dict[str, Any]:
         """Initiates OAuth flow if tokens are missing or invalid."""
+        lib_logger.debug(f"Initializing Gemini token at '{path}'...")
         try:
             creds = await self._load_credentials(path)
-            if not creds.get("refresh_token") or self._is_token_expired(creds):
-                lib_logger.warning(f"Invalid or missing Gemini OAuth tokens at '{path}'. Initiating setup...")
+            
+            reason = ""
+            if not creds.get("refresh_token"):
+                reason = "refresh token is missing"
+            elif self._is_token_expired(creds):
+                reason = "token is expired"
+
+            if reason:
+                lib_logger.warning(f"Gemini OAuth token for '{Path(path).name}' needs setup: {reason}.")
                 # Use subprocess to run gemini-cli setup or simulate web flow
                 # Based on CLIProxyAPI-main/gemini/gemini_auth.go: Use web flow with local server
                 # For simplicity, prompt user to run manual setup or integrate browser flow
@@ -123,6 +135,7 @@ class GeminiAuthBase:
                 print(f"Please open this URL in your browser:\n\n{auth_url}\n")
                 auth_code = input("After authorizing, paste the 'code' from the redirected URL here: ")
                 
+                lib_logger.info(f"Attempting to exchange authorization code for tokens...")
                 async with httpx.AsyncClient() as client:
                     response = await client.post(TOKEN_URI, data={
                         "code": auth_code.strip(),
@@ -141,11 +154,13 @@ class GeminiAuthBase:
                         "client_secret": CLIENT_SECRET
                     }
                     await self._save_credentials(path, creds)
-                    lib_logger.info(f"Gemini OAuth initialized successfully for '{path}'.")
+                    lib_logger.info(f"Gemini OAuth initialized successfully for '{Path(path).name}'.")
                 return creds
+            
+            lib_logger.info(f"Gemini OAuth token at '{Path(path).name}' is valid.")
             return creds
         except Exception as e:
-            raise ValueError(f"Failed to initialize Gemini OAuth: {e}")
+            raise ValueError(f"Failed to initialize Gemini OAuth for '{path}': {e}")
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
         creds = await self._load_credentials(credential_path)

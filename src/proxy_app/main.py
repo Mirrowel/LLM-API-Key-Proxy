@@ -172,18 +172,23 @@ async def lifespan(app: FastAPI):
         discovered_creds = temp_cred_manager.discover_and_prepare()
         
         init_tasks = []
-        failed_inits = []
-        for provider, paths in discovered_creds.items():
-            provider_plugin_class = PROVIDER_PLUGINS.get(provider)
-            if provider_plugin_class and hasattr(provider_plugin_class(), 'initialize_token'):
-                provider_instance = provider_plugin_class()
-                for path in paths:
-                    init_tasks.append(provider_instance.initialize_token(path))
+        if discovered_creds:
+            logging.info(f"Found OAuth credentials for {len(discovered_creds)} provider(s). Validating tokens...")
+            for provider, paths in discovered_creds.items():
+                provider_plugin_class = PROVIDER_PLUGINS.get(provider)
+                if provider_plugin_class and hasattr(provider_plugin_class(), 'initialize_token'):
+                    provider_instance = provider_plugin_class()
+                    for path in paths:
+                        init_tasks.append((provider, path, provider_instance.initialize_token(path)))
         
         if init_tasks:
+            logging.info(f"Attempting to initialize/validate {len(init_tasks)} OAuth token(s)...")
             # Run sequentially to allow for user input without overlap
-            for task in init_tasks:
-                await task
+            for provider, path, task in init_tasks:
+                try:
+                    await task
+                except Exception as e:
+                    logging.error(f"Failed to initialize OAuth token for {provider} at '{path}': {e}")
         logging.info("OAuth credential validation complete.")
 
     # [NEW] Load provider-specific params

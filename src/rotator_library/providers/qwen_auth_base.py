@@ -31,10 +31,13 @@ class QwenAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
             try:
+                lib_logger.debug(f"Loading Qwen credentials from file: {path}")
                 with open(path, 'r') as f:
                     creds = json.load(f)
                 self._credentials_cache[path] = creds
                 return creds
+            except FileNotFoundError:
+                raise IOError(f"Qwen OAuth credential file not found at '{path}'")
             except Exception as e:
                 raise IOError(f"Failed to load Qwen OAuth credentials from '{path}': {e}")
 
@@ -43,6 +46,7 @@ class QwenAuthBase:
         try:
             with open(path, 'w') as f:
                 json.dump(creds, f, indent=2)
+            lib_logger.debug(f"Saved updated Qwen OAuth credentials to '{path}'.")
         except Exception as e:
             lib_logger.error(f"Failed to save updated Qwen OAuth credentials to '{path}': {e}")
 
@@ -100,10 +104,18 @@ class QwenAuthBase:
     # [NEW] Add init flow for invalid/expired tokens
     async def initialize_token(self, path: str) -> Dict[str, Any]:
         """Initiates device flow if tokens are missing or invalid."""
+        lib_logger.debug(f"Initializing Qwen token at '{path}'...")
         try:
             creds = await self._load_credentials(path)
-            if not creds.get("refresh_token") or self._is_token_expired(creds):
-                lib_logger.warning(f"Invalid or missing Qwen OAuth tokens at '{path}'. Initiating device flow...")
+
+            reason = ""
+            if not creds.get("refresh_token"):
+                reason = "refresh token is missing"
+            elif self._is_token_expired(creds):
+                reason = "token is expired"
+
+            if reason:
+                lib_logger.warning(f"Qwen OAuth token for '{Path(path).name}' needs setup: {reason}.")
                 # Based on CLIProxyAPI-main/qwen/qwen_auth.go: Use device code with PKCE
                 code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
                 code_challenge = base64.urlsafe_b64encode(
@@ -126,6 +138,7 @@ class QwenAuthBase:
                     print(f"\n--- Qwen OAuth Setup Required for {Path(path).name} ---")
                     print(f"Please visit: {dev_data['verification_uri_complete']}")
                     print(f"And enter code: {dev_data['user_code']}\n")
+                    lib_logger.info("Polling for token, please complete authentication in the browser...")
                     
                     token_data = None
                     start_time = time.time()
@@ -141,7 +154,9 @@ class QwenAuthBase:
                         )
                         if poll_response.status_code == 200:
                             token_data = poll_response.json()
+                            lib_logger.info("Successfully received token.")
                             break
+                        lib_logger.debug("Polling for device code authentication...")
                         await asyncio.sleep(dev_data['interval'])
                     
                     if not token_data:
@@ -154,11 +169,13 @@ class QwenAuthBase:
                         "resource_url": token_data.get("resource_url")
                     })
                     await self._save_credentials(path, creds)
-                    lib_logger.info(f"Qwen OAuth initialized successfully for '{path}'.")
+                    lib_logger.info(f"Qwen OAuth initialized successfully for '{Path(path).name}'.")
                 return creds
+            
+            lib_logger.info(f"Qwen OAuth token at '{Path(path).name}' is valid.")
             return creds
         except Exception as e:
-            raise ValueError(f"Failed to initialize Qwen OAuth: {e}")
+            raise ValueError(f"Failed to initialize Qwen OAuth for '{path}': {e}")
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
         creds = await self._load_credentials(credential_path)
