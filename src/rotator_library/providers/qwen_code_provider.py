@@ -17,15 +17,10 @@ HARDCODED_MODELS = [
 ]
 
 class QwenCodeProvider(QwenAuthBase, ProviderInterface):
+    skip_cost_calculation = True
+
     def __init__(self):
         super().__init__()
-        for model_id in HARDCODED_MODELS:
-            litellm.register_model({
-                f"qwen_code/{model_id}": {
-                    "input_cost_per_token": 0.0,
-                    "output_cost_per_token": 0.0
-                }
-            })
 
     def has_custom_logic(self) -> bool:
         return True # We use custom logic to handle 401 retries and stream parsing

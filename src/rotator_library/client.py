@@ -359,6 +359,7 @@ class RotatingClient:
 
         except Exception as e:
             # Catch any other unexpected errors during streaming.
+            lib_logger.error(f"Caught unexpected exception of type: {type(e).__name__}")
             lib_logger.error(f"An unexpected error occurred during the stream for credential ...{key[-6:]}: {e}")
             # We still need to raise it so the client knows something went wrong.
             raise
@@ -643,6 +644,10 @@ class RotatingClient:
                     tried_creds.add(current_cred)
 
                     litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+                    if "reasoning_effort" in kwargs:
+                        litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
+                    if "custom_reasoning_budget" in kwargs:
+                        litellm_kwargs["custom_reasoning_budget"] = kwargs["custom_reasoning_budget"]
                     
                     # [NEW] Merge provider-specific params
                     if provider in self.litellm_provider_params:
@@ -656,15 +661,28 @@ class RotatingClient:
                         lib_logger.debug(f"Provider '{provider}' has custom logic. Delegating call.")
                         litellm_kwargs["credential_identifier"] = current_cred
                         
+                        lib_logger.info(f"Attempting stream with credential ...{current_cred[-6:]} (Attempt 1/1)")
+                        
                         # The plugin handles the entire call, including retries on 401, etc.
                         # The main retry loop here is for key rotation on other errors.
-                        response = await provider_plugin.acompletion(self.http_client, **litellm_kwargs)
-                        
-                        key_acquired = False
-                        stream_generator = self._safe_streaming_wrapper(response, current_cred, model, request)
-                        async for chunk in stream_generator:
-                            yield chunk
-                        return
+                        try:
+                            response = await provider_plugin.acompletion(self.http_client, **litellm_kwargs)
+                            lib_logger.info(f"Stream connection established for credential ...{current_cred[-6:]}. Processing response.")
+                            
+                            key_acquired = False
+                            stream_generator = self._safe_streaming_wrapper(response, current_cred, model, request)
+                            async for chunk in stream_generator:
+                                yield chunk
+                            return
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 429:
+                                last_exception = e
+                                classified_error = classify_error(e)
+                                await self.usage_manager.record_failure(current_cred, model, classified_error)
+                                lib_logger.warning(f"Credential ...{current_cred[-6:]} encountered a 429 error during custom provider stream. Rotating key silently.")
+                                break
+                            else:
+                                raise e
 
                     else: # This is the standard API Key / litellm-handled provider logic
                         is_oauth = provider in self.oauth_providers

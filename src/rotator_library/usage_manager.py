@@ -9,6 +9,7 @@ import aiofiles
 import litellm
 
 from .error_handler import ClassifiedError, NoAvailableKeysError
+from .providers import PROVIDER_PLUGINS
 
 lib_logger = logging.getLogger('rotator_library')
 lib_logger.propagate = False
@@ -259,14 +260,20 @@ class UsageManager:
                 daily_model_data["completion_tokens"] += getattr(usage, 'completion_tokens', 0) # Not present in embedding responses
                 lib_logger.info(f"Recorded usage from final stream object for key ...{key[-6:]}")
                 try:
-                    # Differentiate cost calculation based on response type
-                    if isinstance(completion_response, litellm.EmbeddingResponse):
-                        cost = litellm.embedding_cost(embedding_response=completion_response)
+                    provider_name = model.split('/')[0]
+                    provider_plugin = PROVIDER_PLUGINS.get(provider_name)
+
+                    if provider_plugin and provider_plugin.skip_cost_calculation:
+                        lib_logger.debug(f"Skipping cost calculation for provider '{provider_name}' as per its configuration.")
                     else:
-                        cost = litellm.completion_cost(completion_response=completion_response, model=model)
-                    
-                    if cost is not None:
-                        daily_model_data["approx_cost"] += cost
+                        # Differentiate cost calculation based on response type
+                        if isinstance(completion_response, litellm.EmbeddingResponse):
+                            cost = litellm.embedding_cost(embedding_response=completion_response)
+                        else:
+                            cost = litellm.completion_cost(completion_response=completion_response, model=model)
+                        
+                        if cost is not None:
+                            daily_model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
             else:

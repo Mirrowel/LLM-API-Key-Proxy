@@ -8,6 +8,7 @@ class ProviderInterface(ABC):
     An interface for API provider-specific functionality, including model
     discovery and custom API call handling for non-standard providers.
     """
+    skip_cost_calculation: bool = False
     
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:

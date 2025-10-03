@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
-import logging
 import colorlog
 from pathlib import Path
 import sys
@@ -17,6 +16,12 @@ import time
 from typing import AsyncGenerator, Any, List, Optional, Union
 from pydantic import BaseModel, Field
 import argparse
+import logging
+
+# --- Early Log Level Configuration ---
+# Set the log level for LiteLLM before it's imported to prevent startup spam.
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
 import litellm
 
 

@@ -19,20 +19,16 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-preview-09-2025",
     "gemini-2.5-flash-lite"
 ]
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
+    skip_cost_calculation = True
+
     def __init__(self):
         super().__init__()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
-        for model_id in HARDCODED_MODELS:
-            litellm.register_model({
-                f"gemini_cli/{model_id}": {
-                    "input_cost_per_token": 0.0,
-                    "output_cost_per_token": 0.0
-                }
-            })
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
         """Discovers the Google Cloud Project ID, with caching."""
@@ -163,29 +159,37 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         if "thinkingConfig" in payload.get("generationConfig", {}):
             return None
 
-        if custom_reasoning_budget:
-            budget = -1 # Default
-            if reasoning_effort:
-                if "gemini-2.5-pro" in model:
-                    budgets = {"low": 8192, "medium": 16384, "high": 32768}
-                elif "gemini-2.5-flash" in model:
-                    budgets = {"low": 6144, "medium": 12288, "high": 24576}
-                else:
-                    budgets = {"low": 1024, "medium": 2048, "high": 4096}
-                
-                budget = budgets.get(reasoning_effort, -1)
-                if reasoning_effort == "disable":
-                    budget = 0
-            
+        # Only apply reasoning logic to the gemini-2.5 model family
+        if "gemini-2.5" not in model:
             payload.pop("reasoning_effort", None)
             payload.pop("custom_reasoning_budget", None)
-            return {"thinkingBudget": budget}
+            return None
 
         if not reasoning_effort:
-            if "gemini-2.5-pro" in model or "gemini-2.5-flash" in model:
-                return {"thinkingBudget": -1}
+            return {"thinkingBudget": -1, "include_thoughts": True}
+
+        # If reasoning_effort is provided, calculate the budget
+        budget = -1  # Default for 'auto' or invalid values
+        if "gemini-2.5-pro" in model:
+            budgets = {"low": 8192, "medium": 16384, "high": 32768}
+        elif "gemini-2.5-flash" in model:
+            budgets = {"low": 6144, "medium": 12288, "high": 24576}
+        else:
+            # Fallback for other gemini-2.5 models
+            budgets = {"low": 1024, "medium": 2048, "high": 4096}
+
+        budget = budgets.get(reasoning_effort, -1)
+        if reasoning_effort == "disable":
+            budget = 0
         
-        return None
+        if not custom_reasoning_budget:
+            budget = budget // 4
+
+        # Clean up the original payload
+        payload.pop("reasoning_effort", None)
+        payload.pop("custom_reasoning_budget", None)
+        
+        return {"thinkingBudget": budget, "include_thoughts": True}
 
     def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
         response_data = chunk.get('response', chunk)
@@ -278,7 +282,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 gen_config["thinkingConfig"] = thinking_config
 
             system_instruction, contents = self._transform_messages(kwargs.get("messages", []))
-
             request_payload = {
                 "model": model_name,
                 "project": project_id,
@@ -300,10 +303,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             
             # Log the final payload for debugging, as requested
             lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
-
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
+
             async def stream_handler():
-                async with client.stream("POST", url, headers=auth_header, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
+                final_headers = auth_header.copy()
+                final_headers.update({
+                    "User-Agent": "google-api-nodejs-client/9.15.1",
+                    "X-Goog-Api-Client": "gl-node/22.17.0",
+                    "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+                })
+                async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if line.startswith('data: '):
