@@ -84,91 +84,214 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def has_custom_logic(self) -> bool:
         return True
 
-    def _transform_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # As seen in Kilo examples, system prompts are injected into the first user message.
+    def _transform_messages(self, messages: List[Dict[str, Any]]) -> (Optional[Dict[str, Any]], List[Dict[str, Any]]):
+        system_instruction = None
         gemini_contents = []
-        system_prompt = ""
+        
+        # Separate system prompt from other messages
         if messages and messages[0].get('role') == 'system':
-            system_prompt = messages.pop(0).get('content', '')
+            system_prompt_content = messages.pop(0).get('content', '')
+            if system_prompt_content:
+                system_instruction = {
+                    "role": "user",
+                    "parts": [{"text": system_prompt_content}]
+                }
+
+        tool_call_id_to_name = {}
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg["tool_calls"]:
+                    if tool_call.get("type") == "function":
+                        tool_call_id_to_name[tool_call["id"]] = tool_call["function"]["name"]
 
         for msg in messages:
-            role = "model" if msg.get("role") == "assistant" else "user"
-            content = msg.get("content", "")
-            if system_prompt and role == "user":
-                content = f"{system_prompt}\n\n{content}"
-                system_prompt = "" # Inject only once
-            gemini_contents.append({"role": role, "parts": [{"text": content}]})
-        return gemini_contents
+            role = msg.get("role")
+            content = msg.get("content")
+            parts = []
+            gemini_role = "model" if role == "assistant" else "tool" if role == "tool" else "user"
 
-    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str) -> dict:
-        response_data = chunk.get('response', chunk)
-        candidate = response_data.get('candidates', [{}])[0]
+            if role == "user":
+                text_content = ""
+                if isinstance(content, str):
+                    text_content = content
+                elif isinstance(content, list):
+                    text_content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+                if text_content:
+                    parts.append({"text": text_content})
+
+            elif role == "assistant":
+                if isinstance(content, str):
+                    parts.append({"text": content})
+                if msg.get("tool_calls"):
+                    for tool_call in msg["tool_calls"]:
+                        if tool_call.get("type") == "function":
+                            try:
+                                args_dict = json.loads(tool_call["function"]["arguments"])
+                            except (json.JSONDecodeError, TypeError):
+                                args_dict = {}
+                            parts.append({"functionCall": {"name": tool_call["function"]["name"], "args": args_dict}})
+
+            elif role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                function_name = tool_call_id_to_name.get(tool_call_id)
+                if function_name:
+                    # Per Go example, wrap the tool response in a 'result' object
+                    response_content = {"result": content}
+                    parts.append({"functionResponse": {"name": function_name, "response": response_content}})
+
+            if parts:
+                gemini_contents.append({"role": gemini_role, "parts": parts})
+
+        if not any(c['role'] == 'user' for c in gemini_contents):
+             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
+        elif gemini_contents and gemini_contents[0]["role"] == "model":
+            gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
+
+        return system_instruction, gemini_contents
+
+    def _handle_reasoning_parameters(self, payload: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+        custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
+        reasoning_effort = payload.get("reasoning_effort")
+
+        if "thinkingConfig" in payload.get("generationConfig", {}):
+            return None
+
+        if custom_reasoning_budget:
+            budget = -1 # Default
+            if reasoning_effort:
+                if "gemini-2.5-pro" in model:
+                    budgets = {"low": 8192, "medium": 16384, "high": 32768}
+                elif "gemini-2.5-flash" in model:
+                    budgets = {"low": 6144, "medium": 12288, "high": 24576}
+                else:
+                    budgets = {"low": 1024, "medium": 2048, "high": 4096}
+                
+                budget = budgets.get(reasoning_effort, -1)
+                if reasoning_effort == "disable":
+                    budget = 0
+            
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
+            return {"thinkingBudget": budget}
+
+        if not reasoning_effort:
+            if "gemini-2.5-pro" in model or "gemini-2.5-flash" in model:
+                return {"thinkingBudget": -1}
         
-        delta = {}
-        finish_reason = None
+        return None
 
-        # Correctly handle reasoning vs. content based on 'thought' flag from Kilo example
-        if 'content' in candidate and 'parts' in candidate['content']:
-            part = candidate['content']['parts'][0]
-            if part.get('text'):
+    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
+        response_data = chunk.get('response', chunk)
+        candidates = response_data.get('candidates', [])
+        if not candidates:
+            return
+
+        candidate = candidates[0]
+        parts = candidate.get('content', {}).get('parts', [])
+
+        for part in parts:
+            delta = {}
+            finish_reason = None
+
+            if 'functionCall' in part:
+                function_call = part['functionCall']
+                delta['tool_calls'] = [{
+                    "index": 0,
+                    "id": f"tool-call-{time.time()}",
+                    "type": "function",
+                    "function": {
+                        "name": function_call.get('name'),
+                        "arguments": json.dumps(function_call.get('args', {}))
+                    }
+                }]
+            elif 'text' in part:
                 if part.get('thought') is True:
-                    # This is a reasoning/thinking step
                     delta['reasoning_content'] = part['text']
                 else:
                     delta['content'] = part['text']
+            
+            if not delta:
+                continue
 
-        raw_finish_reason = candidate.get('finishReason')
-        if raw_finish_reason:
-            mapping = {'STOP': 'stop', 'MAX_TOKENS': 'length', 'SAFETY': 'content_filter'}
-            finish_reason = mapping.get(raw_finish_reason, 'stop')
+            raw_finish_reason = candidate.get('finishReason')
+            if raw_finish_reason:
+                mapping = {'STOP': 'stop', 'MAX_TOKENS': 'length', 'SAFETY': 'content_filter'}
+                finish_reason = mapping.get(raw_finish_reason, 'stop')
 
-        choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
-        
-        openai_chunk = {
-            "choices": [choice], "model": model_id, "object": "chat.completion.chunk",
-            "id": f"chatcmpl-geminicli-{time.time()}", "created": int(time.time())
-        }
-
-        if 'usageMetadata' in response_data:
-            usage = response_data['usageMetadata']
-            openai_chunk["usage"] = {
-                "prompt_tokens": usage.get("promptTokenCount", 0),
-                "completion_tokens": usage.get("candidatesTokenCount", 0),
-                "total_tokens": usage.get("totalTokenCount", 0),
+            choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            
+            openai_chunk = {
+                "choices": [choice], "model": model_id, "object": "chat.completion.chunk",
+                "id": f"chatcmpl-geminicli-{time.time()}", "created": int(time.time())
             }
-        
-        return openai_chunk
+
+            if 'usageMetadata' in response_data:
+                usage = response_data['usageMetadata']
+                openai_chunk["usage"] = {
+                    "prompt_tokens": usage.get("promptTokenCount", 0),
+                    "completion_tokens": usage.get("candidatesTokenCount", 0),
+                    "total_tokens": usage.get("totalTokenCount", 0),
+                }
+            
+            yield openai_chunk
 
     async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
         
         async def do_call():
+            # Get auth header once, it's needed for the request anyway
             auth_header = await self.get_auth_header(credential_path)
-            access_token = auth_header['Authorization'].split(' ')[1]
-            project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
+
+            # Discover project ID only if not already cached
+            project_id = self.project_id_cache.get(credential_path)
+            if not project_id:
+                access_token = auth_header['Authorization'].split(' ')[1]
+                project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
             
             # Handle :thinking suffix from Kilo example
-            model_name = model.split('/')[-1]
-            enable_thinking = model_name.endswith(':thinking')
-            if enable_thinking:
-                model_name = model_name.replace(':thinking', '')
+            model_name = model.split('/')[-1].replace(':thinking', '')
 
             gen_config = {
-                "temperature": kwargs.get("temperature", 0.7),
-                "maxOutputTokens": kwargs.get("max_tokens", 8192),
+                "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
             }
-            if enable_thinking:
-                gen_config["thinkingConfig"] = {"thinkingBudget": -1}
+            if "temperature" in kwargs:
+                gen_config["temperature"] = kwargs["temperature"]
+            else:
+                gen_config["temperature"] = 0.7
+            if "top_k" in kwargs:
+                gen_config["topK"] = kwargs["top_k"]
+            if "top_p" in kwargs:
+                gen_config["topP"] = kwargs["top_p"]
+
+            # Use the sophisticated reasoning logic
+            thinking_config = self._handle_reasoning_parameters(kwargs, model_name)
+            if thinking_config:
+                gen_config["thinkingConfig"] = thinking_config
+
+            system_instruction, contents = self._transform_messages(kwargs.get("messages", []))
 
             request_payload = {
                 "model": model_name,
                 "project": project_id,
                 "request": {
-                    "contents": self._transform_messages(kwargs.get("messages", [])),
+                    "contents": contents,
                     "generationConfig": gen_config,
                 },
             }
+
+            if system_instruction:
+                request_payload["request"]["systemInstruction"] = system_instruction
+
+            if "tools" in kwargs and kwargs["tools"]:
+                function_declarations = [
+                    tool["function"] for tool in kwargs["tools"] if tool.get("type") == "function"
+                ]
+                if function_declarations:
+                    request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
+            
+            # Log the final payload for debugging, as requested
+            lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
 
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
             async def stream_handler():
@@ -180,8 +303,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                             if data_str == "[DONE]": break
                             try:
                                 chunk = json.loads(data_str)
-                                openai_chunk = self._convert_chunk_to_openai(chunk, model)
-                                yield litellm.ModelResponse(**openai_chunk)
+                                for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                    yield litellm.ModelResponse(**openai_chunk)
                             except json.JSONDecodeError:
                                 lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
             return stream_handler()
