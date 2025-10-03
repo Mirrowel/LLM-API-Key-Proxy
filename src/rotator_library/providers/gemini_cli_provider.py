@@ -221,6 +221,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         return {"thinkingBudget": budget, "include_thoughts": True}
 
     def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
+        lib_logger.debug(f"Converting Gemini chunk: {json.dumps(chunk)}")
         response_data = chunk.get('response', chunk)
         candidates = response_data.get('candidates', [])
         if not candidates:

@@ -269,7 +269,7 @@ class RotatingClient:
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
         and distinguishes between content and streamed errors.
         """
-        usage_recorded = False
+        last_usage = None
         stream_completed = False
         stream_iterator = stream.__aiter__()
         json_buffer = ""
@@ -292,14 +292,20 @@ class RotatingClient:
                     
                     yield f"data: {json.dumps(chunk.dict())}\n\n"
 
-                    if not usage_recorded and hasattr(chunk, 'usage') and chunk.usage:
-                        await self.usage_manager.record_success(key, model, chunk)
-                        usage_recorded = True
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        last_usage = chunk.usage  # Overwrite with the latest (cumulative)
 
                 except StopAsyncIteration:
                     stream_completed = True
                     if json_buffer:
                         lib_logger.info(f"Stream ended with incomplete data in buffer: {json_buffer}")
+                    if last_usage:
+                        # Create a dummy ModelResponse for recording (only usage matters)
+                        dummy_response = litellm.ModelResponse(usage=last_usage)
+                        await self.usage_manager.record_success(key, model, dummy_response)
+                    else:
+                        # If no usage seen (rare), record success without tokens/cost
+                        await self.usage_manager.record_success(key, model)
                     break
 
                 except (litellm.RateLimitError, litellm.ServiceUnavailableError, litellm.InternalServerError, APIConnectionError) as e:
@@ -367,27 +373,6 @@ class RotatingClient:
         finally:
             # This block now runs regardless of how the stream terminates (completion, client disconnect, etc.).
             # The primary goal is to ensure usage is always logged internally.
-            if not usage_recorded:
-                # This will be triggered if the stream is exhausted OR if the client disconnects early.
-                # It ensures that we always attempt to log usage from the final stream object.
-                await self.usage_manager.record_success(key, model, stream)
-                
-                # We still attempt to send the final usage to the client, but only if they are still connected.
-                if request and not await request.is_disconnected() and hasattr(stream, 'usage') and stream.usage:
-                    try:
-                        final_usage_chunk = {
-                            "id": getattr(stream, 'id', None),
-                            "model": getattr(stream, 'model', None),
-                            "object": "chat.completion.chunk",
-                            "created": getattr(stream, 'created', None),
-                            "choices": [],
-                            "usage": stream.usage.dict() if hasattr(stream.usage, 'dict') else vars(stream.usage)
-                        }
-                        yield f"data: {json.dumps(final_usage_chunk)}\n\n"
-                        lib_logger.info(f"Yielded final usage chunk for credential ...{key[-6:]}.")
-                    except Exception as e:
-                        lib_logger.error(f"Failed to create or yield final usage chunk: {e}")
-
             await self.usage_manager.release_key(key, model)
             lib_logger.info(f"STREAM FINISHED and lock released for credential ...{key[-6:]}.")
             
@@ -661,28 +646,70 @@ class RotatingClient:
                         lib_logger.debug(f"Provider '{provider}' has custom logic. Delegating call.")
                         litellm_kwargs["credential_identifier"] = current_cred
                         
-                        lib_logger.info(f"Attempting stream with credential ...{current_cred[-6:]} (Attempt 1/1)")
-                        
-                        # The plugin handles the entire call, including retries on 401, etc.
-                        # The main retry loop here is for key rotation on other errors.
-                        try:
-                            response = await provider_plugin.acompletion(self.http_client, **litellm_kwargs)
-                            lib_logger.info(f"Stream connection established for credential ...{current_cred[-6:]}. Processing response.")
-                            
-                            key_acquired = False
-                            stream_generator = self._safe_streaming_wrapper(response, current_cred, model, request)
-                            async for chunk in stream_generator:
-                                yield chunk
-                            return
-                        except httpx.HTTPStatusError as e:
-                            if e.response.status_code == 429:
+                        for attempt in range(self.max_retries):
+                            try:
+                                lib_logger.info(f"Attempting stream with credential ...{current_cred[-6:]} (Attempt {attempt + 1}/{self.max_retries})")
+                                
+                                if pre_request_callback:
+                                    try:
+                                        await pre_request_callback(request, litellm_kwargs)
+                                    except Exception as e:
+                                        if self.abort_on_callback_error:
+                                            raise PreRequestCallbackError(f"Pre-request callback failed: {e}") from e
+                                        else:
+                                            lib_logger.warning(f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}")
+                                
+                                response = await provider_plugin.acompletion(self.http_client, **litellm_kwargs)
+                                
+                                lib_logger.info(f"Stream connection established for credential ...{current_cred[-6:]}. Processing response.")
+
+                                key_acquired = False
+                                stream_generator = self._safe_streaming_wrapper(response, current_cred, model, request)
+                                
+                                async for chunk in stream_generator:
+                                    yield chunk
+                                return
+
+                            except (StreamedAPIError, litellm.RateLimitError, httpx.HTTPStatusError) as e:
+                                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code != 429:
+                                    raise e
+
                                 last_exception = e
                                 classified_error = classify_error(e)
                                 await self.usage_manager.record_failure(current_cred, model, classified_error)
-                                lib_logger.warning(f"Credential ...{current_cred[-6:]} encountered a 429 error during custom provider stream. Rotating key silently.")
+                                lib_logger.warning(f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during custom provider stream. Rotating key.")
                                 break
-                            else:
-                                raise e
+
+                            except (APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError) as e:
+                                last_exception = e
+                                log_failure(api_key=current_cred, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
+                                classified_error = classify_error(e)
+                                await self.usage_manager.record_failure(current_cred, model, classified_error)
+
+                                if attempt >= self.max_retries - 1:
+                                    lib_logger.warning(f"Credential ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Rotating key.")
+                                    break
+                                
+                                wait_time = classified_error.retry_after or (1 * (2 ** attempt)) + random.uniform(0, 1)
+                                remaining_budget = deadline - time.time()
+                                if wait_time > remaining_budget:
+                                    lib_logger.warning(f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early.")
+                                    break
+                                
+                                error_message = str(e).split('\n')[0]
+                                lib_logger.warning(f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s.")
+                                await asyncio.sleep(wait_time)
+                                continue
+
+                            except Exception as e:
+                                last_exception = e
+                                log_failure(api_key=current_cred, model=model, attempt=attempt + 1, error=e, request_headers=dict(request.headers) if request else {})
+                                classified_error = classify_error(e)
+                                lib_logger.warning(f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key.")
+                                if classified_error.error_type in ['invalid_request', 'context_window_exceeded', 'authentication']:
+                                    raise last_exception
+                                await self.usage_manager.record_failure(current_cred, model, classified_error)
+                                break
 
                     else: # This is the standard API Key / litellm-handled provider logic
                         is_oauth = provider in self.oauth_providers

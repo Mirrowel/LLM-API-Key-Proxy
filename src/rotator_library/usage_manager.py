@@ -258,7 +258,7 @@ class UsageManager:
                 usage = completion_response.usage
                 daily_model_data["prompt_tokens"] += usage.prompt_tokens
                 daily_model_data["completion_tokens"] += getattr(usage, 'completion_tokens', 0) # Not present in embedding responses
-                lib_logger.info(f"Recorded usage from final stream object for key ...{key[-6:]}")
+                lib_logger.info(f"Recorded usage from response object for key ...{key[-6:]}")
                 try:
                     provider_name = model.split('/')[0]
                     provider_plugin = PROVIDER_PLUGINS.get(provider_name)
@@ -276,6 +276,9 @@ class UsageManager:
                             daily_model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
+            elif asyncio.iscoroutine(completion_response) or isinstance(completion_response, asyncio.Future) or hasattr(completion_response, '__aiter__'):
+                # This is an unconsumed stream object. Do not log a warning, as usage will be recorded from the chunks.
+                pass
             else:
                 lib_logger.warning(f"No usage data found in completion response for model {model}. Recording success without token count.")
 
