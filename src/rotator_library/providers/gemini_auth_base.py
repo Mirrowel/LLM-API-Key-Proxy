@@ -1,5 +1,7 @@
 # src/rotator_library/providers/gemini_auth_base.py
 
+import subprocess
+from typing import Optional
 import json
 import time
 import asyncio
@@ -85,12 +87,6 @@ class GeminiAuthBase:
             lib_logger.info(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.")
             return creds
 
-    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path, creds)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
-
     async def proactively_refresh(self, credential_path: str):
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
@@ -100,3 +96,58 @@ class GeminiAuthBase:
         if path not in self._refresh_locks:
             self._refresh_locks[path] = asyncio.Lock()
         return self._refresh_locks[path]
+
+    # [NEW] Add init flow for invalid/expired tokens
+    async def initialize_token(self, path: str) -> Dict[str, Any]:
+        """Initiates OAuth flow if tokens are missing or invalid."""
+        try:
+            creds = await self._load_credentials(path)
+            if not creds.get("refresh_token") or self._is_token_expired(creds):
+                lib_logger.warning(f"Invalid or missing Gemini OAuth tokens at '{path}'. Initiating setup...")
+                # Use subprocess to run gemini-cli setup or simulate web flow
+                # Based on CLIProxyAPI-main/gemini/gemini_auth.go: Use web flow with local server
+                # For simplicity, prompt user to run manual setup or integrate browser flow
+                print("Gemini CLI OAuth setup required. Please visit the authorization URL and paste the code.")
+                # Simulate getTokenFromWeb logic
+                from urllib.parse import urlencode
+                auth_url = "https://accounts.google.com/oauth2/v2/auth?" + urlencode({
+                    "client_id": CLIENT_ID,
+                    "redirect_uri": "http://localhost:8085/oauth2callback",
+                    "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
+                    "access_type": "offline",
+                    "response_type": "code",
+                    "prompt": "consent"
+                })
+                print(f"\n--- Gemini OAuth Setup Required for {Path(path).name} ---")
+                print(f"Please open this URL in your browser:\n\n{auth_url}\n")
+                auth_code = input("After authorizing, paste the 'code' from the redirected URL here: ")
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(TOKEN_URI, data={
+                        "code": auth_code.strip(),
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "redirect_uri": "http://localhost:8085/oauth2callback",
+                        "grant_type": "authorization_code"
+                    })
+                    response.raise_for_status()
+                    token_data = response.json()
+                    creds = {
+                        "access_token": token_data["access_token"],
+                        "refresh_token": token_data["refresh_token"],
+                        "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET
+                    }
+                    await self._save_credentials(path, creds)
+                    lib_logger.info(f"Gemini OAuth initialized successfully for '{path}'.")
+                return creds
+            return creds
+        except Exception as e:
+            raise ValueError(f"Failed to initialize Gemini OAuth: {e}")
+
+    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+        creds = await self.initialize_token(credential_path)  # [NEW] Call init if needed
+        if self._is_token_expired(creds):
+            creds = await self._refresh_token(credential_path, creds)
+        return {"Authorization": f"Bearer {creds['access_token']}"}

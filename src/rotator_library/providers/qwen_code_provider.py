@@ -1,5 +1,6 @@
 # src/rotator_library/providers/qwen_code_provider.py
 
+import litellm.exceptions as litellm_exc
 import httpx
 import logging
 from typing import Union, AsyncGenerator
@@ -31,6 +32,12 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             if content and ("<think>" in content or "</think>" in content):
                 parts = content.replace("<think>", "||THINK||").replace("</think>", "||/THINK||").split("||")
                 for part in parts:
+                    # [NEW] Check for provider-specific errors in content
+                    if "slow_down" in part.lower():
+                        lib_logger.warning("Qwen 'slow_down' detected in response content. Treating as rate limit.")
+                        raise litellm_exc.RateLimitError(
+                            message="Qwen slow_down error detected.", llm_provider="qwen_code"
+                        )
                     if not part: continue
                     new_chunk = chunk.copy()
                     if part.startswith("THINK||"):
@@ -52,8 +59,15 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         async def do_call():
             api_base, access_token = self.get_api_details(credential_path)
             response = await litellm.acompletion(
+                # [NEW] Add timeout and retry params if needed, but since rotation handles retries, this is optional
                 **kwargs, api_key=access_token, api_base=api_base
             )
+            # [NEW] Post-call check for specific finish reasons or errors
+            if not kwargs.get("stream") and response.choices[0].finish_reason == "slow_down":
+                lib_logger.warning("Qwen 'slow_down' finish reason detected. Treating as rate limit.")
+                raise litellm_exc.RateLimitError(
+                    message="Qwen slow_down finish reason.", llm_provider="qwen_code"
+                )
             return response
         
         try:
@@ -63,6 +77,11 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                 lib_logger.warning("Qwen Code returned 401. Forcing token refresh and retrying once.")
                 await self._refresh_token(credential_path, force=True)
                 response = await do_call()
+            # [NEW] Catch provider-specific exceptions
+            elif "slow_down" in str(e).lower():
+                raise litellm_exc.RateLimitError(
+                    message="Qwen slow_down error in exception.", llm_provider="qwen_code"
+                )
             else:
                 raise e
 

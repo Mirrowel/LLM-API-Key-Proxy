@@ -1,5 +1,8 @@
 # src/rotator_library/providers/qwen_auth_base.py
 
+import secrets
+import hashlib
+import base64
 import json
 import time
 import asyncio
@@ -77,12 +80,6 @@ class QwenAuthBase:
             lib_logger.info(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
             return creds_from_file
 
-    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
-
     def get_api_details(self, credential_path: str) -> Tuple[str, str]:
         creds = self._credentials_cache[credential_path]
         base_url = creds.get("resource_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -99,3 +96,72 @@ class QwenAuthBase:
         if path not in self._refresh_locks:
             self._refresh_locks[path] = asyncio.Lock()
         return self._refresh_locks[path]
+
+    # [NEW] Add init flow for invalid/expired tokens
+    async def initialize_token(self, path: str) -> Dict[str, Any]:
+        """Initiates device flow if tokens are missing or invalid."""
+        try:
+            creds = await self._load_credentials(path)
+            if not creds.get("refresh_token") or self._is_token_expired(creds):
+                lib_logger.warning(f"Invalid or missing Qwen OAuth tokens at '{path}'. Initiating device flow...")
+                # Based on CLIProxyAPI-main/qwen/qwen_auth.go: Use device code with PKCE
+                code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+                code_challenge = base64.urlsafe_b64encode(
+                    hashlib.sha256(code_verifier.encode('utf-8')).digest()
+                ).decode('utf-8').rstrip('=')
+                
+                async with httpx.AsyncClient() as client:
+                    dev_response = await client.post(
+                        "https://chat.qwen.ai/api/v1/oauth2/device/code",
+                        data={
+                            "client_id": CLIENT_ID,
+                            "scope": "openid profile email model.completion",
+                            "code_challenge": code_challenge,
+                            "code_challenge_method": "S256"
+                        }
+                    )
+                    dev_response.raise_for_status()
+                    dev_data = dev_response.json()
+                    
+                    print(f"\n--- Qwen OAuth Setup Required for {Path(path).name} ---")
+                    print(f"Please visit: {dev_data['verification_uri_complete']}")
+                    print(f"And enter code: {dev_data['user_code']}\n")
+                    
+                    token_data = None
+                    start_time = time.time()
+                    while time.time() - start_time < dev_data['expires_in']:
+                        poll_response = await client.post(
+                            TOKEN_ENDPOINT,
+                            data={
+                                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                "device_code": dev_data['device_code'],
+                                "client_id": CLIENT_ID,
+                                "code_verifier": code_verifier
+                            }
+                        )
+                        if poll_response.status_code == 200:
+                            token_data = poll_response.json()
+                            break
+                        await asyncio.sleep(dev_data['interval'])
+                    
+                    if not token_data:
+                        raise TimeoutError("Qwen device flow timed out.")
+                    
+                    creds.update({
+                        "access_token": token_data["access_token"],
+                        "refresh_token": token_data.get("refresh_token"),
+                        "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
+                        "resource_url": token_data.get("resource_url")
+                    })
+                    await self._save_credentials(path, creds)
+                    lib_logger.info(f"Qwen OAuth initialized successfully for '{path}'.")
+                return creds
+            return creds
+        except Exception as e:
+            raise ValueError(f"Failed to initialize Qwen OAuth: {e}")
+
+    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+        creds = await self.initialize_token(credential_path)  # [NEW] Call init if needed
+        if self._is_token_expired(creds):
+            creds = await self._refresh_token(credential_path)
+        return {"Authorization": f"Bearer {creds['access_token']}"}

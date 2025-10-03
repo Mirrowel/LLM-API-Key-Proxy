@@ -1,8 +1,9 @@
 # src/rotator_library/background_refresher.py
 
+import os
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .client import RotatingClient
@@ -14,9 +15,14 @@ class BackgroundRefresher:
     A background task that periodically checks and refreshes OAuth tokens
     to ensure they remain valid.
     """
-    def __init__(self, client: 'RotatingClient', interval_seconds: int = 300):
+    def __init__(self, client: 'RotatingClient'):
+        try:
+            interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "3600")
+            self._interval = int(interval_str)
+        except ValueError:
+            lib_logger.warning(f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. Falling back to 3600s.")
+            self._interval = 3600
         self._client = client
-        self._interval = interval_seconds
         self._task: Optional[asyncio.Task] = None
 
     def start(self):
@@ -24,6 +30,7 @@ class BackgroundRefresher:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
             lib_logger.info(f"Background token refresher started. Check interval: {self._interval} seconds.")
+            # [NEW] Log if custom interval is set
 
     async def stop(self):
         """Stops the background refresh task."""

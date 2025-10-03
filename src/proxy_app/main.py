@@ -163,6 +163,27 @@ for key, value in os.environ.items():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    # [MODIFIED] Perform skippable OAuth initialization at startup
+    skip_oauth_init = os.getenv("SKIP_OAUTH_INIT_CHECK", "false").lower() == "true"
+
+    if not skip_oauth_init:
+        logging.info("Performing OAuth credential validation at startup...")
+        temp_cred_manager = CredentialManager(oauth_credentials)
+        discovered_creds = temp_cred_manager.discover_and_prepare()
+        
+        init_tasks = []
+        for provider, paths in discovered_creds.items():
+            provider_plugin_class = PROVIDER_PLUGINS.get(provider)
+            if provider_plugin_class:
+                provider_instance = provider_plugin_class()
+                if hasattr(provider_instance, 'initialize_token'):
+                    for path in paths:
+                        init_tasks.append(provider_instance.initialize_token(path))
+        
+        if init_tasks:
+            await asyncio.gather(*init_tasks)
+        logging.info("OAuth credential validation complete.")
+
     # [NEW] Load provider-specific params
     litellm_provider_params = {
         "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
