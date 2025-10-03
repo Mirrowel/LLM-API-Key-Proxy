@@ -15,6 +15,7 @@ import httpx
 lib_logger = logging.getLogger('rotator_library')
 
 CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56" ##https://api.kilocode.ai/extension-config.json
+SCOPE = "openid profile email model.completion"
 TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token"
 REFRESH_EXPIRY_BUFFER_SECONDS = 300
 
@@ -23,23 +24,29 @@ class QwenAuthBase:
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
 
+    async def _read_creds_from_file(self, path: str) -> Dict[str, Any]:
+        """Reads credentials from file and populates the cache. No locking."""
+        try:
+            lib_logger.debug(f"Reading Qwen credentials from file: {path}")
+            with open(path, 'r') as f:
+                creds = json.load(f)
+            self._credentials_cache[path] = creds
+            return creds
+        except FileNotFoundError:
+            raise IOError(f"Qwen OAuth credential file not found at '{path}'")
+        except Exception as e:
+            raise IOError(f"Failed to load Qwen OAuth credentials from '{path}': {e}")
+
     async def _load_credentials(self, path: str) -> Dict[str, Any]:
+        """Loads credentials from cache or file."""
         if path in self._credentials_cache:
             return self._credentials_cache[path]
         
         async with self._get_lock(path):
+            # Re-check cache after acquiring lock
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
-            try:
-                lib_logger.debug(f"Loading Qwen credentials from file: {path}")
-                with open(path, 'r') as f:
-                    creds = json.load(f)
-                self._credentials_cache[path] = creds
-                return creds
-            except FileNotFoundError:
-                raise IOError(f"Qwen OAuth credential file not found at '{path}'")
-            except Exception as e:
-                raise IOError(f"Failed to load Qwen OAuth credentials from '{path}': {e}")
+            return await self._read_creds_from_file(path)
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
         self._credentials_cache[path] = creds
@@ -60,15 +67,22 @@ class QwenAuthBase:
             if not force and cached_creds and not self._is_token_expired(cached_creds):
                 return cached_creds
 
-            creds_from_file = await self._load_credentials(path)
+            # If cache is empty, read from file. This is safe because we hold the lock.
+            if path not in self._credentials_cache:
+                await self._read_creds_from_file(path)
+            
+            creds_from_file = self._credentials_cache[path]
             
             lib_logger.info(f"Refreshing Qwen OAuth token for '{Path(path).name}'...")
             refresh_token = creds_from_file.get("refresh_token")
             if not refresh_token:
                 raise ValueError("No refresh_token found in Qwen credentials file.")
 
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
             async with httpx.AsyncClient() as client:
-                response = await client.post(TOKEN_ENDPOINT, data={
+                response = await client.post(TOKEN_ENDPOINT, headers=headers, data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
                     "client_id": CLIENT_ID,
@@ -80,6 +94,10 @@ class QwenAuthBase:
             creds_from_file["refresh_token"] = new_token_data.get("refresh_token", creds_from_file["refresh_token"])
             creds_from_file["expiry_date"] = (time.time() + new_token_data["expires_in"]) * 1000
             
+            # Update timestamp in metadata if it exists
+            if creds_from_file.get("_proxy_metadata"):
+                creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
             await self._save_credentials(path, creds_from_file)
             lib_logger.info(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
             return creds_from_file
@@ -101,7 +119,6 @@ class QwenAuthBase:
             self._refresh_locks[path] = asyncio.Lock()
         return self._refresh_locks[path]
 
-    # [NEW] Add init flow for invalid/expired tokens
     async def initialize_token(self, path: str) -> Dict[str, Any]:
         """Initiates device flow if tokens are missing or invalid."""
         lib_logger.debug(f"Initializing Qwen token at '{path}'...")
@@ -116,35 +133,52 @@ class QwenAuthBase:
 
             if reason:
                 lib_logger.warning(f"Qwen OAuth token for '{Path(path).name}' needs setup: {reason}.")
-                # Based on CLIProxyAPI-main/qwen/qwen_auth.go: Use device code with PKCE
                 code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
                 code_challenge = base64.urlsafe_b64encode(
                     hashlib.sha256(code_verifier.encode('utf-8')).digest()
                 ).decode('utf-8').rstrip('=')
                 
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json"
+                }
                 async with httpx.AsyncClient() as client:
-                    dev_response = await client.post(
-                        "https://chat.qwen.ai/api/v1/oauth2/device/code",
-                        data={
-                            "client_id": CLIENT_ID,
-                            "scope": "openid profile email model.completion",
-                            "code_challenge": code_challenge,
-                            "code_challenge_method": "S256"
-                        }
-                    )
-                    dev_response.raise_for_status()
-                    dev_data = dev_response.json()
+                    request_data = {
+                        "client_id": CLIENT_ID,
+                        "scope": SCOPE,
+                        "code_challenge": code_challenge,
+                        "code_challenge_method": "S256"
+                    }
+                    lib_logger.debug(f"Qwen device code request data: {request_data}")
+                    try:
+                        dev_response = await client.post(
+                            "https://chat.qwen.ai/api/v1/oauth2/device/code",
+                            headers=headers,
+                            data=request_data
+                        )
+                        dev_response.raise_for_status()
+                        dev_data = dev_response.json()
+                        lib_logger.debug(f"Qwen device auth response: {dev_data}")
+                    except httpx.HTTPStatusError as e:
+                        lib_logger.error(f"Qwen device code request failed with status {e.response.status_code}: {e.response.text}")
+                        raise e
                     
                     print(f"\n--- Qwen OAuth Setup Required for {Path(path).name} ---")
-                    print(f"Please visit: {dev_data['verification_uri_complete']}")
-                    print(f"And enter code: {dev_data['user_code']}\n")
+                    print("IMPORTANT: Please copy your email or another unique identifier now.")
+                    print("You will be prompted to enter it after authorizing the application.\n")
+                    print(f"Please visit the following URL to sign in and authorize:")
+                    print(f"{dev_data['verification_uri_complete']}\n")
                     lib_logger.info("Polling for token, please complete authentication in the browser...")
                     
                     token_data = None
                     start_time = time.time()
+                    interval = dev_data.get('interval', 5)  # Use default of 5s if not provided
+
                     while time.time() - start_time < dev_data['expires_in']:
                         poll_response = await client.post(
                             TOKEN_ENDPOINT,
+                            headers=headers,
                             data={
                                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                                 "device_code": dev_data['device_code'],
@@ -156,8 +190,22 @@ class QwenAuthBase:
                             token_data = poll_response.json()
                             lib_logger.info("Successfully received token.")
                             break
-                        lib_logger.debug("Polling for device code authentication...")
-                        await asyncio.sleep(dev_data['interval'])
+                        elif poll_response.status_code == 400:
+                            poll_data = poll_response.json()
+                            error_type = poll_data.get("error")
+                            if error_type == "authorization_pending":
+                                lib_logger.debug(f"Polling status: {error_type}, waiting {interval}s")
+                            elif error_type == "slow_down":
+                                interval = int(interval * 1.5)
+                                if interval > 10:
+                                    interval = 10
+                                lib_logger.debug(f"Polling status: {error_type}, waiting {interval}s")
+                            else:
+                                raise ValueError(f"Token polling failed: {poll_data.get('error_description', error_type)}")
+                        else:
+                            poll_response.raise_for_status()
+                        
+                        await asyncio.sleep(interval)
                     
                     if not token_data:
                         raise TimeoutError("Qwen device flow timed out.")
@@ -168,6 +216,19 @@ class QwenAuthBase:
                         "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
                         "resource_url": token_data.get("resource_url")
                     })
+
+                    # Prompt for user identifier and create metadata object if needed
+                    if not creds.get("_proxy_metadata", {}).get("email"):
+                        try:
+                            email = input(f"\n[Qwen] Please enter your email or a unique identifier for '{Path(path).name}': ").strip()
+                            creds["_proxy_metadata"] = {
+                                "email": email,
+                                "last_check_timestamp": time.time()
+                            }
+                        except (EOFError, KeyboardInterrupt):
+                            lib_logger.warning("\n[Qwen] No identifier provided. Deduplication will not be possible.")
+                            creds["_proxy_metadata"] = {"email": None, "last_check_timestamp": time.time()}
+                    
                     await self._save_credentials(path, creds)
                     lib_logger.info(f"Qwen OAuth initialized successfully for '{Path(path).name}'.")
                 return creds
@@ -182,3 +243,27 @@ class QwenAuthBase:
         if self._is_token_expired(creds):
             creds = await self._refresh_token(credential_path)
         return {"Authorization": f"Bearer {creds['access_token']}"}
+
+    async def get_user_info(self, path: str) -> Dict[str, Any]:
+        """
+        Retrieves user info from the _proxy_metadata in the credential file.
+        """
+        try:
+            await self.initialize_token(path)
+            creds = await self._load_credentials(path)
+            
+            metadata = creds.get("_proxy_metadata", {"email": None})
+            email = metadata.get("email")
+
+            if not email:
+                lib_logger.warning(f"No email found in _proxy_metadata for '{Path(path).name}'.")
+
+            # Update timestamp on check and save
+            if "_proxy_metadata" in creds:
+                creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+                await self._save_credentials(path, creds)
+
+            return {"email": email}
+        except Exception as e:
+            lib_logger.error(f"Failed to get Qwen user info from credentials: {e}")
+            return {"email": None}
