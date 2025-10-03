@@ -45,6 +45,7 @@ parser = argparse.ArgumentParser(description="API Key Proxy Server")
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
 parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
 parser.add_argument("--enable-request-logging", action="store_true", help="Enable request logging.")
+parser.add_argument("--add-credential", action="store_true", help="Launch the interactive tool to add a new OAuth credential.")
 args, _ = parser.parse_known_args()
 
 
@@ -54,6 +55,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from rotator_library import RotatingClient, PROVIDER_PLUGINS
 from rotator_library.credential_manager import CredentialManager
 from rotator_library.background_refresher import BackgroundRefresher
+from rotator_library.credential_tool import run_credential_tool
 from proxy_app.request_logger import log_request_to_console
 from proxy_app.batch_manager import EmbeddingBatcher
 from proxy_app.detailed_logger import DetailedLogger
@@ -603,5 +605,8 @@ async def token_count(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
+    if args.add_credential:
+        run_credential_tool()
+    else:
+        import uvicorn
+        uvicorn.run(app, host=args.host, port=args.port)
