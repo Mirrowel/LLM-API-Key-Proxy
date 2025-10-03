@@ -14,7 +14,7 @@ import httpx
 
 lib_logger = logging.getLogger('rotator_library')
 
-CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
+CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56" ##https://api.kilocode.ai/extension-config.json
 TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token"
 REFRESH_EXPIRY_BUFFER_SECONDS = 300
 
