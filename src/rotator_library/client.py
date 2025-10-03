@@ -97,42 +97,62 @@ class RotatingClient:
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
         Checks if a model should be ignored based on the ignore list.
-        Supports exact and partial matching.
+        Supports exact and partial matching for both full model IDs and model names.
         """
-        if provider not in self.ignore_models:
+        model_provider = model_id.split('/')[0]
+        if model_provider not in self.ignore_models:
             return False
 
-        ignore_list = self.ignore_models[provider]
+        ignore_list = self.ignore_models[model_provider]
         if ignore_list == ['*']:
             return True
-        for ignored_model in ignore_list:
-            if ignored_model.endswith('*'):
-                # Partial match
-                if ignored_model[:-1] in model_id:
+        
+        try:
+            # This is the model name as the provider sees it (e.g., "gpt-4" or "google/gemma-7b")
+            provider_model_name = model_id.split('/', 1)[1]
+        except IndexError:
+            provider_model_name = model_id
+
+        for ignored_pattern in ignore_list:
+            if ignored_pattern.endswith('*'):
+                match_pattern = ignored_pattern[:-1]
+                # Match wildcard against the provider's model name
+                if provider_model_name.startswith(match_pattern):
                     return True
             else:
-                # Exact match (ignoring provider prefix)
-                if model_id.endswith(ignored_model):
+                # Exact match against the full proxy ID OR the provider's model name
+                if model_id == ignored_pattern or provider_model_name == ignored_pattern:
                     return True
         return False
 
     def _is_model_whitelisted(self, provider: str, model_id: str) -> bool:
         """
         Checks if a model is explicitly whitelisted.
-        Supports exact and partial matching.
+        Supports exact and partial matching for both full model IDs and model names.
         """
-        if provider not in self.whitelist_models:
+        model_provider = model_id.split('/')[0]
+        if model_provider not in self.whitelist_models:
             return False
 
-        whitelist = self.whitelist_models[provider]
-        for whitelisted_model in whitelist:
-            if whitelisted_model == '*':
+        whitelist = self.whitelist_models[model_provider]
+        for whitelisted_pattern in whitelist:
+            if whitelisted_pattern == '*':
                 return True
-            if whitelisted_model.endswith('*'):
-                if whitelisted_model[:-1] in model_id:
+            
+            try:
+                # This is the model name as the provider sees it (e.g., "gpt-4" or "google/gemma-7b")
+                provider_model_name = model_id.split('/', 1)[1]
+            except IndexError:
+                provider_model_name = model_id
+
+            if whitelisted_pattern.endswith('*'):
+                match_pattern = whitelisted_pattern[:-1]
+                # Match wildcard against the provider's model name
+                if provider_model_name.startswith(match_pattern):
                     return True
             else:
-                if model_id.endswith(whitelisted_model):
+                # Exact match against the full proxy ID OR the provider's model name
+                if model_id == whitelisted_pattern or provider_model_name == whitelisted_pattern:
                     return True
         return False
 
@@ -918,21 +938,27 @@ class RotatingClient:
             lib_logger.debug(f"Returning cached models for provider: {provider}")
             return self._model_list_cache[provider]
 
-        keys_for_provider = self.api_keys.get(provider)
-        if not keys_for_provider:
-            lib_logger.warning(f"No API key for provider: {provider}")
+        credentials_for_provider = self.all_credentials.get(provider)
+        if not credentials_for_provider:
+            lib_logger.warning(f"No credentials for provider: {provider}")
             return []
 
-        # Create a copy and shuffle it to randomize the starting key
-        shuffled_keys = list(keys_for_provider)
-        random.shuffle(shuffled_keys)
+        # Create a copy and shuffle it to randomize the starting credential
+        shuffled_credentials = list(credentials_for_provider)
+        random.shuffle(shuffled_credentials)
 
         provider_instance = self._get_provider_instance(provider)
         if provider_instance:
-            for api_key in shuffled_keys:
+            # For providers with hardcoded models (like gemini_cli), we only need to call once.
+            # For others, we might need to try multiple keys if one is invalid.
+            # The current logic of iterating works for both, as the credential is not
+            # always used in get_models.
+            for credential in shuffled_credentials:
                 try:
-                    lib_logger.debug(f"Attempting to get models for {provider} with credential ...{api_key[-6:]}")
-                    models = await provider_instance.get_models(api_key, self.http_client)
+                    # Display last 6 chars for API keys, or the filename for OAuth paths
+                    cred_display = credential[-6:] if not os.path.isfile(credential) else os.path.basename(credential)
+                    lib_logger.debug(f"Attempting to get models for {provider} with credential ...{cred_display}")
+                    models = await provider_instance.get_models(credential, self.http_client)
                     lib_logger.info(f"Got {len(models)} models for provider: {provider}")
 
                     # Whitelist and blacklist logic
@@ -955,7 +981,8 @@ class RotatingClient:
                     return final_models
                 except Exception as e:
                     classified_error = classify_error(e)
-                    lib_logger.debug(f"Failed to get models for provider {provider} with credential ...{api_key[-6:]}: {classified_error.error_type}. Trying next credential.")
+                    cred_display = credential[-6:] if not os.path.isfile(credential) else os.path.basename(credential)
+                    lib_logger.debug(f"Failed to get models for provider {provider} with credential ...{cred_display}: {classified_error.error_type}. Trying next credential.")
                     continue # Try the next credential
 
         lib_logger.error(f"Failed to get models for provider {provider} after trying all credentials.")
@@ -964,11 +991,13 @@ class RotatingClient:
     async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:
         """Returns a list of all available models, either grouped by provider or as a flat list."""
         lib_logger.info("Getting all available models...")
-        tasks = [self.get_available_models(provider) for provider in self.api_keys.keys()]
+        
+        all_providers = list(self.all_credentials.keys())
+        tasks = [self.get_available_models(provider) for provider in all_providers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_provider_models = {}
-        for provider, result in zip(self.api_keys.keys(), results):
+        for provider, result in zip(all_providers, results):
             if isinstance(result, Exception):
                 lib_logger.error(f"Failed to get models for provider {provider}: {result}")
                 all_provider_models[provider] = []

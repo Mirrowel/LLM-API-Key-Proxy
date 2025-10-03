@@ -21,7 +21,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         return True # We use custom logic to handle 401 retries and stream parsing
 
     # [NEW] get_models implementation
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+    async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """Returns a hardcoded list of known compatible Qwen models for the OpenAI-compatible API."""
         return [f"qwen_code/{model_id}" for model_id in HARDCODED_MODELS]
 

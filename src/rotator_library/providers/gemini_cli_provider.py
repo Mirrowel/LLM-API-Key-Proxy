@@ -15,6 +15,13 @@ lib_logger = logging.getLogger('rotator_library')
 
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
+# [NEW] Hardcoded model list based on Kilo example
+HARDCODED_MODELS = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite"
+]
+
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def __init__(self):
         super().__init__()
@@ -197,14 +204,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             chunks = [chunk async for chunk in response_gen]
             return litellm.utils.stream_to_completion_response(chunks)
 
-    # [NEW] Hardcoded model list based on Kilo example
-    HARDCODED_MODELS = [
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite"
-    ]
     # Use the shared GeminiAuthBase for auth logic
     # get_models is not applicable for this custom provider
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+    async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """Returns a hardcoded list of known compatible Gemini CLI models."""
         return [f"gemini_cli/{model_id}" for model_id in HARDCODED_MODELS]
