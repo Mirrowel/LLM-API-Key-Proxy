@@ -217,3 +217,15 @@ class GeminiAuthBase:
         if self._is_token_expired(creds):
             creds = await self._refresh_token(credential_path, creds)
         return {"Authorization": f"Bearer {creds['access_token']}"}
+
+    async def get_user_info(self, credential_path: str) -> Dict[str, Any]:
+        """Fetches user info from Google's userinfo endpoint."""
+        creds = await self._load_credentials(credential_path)
+        if self._is_token_expired(creds):
+            creds = await self._refresh_token(credential_path, creds)
+        
+        headers = {"Authorization": f"Bearer {creds['access_token']}"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get("https://www.googleapis.com/oauth2/v1/userinfo", headers=headers)
+            response.raise_for_status()
+            return response.json()

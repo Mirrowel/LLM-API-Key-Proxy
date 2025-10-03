@@ -127,28 +127,14 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
 
-# Split API keys and OAuth config loading
+# Discover API keys from environment variables
 api_keys = {}
-oauth_credentials = {}
 for key, value in os.environ.items():
-    if key == "PROXY_API_KEY":
-        continue
-    
-    # Handles GEMINI_CLI_OAUTH_1, QWEN_CODE_OAUTH_1, etc.
-    if "_OAUTH_" in key:
-        provider = key.split("_OAUTH_")[0].lower()
-        if provider not in oauth_credentials:
-            oauth_credentials[provider] = []
-        oauth_credentials[provider].append(value)
-    # Handles GEMINI_API_KEY_1, etc.
-    elif "_API_KEY" in key:
+    if "_API_KEY" in key and key != "PROXY_API_KEY":
         provider = key.split("_API_KEY")[0].lower()
         if provider not in api_keys:
             api_keys[provider] = []
         api_keys[provider].append(value)
-
-if not api_keys and not oauth_credentials:
-    raise ValueError("No provider API keys or OAuth credentials found in environment variables.")
 
 # Load model ignore lists from environment variables
 ignore_models = {}
@@ -166,30 +152,48 @@ async def lifespan(app: FastAPI):
     # [MODIFIED] Perform skippable OAuth initialization at startup
     skip_oauth_init = os.getenv("SKIP_OAUTH_INIT_CHECK", "false").lower() == "true"
 
-    if not skip_oauth_init:
-        logging.info("Performing OAuth credential validation at startup...")
-        temp_cred_manager = CredentialManager(oauth_credentials)
-        discovered_creds = temp_cred_manager.discover_and_prepare()
-        
-        init_tasks = []
-        if discovered_creds:
-            logging.info(f"Found OAuth credentials for {len(discovered_creds)} provider(s). Validating tokens...")
-            for provider, paths in discovered_creds.items():
-                provider_plugin_class = PROVIDER_PLUGINS.get(provider)
-                if provider_plugin_class and hasattr(provider_plugin_class(), 'initialize_token'):
-                    provider_instance = provider_plugin_class()
-                    for path in paths:
-                        init_tasks.append((provider, path, provider_instance.initialize_token(path)))
-        
-        if init_tasks:
-            logging.info(f"Attempting to initialize/validate {len(init_tasks)} OAuth token(s)...")
-            # Run sequentially to allow for user input without overlap
-            for provider, path, task in init_tasks:
+    # The CredentialManager now handles all discovery, including .env overrides.
+    # We pass all environment variables to it for this purpose.
+    cred_manager = CredentialManager(os.environ)
+    oauth_credentials = cred_manager.discover_and_prepare()
+
+    if not api_keys and not oauth_credentials:
+        raise ValueError("No provider API keys or OAuth credentials found.")
+
+    if not skip_oauth_init and oauth_credentials:
+        logging.info("Validating OAuth credentials and checking for duplicates...")
+        processed_emails = {}
+        for provider, paths in oauth_credentials.items():
+            provider_plugin_class = PROVIDER_PLUGINS.get(provider)
+            if not provider_plugin_class: continue
+            
+            provider_instance = provider_plugin_class()
+            for path in paths:
                 try:
-                    await task
+                    await provider_instance.initialize_token(path)
+                    if hasattr(provider_instance, 'get_user_info'):
+                        with open(path, 'r+') as f:
+                            data = json.load(f)
+                            metadata = data.get("_proxy_metadata", {})
+                            last_check = metadata.get("last_check_timestamp", 0)
+                            if time.time() - last_check > 86400:
+                                user_info = await provider_instance.get_user_info(path)
+                                metadata["email"] = user_info.get("email")
+                                metadata["last_check_timestamp"] = time.time()
+                                data["_proxy_metadata"] = metadata
+                                f.seek(0)
+                                json.dump(data, f, indent=2)
+                                f.truncate()
+                            
+                            email = metadata.get("email")
+                            if email:
+                                if email in processed_emails:
+                                    logging.warning(f"Duplicate credential for user '{email}' found at '{Path(path).name}'. Original at '{Path(processed_emails[email]).name}'.")
+                                else:
+                                    processed_emails[email] = path
                 except Exception as e:
-                    logging.error(f"Failed to initialize OAuth token for {provider} at '{path}': {e}")
-        logging.info("OAuth credential validation complete.")
+                    logging.error(f"Failed to process OAuth token for {provider} at '{path}': {e}")
+        logging.info("OAuth credential processing complete.")
 
     # [NEW] Load provider-specific params
     litellm_provider_params = {
