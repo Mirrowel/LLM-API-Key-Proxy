@@ -5,10 +5,11 @@ import httpx
 import logging
 import time
 import asyncio
-from typing import List, Dict, Any, AsyncGenerator, Union, Optional
+from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 import litellm
+from litellm.exceptions import RateLimitError
 import os
 from pathlib import Path
 
@@ -21,7 +22,8 @@ HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-lite-preview-09-2025"
 ]
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
@@ -114,7 +116,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def has_custom_logic(self) -> bool:
         return True
 
-    def _transform_messages(self, messages: List[Dict[str, Any]]) -> (Optional[Dict[str, Any]], List[Dict[str, Any]]):
+    def _transform_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         system_instruction = None
         gemini_contents = []
         
@@ -361,6 +363,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 creds = await self._load_credentials(credential_path)
                 await self._refresh_token(credential_path, creds, force=True)
                 response_gen = await do_call()
+            elif e.response.status_code == 429:
+                raise RateLimitError(
+                    message=f"Gemini CLI rate limit exceeded: {e.response.text}",
+                    llm_provider="gemini_cli",
+                    response=e.response
+                )
             else:
                 raise e
 
