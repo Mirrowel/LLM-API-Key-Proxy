@@ -122,6 +122,12 @@ class GeminiAuthBase:
                 reason = "token is expired"
 
             if reason:
+                if reason == "token is expired" and creds.get("refresh_token"):
+                    try:
+                        return await self._refresh_token(path, creds)
+                    except Exception as e:
+                        lib_logger.warning(f"Automatic token refresh for '{file_name}' failed: {e}. Proceeding to interactive login.")
+
                 lib_logger.warning(f"Gemini OAuth token for '{file_name}' needs setup: {reason}.")
                 auth_code_future = asyncio.get_event_loop().create_future()
                 server = None

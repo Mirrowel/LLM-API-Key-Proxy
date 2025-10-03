@@ -163,42 +163,98 @@ async def lifespan(app: FastAPI):
         raise ValueError("No provider API keys or OAuth credentials found.")
 
     if not skip_oauth_init and oauth_credentials:
-        logging.info("Validating OAuth credentials and checking for duplicates...")
-        processed_emails = {} # email -> {provider: path}
+        logging.info("Starting OAuth credential validation and deduplication...")
+        processed_emails = {}  # email -> {provider: path}
+        credentials_to_initialize = {} # provider -> [paths]
+        final_oauth_credentials = {}
+
+        # --- Pass 1: Pre-initialization Scan & Deduplication ---
+        #logging.info("Pass 1: Scanning for existing metadata to find duplicates...")
         for provider, paths in oauth_credentials.items():
+            if provider not in credentials_to_initialize:
+                credentials_to_initialize[provider] = []
+            for path in paths:
+                try:
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+                    metadata = data.get("_proxy_metadata", {})
+                    email = metadata.get("email")
+
+                    if email:
+                        if email not in processed_emails:
+                            processed_emails[email] = {}
+                        
+                        if provider in processed_emails[email]:
+                            original_path = processed_emails[email][provider]
+                            logging.warning(f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping.")
+                            continue
+                        else:
+                            processed_emails[email][provider] = path
+                    
+                    credentials_to_initialize[provider].append(path)
+
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    logging.warning(f"Could not pre-read metadata from '{path}': {e}. Will process during initialization.")
+                    credentials_to_initialize[provider].append(path)
+        
+        # --- Pass 2: Initialization of Filtered Credentials & Final Check ---
+        #logging.info("Pass 2: Initializing unique credentials and performing final check...")
+        for provider, paths in credentials_to_initialize.items():
+            if not paths: continue
+
             provider_plugin_class = PROVIDER_PLUGINS.get(provider)
             if not provider_plugin_class: continue
             
             provider_instance = provider_plugin_class()
+            
             for path in paths:
                 try:
                     await provider_instance.initialize_token(path)
-                    if hasattr(provider_instance, 'get_user_info'):
+
+                    if not hasattr(provider_instance, 'get_user_info'):
+                        if provider not in final_oauth_credentials:
+                            final_oauth_credentials[provider] = []
+                        final_oauth_credentials[provider].append(path)
+                        continue
+
+                    user_info = await provider_instance.get_user_info(path)
+                    email = user_info.get("email")
+
+                    if not email:
+                        logging.warning(f"Could not retrieve email for '{path}'. Treating as unique.")
+                        if provider not in final_oauth_credentials:
+                            final_oauth_credentials[provider] = []
+                        final_oauth_credentials[provider].append(path)
+                        continue
+
+                    if email not in processed_emails:
+                        processed_emails[email] = {}
+                    
+                    if provider in processed_emails[email] and processed_emails[email][provider] != path:
+                        original_path = processed_emails[email][provider]
+                        logging.warning(f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping.")
+                        continue
+                    else:
+                        processed_emails[email][provider] = path
+                        if provider not in final_oauth_credentials:
+                            final_oauth_credentials[provider] = []
+                        final_oauth_credentials[provider].append(path)
+
                         with open(path, 'r+') as f:
                             data = json.load(f)
                             metadata = data.get("_proxy_metadata", {})
-                            last_check = metadata.get("last_check_timestamp", 0)
-                            if time.time() - last_check > 86400:
-                                user_info = await provider_instance.get_user_info(path)
-                                metadata["email"] = user_info.get("email")
-                                metadata["last_check_timestamp"] = time.time()
-                                data["_proxy_metadata"] = metadata
-                                f.seek(0)
-                                json.dump(data, f, indent=2)
-                                f.truncate()
-                            
-                            email = metadata.get("email")
-                            if email:
-                                if email not in processed_emails:
-                                    processed_emails[email] = {}
-                                if provider in processed_emails[email]:
-                                    original_path = processed_emails[email][provider]
-                                    logging.warning(f"Duplicate credential for user '{email}' on provider '{provider}' found at '{Path(path).name}'. Original at '{Path(original_path).name}'.")
-                                else:
-                                    processed_emails[email][provider] = path
+                            metadata["email"] = email
+                            metadata["last_check_timestamp"] = time.time()
+                            data["_proxy_metadata"] = metadata
+                            f.seek(0)
+                            json.dump(data, f, indent=2)
+                            f.truncate()
+
                 except Exception as e:
                     logging.error(f"Failed to process OAuth token for {provider} at '{path}': {e}")
+
         logging.info("OAuth credential processing complete.")
+        oauth_credentials = final_oauth_credentials
 
     # [NEW] Load provider-specific params
     litellm_provider_params = {

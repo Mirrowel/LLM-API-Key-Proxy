@@ -56,9 +56,10 @@ class CredentialManager:
                     discovered_paths.add(path)
             
             # 2. If no overrides are provided via .env, scan the default directory
-            if not discovered_paths and default_dir.exists():
-                for json_file in default_dir.glob('*.json'):
-                    discovered_paths.add(json_file)
+            # [MODIFIED] This logic is now disabled to prefer local-first credential management.
+            # if not discovered_paths and default_dir.exists():
+            #     for json_file in default_dir.glob('*.json'):
+            #         discovered_paths.add(json_file)
             
             if not discovered_paths:
                 lib_logger.debug(f"No credential files found for provider: {provider}")

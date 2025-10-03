@@ -141,6 +141,12 @@ class QwenAuthBase:
                 reason = "token is expired"
 
             if reason:
+                if reason == "token is expired" and creds.get("refresh_token"):
+                    try:
+                        return await self._refresh_token(path)
+                    except Exception as e:
+                        lib_logger.warning(f"Automatic token refresh for '{file_name}' failed: {e}. Proceeding to interactive login.")
+                
                 lib_logger.warning(f"Qwen OAuth token for '{file_name}' needs setup: {reason}.")
                 code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
                 code_challenge = base64.urlsafe_b64encode(
