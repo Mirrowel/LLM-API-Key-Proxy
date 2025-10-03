@@ -4,6 +4,7 @@ import json
 import httpx
 import logging
 import time
+import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
@@ -31,7 +32,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
-        """Discovers the Google Cloud Project ID, with caching."""
+        """Discovers the Google Cloud Project ID, with caching and onboarding for new accounts."""
         if credential_path in self.project_id_cache:
             return self.project_id_cache[credential_path]
 
@@ -43,47 +44,73 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
         
-        # 1. Try Gemini-specific discovery endpoint
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist", headers=headers, json={"metadata": {"pluginType": "GEMINI"}}, timeout=20)
+        async with httpx.AsyncClient() as client:
+            # 1. Try discovery endpoint with onboarding logic from Kilo example
+            try:
+                initial_project_id = "default"
+                client_metadata = {
+                    "ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI", "duetProject": initial_project_id,
+                }
+                load_request = {"cloudaicompanionProject": initial_project_id, "metadata": client_metadata}
+                
+                response = await client.post(f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist", headers=headers, json=load_request, timeout=20)
                 response.raise_for_status()
                 data = response.json()
+
                 if data.get('cloudaicompanionProject'):
                     project_id = data['cloudaicompanionProject']
                     lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
                     self.project_id_cache[credential_path] = project_id
                     return project_id
-        except httpx.RequestError as e:
-            lib_logger.warning(f"Gemini loadCodeAssist failed, falling back to project listing: {e}")
+                
+                # 2. If no project ID, trigger onboarding
+                lib_logger.info("No existing Gemini project found, attempting to onboard user...")
+                tier_id = next((t.get('id', 'free-tier') for t in data.get('allowedTiers', []) if t.get('isDefault')), 'free-tier')
+                onboard_request = {"tierId": tier_id, "cloudaicompanionProject": initial_project_id, "metadata": client_metadata}
 
-        # 2. Fallback to listing all available GCP projects
+                lro_response = await client.post(f"{CODE_ASSIST_ENDPOINT}:onboardUser", headers=headers, json=onboard_request, timeout=30)
+                lro_response.raise_for_status()
+                lro_data = lro_response.json()
+
+                for i in range(30): # Poll for up to 60 seconds
+                    if lro_data.get('done'): break
+                    await asyncio.sleep(2)
+                    lib_logger.debug(f"Polling onboarding status... (Attempt {i+1}/30)")
+                    lro_response = await client.post(f"{CODE_ASSIST_ENDPOINT}:onboardUser", headers=headers, json=onboard_request, timeout=30)
+                    lro_response.raise_for_status()
+                    lro_data = lro_response.json()
+                
+                if not lro_data.get('done'): raise ValueError("Onboarding process timed out.")
+
+                project_id = lro_data.get('response', {}).get('cloudaicompanionProject', {}).get('id')
+                if not project_id: raise ValueError("Onboarding completed, but no project ID was returned.")
+                
+                lib_logger.info(f"Successfully onboarded user and discovered project ID: {project_id}")
+                self.project_id_cache[credential_path] = project_id
+                return project_id
+
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                lib_logger.warning(f"Gemini onboarding/discovery failed: {e}. Falling back to project listing.")
+
+        # 3. Fallback to listing all available GCP projects (last resort)
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers, timeout=20)
                 response.raise_for_status()
                 projects = response.json().get('projects', [])
-                active_projects = [p for p in projects if p.get('lifecycleState') == 'ACTIVE']
-                if active_projects:
+                if active_projects := [p for p in projects if p.get('lifecycleState') == 'ACTIVE']:
                     project_id = active_projects[0]['projectId']
                     lib_logger.info(f"Discovered Gemini project ID from active projects list: {project_id}")
                     self.project_id_cache[credential_path] = project_id
                     return project_id
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
-                lib_logger.warning(
-                    "Failed to list GCP projects due to a 403 Forbidden error. "
-                    "The OAuth token may lack the 'cloud-platform' scope. "
-                    "Please set GEMINI_CLI_PROJECT_ID in your .env file."
-                )
-            else:
-                lib_logger.error(f"Failed to list GCP projects: {e}")
+            if e.response.status_code == 403: lib_logger.warning("Failed to list GCP projects due to a 403 Forbidden error.")
+            else: lib_logger.error(f"Failed to list GCP projects: {e}")
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to list GCP projects: {e}")
 
-        raise ValueError(
-            "Could not auto-discover Gemini project ID. Please set GEMINI_CLI_PROJECT_ID in your .env file."
-        )
+        raise ValueError("Could not auto-discover Gemini project ID. Onboarding may have failed or the account lacks permissions. Please set GEMINI_CLI_PROJECT_ID in your .env file.")
     def has_custom_logic(self) -> bool:
         return True
 
