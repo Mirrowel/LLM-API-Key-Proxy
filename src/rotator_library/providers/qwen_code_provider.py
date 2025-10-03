@@ -1,16 +1,17 @@
 # src/rotator_library/providers/qwen_code_provider.py
 
-import litellm.exceptions as litellm_exc
+import json
+import time
 import httpx
 import logging
-from typing import Union, AsyncGenerator, List
+from typing import Union, AsyncGenerator, List, Dict, Any
 from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 import litellm
+from litellm.exceptions import RateLimitError, AuthenticationError
 
 lib_logger = logging.getLogger('rotator_library')
 
-# [NEW] Hardcoded model list based on Kilo example
 HARDCODED_MODELS = [
     "qwen3-coder-plus",
     "qwen3-coder-flash"
@@ -23,73 +24,132 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         super().__init__()
 
     def has_custom_logic(self) -> bool:
-        return True # We use custom logic to handle 401 retries and stream parsing
+        return True
 
-    # [NEW] get_models implementation
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
-        """Returns a hardcoded list of known compatible Qwen models for the OpenAI-compatible API."""
+        """Returns a hardcoded list of known compatible Qwen models."""
         return [f"qwen_code/{model_id}" for model_id in HARDCODED_MODELS]
 
-    async def _stream_parser(self, stream: AsyncGenerator, model_id: str) -> AsyncGenerator:
-        """Parses the stream from litellm to handle Qwen's <think> tags."""
-        async for chunk in stream:
-            content = chunk.choices[0].delta.content
-            if content and ("<think>" in content or "</think>" in content):
-                parts = content.replace("<think>", "||THINK||").replace("</think>", "||/THINK||").split("||")
-                for part in parts:
-                    # [NEW] Check for provider-specific errors in content
-                    if "slow_down" in part.lower():
-                        lib_logger.warning("Qwen 'slow_down' detected in response content. Treating as rate limit.")
-                        raise litellm_exc.RateLimitError(
-                            message="Qwen slow_down error detected.", llm_provider="qwen_code"
-                        )
-                    if not part: continue
-                    new_chunk = chunk.copy()
-                    if part.startswith("THINK||"):
-                        new_chunk.choices[0].delta.reasoning_content = part.replace("THINK||", "")
-                        new_chunk.choices[0].delta.content = None
-                    elif part.startswith("/THINK||"):
-                        continue # Ignore closing tag
-                    else:
-                        new_chunk.choices[0].delta.content = part
-                        new_chunk.choices[0].delta.reasoning_content = None
-                    yield new_chunk
-            else:
-                yield chunk
+    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
+        """Converts a raw Qwen SSE chunk to an OpenAI-compatible chunk."""
+        if not isinstance(chunk, dict):
+            return
+
+        # Handle usage data
+        if usage_data := chunk.get("usage"):
+            yield {
+                "choices": [], "model": model_id, "object": "chat.completion.chunk",
+                "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time()),
+                "usage": {
+                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                }
+            }
+            return
+
+        # Handle content data
+        choices = chunk.get("choices", [])
+        if not choices:
+            return
+
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+
+        # Handle <think> tags for reasoning content
+        content = delta.get("content")
+        if content and ("<think>" in content or "</think>" in content):
+            parts = content.replace("<think>", "||THINK||").replace("</think>", "||/THINK||").split("||")
+            for part in parts:
+                if not part: continue
+                
+                new_delta = {}
+                if part.startswith("THINK||"):
+                    new_delta['reasoning_content'] = part.replace("THINK||", "")
+                elif part.startswith("/THINK||"):
+                    continue
+                else:
+                    new_delta['content'] = part
+                
+                yield {
+                    "choices": [{"index": 0, "delta": new_delta, "finish_reason": None}],
+                    "model": model_id, "object": "chat.completion.chunk",
+                    "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
+                }
+        else:
+            # Standard content chunk
+            yield {
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                "model": model_id, "object": "chat.completion.chunk",
+                "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
+            }
 
     async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         credential_path = kwargs.pop("credential_identifier")
         model = kwargs["model"]
-        
+
         async def do_call():
-            api_base, access_token = self.get_api_details(credential_path)
-            response = await litellm.acompletion(
-                # [NEW] Add timeout and retry params if needed, but since rotation handles retries, this is optional
-                **kwargs, api_key=access_token, api_base=api_base
-            )
-            # [NEW] Post-call check for specific finish reasons or errors
-            if not kwargs.get("stream") and response.choices[0].finish_reason == "slow_down":
-                lib_logger.warning("Qwen 'slow_down' finish reason detected. Treating as rate limit.")
-                raise litellm_exc.RateLimitError(
-                    message="Qwen slow_down finish reason.", llm_provider="qwen_code"
-                )
-            return response
-        
+            api_base, access_token = await self.get_api_details(credential_path)
+            
+            # Prepare payload
+            payload = kwargs.copy()
+            payload.pop("litellm_params", None) # Clean up internal params
+            
+            # Per Go example, inject dummy tool to prevent stream corruption
+            if not payload.get("tools"):
+                payload["tools"] = [{"type": "function", "function": {"name": "do_not_call_me", "description": "Do not call this tool under any circumstances.", "parameters": {"type": "object", "properties": {}}}}]
+
+            # Ensure usage is included in stream
+            payload["stream_options"] = {"include_usage": True}
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if kwargs.get("stream") else "application/json",
+                "User-Agent": "google-api-nodejs-client/9.15.1",
+                "X-Goog-Api-Client": "gl-node/22.17.0",
+                "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            }
+            
+            url = f"{api_base.rstrip('/')}/chat/completions"
+            lib_logger.debug(f"Qwen Code Request URL: {url}")
+            lib_logger.debug(f"Qwen Code Request Payload: {json.dumps(payload, indent=2)}")
+
+            async def stream_handler():
+                async with client.stream("POST", url, headers=headers, json=payload, timeout=600) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if line.startswith('data: '):
+                            data_str = line[6:]
+                            if data_str == "[DONE]": break
+                            try:
+                                chunk = json.loads(data_str)
+                                for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                    yield litellm.ModelResponse(**openai_chunk)
+                            except json.JSONDecodeError:
+                                lib_logger.warning(f"Could not decode JSON from Qwen Code: {line}")
+            
+            return stream_handler()
+
         try:
-            response = await do_call()
-        except litellm.AuthenticationError as e:
-            if "401" in str(e):
+            response_gen = await do_call()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
                 lib_logger.warning("Qwen Code returned 401. Forcing token refresh and retrying once.")
                 await self._refresh_token(credential_path, force=True)
-                response = await do_call()
-            # [NEW] Catch provider-specific exceptions
-            elif "slow_down" in str(e).lower():
-                raise litellm_exc.RateLimitError(
-                    message="Qwen slow_down error in exception.", llm_provider="qwen_code"
+                response_gen = await do_call()
+            elif e.response.status_code == 429 or "slow_down" in e.response.text.lower():
+                raise RateLimitError(
+                    message=f"Qwen Code rate limit exceeded: {e.response.text}",
+                    llm_provider="qwen_code",
+                    response=e.response
                 )
             else:
                 raise e
 
         if kwargs.get("stream"):
-            return self._stream_parser(response, model)
-        return response
+            return response_gen
+        else:
+            chunks = [chunk async for chunk in response_gen]
+            return litellm.utils.stream_to_completion_response(chunks)

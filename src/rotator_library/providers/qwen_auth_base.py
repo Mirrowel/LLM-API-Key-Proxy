@@ -112,7 +112,7 @@ class QwenAuthBase:
 
     def get_api_details(self, credential_path: str) -> Tuple[str, str]:
         creds = self._credentials_cache[credential_path]
-        base_url = creds.get("resource_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        base_url = creds.get("resource_url", "https://portal.qwen.ai/v1")
         if not base_url.startswith("http"):
             base_url = f"https://{base_url}"
         return base_url, creds["access_token"]
