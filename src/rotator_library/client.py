@@ -423,19 +423,11 @@ class RotatingClient:
                     # The main retry loop here is for key rotation on other errors.
                     response = await provider_plugin.acompletion(self.http_client, **litellm_kwargs)
                     
-                    # For non-streaming, success is immediate
-                    if not kwargs.get("stream"):
-                        await self.usage_manager.record_success(current_cred, model, response)
-                        await self.usage_manager.release_key(current_cred, model)
-                        key_acquired = False
-                        return response
-                    else:
-                        # For streaming, wrap the response and return
-                        key_acquired = False
-                        stream_generator = self._safe_streaming_wrapper(response, current_cred, model, request)
-                        async for chunk in stream_generator:
-                            yield chunk
-                        return
+                    # For non-streaming, success is immediate, and this function only handles non-streaming.
+                    await self.usage_manager.record_success(current_cred, model, response)
+                    await self.usage_manager.release_key(current_cred, model)
+                    key_acquired = False
+                    return response
 
                 else: # This is the standard API Key / litellm-handled provider logic
                     is_oauth = provider in self.oauth_providers

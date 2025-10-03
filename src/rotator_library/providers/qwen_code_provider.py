@@ -3,7 +3,7 @@
 import litellm.exceptions as litellm_exc
 import httpx
 import logging
-from typing import Union, AsyncGenerator
+from typing import Union, AsyncGenerator, List
 from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 import litellm
