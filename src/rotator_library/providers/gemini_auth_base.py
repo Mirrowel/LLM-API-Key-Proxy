@@ -1,6 +1,7 @@
 # src/rotator_library/providers/gemini_auth_base.py
 
 import subprocess
+import webbrowser
 from typing import Optional
 import json
 import time
@@ -119,21 +120,70 @@ class GeminiAuthBase:
                 lib_logger.warning(f"Gemini OAuth token for '{Path(path).name}' needs setup: {reason}.")
                 # Use subprocess to run gemini-cli setup or simulate web flow
                 # Based on CLIProxyAPI-main/gemini/gemini_auth.go: Use web flow with local server
-                # For simplicity, prompt user to run manual setup or integrate browser flow
-                print("Gemini CLI OAuth setup required. Please visit the authorization URL and paste the code.")
-                # Simulate getTokenFromWeb logic
-                from urllib.parse import urlencode
-                auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
-                    "client_id": CLIENT_ID,
-                    "redirect_uri": "http://localhost:8085/oauth2callback",
-                    "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
-                    "access_type": "offline",
-                    "response_type": "code",
-                    "prompt": "consent"
-                })
-                print(f"\n--- Gemini OAuth Setup Required for {Path(path).name} ---")
-                print(f"Please open this URL in your browser:\n\n{auth_url}\n")
-                auth_code = input("After authorizing, paste the 'code' from the redirected URL here: ")
+                # Automated web flow for OAuth
+                auth_code_future = asyncio.get_event_loop().create_future()
+                server = None
+
+                async def handle_callback(reader, writer):
+                    try:
+                        request_line_bytes = await reader.readline()
+                        if not request_line_bytes:
+                            return
+                        request_line = request_line_bytes.decode('utf-8').strip()
+                        path = request_line.split(' ')[1]
+                        
+                        # Consume headers
+                        while await reader.readline() != b'\r\n':
+                            pass
+
+                        from urllib.parse import urlparse, parse_qs
+                        query_params = parse_qs(urlparse(path).query)
+                        
+                        writer.write(b"HTTP/1.1 200 OK\r\n")
+                        writer.write(b"Content-Type: text/html\r\n\r\n")
+                        
+                        if 'code' in query_params:
+                            auth_code = query_params['code'][0]
+                            if not auth_code_future.done():
+                                auth_code_future.set_result(auth_code)
+                            writer.write(b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
+                        else:
+                            error = query_params.get('error', ['Unknown error'])[0]
+                            if not auth_code_future.done():
+                                auth_code_future.set_exception(Exception(f"OAuth failed: {error}"))
+                            writer.write(f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode())
+                        
+                        await writer.drain()
+                    except Exception as e:
+                        lib_logger.error(f"Error in OAuth callback handler: {e}")
+                    finally:
+                        writer.close()
+
+                try:
+                    server = await asyncio.start_server(handle_callback, '127.0.0.1', 8085)
+                    
+                    from urllib.parse import urlencode
+                    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
+                        "client_id": CLIENT_ID,
+                        "redirect_uri": "http://localhost:8085/oauth2callback",
+                        "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
+                        "access_type": "offline",
+                        "response_type": "code",
+                        "prompt": "consent"
+                    })
+
+                    print(f"\n--- Gemini OAuth Setup Required for {Path(path).name} ---")
+                    print("Your browser will now open for you to log in and authorize the application.")
+                    print(f"If it doesn't, please open this URL manually:\n\n{auth_url}\n")
+                    webbrowser.open(auth_url)
+
+                    auth_code = await asyncio.wait_for(auth_code_future, timeout=300) # 5-minute timeout
+                except asyncio.TimeoutError:
+                    raise Exception("OAuth flow timed out. Please try again.")
+                finally:
+                    if server:
+                        server.close()
+                        await server.wait_closed()
                 
                 lib_logger.info(f"Attempting to exchange authorization code for tokens...")
                 async with httpx.AsyncClient() as client:
