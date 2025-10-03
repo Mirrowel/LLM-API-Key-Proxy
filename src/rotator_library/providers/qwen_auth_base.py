@@ -100,6 +100,7 @@ class QwenAuthBase:
             creds_from_file["access_token"] = new_token_data["access_token"]
             creds_from_file["refresh_token"] = new_token_data.get("refresh_token", creds_from_file["refresh_token"])
             creds_from_file["expiry_date"] = (time.time() + new_token_data["expires_in"]) * 1000
+            creds_from_file["resource_url"] = new_token_data.get("resource_url", creds_from_file.get("resource_url"))
             
             # Update timestamp in metadata if it exists
             if creds_from_file.get("_proxy_metadata"):
