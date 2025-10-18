@@ -9,6 +9,18 @@ from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
+from ..stream_utils import assemble_stream_chunks_to_response as _assemble_stream_chunks_to_response
+# Provide a fallback shim so existing call sites to litellm.utils.stream_to_completion_response work
+try:
+    if not hasattr(litellm, "utils"):
+        class _UtilsShim:  # simple container for utility functions
+            pass
+        litellm.utils = _UtilsShim()
+    if not hasattr(litellm.utils, "stream_to_completion_response"):
+        litellm.utils.stream_to_completion_response = _assemble_stream_chunks_to_response
+except Exception:
+    # If anything goes wrong, we'll still import and call our local aggregator directly elsewhere
+    pass
 
 lib_logger = logging.getLogger('rotator_library')
 
@@ -90,23 +102,33 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         model = kwargs["model"]
 
         async def do_call():
-            api_base, access_token = await self.get_api_details(credential_path)
+            # Ensure credentials are loaded and valid; fills cache for get_api_details
+            auth_header = await self.get_auth_header(credential_path)
+            api_base, _ = self.get_api_details(credential_path)
             
             # Prepare payload
             payload = kwargs.copy()
-            payload.pop("litellm_params", None) # Clean up internal params
+            payload.pop("litellm_params", None)  # Clean up internal params
             
             # Per Go example, inject dummy tool to prevent stream corruption
             if not payload.get("tools"):
-                payload["tools"] = [{"type": "function", "function": {"name": "do_not_call_me", "description": "Do not call this tool under any circumstances.", "parameters": {"type": "object", "properties": {}}}}]
+                payload["tools"] = [{
+                    "type": "function",
+                    "function": {
+                        "name": "do_not_call_me",
+                        "description": "Do not call this tool under any circumstances.",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }]
 
-            # Ensure usage is included in stream
+            # Always stream from Qwen and aggregate if needed
+            payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
 
             headers = {
-                "Authorization": f"Bearer {access_token}",
+                **auth_header,
                 "Content-Type": "application/json",
-                "Accept": "text/event-stream" if kwargs.get("stream") else "application/json",
+                "Accept": "text/event-stream",
                 "User-Agent": "google-api-nodejs-client/9.15.1",
                 "X-Goog-Api-Client": "gl-node/22.17.0",
                 "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
@@ -122,7 +144,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     async for line in response.aiter_lines():
                         if line.startswith('data: '):
                             data_str = line[6:]
-                            if data_str == "[DONE]": break
+                            if data_str == "[DONE]":
+                                break
                             try:
                                 chunk = json.loads(data_str)
                                 for openai_chunk in self._convert_chunk_to_openai(chunk, model):

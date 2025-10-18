@@ -378,7 +378,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         else:
             # Accumulate stream for non-streaming response
             chunks = [chunk async for chunk in response_gen]
-            return litellm.utils.stream_to_completion_response(chunks)
+            from ..stream_utils import assemble_stream_chunks_to_response
+            return assemble_stream_chunks_to_response(chunks, default_model=model)
 
     # Use the shared GeminiAuthBase for auth logic
     # get_models is not applicable for this custom provider
