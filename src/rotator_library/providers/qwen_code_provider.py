@@ -4,23 +4,13 @@ import json
 import time
 import httpx
 import logging
+import re
 from typing import Union, AsyncGenerator, List, Dict, Any
 from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 import litellm
-from litellm.exceptions import RateLimitError, AuthenticationError
-from ..stream_utils import assemble_stream_chunks_to_response as _assemble_stream_chunks_to_response
-# Provide a fallback shim so existing call sites to litellm.utils.stream_to_completion_response work
-try:
-    if not hasattr(litellm, "utils"):
-        class _UtilsShim:  # simple container for utility functions
-            pass
-        litellm.utils = _UtilsShim()
-    if not hasattr(litellm.utils, "stream_to_completion_response"):
-        litellm.utils.stream_to_completion_response = _assemble_stream_chunks_to_response
-except Exception:
-    # If anything goes wrong, we'll still import and call our local aggregator directly elsewhere
-    pass
+from litellm.exceptions import RateLimitError
+from ..stream_utils import assemble_stream_chunks_to_response
 
 lib_logger = logging.getLogger('rotator_library')
 
@@ -69,28 +59,46 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
 
-        # Handle <think> tags for reasoning content
+        # Handle <think> blocks within content by splitting and yielding reasoning/text parts separately
         content = delta.get("content")
-        if content and ("<think>" in content or "</think>" in content):
-            parts = content.replace("<think>", "||THINK||").replace("</think>", "||/THINK||").split("||")
+        emitted_any = False
+        if isinstance(content, str) and ("<think>" in content or "</think>" in content):
+            parts = re.split(r'(</?think>)', content)
+            in_think = False
             for part in parts:
-                if not part: continue
-                
-                new_delta = {}
-                if part.startswith("THINK||"):
-                    new_delta['reasoning_content'] = part.replace("THINK||", "")
-                elif part.startswith("/THINK||"):
+                if part == "<think>":
+                    in_think = True
                     continue
+                if part == "</think>":
+                    in_think = False
+                    continue
+                if not part:
+                    continue
+
+                new_delta: Dict[str, Any] = {}
+                if in_think:
+                    new_delta['reasoning_content'] = part
                 else:
                     new_delta['content'] = part
-                
+
                 yield {
                     "choices": [{"index": 0, "delta": new_delta, "finish_reason": None}],
                     "model": model_id, "object": "chat.completion.chunk",
                     "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
                 }
-        else:
-            # Standard content chunk
+                emitted_any = True
+
+        # If provider sends dedicated reasoning_content in delta, emit it
+        if isinstance(delta.get("reasoning_content"), str) and delta.get("reasoning_content"):
+            yield {
+                "choices": [{"index": 0, "delta": {"reasoning_content": delta["reasoning_content"]}, "finish_reason": None}],
+                "model": model_id, "object": "chat.completion.chunk",
+                "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
+            }
+            emitted_any = True
+
+        # Emit standard content chunk if nothing special was emitted
+        if not emitted_any:
             yield {
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
                 "model": model_id, "object": "chat.completion.chunk",
@@ -175,4 +183,4 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             return response_gen
         else:
             chunks = [chunk async for chunk in response_gen]
-            return litellm.utils.stream_to_completion_response(chunks)
+            return assemble_stream_chunks_to_response(chunks, default_model=model)
