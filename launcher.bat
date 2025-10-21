@@ -189,7 +189,13 @@ goto :eof
 cls
 echo Launching Credential Tool...
 echo.
-call :Execute "--add-credential" ""
+if "%EXECUTION_MODE%"=="exe" (
+    %EXE_NAME% --add-credential
+) else (
+    set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
+    python %SOURCE_PATH% --add-credential
+)
+pause
 goto :MainMenu
 
 :BuildExecutable
@@ -198,18 +204,9 @@ echo ==================================================
 echo      Building Executable
 echo ==================================================
 echo.
-echo Installing dependencies from requirements.txt...
-pip install -r requirements.txt
-echo.
-echo Installing PyInstaller...
-pip install pyinstaller
-echo.
-echo Running build script...
-python src/proxy_app/build.py
-echo.
-echo Build process finished.
-pause
-goto :MainMenu
+echo The build process will start in a new window.
+start "Build Process" cmd /c "pip install -r requirements.txt && pip install pyinstaller && python src/proxy_app/build.py && echo Build finished. && pause"
+goto :eof
 
 :: --- Helper Functions ---
 :Execute
