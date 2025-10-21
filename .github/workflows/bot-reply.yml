@@ -218,7 +218,7 @@ jobs:
 
       - name: Fetch prompts from base branch (Security)
         if: steps.context.outputs.IS_PR == 'true'
-        run: git checkout origin/${{ github.event.repository.default_branch }} -- .github/prompts
+        run: git checkout origin/${{ github.event.repository.default_branch }} -- .github/prompts .github/actions/bot-setup
 
       - name: Checkout repository (for issues)
         if: steps.context.outputs.IS_PR == 'false'
