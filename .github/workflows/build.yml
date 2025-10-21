@@ -46,7 +46,7 @@ jobs:
     - name: Cache PyInstaller build data
       uses: actions/cache@v4
       with:
-        path: ~\AppData\Local\pyinstaller
+        path: '%USERPROFILE%\AppData\Local\pyinstaller'
         key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-3.12-
