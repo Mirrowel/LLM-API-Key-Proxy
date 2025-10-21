@@ -24,7 +24,6 @@ from .error_handler import PreRequestCallbackError, classify_error, AllProviders
 from .providers import PROVIDER_PLUGINS
 from .request_sanitizer import sanitize_request_payload
 from .cooldown_manager import CooldownManager
-from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 
 class StreamedAPIError(Exception):
@@ -65,16 +64,17 @@ class RotatingClient:
         else:
             lib_logger.propagate = False
 
-        if not api_keys:
-            raise ValueError("API keys dictionary cannot be empty.")
-        self.api_keys = api_keys
-        self.credential_manager = CredentialManager(oauth_credentials)
-        self.oauth_credentials = self.credential_manager.discover_and_prepare()
+        # Allow OAuth-only configurations; require at least one credential source
+        if not api_keys and not oauth_credentials:
+            raise ValueError("At least one of API keys or OAuth credentials must be provided.")
+        self.api_keys = api_keys or {}
+        # Use the provided, already-discovered OAuth credentials as-is
+        self.oauth_credentials = oauth_credentials or {}
         self.background_refresher = BackgroundRefresher(self)
         self.oauth_providers = set(self.oauth_credentials.keys())
         
         all_credentials = {}
-        for provider, keys in api_keys.items():
+        for provider, keys in self.api_keys.items():
             all_credentials.setdefault(provider, []).extend(keys)
         for provider, paths in self.oauth_credentials.items():
             all_credentials.setdefault(provider, []).extend(paths)

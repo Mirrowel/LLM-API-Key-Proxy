@@ -35,11 +35,27 @@ class DetailedLogger:
     def log_request(self, headers: Dict[str, Any], body: Dict[str, Any]):
         """Logs the initial request details."""
         self.streaming = body.get("stream", False)
+
+        # Redact sensitive headers and body fields
+        sanitized_headers = {}
+        for k, v in dict(headers).items():
+            kl = k.lower()
+            if kl in {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}:
+                if kl == "authorization" and isinstance(v, str) and v.lower().startswith("bearer "):
+                    sanitized_headers[k] = "Bearer <REDACTED>"
+                else:
+                    sanitized_headers[k] = "<REDACTED>"
+            else:
+                sanitized_headers[k] = v
+        sanitized_body = json.loads(json.dumps(body)) if isinstance(body, dict) else {}
+        if isinstance(sanitized_body, dict) and "api_key" in sanitized_body:
+            sanitized_body["api_key"] = "<REDACTED>"
+
         request_data = {
             "request_id": self.request_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
-            "headers": dict(headers),
-            "body": body
+            "headers": sanitized_headers,
+            "body": sanitized_body
         }
         self._write_json("request.json", request_data)
 

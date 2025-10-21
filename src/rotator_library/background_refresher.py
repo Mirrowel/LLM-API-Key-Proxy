@@ -51,7 +51,7 @@ class BackgroundRefresher:
 
                 oauth_configs = self._client.get_oauth_credentials()
                 for provider, paths in oauth_configs.items():
-                    provider_plugin = self._client._get_provider_instance(f"{provider}_oauth")
+                    provider_plugin = self._client._get_provider_instance(provider)
                     if provider_plugin and hasattr(provider_plugin, 'proactively_refresh'):
                         for path in paths:
                             try:

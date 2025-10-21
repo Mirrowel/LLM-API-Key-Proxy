@@ -54,6 +54,21 @@ def log_failure(api_key: str, model: str, attempt: int, error: Exception, reques
     if not raw_response and hasattr(error, 'response') and hasattr(error.response, 'text'):
         raw_response = error.response.text
 
+    # Redact sensitive request headers
+    sanitized_headers = {}
+    try:
+        for k, v in dict(request_headers or {}).items():
+            kl = str(k).lower()
+            if kl in {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}:
+                if kl == "authorization" and isinstance(v, str) and v.lower().startswith("bearer "):
+                    sanitized_headers[k] = "Bearer <REDACTED>"
+                else:
+                    sanitized_headers[k] = "<REDACTED>"
+            else:
+                sanitized_headers[k] = v
+    except Exception:
+        sanitized_headers = {"_error": "failed to sanitize headers"}
+
     detailed_log_data = {
         "timestamp": datetime.utcnow().isoformat(),
         "api_key_ending": api_key[-4:],
@@ -62,7 +77,7 @@ def log_failure(api_key: str, model: str, attempt: int, error: Exception, reques
         "error_type": type(error).__name__,
         "error_message": str(error),
         "raw_response": raw_response,
-        "request_headers": request_headers,
+        "request_headers": sanitized_headers,
     }
     failure_logger.error(detailed_log_data)
 
