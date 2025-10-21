@@ -761,7 +761,7 @@ class RotatingClient:
                                     else:
                                         lib_logger.warning(f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}")
                             
-                            lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
+                            #lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
                             response = await litellm.acompletion(
                                 **litellm_kwargs,
                                 logger_fn=self._litellm_logger_callback
