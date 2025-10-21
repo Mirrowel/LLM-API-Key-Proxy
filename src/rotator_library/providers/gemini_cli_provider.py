@@ -559,11 +559,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 })
                 try:
                     async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
-                        if response.status_code != 200:
-                            error_body = await response.aread()
-                            error_text = error_body.decode('utf-8', errors='ignore')
-                            file_logger.log_error(f"HTTP Error: {response.status_code}\n{error_text}")
-                            response.raise_for_status()
+                        # This will raise an HTTPStatusError for 4xx/5xx responses
+                        response.raise_for_status()
 
                         async for line in response.aiter_lines():
                             file_logger.log_response_chunk(line)
@@ -576,6 +573,17 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                         yield litellm.ModelResponse(**openai_chunk)
                                 except json.JSONDecodeError:
                                     lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
+
+                except httpx.HTTPStatusError as e:
+                    file_logger.log_error(f"Stream handler HTTPStatusError: {str(e)}")
+                    if e.response.status_code == 429:
+                        raise RateLimitError(
+                            message=f"Gemini CLI rate limit exceeded: {e.response.text}",
+                            llm_provider="gemini_cli",
+                            response=e.response
+                        )
+                    # Re-raise other status errors to be handled by the main acompletion logic
+                    raise e
                 except Exception as e:
                     file_logger.log_error(f"Stream handler exception: {str(e)}")
                     raise
@@ -594,22 +602,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             return logging_stream_wrapper()
 
-        try:
-            response_gen = await do_call()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                lib_logger.warning("Gemini CLI returned 401. Forcing token refresh and retrying once.")
-                creds = await self._load_credentials(credential_path)
-                await self._refresh_token(credential_path, creds, force=True)
-                response_gen = await do_call()
-            elif e.response.status_code == 429:
-                raise RateLimitError(
-                    message=f"Gemini CLI rate limit exceeded: {e.response.text}",
-                    llm_provider="gemini_cli",
-                    response=e.response
-                )
-            else:
-                raise e
+        # All exception handling is now inside the stream_handler,
+        # so we can call do_call directly.
+        response_gen = await do_call()
 
         if kwargs.get("stream", False):
             return response_gen
