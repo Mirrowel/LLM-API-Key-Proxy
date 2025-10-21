@@ -416,11 +416,16 @@ jobs:
           PRERELEASE_FLAG="--prerelease"
           LATEST_FLAG="" # Do not mark non-whitelisted branches as 'latest'
           EXPERIMENTAL_NOTE=$(cat <<-EOF
+        > [!WARNING]
         > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
         > |:---------------------------:|
-        > | This release is from the \`$CURRENT_BRANCH\` branch and is **highly unstable**. |
-        > | It contains features that change frequently and may be removed without notice. |
-        > | **Do not use in production environments.** |
+        > This release is from the [\`$CURRENT_BRANCH\`](https://github.com/${{ github.repository }}/tree/$CURRENT_BRANCH) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
+        >
+        > **Do not use in production environments.**
+        >
+        > ---
+        >
+        > **Found an issue?** Please [report it here](https://github.com/${{ github.repository }}/issues/new/choose) and include the build version (\`${{ steps.version.outputs.version }}\`) in your report.
         EOF
           )
         fi
