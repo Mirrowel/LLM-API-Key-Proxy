@@ -30,7 +30,7 @@ jobs:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          gh pr edit $PR_NUMBER --add-reviewer mirrobot-agent[bot] --repo ${{ github.repository }}
+          gh pr edit $PR_NUMBER --add-reviewer mirrobot-agent --repo ${{ github.repository }}
 
       - name: Add reaction to comment
         env:
@@ -40,4 +40,5 @@ jobs:
             --method POST \
             -H "Accept: application/vnd.github+json" \
             /repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+
             -f content='eyes'
