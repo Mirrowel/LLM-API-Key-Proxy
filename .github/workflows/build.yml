@@ -30,18 +30,27 @@ jobs:
       with:
         python-version: '3.12'
 
+    - name: Get pip cache dir
+      id: pip-cache
+      shell: pwsh
+      run: |
+        echo "dir=$(pip cache dir)" >> $env:GITHUB_OUTPUT
+
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
-        path: ${{ steps.setup-python.outputs.python-path }}
+        path: ${{ steps.pip-cache.outputs.dir }}
         key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-3.12
 
     - name: Install dependencies
+      shell: pwsh
       run: |
-        pip install -r requirements.txt
+        Get-Content requirements.txt | Where-Object { $_ -notmatch '-e src/rotator_library' } | Set-Content temp_requirements.txt
+        pip install -r temp_requirements.txt
         pip install pyinstaller
+        pip install -e src/rotator_library
 
     - name: Cache PyInstaller build data
       uses: actions/cache@v4
@@ -363,8 +372,9 @@ jobs:
           EXPERIMENTAL_NOTE=$(cat <<-EOF
         > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
         > |:---------------------------:|
-        > | This release is from the \`$CURRENT_BRANCH\` branch and is **not stable**. |
-        > | **Do not use in production.** |
+        > | This release is from the \`$CURRENT_BRANCH\` branch and is **highly unstable**. |
+        > | It contains features that change frequently and may be removed without notice. |
+        > | **Do not use in production environments.** |
         EOF
           )
         fi
