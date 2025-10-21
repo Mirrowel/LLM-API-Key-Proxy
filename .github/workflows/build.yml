@@ -57,7 +57,7 @@ jobs:
       if: runner.os == 'Windows'
       uses: actions/cache@v4
       with:
-        path: '%USERPROFILE%\AppData\Local\pyinstaller'
+        path: $HOME/AppData/Local/pyinstaller
         key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-3.12-
@@ -66,7 +66,7 @@ jobs:
       if: runner.os == 'Linux'
       uses: actions/cache@v4
       with:
-        path: '~/.cache/pyinstaller'
+        path: $HOME/.cache/pyinstaller
         key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-3.12-
@@ -75,13 +75,23 @@ jobs:
       if: runner.os == 'macOS'
       uses: actions/cache@v4
       with:
-        path: '~/Library/Application Support/pyinstaller'
+        path: $HOME/Library/Application Support/pyinstaller
         key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-3.12-
 
     - name: Build executable
       run: python src/proxy_app/build.py
+
+    - name: Ensure PyInstaller cache directory exists
+      if: runner.os != 'macOS'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          mkdir -p "$HOME/AppData/Local/pyinstaller"
+        elif [ "${{ runner.os }}" == "Linux" ]; then
+          mkdir -p "$HOME/.cache/pyinstaller"
+        fi
 
     - name: Get short SHA
       id: version
@@ -297,7 +307,7 @@ jobs:
         fi
         echo "win_build_size=$WIN_SIZE" >> $GITHUB_OUTPUT
         
-        LINUX_EXE=$(find release-assets -path "*/proxy-app-build-ubuntu-*/proxy_app" -type f | head -1)
+        LINUX_EXE=$(find release-assets -path "*/proxy-app-build-Linux-*/proxy_app" -type f | head -1)
         if [ -n "$LINUX_EXE" ]; then
           LINUX_SIZE=$(du -sh "$LINUX_EXE" | cut -f1)
         else
@@ -305,7 +315,7 @@ jobs:
         fi
         echo "linux_build_size=$LINUX_SIZE" >> $GITHUB_OUTPUT
 
-        MACOS_EXE=$(find release-assets -path "*/proxy-app-build-macos-*/proxy_app" -type f | head -1)
+        MACOS_EXE=$(find release-assets -path "*/proxy-app-build-macOS-*/proxy_app" -type f | head -1)
         if [ -n "$MACOS_EXE" ]; then
           MACOS_SIZE=$(du -sh "$MACOS_EXE" | cut -f1)
         else
@@ -364,9 +374,9 @@ jobs:
 
         # Generate file table
         FILE_TABLE="| OS | File | Description |\n|----|------|-------------|\n"
-        WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'windows')
-        LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'ubuntu')
-        MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macos')
+        WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
+        LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Linux')
+        MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macOS')
         FILE_TABLE="$FILE_TABLE| Windows | \`$WINDOWS_ARCHIVE\` | Contains \`proxy_app.exe\` and \`launcher.bat\` | \n"
         FILE_TABLE="$FILE_TABLE| Linux | \`$LINUX_ARCHIVE\` | Contains \`proxy_app\` and \`launcher.bat\` | \n"
         FILE_TABLE="$FILE_TABLE| macOS | \`$MACOS_ARCHIVE\` | Contains \`proxy_app\` and \`launcher.bat\` | \n"
