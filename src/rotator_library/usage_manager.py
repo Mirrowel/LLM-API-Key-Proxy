@@ -268,7 +268,13 @@ class UsageManager:
                     else:
                         # Differentiate cost calculation based on response type
                         if isinstance(completion_response, litellm.EmbeddingResponse):
-                            cost = litellm.embedding_cost(embedding_response=completion_response)
+                            # Manually calculate cost for embeddings
+                            model_info = litellm.get_model_info(model)
+                            input_cost = model_info.get("input_cost_per_token")
+                            if input_cost:
+                                cost = completion_response.usage.prompt_tokens * input_cost
+                            else:
+                                cost = None
                         else:
                             cost = litellm.completion_cost(completion_response=completion_response, model=model)
                         
@@ -276,7 +282,7 @@ class UsageManager:
                             daily_model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
-            elif asyncio.iscoroutine(completion_response) or isinstance(completion_response, asyncio.Future) or hasattr(completion_response, '__aiter__'):
+            elif isinstance(completion_response, asyncio.Future) or hasattr(completion_response, '__aiter__'):
                 # This is an unconsumed stream object. Do not log a warning, as usage will be recorded from the chunks.
                 pass
             else:

@@ -231,9 +231,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if parts:
                 gemini_contents.append({"role": gemini_role, "parts": parts})
 
-        if not any(c['role'] == 'user' for c in gemini_contents):
-             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
-        elif gemini_contents and gemini_contents[0]["role"] == "model":
+        if not gemini_contents or gemini_contents[0]['role'] != 'user':
             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
 
         return system_instruction, gemini_contents
@@ -303,8 +301,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     }
                 }]
             elif 'text' in part:
-                # Use a lenient check for the 'thought' flag, as its type can be inconsistent
-                if str(part.get('thought')).lower() == 'true':
+                # Use an explicit check for the 'thought' flag, as its type can be inconsistent
+                thought = part.get('thought')
+                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
                     delta['reasoning_content'] = part['text']
                 else:
                     delta['content'] = part['text']

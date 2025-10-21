@@ -130,6 +130,8 @@ load_dotenv()
 # --- Configuration ---
 USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
+if ENABLE_REQUEST_LOGGING:
+    logging.info("Request logging is enabled.")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 if not PROXY_API_KEY:
     raise ValueError("PROXY_API_KEY environment variable not set.")
@@ -489,31 +491,29 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
-    if ENABLE_REQUEST_LOGGING:
-        # Preserve and re-use the request body so downstream code can still call request.json()
-        raw_body = await request.body()
-        try:
-            parsed_body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-        except Exception:
-            parsed_body = {}
-        # Reattach the raw body for later reads
-        request._body = raw_body
-
-        # Extract the fields we want to log (supporting possible nesting in generationConfig)
-        model = parsed_body.get("model")
-        generation_cfg = parsed_body.get("generationConfig", {}) or parsed_body.get("generation_config", {}) or {}
-        reasoning_effort = parsed_body.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
-        custom_reasoning_budget = parsed_body.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
-
-        logging.getLogger("rotator_library").info(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
-        )
     logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
     try:
-        request_data = await request.json()
+        # Read and parse the request body only once at the beginning.
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+
+        # If logging is enabled, perform all logging operations using the parsed data.
         if logger:
             logger.log_request(headers=request.headers, body=request_data)
 
+            # Extract and log specific reasoning parameters for monitoring.
+            model = request_data.get("model")
+            generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
+            reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
+            custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
+
+            logging.getLogger("rotator_library").info(
+                f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+            )
+
+        # Log basic request info to console (this is a separate, simpler logger).
         log_request_to_console(
             url=str(request.url),
             headers=dict(request.headers),

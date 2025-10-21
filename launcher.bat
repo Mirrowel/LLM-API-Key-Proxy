@@ -182,8 +182,13 @@ if "%LOGGING%"=="true" (
 echo Starting Proxy...
 echo Arguments: %ARGS%
 echo.
-call :Execute "" "%ARGS%"
-goto :eof
+if "%EXECUTION_MODE%"=="exe" (
+    start "LLM API Proxy" %EXE_NAME% %ARGS%
+) else (
+    set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
+    start "LLM API Proxy" python %SOURCE_PATH% %ARGS%
+)
+exit /b 0
 
 :AddCredentials
 cls
@@ -206,18 +211,9 @@ echo ==================================================
 echo.
 echo The build process will start in a new window.
 start "Build Process" cmd /c "pip install -r requirements.txt && pip install pyinstaller && python src/proxy_app/build.py && echo Build finished. && pause"
-goto :eof
+exit /b
 
 :: --- Helper Functions ---
-:Execute
-set "COMMAND=%~1"
-set "ARGS=%~2"
-if "%EXECUTION_MODE%"=="exe" (
-    start "LLM API Proxy" %EXE_NAME% %COMMAND% %ARGS%
-) else (
-    set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
-    start "LLM API Proxy" python %SOURCE_PATH% %COMMAND% %ARGS%
-)
 
 :SelectModeMenu
 cls
