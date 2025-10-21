@@ -1,0 +1,171 @@
+name: 'Bot Setup'
+description: 'Performs all common setup steps for bot workflows, including token generation, git config, and dependency installation.'
+
+inputs:
+  bot-app-id:
+    description: 'The ID of the GitHub App.'
+    required: true
+  bot-private-key:
+    description: 'The private key of the GitHub App.'
+    required: true
+  proxy-base-url:
+    description: 'The base URL for the proxy.'
+    required: true
+  proxy-api-key:
+    description: 'The API key for the proxy.'
+    required: true
+  opencode-model:
+    description: 'The main model for opencode.'
+    required: true
+  opencode-fast-model:
+    description: 'The fast model for opencode.'
+    required: true
+  opencode-model-override:
+    description: 'The model override for opencode.'
+    required: false
+  opencode-api-key-override:
+    description: 'The OpenCode API key override.'
+    required: false
+
+outputs:
+  token:
+    description: "The generated GitHub App token."
+    value: ${{ steps.generate_token.outputs.token }}
+  model-arg:
+    description: "The model argument for opencode."
+    value: ${{ steps.model_override.outputs.model_arg }}
+  opencode-api-key:
+    description: "The final OpenCode API key to use."
+    value: ${{ steps.determine-api-key.outputs.final-key }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate GitHub App Token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.bot-app-id }}
+        private-key: ${{ inputs.bot-private-key }}
+
+    - name: Configure Git for Bot
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+      run: |
+        git config --global user.name "mirrobot-agent[bot]"
+        git config --global user.email "${{ inputs.bot-app-id }}+mirrobot-agent@users.noreply.github.com"
+        git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+    - name: Inject Custom Config (For Proxy Support)
+      shell: bash
+      run: |
+        mkdir -p ~/.config/opencode
+        CONFIG=$(cat <<EOF
+        {
+          "\$schema": "https://opencode.ai/config.json",
+          "provider": {
+            "llm-proxy": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": "Proxy",
+              "options": {
+                "baseURL": "${{ inputs.proxy-base-url }}",
+                "apiKey": "${{ inputs.proxy-api-key }}",
+                "timeout": 300000,
+                "headers": {
+                  "User-Agent": "OpenCode/1.0",
+                  "X-Custom-Header": "your-value"
+                }
+              },
+              "models": {
+                "main_model": {
+                  "id": "${{ inputs.opencode-model }}",
+                  "name": "Custom Model",
+                  "limit": {
+                    "context": 262000,
+                    "output": 64192
+                  }
+                },
+                "fast_model": {
+                  "id": "${{ inputs.opencode-fast-model }}",
+                  "name": "Fast Custom Model",
+                  "limit": {
+                    "context": 262000,
+                    "output": 64192
+                  }
+                }
+              }
+            }
+          },
+          "model": "llm-proxy/main_model",
+          "small_model": "llm-proxy/fast_model",
+          "username": "mirrobot-agent",
+          "autoupdate": true
+        }
+        EOF
+        )
+        echo "$CONFIG" > ~/.config/opencode/opencode.json
+
+    - name: Check for Python requirements file
+      id: check_requirements_file
+      shell: bash
+      run: |
+        if [ -f requirements.txt ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up Python
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Cache pip dependencies
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-3.12
+
+    - name: Install dependencies
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      shell: bash
+      run: pip install -r requirements.txt
+
+    - name: Install opencode
+      shell: bash
+      run: curl -fsSL https://opencode.ai/install | bash
+
+    - name: Ensure opencode directory exists
+      shell: bash
+      run: mkdir -p /home/runner/.local/share/opencode/project
+
+    - name: Check for model override
+      id: model_override
+      shell: bash
+      env:
+        MODEL_OVERRIDE_SECRET: ${{ inputs.opencode-model-override }}
+      run: |
+        if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+          echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+          echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_OUTPUT
+        else
+          echo "No model override found, using default."
+          echo "model_arg=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Determine API Key
+      id: determine-api-key
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.opencode-api-key-override }}" ]; then
+          echo "Using API key override."
+          echo "final-key=${{ inputs.opencode-api-key-override }}" >> $GITHUB_OUTPUT
+        else
+          echo "Using default proxy API key."
+          echo "final-key=${{ inputs.proxy-api-key }}" >> $GITHUB_OUTPUT
+        fi
