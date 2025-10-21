@@ -8,15 +8,6 @@ import logging
 
 from .provider_urls import get_provider_endpoint
 
-LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
-COMPLETIONS_LOGS_DIR = LOGS_DIR / "completions"
-EMBEDDINGS_LOGS_DIR = LOGS_DIR / "embeddings"
-
-# Create directories if they don't exist
-LOGS_DIR.mkdir(exist_ok=True)
-COMPLETIONS_LOGS_DIR.mkdir(exist_ok=True)
-EMBEDDINGS_LOGS_DIR.mkdir(exist_ok=True)
-
 def log_request_to_console(url: str, headers: dict, client_info: tuple, request_data: dict):
     """
     Logs a concise, single-line summary of an incoming request to the console.

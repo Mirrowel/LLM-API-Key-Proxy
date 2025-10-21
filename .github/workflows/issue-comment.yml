@@ -1,0 +1,309 @@
+name: Issue Analysis
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issueNumber:
+        description: 'The number of the issue to analyze manually'
+        required: true
+        type: string
+
+jobs:
+  check-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      # If triggered by 'issues', it uses github.event.issue.number.
+      # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
+
+    steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Configure Git for Bot
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          git config --global user.name "mirrobot-agent[bot]"
+          git config --global user.email "${{ secrets.BOT_APP_ID }}+mirrobot-agent@users.noreply.github.com"
+          git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Inject Custom Config (For Proxy Support)
+        run: |
+          mkdir -p ~/.config/opencode
+          CONFIG='{
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "llm-proxy": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Proxy",
+                "options": {
+                  "baseURL": "${{ secrets.PROXY_BASE_URL }}",
+                  "apiKey": "${{ secrets.PROXY_API_KEY }}",
+                  "timeout": 300000, // 5 minute timeout in ms
+                  "headers": {
+                    "User-Agent": "OpenCode/1.0",
+                    "X-Custom-Header": "your-value"
+                  }
+                },
+                "models": {
+                  "main_model": {
+                    "id": "${{ secrets.OPENCODE_MODEL }}",
+                    "name": "Custom Model",
+                    "limit": {
+                      "context": 262000,
+                      "output": 64192
+                    }
+                  },
+                  "fast_model": {
+                    "id": "${{ secrets.OPENCODE_FAST_MODEL }}",
+                    "name": "Fast Custom Model",
+                    "limit": {
+                      "context": 262000,
+                      "output": 64192
+                    }
+                  }
+                }
+              }
+            },
+            "model": "llm-proxy/main_model",
+            "small_model": "llm-proxy/fast_model",
+            "username": "mirrobot-agent",
+            "autoupdate": true
+          }'
+          echo "$CONFIG" > ~/.config/opencode/opencode.json
+
+      - name: Check for Python requirements file
+        id: check_requirements_file
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-3.12
+
+      - name: Install dependencies
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Install opencode
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Ensure opencode directory exists
+        run: mkdir -p /home/runner/.local/share/opencode/project
+
+      - name: Fetch and Format Full Issue Context
+        id: issue_details
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          # Fetch all necessary data in one call
+          issue_data=$(gh issue view ${{ env.ISSUE_NUMBER }} --json author,title,body,createdAt,state,comments)
+          timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.ISSUE_NUMBER }}/timeline")
+
+          # Debug: Output issue_data and timeline_data for inspection
+          echo "$issue_data" > issue_data.txt
+          echo "$timeline_data" > timeline_data.txt
+          
+          # Prepare metadata
+          author=$(echo "$issue_data" | jq -r .author.login)
+          created_at=$(echo "$issue_data" | jq -r .createdAt)
+          state=$(echo "$issue_data" | jq -r .state)
+          title=$(echo "$issue_data" | jq -r .title)
+          body=$(echo "$issue_data" | jq -r .body)
+
+          # Prepare comments
+          comments=$(echo "$issue_data" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No comments have been posted yet." end')
+
+          # Prepare cross-references
+          references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
+          if [ -z "$references" ]; then
+            references="No other issues or PRs have mentioned this thread."
+          fi
+          # Define a unique, random delimiter for the main context block
+          CONTEXT_DELIMITER="GH_ISSUE_CONTEXT_DELIMITER_$(openssl rand -hex 8)"
+          # Assemble the final context block directly into the environment file line by line
+          echo "ISSUE_CONTEXT<<$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+          echo "Issue: #${{ env.ISSUE_NUMBER }}" >> "$GITHUB_ENV"
+          echo "Title: $title" >> "$GITHUB_ENV"
+          echo "Author: $author" >> "$GITHUB_ENV"
+          echo "Created At: $created_at" >> "$GITHUB_ENV"
+          echo "State: $state" >> "$GITHUB_ENV"
+          echo "<issue_body>" >> "$GITHUB_ENV"
+          echo "$body" >> "$GITHUB_ENV"
+          echo "</issue_body>" >> "$GITHUB_ENV"
+          echo "<issue_comments>" >> "$GITHUB_ENV"
+          echo "$comments" >> "$GITHUB_ENV"
+          echo "</issue_comments>" >> "$GITHUB_ENV"
+          echo "<cross_references>" >> "$GITHUB_ENV"
+          echo "$references" >> "$GITHUB_ENV"
+          echo "</cross_references>" >> "$GITHUB_ENV"
+          echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+          # Also export author for the acknowledgment comment
+          echo "ISSUE_AUTHOR=$author" >> $GITHUB_ENV
+
+
+      - name: Analyze issue and suggest resolution
+        env:
+          OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          OPENCODE_PERMISSION: |
+            {
+              "bash": {
+                "gh*": "allow",
+                "git*": "allow"
+              },
+              "webfetch": "deny"
+            }
+        run: |
+          # Use a heredoc (<<'END_OF_PROMPT') to pass the prompt safely via stdin.
+          # The "-" tells the opencode command to read the prompt from stdin.
+          opencode run --share - <<'END_OF_PROMPT'
+          # [ROLE & OBJECTIVE]
+          You are an expert AI software engineer specializing in bug triage and analysis. Your goal is to provide a comprehensive initial analysis of this new issue to help the maintainers. You will perform an investigation and report your findings directly on the GitHub issue.
+
+          # [Your Identity]
+          You operate under the names **mirrobot**, **mirrobot-agent**, or the git user **mirrobot-agent[bot]**. When analyzing thread history, recognize actions by this name as your own.
+
+          # [OPERATIONAL PERMISSIONS]
+          Your actions are constrained by the permissions granted to your underlying GitHub App and the job's workflow token.
+
+          **Job-Level Permissions (via workflow token):**
+          - contents: read
+          - issues: write
+
+          **GitHub App Permissions (via App installation):**
+          - contents: read & write
+          - issues: read & write
+          - pull_requests: read & write
+          - metadata: read-only
+
+          If you suspect a command will fail due to a missing permission, you must state this to the user and explain which permission is required.
+
+          # [COMMUNICATION GUIDELINES]
+          Your interaction must be in two steps to provide a good user experience:
+          1. **Acknowledge:** Immediately post a short comment to let the user know you are starting your analysis.
+          2. **Summarize:** After the analysis is complete, post a second, detailed comment with your full findings. Do not expose internal thought processes or tool executions in your comments; keep the output clean and professional.
+
+          # [ISSUE CONTEXT]
+          This is the full context for the issue you must analyze.
+          <issue_context>
+          ${{ env.ISSUE_CONTEXT }}
+          </issue_context>
+
+          # [EXECUTION PLAN]
+          First, post your acknowledgment, then begin your investigation.
+
+          **Step 1: Post Acknowledgment Comment**
+          Use this command to inform the user you are starting.
+          ```bash
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "@${{ env.ISSUE_AUTHOR }} Thank you for submitting this issue. I am now beginning my analysis and will report back shortly."
+          ```
+
+          **Step 2: Conduct Investigation**
+          Internally, follow these steps. Do not output this part of the process to the user.
+          1. **Search for Duplicates:** Lookup this issue and search through existing issues (excluding #${{ env.ISSUE_NUMBER }}) in this repository to find any potential duplicates of this new issue.
+            Consider:
+            - Similar titles or descriptions
+            - Same error messages or symptoms
+            - Related functionality or components
+            - Similar feature requests
+
+            If you find any potential duplicates, comment on the new issue with:
+            - A brief explanation of why it might be a duplicate
+            - Links to the potentially duplicate issues
+            - A suggestion to check those issues first
+
+            Use this format for the comment:
+            This issue might be a duplicate of existing issues. Please check:
+            - #[issue_number]: [brief description of similarity]
+
+            If duplicates are found, stop further analysis.
+          2. **Understand the Problem:** Read the title and description within the `<issue_context>` to grasp the problem.
+          3. **Explore the Codebase:** Navigate the repository to find the most relevant files, configurations, or recent commits related to the issue. Utilize `git` and `gh` commands for this exploration. Use `git log --grep="<keyword>"` to find related commits, `git grep "<error_message>"` to search the codebase for error strings, and `git blame <file>` to inspect the history of suspicious files. Start by getting an overview of the project structure with `ls -R`.
+          4. **Identify Root Cause:** Form a hypothesis about the root cause of the issue.
+          5. **Validate the Issue:** Assess if the issue is valid and if the description provides enough information to reproduce the problem. Determine if the issue description is sufficient for reproduction. Try reproducing it if possible.
+
+          **Step 3: Post Final Analysis Comment**
+          After your internal investigation, post a single, well-formatted comment summarizing your findings. Use the command below, filling in the sections based on your analysis.
+          ```bash
+          gh issue comment ${{ env.ISSUE_NUMBER }} -F - <<'EOF'
+          ### Initial Analysis Report
+
+          **Summary:** [A one-sentence overview of your findings.]
+          **Issue Validation:** [State `Confirmed`, `Partially Confirmed`, `Needs More Info`, or `Potential Duplicate`.]
+          **Reproducibility Assessment:** `Reproducible` | `Not Reproducible` | `Needs More Info`.
+          **Root Cause Analysis:** [Explain the suspected root cause with evidence like file paths and function names.]
+          **Suggested Labels:** [Suggest labels like `bug`, `documentation`, `enhancement`, `needs-reproduction` with a brief justification.]
+          **Proposed Next Steps:** [Provide concrete steps, code snippets, or a plan for resolution.]
+          **Missing Information (if any):** [Clearly state what information is needed from the issue filer, e.g., logs, code samples, or versions.]
+
+          ### Investigation Warnings
+          *Optional section. Use only if a Level 3 (Non-Fatal) error occurred.*
+          - Example: I was unable to perform a full duplicate search due to a temporary API error. The results above are based on a codebase analysis only.
+
+          _This analysis was generated by an AI assistant._
+          EOF
+          ```
+
+          # [ERROR HANDLING & RECOVERY PROTOCOL]
+          You must be resilient. Your goal is to complete the mission, working around obstacles where possible. Classify all errors into one of two levels and act accordingly.
+
+          ---
+          ### Level 2: Fatal Errors (Halt)
+          This level applies to critical failures that you cannot solve, such as being unable to post comments.
+
+          - **Trigger:** A critical command like `gh issue comment` fails.
+          - **Procedure:**
+              1.  **Halt immediately.** Do not attempt any further steps.
+              2.  The workflow will fail, and the user will see the error in the GitHub Actions log. There is no need for you to post a separate comment about this failure, as you are unable to.
+
+          ---
+          ### Level 3: Non-Fatal Warnings (Note and Continue)
+          This level applies to minor issues where a secondary investigation task fails but the primary objective can still be met.
+
+          - **Trigger:** A non-essential investigation command fails (e.g., `git grep`, `gh search`), but you can reasonably continue the analysis with the remaining information.
+          - **Procedure:**
+              1.  **Acknowledge the error internally** and make a note of it.
+              2.  **Attempt a single retry.** If it fails again, move on.
+              3.  **Continue with the primary analysis.**
+              4.  **Report in the final summary.** In your final analysis comment, you MUST include a `### Investigation Warnings` section detailing what failed and how it may have impacted the analysis.
+
+          # [TOOLS NOTE]
+          When using `bash` to execute `gh issue comment` with multi-line content from stdin, you MUST use the `-F -` flag with a heredoc (`<<'EOF'`). This correctly pipes the content to the command.
+
+          When using a heredoc (`<<'EOF'`), the closing delimiter (`EOF`) **must** be on a new line by itself, with no leading or trailing spaces, quotes, or other characters.
+
+          Now, execute the plan. Start with Step 1.
+          END_OF_PROMPT

@@ -9,6 +9,7 @@ import aiofiles
 import litellm
 
 from .error_handler import ClassifiedError, NoAvailableKeysError
+from .providers import PROVIDER_PLUGINS
 
 lib_logger = logging.getLogger('rotator_library')
 lib_logger.propagate = False
@@ -89,7 +90,7 @@ class UsageManager:
                 reset_threshold_today = datetime.combine(now_utc.date(), self.daily_reset_time_utc)
 
                 if last_reset_dt is None or last_reset_dt < reset_threshold_today <= now_utc:
-                    lib_logger.info(f"Performing daily reset for key ...{key[-4:]}")
+                    lib_logger.info(f"Performing daily reset for key ...{key[-6:]}")
                     needs_saving = True
                     
                     # Reset cooldowns
@@ -171,7 +172,7 @@ class UsageManager:
                 async with state["lock"]:
                     if not state["models_in_use"]:
                         state["models_in_use"].add(model)
-                        lib_logger.info(f"Acquired Tier 1 key ...{key[-4:]} for model {model}")
+                        lib_logger.info(f"Acquired Tier 1 key ...{key[-6:]} for model {model}")
                         return key
 
             # If no Tier 1 keys are available, try Tier 2.
@@ -180,7 +181,7 @@ class UsageManager:
                 async with state["lock"]:
                     if model not in state["models_in_use"]:
                         state["models_in_use"].add(model)
-                        lib_logger.info(f"Acquired Tier 2 key ...{key[-4:]} for model {model}")
+                        lib_logger.info(f"Acquired Tier 2 key ...{key[-6:]} for model {model}")
                         return key
 
             # If all eligible keys are locked, wait for a key to be released.
@@ -221,9 +222,9 @@ class UsageManager:
         async with state["lock"]:
             if model in state["models_in_use"]:
                 state["models_in_use"].remove(model)
-                lib_logger.info(f"Released key ...{key[-4:]} from model {model}")
+                lib_logger.info(f"Released credential ...{key[-6:]} from model {model}")
             else:
-                lib_logger.warning(f"Attempted to release key ...{key[-4:]} for model {model}, but it was not in use.")
+                lib_logger.warning(f"Attempted to release credential ...{key[-6:]} for model {model}, but it was not in use.")
 
         # Notify all tasks waiting on this key's condition
         async with state["condition"]:
@@ -257,18 +258,27 @@ class UsageManager:
                 usage = completion_response.usage
                 daily_model_data["prompt_tokens"] += usage.prompt_tokens
                 daily_model_data["completion_tokens"] += getattr(usage, 'completion_tokens', 0) # Not present in embedding responses
-                lib_logger.info(f"Recorded usage from final stream object for key ...{key[-4:]}")
+                lib_logger.info(f"Recorded usage from response object for key ...{key[-6:]}")
                 try:
-                    # Differentiate cost calculation based on response type
-                    if isinstance(completion_response, litellm.EmbeddingResponse):
-                        cost = litellm.embedding_cost(embedding_response=completion_response)
+                    provider_name = model.split('/')[0]
+                    provider_plugin = PROVIDER_PLUGINS.get(provider_name)
+
+                    if provider_plugin and provider_plugin.skip_cost_calculation:
+                        lib_logger.debug(f"Skipping cost calculation for provider '{provider_name}' as per its configuration.")
                     else:
-                        cost = litellm.completion_cost(completion_response=completion_response)
-                    
-                    if cost is not None:
-                        daily_model_data["approx_cost"] += cost
+                        # Differentiate cost calculation based on response type
+                        if isinstance(completion_response, litellm.EmbeddingResponse):
+                            cost = litellm.embedding_cost(embedding_response=completion_response)
+                        else:
+                            cost = litellm.completion_cost(completion_response=completion_response, model=model)
+                        
+                        if cost is not None:
+                            daily_model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(f"Could not calculate cost for model {model}: {e}")
+            elif asyncio.iscoroutine(completion_response) or isinstance(completion_response, asyncio.Future) or hasattr(completion_response, '__aiter__'):
+                # This is an unconsumed stream object. Do not log a warning, as usage will be recorded from the chunks.
+                pass
             else:
                 lib_logger.warning(f"No usage data found in completion response for model {model}. Recording success without token count.")
 
@@ -289,7 +299,7 @@ class UsageManager:
             elif classified_error.error_type == 'authentication':
                 # Apply a 5-minute key-level lockout for auth errors
                 key_data["key_cooldown_until"] = time.time() + 300
-                lib_logger.warning(f"Authentication error on key ...{key[-4:]}. Applying 5-minute key-level lockout.")
+                lib_logger.warning(f"Authentication error on key ...{key[-6:]}. Applying 5-minute key-level lockout.")
                 await self._save_usage()
                 return # No further backoff logic needed
             else:
@@ -305,7 +315,7 @@ class UsageManager:
             # Apply the cooldown
             model_cooldowns = key_data.setdefault("model_cooldowns", {})
             model_cooldowns[model] = time.time() + cooldown_seconds
-            lib_logger.warning(f"Failure recorded for key ...{key[-4:]} with model {model}. Applying {cooldown_seconds}s cooldown.")
+            lib_logger.warning(f"Failure recorded for key ...{key[-6:]} with model {model}. Applying {cooldown_seconds}s cooldown.")
 
             # Check for key-level lockout condition
             await self._check_key_lockout(key, key_data)
@@ -329,4 +339,4 @@ class UsageManager:
         
         if long_term_lockout_models >= 3:
             key_data["key_cooldown_until"] = now + 300 # 5-minute key lockout
-            lib_logger.error(f"Key ...{key[-4:]} has {long_term_lockout_models} models in long-term lockout. Applying 5-minute key-level lockout.")
+            lib_logger.error(f"Key ...{key[-6:]} has {long_term_lockout_models} models in long-term lockout. Applying 5-minute key-level lockout.")

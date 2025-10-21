@@ -66,6 +66,8 @@ client = RotatingClient(
 -   `max_retries`: The number of times to retry a request with the *same key* if a transient server error occurs.
 -   `usage_file_path`: The path to the JSON file where key usage data will be stored.
 -   `global_timeout`: A hard time limit (in seconds) for the entire request lifecycle. If the total time exceeds this, the request will fail.
+-   `ignore_models`: A dictionary where keys are provider names and values are lists of model names/patterns to exclude (blacklist).
+-   `whitelist_models`: A dictionary where keys are provider names and values are lists of model names/patterns to always include, overriding any blacklists.
 
 ### Concurrency and Resource Management
 
@@ -123,7 +125,7 @@ Calculates the token count for a given text or list of messages using `litellm.t
 
 #### `async def get_available_models(self, provider: str) -> List[str]:`
 
-Fetches a list of available models for a specific provider. Results are cached in memory.
+Fetches a list of available models for a specific provider, applying any configured whitelists or blacklists. Results are cached in memory.
 
 #### `async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:`
 

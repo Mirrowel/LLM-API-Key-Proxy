@@ -28,11 +28,14 @@ This project provides a powerful solution for developers building complex applic
 -   **Resilient Performance**: A global timeout on all requests prevents your application from hanging on unresponsive provider APIs.
 -   **Efficient Concurrency**: Maximizes throughput by allowing a single API key to handle multiple concurrent requests to different models.
 -   **Intelligent Key Management**: Optimizes request distribution across your pool of keys by selecting the best available one for each call.
+-   **Automated OAuth Discovery**: Automatically discovers, validates, and manages OAuth credentials from standard provider directories (e.g., `~/.gemini/`, `~/.qwen/`). No manual `.env` configuration is required for supported providers.
+-   **Duplicate Credential Detection**: Intelligently detects if multiple local credential files belong to the same user account and logs a warning, preventing redundancy in your key pool.
 -   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
 -   **Detailed Request Logging**: Enable comprehensive logging for debugging. Each request gets its own directory with full request/response details, streaming chunks, and performance metadata.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
+-   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
 
 ---
 
@@ -103,8 +106,18 @@ Now, open the new `.env` file and add your keys.
 
 **Refer to the `.env.example` file for the correct format and a full list of supported providers.**
 
-1.  **`PROXY_API_KEY`**: This is a secret key **you create**. It is used to authorize requests to *your* proxy, preventing unauthorized use.
-2.  **Provider Keys**: These are the API keys you get from LLM providers (like Gemini, OpenAI, etc.). The proxy automatically finds them based on their name (e.g., `GEMINI_API_KEY_1`).
+The proxy supports two types of credentials:
+
+1.  **API Keys**: Standard secret keys from providers like OpenAI, Anthropic, etc.
+2.  **OAuth Credentials**: For services that use OAuth 2.0, like the Gemini CLI.
+
+#### Automated Credential Discovery (Recommended)
+
+For many providers, **no configuration is necessary**. The proxy automatically discovers and manages credentials from their default locations:
+-   **API Keys**: Scans your environment variables for keys matching the format `PROVIDER_API_KEY_1` (e.g., `GEMINI_API_KEY_1`).
+-   **OAuth Credentials**: Scans default system directories (e.g., `~/.gemini/`, `~/.qwen/`) for all `*.json` credential files.
+
+You only need to create a `.env` file to set your `PROXY_API_KEY` and to override or add credentials if the automatic discovery doesn't suit your needs.
 
 **Example `.env` configuration:**
 ```env
@@ -112,18 +125,17 @@ Now, open the new `.env` file and add your keys.
 # This can be any secret string you choose.
 PROXY_API_KEY="a-very-secret-and-unique-key"
 
-# --- Provider API Keys ---
-# Add your keys from various providers below.
-# You can add multiple keys for one provider by numbering them (e.g., _1, _2).
-
+# --- Provider API Keys (Optional) ---
+# The proxy automatically finds keys in your environment variables.
+# You can also define them here. Add multiple keys by numbering them (_1, _2).
 GEMINI_API_KEY_1="YOUR_GEMINI_API_KEY_1"
 GEMINI_API_KEY_2="YOUR_GEMINI_API_KEY_2"
-
 OPENROUTER_API_KEY_1="YOUR_OPENROUTER_API_KEY_1"
 
-NVIDIA_NIM_API_KEY_1="YOUR_NVIDIA_NIM_API_KEY_1"
-
-CHUTES_API_KEY_1="YOUR_CHUTES_API_KEY_1"
+# --- OAuth Credentials (Optional) ---
+# The proxy automatically finds credentials in standard system paths.
+# You can override this by specifying a path to your credential file.
+GEMINI_CLI_OAUTH_1="/path/to/your/specific/gemini_creds.json"
 ```
 
 ### 3. Run the Proxy
@@ -264,3 +276,43 @@ For convenience on Windows, you can use the provided `.bat` scripts in the root 
 
 -   **Using the Library**: For documentation on how to use the `api-key-manager` library directly in your own Python projects, please refer to its [README.md](src/rotator_library/README.md).
 -   **Technical Details**: For a more in-depth technical explanation of the library's architecture, components, and internal workings, please refer to the [Technical Documentation](DOCUMENTATION.md).
+
+### Advanced Model Filtering (Whitelists & Blacklists)
+
+The proxy provides a powerful way to control which models are available to your applications using environment variables in your `.env` file.
+
+#### How It Works
+
+The filtering logic is applied in this order:
+
+1.  **Whitelist Check**: If a provider has a whitelist defined (`WHITELIST_MODELS_<PROVIDER>`), any model on that list will **always be available**, even if it's on the blacklist.
+2.  **Blacklist Check**: For any model *not* on the whitelist, the proxy checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model is on the blacklist, it will be hidden.
+3.  **Default**: If a model is on neither list, it will be available.
+
+This allows for two powerful patterns:
+
+#### Use Case 1: Pure Whitelist Mode
+
+You can expose *only* the specific models you want. To do this, set the blacklist to `*` to block all models by default, and then add the desired models to the whitelist.
+
+**Example `.env`:**
+```env
+# Block all Gemini models by default
+IGNORE_MODELS_GEMINI="*"
+
+# Only allow gemini-1.5-pro and gemini-1.5-flash
+WHITELIST_MODELS_GEMINI="gemini-1.5-pro-latest,gemini-1.5-flash-latest"
+```
+
+#### Use Case 2: Exemption Mode
+
+You can block a broad category of models and then use the whitelist to make specific exceptions.
+
+**Example `.env`:**
+```env
+# Block all preview models from OpenAI
+IGNORE_MODELS_OPENAI="*-preview*"
+
+# But make an exception for a specific preview model you want to test
+WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
+```

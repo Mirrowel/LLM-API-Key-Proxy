@@ -42,6 +42,20 @@ client = RotatingClient(
 *   Dynamically loading and using provider-specific plugins from the `providers/` directory.
 *   Executing API calls via `litellm` with a robust, **deadline-driven** retry and key selection strategy.
 *   Providing a safe, stateful wrapper for handling streaming responses.
+*   Filtering available models using configurable whitelists and blacklists.
+
+#### Model Filtering Logic
+
+The `RotatingClient` provides fine-grained control over which models are exposed via the `/v1/models` endpoint. This is handled by the `get_available_models` method, which is called by `get_all_available_models`.
+
+The logic is as follows:
+1.  The client is initialized with `ignore_models` (blacklist) and `whitelist_models` dictionaries.
+2.  When `get_available_models` is called for a provider, it first fetches all models from the provider's API.
+3.  It then iterates through this list of actual models and applies the following rules:
+    -   **Whitelist Check**: It first checks if the model matches any pattern in the provider's whitelist. If it does, the model is **immediately included** in the final list, and the blacklist is ignored for this model.
+    -   **Blacklist Check**: If the model is *not* on the whitelist, it is then checked against the blacklist. If it matches a pattern, it is excluded.
+    -   **Default**: If a model is on neither list, it is included.
+4.  This ensures that the whitelist always acts as a definitive override to the blacklist.
 
 #### Request Lifecycle: A Deadline-Driven Approach
 

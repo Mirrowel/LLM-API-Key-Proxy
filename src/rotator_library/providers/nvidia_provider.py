@@ -1,6 +1,7 @@
 import httpx
 import logging
 from typing import List
+import litellm
 from .provider_interface import ProviderInterface
 
 lib_logger = logging.getLogger('rotator_library')
@@ -9,6 +10,7 @@ if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
 
 class NvidiaProvider(ProviderInterface):
+    skip_cost_calculation = True
     """
     Provider implementation for the NVIDIA API.
     """
@@ -22,7 +24,8 @@ class NvidiaProvider(ProviderInterface):
                 headers={"Authorization": f"Bearer {api_key}"}
             )
             response.raise_for_status()
-            return [f"nvidia_nim/{model['id']}" for model in response.json().get("data", [])]
+            models = [f"nvidia_nim/{model['id']}" for model in response.json().get("data", [])]
+            return models
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to fetch NVIDIA models: {e}")
             return []
