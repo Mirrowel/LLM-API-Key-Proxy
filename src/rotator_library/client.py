@@ -915,6 +915,8 @@ class RotatingClient:
             if last_exception:
                 final_error_message = f"Failed to complete the streaming request. Last error: {str(last_exception)}"
                 lib_logger.error(f"Streaming request failed after trying all keys. Last error: {last_exception}")
+            else:
+                lib_logger.error(final_error_message)
 
             error_data = {"error": {"message": final_error_message, "type": "proxy_error"}}
             yield f"data: {json.dumps(error_data)}\n\n"

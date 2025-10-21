@@ -376,7 +376,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 for tc_chunk in delta["tool_calls"]:
                     index = tc_chunk["index"]
                     if index not in aggregated_tool_calls:
-                        aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}}
+                        aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
                     if "function" in tc_chunk:
@@ -613,6 +613,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 except httpx.HTTPStatusError as e:
                     file_logger.log_error(f"Stream handler HTTPStatusError: {str(e)}")
                     if e.response.status_code == 429:
+                        await e.response.aread()  # Read the response to access content
                         raise RateLimitError(
                             message=f"Gemini CLI rate limit exceeded: {e.response.text}",
                             llm_provider="gemini_cli",
