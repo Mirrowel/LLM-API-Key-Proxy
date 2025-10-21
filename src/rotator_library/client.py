@@ -675,7 +675,9 @@ class RotatingClient:
                                     raise e
 
                                 last_exception = e
-                                classified_error = classify_error(e)
+                                # If the exception is our custom wrapper, unwrap the original error
+                                original_exc = getattr(e, 'data', e)
+                                classified_error = classify_error(original_exc)
                                 await self.usage_manager.record_failure(current_cred, model, classified_error)
                                 lib_logger.warning(f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during custom provider stream. Rotating key.")
                                 break
@@ -777,13 +779,12 @@ class RotatingClient:
                         except (StreamedAPIError, litellm.RateLimitError) as e:
                             last_exception = e
                             
-                            classified_error = classify_error(e)
-                            
                             # This is the final, robust handler for streamed errors.
                             error_payload = {}
                             cleaned_str = None
                             # The actual exception might be wrapped in our StreamedAPIError.
                             original_exc = getattr(e, 'data', e)
+                            classified_error = classify_error(original_exc)
 
                             try:
                                 # The full error JSON is in the string representation of the exception.
