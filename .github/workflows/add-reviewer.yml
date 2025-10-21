@@ -8,7 +8,10 @@ jobs:
   add-reviewer:
     if: |
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/mirrobot-add')
+      (
+      contains(github.event.comment.body, '/mirrobot-add') ||
+      contains(github.event.comment.body, '/mirrobot_add')
+      )
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write # To add a reviewer
@@ -27,7 +30,7 @@ jobs:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          gh pr edit $PR_NUMBER --add-reviewer mirrobot-agent --repo ${{ github.repository }}
+          gh pr edit $PR_NUMBER --add-reviewer mirrobot-agent[bot] --repo ${{ github.repository }}
 
       - name: Add reaction to comment
         env:
