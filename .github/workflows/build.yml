@@ -25,13 +25,22 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      id: setup-python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      id: cache-pip
+      with:
+        path: ${{ steps.setup-python.outputs.pip-cache-path }}
+        key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-3.12-
+
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
 
@@ -332,12 +341,21 @@ jobs:
         $CHANGELOG_URL
         EOF
 
+        # Set release flags based on the branch
+        PRERELEASE_FLAG=""
+        LATEST_FLAG="--latest"
+        if [ "${{ github.ref_name }}" != "main" ]; then
+          PRERELEASE_FLAG="--prerelease"
+          LATEST_FLAG="" # Do not mark pre-releases as 'latest'
+        fi
+        
         # Create the release using the notes file
         gh release create ${{ steps.version.outputs.release_tag }} \
           --target ${{ github.sha }} \
           --title "${{ steps.version.outputs.release_title }}" \
           --notes-file releasenotes.md \
-          --latest \
+          $LATEST_FLAG \
+          $PRERELEASE_FLAG \
           ${{ steps.archive.outputs.ASSET_PATH }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
