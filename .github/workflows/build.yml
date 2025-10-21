@@ -33,7 +33,7 @@ jobs:
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
-        path: ~/.cache/pip
+        path: ${{ steps.setup-python.outputs.python-path }}
         key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-3.12
@@ -42,6 +42,14 @@ jobs:
       run: |
         pip install -r requirements.txt
         pip install pyinstaller
+
+    - name: Cache PyInstaller build data
+      uses: actions/cache@v4
+      with:
+        path: ~\AppData\Local\pyinstaller
+        key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pyinstaller-3.12-
 
     - name: Build executable
       run: python src/proxy_app/build.py
