@@ -175,7 +175,7 @@ goto :ConfigMenu
 :: --- Phase 4: Execution ---
 :RunProxy
 cls
-set "ARGS=--host %HOST% --port %PORT%"
+set "ARGS=--host "%HOST%" --port %PORT%"
 if "%LOGGING%"=="true" (
     set "ARGS=%ARGS% --enable-request-logging"
 )
@@ -183,10 +183,10 @@ echo Starting Proxy...
 echo Arguments: %ARGS%
 echo.
 if "%EXECUTION_MODE%"=="exe" (
-    start "LLM API Proxy" %EXE_NAME% %ARGS%
+    start "LLM API Proxy" "%EXE_NAME%" %ARGS%
 ) else (
     set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
-    start "LLM API Proxy" python %SOURCE_PATH% %ARGS%
+    start "LLM API Proxy" python "%SOURCE_PATH%" %ARGS%
 )
 exit /b 0
 
@@ -195,10 +195,10 @@ cls
 echo Launching Credential Tool...
 echo.
 if "%EXECUTION_MODE%"=="exe" (
-    %EXE_NAME% --add-credential
+    "%EXE_NAME%" --add-credential
 ) else (
     set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
-    python %SOURCE_PATH% --add-credential
+    python "%SOURCE_PATH%" --add-credential
 )
 pause
 goto :MainMenu
@@ -210,7 +210,7 @@ echo      Building Executable
 echo ==================================================
 echo.
 echo The build process will start in a new window.
-start "Build Process" cmd /c "pip install -r requirements.txt && pip install pyinstaller && python src/proxy_app/build.py && echo Build finished. && pause"
+start "Build Process" cmd /c "pip install -r requirements.txt && pip install pyinstaller && python "src/proxy_app/build.py" && echo Build finished. && pause"
 exit /b
 
 :: --- Helper Functions ---
@@ -224,8 +224,8 @@ echo.
 echo   Both executable and source code found.
 echo   Please choose which to use:
 echo.
-echo   1. Executable (%EXE_NAME%)
-echo   2. Source Code (%SOURCE_PATH%)
+echo   1. Executable ("%EXE_NAME%")
+echo   2. Source Code ("%SOURCE_PATH%")
 echo.
 set /p "CHOICE=Enter your choice: "
 
@@ -280,8 +280,8 @@ echo ==================================================
 echo      Error
 echo ==================================================
 echo.
-echo   Could not find the executable (%EXE_NAME%)
-echo   or the source code (%SOURCE_PATH%).
+echo   Could not find the executable ("%EXE_NAME%")
+echo   or the source code ("%SOURCE_PATH%").
 echo.
 echo   Please ensure the launcher is in the correct
 echo   directory or that the project has been built.
