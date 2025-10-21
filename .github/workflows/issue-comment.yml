@@ -174,6 +174,19 @@ jobs:
           echo "ISSUE_AUTHOR=$author" >> $GITHUB_ENV
 
 
+      - name: Check for model override
+        id: model_override
+        env:
+          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
+          else
+            echo "No model override found, using default."
+            echo "model_arg=" >> $GITHUB_ENV
+          fi
+
       - name: Analyze issue and suggest resolution
         env:
           OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
@@ -189,7 +202,7 @@ jobs:
         run: |
           # Use a heredoc (<<'END_OF_PROMPT') to pass the prompt safely via stdin.
           # The "-" tells the opencode command to read the prompt from stdin.
-          opencode run --share - <<'END_OF_PROMPT'
+          opencode run --share $model_arg - <<'END_OF_PROMPT'
           # [ROLE & OBJECTIVE]
           You are an expert AI software engineer specializing in bug triage and analysis. Your goal is to provide a comprehensive initial analysis of this new issue to help the maintainers. You will perform an investigation and report your findings directly on the GitHub issue.
 

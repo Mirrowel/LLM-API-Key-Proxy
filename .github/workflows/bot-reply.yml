@@ -290,6 +290,19 @@ jobs:
       - name: Ensure opencode directory exists
         run: mkdir -p /home/runner/.local/share/opencode/project
 
+      - name: Check for model override
+        id: model_override
+        env:
+          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
+          else
+            echo "No model override found, using default."
+            echo "model_arg=" >> $GITHUB_ENV
+          fi
+
       - name: Analyze comment and respond
         env:
           OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
@@ -310,5 +323,5 @@ jobs:
               "webfetch": "deny"
             }
         run: |
-            envsubst < .github/prompts/bot-reply.md | opencode run --share -
+            envsubst < .github/prompts/bot-reply.md | opencode run --share $model_arg -
             

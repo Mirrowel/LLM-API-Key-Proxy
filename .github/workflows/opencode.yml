@@ -107,12 +107,24 @@ jobs:
         if: steps.check_requirements_file.outputs.exists == 'true'
         run: pip install -r requirements.txt
 
+      - name: Check for model override
+        id: model_override
+        env:
+          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+            echo "model_arg=$MODEL_OVERRIDE_SECRET" >> $GITHUB_OUTPUT
+          else
+            echo "No model override found, using default."
+            echo "model_arg=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run opencode
         uses: sst/opencode/github@latest
         env:
           OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
           GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
         with:
-          model: llm-proxy/main_model
+          model: ${{ steps.model_override.outputs.model_arg || 'llm-proxy/main_model' }}
           share: true
-          token: ${{ steps.generate_token.outputs.token }}

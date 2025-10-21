@@ -215,6 +215,19 @@ jobs:
       - name: Ensure opencode directory exists
         run: mkdir -p /home/runner/.local/share/opencode/project
 
+      - name: Check for model override
+        id: model_override
+        env:
+          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
+          else
+            echo "No model override found, using default."
+            echo "model_arg=" >> $GITHUB_ENV
+          fi
+
       - name: Review PR comprehensively
         env:
           OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
@@ -230,7 +243,7 @@ jobs:
         run: |
           # Use a heredoc (<<'END_OF_PROMPT') to pass the prompt safely via stdin.
           # The "-" tells the opencode command to read the prompt from stdin.
-          opencode run --share - <<'END_OF_PROMPT'
+          opencode run --share $model_arg - <<'END_OF_PROMPT'
           # [ROLE AND OBJECTIVE]
           You are an expert AI code reviewer. Your goal is to provide meticulous, constructive, and actionable feedback by posting it directly to the pull request as a series of commands.
 
