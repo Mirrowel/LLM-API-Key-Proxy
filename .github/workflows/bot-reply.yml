@@ -21,11 +21,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Stash prompts from base branch(For security reasons)
-        run: |
-          mkdir -p /tmp/prompts
-          cp .github/prompts/*.md /tmp/prompts
-
       - name: Bot Setup
         id: setup
         uses: ./.github/actions/bot-setup
@@ -221,6 +216,10 @@ jobs:
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
 
+      - name: Fetch prompts from base branch (Security)
+        if: steps.context.outputs.IS_PR == 'true'
+        run: git checkout origin/${{ github.event.repository.default_branch }} -- .github/prompts
+
       - name: Checkout repository (for issues)
         if: steps.context.outputs.IS_PR == 'false'
         uses: actions/checkout@v4
@@ -248,5 +247,5 @@ jobs:
               "webfetch": "deny"
             }
         run: |
-            envsubst < /tmp/prompts/bot-reply.md | opencode run --share ${{ steps.setup.outputs.model-arg }} -
+            envsubst < .github/prompts/bot-reply.md | opencode run --share ${{ steps.setup.outputs.model-arg }} -
             
