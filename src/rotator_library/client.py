@@ -710,6 +710,10 @@ class RotatingClient:
                                     raise last_exception
                                 await self.usage_manager.record_failure(current_cred, model, classified_error)
                                 break
+                        
+                        # If the inner loop breaks, it means the key failed and we need to rotate.
+                        # Continue to the next iteration of the outer while loop to pick a new key.
+                        continue
 
                     else: # This is the standard API Key / litellm-handled provider logic
                         is_oauth = provider in self.oauth_providers
@@ -736,6 +740,12 @@ class RotatingClient:
                     
                     litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
 
+                    # If the provider is 'qwen_code', set the custom provider to 'qwen'
+                    # and strip the prefix from the model name for LiteLLM.
+                    if provider == "qwen_code":
+                        litellm_kwargs["custom_llm_provider"] = "qwen"
+                        litellm_kwargs["model"] = model.split('/', 1)[1]
+
                     for attempt in range(self.max_retries):
                         try:
                             lib_logger.info(f"Attempting stream with credential ...{current_cred[-6:]} (Attempt {attempt + 1}/{self.max_retries})")
@@ -749,6 +759,7 @@ class RotatingClient:
                                     else:
                                         lib_logger.warning(f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}")
                             
+                            lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
                             response = await litellm.acompletion(
                                 **litellm_kwargs,
                                 logger_fn=self._litellm_logger_callback

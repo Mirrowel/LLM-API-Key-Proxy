@@ -66,7 +66,7 @@ from proxy_app.batch_manager import EmbeddingBatcher
 from proxy_app.detailed_logger import DetailedLogger
 
 # --- Logging Configuration ---
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 # Configure a file handler for INFO-level logs and higher
@@ -489,6 +489,25 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
+    if ENABLE_REQUEST_LOGGING:
+        # Preserve and re-use the request body so downstream code can still call request.json()
+        raw_body = await request.body()
+        try:
+            parsed_body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        except Exception:
+            parsed_body = {}
+        # Reattach the raw body for later reads
+        request._body = raw_body
+
+        # Extract the fields we want to log (supporting possible nesting in generationConfig)
+        model = parsed_body.get("model")
+        generation_cfg = parsed_body.get("generationConfig", {}) or parsed_body.get("generation_config", {}) or {}
+        reasoning_effort = parsed_body.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
+        custom_reasoning_budget = parsed_body.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
+
+        logging.getLogger("rotator_library").info(
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+        )
     logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
     try:
         request_data = await request.json()

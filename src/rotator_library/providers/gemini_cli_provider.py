@@ -10,10 +10,67 @@ from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 import litellm
 from litellm.exceptions import RateLimitError
+from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
 import os
 from pathlib import Path
+import uuid
+from datetime import datetime
 
 lib_logger = logging.getLogger('rotator_library')
+
+LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
+GEMINI_CLI_LOGS_DIR = LOGS_DIR / "gemini_cli_logs"
+
+class _GeminiCliFileLogger:
+    """A simple file logger for a single Gemini CLI transaction."""
+    def __init__(self, model_name: str):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        request_id = str(uuid.uuid4())
+        # Sanitize model name for directory
+        safe_model_name = model_name.replace('/', '_').replace(':', '_')
+        self.log_dir = GEMINI_CLI_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.enabled = True
+        except Exception as e:
+            lib_logger.error(f"Failed to create Gemini CLI log directory: {e}")
+            self.enabled = False
+
+    def log_request(self, payload: Dict[str, Any]):
+        """Logs the request payload sent to Gemini."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "request_payload.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_GeminiCliFileLogger: Failed to write request: {e}")
+
+    def log_response_chunk(self, chunk: str):
+        """Logs a raw chunk from the Gemini response stream."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
+                f.write(chunk + "\n")
+        except Exception as e:
+            lib_logger.error(f"_GeminiCliFileLogger: Failed to write response chunk: {e}")
+
+    def log_error(self, error_message: str):
+        """Logs an error message."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
+        except Exception as e:
+            lib_logger.error(f"_GeminiCliFileLogger: Failed to write error: {e}")
+
+    def log_final_response(self, response_data: Dict[str, Any]):
+        """Logs the final, reassembled response."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
+                json.dump(response_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_GeminiCliFileLogger: Failed to write final response: {e}")
 
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
@@ -277,6 +334,161 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             
             yield openai_chunk
 
+    def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
+        """
+        Manually reassembles streaming chunks into a complete response.
+        This replaces the non-existent litellm.utils.stream_to_completion_response function.
+        """
+        if not chunks:
+            raise ValueError("No chunks provided for reassembly")
+
+        # Initialize the final response structure
+        final_message = {"role": "assistant"}
+        aggregated_tool_calls = {}
+        usage_data = None
+        finish_reason = None
+
+        # Get the first chunk for basic response metadata
+        first_chunk = chunks[0]
+
+        # Process each chunk to aggregate content
+        for chunk in chunks:
+            if not hasattr(chunk, 'choices') or not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.get("delta", {})
+
+            # Aggregate content
+            if "content" in delta and delta["content"] is not None:
+                if "content" not in final_message:
+                    final_message["content"] = ""
+                final_message["content"] += delta["content"]
+
+            # Aggregate reasoning content
+            if "reasoning_content" in delta and delta["reasoning_content"] is not None:
+                if "reasoning_content" not in final_message:
+                    final_message["reasoning_content"] = ""
+                final_message["reasoning_content"] += delta["reasoning_content"]
+
+            # Aggregate tool calls
+            if "tool_calls" in delta and delta["tool_calls"]:
+                for tc_chunk in delta["tool_calls"]:
+                    index = tc_chunk["index"]
+                    if index not in aggregated_tool_calls:
+                        aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}}
+                    if "id" in tc_chunk:
+                        aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                    if "function" in tc_chunk:
+                        if "name" in tc_chunk["function"] and tc_chunk["function"]["name"] is not None:
+                            aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
+                        if "arguments" in tc_chunk["function"] and tc_chunk["function"]["arguments"] is not None:
+                            aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
+
+            # Aggregate function calls (legacy format)
+            if "function_call" in delta and delta["function_call"] is not None:
+                if "function_call" not in final_message:
+                    final_message["function_call"] = {"name": "", "arguments": ""}
+                if "name" in delta["function_call"] and delta["function_call"]["name"] is not None:
+                    final_message["function_call"]["name"] += delta["function_call"]["name"]
+                if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
+                    final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
+
+            # Get finish reason from the last chunk that has it
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+        # Handle usage data from the last chunk that has it
+        for chunk in reversed(chunks):
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_data = chunk.usage
+                break
+
+        # Add tool calls to final message if any
+        if aggregated_tool_calls:
+            final_message["tool_calls"] = list(aggregated_tool_calls.values())
+
+        # Ensure standard fields are present for consistent logging
+        for field in ["content", "tool_calls", "function_call"]:
+            if field not in final_message:
+                final_message[field] = None
+
+        # Construct the final response
+        final_choice = {
+            "index": 0,
+            "message": final_message,
+            "finish_reason": finish_reason
+        }
+
+        # Create the final ModelResponse
+        final_response_data = {
+            "id": first_chunk.id,
+            "object": "chat.completion",
+            "created": first_chunk.created,
+            "model": first_chunk.model,
+            "choices": [final_choice],
+            "usage": usage_data
+        }
+
+        return litellm.ModelResponse(**final_response_data)
+
+    def _gemini_cli_transform_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Recursively transforms a JSON schema to be compatible with the Gemini CLI endpoint.
+        - Converts `type: ["type", "null"]` to `type: "type", nullable: true`
+        - Removes unsupported properties like `strict` and `additionalProperties`.
+        """
+        if not isinstance(schema, dict):
+            return schema
+
+        # Handle nullable types
+        if 'type' in schema and isinstance(schema['type'], list):
+            types = schema['type']
+            if 'null' in types:
+                schema['nullable'] = True
+                remaining_types = [t for t in types if t != 'null']
+                if len(remaining_types) == 1:
+                    schema['type'] = remaining_types[0]
+                elif len(remaining_types) > 1:
+                    schema['type'] = remaining_types # Let's see if Gemini supports this
+                else:
+                    del schema['type']
+
+        # Recurse into properties
+        if 'properties' in schema and isinstance(schema['properties'], dict):
+            for prop_schema in schema['properties'].values():
+                self._gemini_cli_transform_schema(prop_schema)
+
+        # Recurse into items (for arrays)
+        if 'items' in schema and isinstance(schema['items'], dict):
+            self._gemini_cli_transform_schema(schema['items'])
+
+        # Clean up unsupported properties
+        schema.pop("strict", None)
+        schema.pop("additionalProperties", None)
+        
+        return schema
+
+    def _transform_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Transforms a list of OpenAI-style tool schemas into the format required by the Gemini CLI API.
+        This uses a custom schema transformer instead of litellm's generic one.
+        """
+        transformed_declarations = []
+        for tool in tools:
+            if tool.get("type") == "function" and "function" in tool:
+                new_function = json.loads(json.dumps(tool["function"]))
+                
+                # The Gemini CLI API does not support the 'strict' property.
+                new_function.pop("strict", None)
+
+                if "parameters" in new_function and isinstance(new_function["parameters"], dict):
+                    new_function["parameters"] = self._gemini_cli_transform_schema(new_function["parameters"])
+                
+                transformed_declarations.append(new_function)
+        
+        return transformed_declarations
+
     async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
@@ -293,6 +505,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             
             # Handle :thinking suffix from Kilo example
             model_name = model.split('/')[-1].replace(':thinking', '')
+            
+            # [NEW] Create a dedicated file logger for this request
+            file_logger = _GeminiCliFileLogger(model_name=model_name)
 
             gen_config = {
                 "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
@@ -325,14 +540,14 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 request_payload["request"]["systemInstruction"] = system_instruction
 
             if "tools" in kwargs and kwargs["tools"]:
-                function_declarations = [
-                    tool["function"] for tool in kwargs["tools"] if tool.get("type") == "function"
-                ]
+                function_declarations = self._transform_tool_schemas(kwargs["tools"])
                 if function_declarations:
                     request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
             
-            # Log the final payload for debugging, as requested
+            # Log the final payload for debugging and to the dedicated file
             lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
+            file_logger.log_request(request_payload)
+            
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
 
             async def stream_handler():
@@ -342,19 +557,42 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     "X-Goog-Api-Client": "gl-node/22.17.0",
                     "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
                 })
-                async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if line.startswith('data: '):
-                            data_str = line[6:]
-                            if data_str == "[DONE]": break
-                            try:
-                                chunk = json.loads(data_str)
-                                for openai_chunk in self._convert_chunk_to_openai(chunk, model):
-                                    yield litellm.ModelResponse(**openai_chunk)
-                            except json.JSONDecodeError:
-                                lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
-            return stream_handler()
+                try:
+                    async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
+                        if response.status_code != 200:
+                            error_body = await response.aread()
+                            error_text = error_body.decode('utf-8', errors='ignore')
+                            file_logger.log_error(f"HTTP Error: {response.status_code}\n{error_text}")
+                            response.raise_for_status()
+
+                        async for line in response.aiter_lines():
+                            file_logger.log_response_chunk(line)
+                            if line.startswith('data: '):
+                                data_str = line[6:]
+                                if data_str == "[DONE]": break
+                                try:
+                                    chunk = json.loads(data_str)
+                                    for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                        yield litellm.ModelResponse(**openai_chunk)
+                                except json.JSONDecodeError:
+                                    lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
+                except Exception as e:
+                    file_logger.log_error(f"Stream handler exception: {str(e)}")
+                    raise
+
+            async def logging_stream_wrapper():
+                """Wraps the stream to log the final reassembled response."""
+                openai_chunks = []
+                try:
+                    async for chunk in stream_handler():
+                        openai_chunks.append(chunk)
+                        yield chunk
+                finally:
+                    if openai_chunks:
+                        final_response = self._stream_to_completion_response(openai_chunks)
+                        file_logger.log_final_response(final_response.dict())
+
+            return logging_stream_wrapper()
 
         try:
             response_gen = await do_call()
@@ -378,7 +616,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         else:
             # Accumulate stream for non-streaming response
             chunks = [chunk async for chunk in response_gen]
-            return litellm.utils.stream_to_completion_response(chunks)
+            return self._stream_to_completion_response(chunks)
 
     # Use the shared GeminiAuthBase for auth logic
     # get_models is not applicable for this custom provider
