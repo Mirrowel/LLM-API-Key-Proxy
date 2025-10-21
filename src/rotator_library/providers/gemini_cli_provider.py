@@ -489,6 +489,36 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return transformed_declarations
 
+    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Translates OpenAI's `tool_choice` to Gemini's `toolConfig`.
+        """
+        if not tool_choice:
+            return None
+
+        config = {}
+        mode = "AUTO"  # Default to auto
+
+        if isinstance(tool_choice, str):
+            if tool_choice == "auto":
+                mode = "AUTO"
+            elif tool_choice == "none":
+                mode = "NONE"
+            elif tool_choice == "required":
+                mode = "ANY"
+        elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function_name = tool_choice.get("function", {}).get("name")
+            if function_name:
+                mode = "ANY" # Force a call, but only to this function
+                config["functionCallingConfig"] = {
+                    "mode": mode,
+                    "allowedFunctionNames": [function_name]
+                }
+                return config
+
+        config["functionCallingConfig"] = {"mode": mode}
+        return config
+
     async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
@@ -543,6 +573,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 function_declarations = self._transform_tool_schemas(kwargs["tools"])
                 if function_declarations:
                     request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
+
+            # [NEW] Handle tool_choice translation
+            if "tool_choice" in kwargs and kwargs["tool_choice"]:
+                tool_config = self._translate_tool_choice(kwargs["tool_choice"])
+                if tool_config:
+                    request_payload["request"]["toolConfig"] = tool_config
             
             # Log the final payload for debugging and to the dedicated file
             lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
