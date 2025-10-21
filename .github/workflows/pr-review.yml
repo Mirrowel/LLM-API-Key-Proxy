@@ -1,12 +1,14 @@
 name: PR Review
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.prNumber }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.prNumber }}
   cancel-in-progress: false
 
 on:
   pull_request_target:
     types: [opened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       prNumber:
@@ -16,24 +18,24 @@ on:
 
 jobs:
   review-pr:
-    if: ${{
+    if: |
       github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
+      github.event.action == 'ready_for_review' ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'Agent Monitored')) ||
       (
-        github.event_name == 'pull_request_target' &&
-        (
-          (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
-          contains(github.event.pull_request.requested_reviewers.*.login, 'mirrobot-agent[bot]') ||
-          github.event.action == 'ready_for_review'
-        )
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.issue.labels.*.name, 'Agent Monitored') &&
+        (contains(github.event.comment.body, '/mirrobot-review') || contains(github.event.comment.body, '/mirrobot_review'))
       )
-      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
 
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number || inputs.prNumber }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.prNumber }}
 
     steps:
       - name: Bot Setup
