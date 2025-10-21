@@ -617,6 +617,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         raise RateLimitError(
                             message=f"Gemini CLI rate limit exceeded: {e.response.text}",
                             llm_provider="gemini_cli",
+                            model=model,
                             response=e.response
                         )
                     # Re-raise other status errors to be handled by the main acompletion logic
