@@ -409,7 +409,7 @@ async def streaming_response_wrapper(
                             for tc_chunk in value:
                                 index = tc_chunk["index"]
                                 if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}} # Initialize with minimal required keys
+                                    aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
                                 # Ensure 'function' key exists for this index before accessing its sub-keys
                                 if "function" not in aggregated_tool_calls[index]:
                                     aggregated_tool_calls[index]["function"] = {"name": "", "arguments": ""}
