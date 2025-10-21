@@ -613,9 +613,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 except httpx.HTTPStatusError as e:
                     file_logger.log_error(f"Stream handler HTTPStatusError: {str(e)}")
                     if e.response.status_code == 429:
-                        await e.response.aread()  # Read the response to access content
+                        # Pass the raw response object to the exception. Do not read the
+                        # response body here as it will close the stream and cause a
+                        # 'StreamClosed' error in the client's stream reader.
                         raise RateLimitError(
-                            message=f"Gemini CLI rate limit exceeded: {e.response.text}",
+                            message=f"Gemini CLI rate limit exceeded: {e.request.url}",
                             llm_provider="gemini_cli",
                             model=model,
                             response=e.response
