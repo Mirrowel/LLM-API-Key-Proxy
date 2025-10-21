@@ -1,0 +1,327 @@
+name: Bot Reply on Mention
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  continuous-reply:
+    if: ${{ contains(github.event.comment.body, '@mirrobot') || contains(github.event.comment.body, '@mirrobot-agent') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    env:
+      THREAD_NUMBER: ${{ github.event.issue.number }}
+
+    steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: Gather Full Thread Context
+        id: context
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          # Common Info
+          echo "NEW_COMMENT_AUTHOR=${{ github.event.comment.user.login }}" >> $GITHUB_ENV
+          # Use a unique delimiter for safety
+          COMMENT_DELIMITER="GH_BODY_DELIMITER_$(openssl rand -hex 8)"
+          { echo "NEW_COMMENT_BODY<<$COMMENT_DELIMITER"; echo "${{ github.event.comment.body }}"; echo "$COMMENT_DELIMITER"; } >> "$GITHUB_ENV"
+          # Determine if PR or Issue
+          if [ -n '${{ github.event.issue.pull_request }}' ]; then
+            IS_PR="true"
+          else
+            IS_PR="false"
+          fi
+          echo "IS_PR=$IS_PR" >> $GITHUB_OUTPUT
+          # Define a unique, random delimiter for the main context block
+          CONTEXT_DELIMITER="GH_CONTEXT_DELIMITER_$(openssl rand -hex 8)"
+          # Fetch and Format Context based on type
+          if [[ "$IS_PR" == "true" ]]; then
+            # Fetch PR data
+            pr_json=$(gh pr view ${{ env.THREAD_NUMBER }} --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,comments,reviews,closingIssuesReferences)
+            # Fetch review comments separately
+            review_comments_json=$(gh api "/repos/${{ github.repository }}/pulls/${{ env.THREAD_NUMBER }}/comments")
+
+            # Debug: Output pr_json and review_comments_json for inspection
+            echo "$pr_json" > pr_json.txt
+            echo "$review_comments_json" > review_comments_json.txt
+
+            # Fetch timeline data to find cross-references
+            timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.THREAD_NUMBER }}/timeline")
+
+            # For checkout step
+            echo "repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')" >> $GITHUB_OUTPUT
+            echo "ref_name=$(echo "$pr_json" | jq -r .headRefName)" >> $GITHUB_OUTPUT
+           
+            # For prompt context
+            echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
+            echo "THREAD_AUTHOR=$(echo "$pr_json" | jq -r .author.login)" >> $GITHUB_ENV
+            # Prepare all variables from JSON
+            author=$(echo "$pr_json" | jq -r .author.login)
+            created_at=$(echo "$pr_json" | jq -r .createdAt)
+            base_branch=$(echo "$pr_json" | jq -r .baseRefName)
+            head_branch=$(echo "$pr_json" | jq -r .headRefName)
+            state=$(echo "$pr_json" | jq -r .state)
+            additions=$(echo "$pr_json" | jq -r .additions)
+            deletions=$(echo "$pr_json" | jq -r .deletions)
+            total_commits=$(echo "$pr_json" | jq -r '.commits | length')
+            changed_files_count=$(echo "$pr_json" | jq -r '.files | length')
+            title=$(echo "$pr_json" | jq -r .title)
+            body=$(echo "$pr_json" | jq -r .body)
+            # Prepare changed files list
+            changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-((.deletions))"')
+            # Prepare general PR comments
+            comments=$(echo "$pr_json" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No general comments." end')
+            # Prepare reviews (only include reviews with a non-empty body or non-COMMENTED state, exclude ellipsis-dev)
+            reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
+            # Prepare review comments (group by pull_request_review_id, exclude ellipsis-dev)
+            review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+
+            # Prepare linked issues robustly by fetching each one individually.
+            linked_issues_content=""
+            issue_numbers=$(echo "$pr_json" | jq -r '.closingIssuesReferences[].number')
+
+            if [ -z "$issue_numbers" ]; then
+              linked_issues="No issues are formally linked for closure by this PR."
+            else
+              for number in $issue_numbers; do
+                # Fetch each issue's data separately. This is more reliable for cross-repo issues or permission nuances.
+                issue_details_json=$(gh issue view "$number" --repo "${{ github.repository }}" --json title,body 2>/dev/null || echo "{}")
+                
+                issue_title=$(echo "$issue_details_json" | jq -r '.title // "Title not available"')
+                issue_body=$(echo "$issue_details_json" | jq -r '.body // "Body not available"')
+                linked_issues_content+=$(printf "<issue>\n <number>#%s</number>\n <title>%s</title>\n <body>\n%s\n</body>\n</issue>\n" "$number" "$issue_title" "$issue_body")
+              done
+              linked_issues=$linked_issues_content
+            fi
+
+            # Prepare cross-references from timeline data
+            references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
+            if [ -z "$references" ]; then references="This PR has not been mentioned in other issues or PRs."; fi
+            
+            # Step 1: Write the header for the multi-line environment variable
+            echo "THREAD_CONTEXT<<$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+            # Step 2: Append the content line by line
+            echo "Type: Pull Request" >> "$GITHUB_ENV"
+            echo "PR Number: #${{ env.THREAD_NUMBER }}" >> "$GITHUB_ENV"
+            echo "Title: $title" >> "$GITHUB_ENV"
+            echo "Author: $author" >> "$GITHUB_ENV"
+            echo "Created At: $created_at" >> "$GITHUB_ENV"
+            echo "Base Branch: $base_branch" >> "$GITHUB_ENV"
+            echo "Head Branch: $head_branch" >> "$GITHUB_ENV"
+            echo "State: $state" >> "$GITHUB_ENV"
+            echo "Additions: $additions" >> "$GITHUB_ENV"
+            echo "Deletions: $deletions" >> "$GITHUB_ENV"
+            echo "Total Commits: $total_commits" >> "$GITHUB_ENV"
+            echo "Changed Files: $changed_files_count files" >> "$GITHUB_ENV"
+            echo "<pull_request_body>" >> "$GITHUB_ENV"
+            echo "$body" >> "$GITHUB_ENV"
+            echo "</pull_request_body>" >> "$GITHUB_ENV"
+            echo "<pull_request_comments>" >> "$GITHUB_ENV"
+            echo "$comments" >> "$GITHUB_ENV"
+            echo "</pull_request_comments>" >> "$GITHUB_ENV"
+            echo "<pull_request_reviews>" >> "$GITHUB_ENV"
+            echo "$reviews" >> "$GITHUB_ENV"
+            echo "</pull_request_reviews>" >> "$GITHUB_ENV"
+            echo "<pull_request_review_comments>" >> "$GITHUB_ENV"
+            echo "$review_comments" >> "$GITHUB_ENV"
+            echo "</pull_request_review_comments>" >> "$GITHUB_ENV"
+            echo "<pull_request_changed_files>" >> "$GITHUB_ENV"
+            echo "$changed_files_list" >> "$GITHUB_ENV"
+            echo "</pull_request_changed_files>" >> "$GITHUB_ENV"
+            echo "<linked_issues>" >> "$GITHUB_ENV"
+            echo "$linked_issues" >> "$GITHUB_ENV"
+            echo "</linked_issues>" >> "$GITHUB_ENV"
+
+            # Step 3: Write the closing delimiter
+            # Add cross-references to the final context
+            echo "<cross_references>" >> "$GITHUB_ENV"
+            echo "$references" >> "$GITHUB_ENV"
+            echo "</cross_references>" >> "$GITHUB_ENV"
+
+            echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+          else # It's an Issue
+            issue_data=$(gh issue view ${{ env.THREAD_NUMBER }} --repo ${{ github.repository }} --json author,title,body,createdAt,state,comments)
+            timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.THREAD_NUMBER }}/timeline")
+            echo "THREAD_AUTHOR=$(echo "$issue_data" | jq -r .author.login)" >> $GITHUB_ENV
+            # Prepare metadata
+            author=$(echo "$issue_data" | jq -r .author.login)
+            created_at=$(echo "$issue_data" | jq -r .createdAt)
+            state=$(echo "$issue_data" | jq -r .state)
+            title=$(echo "$issue_data" | jq -r .title)
+            body=$(echo "$issue_data" | jq -r .body)
+            # Prepare comments
+            comments=$(echo "$issue_data" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No comments have been posted yet." end')
+
+            # Prepare cross-references
+            references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
+            if [ -z "$references" ]; then references="No other issues or PRs have mentioned this thread."; fi
+
+            # Step 1: Write the header
+            echo "THREAD_CONTEXT<<$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+            # Step 2: Append the content line by line
+            echo "Type: Issue" >> "$GITHUB_ENV"
+            echo "Issue Number: #${{ env.THREAD_NUMBER }}" >> "$GITHUB_ENV"
+            echo "Title: $title" >> "$GITHUB_ENV"
+            echo "Author: $author" >> "$GITHUB_ENV"
+            echo "Created At: $created_at" >> "$GITHUB_ENV"
+            echo "State: $state" >> "$GITHUB_ENV"
+            echo "<issue_body>" >> "$GITHUB_ENV"
+            echo "$body" >> "$GITHUB_ENV"
+            echo "</issue_body>" >> "$GITHUB_ENV"
+            echo "<issue_comments>" >> "$GITHUB_ENV"
+            echo "$comments" >> "$GITHUB_ENV"
+            echo "</issue_comments>" >> "$GITHUB_ENV"
+            echo "<cross_references>" >> "$GITHUB_ENV"
+            echo "$references" >> "$GITHUB_ENV"
+            echo "</cross_references>" >> "$GITHUB_ENV"
+            # Step 3: Write the footer
+            echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout PR head
+        if: steps.context.outputs.IS_PR == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.context.outputs.repo_full_name }}
+          ref: ${{ steps.context.outputs.ref_name }}
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Checkout repository (for issues)
+        if: steps.context.outputs.IS_PR == 'false'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Configure Git for Bot
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          git config --global user.name "mirrobot-agent[bot]"
+          git config --global user.email "${{ secrets.BOT_APP_ID }}+mirrobot-agent@users.noreply.github.com"
+          git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Inject Custom Config (For Proxy Support)
+        run: |
+          mkdir -p ~/.config/opencode
+          CONFIG='{
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "llm-proxy": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Proxy",
+                "options": {
+                  "baseURL": "${{ secrets.PROXY_BASE_URL }}",
+                  "apiKey": "${{ secrets.PROXY_API_KEY }}",
+                  "timeout": 300000, // 5 minute timeout in ms
+                  "headers": {
+                    "User-Agent": "OpenCode/1.0",
+                    "X-Custom-Header": "your-value"
+                  }
+                },
+                "models": {
+                  "main_model": {
+                    "id": "${{ secrets.OPENCODE_MODEL }}",
+                    "name": "Custom Model",
+                    "limit": {
+                      "context": 262000,
+                      "output": 64192
+                    }
+                  },
+                  "fast_model": {
+                    "id": "${{ secrets.OPENCODE_FAST_MODEL }}",
+                    "name": "Fast Custom Model",
+                    "limit": {
+                      "context": 262000,
+                      "output": 64192
+                    }
+                  }
+                }
+              }
+            },
+            "model": "llm-proxy/main_model",
+            "small_model": "llm-proxy/fast_model",
+            "username": "mirrobot-agent",
+            "autoupdate": true
+          }'
+          echo "$CONFIG" > ~/.config/opencode/opencode.json
+
+      - name: Check for Python requirements file
+        id: check_requirements_file
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-3.12
+
+      - name: Install dependencies
+        if: steps.check_requirements_file.outputs.exists == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Install opencode
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Ensure opencode directory exists
+        run: mkdir -p /home/runner/.local/share/opencode/project
+
+      - name: Check for model override
+        id: model_override
+        env:
+          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
+            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
+            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
+          else
+            echo "No model override found, using default."
+            echo "model_arg=" >> $GITHUB_ENV
+          fi
+
+      - name: Analyze comment and respond
+        env:
+          OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          THREAD_CONTEXT: ${{ env.THREAD_CONTEXT }}
+          NEW_COMMENT_AUTHOR: ${{ env.NEW_COMMENT_AUTHOR }}
+          NEW_COMMENT_BODY: ${{ env.NEW_COMMENT_BODY }}
+          THREAD_NUMBER: ${{ env.THREAD_NUMBER }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          THREAD_AUTHOR: ${{ env.THREAD_AUTHOR }}
+          PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
+          OPENCODE_PERMISSION: |
+            {
+              "bash": {
+                "gh*": "allow",
+                "git*": "allow"
+              },
+              "webfetch": "deny"
+            }
+        run: |
+            envsubst < .github/prompts/bot-reply.md | opencode run --share $model_arg -
+            
