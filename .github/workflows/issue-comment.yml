@@ -23,110 +23,39 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
 
     steps:
-      - name: Generate GitHub App Token
-        id: generate_token
-        uses: actions/create-github-app-token@v1
+      - name: Bot Setup
+        id: setup
+        uses: ./.github/actions/bot-setup
         with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          bot-app-id: ${{ secrets.BOT_APP_ID }}
+          bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          proxy-base-url: ${{ secrets.PROXY_BASE_URL }}
+          proxy-api-key: ${{ secrets.PROXY_API_KEY }}
+          opencode-model: ${{ secrets.OPENCODE_MODEL }}
+          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
+          opencode-model-override: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
+          opencode-api-key-override: ${{ secrets.OPENCODE_API_KEY_OVERRIDE }}
+
+      - name: Add reaction to issue
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/${{ env.ISSUE_NUMBER }}/reactions \
+            -f content='eyes'
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.generate_token.outputs.token }}
+          token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
-
-      - name: Configure Git for Bot
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-        run: |
-          git config --global user.name "mirrobot-agent[bot]"
-          git config --global user.email "${{ secrets.BOT_APP_ID }}+mirrobot-agent@users.noreply.github.com"
-          git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
-
-      - name: Inject Custom Config (For Proxy Support)
-        run: |
-          mkdir -p ~/.config/opencode
-          CONFIG='{
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "llm-proxy": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Proxy",
-                "options": {
-                  "baseURL": "${{ secrets.PROXY_BASE_URL }}",
-                  "apiKey": "${{ secrets.PROXY_API_KEY }}",
-                  "timeout": 300000, // 5 minute timeout in ms
-                  "headers": {
-                    "User-Agent": "OpenCode/1.0",
-                    "X-Custom-Header": "your-value"
-                  }
-                },
-                "models": {
-                  "main_model": {
-                    "id": "${{ secrets.OPENCODE_MODEL }}",
-                    "name": "Custom Model",
-                    "limit": {
-                      "context": 262000,
-                      "output": 64192
-                    }
-                  },
-                  "fast_model": {
-                    "id": "${{ secrets.OPENCODE_FAST_MODEL }}",
-                    "name": "Fast Custom Model",
-                    "limit": {
-                      "context": 262000,
-                      "output": 64192
-                    }
-                  }
-                }
-              }
-            },
-            "model": "llm-proxy/main_model",
-            "small_model": "llm-proxy/fast_model",
-            "username": "mirrobot-agent",
-            "autoupdate": true
-          }'
-          echo "$CONFIG" > ~/.config/opencode/opencode.json
-
-      - name: Check for Python requirements file
-        id: check_requirements_file
-        run: |
-          if [ -f requirements.txt ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Set up Python
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Cache pip dependencies
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-3.12
-
-      - name: Install dependencies
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        run: pip install -r requirements.txt
-
-      - name: Install opencode
-        run: curl -fsSL https://opencode.ai/install | bash
-
-      - name: Ensure opencode directory exists
-        run: mkdir -p /home/runner/.local/share/opencode/project
 
       - name: Fetch and Format Full Issue Context
         id: issue_details
         env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
         run: |
           # Fetch all necessary data in one call
           issue_data=$(gh issue view ${{ env.ISSUE_NUMBER }} --json author,title,body,createdAt,state,comments)
@@ -173,24 +102,10 @@ jobs:
           # Also export author for the acknowledgment comment
           echo "ISSUE_AUTHOR=$author" >> $GITHUB_ENV
 
-
-      - name: Check for model override
-        id: model_override
-        env:
-          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
-        run: |
-          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
-            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
-            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
-          else
-            echo "No model override found, using default."
-            echo "model_arg=" >> $GITHUB_ENV
-          fi
-
       - name: Analyze issue and suggest resolution
         env:
-          OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
-          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          OPENCODE_API_KEY: ${{ steps.setup.outputs.opencode-api-key }}
+          GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
             {
               "bash": {
@@ -202,7 +117,7 @@ jobs:
         run: |
           # Use a heredoc (<<'END_OF_PROMPT') to pass the prompt safely via stdin.
           # The "-" tells the opencode command to read the prompt from stdin.
-          opencode run --share $model_arg - <<'END_OF_PROMPT'
+          opencode run --share ${{ steps.setup.outputs.model-arg }} - <<'END_OF_PROMPT'
           # [ROLE & OBJECTIVE]
           You are an expert AI software engineer specializing in bug triage and analysis. Your goal is to provide a comprehensive initial analysis of this new issue to help the maintainers. You will perform an investigation and report your findings directly on the GitHub issue.
 
