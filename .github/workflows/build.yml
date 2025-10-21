@@ -32,12 +32,11 @@ jobs:
 
     - name: Cache pip dependencies
       uses: actions/cache@v4
-      id: cache-pip
       with:
-        path: ${{ steps.setup-python.outputs.pip-cache-path }}
+        path: ~/.cache/pip
         key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
-          ${{ runner.os }}-pip-3.12-
+          ${{ runner.os }}-pip-3.12
 
     - name: Install dependencies
       run: |
@@ -89,6 +88,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      WHITELISTED_BRANCHES: "main"
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -341,12 +342,28 @@ jobs:
         $CHANGELOG_URL
         EOF
 
-        # Set release flags based on the branch
+        # Set release flags and notes based on the branch
+        CURRENT_BRANCH="${{ github.ref_name }}"
         PRERELEASE_FLAG=""
         LATEST_FLAG="--latest"
-        if [ "${{ github.ref_name }}" != "main" ]; then
+        EXPERIMENTAL_NOTE=""
+
+        # Check if the current branch is in the comma-separated whitelist
+        if ! [[ ",${{ env.WHITELISTED_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
           PRERELEASE_FLAG="--prerelease"
-          LATEST_FLAG="" # Do not mark pre-releases as 'latest'
+          LATEST_FLAG="" # Do not mark non-whitelisted branches as 'latest'
+          EXPERIMENTAL_NOTE=$(cat <<-EOF
+        > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
+        > |:---------------------------:|
+        > | This release is from the \`$CURRENT_BRANCH\` branch and is **not stable**. |
+        > | **Do not use in production.** |
+        EOF
+          )
+        fi
+
+        # Prepend the experimental note if it exists
+        if [ -n "$EXPERIMENTAL_NOTE" ]; then
+          echo -e "$EXPERIMENTAL_NOTE\n\n$(cat releasenotes.md)" > releasenotes.md
         fi
         
         # Create the release using the notes file
