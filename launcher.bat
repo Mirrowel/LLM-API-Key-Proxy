@@ -213,10 +213,10 @@ goto :eof
 set "COMMAND=%~1"
 set "ARGS=%~2"
 if "%EXECUTION_MODE%"=="exe" (
-    start "LLM PROXY" %EXE_NAME% %COMMAND% %ARGS%
+    start "LLM API Proxy" %EXE_NAME% %COMMAND% %ARGS%
 ) else (
     set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
-    start "LLM PROXY" python %SOURCE_PATH% %COMMAND% %ARGS%
+    start "LLM API Proxy" python %SOURCE_PATH% %COMMAND% %ARGS%
 )
 
 :SelectModeMenu
