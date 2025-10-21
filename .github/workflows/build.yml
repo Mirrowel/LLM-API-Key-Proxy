@@ -53,29 +53,22 @@ jobs:
         pip install pyinstaller
         pip install -e src/rotator_library
 
-    - name: Cache PyInstaller build data (Windows)
-      if: runner.os == 'Windows'
-      uses: actions/cache@v4
-      with:
-        path: $HOME/AppData/Local/pyinstaller
-        key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pyinstaller-3.12-
+    - name: Get PyInstaller cache directory
+      id: pyinstaller-cache-dir
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          echo "path=$HOME/AppData/Local/pyinstaller" >> $GITHUB_OUTPUT
+        elif [ "${{ runner.os }}" == "Linux" ]; then
+          echo "path=$HOME/.cache/pyinstaller" >> $GITHUB_OUTPUT
+        elif [ "${{ runner.os }}" == "macOS" ]; then
+          echo "path=$HOME/Library/Application Support/pyinstaller" >> $GITHUB_OUTPUT
+        fi
 
-    - name: Cache PyInstaller build data (Linux)
-      if: runner.os == 'Linux'
+    - name: Cache PyInstaller build data
       uses: actions/cache@v4
       with:
-        path: $HOME/.cache/pyinstaller
-        key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pyinstaller-3.12-
-
-    - name: Cache PyInstaller build data (macOS)
-      if: runner.os == 'macOS'
-      uses: actions/cache@v4
-      with:
-        path: $HOME/Library/Application Support/pyinstaller
+        path: ${{ steps.pyinstaller-cache-dir.outputs.path }}
         key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pyinstaller-3.12-
@@ -84,14 +77,8 @@ jobs:
       run: python src/proxy_app/build.py
 
     - name: Ensure PyInstaller cache directory exists
-      if: runner.os != 'macOS'
       shell: bash
-      run: |
-        if [ "${{ runner.os }}" == "Windows" ]; then
-          mkdir -p "$HOME/AppData/Local/pyinstaller"
-        elif [ "${{ runner.os }}" == "Linux" ]; then
-          mkdir -p "$HOME/.cache/pyinstaller"
-        fi
+      run: mkdir -p ${{ steps.pyinstaller-cache-dir.outputs.path }}
 
     - name: Get short SHA
       id: version
@@ -372,14 +359,17 @@ jobs:
           CHANGELOG_URL=""
         fi
 
-        # Generate file table
-        FILE_TABLE="| OS | File | Description |\n|----|------|-------------|\n"
+        # Generate file descriptions
+        FILE_TABLE="| File | Description |\n|------|-------------|\n"
+        FILE_TABLE="$FILE_TABLE| \`proxy_app.exe\` | Main application executable for **Windows**. |\n"
+        FILE_TABLE="$FILE_TABLE| \`proxy_app\` | Main application executable for **Linux** and **macOS**. |\n"
+        FILE_TABLE="$FILE_TABLE| \`launcher.bat\` | A batch script to easily configure and run the proxy on Windows. |"
+
+        # List archives
         WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
         LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Linux')
         MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macOS')
-        FILE_TABLE="$FILE_TABLE| Windows | \`$WINDOWS_ARCHIVE\` | Contains \`proxy_app.exe\` and \`launcher.bat\` | \n"
-        FILE_TABLE="$FILE_TABLE| Linux | \`$LINUX_ARCHIVE\` | Contains \`proxy_app\` and \`launcher.bat\` | \n"
-        FILE_TABLE="$FILE_TABLE| macOS | \`$MACOS_ARCHIVE\` | Contains \`proxy_app\` and \`launcher.bat\` | \n"
+        ARCHIVE_LIST="- **Windows**: \`$WINDOWS_ARCHIVE\`\n- **Linux**: \`$LINUX_ARCHIVE\`\n- **macOS**: \`$MACOS_ARCHIVE\`"
 
         cat > releasenotes.md <<-EOF
         ## Build Information
@@ -398,7 +388,11 @@ jobs:
         $CHANGELOG_CONTENT
 
         ### 📁 Included Files
+        Each OS-specific archive contains the following files:
         $FILE_TABLE
+
+        ### 📦 Archives
+        $ARCHIVE_LIST
 
         ## 🔗 Useful Links
         - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
