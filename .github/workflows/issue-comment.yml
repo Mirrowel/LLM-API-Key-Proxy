@@ -23,6 +23,10 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
 
     steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Bot Setup
         id: setup
         uses: ./.github/actions/bot-setup

@@ -38,6 +38,10 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.prNumber }}
 
     steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Bot Setup
         id: setup
         uses: ./.github/actions/bot-setup
