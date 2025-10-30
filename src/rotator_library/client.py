@@ -448,6 +448,18 @@ class RotatingClient:
                 if provider_plugin and provider_plugin.has_custom_logic():
                     lib_logger.debug(f"Provider '{provider}' has custom logic. Delegating call.")
                     litellm_kwargs["credential_identifier"] = current_cred
+
+                    # Check body first for custom_reasoning_budget
+                    if "custom_reasoning_budget" in kwargs:
+                        litellm_kwargs["custom_reasoning_budget"] = kwargs["custom_reasoning_budget"]
+                    else:
+                        custom_budget_header = None
+                        if request and hasattr(request, 'headers'):
+                            custom_budget_header = request.headers.get("custom_reasoning_budget")
+
+                        if custom_budget_header is not None:
+                            is_budget_enabled = custom_budget_header.lower() == 'true'
+                            litellm_kwargs["custom_reasoning_budget"] = is_budget_enabled
                     
                     # The plugin handles the entire call, including retries on 401, etc.
                     # The main retry loop here is for key rotation on other errors.
@@ -631,8 +643,17 @@ class RotatingClient:
                     litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
+                    # Check body first for custom_reasoning_budget
                     if "custom_reasoning_budget" in kwargs:
                         litellm_kwargs["custom_reasoning_budget"] = kwargs["custom_reasoning_budget"]
+                    else:
+                        custom_budget_header = None
+                        if request and hasattr(request, 'headers'):
+                            custom_budget_header = request.headers.get("custom_reasoning_budget")
+
+                        if custom_budget_header is not None:
+                            is_budget_enabled = custom_budget_header.lower() == 'true'
+                            litellm_kwargs["custom_reasoning_budget"] = is_budget_enabled
                     
                     # [NEW] Merge provider-specific params
                     if provider in self.litellm_provider_params:
