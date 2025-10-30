@@ -490,6 +490,8 @@ class RotatingClient:
                     
                     if provider == "gemini" and provider_instance:
                         provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+                    if provider == "nvidia_nim" and provider_instance:
+                        provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:
                         litellm_kwargs["messages"] = [{"role": "user", "content": m["content"]} if m.get("role") == "system" else m for m in litellm_kwargs["messages"]]
@@ -756,6 +758,8 @@ class RotatingClient:
                                 del litellm_kwargs["safety_settings"]
                     
                     if provider == "gemini" and provider_instance:
+                        provider_instance.handle_thinking_parameter(litellm_kwargs, model)
+                    if provider == "nvidia_nim" and provider_instance:
                         provider_instance.handle_thinking_parameter(litellm_kwargs, model)
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:

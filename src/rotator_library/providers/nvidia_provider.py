@@ -1,6 +1,6 @@
 import httpx
 import logging
-from typing import List
+from typing import List, Dict, Any
 import litellm
 from .provider_interface import ProviderInterface
 
@@ -29,3 +29,27 @@ class NvidiaProvider(ProviderInterface):
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to fetch NVIDIA models: {e}")
             return []
+
+    def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
+        """
+        Adds the 'thinking' parameter for specific DeepSeek models on the NVIDIA provider,
+        only if reasoning_effort is set to low, medium, or high.
+        """
+        deepseek_models = [
+            "deepseek-ai/deepseek-v3.1",
+            "deepseek-ai/deepseek-v3.1-terminus",
+            "deepseek-ai/deepseek-v3.2"
+        ]
+
+        # The model name in the payload is prefixed with 'nvidia_nim/'
+        model_name = model.split('/', 1)[1] if '/' in model else model
+        reasoning_effort = payload.get("reasoning_effort")
+
+        if model_name in deepseek_models and reasoning_effort in ["low", "medium", "high"]:
+            if "extra_body" not in payload:
+                payload["extra_body"] = {}
+            if "chat_template_kwargs" not in payload["extra_body"]:
+                payload["extra_body"]["chat_template_kwargs"] = {}
+            
+            payload["extra_body"]["chat_template_kwargs"]["thinking"] = True
+            lib_logger.info(f"Enabled 'thinking' parameter for model: {model_name} due to reasoning_effort: '{reasoning_effort}'")
