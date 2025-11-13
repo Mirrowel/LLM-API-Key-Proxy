@@ -78,9 +78,7 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-09-2025"
+    "gemini-2.5-flash-lite"
 ]
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
