@@ -282,9 +282,10 @@ async def lifespan(app: FastAPI):
         api_keys=api_keys,
         oauth_credentials=oauth_credentials, # Pass OAuth config
         configure_logging=True,
-        litellm_provider_params=litellm_provider_params, # [NEW]
+        litellm_provider_params=litellm_provider_params,
         ignore_models=ignore_models,
-        whitelist_models=whitelist_models
+        whitelist_models=whitelist_models,
+        enable_request_logging=ENABLE_REQUEST_LOGGING
     )
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client

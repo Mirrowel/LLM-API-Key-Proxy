@@ -23,7 +23,11 @@ GEMINI_CLI_LOGS_DIR = LOGS_DIR / "gemini_cli_logs"
 
 class _GeminiCliFileLogger:
     """A simple file logger for a single Gemini CLI transaction."""
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, enabled: bool = True):
+        self.enabled = enabled
+        if not self.enabled:
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         request_id = str(uuid.uuid4())
         # Sanitize model name for directory
@@ -31,7 +35,6 @@ class _GeminiCliFileLogger:
         self.log_dir = GEMINI_CLI_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            self.enabled = True
         except Exception as e:
             lib_logger.error(f"Failed to create Gemini CLI log directory: {e}")
             self.enabled = False
@@ -519,6 +522,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
+        enable_request_logging = kwargs.pop("enable_request_logging", False)
         
         async def do_call():
             # Get auth header once, it's needed for the request anyway
@@ -534,7 +538,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             model_name = model.split('/')[-1].replace(':thinking', '')
             
             # [NEW] Create a dedicated file logger for this request
-            file_logger = _GeminiCliFileLogger(model_name=model_name)
+            file_logger = _GeminiCliFileLogger(
+                model_name=model_name,
+                enabled=enable_request_logging
+            )
 
             gen_config = {
                 "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
@@ -578,7 +585,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     request_payload["request"]["toolConfig"] = tool_config
             
             # Log the final payload for debugging and to the dedicated file
-            lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
+            #lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
             file_logger.log_request(request_payload)
             
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"

@@ -47,9 +47,10 @@ class RotatingClient:
         configure_logging: bool = True,
         global_timeout: int = 30,
         abort_on_callback_error: bool = True,
-        litellm_provider_params: Optional[Dict[str, Any]] = None, # [NEW]
+        litellm_provider_params: Optional[Dict[str, Any]] = None,
         ignore_models: Optional[Dict[str, List[str]]] = None,
-        whitelist_models: Optional[Dict[str, List[str]]] = None
+        whitelist_models: Optional[Dict[str, List[str]]] = None,
+        enable_request_logging: bool = False
     ):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
@@ -93,6 +94,7 @@ class RotatingClient:
         self.litellm_provider_params = litellm_provider_params or {}
         self.ignore_models = ignore_models or {}
         self.whitelist_models = whitelist_models or {}
+        self.enable_request_logging = enable_request_logging
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
@@ -448,6 +450,7 @@ class RotatingClient:
                 if provider_plugin and provider_plugin.has_custom_logic():
                     lib_logger.debug(f"Provider '{provider}' has custom logic. Delegating call.")
                     litellm_kwargs["credential_identifier"] = current_cred
+                    litellm_kwargs["enable_request_logging"] = self.enable_request_logging
 
                     # Check body first for custom_reasoning_budget
                     if "custom_reasoning_budget" in kwargs:
@@ -668,6 +671,7 @@ class RotatingClient:
                     if provider_plugin and provider_plugin.has_custom_logic():
                         lib_logger.debug(f"Provider '{provider}' has custom logic. Delegating call.")
                         litellm_kwargs["credential_identifier"] = current_cred
+                        litellm_kwargs["enable_request_logging"] = self.enable_request_logging
                         
                         for attempt in range(self.max_retries):
                             try:
