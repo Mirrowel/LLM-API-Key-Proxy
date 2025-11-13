@@ -205,6 +205,11 @@ class RotatingClient:
         This allows us to control the log level and destination of litellm's output.
         It also cleans up error logs for better readability in debug files.
         """
+        # Filter out verbose pre_api_call and post_api_call logs
+        log_event_type = log_data.get("log_event_type")
+        if log_event_type in ["pre_api_call", "post_api_call"]:
+            return  # Skip these verbose logs entirely
+        
         # For successful calls or pre-call logs, a simple debug message is enough.
         if not log_data.get("exception"):
             sanitized_log = self._sanitize_litellm_log(log_data)
