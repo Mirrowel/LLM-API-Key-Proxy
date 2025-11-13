@@ -175,9 +175,6 @@ async def lifespan(app: FastAPI):
     cred_manager = CredentialManager(os.environ)
     oauth_credentials = cred_manager.discover_and_prepare()
 
-    if not api_keys and not oauth_credentials:
-        raise ValueError("No provider API keys or OAuth credentials found.")
-
     if not skip_oauth_init and oauth_credentials:
         logging.info("Starting OAuth credential validation and deduplication...")
         processed_emails = {}  # email -> {provider: path}

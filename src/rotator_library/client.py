@@ -40,8 +40,8 @@ class RotatingClient:
     """
     def __init__(
         self,
-        api_keys: Dict[str, List[str]],
-        oauth_credentials: Dict[str, List[str]],
+        api_keys: Optional[Dict[str, List[str]]] = None,
+        oauth_credentials: Optional[Dict[str, List[str]]] = None,
         max_retries: int = 2,
         usage_file_path: str = "key_usage.json",
         configure_logging: bool = True,
@@ -66,8 +66,16 @@ class RotatingClient:
         else:
             lib_logger.propagate = False
 
-        if not api_keys:
-            raise ValueError("API keys dictionary cannot be empty.")
+        api_keys = api_keys or {}
+        oauth_credentials = oauth_credentials or {}
+
+        # Filter out providers with empty lists of credentials to ensure validity
+        api_keys = {provider: keys for provider, keys in api_keys.items() if keys}
+        oauth_credentials = {provider: paths for provider, paths in oauth_credentials.items() if paths}
+
+        if not api_keys and not oauth_credentials:
+            raise ValueError("No valid credentials provided. Either 'api_keys' or 'oauth_credentials' must be provided and non-empty.")
+
         self.api_keys = api_keys
         self.credential_manager = CredentialManager(oauth_credentials)
         self.oauth_credentials = self.credential_manager.discover_and_prepare()
