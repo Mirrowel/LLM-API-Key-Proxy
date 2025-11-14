@@ -16,6 +16,9 @@ class DynamicOpenAICompatibleProvider:
     Created at runtime for providers with API_BASE environment variables.
     """
 
+    # Class attribute - no need to instantiate
+    skip_cost_calculation: bool = True
+
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
         # Get API base URL from environment
@@ -29,10 +32,6 @@ class DynamicOpenAICompatibleProvider:
         from ..model_definitions import ModelDefinitions
 
         self.model_definitions = ModelDefinitions()
-
-    def skip_cost_calculation(self) -> bool:
-        """Custom providers should skip cost calculation."""
-        return True
 
     def get_models(self, api_key: str, client):
         """Delegate to OpenAI-compatible provider implementation."""

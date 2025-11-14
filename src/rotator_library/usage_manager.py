@@ -344,7 +344,10 @@ class UsageManager:
                     provider_name = model.split("/")[0]
                     provider_plugin = PROVIDER_PLUGINS.get(provider_name)
 
-                    if provider_plugin and provider_plugin.skip_cost_calculation():
+                    # Check class attribute directly - no need to instantiate
+                    if provider_plugin and getattr(
+                        provider_plugin, "skip_cost_calculation", False
+                    ):
                         lib_logger.debug(
                             f"Skipping cost calculation for provider '{provider_name}' (custom provider)."
                         )
