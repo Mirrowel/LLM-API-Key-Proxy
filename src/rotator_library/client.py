@@ -297,6 +297,32 @@ class RotatingClient:
 
         return kwargs
 
+    def _convert_model_params_for_litellm(self, **kwargs) -> Dict[str, Any]:
+        """
+        Converts model parameters specifically for LiteLLM calls.
+        This is called right before calling LiteLLM to handle custom providers.
+        """
+        model = kwargs.get("model")
+        if not model:
+            return kwargs
+
+        provider = model.split("/")[0]
+
+        # Handle custom OpenAI-compatible providers
+        # Check if this is a custom provider by looking for API_BASE environment variable
+        import os
+
+        api_base_env = f"{provider.upper()}_API_BASE"
+        if os.getenv(api_base_env):
+            # For custom providers, tell LiteLLM to use openai provider with custom model name
+            # This preserves original model name in logs but converts for LiteLLM
+            kwargs = kwargs.copy()  # Don't modify original
+            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
+            kwargs["api_base"] = os.getenv(api_base_env).rstrip("/")
+            kwargs["custom_llm_provider"] = "openai"
+
+        return kwargs
+
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         return self.oauth_credentials
 
@@ -566,6 +592,18 @@ class RotatingClient:
                     }
 
                 provider_plugin = self._get_provider_instance(provider)
+
+                # Apply model-specific options for custom providers
+                if provider_plugin and hasattr(provider_plugin, "get_model_options"):
+                    model_options = provider_plugin.get_model_options(model)
+                    if model_options:
+                        # Merge model options into litellm_kwargs
+                        for key, value in model_options.items():
+                            if key == "reasoning_effort":
+                                litellm_kwargs["reasoning_effort"] = value
+                            elif key not in litellm_kwargs:
+                                litellm_kwargs[key] = value
+
                 if provider_plugin and provider_plugin.has_custom_logic():
                     lib_logger.debug(
                         f"Provider '{provider}' has custom logic. Delegating call."
@@ -666,8 +704,13 @@ class RotatingClient:
                                             f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                         )
 
+                            # Convert model parameters for custom providers right before LiteLLM call
+                            final_kwargs = self._convert_model_params_for_litellm(
+                                **litellm_kwargs
+                            )
+
                             response = await api_call(
-                                **litellm_kwargs,
+                                **final_kwargs,
                                 logger_fn=self._litellm_logger_callback,
                             )
 
@@ -912,6 +955,19 @@ class RotatingClient:
                         }
 
                     provider_plugin = self._get_provider_instance(provider)
+
+                    # Apply model-specific options for custom providers
+                    if provider_plugin and hasattr(
+                        provider_plugin, "get_model_options"
+                    ):
+                        model_options = provider_plugin.get_model_options(model)
+                        if model_options:
+                            # Merge model options into litellm_kwargs
+                            for key, value in model_options.items():
+                                if key == "reasoning_effort":
+                                    litellm_kwargs["reasoning_effort"] = value
+                                elif key not in litellm_kwargs:
+                                    litellm_kwargs[key] = value
                     if provider_plugin and provider_plugin.has_custom_logic():
                         lib_logger.debug(
                             f"Provider '{provider}' has custom logic. Delegating call."
@@ -1121,8 +1177,13 @@ class RotatingClient:
                                         )
 
                             # lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
+                            # Convert model parameters for custom providers right before LiteLLM call
+                            final_kwargs = self._convert_model_params_for_litellm(
+                                **litellm_kwargs
+                            )
+
                             response = await litellm.acompletion(
-                                **litellm_kwargs,
+                                **final_kwargs,
                                 logger_fn=self._litellm_logger_callback,
                             )
 

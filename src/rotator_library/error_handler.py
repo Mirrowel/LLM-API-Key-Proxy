@@ -269,7 +269,7 @@ class AllProviders:
                 api_base = os.getenv(env_var)
                 if api_base:
                     self.providers[provider_name] = {
-                        "api_base": api_base.rstrip("/") if api_base else None,
+                        "api_base": api_base.rstrip("/") if api_base else "",
                         "model_prefix": None,  # No prefix for custom providers
                     }
 
