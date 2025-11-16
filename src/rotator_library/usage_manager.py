@@ -398,9 +398,18 @@ class UsageManager:
         await self._save_usage()
 
     async def record_failure(
-        self, key: str, model: str, classified_error: ClassifiedError
+        self, key: str, model: str, classified_error: ClassifiedError,
+        increment_consecutive_failures: bool = True
     ):
-        """Records a failure and applies cooldowns based on an escalating backoff strategy."""
+        """Records a failure and applies cooldowns based on an escalating backoff strategy.
+
+        Args:
+            key: The API key or credential identifier
+            model: The model name
+            classified_error: The classified error object
+            increment_consecutive_failures: Whether to increment the failure counter.
+                Set to False for provider-level errors that shouldn't count against the key.
+        """
         await self._lazy_init()
         async with self._data_lock:
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
@@ -414,22 +423,36 @@ class UsageManager:
                 },
             )
 
-            # Handle specific error types first
-            if (
-                classified_error.error_type == "rate_limit"
-                and classified_error.retry_after
-            ):
-                cooldown_seconds = classified_error.retry_after
+            # Provider-level errors (transient issues) should not count against the key
+            provider_level_errors = {"server_error", "api_connection"}
+
+            # Determine if we should increment the failure counter
+            should_increment = (
+                increment_consecutive_failures
+                and classified_error.error_type not in provider_level_errors
+            )
+
+            # Calculate cooldown duration based on error type
+            cooldown_seconds = None
+
+            if classified_error.error_type == "rate_limit":
+                # Rate limit errors: use retry_after if available, otherwise default to 60s
+                cooldown_seconds = classified_error.retry_after or 60
+                lib_logger.info(
+                    f"Rate limit error on key ...{key[-6:]} for model {model}. "
+                    f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
+                )
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
                 key_data["key_cooldown_until"] = time.time() + 300
                 lib_logger.warning(
                     f"Authentication error on key ...{key[-6:]}. Applying 5-minute key-level lockout."
                 )
-                await self._save_usage()
-                return  # No further backoff logic needed
-            else:
-                # General backoff logic for other errors
+                # Auth errors still use escalating backoff for the specific model
+                cooldown_seconds = 300  # 5 minutes for model cooldown
+
+            # If we should increment failures, calculate escalating backoff
+            if should_increment:
                 failures_data = key_data.setdefault("failures", {})
                 model_failures = failures_data.setdefault(
                     model, {"consecutive_failures": 0}
@@ -437,14 +460,29 @@ class UsageManager:
                 model_failures["consecutive_failures"] += 1
                 count = model_failures["consecutive_failures"]
 
-                backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
-                cooldown_seconds = backoff_tiers.get(count, 7200)  # Default to 2 hours
+                # If cooldown wasn't set by specific error type, use escalating backoff
+                if cooldown_seconds is None:
+                    backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
+                    cooldown_seconds = backoff_tiers.get(count, 7200)  # Default to 2 hours for "spent" keys
+                    lib_logger.warning(
+                        f"Failure #{count} for key ...{key[-6:]} with model {model}. "
+                        f"Error type: {classified_error.error_type}"
+                    )
+            else:
+                # Provider-level errors: apply short cooldown but don't count against key
+                if cooldown_seconds is None:
+                    cooldown_seconds = 30  # 30s cooldown for provider issues
+                lib_logger.info(
+                    f"Provider-level error ({classified_error.error_type}) for key ...{key[-6:]} with model {model}. "
+                    f"NOT incrementing consecutive failures. Applying {cooldown_seconds}s cooldown."
+                )
 
             # Apply the cooldown
             model_cooldowns = key_data.setdefault("model_cooldowns", {})
             model_cooldowns[model] = time.time() + cooldown_seconds
             lib_logger.warning(
-                f"Failure recorded for key ...{key[-6:]} with model {model}. Applying {cooldown_seconds}s cooldown."
+                f"Cooldown applied for key ...{key[-6:]} with model {model}: {cooldown_seconds}s. "
+                f"Error type: {classified_error.error_type}"
             )
 
             # Check for key-level lockout condition

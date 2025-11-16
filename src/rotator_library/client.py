@@ -784,8 +784,10 @@ class RotatingClient:
                                 else {},
                             )
                             classified_error = classify_error(e)
+                            # Provider-level error: don't increment consecutive failures
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error
+                                current_cred, model, classified_error,
+                                increment_consecutive_failures=False
                             )
 
                             if attempt >= self.max_retries - 1:
@@ -1067,8 +1069,10 @@ class RotatingClient:
                                     else {},
                                 )
                                 classified_error = classify_error(e)
+                                # Provider-level error: don't increment consecutive failures
                                 await self.usage_manager.record_failure(
-                                    current_cred, model, classified_error
+                                    current_cred, model, classified_error,
+                                    increment_consecutive_failures=False
                                 )
 
                                 if attempt >= self.max_retries - 1:
@@ -1358,8 +1362,10 @@ class RotatingClient:
                                 else {},
                             )
                             classified_error = classify_error(e)
+                            # Provider-level error: don't increment consecutive failures
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error
+                                current_cred, model, classified_error,
+                                increment_consecutive_failures=False
                             )
 
                             if attempt >= self.max_retries - 1:

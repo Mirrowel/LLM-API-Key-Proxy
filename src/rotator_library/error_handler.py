@@ -52,13 +52,38 @@ def get_retry_after(error: Exception) -> Optional[int]:
     """
     Extracts the 'retry-after' duration in seconds from an exception message.
     Handles both integer and string representations of the duration, as well as JSON bodies.
+    Also checks HTTP response headers for httpx.HTTPStatusError instances.
     """
+    # 0. For httpx errors, check response headers first (most reliable)
+    if isinstance(error, httpx.HTTPStatusError):
+        headers = error.response.headers
+        # Check standard Retry-After header (case-insensitive)
+        retry_header = headers.get('retry-after') or headers.get('Retry-After')
+        if retry_header:
+            try:
+                return int(retry_header)  # Assumes seconds format
+            except ValueError:
+                pass  # Might be HTTP date format, skip for now
+
+        # Check X-RateLimit-Reset header (Unix timestamp)
+        reset_header = headers.get('x-ratelimit-reset') or headers.get('X-RateLimit-Reset')
+        if reset_header:
+            try:
+                import time
+                reset_timestamp = int(reset_header)
+                current_time = int(time.time())
+                wait_seconds = reset_timestamp - current_time
+                if wait_seconds > 0:
+                    return wait_seconds
+            except (ValueError, TypeError):
+                pass
+
     error_str = str(error).lower()
 
     # 1. Try to parse JSON from the error string to find 'retryDelay'
     try:
         # It's common for the actual JSON to be embedded in the string representation
-        json_match = re.search(r"(\{.*\})", error_str)
+        json_match = re.search(r"(\{.*\})", error_str, re.DOTALL)
         if json_match:
             error_json = json.loads(json_match.group(1))
             retry_info = error_json.get("error", {}).get("details", [{}])[0]
@@ -74,13 +99,13 @@ def get_retry_after(error: Exception) -> Optional[int]:
     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
         pass  # If JSON parsing fails, proceed to regex and attribute checks
 
-    # 2. Common regex patterns for 'retry-after'
+    # 2. Common regex patterns for 'retry-after' (with duration format support)
     patterns = [
-        r"retry after:?\s*(\d+)",
-        r"retry_after:?\s*(\d+)",
-        r"retry in\s*(\d+)\s*seconds",
-        r"wait for\s*(\d+)\s*seconds",
+        r"retry[-_\s]after:?\s*(\d+)",  # Matches: retry-after, retry_after, retry after
+        r"retry in\s*(\d+)\s*seconds?",
+        r"wait for\s*(\d+)\s*seconds?",
         r'"retryDelay":\s*"(\d+)s"',
+        r"x-ratelimit-reset:?\s*(\d+)",
     ]
 
     for pattern in patterns:
@@ -91,13 +116,41 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, IndexError):
                 continue
 
-    # 3. Handle cases where the error object itself has the attribute
+    # 3. Handle duration formats like "60s", "2m", "1h"
+    duration_match = re.search(r'(\d+)\s*([smh])', error_str)
+    if duration_match:
+        try:
+            value = int(duration_match.group(1))
+            unit = duration_match.group(2)
+            if unit == 's':
+                return value
+            elif unit == 'm':
+                return value * 60
+            elif unit == 'h':
+                return value * 3600
+        except (ValueError, IndexError):
+            pass
+
+    # 4. Handle cases where the error object itself has the attribute
     if hasattr(error, "retry_after"):
         value = getattr(error, "retry_after")
         if isinstance(value, int):
             return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
+        if isinstance(value, str):
+            # Try to parse string formats
+            if value.isdigit():
+                return int(value)
+            # Handle "60s", "2m" format in attribute
+            duration_match = re.search(r'(\d+)\s*([smh])', value.lower())
+            if duration_match:
+                val = int(duration_match.group(1))
+                unit = duration_match.group(2)
+                if unit == 's':
+                    return val
+                elif unit == 'm':
+                    return val * 60
+                elif unit == 'h':
+                    return val * 3600
 
     return None
 
@@ -186,8 +239,9 @@ def classify_error(e: Exception) -> ClassifiedError:
             status_code=status_code or 503,  # Treat like a server error
         )
 
-    if isinstance(e, (ServiceUnavailableError, InternalServerError, OpenAIError)):
+    if isinstance(e, (ServiceUnavailableError, InternalServerError)):
         # These are often temporary server-side issues
+        # Note: OpenAIError removed - it's too broad and can catch client errors
         return ClassifiedError(
             error_type="server_error",
             original_exception=e,
