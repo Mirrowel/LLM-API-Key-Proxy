@@ -61,6 +61,7 @@ class RotatingClient:
         ignore_models: Optional[Dict[str, List[str]]] = None,
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
+        max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
     ):
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
@@ -117,6 +118,14 @@ class RotatingClient:
         self.ignore_models = ignore_models or {}
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
+
+        # Store and validate max concurrent requests per key
+        self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
+        # Validate all values are >= 1
+        for provider, max_val in self.max_concurrent_requests_per_key.items():
+            if max_val < 1:
+                lib_logger.warning(f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1.")
+                self.max_concurrent_requests_per_key[provider] = 1
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
@@ -576,8 +585,10 @@ class RotatingClient:
                 lib_logger.info(
                     f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{len(credentials_for_provider)}"
                 )
+                max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
-                    available_keys=creds_to_try, model=model, deadline=deadline
+                    available_keys=creds_to_try, model=model, deadline=deadline,
+                    max_concurrent=max_concurrent
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -918,8 +929,10 @@ class RotatingClient:
                     lib_logger.info(
                         f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{len(credentials_for_provider)}"
                     )
+                    max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                     current_cred = await self.usage_manager.acquire_key(
-                        available_keys=creds_to_try, model=model, deadline=deadline
+                        available_keys=creds_to_try, model=model, deadline=deadline,
+                        max_concurrent=max_concurrent
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)

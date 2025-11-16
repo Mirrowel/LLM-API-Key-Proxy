@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 # A comprehensive map of provider names to their base URLs.
@@ -31,10 +32,17 @@ PROVIDER_URL_MAP = {
 def get_provider_endpoint(provider: str, model_name: str, incoming_path: str) -> Optional[str]:
     """
     Constructs the full provider endpoint URL based on the provider and incoming request path.
+    Supports both hardcoded providers and custom OpenAI-compatible providers via environment variables.
     """
+    # First, check the hardcoded map
     base_url = PROVIDER_URL_MAP.get(provider)
+
+    # If not found, check for custom provider via environment variable
     if not base_url:
-        return None
+        api_base_env = f"{provider.upper()}_API_BASE"
+        base_url = os.getenv(api_base_env)
+        if not base_url:
+            return None
 
     # Determine the specific action from the incoming path (e.g., 'chat/completions')
     action = incoming_path.split('/v1/', 1)[-1] if '/v1/' in incoming_path else incoming_path

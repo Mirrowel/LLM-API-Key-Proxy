@@ -163,6 +163,21 @@ for key, value in os.environ.items():
         whitelist_models[provider] = models_to_whitelist
         logging.debug(f"Loaded whitelist for provider '{provider}': {models_to_whitelist}")
 
+# Load max concurrent requests per key from environment variables
+max_concurrent_requests_per_key = {}
+for key, value in os.environ.items():
+    if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
+        provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
+        try:
+            max_concurrent = int(value)
+            if max_concurrent < 1:
+                logging.warning(f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1).")
+                max_concurrent = 1
+            max_concurrent_requests_per_key[provider] = max_concurrent
+            logging.debug(f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}")
+        except ValueError:
+            logging.warning(f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1).")
+
 # --- Lifespan Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -282,7 +297,8 @@ async def lifespan(app: FastAPI):
         litellm_provider_params=litellm_provider_params,
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,
-        enable_request_logging=ENABLE_REQUEST_LOGGING
+        enable_request_logging=ENABLE_REQUEST_LOGGING,
+        max_concurrent_requests_per_key=max_concurrent_requests_per_key
     )
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client

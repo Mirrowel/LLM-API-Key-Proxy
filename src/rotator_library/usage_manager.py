@@ -157,11 +157,12 @@ class UsageManager:
                 self.key_states[key] = {
                     "lock": asyncio.Lock(),
                     "condition": asyncio.Condition(),
-                    "models_in_use": set(),
+                    "models_in_use": {},  # Dict[model_name, concurrent_count]
                 }
 
     async def acquire_key(
-        self, available_keys: List[str], model: str, deadline: float
+        self, available_keys: List[str], model: str, deadline: float,
+        max_concurrent: int = 1
     ) -> str:
         """
         Acquires the best available key using a tiered, model-aware locking strategy,
@@ -198,8 +199,8 @@ class UsageManager:
                     # Tier 1: Completely idle keys (preferred).
                     if not key_state["models_in_use"]:
                         tier1_keys.append((key, usage_count))
-                    # Tier 2: Keys busy with other models, but free for this one.
-                    elif model not in key_state["models_in_use"]:
+                    # Tier 2: Keys that can accept more concurrent requests for this model.
+                    elif key_state["models_in_use"].get(model, 0) < max_concurrent:
                         tier2_keys.append((key, usage_count))
 
             tier1_keys.sort(key=lambda x: x[1])
@@ -210,7 +211,7 @@ class UsageManager:
                 state = self.key_states[key]
                 async with state["lock"]:
                     if not state["models_in_use"]:
-                        state["models_in_use"].add(model)
+                        state["models_in_use"][model] = 1
                         lib_logger.info(
                             f"Acquired Tier 1 key ...{key[-6:]} for model {model}"
                         )
@@ -220,10 +221,12 @@ class UsageManager:
             for key, _ in tier2_keys:
                 state = self.key_states[key]
                 async with state["lock"]:
-                    if model not in state["models_in_use"]:
-                        state["models_in_use"].add(model)
+                    current_count = state["models_in_use"].get(model, 0)
+                    if current_count < max_concurrent:
+                        state["models_in_use"][model] = current_count + 1
                         lib_logger.info(
-                            f"Acquired Tier 2 key ...{key[-6:]} for model {model}"
+                            f"Acquired Tier 2 key ...{key[-6:]} for model {model} "
+                            f"(concurrent: {state['models_in_use'][model]}/{max_concurrent})"
                         )
                         return key
 
@@ -271,8 +274,14 @@ class UsageManager:
         state = self.key_states[key]
         async with state["lock"]:
             if model in state["models_in_use"]:
-                state["models_in_use"].remove(model)
-                lib_logger.info(f"Released credential ...{key[-6:]} from model {model}")
+                state["models_in_use"][model] -= 1
+                remaining = state["models_in_use"][model]
+                if remaining <= 0:
+                    del state["models_in_use"][model]  # Clean up when count reaches 0
+                lib_logger.info(
+                    f"Released credential ...{key[-6:]} from model {model} "
+                    f"(remaining concurrent: {max(0, remaining)})"
+                )
             else:
                 lib_logger.warning(
                     f"Attempted to release credential ...{key[-6:]} for model {model}, but it was not in use."
