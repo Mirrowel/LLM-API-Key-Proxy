@@ -201,13 +201,35 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             gemini_role = "model" if role == "assistant" else "tool" if role == "tool" else "user"
 
             if role == "user":
-                text_content = ""
                 if isinstance(content, str):
-                    text_content = content
+                    # Simple text content
+                    if content:
+                        parts.append({"text": content})
                 elif isinstance(content, list):
-                    text_content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
-                if text_content:
-                    parts.append({"text": text_content})
+                    # Multi-part content (text, images, etc.)
+                    for item in content:
+                        if item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text:
+                                parts.append({"text": text})
+                        elif item.get("type") == "image_url":
+                            # Handle image data URLs
+                            image_url = item.get("image_url", {}).get("url", "")
+                            if image_url.startswith("data:"):
+                                try:
+                                    # Parse: data:image/png;base64,iVBORw0KG...
+                                    header, data = image_url.split(",", 1)
+                                    mime_type = header.split(":")[1].split(";")[0]
+                                    parts.append({
+                                        "inlineData": {
+                                            "mimeType": mime_type,
+                                            "data": data
+                                        }
+                                    })
+                                except Exception as e:
+                                    lib_logger.warning(f"Failed to parse image data URL: {e}")
+                            else:
+                                lib_logger.warning(f"Non-data-URL images not supported: {image_url[:50]}...")
 
             elif role == "assistant":
                 if isinstance(content, str):
@@ -292,12 +314,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             if 'functionCall' in part:
                 function_call = part['functionCall']
+                function_name = function_call.get('name', 'unknown')
+                # Generate unique ID with nanosecond precision (matching Go implementation)
+                tool_call_id = f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
                 delta['tool_calls'] = [{
                     "index": 0,
-                    "id": f"tool-call-{time.time()}",
+                    "id": tool_call_id,
                     "type": "function",
                     "function": {
-                        "name": function_call.get('name'),
+                        "name": function_name,
                         "arguments": json.dumps(function_call.get('args', {}))
                     }
                 }]
@@ -326,11 +351,21 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             if 'usageMetadata' in response_data:
                 usage = response_data['usageMetadata']
+                prompt_tokens = usage.get("promptTokenCount", 0)
+                thoughts_tokens = usage.get("thoughtsTokenCount", 0)
+                candidate_tokens = usage.get("candidatesTokenCount", 0)
+
                 openai_chunk["usage"] = {
-                    "prompt_tokens": usage.get("promptTokenCount", 0),
-                    "completion_tokens": usage.get("candidatesTokenCount", 0),
+                    "prompt_tokens": prompt_tokens + thoughts_tokens,  # Include thoughts in prompt tokens
+                    "completion_tokens": candidate_tokens,
                     "total_tokens": usage.get("totalTokenCount", 0),
                 }
+
+                # Add reasoning tokens details if present (OpenAI o1 format)
+                if thoughts_tokens > 0:
+                    if "completion_tokens_details" not in openai_chunk["usage"]:
+                        openai_chunk["usage"]["completion_tokens_details"] = {}
+                    openai_chunk["usage"]["completion_tokens_details"]["reasoning_tokens"] = thoughts_tokens
             
             yield openai_chunk
 
@@ -482,9 +517,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # The Gemini CLI API does not support the 'strict' property.
                 new_function.pop("strict", None)
 
-                if "parameters" in new_function and isinstance(new_function["parameters"], dict):
-                    new_function["parameters"] = self._gemini_cli_transform_schema(new_function["parameters"])
-                
+                # Gemini CLI expects 'parametersJsonSchema' instead of 'parameters'
+                if "parameters" in new_function:
+                    schema = self._gemini_cli_transform_schema(new_function["parameters"])
+                    new_function["parametersJsonSchema"] = schema
+                    del new_function["parameters"]
+                elif "parametersJsonSchema" not in new_function:
+                    # Set default empty schema if neither exists
+                    new_function["parametersJsonSchema"] = {"type": "object", "properties": {}}
+
                 transformed_declarations.append(new_function)
         
         return transformed_declarations
@@ -548,8 +589,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             }
             if "temperature" in kwargs:
                 gen_config["temperature"] = kwargs["temperature"]
-            else:
-                gen_config["temperature"] = 0.7
+            # No else - let Gemini use its default temperature (matches OpenAI behavior)
             if "top_k" in kwargs:
                 gen_config["topK"] = kwargs["top_k"]
             if "top_p" in kwargs:
@@ -583,7 +623,17 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 tool_config = self._translate_tool_choice(kwargs["tool_choice"])
                 if tool_config:
                     request_payload["request"]["toolConfig"] = tool_config
-            
+
+            # Add default safety settings to prevent content filtering
+            if "safetySettings" not in request_payload["request"]:
+                request_payload["request"]["safetySettings"] = [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+                ]
+
             # Log the final payload for debugging and to the dedicated file
             #lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
             file_logger.log_request(request_payload)
