@@ -126,6 +126,11 @@ jobs:
                         diffHunk
                         isMinimized
                         minimizedReason
+                        pullRequestReview {
+                          databaseId
+                          isMinimized
+                          minimizedReason
+                        }
                       }
                     }
                   }
@@ -226,10 +231,16 @@ jobs:
           review_comment_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_comment_filter_err.log")
           if review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
             ((.data.repository.pullRequest.reviewThreads.nodes // [])
-              | map(select(.isResolved != true and .isOutdated != true))
+              | map(select(
+                  .isResolved != true and .isOutdated != true
+                  and (((.comments.nodes // []) | first | .isMinimized) != true)
+                  and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true)
+                ))
               | map(.comments.nodes // [])
               | flatten
-              | map(select((.isMinimized != true) and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
+              | map(select((.isMinimized != true)
+                           and ((.pullRequestReview.isMinimized // false) != true)
+                           and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
             | if length > 0 then
                 map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
                 | join("")
@@ -258,9 +269,15 @@ jobs:
             fi
             review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
               ((.data.repository.pullRequest.reviewThreads.nodes // [])
+                | map(select(
+                    (((.comments.nodes // []) | first | .isMinimized) != true)
+                    and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true)
+                  ))
                 | map(.comments.nodes // [])
                 | flatten
-                | map(select(((.author.login? // "unknown") as $login | $ignored | index($login)) | not)))
+                | map(select((.isMinimized != true)
+                             and ((.pullRequestReview.isMinimized // false) != true)
+                             and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
               | if length > 0 then
                   map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
                   | join("")
@@ -570,6 +587,36 @@ jobs:
           else
             echo "::warning::OpenCode config not found at $CONFIG_PATH; skipping instructions patch."
           fi
+
+      - name: Copy Instruction Files to Workspace and Log Locations (TEMP verify)
+        run: |
+          set -e
+          CONFIG_PATH="$HOME/.config/opencode/opencode.json"
+          SRC_DIR="$HOME/.config/opencode"
+          DST_DIR="$GITHUB_WORKSPACE"
+          echo "CONFIG_PATH=$CONFIG_PATH"
+          echo "SRC_DIR=$SRC_DIR"
+          echo "DST_DIR=$DST_DIR"
+          mkdir -p "$DST_DIR"
+          # Copy instruction files to workspace root so opencode can resolve bare filenames
+          cp "$SRC_DIR/pr-context.txt" "$DST_DIR/pr-context.txt" || true
+          cp "$SRC_DIR/pr-diff.txt" "$DST_DIR/pr-diff.txt" || true
+          # Log exact locations for verification
+          echo "-- Source instruction files --"
+          ls -l "$SRC_DIR"/pr-*.txt || true
+          echo "-- Workspace instruction files --"
+          ls -l "$DST_DIR"/pr-*.txt || true
+          echo "-- Config file --"
+          ls -l "$CONFIG_PATH" || true
+          echo "-- Absolute paths --"
+          (command -v realpath >/dev/null 2>&1 && {
+            echo "Workspace pr-context: $(realpath "$DST_DIR/pr-context.txt" 2>/dev/null || true)";
+            echo "Workspace pr-diff:    $(realpath "$DST_DIR/pr-diff.txt" 2>/dev/null || true)";
+            echo "Config path:          $(realpath "$CONFIG_PATH" 2>/dev/null || true)";
+            echo "Source pr-context:    $(realpath "$SRC_DIR/pr-context.txt" 2>/dev/null || true)";
+            echo "Source pr-diff:       $(realpath "$SRC_DIR/pr-diff.txt" 2>/dev/null || true)";
+          }) || true
+          echo "PWD=$(pwd)"
 
 
       - name: Assemble Review Prompt
