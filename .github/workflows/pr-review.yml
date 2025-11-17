@@ -15,11 +15,6 @@ on:
         description: 'The number of the PR to review manually'
         required: true
         type: string
-      skipRun:
-        description: 'TEMP DEBUG: skip opencode run (REMOVE WHEN STABLE)'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   review-pr:
@@ -476,11 +471,6 @@ jobs:
             echo "$DIFF_CONTENT" > "$TMP_DIR/first_review_diff.txt"
           fi
           
-          # Use a delimiter for multiline diff content
-          DELIMITER="FIRST_REVIEW_DIFF_DELIMITER_$(openssl rand -hex 8)"
-          echo "diff_content<<$DELIMITER" >> "$GITHUB_OUTPUT"
-          echo "$DIFF_CONTENT" >> "$GITHUB_OUTPUT"
-          echo "$DELIMITER" >> "$GITHUB_OUTPUT"
         env:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
 
@@ -522,101 +512,10 @@ jobs:
             echo "" > "$TMP_DIR/incremental_diff.txt"
           fi
           
-          # Use a delimiter for multiline diff content, even if it's empty
-          DELIMITER="INCREMENTAL_DIFF_DELIMITER_$(openssl rand -hex 8)"
-          echo "diff_content<<$DELIMITER" >> "$GITHUB_OUTPUT"
-          echo "$DIFF_CONTENT" >> "$GITHUB_OUTPUT"
-          echo "$DELIMITER" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare Diff Files (ensure exist)
-        run: |
+          # Ensure files exist even on edge cases
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           [ -f "$TMP_DIR/first_review_diff.txt" ] || touch "$TMP_DIR/first_review_diff.txt"
           [ -f "$TMP_DIR/incremental_diff.txt" ] || touch "$TMP_DIR/incremental_diff.txt"
-
-      - name: Write OpenCode Instruction Files (Context + Diff)
-        run: |
-          set -e
-          mkdir -p "$HOME/.config/opencode"
-          # Write full PR context to opencode home; wrap exactly as the prompt would embed it
-          {
-            echo "# [PULL REQUEST CONTEXT]";
-            echo "This is the full context for the pull request you must review.";
-            echo "<pull_request_context>";
-            printf "%s" "${PULL_REQUEST_CONTEXT}";
-            echo;
-            echo "</pull_request_context>";
-          } > "$HOME/.config/opencode/pr-context.txt"
-
-          # Unify diff into a single file in opencode home, wrapped in tags
-          TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          {
-            echo "# [Diff CONTEXT]";
-            if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
-              echo "Diff Type: FULL_PR_DIFF";
-            else
-              echo "Diff Type: INCREMENTAL_DIFF";
-            fi;
-            echo "<diff>";
-            if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
-              cat "$TMP_DIR/first_review_diff.txt";
-            else
-              cat "$TMP_DIR/incremental_diff.txt";
-            fi;
-            echo "</diff>";
-          } > "$HOME/.config/opencode/pr-diff.txt"
-        env:
-          PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
-
-      - name: Clear Large Env Variables
-        run: |
-          # Remove large context from environment to avoid oversized process env
-          echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
-          # Also clear any diff-related env vars if present
-          echo "DIFF_CONTENT=" >> "$GITHUB_ENV"
-
-      - name: Patch OpenCode Config Instructions (bare filenames)
-        run: |
-          set -e
-          CONFIG_PATH="$HOME/.config/opencode/opencode.json"
-          TMP_CONFIG="$CONFIG_PATH.tmp"
-          if [ -f "$CONFIG_PATH" ]; then
-            jq '.instructions = ((.instructions // []) + ["pr-context.txt","pr-diff.txt"]) | .instructions |= unique' \
-              "$CONFIG_PATH" > "$TMP_CONFIG"
-            mv "$TMP_CONFIG" "$CONFIG_PATH"
-          else
-            echo "::warning::OpenCode config not found at $CONFIG_PATH; skipping instructions patch."
-          fi
-
-      - name: Copy Instruction Files to Workspace and Log Locations (TEMP verify)
-        run: |
-          set -e
-          CONFIG_PATH="$HOME/.config/opencode/opencode.json"
-          SRC_DIR="$HOME/.config/opencode"
-          DST_DIR="$GITHUB_WORKSPACE"
-          echo "CONFIG_PATH=$CONFIG_PATH"
-          echo "SRC_DIR=$SRC_DIR"
-          echo "DST_DIR=$DST_DIR"
-          mkdir -p "$DST_DIR"
-          # Copy instruction files to workspace root so opencode can resolve bare filenames
-          cp "$SRC_DIR/pr-context.txt" "$DST_DIR/pr-context.txt" || true
-          cp "$SRC_DIR/pr-diff.txt" "$DST_DIR/pr-diff.txt" || true
-          # Log exact locations for verification
-          echo "-- Source instruction files --"
-          ls -l "$SRC_DIR"/pr-*.txt || true
-          echo "-- Workspace instruction files --"
-          ls -l "$DST_DIR"/pr-*.txt || true
-          echo "-- Config file --"
-          ls -l "$CONFIG_PATH" || true
-          echo "-- Absolute paths --"
-          (command -v realpath >/dev/null 2>&1 && {
-            echo "Workspace pr-context: $(realpath "$DST_DIR/pr-context.txt" 2>/dev/null || true)";
-            echo "Workspace pr-diff:    $(realpath "$DST_DIR/pr-diff.txt" 2>/dev/null || true)";
-            echo "Config path:          $(realpath "$CONFIG_PATH" 2>/dev/null || true)";
-            echo "Source pr-context:    $(realpath "$SRC_DIR/pr-context.txt" 2>/dev/null || true)";
-            echo "Source pr-diff:       $(realpath "$SRC_DIR/pr-diff.txt" 2>/dev/null || true)";
-          }) || true
-          echo "PWD=$(pwd)"
 
 
       - name: Assemble Review Prompt
@@ -627,14 +526,27 @@ jobs:
           PR_NUMBER: ${{ env.PR_NUMBER }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
+          PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
         run: |
-          # Keep envsubst minimal; context & diff now loaded via config instructions files
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA}'
+          # Build DIFF_FILE_PATH pointing to the generated diff in RUNNER_TEMP
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          envsubst "$VARS" < /tmp/pr-review.md > "$TMP_DIR/assembled_prompt.txt"
+          if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+            DIFF_FILE_PATH="$TMP_DIR/first_review_diff.txt"
+          else
+            DIFF_FILE_PATH="$TMP_DIR/incremental_diff.txt"
+          fi
+          # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
+          DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/pr-review.md > "$TMP_DIR/assembled_prompt.txt"
+          # Immediately clear large env after use
+          echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
+          # Clear small, now-redundant flags included in the context summary
+          echo "EXCLUDED_REVIEWS=" >> "$GITHUB_ENV" || true
+          echo "EXCLUDED_COMMENTS=" >> "$GITHUB_ENV" || true
+          echo "FILTER_ERROR_REVIEWS=" >> "$GITHUB_ENV" || true
+          echo "FILTER_ERROR_COMMENTS=" >> "$GITHUB_ENV" || true
 
       - name: Review PR with OpenCode
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skipRun == 'true') }}
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
@@ -655,27 +567,3 @@ jobs:
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
-
-      - name: DEBUG Skip Notice (TEMP REMOVE WHEN STABLE)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skipRun == 'true' }}
-        run: |
-          echo "skipRun=true -> Skipping opencode execution. (REMOVE skipRun input + this step when stable)"
-
-      - name: Stage Artifacts to Temp
-        if: always()
-        run: |
-           set -e
-           cp "$HOME/.config/opencode/pr-context.txt" "$RUNNER_TEMP/opencode-pr-context.txt" || true
-           cp "$HOME/.config/opencode/pr-diff.txt" "$RUNNER_TEMP/opencode-pr-diff.txt" || true
-           cp "$HOME/.config/opencode/opencode.json" "$RUNNER_TEMP/opencode-config.json" || true
-
-      - name: Upload Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-review-prompt-and-files-${{ env.PR_NUMBER }}
-          path: |
-            ${{ runner.temp }}/assembled_prompt.txt
-            ${{ runner.temp }}/opencode-pr-context.txt
-            ${{ runner.temp }}/opencode-pr-diff.txt
-            ${{ runner.temp }}/opencode-config.json
