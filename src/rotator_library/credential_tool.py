@@ -174,7 +174,21 @@ async def setup_new_credential(provider_name: str):
         auth_class = get_provider_auth_class(provider_name)
         auth_instance = auth_class()
 
-        temp_creds = {}
+        # Build display name for better user experience
+        oauth_friendly_names = {
+            "gemini_cli": "Gemini CLI (OAuth)",
+            "qwen_code": "Qwen Code (OAuth - also supports API keys)",
+            "iflow": "iFlow (OAuth - also supports API keys)"
+        }
+        display_name = oauth_friendly_names.get(provider_name, provider_name.replace('_', ' ').title())
+
+        # Pass provider metadata to auth classes for better display
+        temp_creds = {
+            "_proxy_metadata": {
+                "provider_name": provider_name,
+                "display_name": display_name
+            }
+        }
         initialized_creds = await auth_instance.initialize_token(temp_creds)
         
         user_info = await auth_instance.get_user_info(initialized_creds)
@@ -317,6 +331,185 @@ async def export_gemini_cli_to_env():
         console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
 
 
+async def export_qwen_code_to_env():
+    """
+    Export a Qwen Code credential JSON file to .env format.
+    Generates one .env file per credential.
+    """
+    console.print(Panel("[bold cyan]Export Qwen Code Credential to .env[/bold cyan]", expand=False))
+
+    # Find all qwen_code credentials
+    qwen_code_files = list(OAUTH_BASE_DIR.glob("qwen_code_oauth_*.json"))
+
+    if not qwen_code_files:
+        console.print(Panel("No Qwen Code credentials found. Please add one first using 'Add OAuth Credential'.",
+                          style="bold red", title="No Credentials"))
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_file in enumerate(qwen_code_files):
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            cred_text.append(f"  {i + 1}. {cred_file.name} ({email})\n")
+        except Exception as e:
+            cred_text.append(f"  {i + 1}. {cred_file.name} (error reading: {e})\n")
+
+    console.print(Panel(cred_text, title="Available Qwen Code Credentials", style="bold blue"))
+
+    choice = Prompt.ask(
+        Text.from_markup("[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"),
+        choices=[str(i + 1) for i in range(len(qwen_code_files))] + ["b"],
+        show_choices=False
+    )
+
+    if choice.lower() == 'b':
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(qwen_code_files):
+            cred_file = qwen_code_files[choice_index]
+
+            # Load the credential
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Generate .env file name
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"qwen_code_{safe_email}.env"
+            env_filepath = OAUTH_BASE_DIR / env_filename
+
+            # Build .env content
+            env_lines = [
+                f"# Qwen Code Credential for: {email}",
+                f"# Generated from: {cred_file.name}",
+                f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                f"QWEN_CODE_ACCESS_TOKEN={creds.get('access_token', '')}",
+                f"QWEN_CODE_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+                f"QWEN_CODE_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+                f"QWEN_CODE_RESOURCE_URL={creds.get('resource_url', 'https://portal.qwen.ai/v1')}",
+                f"QWEN_CODE_EMAIL={email}",
+            ]
+
+            # Write to .env file
+            with open(env_filepath, 'w') as f:
+                f.write('\n'.join(env_lines))
+
+            success_text = Text.from_markup(
+                f"Successfully exported credential to [bold yellow]'{env_filepath}'[/bold yellow]\n\n"
+                f"To use this credential:\n"
+                f"1. Copy [bold yellow]{env_filepath.name}[/bold yellow] to your deployment environment\n"
+                f"2. Load the variables: [bold cyan]export $(cat {env_filepath.name} | grep -v '^#' | xargs)[/bold cyan]\n"
+                f"3. Or source it: [bold cyan]source {env_filepath.name}[/bold cyan]\n"
+                f"4. The Qwen Code provider will automatically use these environment variables"
+            )
+            console.print(Panel(success_text, style="bold green", title="Success"))
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print("[bold red]Invalid input. Please enter a number or 'b'.[/bold red]")
+    except Exception as e:
+        console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
+
+
+async def export_iflow_to_env():
+    """
+    Export an iFlow credential JSON file to .env format.
+    Generates one .env file per credential.
+    """
+    console.print(Panel("[bold cyan]Export iFlow Credential to .env[/bold cyan]", expand=False))
+
+    # Find all iflow credentials
+    iflow_files = list(OAUTH_BASE_DIR.glob("iflow_oauth_*.json"))
+
+    if not iflow_files:
+        console.print(Panel("No iFlow credentials found. Please add one first using 'Add OAuth Credential'.",
+                          style="bold red", title="No Credentials"))
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_file in enumerate(iflow_files):
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            cred_text.append(f"  {i + 1}. {cred_file.name} ({email})\n")
+        except Exception as e:
+            cred_text.append(f"  {i + 1}. {cred_file.name} (error reading: {e})\n")
+
+    console.print(Panel(cred_text, title="Available iFlow Credentials", style="bold blue"))
+
+    choice = Prompt.ask(
+        Text.from_markup("[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"),
+        choices=[str(i + 1) for i in range(len(iflow_files))] + ["b"],
+        show_choices=False
+    )
+
+    if choice.lower() == 'b':
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(iflow_files):
+            cred_file = iflow_files[choice_index]
+
+            # Load the credential
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Generate .env file name
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"iflow_{safe_email}.env"
+            env_filepath = OAUTH_BASE_DIR / env_filename
+
+            # Build .env content
+            # IMPORTANT: iFlow requires BOTH OAuth tokens AND the API key for API requests
+            env_lines = [
+                f"# iFlow Credential for: {email}",
+                f"# Generated from: {cred_file.name}",
+                f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                f"IFLOW_ACCESS_TOKEN={creds.get('access_token', '')}",
+                f"IFLOW_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+                f"IFLOW_API_KEY={creds.get('api_key', '')}",
+                f"IFLOW_EXPIRY_DATE={creds.get('expiry_date', '')}",
+                f"IFLOW_EMAIL={email}",
+                f"IFLOW_TOKEN_TYPE={creds.get('token_type', 'Bearer')}",
+                f"IFLOW_SCOPE={creds.get('scope', 'read write')}",
+            ]
+
+            # Write to .env file
+            with open(env_filepath, 'w') as f:
+                f.write('\n'.join(env_lines))
+
+            success_text = Text.from_markup(
+                f"Successfully exported credential to [bold yellow]'{env_filepath}'[/bold yellow]\n\n"
+                f"To use this credential:\n"
+                f"1. Copy [bold yellow]{env_filepath.name}[/bold yellow] to your deployment environment\n"
+                f"2. Load the variables: [bold cyan]export $(cat {env_filepath.name} | grep -v '^#' | xargs)[/bold cyan]\n"
+                f"3. Or source it: [bold cyan]source {env_filepath.name}[/bold cyan]\n"
+                f"4. The iFlow provider will automatically use these environment variables"
+            )
+            console.print(Panel(success_text, style="bold green", title="Success"))
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print("[bold red]Invalid input. Please enter a number or 'b'.[/bold red]")
+    except Exception as e:
+        console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
+
+
 async def main():
     """
     An interactive CLI tool to add new credentials.
@@ -326,14 +519,20 @@ async def main():
     
     while True:
         console.print(Panel(
-            Text.from_markup("1. Add OAuth Credential\n2. Add API Key\n3. Export Gemini CLI credential to .env"),
+            Text.from_markup(
+                "1. Add OAuth Credential\n"
+                "2. Add API Key\n"
+                "3. Export Gemini CLI credential to .env\n"
+                "4. Export Qwen Code credential to .env\n"
+                "5. Export iFlow credential to .env"
+            ),
             title="Choose credential type",
             style="bold blue"
         ))
 
         setup_type = Prompt.ask(
             Text.from_markup("[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"),
-            choices=["1", "2", "3", "q"],
+            choices=["1", "2", "3", "4", "5", "q"],
             show_choices=False
         )
 
@@ -381,6 +580,12 @@ async def main():
 
         elif setup_type == "3":
             await export_gemini_cli_to_env()
+
+        elif setup_type == "4":
+            await export_qwen_code_to_env()
+
+        elif setup_type == "5":
+            await export_iflow_to_env()
 
         console.print("\n" + "="*50 + "\n")
 

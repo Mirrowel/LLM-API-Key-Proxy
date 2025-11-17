@@ -609,8 +609,14 @@ class IFlowAuthBase:
         Uses local callback server to receive authorization code.
         """
         path = creds_or_path if isinstance(creds_or_path, str) else None
-        file_name = Path(path).name if path else "in-memory object"
-        lib_logger.debug(f"Initializing iFlow token for '{file_name}'...")
+
+        # Get display name from metadata if available, otherwise derive from path
+        if isinstance(creds_or_path, dict):
+            display_name = creds_or_path.get("_proxy_metadata", {}).get("display_name", "in-memory object")
+        else:
+            display_name = Path(path).name if path else "in-memory object"
+
+        lib_logger.debug(f"Initializing iFlow token for '{display_name}'...")
 
         try:
             creds = await self._load_credentials(creds_or_path) if path else creds_or_path
@@ -627,10 +633,10 @@ class IFlowAuthBase:
                     try:
                         return await self._refresh_token(path)
                     except Exception as e:
-                        lib_logger.warning(f"Automatic token refresh for '{file_name}' failed: {e}. Proceeding to interactive login.")
+                        lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
 
                 # Interactive OAuth flow
-                lib_logger.warning(f"iFlow OAuth token for '{file_name}' needs setup: {reason}.")
+                lib_logger.warning(f"iFlow OAuth token for '{display_name}' needs setup: {reason}.")
 
                 # Generate random state for CSRF protection
                 state = secrets.token_urlsafe(32)
@@ -657,7 +663,7 @@ class IFlowAuthBase:
                         "2. [bold]Authorize the application[/bold] to access your account.\n"
                         "3. You will be automatically redirected after authorization."
                     )
-                    console.print(Panel(auth_panel_text, title=f"iFlow OAuth Setup for [bold yellow]{file_name}[/bold yellow]", style="bold blue"))
+                    console.print(Panel(auth_panel_text, title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
                     console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
 
                     # Open browser
@@ -693,13 +699,13 @@ class IFlowAuthBase:
                     if path:
                         await self._save_credentials(path, creds)
 
-                    lib_logger.info(f"iFlow OAuth initialized successfully for '{file_name}'.")
+                    lib_logger.info(f"iFlow OAuth initialized successfully for '{display_name}'.")
                     return creds
 
                 finally:
                     await callback_server.stop()
 
-            lib_logger.info(f"iFlow OAuth token at '{file_name}' is valid.")
+            lib_logger.info(f"iFlow OAuth token at '{display_name}' is valid.")
             return creds
 
         except Exception as e:

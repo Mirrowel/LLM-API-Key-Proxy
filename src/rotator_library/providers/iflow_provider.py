@@ -8,6 +8,7 @@ import logging
 from typing import Union, AsyncGenerator, List, Dict, Any
 from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
+from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 
@@ -15,9 +16,20 @@ lib_logger = logging.getLogger('rotator_library')
 
 # Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
+    "glm-4.6",
+    "qwen3-coder-plus",
+    "kimi-k2-0905",
+    "qwen3-max",
+    "qwen3-235b-a22b-thinking-2507",
+    "qwen3-coder",
+    "kimi-k2",
+    "deepseek-v3.2",
+    "deepseek-v3.1",
+    "deepseek-r1",
     "deepseek-v3",
-    "deepseek-chat",
-    "deepseek-coder"
+    "qwen3-vl-plus",
+    "qwen3-235b-a22b-instruct",
+    "qwen3-235b"
 ]
 
 # OpenAI-compatible parameters supported by iFlow API
@@ -37,24 +49,72 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
     def __init__(self):
         super().__init__()
+        self.model_definitions = ModelDefinitions()
 
     def has_custom_logic(self) -> bool:
         return True
 
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """
-        Returns a hardcoded list of known compatible iFlow models.
+        Returns a merged list of iFlow models from three sources:
+        1. Environment variable models (via IFLOW_MODELS)
+        2. Hardcoded models (fallback list)
+        3. Dynamic discovery from iFlow API (if supported)
+
         Validates OAuth credentials if applicable.
         """
-        # If it's an OAuth credential (file path), ensure it's valid
-        if os.path.isfile(credential):
-            try:
-                await self.initialize_token(credential)
-            except Exception as e:
-                lib_logger.warning(f"Failed to validate iFlow OAuth credential: {e}")
-        # else: Direct API key, no validation needed here
+        models = []
 
-        return [f"iflow/{model_id}" for model_id in HARDCODED_MODELS]
+        # Source 1: Load environment variable models
+        static_models = self.model_definitions.get_all_provider_models("iflow")
+        if static_models:
+            models.extend(static_models)
+            lib_logger.info(f"Loaded {len(static_models)} static models for iflow from environment variables")
+
+        # Source 2: Add hardcoded models (avoiding duplicates)
+        existing_ids = [m.split("/")[-1] for m in models]
+        for model_id in HARDCODED_MODELS:
+            if model_id not in existing_ids:
+                models.append(f"iflow/{model_id}")
+
+        # Source 3: Try dynamic discovery from iFlow API
+        try:
+            # Validate OAuth credentials and get API details
+            if os.path.isfile(credential):
+                await self.initialize_token(credential)
+
+            api_base, api_key = await self.get_api_details(credential)
+            models_url = f"{api_base.rstrip('/')}/models"
+
+            response = await client.get(
+                models_url,
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+            response.raise_for_status()
+
+            # Parse dynamic models and avoid duplicates
+            existing_ids = [m.split("/")[-1] for m in models]
+            dynamic_data = response.json()
+
+            # Handle both {data: [...]} and direct [...] formats
+            model_list = dynamic_data.get("data", dynamic_data) if isinstance(dynamic_data, dict) else dynamic_data
+
+            dynamic_count = 0
+            for model in model_list:
+                model_id = model.get("id") if isinstance(model, dict) else model
+                if model_id and model_id not in existing_ids:
+                    models.append(f"iflow/{model_id}")
+                    dynamic_count += 1
+
+            if dynamic_count > 0:
+                lib_logger.debug(f"Discovered {dynamic_count} additional models for iflow from API")
+
+        except Exception as e:
+            # Silently ignore dynamic discovery errors
+            lib_logger.debug(f"Dynamic model discovery failed for iflow: {e}")
+            pass
+
+        return models
 
     def _clean_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

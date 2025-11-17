@@ -343,8 +343,14 @@ class QwenAuthBase:
     async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         """Initiates device flow if tokens are missing or invalid."""
         path = creds_or_path if isinstance(creds_or_path, str) else None
-        file_name = Path(path).name if path else "in-memory object"
-        lib_logger.debug(f"Initializing Qwen token for '{file_name}'...")
+
+        # Get display name from metadata if available, otherwise derive from path
+        if isinstance(creds_or_path, dict):
+            display_name = creds_or_path.get("_proxy_metadata", {}).get("display_name", "in-memory object")
+        else:
+            display_name = Path(path).name if path else "in-memory object"
+
+        lib_logger.debug(f"Initializing Qwen token for '{display_name}'...")
         try:
             creds = await self._load_credentials(creds_or_path) if path else creds_or_path
 
@@ -359,9 +365,9 @@ class QwenAuthBase:
                     try:
                         return await self._refresh_token(path)
                     except Exception as e:
-                        lib_logger.warning(f"Automatic token refresh for '{file_name}' failed: {e}. Proceeding to interactive login.")
-                
-                lib_logger.warning(f"Qwen OAuth token for '{file_name}' needs setup: {reason}.")
+                        lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
+
+                lib_logger.warning(f"Qwen OAuth token for '{display_name}' needs setup: {reason}.")
                 code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
                 code_challenge = base64.urlsafe_b64encode(
                     hashlib.sha256(code_verifier.encode('utf-8')).digest()
@@ -452,7 +458,7 @@ class QwenAuthBase:
                     # Prompt for user identifier and create metadata object if needed
                     if not creds.get("_proxy_metadata", {}).get("email"):
                         try:
-                            prompt_text = Text.from_markup(f"\n[bold]Please enter your email or a unique identifier for [yellow]'{file_name}'[/yellow][/bold]")
+                            prompt_text = Text.from_markup(f"\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]")
                             email = Prompt.ask(prompt_text)
                             creds["_proxy_metadata"] = {
                                 "email": email.strip(),
@@ -461,13 +467,13 @@ class QwenAuthBase:
                         except (EOFError, KeyboardInterrupt):
                             console.print("\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]")
                             creds["_proxy_metadata"] = {"email": None, "last_check_timestamp": time.time()}
-                    
+
                     if path:
                         await self._save_credentials(path, creds)
-                    lib_logger.info(f"Qwen OAuth initialized successfully for '{file_name}'.")
+                    lib_logger.info(f"Qwen OAuth initialized successfully for '{display_name}'.")
                 return creds
-            
-            lib_logger.info(f"Qwen OAuth token at '{file_name}' is valid.")
+
+            lib_logger.info(f"Qwen OAuth token at '{display_name}' is valid.")
             return creds
         except Exception as e:
             raise ValueError(f"Failed to initialize Qwen OAuth for '{path}': {e}")

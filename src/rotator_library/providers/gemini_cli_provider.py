@@ -8,6 +8,7 @@ import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
+from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
 from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
@@ -88,6 +89,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
     def __init__(self):
         super().__init__()
+        self.model_definitions = ModelDefinitions()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
@@ -717,7 +719,72 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             return self._stream_to_completion_response(chunks)
 
     # Use the shared GeminiAuthBase for auth logic
-    # get_models is not applicable for this custom provider
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
-        """Returns a hardcoded list of known compatible Gemini CLI models."""
-        return [f"gemini_cli/{model_id}" for model_id in HARDCODED_MODELS]
+        """
+        Returns a merged list of Gemini CLI models from three sources:
+        1. Environment variable models (via GEMINI_CLI_MODELS)
+        2. Hardcoded models (fallback list)
+        3. Dynamic discovery from Gemini API (if supported)
+        """
+        models = []
+
+        # Source 1: Load environment variable models
+        static_models = self.model_definitions.get_all_provider_models("gemini_cli")
+        if static_models:
+            models.extend(static_models)
+            lib_logger.info(f"Loaded {len(static_models)} static models for gemini_cli from environment variables")
+
+        # Source 2: Add hardcoded models (avoiding duplicates)
+        existing_ids = [m.split("/")[-1] for m in models]
+        for model_id in HARDCODED_MODELS:
+            if model_id not in existing_ids:
+                models.append(f"gemini_cli/{model_id}")
+
+        # Source 3: Try dynamic discovery from Gemini API
+        try:
+            # Get access token for API calls
+            access_token = await self.get_access_token(credential)
+
+            # Try Vertex AI models endpoint
+            # Note: Gemini may not support a simple /models endpoint like OpenAI
+            # This is a best-effort attempt that will gracefully fail if unsupported
+            models_url = f"https://generativelanguage.googleapis.com/v1beta/models"
+
+            response = await client.get(
+                models_url,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            response.raise_for_status()
+
+            # Parse dynamic models and avoid duplicates
+            existing_ids = [m.split("/")[-1] for m in models]
+            dynamic_data = response.json()
+
+            # Handle various response formats
+            model_list = dynamic_data.get("models", dynamic_data.get("data", []))
+
+            dynamic_count = 0
+            for model in model_list:
+                # Extract model ID (may be in 'name' or 'id' field)
+                model_id = None
+                if isinstance(model, dict):
+                    model_id = model.get("name", model.get("id"))
+                    # Gemini models often have format "models/gemini-pro", extract just the model name
+                    if model_id and "/" in model_id:
+                        model_id = model_id.split("/")[-1]
+                else:
+                    model_id = model
+
+                if model_id and model_id not in existing_ids and model_id.startswith("gemini"):
+                    models.append(f"gemini_cli/{model_id}")
+                    dynamic_count += 1
+
+            if dynamic_count > 0:
+                lib_logger.debug(f"Discovered {dynamic_count} additional models for gemini_cli from API")
+
+        except Exception as e:
+            # Silently ignore dynamic discovery errors
+            lib_logger.debug(f"Dynamic model discovery failed for gemini_cli: {e}")
+            pass
+
+        return models

@@ -363,8 +363,14 @@ class GeminiAuthBase:
 
     async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         path = creds_or_path if isinstance(creds_or_path, str) else None
-        file_name = Path(path).name if path else "in-memory object"
-        lib_logger.debug(f"Initializing Gemini token for '{file_name}'...")
+
+        # Get display name from metadata if available, otherwise derive from path
+        if isinstance(creds_or_path, dict):
+            display_name = creds_or_path.get("_proxy_metadata", {}).get("display_name", "in-memory object")
+        else:
+            display_name = Path(path).name if path else "in-memory object"
+
+        lib_logger.debug(f"Initializing Gemini token for '{display_name}'...")
         try:
             creds = await self._load_credentials(creds_or_path) if path else creds_or_path
             reason = ""
@@ -378,9 +384,9 @@ class GeminiAuthBase:
                     try:
                         return await self._refresh_token(path, creds)
                     except Exception as e:
-                        lib_logger.warning(f"Automatic token refresh for '{file_name}' failed: {e}. Proceeding to interactive login.")
+                        lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
 
-                lib_logger.warning(f"Gemini OAuth token for '{file_name}' needs setup: {reason}.")
+                lib_logger.warning(f"Gemini OAuth token for '{display_name}' needs setup: {reason}.")
                 auth_code_future = asyncio.get_event_loop().create_future()
                 server = None
 
@@ -418,7 +424,7 @@ class GeminiAuthBase:
                         "access_type": "offline", "response_type": "code", "prompt": "consent"
                     })
                     auth_panel_text = Text.from_markup("1. Your browser will now open to log in and authorize the application.\n2. If it doesn't, please open the URL below manually.")
-                    console.print(Panel(auth_panel_text, title=f"Gemini OAuth Setup for [bold yellow]{file_name}[/bold yellow]", style="bold blue"))
+                    console.print(Panel(auth_panel_text, title=f"Gemini OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
                     console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
                     webbrowser.open(auth_url)
                     with console.status("[bold green]Waiting for you to complete authentication in the browser...[/bold green]", spinner="dots"):
@@ -462,10 +468,10 @@ class GeminiAuthBase:
 
                     if path:
                         await self._save_credentials(path, creds)
-                    lib_logger.info(f"Gemini OAuth initialized successfully for '{file_name}'.")
+                    lib_logger.info(f"Gemini OAuth initialized successfully for '{display_name}'.")
                 return creds
-            
-            lib_logger.info(f"Gemini OAuth token at '{file_name}' is valid.")
+
+            lib_logger.info(f"Gemini OAuth token at '{display_name}' is valid.")
             return creds
         except Exception as e:
             raise ValueError(f"Failed to initialize Gemini OAuth for '{path}': {e}")
