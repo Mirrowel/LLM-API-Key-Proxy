@@ -427,6 +427,8 @@ jobs:
           BASE_BRANCH="${{ env.BASE_BRANCH }}"
           CURRENT_SHA="${PR_HEAD_SHA}"
           DIFF_CONTENT=""
+          # Ensure dedicated diff folder exists in the workspace (hidden to avoid accidental use)
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           
           echo "Generating full PR diff against base branch: $BASE_BRANCH"
           
@@ -450,25 +452,25 @@ jobs:
                   TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - PR is very large. Showing first 500KB only. Review scaled to high-impact areas.]'
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
-                TMP_DIR="${RUNNER_TEMP:-/tmp}"
-                echo "$DIFF_CONTENT" > "$TMP_DIR/first_review_diff.txt"
+                # Write diff directly into the repository workspace in the dedicated folder
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               else
                 echo "::warning::Could not generate diff. Using changed files list only."
                 DIFF_CONTENT="(Diff generation failed. Please refer to the changed files list above.)"
-                TMP_DIR="${RUNNER_TEMP:-/tmp}"
-                echo "$DIFF_CONTENT" > "$TMP_DIR/first_review_diff.txt"
+                # Write fallback diff directly into the workspace folder
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               fi
             else
-              echo "::warning::Could not find merge base between $BASE_BRANCH and $CURRENT_SHA."
-              DIFF_CONTENT="(No common ancestor found. This might be a new branch or orphaned commits.)"
-              TMP_DIR="${RUNNER_TEMP:-/tmp}"
-              echo "$DIFF_CONTENT" > "$TMP_DIR/first_review_diff.txt"
+            echo "::warning::Could not find merge base between $BASE_BRANCH and $CURRENT_SHA."
+            DIFF_CONTENT="(No common ancestor found. This might be a new branch or orphaned commits.)"
+            # Write fallback diff content directly into the repository workspace folder
+            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
             fi
           else
             echo "::warning::Could not fetch base branch $BASE_BRANCH. Using changed files list only."
             DIFF_CONTENT="(Base branch not available for diff. Please refer to the changed files list above.)"
-            TMP_DIR="${RUNNER_TEMP:-/tmp}"
-            echo "$DIFF_CONTENT" > "$TMP_DIR/first_review_diff.txt"
+            # Write error-case diff directly into the repository workspace folder
+            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           fi
           
         env:
@@ -481,6 +483,8 @@ jobs:
           LAST_SHA=${{ steps.review_type.outputs.last_reviewed_sha }}
           CURRENT_SHA="${PR_HEAD_SHA}"
           DIFF_CONTENT=""
+          # Ensure dedicated diff folder exists in the workspace (hidden to avoid accidental use)
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           echo "Attempting to generate incremental diff from $LAST_SHA to $CURRENT_SHA"
           
           # Fetch the last reviewed commit, handle potential errors (e.g., rebased/force-pushed commit)
@@ -499,23 +503,22 @@ jobs:
                 TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - Changes are very large. Showing first 500KB only.]'
                 DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
               fi
-              TMP_DIR="${RUNNER_TEMP:-/tmp}"
-              echo "$DIFF_CONTENT" > "$TMP_DIR/incremental_diff.txt"
+              # Write incremental diff directly into the repository workspace folder
+              echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             else
               echo "::warning::Could not generate diff between $LAST_SHA and $CURRENT_SHA. Possible rebase/force-push. AI will perform full review."
-              TMP_DIR="${RUNNER_TEMP:-/tmp}"
-              echo "" > "$TMP_DIR/incremental_diff.txt"
+              # Ensure an empty incremental diff file exists in the workspace folder as fallback
+              echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             fi
           else
             echo "::warning::Failed to fetch last reviewed SHA: $LAST_SHA. This can happen if the commit was part of a force-push or rebase. The AI will perform a full review as a fallback."
-            TMP_DIR="${RUNNER_TEMP:-/tmp}"
-            echo "" > "$TMP_DIR/incremental_diff.txt"
+            # Ensure an empty incremental diff file exists in the workspace folder when last-SHA fetch fails
+            echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
           fi
           
-          # Ensure files exist even on edge cases
-          TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          [ -f "$TMP_DIR/first_review_diff.txt" ] || touch "$TMP_DIR/first_review_diff.txt"
-          [ -f "$TMP_DIR/incremental_diff.txt" ] || touch "$TMP_DIR/incremental_diff.txt"
+          # Ensure workspace diff files exist even on edge cases (in the hidden folder)
+          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
 
 
       - name: Assemble Review Prompt
@@ -528,14 +531,14 @@ jobs:
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
           PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
         run: |
-          # Build DIFF_FILE_PATH pointing to the generated diff in RUNNER_TEMP
-          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          # Build DIFF_FILE_PATH pointing to the generated diff in the repository workspace
           if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
-            DIFF_FILE_PATH="$TMP_DIR/first_review_diff.txt"
+            DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           else
-            DIFF_FILE_PATH="$TMP_DIR/incremental_diff.txt"
+            DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
           VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
           DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/pr-review.md > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
