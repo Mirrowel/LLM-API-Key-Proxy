@@ -236,57 +236,20 @@ EOF
 ```
 
 **Step 2: Collect All Potential Findings (Internal)**
-Analyze the changed files from the `<diff>` in the context. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external "scratchpad"; do not filter or curate at this stage.
+Analyze the changed files from the diff file at `${DIFF_FILE_PATH}`. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external "scratchpad"; do not filter or curate at this stage.
 
-#### Build the Diff to Review (First vs Follow-up)
-- Detect if you previously reviewed this PR. If yes, extract the `last_reviewed_sha` marker from your last summary and generate an incremental diff. Otherwise, generate a full diff from the merge base with the base branch.
+#### Read the Diff File (Provided by Workflow)
+- The workflow already generated the appropriate diff and exposed it at `${DIFF_FILE_PATH}`.
+- Read this file first; it may be a full diff (first review) or an incremental diff (follow-up), depending on `${IS_FIRST_REVIEW}`.
+- Do not regenerate diffs, scrape SHAs, or attempt to infer prior reviews. Use the provided inputs only. Unless something is missing, which will be noted in the file.
 
-Example commands:
-```bash
-# Get base branch name (fallback to parsing context if needed)
-BASE_BRANCH_NAME=$(gh pr view $THREAD_NUMBER --repo $GITHUB_REPOSITORY --json baseRefName -q .baseRefName 2>/dev/null || echo "")
-
-# Locate the last bot summary and extract the last reviewed SHA
-pr_summary_payload=$(gh pr view $THREAD_NUMBER --repo $GITHUB_REPOSITORY --json comments,reviews)
-last_summary_comment=$(echo "$pr_summary_payload" | jq -r '[
-  (.comments[]? | {body:(.body // ""), ts:(.updatedAt // .createdAt // ""), author:(.author.login // "unknown")} ),
-  (.reviews[]?  | {body:(.body // ""), ts:(.submittedAt // .updatedAt // .createdAt // ""), author:(.author.login // "unknown")} )
-] | sort_by(.ts) | last | .body // "")'
-LAST_REVIEWED_SHA=$(echo "$last_summary_comment" | sed -n 's/.*<!-- last_reviewed_sha:\([a-f0-9]\{7,40\}\) -->.*/\1/p')
-
-CURRENT_SHA=$(git rev-parse HEAD)
-[ -n "$BASE_BRANCH_NAME" ] && git fetch origin "$BASE_BRANCH_NAME":refs/remotes/origin/"$BASE_BRANCH_NAME" 2>/dev/null || true
-
-if [ -n "$LAST_REVIEWED_SHA" ] && git cat-file -e "$LAST_REVIEWED_SHA^{commit}" 2>/dev/null; then
-  # Follow-up: incremental diff
-  git diff --patch "$LAST_REVIEWED_SHA".."$CURRENT_SHA" > /tmp/review_diff.txt || true
-fi
-
-if [ ! -s /tmp/review_diff.txt ]; then
-  # First review or fallback: full diff from merge base
-  if [ -n "$BASE_BRANCH_NAME" ]; then
-    MERGE_BASE=$(git merge-base origin/"$BASE_BRANCH_NAME" "$CURRENT_SHA" 2>/dev/null || echo "")
-    if [ -n "$MERGE_BASE" ]; then
-      git diff --patch "$MERGE_BASE".."$CURRENT_SHA" > /tmp/review_diff.txt || true
-    else
-      git diff --patch origin/"$BASE_BRANCH_NAME".."$CURRENT_SHA" > /tmp/review_diff.txt || true
-    fi
-  fi
-fi
-
-# Fallback if still empty: use a full working-tree diff
-[ -s /tmp/review_diff.txt ] || git diff --patch HEAD^..HEAD > /tmp/review_diff.txt || true
-
-# Truncate very large diffs (500KB)
-DIFF_SIZE=$(wc -c < /tmp/review_diff.txt 2>/dev/null || echo 0)
-if [ "$DIFF_SIZE" -gt 500000 ]; then
-  head -c 500000 /tmp/review_diff.txt > /tmp/review_diff.truncated
-  printf '\n\n[DIFF TRUNCATED - Showing first 500KB only.]\n' >> /tmp/review_diff.truncated
-  mv /tmp/review_diff.truncated /tmp/review_diff.txt
-fi
-
-# Proceed to analyze /tmp/review_diff.txt
-```
+#### Head SHA Rules (Critical)
+- Always use the provided environment variable `$PR_HEAD_SHA` for both:
+  - The `commit_id` field in the final review submission payload.
+  - The marker `<!-- last_reviewed_sha:${PR_HEAD_SHA} -->` embedded in your review summary body.
+- Never attempt to derive, scrape, or copy the head SHA from comments, reviews, or other text. Do not reuse `LAST_REVIEWED_SHA` as `commit_id`.
+- The only purpose of `LAST_REVIEWED_SHA` is to determine the base for an incremental diff. It must not replace `$PR_HEAD_SHA` anywhere.
+- If `$PR_HEAD_SHA` is empty or unavailable, do not guess it from comments. Prefer `git rev-parse HEAD` strictly as a fallback and include a warning in your final summary.
 
 #### **Using Line Ranges Correctly**
 Line ranges pinpoint the exact code you're discussing. Use them precisely:
