@@ -83,6 +83,13 @@ jobs:
           echo "Debug: total issue comments before filtering = $total_issue_comments"
           comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
           if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+            filtered_comments=$(echo "$comments" | grep -c "^- " || true)
+            filtered_comments=${filtered_comments//[^0-9]/}
+            [ -z "$filtered_comments" ] && filtered_comments=0
+            total_issue_comments=${total_issue_comments//[^0-9]/}
+            [ -z "$total_issue_comments" ] && total_issue_comments=0
+            excluded_comments=$(( total_issue_comments - filtered_comments )) || excluded_comments=0
+            echo "✓ Filtered comments: $filtered_comments included, $excluded_comments excluded (ignored bots)"
             if [ -s "$comments_filter_err" ]; then
               echo "::debug::jq stderr (issue comments) emitted output:"
               cat "$comments_filter_err"
@@ -97,6 +104,8 @@ jobs:
               echo "::warning::jq returned no stderr for issue comment filter"
             fi
             comments=$(echo "$issue_data" | jq -r 'if (((.comments // []) | length) > 0) then ((.comments[]?) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end')
+            excluded_comments=0
+            echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
           fi
           rm -f "$comments_filter_err" || true
 
