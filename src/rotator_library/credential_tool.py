@@ -80,7 +80,7 @@ async def setup_api_key():
     }
 
     # Discover custom providers and add them to the list
-    oauth_providers = {'gemini_cli', 'qwen_code'}
+    oauth_providers = {'gemini_cli', 'qwen_code', 'iflow'}
     discovered_providers = {
         p.replace('_', ' ').title(): p.upper() + "_API_KEY"
         for p in PROVIDER_PLUGINS.keys()
@@ -222,7 +222,8 @@ async def main():
             available_providers = get_available_providers()
             oauth_friendly_names = {
                 "gemini_cli": "Gemini CLI (OAuth)",
-                "qwen_code": "Qwen Code (OAuth)"
+                "qwen_code": "Qwen Code (OAuth)",
+                "iflow": "iFlow (OAuth)"
             }
             
             provider_text = Text()

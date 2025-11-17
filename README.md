@@ -28,7 +28,7 @@ This project provides a powerful solution for developers building complex applic
 -   **Resilient Performance**: A global timeout on all requests prevents your application from hanging on unresponsive provider APIs.
 -   **Efficient Concurrency**: Maximizes throughput by allowing a single API key to handle multiple concurrent requests to different models.
 -   **Intelligent Key Management**: Optimizes request distribution across your pool of keys by selecting the best available one for each call.
--   **Automated OAuth Discovery**: Automatically discovers, validates, and manages OAuth credentials from standard provider directories (e.g., `~/.gemini/`, `~/.qwen/`). No manual `.env` configuration is required for supported providers.
+-   **Automated OAuth Discovery**: Automatically discovers, validates, and manages OAuth credentials from standard provider directories (e.g., `~/.gemini/`, `~/.qwen/`, `~/.iflow/`). No manual `.env` configuration is required for supported providers.
 -   **Duplicate Credential Detection**: Intelligently detects if multiple local credential files belong to the same user account and logs a warning, preventing redundancy in your key pool.
 -   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
@@ -115,7 +115,7 @@ The proxy supports two types of credentials:
 
 For many providers, **no configuration is necessary**. The proxy automatically discovers and manages credentials from their default locations:
 -   **API Keys**: Scans your environment variables for keys matching the format `PROVIDER_API_KEY_1` (e.g., `GEMINI_API_KEY_1`).
--   **OAuth Credentials**: Scans default system directories (e.g., `~/.gemini/`, `~/.qwen/`) for all `*.json` credential files.
+-   **OAuth Credentials**: Scans default system directories (e.g., `~/.gemini/`, `~/.qwen/`, `~/.iflow/`) for all `*.json` credential files.
 
 You only need to create a `.env` file to set your `PROXY_API_KEY` and to override or add credentials if the automatic discovery doesn't suit your needs.
 

@@ -1,4 +1,4 @@
-# src/rotator_library/providers/qwen_code_provider.py
+# src/rotator_library/providers/iflow_provider.py
 
 import json
 import time
@@ -6,27 +6,34 @@ import httpx
 import logging
 from typing import Union, AsyncGenerator, List, Dict, Any
 from .provider_interface import ProviderInterface
-from .qwen_auth_base import QwenAuthBase
+from .iflow_auth_base import IFlowAuthBase
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 
 lib_logger = logging.getLogger('rotator_library')
 
+# Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
-    "qwen3-coder-plus",
-    "qwen3-coder-flash"
+    "deepseek-v3",
+    "deepseek-chat",
+    "deepseek-coder"
 ]
 
-# OpenAI-compatible parameters supported by Qwen Code API
+# OpenAI-compatible parameters supported by iFlow API
 SUPPORTED_PARAMS = {
     'model', 'messages', 'temperature', 'top_p', 'max_tokens',
     'stream', 'tools', 'tool_choice', 'presence_penalty',
     'frequency_penalty', 'n', 'stop', 'seed', 'response_format'
 }
 
-class QwenCodeProvider(QwenAuthBase, ProviderInterface):
+
+class IFlowProvider(IFlowAuthBase, ProviderInterface):
+    """
+    iFlow provider using OAuth authentication with local callback server.
+    API requests use the derived API key (NOT OAuth access_token).
+    Based on the Go example implementation.
+    """
     skip_cost_calculation = True
-    REASONING_START_MARKER = 'THINK||'
 
     def __init__(self):
         super().__init__()
@@ -35,13 +42,13 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         return True
 
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
-        """Returns a hardcoded list of known compatible Qwen models."""
-        return [f"qwen_code/{model_id}" for model_id in HARDCODED_MODELS]
+        """Returns a hardcoded list of known compatible iFlow models."""
+        return [f"iflow/{model_id}" for model_id in HARDCODED_MODELS]
 
     def _clean_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Removes unsupported properties from tool schemas to prevent API errors.
-        Based on Gemini CLI's approach but adapted for Qwen's API requirements.
+        Similar to Qwen Code implementation.
         """
         import copy
         cleaned_tools = []
@@ -52,7 +59,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             if "function" in cleaned_tool:
                 func = cleaned_tool["function"]
 
-                # Remove strict mode (not supported by Qwen)
+                # Remove strict mode (may not be supported)
                 func.pop("strict", None)
 
                 # Clean parameter schema if present
@@ -104,23 +111,14 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         if "tools" in payload and payload["tools"]:
             payload["tools"] = self._clean_tool_schemas(payload["tools"])
             lib_logger.debug(f"Cleaned {len(payload['tools'])} tool schemas")
-        elif not payload.get("tools"):
-            # Per Qwen Code API bug (see: https://github.com/qianwen-team/flash-dance/issues/2),
-            # injecting a dummy tool prevents stream corruption when no tools are provided
-            payload["tools"] = [{
-                "type": "function",
-                "function": {
-                    "name": "do_not_call_me",
-                    "description": "Do not call this tool.",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }]
-            lib_logger.debug("Injected dummy tool to prevent Qwen API stream corruption")
 
         return payload
 
     def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
-        """Converts a raw Qwen SSE chunk to an OpenAI-compatible chunk."""
+        """
+        Converts a raw iFlow SSE chunk to an OpenAI-compatible chunk.
+        Since iFlow is OpenAI-compatible, minimal conversion is needed.
+        """
         if not isinstance(chunk, dict):
             return
 
@@ -128,7 +126,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         if usage_data := chunk.get("usage"):
             yield {
                 "choices": [], "model": model_id, "object": "chat.completion.chunk",
-                "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time()),
+                "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
+                "created": chunk.get("created", int(time.time())),
                 "usage": {
                     "prompt_tokens": usage_data.get("prompt_tokens", 0),
                     "completion_tokens": usage_data.get("completion_tokens", 0),
@@ -142,42 +141,18 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         if not choices:
             return
 
-        choice = choices[0]
-        delta = choice.get("delta", {})
-        finish_reason = choice.get("finish_reason")
-
-        # Handle <think> tags for reasoning content
-        content = delta.get("content")
-        if content and ("<think>" in content or "</think>" in content):
-            parts = content.replace("<think>", f"||{self.REASONING_START_MARKER}").replace("</think>", f"||/{self.REASONING_START_MARKER}").split("||")
-            for part in parts:
-                if not part: continue
-                
-                new_delta = {}
-                if part.startswith(self.REASONING_START_MARKER):
-                    new_delta['reasoning_content'] = part.replace(self.REASONING_START_MARKER, "")
-                elif part.startswith(f"/{self.REASONING_START_MARKER}"):
-                    continue
-                else:
-                    new_delta['content'] = part
-                
-                yield {
-                    "choices": [{"index": 0, "delta": new_delta, "finish_reason": None}],
-                    "model": model_id, "object": "chat.completion.chunk",
-                    "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
-                }
-        else:
-            # Standard content chunk
-            yield {
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-                "model": model_id, "object": "chat.completion.chunk",
-                "id": f"chatcmpl-qwen-{time.time()}", "created": int(time.time())
-            }
+        # iFlow returns OpenAI-compatible format, so we can mostly pass through
+        yield {
+            "choices": choices,
+            "model": model_id,
+            "object": "chat.completion.chunk",
+            "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
+            "created": chunk.get("created", int(time.time()))
+        }
 
     def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
-        This replaces the non-existent litellm.utils.stream_to_completion_response function.
         """
         if not chunks:
             raise ValueError("No chunks provided for reassembly")
@@ -205,7 +180,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     final_message["content"] = ""
                 final_message["content"] += delta["content"]
 
-            # Aggregate reasoning content
+            # Aggregate reasoning content (if supported by iFlow)
             if "reasoning_content" in delta and delta["reasoning_content"] is not None:
                 if "reasoning_content" not in final_message:
                     final_message["reasoning_content"] = ""
@@ -219,6 +194,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                         aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}}
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                    if "type" in tc_chunk:
+                        aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
                         if "name" in tc_chunk["function"] and tc_chunk["function"]["name"] is not None:
                             aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
@@ -279,27 +256,26 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
         async def make_request():
             """Prepares and makes the actual API call."""
-            api_base, access_token = await self.get_api_details(credential_path)
+            # CRITICAL: get_api_details returns api_key, NOT access_token
+            api_base, api_key = await self.get_api_details(credential_path)
 
             # Build clean payload with only supported parameters
             payload = self._build_request_payload(**kwargs)
 
             headers = {
-                "Authorization": f"Bearer {access_token}",
+                "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": "google-api-nodejs-client/9.15.1",
-                "X-Goog-Api-Client": "gl-node/22.17.0",
-                "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+                "User-Agent": "iFlow-Cli"
             }
 
-            url = f"{api_base.rstrip('/')}/v1/chat/completions"
+            url = f"{api_base.rstrip('/')}/chat/completions"
 
             if enable_request_logging:
-                lib_logger.info(f"Qwen Code Request URL: {url}")
-                lib_logger.info(f"Qwen Code Request Payload: {json.dumps(payload, indent=2)}")
+                lib_logger.info(f"iFlow Request URL: {url}")
+                lib_logger.info(f"iFlow Request Payload: {json.dumps(payload, indent=2)}")
             else:
-                lib_logger.debug(f"Qwen Code Request URL: {url}")
+                lib_logger.debug(f"iFlow Request URL: {url}")
 
             return client.stream("POST", url, headers=headers, json=payload, timeout=600)
 
@@ -314,7 +290,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
                         # Handle 401: Force token refresh and retry once
                         if response.status_code == 401 and attempt == 1:
-                            lib_logger.warning("Qwen Code returned 401. Forcing token refresh and retrying once.")
+                            lib_logger.warning("iFlow returned 401. Forcing token refresh and retrying once.")
                             await self._refresh_token(credential_path, force=True)
                             retry_stream = await make_request()
                             async for chunk in stream_handler(retry_stream, attempt=2):
@@ -324,8 +300,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                         # Handle 429: Rate limit
                         elif response.status_code == 429 or "slow_down" in error_text.lower():
                             raise RateLimitError(
-                                f"Qwen Code rate limit exceeded: {error_text}",
-                                llm_provider="qwen_code",
+                                f"iFlow rate limit exceeded: {error_text}",
+                                llm_provider="iflow",
                                 model=model,
                                 response=response
                             )
@@ -333,7 +309,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                         # Handle other errors
                         else:
                             if enable_request_logging:
-                                lib_logger.error(f"Qwen Code HTTP {response.status_code} error: {error_text}")
+                                lib_logger.error(f"iFlow HTTP {response.status_code} error: {error_text}")
                             raise httpx.HTTPStatusError(
                                 f"HTTP {response.status_code}: {error_text}",
                                 request=response.request,
@@ -351,13 +327,13 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                                 for openai_chunk in self._convert_chunk_to_openai(chunk, model):
                                     yield litellm.ModelResponse(**openai_chunk)
                             except json.JSONDecodeError:
-                                lib_logger.warning(f"Could not decode JSON from Qwen Code: {line}")
+                                lib_logger.warning(f"Could not decode JSON from iFlow: {line}")
 
             except httpx.HTTPStatusError:
                 raise  # Re-raise HTTP errors we already handled
             except Exception as e:
                 if enable_request_logging:
-                    lib_logger.error(f"Error during Qwen Code stream processing: {e}", exc_info=True)
+                    lib_logger.error(f"Error during iFlow stream processing: {e}", exc_info=True)
                 raise
 
         http_response_stream = await make_request()

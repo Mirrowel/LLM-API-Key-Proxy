@@ -13,6 +13,7 @@ OAUTH_BASE_DIR.mkdir(exist_ok=True)
 DEFAULT_OAUTH_DIRS = {
     "gemini_cli": Path.home() / ".gemini",
     "qwen_code": Path.home() / ".qwen",
+    "iflow": Path.home() / ".iflow",
     # Add other providers like 'claude' here if they have a standard CLI path
 }
 
