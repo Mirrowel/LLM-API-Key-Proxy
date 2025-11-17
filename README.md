@@ -119,6 +119,25 @@ For many providers, **no configuration is necessary**. The proxy automatically d
 
 You only need to create a `.env` file to set your `PROXY_API_KEY` and to override or add credentials if the automatic discovery doesn't suit your needs.
 
+#### Interactive Credential Management Tool
+
+For easier credential management, you can use the interactive credential tool:
+
+```bash
+python -m rotator_library.credential_tool
+```
+
+This tool provides:
+1. **Add OAuth Credential** - Interactive OAuth flow for Gemini CLI, Qwen Code, and iFlow
+2. **Add API Key** - Add API keys for any LiteLLM-supported provider
+3. **Export Gemini CLI to .env** - NEW! Export OAuth credentials to environment variables for stateless deployments
+
+**For Stateless Hosting (Railway, Render, Vercel, etc.):**
+- Use option 3 to export your Gemini CLI credentials to `.env` format
+- The generated file contains all necessary environment variables
+- Simply paste these into your hosting platform's environment settings
+- No file persistence required - credentials load automatically from environment variables
+
 **Example `.env` configuration:**
 ```env
 # A secret key for your proxy server to authenticate requests.
@@ -136,6 +155,16 @@ OPENROUTER_API_KEY_1="YOUR_OPENROUTER_API_KEY_1"
 # The proxy automatically finds credentials in standard system paths.
 # You can override this by specifying a path to your credential file.
 GEMINI_CLI_OAUTH_1="/path/to/your/specific/gemini_creds.json"
+
+# --- Gemini CLI: Stateless Deployment Support ---
+# For hosts without file persistence (Railway, Render, etc.), you can provide
+# Gemini CLI credentials directly via environment variables:
+GEMINI_CLI_ACCESS_TOKEN="ya29.your-access-token"
+GEMINI_CLI_REFRESH_TOKEN="1//your-refresh-token"
+GEMINI_CLI_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_EMAIL="your-email@gmail.com"
+# Optional: GEMINI_CLI_PROJECT_ID, GEMINI_CLI_CLIENT_ID, etc.
+# See IMPLEMENTATION_SUMMARY.md for full list of supported variables
 
 # --- Dual Authentication Support ---
 # Some providers (qwen_code, iflow) support BOTH OAuth and direct API keys.

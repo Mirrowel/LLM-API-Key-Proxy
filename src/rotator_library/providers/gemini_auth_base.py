@@ -1,7 +1,8 @@
 # src/rotator_library/providers/gemini_auth_base.py
 
+import os
 import webbrowser
-from typing import Union
+from typing import Union, Optional
 import json
 import time
 import asyncio
@@ -29,13 +30,80 @@ class GeminiAuthBase:
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
 
+    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+        """
+        Load OAuth credentials from environment variables for stateless deployments.
+
+        Expected environment variables:
+        - GEMINI_CLI_ACCESS_TOKEN (required)
+        - GEMINI_CLI_REFRESH_TOKEN (required)
+        - GEMINI_CLI_EXPIRY_DATE (optional, defaults to 0)
+        - GEMINI_CLI_CLIENT_ID (optional, uses default)
+        - GEMINI_CLI_CLIENT_SECRET (optional, uses default)
+        - GEMINI_CLI_TOKEN_URI (optional, uses default)
+        - GEMINI_CLI_UNIVERSE_DOMAIN (optional, defaults to googleapis.com)
+        - GEMINI_CLI_EMAIL (optional, defaults to "env-user")
+        - GEMINI_CLI_PROJECT_ID (optional)
+
+        Returns:
+            Dict with credential structure if env vars present, None otherwise
+        """
+        access_token = os.getenv("GEMINI_CLI_ACCESS_TOKEN")
+        refresh_token = os.getenv("GEMINI_CLI_REFRESH_TOKEN")
+
+        # Both access and refresh tokens are required
+        if not (access_token and refresh_token):
+            return None
+
+        lib_logger.debug("Loading Gemini CLI credentials from environment variables")
+
+        # Parse expiry_date as float, default to 0 if not present
+        expiry_str = os.getenv("GEMINI_CLI_EXPIRY_DATE", "0")
+        try:
+            expiry_date = float(expiry_str)
+        except ValueError:
+            lib_logger.warning(f"Invalid GEMINI_CLI_EXPIRY_DATE value: {expiry_str}, using 0")
+            expiry_date = 0
+
+        creds = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expiry_date": expiry_date,
+            "client_id": os.getenv("GEMINI_CLI_CLIENT_ID", CLIENT_ID),
+            "client_secret": os.getenv("GEMINI_CLI_CLIENT_SECRET", CLIENT_SECRET),
+            "token_uri": os.getenv("GEMINI_CLI_TOKEN_URI", TOKEN_URI),
+            "universe_domain": os.getenv("GEMINI_CLI_UNIVERSE_DOMAIN", "googleapis.com"),
+            "_proxy_metadata": {
+                "email": os.getenv("GEMINI_CLI_EMAIL", "env-user"),
+                "last_check_timestamp": time.time(),
+                "loaded_from_env": True  # Flag to indicate env-based credentials
+            }
+        }
+
+        # Add project_id if provided
+        project_id = os.getenv("GEMINI_CLI_PROJECT_ID")
+        if project_id:
+            creds["_proxy_metadata"]["project_id"] = project_id
+
+        return creds
+
     async def _load_credentials(self, path: str) -> Dict[str, Any]:
         if path in self._credentials_cache:
             return self._credentials_cache[path]
-        
+
         async with self._get_lock(path):
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
+
+            # First, try loading from environment variables
+            env_creds = self._load_from_env()
+            if env_creds:
+                lib_logger.info("Using Gemini CLI credentials from environment variables")
+                # Cache env-based credentials using the path as key
+                self._credentials_cache[path] = env_creds
+                return env_creds
+
+            # Fall back to file-based loading
             try:
                 lib_logger.debug(f"Loading Gemini credentials from file: {path}")
                 with open(path, 'r') as f:
@@ -52,6 +120,12 @@ class GeminiAuthBase:
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
         self._credentials_cache[path] = creds
+
+        # Don't save to file if credentials were loaded from environment
+        if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
+            lib_logger.debug("Credentials loaded from env, skipping file save")
+            return
+
         try:
             with open(path, 'w') as f:
                 json.dump(creds, f, indent=2)

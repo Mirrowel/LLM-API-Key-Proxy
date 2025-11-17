@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from dotenv import set_key, get_key
 
@@ -220,6 +221,102 @@ async def setup_new_credential(provider_name: str):
         console.print(Panel(f"An error occurred during setup for {provider_name}: {e}", style="bold red", title="Error"))
 
 
+async def export_gemini_cli_to_env():
+    """
+    Export a Gemini CLI credential JSON file to .env format.
+    Generates one .env file per credential.
+    """
+    console.print(Panel("[bold cyan]Export Gemini CLI Credential to .env[/bold cyan]", expand=False))
+
+    # Find all gemini_cli credentials
+    gemini_cli_files = list(OAUTH_BASE_DIR.glob("gemini_cli_oauth_*.json"))
+
+    if not gemini_cli_files:
+        console.print(Panel("No Gemini CLI credentials found. Please add one first using 'Add OAuth Credential'.",
+                          style="bold red", title="No Credentials"))
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_file in enumerate(gemini_cli_files):
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            cred_text.append(f"  {i + 1}. {cred_file.name} ({email})\n")
+        except Exception as e:
+            cred_text.append(f"  {i + 1}. {cred_file.name} (error reading: {e})\n")
+
+    console.print(Panel(cred_text, title="Available Gemini CLI Credentials", style="bold blue"))
+
+    choice = Prompt.ask(
+        Text.from_markup("[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"),
+        choices=[str(i + 1) for i in range(len(gemini_cli_files))] + ["b"],
+        show_choices=False
+    )
+
+    if choice.lower() == 'b':
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(gemini_cli_files):
+            cred_file = gemini_cli_files[choice_index]
+
+            # Load the credential
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            project_id = creds.get("_proxy_metadata", {}).get("project_id", "")
+
+            # Generate .env file name
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"gemini_cli_{safe_email}.env"
+            env_filepath = OAUTH_BASE_DIR / env_filename
+
+            # Build .env content
+            env_lines = [
+                f"# Gemini CLI Credential for: {email}",
+                f"# Generated from: {cred_file.name}",
+                f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                f"GEMINI_CLI_ACCESS_TOKEN={creds.get('access_token', '')}",
+                f"GEMINI_CLI_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+                f"GEMINI_CLI_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+                f"GEMINI_CLI_CLIENT_ID={creds.get('client_id', '')}",
+                f"GEMINI_CLI_CLIENT_SECRET={creds.get('client_secret', '')}",
+                f"GEMINI_CLI_TOKEN_URI={creds.get('token_uri', 'https://oauth2.googleapis.com/token')}",
+                f"GEMINI_CLI_UNIVERSE_DOMAIN={creds.get('universe_domain', 'googleapis.com')}",
+                f"GEMINI_CLI_EMAIL={email}",
+            ]
+
+            # Add project_id if present
+            if project_id:
+                env_lines.append(f"GEMINI_CLI_PROJECT_ID={project_id}")
+
+            # Write to .env file
+            with open(env_filepath, 'w') as f:
+                f.write('\n'.join(env_lines))
+
+            success_text = Text.from_markup(
+                f"Successfully exported credential to [bold yellow]'{env_filepath}'[/bold yellow]\n\n"
+                f"To use this credential:\n"
+                f"1. Copy [bold yellow]{env_filepath.name}[/bold yellow] to your deployment environment\n"
+                f"2. Load the variables: [bold cyan]export $(cat {env_filepath.name} | grep -v '^#' | xargs)[/bold cyan]\n"
+                f"3. Or source it: [bold cyan]source {env_filepath.name}[/bold cyan]\n"
+                f"4. The Gemini CLI provider will automatically use these environment variables"
+            )
+            console.print(Panel(success_text, style="bold green", title="Success"))
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print("[bold red]Invalid input. Please enter a number or 'b'.[/bold red]")
+    except Exception as e:
+        console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
+
+
 async def main():
     """
     An interactive CLI tool to add new credentials.
@@ -229,20 +326,20 @@ async def main():
     
     while True:
         console.print(Panel(
-            Text.from_markup("1. Add OAuth Credential\n2. Add API Key"),
+            Text.from_markup("1. Add OAuth Credential\n2. Add API Key\n3. Export Gemini CLI credential to .env"),
             title="Choose credential type",
             style="bold blue"
         ))
-        
+
         setup_type = Prompt.ask(
             Text.from_markup("[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"),
-            choices=["1", "2", "q"],
+            choices=["1", "2", "3", "q"],
             show_choices=False
         )
 
         if setup_type.lower() == 'q':
             break
-        
+
         if setup_type == "1":
             available_providers = get_available_providers()
             oauth_friendly_names = {
@@ -281,6 +378,9 @@ async def main():
 
         elif setup_type == "2":
             await setup_api_key()
+
+        elif setup_type == "3":
+            await export_gemini_cli_to_env()
 
         console.print("\n" + "="*50 + "\n")
 
