@@ -21,6 +21,7 @@ jobs:
       # If triggered by 'issues', it uses github.event.issue.number.
       # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
 
     steps:
 
@@ -77,8 +78,27 @@ jobs:
           title=$(echo "$issue_data" | jq -r .title)
           body=$(echo "$issue_data" | jq -r '.body // "(No description provided)"')
 
-          # Prepare comments
-          comments=$(echo "$issue_data" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No comments have been posted yet." end')
+          # Prepare comments (exclude ignored bots)
+          total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
+          echo "Debug: total issue comments before filtering = $total_issue_comments"
+          comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
+          if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+            if [ -s "$comments_filter_err" ]; then
+              echo "::debug::jq stderr (issue comments) emitted output:"
+              cat "$comments_filter_err"
+            fi
+          else
+            jq_status=$?
+            echo "::warning::Issue comment filtering failed (exit $jq_status), using unfiltered data"
+            if [ -s "$comments_filter_err" ]; then
+              echo "::warning::jq stderr (issue comments):"
+              cat "$comments_filter_err"
+            else
+              echo "::warning::jq returned no stderr for issue comment filter"
+            fi
+            comments=$(echo "$issue_data" | jq -r 'if (((.comments // []) | length) > 0) then ((.comments[]?) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end')
+          fi
+          rm -f "$comments_filter_err" || true
 
           # Prepare cross-references
           references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
