@@ -80,11 +80,12 @@ async def setup_api_key():
     }
 
     # Discover custom providers and add them to the list
-    oauth_providers = {'gemini_cli', 'qwen_code', 'iflow'}
+    # Note: gemini_cli is OAuth-only, but qwen_code and iflow support both OAuth and API keys
+    oauth_only_providers = {'gemini_cli'}
     discovered_providers = {
         p.replace('_', ' ').title(): p.upper() + "_API_KEY"
         for p in PROVIDER_PLUGINS.keys()
-        if p not in oauth_providers and p.replace('_', ' ').title() not in LITELLM_PROVIDERS
+        if p not in oauth_only_providers and p.replace('_', ' ').title() not in LITELLM_PROVIDERS
     }
     
     combined_providers = {**LITELLM_PROVIDERS, **discovered_providers}
@@ -112,6 +113,23 @@ async def setup_api_key():
             api_var_base = combined_providers[display_name]
 
             api_key = Prompt.ask(f"Enter the API key for {display_name}")
+
+            # Check for duplicate API key value
+            if ENV_FILE.is_file():
+                with open(ENV_FILE, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith(api_var_base) and "=" in line:
+                            existing_key_name, _, existing_key_value = line.partition("=")
+                            if existing_key_value == api_key:
+                                warning_text = Text.from_markup(f"This API key already exists as [bold yellow]'{existing_key_name}'[/bold yellow]. Overwriting...")
+                                console.print(Panel(warning_text, style="bold yellow", title="Updating API Key"))
+
+                                set_key(str(ENV_FILE), existing_key_name, api_key)
+
+                                success_text = Text.from_markup(f"Successfully updated existing key [bold yellow]'{existing_key_name}'[/bold yellow].")
+                                console.print(Panel(success_text, style="bold green", title="Success"))
+                                return
 
             # Special handling for AWS
             if display_name in ["AWS Bedrock", "AWS SageMaker"]:
@@ -168,11 +186,18 @@ async def setup_new_credential(provider_name: str):
         for cred_file in OAUTH_BASE_DIR.glob(f"{provider_name}_oauth_*.json"):
             with open(cred_file, 'r') as f:
                 existing_creds = json.load(f)
-            
+
             metadata = existing_creds.get("_proxy_metadata", {})
             if metadata.get("email") == email:
-                error_text = Text.from_markup(f"An existing credential for [bold cyan]'{email}'[/bold cyan] already exists at [bold yellow]'{cred_file.name}'[/bold yellow]. Aborting.")
-                console.print(Panel(error_text, style="bold red", title="Duplicate Credential"))
+                warning_text = Text.from_markup(f"Found existing credential for [bold cyan]'{email}'[/bold cyan] at [bold yellow]'{cred_file.name}'[/bold yellow]. Overwriting...")
+                console.print(Panel(warning_text, style="bold yellow", title="Updating Credential"))
+
+                # Overwrite the existing file in-place
+                with open(cred_file, 'w') as f:
+                    json.dump(initialized_creds, f, indent=2)
+
+                success_text = Text.from_markup(f"Successfully updated credential at [bold yellow]'{cred_file.name}'[/bold yellow] for user [bold cyan]'{email}'[/bold cyan].")
+                console.print(Panel(success_text, style="bold green", title="Success"))
                 return
 
         existing_files = list(OAUTH_BASE_DIR.glob(f"{provider_name}_oauth_*.json"))
@@ -222,8 +247,8 @@ async def main():
             available_providers = get_available_providers()
             oauth_friendly_names = {
                 "gemini_cli": "Gemini CLI (OAuth)",
-                "qwen_code": "Qwen Code (OAuth)",
-                "iflow": "iFlow (OAuth)"
+                "qwen_code": "Qwen Code (OAuth - also supports API keys)",
+                "iflow": "iFlow (OAuth - also supports API keys)"
             }
             
             provider_text = Text()

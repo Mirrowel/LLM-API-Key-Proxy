@@ -112,6 +112,8 @@ def _register_providers():
                 "groq",
                 "openrouter",
                 "chutes",
+                "iflow",
+                "qwen_code",
             ]:
                 continue
 

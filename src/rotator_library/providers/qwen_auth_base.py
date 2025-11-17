@@ -8,6 +8,7 @@ import time
 import asyncio
 import logging
 import webbrowser
+import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, Union
 
@@ -110,17 +111,42 @@ class QwenAuthBase:
             lib_logger.info(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
             return creds_from_file
 
-    async def get_api_details(self, credential_path: str) -> Tuple[str, str]:
-        creds = await self._load_credentials(credential_path)
-        base_url = creds.get("resource_url", "https://portal.qwen.ai/v1")
-        if not base_url.startswith("http"):
-            base_url = f"https://{base_url}"
-        return base_url, creds["access_token"]
+    async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
+        """
+        Returns the API base URL and access token.
 
-    async def proactively_refresh(self, credential_path: str):
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            await self._refresh_token(credential_path)
+        Supports both credential types:
+        - OAuth: credential_identifier is a file path to JSON credentials
+        - API Key: credential_identifier is the API key string itself
+        """
+        # Detect credential type
+        if os.path.isfile(credential_identifier):
+            # OAuth credential: file path to JSON
+            lib_logger.debug(f"Using OAuth credentials from file: {credential_identifier}")
+            creds = await self._load_credentials(credential_identifier)
+            base_url = creds.get("resource_url", "https://portal.qwen.ai/v1")
+            if not base_url.startswith("http"):
+                base_url = f"https://{base_url}"
+            access_token = creds["access_token"]
+        else:
+            # Direct API key: use as-is
+            lib_logger.debug("Using direct API key for Qwen Code")
+            base_url = "https://portal.qwen.ai/v1"
+            access_token = credential_identifier
+
+        return base_url, access_token
+
+    async def proactively_refresh(self, credential_identifier: str):
+        """
+        Proactively refreshes tokens if they're close to expiry.
+        Only applies to OAuth credentials (file paths). Direct API keys are skipped.
+        """
+        # Only refresh if it's an OAuth credential (file path)
+        if os.path.isfile(credential_identifier):
+            creds = await self._load_credentials(credential_identifier)
+            if self._is_token_expired(creds):
+                await self._refresh_token(credential_identifier)
+        # else: Direct API key, no refresh needed
     
     def _get_lock(self, path: str) -> asyncio.Lock:
         if path not in self._refresh_locks:

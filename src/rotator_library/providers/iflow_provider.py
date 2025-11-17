@@ -2,6 +2,7 @@
 
 import json
 import time
+import os
 import httpx
 import logging
 from typing import Union, AsyncGenerator, List, Dict, Any
@@ -42,7 +43,18 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         return True
 
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
-        """Returns a hardcoded list of known compatible iFlow models."""
+        """
+        Returns a hardcoded list of known compatible iFlow models.
+        Validates OAuth credentials if applicable.
+        """
+        # If it's an OAuth credential (file path), ensure it's valid
+        if os.path.isfile(credential):
+            try:
+                await self.initialize_token(credential)
+            except Exception as e:
+                lib_logger.warning(f"Failed to validate iFlow OAuth credential: {e}")
+        # else: Direct API key, no validation needed here
+
         return [f"iflow/{model_id}" for model_id in HARDCODED_MODELS]
 
     def _clean_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

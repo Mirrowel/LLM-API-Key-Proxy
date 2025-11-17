@@ -8,6 +8,7 @@ import asyncio
 import logging
 import webbrowser
 import socket
+import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, Union, Optional
 from urllib.parse import urlencode, parse_qs, urlparse
@@ -369,29 +370,47 @@ class IFlowAuthBase:
             lib_logger.info(f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'.")
             return creds_from_file
 
-    async def get_api_details(self, credential_path: str) -> Tuple[str, str]:
+    async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
         """
         Returns the API base URL and API key (NOT access_token).
         CRITICAL: iFlow uses the api_key for API requests, not the OAuth access_token.
+
+        Supports both credential types:
+        - OAuth: credential_identifier is a file path to JSON credentials
+        - API Key: credential_identifier is the API key string itself
         """
-        creds = await self._load_credentials(credential_path)
+        # Detect credential type
+        if os.path.isfile(credential_identifier):
+            # OAuth credential: file path to JSON
+            lib_logger.debug(f"Using OAuth credentials from file: {credential_identifier}")
+            creds = await self._load_credentials(credential_identifier)
 
-        # Check if token needs refresh
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path)
+            # Check if token needs refresh
+            if self._is_token_expired(creds):
+                creds = await self._refresh_token(credential_identifier)
 
-        api_key = creds.get("api_key")
-        if not api_key:
-            raise ValueError("Missing api_key in iFlow credentials")
+            api_key = creds.get("api_key")
+            if not api_key:
+                raise ValueError("Missing api_key in iFlow OAuth credentials")
+        else:
+            # Direct API key: use as-is
+            lib_logger.debug("Using direct API key for iFlow")
+            api_key = credential_identifier
 
         base_url = "https://apis.iflow.cn/v1"
         return base_url, api_key
 
-    async def proactively_refresh(self, credential_path: str):
-        """Proactively refreshes tokens if they're close to expiry."""
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            await self._refresh_token(credential_path)
+    async def proactively_refresh(self, credential_identifier: str):
+        """
+        Proactively refreshes tokens if they're close to expiry.
+        Only applies to OAuth credentials (file paths). Direct API keys are skipped.
+        """
+        # Only refresh if it's an OAuth credential (file path)
+        if os.path.isfile(credential_identifier):
+            creds = await self._load_credentials(credential_identifier)
+            if self._is_token_expired(creds):
+                await self._refresh_token(credential_identifier)
+        # else: Direct API key, no refresh needed
 
     def _get_lock(self, path: str) -> asyncio.Lock:
         """Gets or creates a lock for the given credential path."""

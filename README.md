@@ -136,6 +136,14 @@ OPENROUTER_API_KEY_1="YOUR_OPENROUTER_API_KEY_1"
 # The proxy automatically finds credentials in standard system paths.
 # You can override this by specifying a path to your credential file.
 GEMINI_CLI_OAUTH_1="/path/to/your/specific/gemini_creds.json"
+
+# --- Dual Authentication Support ---
+# Some providers (qwen_code, iflow) support BOTH OAuth and direct API keys.
+# You can use either method, or mix both for credential rotation:
+QWEN_CODE_API_KEY_1="your-qwen-api-key"  # Direct API key
+# AND/OR use OAuth: oauth_creds/qwen_code_oauth_1.json
+IFLOW_API_KEY_1="sk-your-iflow-key"      # Direct API key
+# AND/OR use OAuth: oauth_creds/iflow_oauth_1.json
 ```
 
 ### 3. Run the Proxy
