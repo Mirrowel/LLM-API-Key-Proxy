@@ -32,7 +32,6 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
     """
     iFlow provider using OAuth authentication with local callback server.
     API requests use the derived API key (NOT OAuth access_token).
-    Based on the Go example implementation.
     """
     skip_cost_calculation = True
 

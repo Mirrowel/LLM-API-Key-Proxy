@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, Union, Optional
 from urllib.parse import urlencode, parse_qs, urlparse
+import tempfile
+import shutil
 
 import httpx
 from aiohttp import web
@@ -22,7 +24,6 @@ from rich.text import Text
 
 lib_logger = logging.getLogger('rotator_library')
 
-# OAuth endpoints and credentials from Go example
 IFLOW_OAUTH_AUTHORIZE_ENDPOINT = "https://iflow.cn/oauth"
 IFLOW_OAUTH_TOKEN_ENDPOINT = "https://iflow.cn/oauth/token"
 IFLOW_USER_INFO_ENDPOINT = "https://iflow.cn/api/oauth/getUserInfo"
@@ -36,7 +37,7 @@ IFLOW_CLIENT_SECRET = "4Z3YjXycVsQvyGF1etiNlIBB4RsqSDtW"
 # Local callback server port
 CALLBACK_PORT = 11451
 
-# Refresh tokens 24 hours before expiry (from Go example)
+# Refresh tokens 24 hours before expiry
 REFRESH_EXPIRY_BUFFER_SECONDS = 24 * 60 * 60
 
 console = Console()
@@ -45,7 +46,6 @@ console = Console()
 class OAuthCallbackServer:
     """
     Minimal HTTP server for handling iFlow OAuth callbacks.
-    Based on the Go example's oauth_server.go implementation.
     """
 
     def __init__(self, port: int = CALLBACK_PORT):
@@ -140,12 +140,61 @@ class IFlowAuthBase:
     """
     iFlow OAuth authentication base class.
     Implements authorization code flow with local callback server.
-    Based on the Go example implementation.
     """
 
     def __init__(self):
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()  # Protects the locks dict from race conditions
+        # [BACKOFF TRACKING] Track consecutive failures per credential
+        self._refresh_failures: Dict[str, int] = {}  # Track consecutive failures per credential
+        self._next_refresh_after: Dict[str, float] = {}  # Track backoff timers (Unix timestamp)
+
+    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+        """
+        Load OAuth credentials from environment variables for stateless deployments.
+
+        Expected environment variables:
+        - IFLOW_ACCESS_TOKEN (required)
+        - IFLOW_REFRESH_TOKEN (required)
+        - IFLOW_API_KEY (required - critical for iFlow!)
+        - IFLOW_EXPIRY_DATE (optional, defaults to empty string)
+        - IFLOW_EMAIL (optional, defaults to "env-user")
+        - IFLOW_TOKEN_TYPE (optional, defaults to "Bearer")
+        - IFLOW_SCOPE (optional, defaults to "read write")
+
+        Returns:
+            Dict with credential structure if env vars present, None otherwise
+        """
+        access_token = os.getenv("IFLOW_ACCESS_TOKEN")
+        refresh_token = os.getenv("IFLOW_REFRESH_TOKEN")
+        api_key = os.getenv("IFLOW_API_KEY")
+
+        # All three are required for iFlow
+        if not (access_token and refresh_token and api_key):
+            return None
+
+        lib_logger.debug("Loading iFlow credentials from environment variables")
+
+        # Parse expiry_date as string (ISO 8601 format)
+        expiry_str = os.getenv("IFLOW_EXPIRY_DATE", "")
+
+        creds = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "api_key": api_key,  # Critical for iFlow!
+            "expiry_date": expiry_str,
+            "email": os.getenv("IFLOW_EMAIL", "env-user"),
+            "token_type": os.getenv("IFLOW_TOKEN_TYPE", "Bearer"),
+            "scope": os.getenv("IFLOW_SCOPE", "read write"),
+            "_proxy_metadata": {
+                "email": os.getenv("IFLOW_EMAIL", "env-user"),
+                "last_check_timestamp": time.time(),
+                "loaded_from_env": True  # Flag to indicate env-based credentials
+            }
+        }
+
+        return creds
 
     async def _read_creds_from_file(self, path: str) -> Dict[str, Any]:
         """Reads credentials from file and populates the cache. No locking."""
@@ -161,29 +210,84 @@ class IFlowAuthBase:
             raise IOError(f"Failed to load iFlow OAuth credentials from '{path}': {e}")
 
     async def _load_credentials(self, path: str) -> Dict[str, Any]:
-        """Loads credentials from cache or file."""
+        """Loads credentials from cache, environment variables, or file."""
         if path in self._credentials_cache:
             return self._credentials_cache[path]
 
-        async with self._get_lock(path):
+        async with await self._get_lock(path):
             # Re-check cache after acquiring lock
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
+
+            # First, try loading from environment variables
+            env_creds = self._load_from_env()
+            if env_creds:
+                lib_logger.info("Using iFlow credentials from environment variables")
+                # Cache env-based credentials using the path as key
+                self._credentials_cache[path] = env_creds
+                return env_creds
+
+            # Fall back to file-based loading
             return await self._read_creds_from_file(path)
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
-        """Saves credentials to cache and file."""
-        self._credentials_cache[path] = creds
+        """Saves credentials to cache and file using atomic writes."""
+        # Don't save to file if credentials were loaded from environment
+        if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
+            lib_logger.debug("Credentials loaded from env, skipping file save")
+            # Still update cache for in-memory consistency
+            self._credentials_cache[path] = creds
+            return
+
+        # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
+        # This prevents credential corruption if the process is interrupted during write
+        parent_dir = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent_dir, exist_ok=True)
+
+        tmp_fd = None
+        tmp_path = None
         try:
-            with open(path, 'w') as f:
+            # Create temp file in same directory as target (ensures same filesystem)
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix='.tmp_', suffix='.json', text=True)
+
+            # Write JSON to temp file
+            with os.fdopen(tmp_fd, 'w') as f:
                 json.dump(creds, f, indent=2)
-            lib_logger.debug(f"Saved updated iFlow OAuth credentials to '{path}'.")
+                tmp_fd = None  # fdopen closes the fd
+
+            # Set secure permissions (0600 = owner read/write only)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except (OSError, AttributeError):
+                # Windows may not support chmod, ignore
+                pass
+
+            # Atomic move (overwrites target if it exists)
+            shutil.move(tmp_path, path)
+            tmp_path = None  # Successfully moved
+
+            # Update cache AFTER successful file write
+            self._credentials_cache[path] = creds
+            lib_logger.debug(f"Saved updated iFlow OAuth credentials to '{path}' (atomic write).")
+
         except Exception as e:
             lib_logger.error(f"Failed to save updated iFlow OAuth credentials to '{path}': {e}")
+            # Clean up temp file if it still exists
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except:
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+            raise
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         """Checks if the token is expired (with buffer for proactive refresh)."""
-        # Try to parse expiry_date as ISO 8601 string (from Go example)
+        # Try to parse expiry_date as ISO 8601 string
         expiry_str = creds.get("expiry_date")
         if not expiry_str:
             return True
@@ -238,7 +342,7 @@ class IFlowAuthBase:
     async def _exchange_code_for_tokens(self, code: str, redirect_uri: str) -> Dict[str, Any]:
         """
         Exchanges authorization code for access and refresh tokens.
-        Uses Basic Auth with client credentials (from Go example).
+        Uses Basic Auth with client credentials.
         """
         # Create Basic Auth header
         auth_string = f"{IFLOW_CLIENT_ID}:{IFLOW_CLIENT_SECRET}"
@@ -299,7 +403,7 @@ class IFlowAuthBase:
         Refreshes the OAuth tokens and re-fetches the API key.
         CRITICAL: Must re-fetch user info to get potentially updated API key.
         """
-        async with self._get_lock(path):
+        async with await self._get_lock(path):
             cached_creds = self._credentials_cache.get(path)
             if not force and cached_creds and not self._is_token_expired(cached_creds):
                 return cached_creds
@@ -314,6 +418,11 @@ class IFlowAuthBase:
             refresh_token = creds_from_file.get("refresh_token")
             if not refresh_token:
                 raise ValueError("No refresh_token found in iFlow credentials file.")
+
+            # [RETRY LOGIC] Implement exponential backoff for transient errors
+            max_retries = 3
+            new_token_data = None
+            last_error = None
 
             # Create Basic Auth header
             auth_string = f"{IFLOW_CLIENT_ID}:{IFLOW_CLIENT_SECRET}"
@@ -333,9 +442,54 @@ class IFlowAuthBase:
             }
 
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data)
-                response.raise_for_status()
-                new_token_data = response.json()
+                for attempt in range(max_retries):
+                    try:
+                        response = await client.post(IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data)
+                        response.raise_for_status()
+                        new_token_data = response.json()
+                        break  # Success
+
+                    except httpx.HTTPStatusError as e:
+                        last_error = e
+                        status_code = e.response.status_code
+
+                        # [STATUS CODE HANDLING]
+                        if status_code in (401, 403):
+                            lib_logger.error(f"Refresh token invalid (HTTP {status_code}), marking as revoked")
+                            creds_from_file["refresh_token"] = None
+                            await self._save_credentials(path, creds_from_file)
+                            raise ValueError(f"Refresh token revoked or invalid (HTTP {status_code}). Re-authentication required.")
+
+                        elif status_code == 429:
+                            retry_after = int(e.response.headers.get("Retry-After", 60))
+                            lib_logger.warning(f"Rate limited (HTTP 429), retry after {retry_after}s")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_after)
+                                continue
+                            raise
+
+                        elif 500 <= status_code < 600:
+                            if attempt < max_retries - 1:
+                                wait_time = 2 ** attempt
+                                lib_logger.warning(f"Server error (HTTP {status_code}), retry {attempt + 1}/{max_retries} in {wait_time}s")
+                                await asyncio.sleep(wait_time)
+                                continue
+                            raise
+
+                        else:
+                            raise
+
+                    except (httpx.RequestError, httpx.TimeoutException) as e:
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            lib_logger.warning(f"Network error during refresh: {e}, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise
+
+            if new_token_data is None:
+                raise last_error or Exception("Token refresh failed after all retries")
 
             # Update tokens
             access_token = new_token_data.get("access_token")
@@ -362,9 +516,10 @@ class IFlowAuthBase:
             except Exception as e:
                 lib_logger.warning(f"Failed to update API key during token refresh: {e}")
 
-            # Update timestamp in metadata if it exists
-            if creds_from_file.get("_proxy_metadata"):
-                creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
+            # Ensure _proxy_metadata exists and update timestamp
+            if "_proxy_metadata" not in creds_from_file:
+                creds_from_file["_proxy_metadata"] = {}
+            creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
             await self._save_credentials(path, creds_from_file)
             lib_logger.info(f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'.")
@@ -406,17 +561,47 @@ class IFlowAuthBase:
         Only applies to OAuth credentials (file paths). Direct API keys are skipped.
         """
         # Only refresh if it's an OAuth credential (file path)
-        if os.path.isfile(credential_identifier):
-            creds = await self._load_credentials(credential_identifier)
-            if self._is_token_expired(creds):
-                await self._refresh_token(credential_identifier)
-        # else: Direct API key, no refresh needed
+        if not os.path.isfile(credential_identifier):
+            return  # Direct API key, no refresh needed
 
-    def _get_lock(self, path: str) -> asyncio.Lock:
+        # [BACKOFF] Check if refresh is in backoff period
+        now = time.time()
+        if credential_identifier in self._next_refresh_after:
+            backoff_until = self._next_refresh_after[credential_identifier]
+            if now < backoff_until:
+                remaining = int(backoff_until - now)
+                lib_logger.debug(f"Skipping refresh for '{Path(credential_identifier).name}' (in backoff for {remaining}s)")
+                return
+
+        creds = await self._load_credentials(credential_identifier)
+        if self._is_token_expired(creds):
+            try:
+                await self._refresh_token(credential_identifier)
+                # [SUCCESS] Clear failure tracking
+                self._refresh_failures.pop(credential_identifier, None)
+                self._next_refresh_after.pop(credential_identifier, None)
+                lib_logger.debug(f"Successfully refreshed '{Path(credential_identifier).name}', cleared failure tracking")
+            except Exception as e:
+                # [FAILURE] Increment failure count and set exponential backoff
+                failures = self._refresh_failures.get(credential_identifier, 0) + 1
+                self._refresh_failures[credential_identifier] = failures
+
+                # Exponential backoff: 5min → 10min → 20min → max 1 hour
+                backoff_seconds = min(300 * (2 ** (failures - 1)), 3600)
+                self._next_refresh_after[credential_identifier] = now + backoff_seconds
+
+                lib_logger.error(
+                    f"Refresh failed for '{Path(credential_identifier).name}' "
+                    f"(attempt {failures}). Next retry in {backoff_seconds}s. Error: {e}"
+                )
+
+    async def _get_lock(self, path: str) -> asyncio.Lock:
         """Gets or creates a lock for the given credential path."""
-        if path not in self._refresh_locks:
-            self._refresh_locks[path] = asyncio.Lock()
-        return self._refresh_locks[path]
+        # [FIX RACE CONDITION] Protect lock creation with a master lock
+        async with self._locks_lock:
+            if path not in self._refresh_locks:
+                self._refresh_locks[path] = asyncio.Lock()
+            return self._refresh_locks[path]
 
     async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         """

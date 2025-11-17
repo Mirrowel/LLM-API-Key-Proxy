@@ -53,7 +53,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
     def _clean_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Removes unsupported properties from tool schemas to prevent API errors.
-        Based on Gemini CLI's approach but adapted for Qwen's API requirements.
+        Adapted for Qwen's API requirements.
         """
         import copy
         cleaned_tools = []

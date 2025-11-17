@@ -77,7 +77,6 @@ class _GeminiCliFileLogger:
 
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
-# [NEW] Hardcoded model list based on Kilo example
 HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
@@ -247,7 +246,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 tool_call_id = msg.get("tool_call_id")
                 function_name = tool_call_id_to_name.get(tool_call_id)
                 if function_name:
-                    # Per Go example, wrap the tool response in a 'result' object
+                    # Wrap the tool response in a 'result' object
                     response_content = {"result": content}
                     parts.append({"functionResponse": {"name": function_name, "response": response_content}})
 
@@ -315,7 +314,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if 'functionCall' in part:
                 function_call = part['functionCall']
                 function_name = function_call.get('name', 'unknown')
-                # Generate unique ID with nanosecond precision (matching Go implementation)
+                # Generate unique ID with nanosecond precision
                 tool_call_id = f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
                 delta['tool_calls'] = [{
                     "index": 0,
@@ -575,7 +574,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 access_token = auth_header['Authorization'].split(' ')[1]
                 project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
             
-            # Handle :thinking suffix from Kilo example
+            # Handle :thinking suffix
             model_name = model.split('/')[-1].replace(':thinking', '')
             
             # [NEW] Create a dedicated file logger for this request
@@ -666,7 +665,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                     lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
 
                 except httpx.HTTPStatusError as e:
-                    file_logger.log_error(f"Stream handler HTTPStatusError: {str(e)}")
+                    error_body = None
+                    if e.response is not None:
+                        try:
+                            error_body = e.response.text
+                        except Exception:
+                            pass
+                    log_line = f"Stream handler HTTPStatusError: {str(e)}"
+                    if error_body:
+                        log_line = f"{log_line} | response_body={error_body}"
+                    file_logger.log_error(log_line)
                     if e.response.status_code == 429:
                         # Pass the raw response object to the exception. Do not read the
                         # response body here as it will close the stream and cause a
