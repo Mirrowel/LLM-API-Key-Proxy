@@ -526,6 +526,46 @@ jobs:
           [ -f first_review_diff.txt ] || touch first_review_diff.txt
           [ -f incremental_diff.txt ] || touch incremental_diff.txt
 
+      - name: Write OpenCode Instruction Files (Context + Diff)
+        run: |
+          set -e
+          # Write full PR context to opencode home; wrap exactly as the prompt would embed it
+          {
+            echo "# [PULL REQUEST CONTEXT]";
+            echo "This is the full context for the pull request you must review.";
+            echo "<pull_request_context>";
+            printf "%s" "${PULL_REQUEST_CONTEXT}";
+            echo;
+            echo "</pull_request_context>";
+          } > "~/.config/opencode/pr-context.txt"
+
+          # Unify diff into a single file in opencode home, wrapped in tags
+          {
+            echo "# [Diff CONTEXT]";
+            echo "<diff>";
+            if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+              cat first_review_diff.txt;
+            else
+              cat incremental_diff.txt;
+            fi;
+            echo "</diff>";
+          } > "~/.config/opencode/pr-diff.txt"
+        env:
+          PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
+
+      - name: Patch OpenCode Config Instructions (bare filenames)
+        run: |
+          set -e
+          CONFIG_PATH="~/.config/opencode/opencode.json"
+          TMP_CONFIG="$CONFIG_PATH.tmp"
+          if [ -f "$CONFIG_PATH" ]; then
+            jq '.instructions = ((.instructions // []) + ["pr-context.txt","pr-diff.txt"]) | .instructions |= unique' \
+              "$CONFIG_PATH" > "$TMP_CONFIG"
+            mv "$TMP_CONFIG" "$CONFIG_PATH"
+          else
+            echo "::warning::OpenCode config not found at $CONFIG_PATH; skipping instructions patch."
+          fi
+
       - name: Upload Diff Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -545,7 +585,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |
-          VARS='${REVIEW_TYPE} ${INCREMENTAL_DIFF} ${PULL_REQUEST_CONTEXT} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA}'
+          # Keep envsubst minimal; context & diff now loaded via config instructions files
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA}'
           envsubst "$VARS" < /tmp/pr-review.md > assembled_prompt.txt
 
       - name: Review PR with OpenCode

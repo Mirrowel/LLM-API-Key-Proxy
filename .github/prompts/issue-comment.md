@@ -72,6 +72,12 @@ You have access to a full set of native file tools from Opencode, as well as ful
 - All file paths should be relative to repository root or absolute for `/tmp`
 - Start with `ls -R` to get an overview of the project structure
 
+# [CONTEXT-INTENSIVE TASKS]
+For large or complex reviews (many files/lines, deep history, multi-threaded discussions), use OpenCode's task planning:
+- Prefer the `task`/`subtask` workflow to break down context-heavy work (e.g., codebase exploration, change analysis, dependency impact).
+- Produce concise, structured subtask reports (findings, risks, next steps). Roll up only the high-signal conclusions to the final summary.
+- Avoid copying large excerpts; cite file paths, function names, and line ranges instead.
+
 # [COMMUNICATION GUIDELINES]
 Your interaction must be in two steps to provide a good user experience:
 1. **Acknowledge:** Immediately post a short comment to let the user know you are starting your analysis.
