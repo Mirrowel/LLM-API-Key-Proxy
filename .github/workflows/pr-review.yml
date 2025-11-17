@@ -15,6 +15,11 @@ on:
         description: 'The number of the PR to review manually'
         required: true
         type: string
+      skipRun:
+        description: 'TEMP DEBUG: skip opencode run (REMOVE WHEN STABLE)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   review-pr:
@@ -582,6 +587,7 @@ jobs:
           envsubst "$VARS" < /tmp/pr-review.md > "$TMP_DIR/assembled_prompt.txt"
 
       - name: Review PR with OpenCode
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skipRun == 'true') }}
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
@@ -603,12 +609,18 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
 
+      - name: DEBUG Skip Notice (TEMP REMOVE WHEN STABLE)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skipRun == 'true' }}
+        run: |
+          echo "skipRun=true -> Skipping opencode execution. (REMOVE skipRun input + this step when stable)"
+
       - name: Stage Artifacts to Temp
         if: always()
         run: |
            set -e
            cp "$HOME/.config/opencode/pr-context.txt" "$RUNNER_TEMP/opencode-pr-context.txt" || true
            cp "$HOME/.config/opencode/pr-diff.txt" "$RUNNER_TEMP/opencode-pr-diff.txt" || true
+           cp "$HOME/.config/opencode/opencode.json" "$RUNNER_TEMP/opencode-config.json" || true
 
       - name: Upload Artifacts
         if: always()
@@ -619,3 +631,4 @@ jobs:
             ${{ runner.temp }}/assembled_prompt.txt
             ${{ runner.temp }}/opencode-pr-context.txt
             ${{ runner.temp }}/opencode-pr-diff.txt
+            ${{ runner.temp }}/opencode-config.json
