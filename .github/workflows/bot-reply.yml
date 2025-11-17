@@ -17,17 +17,35 @@ jobs:
       THREAD_NUMBER: ${{ github.event.issue.number }}
 
     steps:
-      - name: Generate GitHub App Token
-        id: generate_token
-        uses: actions/create-github-app-token@v1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bot Setup
+        id: setup
+        uses: ./.github/actions/bot-setup
         with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          bot-app-id: ${{ secrets.BOT_APP_ID }}
+          bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          opencode-model: ${{ secrets.OPENCODE_MODEL }}
+          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
+          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+      - name: Add reaction to comment
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='eyes'
 
       - name: Gather Full Thread Context
         id: context
         env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
         run: |
           # Common Info
           echo "NEW_COMMENT_AUTHOR=${{ github.event.comment.user.login }}" >> $GITHUB_ENV
@@ -57,6 +75,10 @@ jobs:
             # Fetch timeline data to find cross-references
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.THREAD_NUMBER }}/timeline")
 
+            # Fetch the diff to enable code review strategy
+            echo "Fetching PR diff..."
+            diff_content=$(gh pr diff ${{ env.THREAD_NUMBER }} --repo ${{ github.repository }} || echo "Failed to fetch diff.")
+
             # For checkout step
             echo "repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')" >> $GITHUB_OUTPUT
             echo "ref_name=$(echo "$pr_json" | jq -r .headRefName)" >> $GITHUB_OUTPUT
@@ -80,10 +102,39 @@ jobs:
             changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-((.deletions))"')
             # Prepare general PR comments
             comments=$(echo "$pr_json" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No general comments." end')
-            # Prepare reviews (only include reviews with a non-empty body or non-COMMENTED state, exclude ellipsis-dev)
-            reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
-            # Prepare review comments (group by pull_request_review_id, exclude ellipsis-dev)
-            review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+            
+            # ===== ENHANCED FILTERING WITH ERROR HANDLING =====
+            
+            # Count totals before filtering
+            total_reviews=$(echo "$pr_json" | jq '[.reviews[] | select(.author.login != "ellipsis-dev")] | length')
+            total_review_comments=$(echo "$review_comments_json" | jq '[.[] | select(.user.login != "ellipsis-dev")] | length')
+            
+            # Prepare reviews: exclude COMMENTED (duplicates inline comments) and DISMISSED states
+            # Fallback to unfiltered if jq fails
+            if reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED" and .state != "DISMISSED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end' 2>/dev/null); then
+              filtered_reviews=$(echo "$reviews" | grep -c "^- " || echo "0")
+              excluded_reviews=$((total_reviews - filtered_reviews))
+              echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (COMMENTED/DISMISSED)"
+            else
+              echo "::warning::Review filtering failed, using unfiltered data"
+              reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null) | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
+              excluded_reviews=0
+            fi
+            
+            # Prepare review comments: exclude outdated comments
+            # Fallback to unfiltered if jq fails
+            if review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev" and (.outdated == false or .outdated == null)) | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end' 2>/dev/null); then
+              filtered_comments=$(echo "$review_comments" | grep -c "^- " || echo "0")
+              excluded_comments=$((total_review_comments - filtered_comments))
+              echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated)"
+            else
+              echo "::warning::Review comment filtering failed, using unfiltered data"
+              review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+              excluded_comments=0
+            fi
+            
+            # Build filtering summary
+            filter_summary="Context filtering applied: $excluded_reviews reviews and $excluded_comments review comments excluded from this context."
 
             # Prepare linked issues robustly by fetching each one individually.
             linked_issues_content=""
@@ -122,6 +173,9 @@ jobs:
             echo "Deletions: $deletions" >> "$GITHUB_ENV"
             echo "Total Commits: $total_commits" >> "$GITHUB_ENV"
             echo "Changed Files: $changed_files_count files" >> "$GITHUB_ENV"
+            echo "<diff>" >> "$GITHUB_ENV"
+            echo "$diff_content" >> "$GITHUB_ENV"
+            echo "</diff>" >> "$GITHUB_ENV"
             echo "<pull_request_body>" >> "$GITHUB_ENV"
             echo "$body" >> "$GITHUB_ENV"
             echo "</pull_request_body>" >> "$GITHUB_ENV"
@@ -142,10 +196,13 @@ jobs:
             echo "</linked_issues>" >> "$GITHUB_ENV"
 
             # Step 3: Write the closing delimiter
-            # Add cross-references to the final context
+            # Add cross-references and filtering summary to the final context
             echo "<cross_references>" >> "$GITHUB_ENV"
             echo "$references" >> "$GITHUB_ENV"
             echo "</cross_references>" >> "$GITHUB_ENV"
+            echo "<filtering_summary>" >> "$GITHUB_ENV"
+            echo "$filter_summary" >> "$GITHUB_ENV"
+            echo "</filtering_summary>" >> "$GITHUB_ENV"
 
             echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           else # It's an Issue
@@ -187,126 +244,29 @@ jobs:
             echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           fi
 
+      - name: Save secure prompt from base branch
+        if: steps.context.outputs.IS_PR == 'true'
+        run: cp .github/prompts/bot-reply.md /tmp/bot-reply.md
+
       - name: Checkout PR head
         if: steps.context.outputs.IS_PR == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.context.outputs.repo_full_name }}
           ref: ${{ steps.context.outputs.ref_name }}
-          token: ${{ steps.generate_token.outputs.token }}
+          token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
 
       - name: Checkout repository (for issues)
         if: steps.context.outputs.IS_PR == 'false'
         uses: actions/checkout@v4
         with:
-          token: ${{ steps.generate_token.outputs.token }}
+          token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
-
-      - name: Configure Git for Bot
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-        run: |
-          git config --global user.name "mirrobot-agent[bot]"
-          git config --global user.email "${{ secrets.BOT_APP_ID }}+mirrobot-agent@users.noreply.github.com"
-          git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
-
-      - name: Inject Custom Config (For Proxy Support)
-        run: |
-          mkdir -p ~/.config/opencode
-          CONFIG='{
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-              "llm-proxy": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Proxy",
-                "options": {
-                  "baseURL": "${{ secrets.PROXY_BASE_URL }}",
-                  "apiKey": "${{ secrets.PROXY_API_KEY }}",
-                  "timeout": 300000, // 5 minute timeout in ms
-                  "headers": {
-                    "User-Agent": "OpenCode/1.0",
-                    "X-Custom-Header": "your-value"
-                  }
-                },
-                "models": {
-                  "main_model": {
-                    "id": "${{ secrets.OPENCODE_MODEL }}",
-                    "name": "Custom Model",
-                    "limit": {
-                      "context": 262000,
-                      "output": 64192
-                    }
-                  },
-                  "fast_model": {
-                    "id": "${{ secrets.OPENCODE_FAST_MODEL }}",
-                    "name": "Fast Custom Model",
-                    "limit": {
-                      "context": 262000,
-                      "output": 64192
-                    }
-                  }
-                }
-              }
-            },
-            "model": "llm-proxy/main_model",
-            "small_model": "llm-proxy/fast_model",
-            "username": "mirrobot-agent",
-            "autoupdate": true
-          }'
-          echo "$CONFIG" > ~/.config/opencode/opencode.json
-
-      - name: Check for Python requirements file
-        id: check_requirements_file
-        run: |
-          if [ -f requirements.txt ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Set up Python
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Cache pip dependencies
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-3.12
-
-      - name: Install dependencies
-        if: steps.check_requirements_file.outputs.exists == 'true'
-        run: pip install -r requirements.txt
-
-      - name: Install opencode
-        run: curl -fsSL https://opencode.ai/install | bash
-
-      - name: Ensure opencode directory exists
-        run: mkdir -p /home/runner/.local/share/opencode/project
-
-      - name: Check for model override
-        id: model_override
-        env:
-          MODEL_OVERRIDE_SECRET: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
-        run: |
-          if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
-            echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
-            echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_ENV
-          else
-            echo "No model override found, using default."
-            echo "model_arg=" >> $GITHUB_ENV
-          fi
 
       - name: Analyze comment and respond
         env:
-          OPENCODE_API_KEY: ${{ secrets.PROXY_API_KEY }}
-          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           THREAD_CONTEXT: ${{ env.THREAD_CONTEXT }}
           NEW_COMMENT_AUTHOR: ${{ env.NEW_COMMENT_AUTHOR }}
           NEW_COMMENT_BODY: ${{ env.NEW_COMMENT_BODY }}
@@ -323,5 +283,4 @@ jobs:
               "webfetch": "deny"
             }
         run: |
-            envsubst < .github/prompts/bot-reply.md | opencode run --share $model_arg -
-            
+            envsubst < /tmp/bot-reply.md | opencode run --share -
