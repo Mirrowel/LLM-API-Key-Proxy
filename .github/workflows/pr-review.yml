@@ -37,6 +37,10 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.prNumber }}
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
       IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      COMMENT_FETCH_LIMIT: '40'
+      REVIEW_FETCH_LIMIT: '20'
+      REVIEW_THREAD_FETCH_LIMIT: '25'
+      THREAD_COMMENT_FETCH_LIMIT: '10'
 
     steps:
 
@@ -71,15 +75,73 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
         run: |
-          # Fetch all PR data (including headRepository for fork PRs)
-          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,comments,reviews,closingIssuesReferences,headRepository)
-          review_comments_json=$(gh api "/repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments")
+          # Fetch core PR metadata (comments and reviews fetched via GraphQL below)
+          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
           # Fetch timeline data to find cross-references
           timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/timeline")
-          
-          # Debug: Output pr_json and review_comments_json for inspection
+
+          repo_owner="${GITHUB_REPOSITORY%/*}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          GRAPHQL_QUERY='query($owner:String!, $name:String!, $number:Int!, $commentLimit:Int!, $reviewLimit:Int!, $threadLimit:Int!, $threadCommentLimit:Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                comments(last: $commentLimit) {
+                  nodes {
+                    databaseId
+                    author { login }
+                    body
+                    createdAt
+                    isMinimized
+                    minimizedReason
+                  }
+                }
+                reviews(last: $reviewLimit) {
+                  nodes {
+                    databaseId
+                    author { login }
+                    body
+                    state
+                    submittedAt
+                  }
+                }
+                reviewThreads(last: $threadLimit) {
+                  nodes {
+                    id
+                    isResolved
+                    isOutdated
+                    comments(last: $threadCommentLimit) {
+                      nodes {
+                        databaseId
+                        author { login }
+                        body
+                        createdAt
+                        path
+                        line
+                        originalLine
+                        diffHunk
+                        isMinimized
+                        minimizedReason
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          discussion_data=$(gh api graphql \
+            -F owner="$repo_owner" \
+            -F name="$repo_name" \
+            -F number=${{ env.PR_NUMBER }} \
+            -F commentLimit=${{ env.COMMENT_FETCH_LIMIT }} \
+            -F reviewLimit=${{ env.REVIEW_FETCH_LIMIT }} \
+            -F threadLimit=${{ env.REVIEW_THREAD_FETCH_LIMIT }} \
+            -F threadCommentLimit=${{ env.THREAD_COMMENT_FETCH_LIMIT }} \
+            -f query="$GRAPHQL_QUERY")
+
+          # Debug: Output pr_json and the discussion GraphQL payload for inspection
           echo "$pr_json" > pr_json.txt
-          echo "$review_comments_json" > review_comments_json.txt
+          echo "$discussion_data" > discussion_data.txt
           
           # For checkout step
           repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')
@@ -101,20 +163,33 @@ jobs:
           # Build changed files list with correct jq interpolations for additions and deletions
           # Previous pattern had a missing backslash before the deletions interpolation, leaving a literal '((.deletions))'.
           changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-\((.deletions))"')
-          comments=$(echo "$pr_json" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No general comments." end')
+          comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
+            ((.data.repository.pullRequest.comments.nodes // [])
+              | map(select((.isMinimized != true) and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
+            | if length > 0 then
+                map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n")
+                | join("")
+              else
+                "No general comments."
+              end')
           
           # ===== ENHANCED FILTERING WITH ERROR HANDLING =====
           
           # Count totals before filtering
-          total_reviews=$(echo "$pr_json" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '[((.reviews | (if (type == "object" and has("nodes")) then .nodes else . end) // [])[]? | select((.author.login as $login | $ignored | index($login)) | not))] | length')
-          total_review_comments=$(echo "$review_comments_json" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '[.[]? | select((.user.login as $login | $ignored | index($login)) | not)] | length')
+          total_reviews=$(echo "$discussion_data" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '[((.data.repository.pullRequest.reviews.nodes // [])[]? | select((.author.login? // "unknown") as $login | $ignored | index($login) | not))] | length')
+            total_review_comments=$(echo "$discussion_data" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '((.data.repository.pullRequest.reviewThreads.nodes // [])
+              | map(select(.isResolved != true and .isOutdated != true))
+              | map(.comments.nodes // [])
+              | flatten
+              | map(select(((.author.login? // "unknown") as $login | $ignored | index($login)) | not))
+              | length) // 0')
           echo "Debug: total reviews before filtering = $total_reviews"
           echo "Debug: total review comments before filtering = $total_review_comments"
           
           # Filter reviews: exclude COMMENTED (duplicates inline comments) and DISMISSED states
           # Fallback to unfiltered if jq fails
           review_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_filter_err.log")
-          if reviews=$(echo "$pr_json" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((((.reviews | (if (type == "object" and has("nodes")) then .nodes else . end)) // []) | length) > 0) then (((.reviews | (if (type == "object" and has("nodes")) then .nodes else . end)) // [])[]? | select((.author.login as $login | $ignored | index($login)) | not and .body != null and .state != "COMMENTED" and .state != "DISMISSED") | "- \(.author.login // \"unknown\") at \(.createdAt // \"N/A\"):\n - Review body: \(.body // \"No summary comment.\")\n - State: \(.state // \"UNKNOWN\")\n") else "No formal reviews." end' 2>"$review_filter_err"); then
+          if reviews=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((((.data.repository.pullRequest.reviews.nodes // []) | length) > 0)) then ((.data.repository.pullRequest.reviews.nodes // [])[]? | select((.author.login? // "unknown") as $login | $ignored | index($login) | not and .body != null and .state != "COMMENTED" and .state != "DISMISSED") | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + ":\n - Review body: " + (.body // "No summary comment.") + "\n - State: " + (.state // "UNKNOWN") + "\n") else "No formal reviews." end' 2>"$review_filter_err"); then
             filtered_reviews=$(echo "$reviews" | grep -c "^- " || echo "0")
             excluded_reviews=$((total_reviews - filtered_reviews))
             echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (COMMENTED/DISMISSED)"
@@ -131,7 +206,7 @@ jobs:
             else
               echo "::warning::jq returned no stderr for reviews filter"
             fi
-            reviews=$(echo "$pr_json" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((((.reviews | (if (type == "object" and has("nodes")) then .nodes else . end)) // []) | length) > 0) then (((.reviews | (if (type == "object" and has("nodes")) then .nodes else . end)) // [])[]? | select((.author.login as $login | $ignored | index($login)) | not and .body != null) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n - Review body: " + (.body // "No summary comment.") + "\n - State: " + (.state // "UNKNOWN") + "\n") else "No formal reviews." end')
+            reviews=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((((.data.repository.pullRequest.reviews.nodes // []) | length) > 0)) then ((.data.repository.pullRequest.reviews.nodes // [])[]? | select((.author.login? // "unknown") as $login | $ignored | index($login) | not and .body != null) | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + ":\n - Review body: " + (.body // "No summary comment.") + "\n - State: " + (.state // "UNKNOWN") + "\n") else "No formal reviews." end')
             excluded_reviews=0
             echo "FILTER_ERROR_REVIEWS=true" >> $GITHUB_ENV
           fi
@@ -140,7 +215,18 @@ jobs:
           # Filter review comments: exclude outdated comments
           # Fallback to unfiltered if jq fails
           review_comment_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_comment_filter_err.log")
-          if review_comments=$(echo "$review_comments_json" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((. | type) == "array" and (length > 0)) then (.[]? | select((.user.login as $login | $ignored | index($login)) | not and (.outdated == false or .outdated == null)) | .pull_request_review_id as $review_id | "- " + (.user.login // "unknown") + " (Review ID: " + (($review_id // "N/A") | tostring) + ") at " + (.created_at // "N/A") + ":\n - Inline Comment: " + ((.path // "") | tostring) + ":" + ((.line // "N/A") | tostring) + ":\n   " + ((.body // "") | tostring) + "\n") else "No inline review comments." end' 2>"$review_comment_filter_err"); then
+          if review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
+            ((.data.repository.pullRequest.reviewThreads.nodes // [])
+              | map(select(.isResolved != true and .isOutdated != true))
+              | map(.comments.nodes // [])
+              | flatten
+              | map(select((.isMinimized != true) and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
+            | if length > 0 then
+                map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
+                | join("")
+              else
+                "No inline review comments."
+              end' 2>"$review_comment_filter_err"); then
             filtered_comments=$(echo "$review_comments" | grep -c "^- " || echo "0")
             excluded_comments=$((total_review_comments - filtered_comments))
             echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated)"
@@ -157,7 +243,17 @@ jobs:
             else
               echo "::warning::jq returned no stderr for review comment filter"
             fi
-            review_comments=$(echo "$review_comments_json" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((. | type) == "array" and (length > 0)) then (.[]? | select((.user.login as $login | $ignored | index($login)) | not and (.outdated == false or .outdated == null)) | .pull_request_review_id as $review_id | "- " + (.user.login // "unknown") + " (Review ID: " + (($review_id // "N/A") | tostring) + ") at " + (.created_at // "N/A") + ":\n - Inline Comment: " + ((.path // "") | tostring) + ":" + ((.line // "N/A") | tostring) + ":\n   " + ((.body // "") | tostring) + "\n") else "No inline review comments." end')
+            review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
+              ((.data.repository.pullRequest.reviewThreads.nodes // [])
+                | map(.comments.nodes // [])
+                | flatten
+                | map(select(((.author.login? // "unknown") as $login | $ignored | index($login)) | not)))
+              | if length > 0 then
+                  map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
+                  | join("")
+                else
+                  "No inline review comments."
+                end')
             excluded_comments=0
             echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
           fi
