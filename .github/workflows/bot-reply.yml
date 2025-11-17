@@ -27,12 +27,10 @@ jobs:
         with:
           bot-app-id: ${{ secrets.BOT_APP_ID }}
           bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
-          proxy-base-url: ${{ secrets.PROXY_BASE_URL }}
-          proxy-api-key: ${{ secrets.PROXY_API_KEY }}
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
-          opencode-model-override: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
-          opencode-api-key-override: ${{ secrets.OPENCODE_API_KEY_OVERRIDE }}
+          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
 
       - name: Add reaction to comment
         env:
@@ -77,6 +75,10 @@ jobs:
             # Fetch timeline data to find cross-references
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/${{ env.THREAD_NUMBER }}/timeline")
 
+            # Fetch the diff to enable code review strategy
+            echo "Fetching PR diff..."
+            diff_content=$(gh pr diff ${{ env.THREAD_NUMBER }} --repo ${{ github.repository }} || echo "Failed to fetch diff.")
+
             # For checkout step
             echo "repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')" >> $GITHUB_OUTPUT
             echo "ref_name=$(echo "$pr_json" | jq -r .headRefName)" >> $GITHUB_OUTPUT
@@ -100,10 +102,39 @@ jobs:
             changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-((.deletions))"')
             # Prepare general PR comments
             comments=$(echo "$pr_json" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No general comments." end')
-            # Prepare reviews (only include reviews with a non-empty body or non-COMMENTED state, exclude ellipsis-dev)
-            reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
-            # Prepare review comments (group by pull_request_review_id, exclude ellipsis-dev)
-            review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+            
+            # ===== ENHANCED FILTERING WITH ERROR HANDLING =====
+            
+            # Count totals before filtering
+            total_reviews=$(echo "$pr_json" | jq '[.reviews[] | select(.author.login != "ellipsis-dev")] | length')
+            total_review_comments=$(echo "$review_comments_json" | jq '[.[] | select(.user.login != "ellipsis-dev")] | length')
+            
+            # Prepare reviews: exclude COMMENTED (duplicates inline comments) and DISMISSED states
+            # Fallback to unfiltered if jq fails
+            if reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED" and .state != "DISMISSED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end' 2>/dev/null); then
+              filtered_reviews=$(echo "$reviews" | grep -c "^- " || echo "0")
+              excluded_reviews=$((total_reviews - filtered_reviews))
+              echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (COMMENTED/DISMISSED)"
+            else
+              echo "::warning::Review filtering failed, using unfiltered data"
+              reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null) | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
+              excluded_reviews=0
+            fi
+            
+            # Prepare review comments: exclude outdated comments
+            # Fallback to unfiltered if jq fails
+            if review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev" and (.outdated == false or .outdated == null)) | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end' 2>/dev/null); then
+              filtered_comments=$(echo "$review_comments" | grep -c "^- " || echo "0")
+              excluded_comments=$((total_review_comments - filtered_comments))
+              echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated)"
+            else
+              echo "::warning::Review comment filtering failed, using unfiltered data"
+              review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+              excluded_comments=0
+            fi
+            
+            # Build filtering summary
+            filter_summary="Context filtering applied: $excluded_reviews reviews and $excluded_comments review comments excluded from this context."
 
             # Prepare linked issues robustly by fetching each one individually.
             linked_issues_content=""
@@ -142,6 +173,9 @@ jobs:
             echo "Deletions: $deletions" >> "$GITHUB_ENV"
             echo "Total Commits: $total_commits" >> "$GITHUB_ENV"
             echo "Changed Files: $changed_files_count files" >> "$GITHUB_ENV"
+            echo "<diff>" >> "$GITHUB_ENV"
+            echo "$diff_content" >> "$GITHUB_ENV"
+            echo "</diff>" >> "$GITHUB_ENV"
             echo "<pull_request_body>" >> "$GITHUB_ENV"
             echo "$body" >> "$GITHUB_ENV"
             echo "</pull_request_body>" >> "$GITHUB_ENV"
@@ -162,10 +196,13 @@ jobs:
             echo "</linked_issues>" >> "$GITHUB_ENV"
 
             # Step 3: Write the closing delimiter
-            # Add cross-references to the final context
+            # Add cross-references and filtering summary to the final context
             echo "<cross_references>" >> "$GITHUB_ENV"
             echo "$references" >> "$GITHUB_ENV"
             echo "</cross_references>" >> "$GITHUB_ENV"
+            echo "<filtering_summary>" >> "$GITHUB_ENV"
+            echo "$filter_summary" >> "$GITHUB_ENV"
+            echo "</filtering_summary>" >> "$GITHUB_ENV"
 
             echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           else # It's an Issue
@@ -207,6 +244,10 @@ jobs:
             echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           fi
 
+      - name: Save secure prompt from base branch
+        if: steps.context.outputs.IS_PR == 'true'
+        run: cp .github/prompts/bot-reply.md /tmp/bot-reply.md
+
       - name: Checkout PR head
         if: steps.context.outputs.IS_PR == 'true'
         uses: actions/checkout@v4
@@ -215,10 +256,6 @@ jobs:
           ref: ${{ steps.context.outputs.ref_name }}
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
-
-      - name: Fetch prompts from base branch (Security)
-        if: steps.context.outputs.IS_PR == 'true'
-        run: git checkout origin/${{ github.event.repository.default_branch }} -- .github/prompts .github/actions/bot-setup
 
       - name: Checkout repository (for issues)
         if: steps.context.outputs.IS_PR == 'false'
@@ -229,7 +266,7 @@ jobs:
 
       - name: Analyze comment and respond
         env:
-          OPENCODE_API_KEY: ${{ steps.setup.outputs.opencode-api-key }}
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           THREAD_CONTEXT: ${{ env.THREAD_CONTEXT }}
           NEW_COMMENT_AUTHOR: ${{ env.NEW_COMMENT_AUTHOR }}
@@ -247,5 +284,4 @@ jobs:
               "webfetch": "deny"
             }
         run: |
-            envsubst < .github/prompts/bot-reply.md | opencode run --share ${{ steps.setup.outputs.model-arg }} -
-            
+            envsubst < /tmp/bot-reply.md | opencode run --share -

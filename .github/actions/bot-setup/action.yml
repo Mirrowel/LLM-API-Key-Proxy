@@ -8,35 +8,23 @@ inputs:
   bot-private-key:
     description: 'The private key of the GitHub App.'
     required: true
-  proxy-base-url:
-    description: 'The base URL for the proxy.'
-    required: true
-  proxy-api-key:
-    description: 'The API key for the proxy.'
-    required: true
+  opencode-api-key:
+    description: 'The default API key, used for providers that do not have one defined in the custom providers JSON.'
+    required: false
   opencode-model:
-    description: 'The main model for opencode.'
+    description: 'The main model to use (e.g., openai/gpt-4o or a custom one from custom providers JSON).'
     required: true
   opencode-fast-model:
-    description: 'The fast model for opencode.'
-    required: true
-  opencode-model-override:
-    description: 'The model override for opencode.'
+    description: 'Optional: The fast model for smaller tasks.'
     required: false
-  opencode-api-key-override:
-    description: 'The OpenCode API key override.'
+  custom-providers-json:
+    description: 'Optional: A JSON string defining custom providers. Use minifier to correctly format.'
     required: false
 
 outputs:
   token:
     description: "The generated GitHub App token."
     value: ${{ steps.generate_token.outputs.token }}
-  model-arg:
-    description: "The model argument for opencode."
-    value: ${{ steps.model_override.outputs.model_arg }}
-  opencode-api-key:
-    description: "The final OpenCode API key to use."
-    value: ${{ steps.determine-api-key.outputs.final-key }}
 
 runs:
   using: "composite"
@@ -57,54 +45,104 @@ runs:
         git config --global user.email "${{ inputs.bot-app-id }}+mirrobot-agent@users.noreply.github.com"
         git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
-    - name: Inject Custom Config (For Proxy Support)
+    - name: Generate OpenCode Configuration
       shell: bash
       run: |
+        set -e # Exit immediately if a command fails
+
+        # --- HARDCODED TOGGLE ---
+        # Set to "true" to add 'reasoning_effort: "high"' to the main model's request body.
+        # Set to "false" to disable.
+        ADD_REASONING_EFFORT="true"
+
         mkdir -p ~/.config/opencode
-        CONFIG=$(cat <<EOF
-        {
-          "\$schema": "https://opencode.ai/config.json",
-          "provider": {
-            "llm-proxy": {
-              "npm": "@ai-sdk/openai-compatible",
-              "name": "Proxy",
-              "options": {
-                "baseURL": "${{ inputs.proxy-base-url }}",
-                "apiKey": "${{ inputs.proxy-api-key }}",
-                "timeout": 300000,
-                "headers": {
-                  "User-Agent": "OpenCode/1.0",
-                  "X-Custom-Header": "your-value"
-                }
-              },
-              "models": {
-                "main_model": {
-                  "id": "${{ inputs.opencode-model }}",
-                  "name": "Custom Model",
-                  "limit": {
-                    "context": 262000,
-                    "output": 64192
-                  }
-                },
-                "fast_model": {
-                  "id": "${{ inputs.opencode-fast-model }}",
-                  "name": "Fast Custom Model",
-                  "limit": {
-                    "context": 262000,
-                    "output": 64192
-                  }
-                }
-              }
-            }
-          },
-          "model": "llm-proxy/main_model",
-          "small_model": "llm-proxy/fast_model",
-          "username": "mirrobot-agent",
-          "autoupdate": true
-        }
+
+        # --- INPUTS ---
+        MAIN_MODEL="${{ inputs.opencode-model }}"
+        FAST_MODEL="${{ inputs.opencode-fast-model }}"
+        DEFAULT_API_KEY="${{ inputs.opencode-api-key }}"
+
+        # Use command substitution with a heredoc to safely read the input into a variable.
+        # This is robust against complex characters and avoids creating a giant line of code that can break shell parsers.
+        CUSTOM_PROVIDERS=$(cat <<'EOF'
+        ${{ inputs.custom-providers-json }}
         EOF
         )
+
+        # If the input was empty (or just whitespace), the variable will be empty. Set a default.
+        if [ -z "$CUSTOM_PROVIDERS" ]; then
+          CUSTOM_PROVIDERS='{}'
+        fi
+
+        # --- INITIAL CONFIG SETUP ---
+        mkdir -p ~/.config/opencode
+        CONFIG='{"$schema": "https://opencode.ai/config.json", "username": "mirrobot-agent", "autoupdate": true}'
+
+        # Merge custom provider definitions if they are not the empty default
+        if [ "$CUSTOM_PROVIDERS" != "{}" ]; then
+          echo "Custom provider definitions found. Merging into configuration."
+          CONFIG=$(jq --argjson customProviders "$CUSTOM_PROVIDERS" '. * {provider: $customProviders}' <<< "$CONFIG")
+        else
+          echo "No custom provider definitions supplied."
+        fi
+
+        # --- MODULAR FUNCTION TO CONFIGURE A MODEL ---
+        configure_model() {
+          local model_string="$1"
+          local config_key="$2"
+          local provider="${model_string%%/*}"
+          local model_name="${model_string#*/}"
+
+          echo "--- Configuring ${config_key} with '${model_string}' ---"
+
+          # Check if the provider exists in the custom definitions
+          if jq -e --arg provider "$provider" '. | has($provider)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
+            echo "Provider '$provider' found in custom definitions."
+
+            # CASE 2: Provider exists, but the model does not. This is an error.
+            if ! jq -e --arg provider "$provider" --arg modelName "$model_name" '.[$provider].models | has($modelName)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
+              echo "::error::Configuration error: Provider '$provider' is defined, but model '$model_name' is not found within it. Aborting."
+              exit 1
+            fi
+
+            # CASE 1: Provider and model both exist. Use it as is.
+            echo "Model '$model_name' also found. Setting '${config_key}' to '${model_string}'."
+            CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
+
+          else
+            # CASE 3: Provider does not exist in custom definitions. Treat as a standard provider.
+            echo "Provider '$provider' not found in custom definitions. Configuring as a standard provider."
+            
+            CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
+            
+            echo "Setting default API key for provider '$provider'."
+            CONFIG=$(jq \
+              --arg provider "$provider" \
+              --arg apiKey "$DEFAULT_API_KEY" \
+              '.provider[$provider].options.apiKey = $apiKey' <<< "$CONFIG")
+
+            if [[ "$config_key" == "model" && "$ADD_REASONING_EFFORT" == "true" ]]; then
+              echo "Reasoning effort toggle is ON. Applying to standard provider model '$model_name'."
+              CONFIG=$(jq \
+                --arg provider "$provider" \
+                --arg modelName "$model_name" \
+                '.provider[$provider].models[$modelName].options.reasoning_effort = "high"' <<< "$CONFIG")
+            fi
+          fi
+        }
+
+        # --- EXECUTION ---
+        configure_model "$MAIN_MODEL" "model"
+        if [ -n "$FAST_MODEL" ]; then
+          configure_model "$FAST_MODEL" "small_model"
+        fi
+
+        # --- FINALIZATION ---
         echo "$CONFIG" > ~/.config/opencode/opencode.json
+        echo "--- Generated OpenCode Configuration ---"
+        jq . ~/.config/opencode/opencode.json
+        echo "----------------------------------------"
+        echo "Successfully generated OpenCode configuration."
 
     - name: Check for Python requirements file
       id: check_requirements_file
@@ -143,29 +181,3 @@ runs:
     - name: Ensure opencode directory exists
       shell: bash
       run: mkdir -p /home/runner/.local/share/opencode/project
-
-    - name: Check for model override
-      id: model_override
-      shell: bash
-      env:
-        MODEL_OVERRIDE_SECRET: ${{ inputs.opencode-model-override }}
-      run: |
-        if [ -n "$MODEL_OVERRIDE_SECRET" ]; then
-          echo "Model override from secret: $MODEL_OVERRIDE_SECRET"
-          echo "model_arg=-m $MODEL_OVERRIDE_SECRET" >> $GITHUB_OUTPUT
-        else
-          echo "No model override found, using default."
-          echo "model_arg=" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Determine API Key
-      id: determine-api-key
-      shell: bash
-      run: |
-        if [ -n "${{ inputs.opencode-api-key-override }}" ]; then
-          echo "Using API key override."
-          echo "final-key=${{ inputs.opencode-api-key-override }}" >> $GITHUB_OUTPUT
-        else
-          echo "Using default proxy API key."
-          echo "final-key=${{ inputs.proxy-api-key }}" >> $GITHUB_OUTPUT
-        fi

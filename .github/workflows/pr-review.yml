@@ -26,7 +26,6 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        contains(github.event.issue.labels.*.name, 'Agent Monitored') &&
         (contains(github.event.comment.body, '/mirrobot-review') || contains(github.event.comment.body, '/mirrobot_review'))
       )
     runs-on: ubuntu-latest
@@ -48,12 +47,10 @@ jobs:
         with:
           bot-app-id: ${{ secrets.BOT_APP_ID }}
           bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
-          proxy-base-url: ${{ secrets.PROXY_BASE_URL }}
-          proxy-api-key: ${{ secrets.PROXY_API_KEY }}
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
-          opencode-model-override: ${{ secrets.OPENCODE_MODEL_OVERRIDE }}
-          opencode-api-key-override: ${{ secrets.OPENCODE_API_KEY_OVERRIDE }}
+          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
 
       - name: Add reaction to PR
         env:
@@ -95,8 +92,42 @@ jobs:
           body=$(echo "$pr_json" | jq -r .body)
           changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-((.deletions))"')
           comments=$(echo "$pr_json" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No general comments." end')
-          reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
-          review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+          
+          # ===== ENHANCED FILTERING WITH ERROR HANDLING =====
+          
+          # Count totals before filtering
+          total_reviews=$(echo "$pr_json" | jq '[.reviews[] | select(.author.login != "ellipsis-dev")] | length')
+          total_review_comments=$(echo "$review_comments_json" | jq '[.[] | select(.user.login != "ellipsis-dev")] | length')
+          
+          # Filter reviews: exclude COMMENTED (duplicates inline comments) and DISMISSED states
+          # Fallback to unfiltered if jq fails
+          if reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null and .state != "COMMENTED" and .state != "DISMISSED") | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end' 2>/dev/null); then
+            filtered_reviews=$(echo "$reviews" | grep -c "^- " || echo "0")
+            excluded_reviews=$((total_reviews - filtered_reviews))
+            echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (COMMENTED/DISMISSED)"
+          else
+            echo "::warning::Review filtering failed, using unfiltered data"
+            reviews=$(echo "$pr_json" | jq -r 'if (.reviews | length) > 0 then (.reviews[] | select(.author.login != "ellipsis-dev" and .body != null) | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n - Review body: \(.body // "No summary comment.")\n - State: \(.state // "UNKNOWN")\n") else "No formal reviews." end')
+            excluded_reviews=0
+            echo "FILTER_ERROR_REVIEWS=true" >> $GITHUB_ENV
+          fi
+          
+          # Filter review comments: exclude outdated comments
+          # Fallback to unfiltered if jq fails
+          if review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev" and (.outdated == false or .outdated == null)) | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end' 2>/dev/null); then
+            filtered_comments=$(echo "$review_comments" | grep -c "^- " || echo "0")
+            excluded_comments=$((total_review_comments - filtered_comments))
+            echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated)"
+          else
+            echo "::warning::Review comment filtering failed, using unfiltered data"
+            review_comments=$(echo "$review_comments_json" | jq -r 'if (length > 0) then (.[] | select(.user.login != "ellipsis-dev") | .pull_request_review_id as $review_id | "- \(.user.login // "unknown") (Review ID: \($review_id // "N/A")) at \(.created_at // "N/A"):\n - Inline Comment: \(.path):\(.line // "N/A"):\n   \(.body // "")\n") else "No inline review comments." end')
+            excluded_comments=0
+            echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
+          fi
+          
+          # Store filtering statistics
+          echo "EXCLUDED_REVIEWS=$excluded_reviews" >> $GITHUB_ENV
+          echo "EXCLUDED_COMMENTS=$excluded_comments" >> $GITHUB_ENV
 
           # Prepare linked issues robustly by fetching each one individually
           linked_issues_content=""
@@ -116,6 +147,12 @@ jobs:
           # Prepare cross-references from timeline data
           references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
           if [ -z "$references" ]; then references="This PR has not been mentioned in other issues or PRs."; fi
+
+          # Build filtering summary for AI context
+          filter_summary="Context filtering applied: $excluded_reviews reviews and $excluded_comments review comments excluded from this context."
+          if [ "${FILTER_ERROR_REVIEWS}" = "true" ] || [ "${FILTER_ERROR_COMMENTS}" = "true" ]; then
+            filter_summary="$filter_summary"$'\n'"Warning: Some filtering operations encountered errors. Context may include items that should have been filtered."
+          fi
 
           # Assemble the final context block
           CONTEXT_DELIMITER="GH_PR_CONTEXT_DELIMITER_$(openssl rand -hex 8)"
@@ -152,6 +189,9 @@ jobs:
           echo "<cross_references>" >> "$GITHUB_ENV"
           echo "$references" >> "$GITHUB_ENV"
           echo "</cross_references>" >> "$GITHUB_ENV"
+          echo "<filtering_summary>" >> "$GITHUB_ENV"
+          echo "$filter_summary" >> "$GITHUB_ENV"
+          echo "</filtering_summary>" >> "$GITHUB_ENV"
           echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
           echo "PR_AUTHOR=$author" >> $GITHUB_ENV
@@ -191,6 +231,9 @@ jobs:
             fi
           fi
 
+      - name: Save secure prompt from base branch
+        run: cp .github/prompts/pr-review.md /tmp/pr-review.md
+
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
@@ -198,9 +241,6 @@ jobs:
           ref: ${{ steps.pr_meta.outputs.ref_name }}
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0
-
-      - name: Fetch prompts from base branch (Security)
-        run: git checkout origin/${{ github.event.repository.default_branch }} -- .github/prompts .github/actions/bot-setup
 
       - name: Generate Incremental Diff
         if: steps.review_type.outputs.is_first_review == 'false' && steps.review_type.outputs.last_reviewed_sha != ''
@@ -225,15 +265,16 @@ jobs:
           echo "$DIFF_CONTENT" >> "$GITHUB_OUTPUT"
           echo "$DELIMITER" >> "$GITHUB_OUTPUT"
 
-      - name: Review PR comprehensively
+      - name: Review PR with OpenCode
         env:
-          OPENCODE_API_KEY: ${{ steps.setup.outputs.opencode-api-key }}
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
             {
               "bash": {
                 "gh*": "allow",
-                "git*": "allow"
+                "git*": "allow",
+                "jq*": "allow"
               },
               "webfetch": "deny"
             }
@@ -246,4 +287,4 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |
-          envsubst < .github/prompts/pr-review.md | opencode run --share ${{ steps.setup.outputs.model-arg }} -
+          envsubst < /tmp/pr-review.md | opencode run --share -
