@@ -48,11 +48,14 @@ jobs:
             /repos/${{ github.repository }}/issues/${{ env.ISSUE_NUMBER }}/reactions \
             -f content='eyes'
 
+      - name: Save secure prompt from base branch
+        run: cp .github/prompts/issue-comment.md /tmp/issue-comment.md
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ steps.setup.outputs.token }}
-          fetch-depth: 0
+          fetch-depth: 0  # Full history needed for git log, git blame, and other investigation commands
 
       - name: Fetch and Format Full Issue Context
         id: issue_details
@@ -72,7 +75,7 @@ jobs:
           created_at=$(echo "$issue_data" | jq -r .createdAt)
           state=$(echo "$issue_data" | jq -r .state)
           title=$(echo "$issue_data" | jq -r .title)
-          body=$(echo "$issue_data" | jq -r .body)
+          body=$(echo "$issue_data" | jq -r '.body // "(No description provided)"')
 
           # Prepare comments
           comments=$(echo "$issue_data" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No comments have been posted yet." end')
@@ -106,7 +109,6 @@ jobs:
 
       - name: Analyze issue and suggest resolution
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           ISSUE_CONTEXT: ${{ env.ISSUE_CONTEXT }}
           ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
@@ -115,9 +117,12 @@ jobs:
             {
               "bash": {
                 "gh*": "allow",
-                "git*": "allow"
+                "git*": "allow",
+                "jq*": "allow"
               },
               "webfetch": "deny"
             }
         run: |
-            envsubst < .github/prompts/issue-comment.md | opencode run --share -
+            # Only substitute the variables we intend; leave example $vars and secrets intact
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}'
+            envsubst "$VARS" < /tmp/issue-comment.md | opencode run --share -

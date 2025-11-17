@@ -10,7 +10,7 @@ inputs:
     required: true
   opencode-api-key:
     description: 'The default API key, used for providers that do not have one defined in the custom providers JSON.'
-    required: false
+    required: true
   opencode-model:
     description: 'The main model to use (e.g., openai/gpt-4o or a custom one from custom providers JSON).'
     required: true
@@ -93,36 +93,36 @@ runs:
           local provider="${model_string%%/*}"
           local model_name="${model_string#*/}"
 
-          echo "--- Configuring ${config_key} with '${model_string}' ---"
+          # echo "--- Configuring ${config_key} with '${model_string}' ---"
 
           # Check if the provider exists in the custom definitions
           if jq -e --arg provider "$provider" '. | has($provider)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
-            echo "Provider '$provider' found in custom definitions."
+            echo "Provider found in custom definitions."
 
             # CASE 2: Provider exists, but the model does not. This is an error.
             if ! jq -e --arg provider "$provider" --arg modelName "$model_name" '.[$provider].models | has($modelName)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
-              echo "::error::Configuration error: Provider '$provider' is defined, but model '$model_name' is not found within it. Aborting."
+              echo "::error::Configuration error: Provider is defined, but model is not found within it. Aborting."
               exit 1
             fi
 
             # CASE 1: Provider and model both exist. Use it as is.
-            echo "Model '$model_name' also found. Setting '${config_key}' to '${model_string}'."
+            # echo "Model '$model_name' also found. Setting '${config_key}' to '${model_string}'."
             CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
 
           else
             # CASE 3: Provider does not exist in custom definitions. Treat as a standard provider.
-            echo "Provider '$provider' not found in custom definitions. Configuring as a standard provider."
+            echo "Provider not found in custom definitions. Configuring as a standard provider."
             
             CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
             
-            echo "Setting default API key for provider '$provider'."
+            echo "Setting default API key for provider."
             CONFIG=$(jq \
               --arg provider "$provider" \
               --arg apiKey "$DEFAULT_API_KEY" \
               '.provider[$provider].options.apiKey = $apiKey' <<< "$CONFIG")
 
             if [[ "$config_key" == "model" && "$ADD_REASONING_EFFORT" == "true" ]]; then
-              echo "Reasoning effort toggle is ON. Applying to standard provider model '$model_name'."
+              echo "Reasoning effort toggle is ON. Applying to standard provider model."
               CONFIG=$(jq \
                 --arg provider "$provider" \
                 --arg modelName "$model_name" \
@@ -139,9 +139,9 @@ runs:
 
         # --- FINALIZATION ---
         echo "$CONFIG" > ~/.config/opencode/opencode.json
-        echo "--- Generated OpenCode Configuration ---"
-        jq . ~/.config/opencode/opencode.json
-        echo "----------------------------------------"
+        # echo "--- Generated OpenCode Configuration ---"
+        # jq . ~/.config/opencode/opencode.json
+        # echo "----------------------------------------"
         echo "Successfully generated OpenCode configuration."
 
     - name: Check for Python requirements file
