@@ -530,6 +530,11 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           {
             echo "# [Diff CONTEXT]";
+            if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+              echo "Diff Type: FULL_PR_DIFF";
+            else
+              echo "Diff Type: INCREMENTAL_DIFF";
+            fi;
             echo "<diff>";
             if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
               cat "$TMP_DIR/first_review_diff.txt";
@@ -540,6 +545,13 @@ jobs:
           } > "$HOME/.config/opencode/pr-diff.txt"
         env:
           PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
+
+      - name: Clear Large Env Variables
+        run: |
+          # Remove large context from environment to avoid oversized process env
+          echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
+          # Also clear any diff-related env vars if present
+          echo "DIFF_CONTENT=" >> "$GITHUB_ENV"
 
       - name: Patch OpenCode Config Instructions (bare filenames)
         run: |
@@ -558,8 +570,6 @@ jobs:
       - name: Assemble Review Prompt
         env:
           REVIEW_TYPE: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST' || 'FOLLOW-UP' }}
-          INCREMENTAL_DIFF: ${{ steps.review_type.outputs.is_first_review == 'true' && steps.first_review_diff.outputs.diff_content || steps.incremental_diff.outputs.diff_content }}
-          PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
           PR_AUTHOR: ${{ env.PR_AUTHOR }}
           IS_FIRST_REVIEW: ${{ steps.review_type.outputs.is_first_review }}
           PR_NUMBER: ${{ env.PR_NUMBER }}
@@ -584,8 +594,6 @@ jobs:
               "webfetch": "deny"
             }
           REVIEW_TYPE: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST' || 'FOLLOW-UP' }}
-          INCREMENTAL_DIFF: ${{ steps.review_type.outputs.is_first_review == 'true' && steps.first_review_diff.outputs.diff_content || steps.incremental_diff.outputs.diff_content }}
-          PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
           PR_AUTHOR: ${{ env.PR_AUTHOR }}
           IS_FIRST_REVIEW: ${{ steps.review_type.outputs.is_first_review }}
           PR_NUMBER: ${{ env.PR_NUMBER }}
