@@ -91,11 +91,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         super().__init__()
         self.model_definitions = ModelDefinitions()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
+        self.project_tier_cache: Dict[str, str] = {} # Cache project tier per credential path
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
         """Discovers the Google Cloud Project ID, with caching and onboarding for new accounts."""
+        lib_logger.debug(f"Starting project discovery for credential: {credential_path}")
+
         if credential_path in self.project_id_cache:
-            return self.project_id_cache[credential_path]
+            cached_project = self.project_id_cache[credential_path]
+            lib_logger.debug(f"Using cached project ID: {cached_project}")
+            return cached_project
 
         if litellm_params.get("project_id"):
             project_id = litellm_params["project_id"]
@@ -103,10 +108,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             self.project_id_cache[credential_path] = project_id
             return project_id
 
+        lib_logger.debug("No cached or configured project ID found, initiating discovery...")
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
-        
+
         async with httpx.AsyncClient() as client:
-            # 1. Try discovery endpoint with onboarding logic from Kilo example
+            # 1. Try discovery endpoint with onboarding logic
+            lib_logger.debug("Attempting project discovery via Code Assist loadCodeAssist endpoint...")
             try:
                 initial_project_id = "default"
                 client_metadata = {
@@ -119,61 +126,156 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 response.raise_for_status()
                 data = response.json()
 
+                # Extract tier information for paid project detection
+                selected_tier_id = None
+                allowed_tiers = data.get('allowedTiers', [])
+                lib_logger.debug(f"Available tiers from loadCodeAssist response: {[t.get('id') for t in allowed_tiers]}")
+
+                for tier in allowed_tiers:
+                    if tier.get('isDefault'):
+                        selected_tier_id = tier.get('id', 'unknown')
+                        lib_logger.debug(f"Selected default tier: {selected_tier_id}")
+                        break
+                if not selected_tier_id and allowed_tiers:
+                    selected_tier_id = allowed_tiers[0].get('id', 'unknown')
+                    lib_logger.debug(f"No default tier found, using first available: {selected_tier_id}")
+
                 if data.get('cloudaicompanionProject'):
                     project_id = data['cloudaicompanionProject']
-                    lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
+                    lib_logger.debug(f"Existing project found in loadCodeAssist response: {project_id}")
+
+                    # Cache tier info
+                    if selected_tier_id:
+                        self.project_tier_cache[credential_path] = selected_tier_id
+                        lib_logger.debug(f"Cached tier information: {selected_tier_id}")
+
+                    # Log concise message for paid projects
+                    is_paid = selected_tier_id and selected_tier_id not in ['free-tier', 'legacy-tier', 'unknown']
+                    if is_paid:
+                        lib_logger.info(f"Using Gemini paid project: {project_id}")
+                    else:
+                        lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
+
                     self.project_id_cache[credential_path] = project_id
                     return project_id
                 
                 # 2. If no project ID, trigger onboarding
                 lib_logger.info("No existing Gemini project found, attempting to onboard user...")
                 tier_id = next((t.get('id', 'free-tier') for t in data.get('allowedTiers', []) if t.get('isDefault')), 'free-tier')
+                lib_logger.debug(f"Onboarding with tier: {tier_id}")
                 onboard_request = {"tierId": tier_id, "cloudaicompanionProject": initial_project_id, "metadata": client_metadata}
 
+                lib_logger.debug("Initiating onboardUser request...")
                 lro_response = await client.post(f"{CODE_ASSIST_ENDPOINT}:onboardUser", headers=headers, json=onboard_request, timeout=30)
                 lro_response.raise_for_status()
                 lro_data = lro_response.json()
+                lib_logger.debug(f"Initial onboarding response: done={lro_data.get('done')}")
 
-                for i in range(30): # Poll for up to 60 seconds
-                    if lro_data.get('done'): break
+                for i in range(150): # Poll for up to 5 minutes (150 × 2s)
+                    if lro_data.get('done'):
+                        lib_logger.debug(f"Onboarding completed after {i} polling attempts")
+                        break
                     await asyncio.sleep(2)
-                    lib_logger.debug(f"Polling onboarding status... (Attempt {i+1}/30)")
+                    if (i + 1) % 15 == 0:  # Log every 30 seconds
+                        lib_logger.info(f"Still waiting for onboarding completion... ({(i+1)*2}s elapsed)")
+                    lib_logger.debug(f"Polling onboarding status... (Attempt {i+1}/150)")
                     lro_response = await client.post(f"{CODE_ASSIST_ENDPOINT}:onboardUser", headers=headers, json=onboard_request, timeout=30)
                     lro_response.raise_for_status()
                     lro_data = lro_response.json()
-                
-                if not lro_data.get('done'): raise ValueError("Onboarding process timed out.")
+
+                if not lro_data.get('done'):
+                    lib_logger.error("Onboarding process timed out after 5 minutes")
+                    raise ValueError("Onboarding process timed out after 5 minutes. Please try again or contact support.")
 
                 project_id = lro_data.get('response', {}).get('cloudaicompanionProject', {}).get('id')
-                if not project_id: raise ValueError("Onboarding completed, but no project ID was returned.")
-                
-                lib_logger.info(f"Successfully onboarded user and discovered project ID: {project_id}")
+                if not project_id:
+                    lib_logger.error("Onboarding completed but no project ID in response")
+                    raise ValueError("Onboarding completed, but no project ID was returned.")
+
+                lib_logger.debug(f"Successfully extracted project ID from onboarding response: {project_id}")
+
+                # Cache tier info
+                if tier_id:
+                    self.project_tier_cache[credential_path] = tier_id
+                    lib_logger.debug(f"Cached tier information: {tier_id}")
+
+                # Log concise message for paid projects
+                is_paid = tier_id and tier_id not in ['free-tier', 'legacy-tier']
+                if is_paid:
+                    lib_logger.info(f"Using Gemini paid project: {project_id}")
+                else:
+                    lib_logger.info(f"Successfully onboarded user and discovered project ID: {project_id}")
+
                 self.project_id_cache[credential_path] = project_id
                 return project_id
 
-            except (httpx.RequestError, httpx.HTTPStatusError) as e:
-                lib_logger.warning(f"Gemini onboarding/discovery failed: {e}. Falling back to project listing.")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 403:
+                    lib_logger.error(f"Gemini Code Assist API access denied (403). The cloudaicompanion.googleapis.com API may not be enabled for your account. Please enable it in Google Cloud Console.")
+                elif e.response.status_code == 404:
+                    lib_logger.warning(f"Gemini Code Assist endpoint not found (404). Falling back to project listing.")
+                else:
+                    lib_logger.warning(f"Gemini onboarding/discovery failed with status {e.response.status_code}: {e}. Falling back to project listing.")
+            except httpx.RequestError as e:
+                lib_logger.warning(f"Gemini onboarding/discovery network error: {e}. Falling back to project listing.")
 
         # 3. Fallback to listing all available GCP projects (last resort)
+        lib_logger.debug("Attempting to discover project via GCP Resource Manager API...")
         try:
             async with httpx.AsyncClient() as client:
+                lib_logger.debug("Querying Cloud Resource Manager for available projects...")
                 response = await client.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers, timeout=20)
                 response.raise_for_status()
                 projects = response.json().get('projects', [])
-                if active_projects := [p for p in projects if p.get('lifecycleState') == 'ACTIVE']:
+                lib_logger.debug(f"Found {len(projects)} total projects")
+                active_projects = [p for p in projects if p.get('lifecycleState') == 'ACTIVE']
+                lib_logger.debug(f"Found {len(active_projects)} active projects")
+
+                if not projects:
+                    lib_logger.error("No GCP projects found for this account. Please create a project in Google Cloud Console.")
+                elif not active_projects:
+                    lib_logger.error("No active GCP projects found. Please activate a project in Google Cloud Console.")
+                else:
                     project_id = active_projects[0]['projectId']
                     lib_logger.info(f"Discovered Gemini project ID from active projects list: {project_id}")
+                    lib_logger.debug(f"Selected first active project: {project_id} (out of {len(active_projects)} active projects)")
                     self.project_id_cache[credential_path] = project_id
                     return project_id
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403: lib_logger.warning("Failed to list GCP projects due to a 403 Forbidden error.")
-            else: lib_logger.error(f"Failed to list GCP projects: {e}")
+            if e.response.status_code == 403:
+                lib_logger.error("Failed to list GCP projects due to a 403 Forbidden error. The Cloud Resource Manager API may not be enabled, or your account lacks the 'resourcemanager.projects.list' permission.")
+            else:
+                lib_logger.error(f"Failed to list GCP projects with status {e.response.status_code}: {e}")
         except httpx.RequestError as e:
-            lib_logger.error(f"Failed to list GCP projects: {e}")
+            lib_logger.error(f"Network error while listing GCP projects: {e}")
 
-        raise ValueError("Could not auto-discover Gemini project ID. Onboarding may have failed or the account lacks permissions. Please set GEMINI_CLI_PROJECT_ID in your .env file.")
+        raise ValueError(
+            "Could not auto-discover Gemini project ID. Possible causes:\n"
+            "  1. The cloudaicompanion.googleapis.com API is not enabled (enable it in Google Cloud Console)\n"
+            "  2. No active GCP projects exist for this account (create one in Google Cloud Console)\n"
+            "  3. Account lacks necessary permissions\n"
+            "To manually specify a project, set GEMINI_CLI_PROJECT_ID in your .env file."
+        )
     def has_custom_logic(self) -> bool:
         return True
+
+    def _cli_preview_fallback_order(self, model: str) -> List[str]:
+        """
+        Returns a list of model names to try in order for rate limit fallback.
+        First model in list is the original model, subsequent models are fallback options.
+        """
+        # Remove provider prefix if present
+        model_name = model.split('/')[-1].replace(':thinking', '')
+
+        # Define fallback chains for models with preview versions
+        fallback_chains = {
+            "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-pro-preview-06-05"],
+            "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-2.5-flash-preview-05-20"],
+            # Add more fallback chains as needed
+        }
+
+        # Return fallback chain if available, otherwise just return the original model
+        return fallback_chains.get(model_name, [model_name])
 
     def _transform_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         system_instruction = None
@@ -565,8 +667,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
         enable_request_logging = kwargs.pop("enable_request_logging", False)
-        
-        async def do_call():
+
+        # Get fallback models for rate limit handling
+        fallback_models = self._cli_preview_fallback_order(model)
+
+        async def do_call(attempt_model: str, is_fallback: bool = False):
             # Get auth header once, it's needed for the request anyway
             auth_header = await self.get_auth_header(credential_path)
 
@@ -575,10 +680,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if not project_id:
                 access_token = auth_header['Authorization'].split(' ')[1]
                 project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
-            
+
             # Handle :thinking suffix
-            model_name = model.split('/')[-1].replace(':thinking', '')
-            
+            model_name = attempt_model.split('/')[-1].replace(':thinking', '')
+
             # [NEW] Create a dedicated file logger for this request
             file_logger = _GeminiCliFileLogger(
                 model_name=model_name,
@@ -707,16 +812,123 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             return logging_stream_wrapper()
 
-        # All exception handling is now inside the stream_handler,
-        # so we can call do_call directly.
-        response_gen = await do_call()
+        # Try each model in fallback order on rate limit
+        lib_logger.debug(f"Fallback models available: {fallback_models}")
+        last_error = None
+        for idx, attempt_model in enumerate(fallback_models):
+            is_fallback = idx > 0
+            if is_fallback:
+                lib_logger.info(f"Gemini CLI rate limited, retrying with fallback model: {attempt_model}")
+            elif len(fallback_models) > 1:
+                lib_logger.debug(f"Attempting primary model: {attempt_model} (with {len(fallback_models)-1} fallback(s) available)")
 
-        if kwargs.get("stream", False):
-            return response_gen
-        else:
-            # Accumulate stream for non-streaming response
-            chunks = [chunk async for chunk in response_gen]
-            return self._stream_to_completion_response(chunks)
+            try:
+                response_gen = await do_call(attempt_model, is_fallback)
+
+                if kwargs.get("stream", False):
+                    return response_gen
+                else:
+                    # Accumulate stream for non-streaming response
+                    chunks = [chunk async for chunk in response_gen]
+                    return self._stream_to_completion_response(chunks)
+
+            except RateLimitError as e:
+                last_error = e
+                # If this is not the last model in the fallback chain, continue to next model
+                if idx + 1 < len(fallback_models):
+                    lib_logger.debug(f"Rate limit hit on {attempt_model}, trying next fallback...")
+                    continue
+                # If this was the last fallback option, raise the error
+                lib_logger.error(f"Rate limit hit on all fallback models (tried {len(fallback_models)} models)")
+                raise
+
+        # Should not reach here, but raise last error if we do
+        if last_error:
+            raise last_error
+        raise ValueError("No fallback models available")
+
+    async def count_tokens(
+        self,
+        client: httpx.AsyncClient,
+        credential_path: str,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        litellm_params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, int]:
+        """
+        Counts tokens for the given prompt using the Gemini CLI :countTokens endpoint.
+
+        Args:
+            client: The HTTP client to use
+            credential_path: Path to the credential file
+            model: Model name to use for token counting
+            messages: List of messages in OpenAI format
+            tools: Optional list of tool definitions
+            litellm_params: Optional additional parameters
+
+        Returns:
+            Dict with 'prompt_tokens' and 'total_tokens' counts
+        """
+        # Get auth header
+        auth_header = await self.get_auth_header(credential_path)
+
+        # Discover project ID
+        project_id = self.project_id_cache.get(credential_path)
+        if not project_id:
+            access_token = auth_header['Authorization'].split(' ')[1]
+            project_id = await self._discover_project_id(credential_path, access_token, litellm_params or {})
+
+        # Handle :thinking suffix
+        model_name = model.split('/')[-1].replace(':thinking', '')
+
+        # Transform messages to Gemini format
+        system_instruction, contents = self._transform_messages(messages)
+
+        # Build request payload
+        request_payload = {
+            "model": model_name,
+            "project": project_id,
+            "request": {
+                "contents": contents,
+            },
+        }
+
+        if system_instruction:
+            request_payload["request"]["systemInstruction"] = system_instruction
+
+        if tools:
+            function_declarations = self._transform_tool_schemas(tools)
+            if function_declarations:
+                request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
+
+        # Make the request
+        url = f"{CODE_ASSIST_ENDPOINT}:countTokens"
+        headers = auth_header.copy()
+        headers.update({
+            "User-Agent": "google-api-nodejs-client/9.15.1",
+            "X-Goog-Api-Client": "gl-node/22.17.0",
+            "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            "Accept": "application/json",
+        })
+
+        try:
+            response = await client.post(url, headers=headers, json=request_payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract token counts from response
+            total_tokens = data.get('totalTokens', 0)
+
+            return {
+                'prompt_tokens': total_tokens,
+                'total_tokens': total_tokens,
+            }
+
+        except httpx.HTTPStatusError as e:
+            lib_logger.error(f"Failed to count tokens: {e}")
+            # Return 0 on error rather than raising
+            return {'prompt_tokens': 0, 'total_tokens': 0}
 
     # Use the shared GeminiAuthBase for auth logic
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
