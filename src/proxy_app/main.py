@@ -133,8 +133,7 @@ ENABLE_REQUEST_LOGGING = args.enable_request_logging
 if ENABLE_REQUEST_LOGGING:
     logging.info("Request logging is enabled.")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
-if not PROXY_API_KEY:
-    raise ValueError("PROXY_API_KEY environment variable not set.")
+# Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
 # Discover API keys from environment variables
 api_keys = {}
@@ -713,7 +712,15 @@ async def token_count(
 
 if __name__ == "__main__":
     if args.add_credential:
+        # Import and call ensure_env_defaults to create .env and PROXY_API_KEY if needed
+        from rotator_library.credential_tool import ensure_env_defaults
+        ensure_env_defaults()
+        # Reload environment variables after ensure_env_defaults creates/updates .env
+        load_dotenv(override=True)
         run_credential_tool()
     else:
+        # Validate PROXY_API_KEY before starting the server
+        if not PROXY_API_KEY:
+            raise ValueError("PROXY_API_KEY environment variable not set. Please run with --add-credential to set up your environment.")
         import uvicorn
         uvicorn.run(app, host=args.host, port=args.port)
