@@ -722,25 +722,53 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """
         Returns a merged list of Gemini CLI models from three sources:
-        1. Environment variable models (via GEMINI_CLI_MODELS)
-        2. Hardcoded models (fallback list)
-        3. Dynamic discovery from Gemini API (if supported)
+        1. Environment variable models (via GEMINI_CLI_MODELS) - ALWAYS included, take priority
+        2. Hardcoded models (fallback list) - added only if ID not in env vars
+        3. Dynamic discovery from Gemini API (if supported) - added only if ID not in env vars
+
+        Environment variable models always win and are never deduplicated, even if they
+        share the same ID (to support different configs like temperature, etc.)
         """
         models = []
+        env_var_ids = set()  # Track IDs from env vars to prevent hardcoded/dynamic duplicates
 
-        # Source 1: Load environment variable models
+        def extract_model_id(item) -> str:
+            """Extract model ID from various formats (dict, string with/without provider prefix)."""
+            if isinstance(item, dict):
+                # Dict format: extract 'name' or 'id' field
+                model_id = item.get("name") or item.get("id", "")
+                # Gemini models often have format "models/gemini-pro", extract just the model name
+                if model_id and "/" in model_id:
+                    model_id = model_id.split("/")[-1]
+                return model_id
+            elif isinstance(item, str):
+                # String format: extract ID from "provider/id" or "models/id" or just "id"
+                return item.split("/")[-1] if "/" in item else item
+            return str(item)
+
+        # Source 1: Load environment variable models (ALWAYS include ALL of them)
         static_models = self.model_definitions.get_all_provider_models("gemini_cli")
         if static_models:
-            models.extend(static_models)
+            for model in static_models:
+                # Extract model name from "gemini_cli/ModelName" format
+                model_name = model.split("/")[-1] if "/" in model else model
+                # Get the actual model ID from definitions (which may differ from the name)
+                model_id = self.model_definitions.get_model_id("gemini_cli", model_name)
+
+                # ALWAYS add env var models (no deduplication)
+                models.append(model)
+                # Track the ID to prevent hardcoded/dynamic duplicates
+                if model_id:
+                    env_var_ids.add(model_id)
             lib_logger.info(f"Loaded {len(static_models)} static models for gemini_cli from environment variables")
 
-        # Source 2: Add hardcoded models (avoiding duplicates)
-        existing_ids = [m.split("/")[-1] for m in models]
+        # Source 2: Add hardcoded models (only if ID not already in env vars)
         for model_id in HARDCODED_MODELS:
-            if model_id not in existing_ids:
+            if model_id not in env_var_ids:
                 models.append(f"gemini_cli/{model_id}")
+                env_var_ids.add(model_id)
 
-        # Source 3: Try dynamic discovery from Gemini API
+        # Source 3: Try dynamic discovery from Gemini API (only if ID not already in env vars)
         try:
             # Get access token for API calls
             access_token = await self.get_access_token(credential)
@@ -756,27 +784,17 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             )
             response.raise_for_status()
 
-            # Parse dynamic models and avoid duplicates
-            existing_ids = [m.split("/")[-1] for m in models]
             dynamic_data = response.json()
-
             # Handle various response formats
             model_list = dynamic_data.get("models", dynamic_data.get("data", []))
 
             dynamic_count = 0
             for model in model_list:
-                # Extract model ID (may be in 'name' or 'id' field)
-                model_id = None
-                if isinstance(model, dict):
-                    model_id = model.get("name", model.get("id"))
-                    # Gemini models often have format "models/gemini-pro", extract just the model name
-                    if model_id and "/" in model_id:
-                        model_id = model_id.split("/")[-1]
-                else:
-                    model_id = model
-
-                if model_id and model_id not in existing_ids and model_id.startswith("gemini"):
+                model_id = extract_model_id(model)
+                # Only include Gemini models that aren't already in env vars
+                if model_id and model_id not in env_var_ids and model_id.startswith("gemini"):
                     models.append(f"gemini_cli/{model_id}")
+                    env_var_ids.add(model_id)
                     dynamic_count += 1
 
             if dynamic_count > 0:

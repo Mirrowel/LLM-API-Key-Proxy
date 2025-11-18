@@ -57,27 +57,51 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """
         Returns a merged list of iFlow models from three sources:
-        1. Environment variable models (via IFLOW_MODELS)
-        2. Hardcoded models (fallback list)
-        3. Dynamic discovery from iFlow API (if supported)
+        1. Environment variable models (via IFLOW_MODELS) - ALWAYS included, take priority
+        2. Hardcoded models (fallback list) - added only if ID not in env vars
+        3. Dynamic discovery from iFlow API (if supported) - added only if ID not in env vars
+
+        Environment variable models always win and are never deduplicated, even if they
+        share the same ID (to support different configs like temperature, etc.)
 
         Validates OAuth credentials if applicable.
         """
         models = []
+        env_var_ids = set()  # Track IDs from env vars to prevent hardcoded/dynamic duplicates
 
-        # Source 1: Load environment variable models
+        def extract_model_id(item) -> str:
+            """Extract model ID from various formats (dict, string with/without provider prefix)."""
+            if isinstance(item, dict):
+                # Dict format: extract 'id' or 'name' field
+                return item.get("id") or item.get("name", "")
+            elif isinstance(item, str):
+                # String format: extract ID from "provider/id" or just "id"
+                return item.split("/")[-1] if "/" in item else item
+            return str(item)
+
+        # Source 1: Load environment variable models (ALWAYS include ALL of them)
         static_models = self.model_definitions.get_all_provider_models("iflow")
         if static_models:
-            models.extend(static_models)
+            for model in static_models:
+                # Extract model name from "iflow/ModelName" format
+                model_name = model.split("/")[-1] if "/" in model else model
+                # Get the actual model ID from definitions (which may differ from the name)
+                model_id = self.model_definitions.get_model_id("iflow", model_name)
+
+                # ALWAYS add env var models (no deduplication)
+                models.append(model)
+                # Track the ID to prevent hardcoded/dynamic duplicates
+                if model_id:
+                    env_var_ids.add(model_id)
             lib_logger.info(f"Loaded {len(static_models)} static models for iflow from environment variables")
 
-        # Source 2: Add hardcoded models (avoiding duplicates)
-        existing_ids = [m.split("/")[-1] for m in models]
+        # Source 2: Add hardcoded models (only if ID not already in env vars)
         for model_id in HARDCODED_MODELS:
-            if model_id not in existing_ids:
+            if model_id not in env_var_ids:
                 models.append(f"iflow/{model_id}")
+                env_var_ids.add(model_id)
 
-        # Source 3: Try dynamic discovery from iFlow API
+        # Source 3: Try dynamic discovery from iFlow API (only if ID not already in env vars)
         try:
             # Validate OAuth credentials and get API details
             if os.path.isfile(credential):
@@ -92,18 +116,16 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             )
             response.raise_for_status()
 
-            # Parse dynamic models and avoid duplicates
-            existing_ids = [m.split("/")[-1] for m in models]
             dynamic_data = response.json()
-
             # Handle both {data: [...]} and direct [...] formats
             model_list = dynamic_data.get("data", dynamic_data) if isinstance(dynamic_data, dict) else dynamic_data
 
             dynamic_count = 0
             for model in model_list:
-                model_id = model.get("id") if isinstance(model, dict) else model
-                if model_id and model_id not in existing_ids:
+                model_id = extract_model_id(model)
+                if model_id and model_id not in env_var_ids:
                     models.append(f"iflow/{model_id}")
+                    env_var_ids.add(model_id)
                     dynamic_count += 1
 
             if dynamic_count > 0:
