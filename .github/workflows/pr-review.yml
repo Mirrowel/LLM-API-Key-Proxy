@@ -58,6 +58,33 @@ jobs:
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
 
+      - name: Clear pending bot review
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+        run: |
+          pending_review_ids=$(gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/pulls/${{ env.PR_NUMBER }}/reviews" \
+            | jq -r --argjson bots "$BOT_NAMES_JSON" '.[]? | select((.state // "") == "PENDING" and (((.user.login // "") as $login | $bots | index($login)))) | .id' \
+            | sort -u)
+
+          if [ -z "$pending_review_ids" ]; then
+            echo "No pending bot reviews to clear."
+            exit 0
+          fi
+
+          while IFS= read -r review_id; do
+            [ -z "$review_id" ] && continue
+            if gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/pulls/${{ env.PR_NUMBER }}/reviews/$review_id"; then
+              echo "Cleared pending review $review_id"
+            else
+              echo "::warning::Failed to clear pending review $review_id"
+            fi
+          done <<< "$pending_review_ids"
+
       - name: Add reaction to PR
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
