@@ -692,10 +692,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             gen_config = {
                 "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
+                "temperature": kwargs.get("temperature", 1),  # Default to 1 if not provided
             }
-            if "temperature" in kwargs:
-                gen_config["temperature"] = kwargs["temperature"]
-            # No else - let Gemini use its default temperature (matches OpenAI behavior)
             if "top_k" in kwargs:
                 gen_config["topK"] = kwargs["top_k"]
             if "top_p" in kwargs:

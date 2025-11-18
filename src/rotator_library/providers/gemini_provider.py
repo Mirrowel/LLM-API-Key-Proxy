@@ -94,6 +94,10 @@ class GeminiProvider(ProviderInterface):
         3. Applies a default 'thinking' value for specific models if no other reasoning
            parameters are provided, ensuring they 'think' by default.
         """
+        # Set default temperature to 1 if not provided
+        if "temperature" not in payload:
+            payload["temperature"] = 1
+
         custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
         reasoning_effort = payload.get("reasoning_effort")
 
