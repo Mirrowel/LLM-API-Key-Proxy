@@ -11,8 +11,68 @@ from .qwen_auth_base import QwenAuthBase
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
+from pathlib import Path
+import uuid
+from datetime import datetime
 
 lib_logger = logging.getLogger('rotator_library')
+
+LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
+QWEN_CODE_LOGS_DIR = LOGS_DIR / "qwen_code_logs"
+
+class _QwenCodeFileLogger:
+    """A simple file logger for a single Qwen Code transaction."""
+    def __init__(self, model_name: str, enabled: bool = True):
+        self.enabled = enabled
+        if not self.enabled:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        request_id = str(uuid.uuid4())
+        # Sanitize model name for directory
+        safe_model_name = model_name.replace('/', '_').replace(':', '_')
+        self.log_dir = QWEN_CODE_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            lib_logger.error(f"Failed to create Qwen Code log directory: {e}")
+            self.enabled = False
+
+    def log_request(self, payload: Dict[str, Any]):
+        """Logs the request payload sent to Qwen Code."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "request_payload.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_QwenCodeFileLogger: Failed to write request: {e}")
+
+    def log_response_chunk(self, chunk: str):
+        """Logs a raw chunk from the Qwen Code response stream."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
+                f.write(chunk + "\n")
+        except Exception as e:
+            lib_logger.error(f"_QwenCodeFileLogger: Failed to write response chunk: {e}")
+
+    def log_error(self, error_message: str):
+        """Logs an error message."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
+        except Exception as e:
+            lib_logger.error(f"_QwenCodeFileLogger: Failed to write error: {e}")
+
+    def log_final_response(self, response_data: Dict[str, Any]):
+        """Logs the final, reassembled response."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
+                json.dump(response_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_QwenCodeFileLogger: Failed to write final response: {e}")
 
 HARDCODED_MODELS = [
     "qwen3-coder-plus",
@@ -360,6 +420,12 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         enable_request_logging = kwargs.pop("enable_request_logging", False)
         model = kwargs["model"]
 
+        # Create dedicated file logger for this request
+        file_logger = _QwenCodeFileLogger(
+            model_name=model,
+            enabled=enable_request_logging
+        )
+
         async def make_request():
             """Prepares and makes the actual API call."""
             api_base, access_token = await self.get_api_details(credential_path)
@@ -382,11 +448,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
             url = f"{api_base.rstrip('/')}/v1/chat/completions"
 
-            if enable_request_logging:
-                lib_logger.info(f"Qwen Code Request URL: {url}")
-                lib_logger.info(f"Qwen Code Request Payload: {json.dumps(payload, indent=2)}")
-            else:
-                lib_logger.debug(f"Qwen Code Request URL: {url}")
+            # Log request to dedicated file
+            file_logger.log_request(payload)
+            lib_logger.debug(f"Qwen Code Request URL: {url}")
 
             return client.stream("POST", url, headers=headers, json=payload, timeout=600)
 
@@ -419,8 +483,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
                         # Handle other errors
                         else:
-                            if enable_request_logging:
-                                lib_logger.error(f"Qwen Code HTTP {response.status_code} error: {error_text}")
+                            error_msg = f"Qwen Code HTTP {response.status_code} error: {error_text}"
+                            file_logger.log_error(error_msg)
                             raise httpx.HTTPStatusError(
                                 f"HTTP {response.status_code}: {error_text}",
                                 request=response.request,
@@ -429,6 +493,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
                     # Process successful streaming response
                     async for line in response.aiter_lines():
+                        file_logger.log_response_chunk(line)
                         if line.startswith('data: '):
                             data_str = line[6:]
                             if data_str == "[DONE]":
@@ -443,17 +508,26 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             except httpx.HTTPStatusError:
                 raise  # Re-raise HTTP errors we already handled
             except Exception as e:
-                if enable_request_logging:
-                    lib_logger.error(f"Error during Qwen Code stream processing: {e}", exc_info=True)
+                file_logger.log_error(f"Error during Qwen Code stream processing: {e}")
+                lib_logger.error(f"Error during Qwen Code stream processing: {e}", exc_info=True)
                 raise
 
-        http_response_stream = await make_request()
-        response_generator = stream_handler(http_response_stream)
+        async def logging_stream_wrapper():
+            """Wraps the stream to log the final reassembled response."""
+            openai_chunks = []
+            try:
+                async for chunk in stream_handler(await make_request()):
+                    openai_chunks.append(chunk)
+                    yield chunk
+            finally:
+                if openai_chunks:
+                    final_response = self._stream_to_completion_response(openai_chunks)
+                    file_logger.log_final_response(final_response.dict())
 
         if kwargs.get("stream"):
-            return response_generator
+            return logging_stream_wrapper()
         else:
             async def non_stream_wrapper():
-                chunks = [chunk async for chunk in response_generator]
+                chunks = [chunk async for chunk in logging_stream_wrapper()]
                 return self._stream_to_completion_response(chunks)
             return await non_stream_wrapper()
