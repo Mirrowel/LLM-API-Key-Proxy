@@ -404,7 +404,7 @@ class QwenAuthBase:
                         "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
                         "3. You will be prompted to enter your identifier after authorization."
                     )
-                    console.print(Panel(auth_panel_text, title=f"Qwen OAuth Setup for [bold yellow]{file_name}[/bold yellow]", style="bold blue"))
+                    console.print(Panel(auth_panel_text, title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
                     console.print(f"[bold]URL:[/bold] [link={dev_data['verification_uri_complete']}]{dev_data['verification_uri_complete']}[/link]\n")
                     webbrowser.open(dev_data['verification_uri_complete'])
                     

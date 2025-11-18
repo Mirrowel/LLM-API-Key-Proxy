@@ -983,7 +983,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         # Source 3: Try dynamic discovery from Gemini API (only if ID not already in env vars)
         try:
             # Get access token for API calls
-            access_token = await self.get_access_token(credential)
+            auth_header = await self.get_auth_header(credential)
+            access_token = auth_header['Authorization'].split(' ')[1]
 
             # Try Vertex AI models endpoint
             # Note: Gemini may not support a simple /models endpoint like OpenAI
