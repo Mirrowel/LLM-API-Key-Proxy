@@ -721,79 +721,90 @@ class EnsembleManager:
             base_model = self.get_base_model(resolved_id)
             config = self.config_loader.get_swarm_config(base_model)
             count = config.get("count", 3)
+            is_streaming = kwargs.get("stream", False)
             
             lib_logger.info(
                 f"[HiveMind] Processing Swarm request: {resolved_id} "
-                f"(base: {base_model}, {count} drones)"
+                f"(base: {base_model}, {count} drones, streaming: {is_streaming})"
             )
             
-            # Phase 2F: Wire up full swarm execution
-            # Step 1: Prepare drones
-            drones = self._prepare_drones(config, base_model, kwargs)
-            
-            # Step 2: Execute drones in parallel
-            drone_responses, drone_usage = await self._execute_parallel(drones, request)
-            
-            # Step 3: Format responses for arbiter
-            formatted_responses = self._format_for_arbiter(drone_responses, config)
-            
-            # Step 4: Build arbiter prompt
-            original_messages = kwargs.get("messages", [])
-            arbiter_messages = self._build_arbiter_prompt(
-                formatted_responses,
-                config,
-                original_messages
-            )
-            
-            # Step 5: Handle "self" arbiter model
-            arbiter_config = config.get("arbiter", {})
-            arbiter_model = arbiter_config.get("model", "self")
-            if arbiter_model == "self":
-                arbiter_model = base_model
-                lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
-            
-            # Update config with resolved arbiter model
-            config_copy = config.copy()
-            config_copy["arbiter"] = arbiter_config.copy()
-            config_copy["arbiter"]["model"] = arbiter_model
-            
-            # Step 6: Call arbiter
-            arbiter_response, arbiter_usage = await self._call_arbiter(
-                arbiter_messages,
-                config_copy,
-                request
-            )
-            
-            # Step 7: Aggregate total usage
-            total_usage = {
-                'prompt_tokens': drone_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
-                'completion_tokens': drone_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
-                'total_tokens': drone_usage['total_tokens'] + arbiter_usage['total_tokens']
-            }
-            
-            # Include other fields if present
-            for field in ['cached_tokens', 'reasoning_tokens']:
-                if field in drone_usage or field in arbiter_usage:
-                    total_usage[field] = drone_usage.get(field, 0) + arbiter_usage.get(field, 0)
-            
-            # Step 8: Update arbiter response with aggregated usage
-            if hasattr(arbiter_response, 'usage'):
-                # Create a new usage object with aggregated values
-                arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
-                arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
-                arbiter_response.usage.total_tokens = total_usage['total_tokens']
+            # Phase 3B: Route based on streaming mode
+            if is_streaming:
+                # Streaming mode - return async generator
+                return self._handle_swarm_streaming(
+                    config=config,
+                    base_model=base_model,
+                    request=request,
+                    **kwargs
+                )
+            else:
+                # Non-streaming mode - return complete response
+                # Step 1: Prepare drones
+                drones = self._prepare_drones(config, base_model, kwargs)
                 
+                # Step 2: Execute drones in parallel
+                drone_responses, drone_usage = await self._execute_parallel(drones, request)
+                
+                # Step 3: Format responses for arbiter
+                formatted_responses = self._format_for_arbiter(drone_responses, config)
+                
+                # Step 4: Build arbiter prompt
+                original_messages = kwargs.get("messages", [])
+                arbiter_messages = self._build_arbiter_prompt(
+                    formatted_responses,
+                    config,
+                    original_messages
+                )
+                
+                # Step 5: Handle "self" arbiter model
+                arbiter_config = config.get("arbiter", {})
+                arbiter_model = arbiter_config.get("model", "self")
+                if arbiter_model == "self":
+                    arbiter_model = base_model
+                    lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
+                
+                # Update config with resolved arbiter model
+                config_copy = config.copy()
+                config_copy["arbiter"] = arbiter_config.copy()
+                config_copy["arbiter"]["model"] = arbiter_model
+                
+                # Step 6: Call arbiter
+                arbiter_response, arbiter_usage = await self._call_arbiter(
+                    arbiter_messages,
+                    config_copy,
+                    request
+                )
+                
+                # Step 7: Aggregate total usage
+                total_usage = {
+                    'prompt_tokens': drone_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
+                    'completion_tokens': drone_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
+                    'total_tokens': drone_usage['total_tokens'] + arbiter_usage['total_tokens']
+                }
+                
+                # Include other fields if present
                 for field in ['cached_tokens', 'reasoning_tokens']:
-                    if field in total_usage:
-                        setattr(arbiter_response.usage, field, total_usage[field])
-            
-            lib_logger.info(
-                f"[HiveMind] Swarm completed successfully. "
-                f"Total usage: {total_usage['total_tokens']} tokens "
-                f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
-            )
-            
-            return arbiter_response
+                    if field in drone_usage or field in arbiter_usage:
+                        total_usage[field] = drone_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                
+                # Step 8: Update arbiter response with aggregated usage
+                if hasattr(arbiter_response, 'usage'):
+                    # Create a new usage object with aggregated values
+                    arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
+                    arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
+                    arbiter_response.usage.total_tokens = total_usage['total_tokens']
+                    
+                    for field in ['cached_tokens', 'reasoning_tokens']:
+                        if field in total_usage:
+                            setattr(arbiter_response.usage, field, total_usage[field])
+                
+                lib_logger.info(
+                    f"[HiveMind] Swarm completed successfully. "
+                    f"Total usage: {total_usage['total_tokens']} tokens "
+                    f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+                )
+                
+                return arbiter_response
         
         else:
             raise ValueError(f"Unknown ensemble type for model: {model_id}")
