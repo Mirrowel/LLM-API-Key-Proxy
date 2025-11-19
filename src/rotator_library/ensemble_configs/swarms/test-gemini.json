@@ -1,0 +1,15 @@
+{
+  "id": "test-gemini",
+  "description": "Test swarm for Gemini 2.5 Flash",
+  "base_models": ["gemini/gemini-2.5-flash"],
+  "count": 3,
+  "arbiter": {
+    "model": "self",
+    "strategy": "synthesis",
+    "blind": false
+  },
+  "temperature_jitter": {
+    "enabled": true,
+    "delta": 0.3
+  }
+}

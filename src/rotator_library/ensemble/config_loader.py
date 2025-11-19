@@ -63,7 +63,10 @@ class ConfigLoader:
             directory.mkdir(parents=True, exist_ok=True)
     
     def _load_swarm_configs(self) -> None:
-        """Load swarm configurations from swarms/ directory."""
+        """Load swarm configurations from swarms/ directory.
+        
+        Only supports preset-based format with 'id' and 'base_models'.
+        """
         if not self.swarms_dir.exists():
             lib_logger.warning(f"[HiveMind] Swarms directory not found: {self.swarms_dir}")
             return
@@ -80,26 +83,9 @@ class ConfigLoader:
         else:
             lib_logger.warning("[HiveMind] No default swarm config found")
         
-        # Load model-specific configs
-        for config_file in self.swarms_dir.glob("*.json"):
-            if config_file.name == "default.json":
-                continue
-            
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                
-                # Extract model name from config
-                model_name = config.get("model")
-                if model_name:
-                    self.swarm_configs[model_name] = config
-                    lib_logger.debug(f"[HiveMind] Loaded swarm config for '{model_name}'")
-                else:
-                    lib_logger.warning(
-                        f"[HiveMind] Swarm config '{config_file.name}' missing 'model' field"
-                    )
-            except Exception as e:
-                lib_logger.error(f"[HiveMind] Failed to load swarm config '{config_file.name}': {e}")
+        # All swarm configs now use preset-based format (id + base_models)
+        # Discovery is handled by get_all_swarm_model_ids()
+        # Individual preset configs loaded on-demand via get_swarm_config()
     
     def _load_fusion_configs(self) -> None:
         """Load fusion configurations from fusions/ directory.
@@ -175,34 +161,40 @@ class ConfigLoader:
                     f"[HiveMind] Failed to load strategy '{strategy_file.name}': {e}"
                 )
     
-    def get_swarm_config(self, model: str) -> Dict[str, Any]:
+    def get_swarm_config(self, preset_id: str) -> Dict[str, Any]:
         """
-        Get swarm configuration for a specific model.
-        
-        Merges default config with model-specific overrides.
+        Get swarm configuration for a specific preset.
         
         Args:
-            model: Base model name (without [swarm] suffix)
+            preset_id: Preset ID (e.g., "default", "aggressive")
         
         Returns:
-            Merged configuration dictionary
+            Configuration dictionary with defaults applied
         """
-        # BUGFIX: Use deepcopy to prevent mutations to global default config
-        config = copy.deepcopy(self.swarm_default) if self.swarm_default else {}
+        # Try to load preset config file
+        config_file = self.swarms_dir / f"{preset_id}.json"
         
-        # Apply model-specific overrides
-        if model in self.swarm_configs:
-            model_config = self.swarm_configs[model]
-            # Deep merge
-            for key, value in model_config.items():
-                if key == "model":
-                    continue  # Don't copy the model name
-                if isinstance(value, dict) and key in config:
-                    config[key] = {**config[key], **value}
-                else:
-                    config[key] = value
+        if not config_file.exists():
+            lib_logger.warning(f"[HiveMind] Swarm preset '{preset_id}' not found")
+            # Return default config if available
+            return copy.deepcopy(self.swarm_default) if self.swarm_default else {}
         
-        return config
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            # Validate it's a preset-based config
+            if "id" not in config or "base_models" not in config:
+                lib_logger.warning(
+                    f"[HiveMind] Swarm config '{preset_id}' missing 'id' or 'base_models'"
+                )
+                return copy.deepcopy(self.swarm_default) if self.swarm_default else {}
+            
+            return config
+            
+        except Exception as e:
+            lib_logger.error(f"[HiveMind] Failed to load swarm preset '{preset_id}': {e}")
+            return copy.deepcopy(self.swarm_default) if self.swarm_default else {}
     
     def get_fusion_config(self, fusion_id: str) -> Optional[Dict[str, Any]]:
         """
