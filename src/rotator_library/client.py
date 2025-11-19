@@ -636,6 +636,15 @@ class RotatingClient:
         kwargs = self._convert_model_params(**kwargs)
 
         # The main rotation loop. It continues as long as there are untried credentials and the global deadline has not been exceeded.
+        
+        # Resolve model ID early, before any credential operations
+        # This ensures consistent model ID usage for acquisition, release, and tracking
+        resolved_model = self._resolve_model_id(model, provider)
+        if resolved_model != model:
+            lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
+            model = resolved_model
+            kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+
         while (
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
         ):
@@ -689,13 +698,8 @@ class RotatingClient:
 
                 provider_plugin = self._get_provider_instance(provider)
 
-                # Convert model name to ID if custom mapping exists
-                resolved_model = self._resolve_model_id(model, provider)
-                if resolved_model != model:
-                    lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
-                    litellm_kwargs["model"] = resolved_model
-                    # Update the model variable for subsequent logging
-                    model = resolved_model
+                # Model ID is already resolved before the loop, and kwargs['model'] is updated.
+                # No further resolution needed here.
 
                 # Apply model-specific options for custom providers
                 if provider_plugin and hasattr(provider_plugin, "get_model_options"):
@@ -996,6 +1000,14 @@ class RotatingClient:
 
         consecutive_quota_failures = 0
 
+        # Resolve model ID early, before any credential operations
+        # This ensures consistent model ID usage for acquisition, release, and tracking
+        resolved_model = self._resolve_model_id(model, provider)
+        if resolved_model != model:
+            lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
+            model = resolved_model
+            kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+
         try:
             while (
                 len(tried_creds) < len(credentials_for_provider)
@@ -1071,13 +1083,8 @@ class RotatingClient:
 
                     provider_plugin = self._get_provider_instance(provider)
 
-                    # Convert model name to ID if custom mapping exists
-                    resolved_model = self._resolve_model_id(model, provider)
-                    if resolved_model != model:
-                        lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
-                        litellm_kwargs["model"] = resolved_model
-                        # Update the model variable for subsequent logging
-                        model = resolved_model
+                    # Model ID is already resolved before the loop, and kwargs['model'] is updated.
+                    # No further resolution needed here.
 
                     # Apply model-specific options for custom providers
                     if provider_plugin and hasattr(
