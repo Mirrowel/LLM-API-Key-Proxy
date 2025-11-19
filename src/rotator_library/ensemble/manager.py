@@ -191,6 +191,56 @@ class EnsembleManager:
         """
         return self.config_loader.get_all_fusion_ids()
     
+    def _prepare_drones(
+        self,
+        config: Dict[str, Any],
+        base_model: str,
+        request_params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Prepare drone configurations for parallel execution.
+        
+        Creates N identical copies of the request parameters with the base model.
+        Advanced features (jitter, adversarial) will be added in Phase 4.
+        
+        Args:
+            config: Swarm configuration
+            base_model: Base model to use for all drones
+            request_params: Original request parameters
+        
+        Returns:
+            List of drone configurations ready for parallel execution
+        """
+        count = config.get("count", 3)
+        drones = []
+        
+        lib_logger.debug(f"[HiveMind] Preparing {count} drones for base model '{base_model}'")
+        
+        for i in range(count):
+            # Clone the request params
+            drone_params = request_params.copy()
+            
+            # Override model with base model (strip [swarm] suffix)
+            drone_params["model"] = base_model
+            
+            # Deep copy messages to avoid mutation
+            if "messages" in drone_params:
+                import copy
+                drone_params["messages"] = copy.deepcopy(drone_params["messages"])
+            
+            # Store drone metadata for logging
+            drone_params["_drone_index"] = i + 1
+            drone_params["_total_drones"] = count
+            
+            drones.append(drone_params)
+            
+            lib_logger.debug(
+                f"[HiveMind] Drone {i+1}/{count}: model={base_model}, "
+                f"temp={drone_params.get('temperature', 'default')}"
+            )
+        
+        return drones
+    
     async def handle_request(self, request, **kwargs):
         """
         Handle an ensemble request (swarm or fusion).
