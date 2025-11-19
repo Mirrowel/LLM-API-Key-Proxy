@@ -183,24 +183,59 @@ jobs:
                   "No general comments."
                 end')
             
-            # ===== ENHANCED FILTERING WITH ERROR HANDLING =====
+            # ===== ACCURATE FILTERING & COUNTING (Fixed math logic) =====
             
-            # Count totals before filtering
-            total_reviews=$(echo "$discussion_data" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '[((.data.repository.pullRequest.reviews.nodes // [])[]? | select((.author.login? // "unknown") as $login | $ignored | index($login) | not))] | length')
-            total_review_comments=$(echo "$discussion_data" | jq --argjson ignored "$IGNORE_BOT_NAMES_JSON" '((.data.repository.pullRequest.reviewThreads.nodes // [])
-              | map(select(.isResolved != true and .isOutdated != true))
-              | map(.comments.nodes // [])
-              | flatten
-              | map(select(((.author.login? // "unknown") as $login | $ignored | index($login)) | not))
-              | length) // 0')
-            echo "Debug: total reviews before filtering = $total_reviews"
-            echo "Debug: total review comments before filtering = $total_review_comments"
+            stats_json=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
+              # Define filter logic
+              def is_valid_review:
+                (.author.login? // "unknown") as $login | $ignored | index($login) | not
+                and (.isMinimized != true);
+              
+              def is_valid_comment:
+                 .isResolved != true 
+                 and .isOutdated != true
+                 and (((.comments.nodes // []) | first | .isMinimized) != true)
+                 and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true);
+              
+              def is_valid_inline:
+                .isMinimized != true
+                and ((.pullRequestReview.isMinimized // false) != true)
+                and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not);
+
+              # Calculate Reviews
+              def raw_reviews: (.data.repository.pullRequest.reviews.nodes // []);
+              def total_reviews: (raw_reviews | length);
+              def included_reviews: ([raw_reviews[]? | select(is_valid_review)] | length);
+
+              # Calculate Review Comments
+              def raw_threads: (.data.repository.pullRequest.reviewThreads.nodes // []);
+              def valid_threads: (raw_threads | map(select(is_valid_comment)));
+              def all_valid_comments: (valid_threads | map(.comments.nodes // []) | flatten | map(select(is_valid_inline)));
+              
+              # We count total comments as "active/unresolved threads comments"
+              def total_review_comments: (raw_threads | map(select(.isResolved != true and .isOutdated != true)) | map(.comments.nodes // []) | flatten | length);
+              def included_review_comments: (all_valid_comments | length);
+
+              {
+                total_reviews: total_reviews,
+                included_reviews: included_reviews,
+                excluded_reviews: (total_reviews - included_reviews),
+                total_review_comments: total_review_comments,
+                included_review_comments: included_review_comments,
+                excluded_comments: (total_review_comments - included_review_comments)
+              }
+            ')
             
-            # Prepare reviews:
-            # 1. Exclude ignored bots.
-            # 2. Exclude reviews where 'isMinimized' is true (hidden reviews).
-            # 3. Include everything else (COMMENTED/APPROVED/DISMISSED/CHANGES_REQUESTED).
+            # Export stats to env vars
+            filtered_reviews=$(echo "$stats_json" | jq .included_reviews)
+            excluded_reviews=$(echo "$stats_json" | jq .excluded_reviews)
+            filtered_comments=$(echo "$stats_json" | jq .included_review_comments)
+            excluded_comments=$(echo "$stats_json" | jq .excluded_comments)
             
+            echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (ignored bots/hidden)"
+            echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated/hidden)"
+            
+            # Reviews Text
             review_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_filter_err.log")
             if reviews=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
               if ((((.data.repository.pullRequest.reviews.nodes // []) | length) > 0)) then 
@@ -213,33 +248,18 @@ jobs:
               else 
                 "No formal reviews." 
               end' 2>"$review_filter_err"); then
-              filtered_reviews=$(echo "$reviews" | grep -c "^- " || true)
-              filtered_reviews=${filtered_reviews//[^0-9]/}
-              [ -z "$filtered_reviews" ] && filtered_reviews=0
-              total_reviews=${total_reviews//[^0-9]/}
-              [ -z "$total_reviews" ] && total_reviews=0
-              excluded_reviews=$(( total_reviews - filtered_reviews )) || excluded_reviews=0
-              echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (ignored bots or hidden)"
-              if [ -s "$review_filter_err" ]; then
-                echo "::debug::jq stderr (reviews) emitted output:"
-                cat "$review_filter_err"
-              fi
+               if [ -s "$review_filter_err" ]; then
+                 echo "::debug::jq stderr (reviews) emitted output:" 
+                 cat "$review_filter_err"
+               fi
             else
-              jq_status=$?
-              echo "::warning::Review filtering failed (exit $jq_status), using unfiltered data"
-              if [ -s "$review_filter_err" ]; then
-                echo "::warning::jq stderr (reviews):"
-                cat "$review_filter_err"
-              else
-                echo "::warning::jq returned no stderr for reviews filter"
-              fi
-              reviews=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if ((((.data.repository.pullRequest.reviews.nodes // []) | length) > 0)) then ((.data.repository.pullRequest.reviews.nodes // [])[]? | select((.author.login? // "unknown") as $login | $ignored | index($login) | not) | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + ":\n - Review body: " + (.body // "(No summary comment)") + "\n - State: " + (.state // "UNKNOWN") + "\n") else "No formal reviews." end')
-              excluded_reviews=0
-              echo "FILTER_ERROR_REVIEWS=true" >> $GITHUB_ENV
+               echo "::warning::Review formatting failed, using unfiltered data"
+               reviews="Error processing reviews."
+               echo "FILTER_ERROR_REVIEWS=true" >> $GITHUB_ENV
             fi
             rm -f "$review_filter_err" || true
-
-            # Prepare review comments: exclude outdated, resolved, or hidden comments
+            
+            # Review Comments Text
             review_comment_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_comment_filter_err.log")
             if review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
               ((.data.repository.pullRequest.reviewThreads.nodes // [])
@@ -259,45 +279,14 @@ jobs:
                 else
                   "No inline review comments."
                 end' 2>"$review_comment_filter_err"); then
-              filtered_comments=$(echo "$review_comments" | grep -c "^- " || true)
-              filtered_comments=${filtered_comments//[^0-9]/}
-              [ -z "$filtered_comments" ] && filtered_comments=0
-              total_review_comments=${total_review_comments//[^0-9]/}
-              [ -z "$total_review_comments" ] && total_review_comments=0
-              excluded_comments=$(( total_review_comments - filtered_comments )) || excluded_comments=0
-              echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated)"
-              if [ -s "$review_comment_filter_err" ]; then
-                echo "::debug::jq stderr (review comments) emitted output:"
-                cat "$review_comment_filter_err"
-              fi
+               if [ -s "$review_comment_filter_err" ]; then
+                 echo "::debug::jq stderr (review comments) emitted output:"
+                 cat "$review_comment_filter_err"
+               fi
             else
-              jq_status=$?
-              echo "::warning::Review comment filtering failed (exit $jq_status), using unfiltered data"
-              if [ -s "$review_comment_filter_err" ]; then
-                echo "::warning::jq stderr (review comments):"
-                cat "$review_comment_filter_err"
-              else
-                echo "::warning::jq returned no stderr for review comment filter"
-              fi
-              review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
-                ((.data.repository.pullRequest.reviewThreads.nodes // [])
-                  | map(select(
-                      (((.comments.nodes // []) | first | .isMinimized) != true)
-                      and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true)
-                    ))
-                  | map(.comments.nodes // [])
-                  | flatten
-                  | map(select((.isMinimized != true)
-                               and ((.pullRequestReview.isMinimized // false) != true)
-                               and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
-                | if length > 0 then
-                    map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
-                    | join("")
-                  else
-                    "No inline review comments."
-                  end')
-              excluded_comments=0
-              echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
+               echo "::warning::Review comment formatting failed"
+               review_comments="Error processing review comments."
+               echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
             fi
             rm -f "$review_comment_filter_err" || true
             
@@ -306,7 +295,6 @@ jobs:
             echo "EXCLUDED_COMMENTS=$excluded_comments" >> $GITHUB_ENV
 
             # Build filtering summary
-            # Ensure numeric fallbacks so blanks never appear if variables are empty
             filter_summary="Context filtering applied: ${excluded_reviews:-0} reviews and ${excluded_comments:-0} review comments excluded from this context."
             if [ "${FILTER_ERROR_REVIEWS}" = "true" ] || [ "${FILTER_ERROR_COMMENTS}" = "true" ]; then
               filter_summary="$filter_summary"$'\n'"Warning: Some filtering operations encountered errors. Context may include items that should have been filtered."
