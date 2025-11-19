@@ -214,7 +214,20 @@ class EnsembleManager:
         count = config.get("count", 3)
         drones = []
         
+        # Get temperature jitter config
+        temp_jitter_config = config.get("temperature_jitter", {})
+        jitter_enabled = temp_jitter_config.get("enabled", False)
+        jitter_delta = temp_jitter_config.get("delta", 0.2)
+        
+        # Get adversarial config
+        adversarial_config = config.get("adversarial_config", {})
+        adversarial_enabled = adversarial_config.get("enabled", False)
+        adversarial_count = adversarial_config.get("count", 1)
+        adversarial_prompt = adversarial_config.get("prompt", "")
+        
         lib_logger.debug(f"[HiveMind] Preparing {count} drones for base model '{base_model}'")
+        if adversarial_enabled:
+            lib_logger.debug(f"[HiveMind] Adversarial mode enabled: {adversarial_count} critical drones")
         
         for i in range(count):
             # Clone the request params
@@ -228,15 +241,59 @@ class EnsembleManager:
                 import copy
                 drone_params["messages"] = copy.deepcopy(drone_params["messages"])
             
+            # Phase 4: Determine if this drone should be adversarial
+            # Last N drones become adversarial
+            is_adversarial = False
+            if adversarial_enabled and adversarial_prompt:
+                adversarial_start_index = count - adversarial_count
+                if i >= adversarial_start_index:
+                    is_adversarial = True
+                    
+                    # Inject adversarial system prompt
+                    if "messages" in drone_params:
+                        # Insert adversarial system message at the beginning
+                        adversarial_message = {
+                            "role": "system",
+                            "content": adversarial_prompt
+                        }
+                        drone_params["messages"].insert(0, adversarial_message)
+                    
+                    lib_logger.debug(
+                        f"[HiveMind] Drone {i+1}/{count}: ADVERSARIAL - injected critical analysis prompt"
+                    )
+            
+            # Phase 4: Apply temperature jitter if enabled
+            if jitter_enabled:
+                base_temp = drone_params.get("temperature", 1.0)
+                
+                # Apply random jitter
+                import random
+                jitter = random.uniform(-jitter_delta, jitter_delta)
+                new_temp = base_temp + jitter
+                
+                # Clamp to valid range [0.0, 2.0]
+                new_temp = max(0.0, min(2.0, new_temp))
+                
+                drone_params["temperature"] = new_temp
+                
+                lib_logger.debug(
+                    f"[HiveMind] Drone {i+1}/{count}: Applied temperature jitter "
+                    f"({base_temp:.2f} → {new_temp:.2f}, delta: {jitter:+.2f})"
+                )
+            
             # Store drone metadata for logging
             drone_params["_drone_index"] = i + 1
             drone_params["_total_drones"] = count
+            drone_params["_is_adversarial"] = is_adversarial
             
             drones.append(drone_params)
             
+            temp_display = drone_params.get("temperature", "default")
+            if isinstance(temp_display, float):
+                temp_display = f"{temp_display:.2f}"
+            
             lib_logger.debug(
-                f"[HiveMind] Drone {i+1}/{count}: model={base_model}, "
-                f"temp={drone_params.get('temperature', 'default')}"
+                f"[HiveMind] Drone {i+1}/{count}: model={base_model}, temp={temp_display}"
             )
         
         return drones
