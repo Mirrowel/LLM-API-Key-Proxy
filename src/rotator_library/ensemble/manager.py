@@ -6,9 +6,12 @@ This module manages parallel model execution with intelligent arbitration.
 
 import os
 import logging
-import re
-from pathlib import Path
+import asyncio
+import random
+import copy
 from typing import Dict, List, Any, Optional, Set
+
+import litellm
 
 from .config_loader import ConfigLoader
 
@@ -238,7 +241,6 @@ class EnsembleManager:
             
             # Deep copy messages to avoid mutation
             if "messages" in drone_params:
-                import copy
                 drone_params["messages"] = copy.deepcopy(drone_params["messages"])
             
             # Phase 4: Determine if this drone should be adversarial
@@ -265,9 +267,8 @@ class EnsembleManager:
             # Phase 4: Apply temperature jitter if enabled
             if jitter_enabled:
                 base_temp = drone_params.get("temperature", 1.0)
-                
+
                 # Apply random jitter
-                import random
                 jitter = random.uniform(-jitter_delta, jitter_delta)
                 new_temp = base_temp + jitter
                 
@@ -316,11 +317,7 @@ class EnsembleManager:
         Returns:
             Tuple of (successful_responses, aggregated_usage)
         """
-        
         lib_logger.info(f"[HiveMind] Executing {len(drones)} drones in parallel...")
-        
-        # Import litellm for API calls
-        import litellm
         
         # Create tasks for all drones
         tasks = []
@@ -408,7 +405,7 @@ class EnsembleManager:
         Format drone responses for arbiter consumption.
         
         Creates a structured text format with numbered responses.
-        Blind switch and adversarial markers will be added in Phase 4.
+        Phase 4: Implements Blind Switch to strip model names.
         
         Args:
             responses: List of successful drone responses
@@ -418,6 +415,10 @@ class EnsembleManager:
             Formatted text string for arbiter
         """
         lib_logger.debug(f"[HiveMind] Formatting {len(responses)} responses for arbiter")
+        
+        # Check if blind mode is enabled
+        arbiter_config = config.get("arbiter", {})
+        blind_mode = arbiter_config.get("blind", True)  # Default ON
         
         formatted_parts = []
         
@@ -440,15 +441,29 @@ class EnsembleManager:
                 )
                 continue
             
-            # Format: "Response N:\n<content>\n"
-            formatted_parts.append(f"Response {response_num}:\n{content}\n")
+            # Phase 4: Blind Switch - determine label
+            if blind_mode:
+                # Strip model info, just use "Response N"
+                label = f"Response {response_num}"
+                lib_logger.debug(
+                    f"[HiveMind] Blind mode: Response {response_num} anonymized"
+                )
+            else:
+                # Include model name
+                model_name = "unknown"
+                if hasattr(response, 'model'):
+                    model_name = response.model
+                label = f"Response {response_num} (Model: {model_name})"
+            
+            # Format: "Label:\n<content>\n"
+            formatted_parts.append(f"{label}:\n{content}\n")
         
         # Join all responses
         formatted_text = "\n".join(formatted_parts)
         
         lib_logger.debug(
             f"[HiveMind] Formatted {len(formatted_parts)} responses "
-            f"({len(formatted_text)} characters total)"
+            f"({len(formatted_text)} characters total, blind_mode={blind_mode})"
         )
         
         return formatted_text
@@ -559,7 +574,6 @@ class EnsembleManager:
         
         # Call arbiter through RotatingClient
         # Use _execute_with_retry for consistency
-        import litellm
         arbiter_response = await self.rotating_client._execute_with_retry(
             litellm.acompletion,
             request=request,
@@ -623,9 +637,7 @@ class EnsembleManager:
             "messages": messages,
             "stream": True  # Enable streaming
         }
-        
         # Call arbiter through RotatingClient's streaming method
-        import litellm
         stream_generator = self.rotating_client._streaming_acompletion_with_retry(
             request=request,
             **arbiter_params
