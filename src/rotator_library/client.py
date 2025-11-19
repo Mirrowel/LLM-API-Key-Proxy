@@ -132,7 +132,6 @@ class RotatingClient:
         
         # Initialize HiveMind ensemble manager
         self.ensemble_manager = EnsembleManager(rotating_client=self)
-        lib_logger.info("HiveMind ensemble manager initialized")
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """

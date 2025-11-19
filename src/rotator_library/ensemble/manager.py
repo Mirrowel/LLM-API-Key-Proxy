@@ -62,7 +62,7 @@ class EnsembleManager:
         # Initialize provider models
         self._load_provider_models()
         
-        lib_logger.info("[HiveMind] EnsembleManager initialized")
+        lib_logger.info("[HiveMind] Ensemble Manager initialized")
     
     def is_ensemble(self, model_id: str) -> bool:
         """
