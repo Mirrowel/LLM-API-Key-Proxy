@@ -846,6 +846,98 @@ class EnsembleManager:
             
             yield chunk
     
+    async def _handle_fusion_streaming(
+        self,
+        config: Dict[str, Any],
+        request: Any,
+        **kwargs
+    ):
+        """
+        Handle streaming fusion request.
+        
+        Executes specialists in parallel, then streams arbiter response.
+        Aggregates usage and injects into stream.
+        
+        Args:
+            config: Fusion configuration
+            request: Original request object
+            **kwargs: Request parameters
+        
+        Yields:
+            Arbiter response chunks with aggregated usage
+        """
+        # Prepare specialist models
+        specialist_models = self._prepare_fusion_models(config, kwargs)
+        
+        if not specialist_models:
+            raise ValueError("[HiveMind] No valid specialists found for fusion")
+        
+        # Execute specialists in parallel
+        specialist_responses, specialist_usage = await self._execute_parallel(
+            specialist_models, request
+        )
+        
+        # Format responses with role labels
+        formatted_responses = self._format_for_arbiter(
+            specialist_responses,
+            config,
+            specialist_metadata=specialist_models
+        )
+        
+        # Build arbiter prompt
+        original_messages = kwargs.get("messages", [])
+        arbiter_messages = self._build_arbiter_prompt(
+            formatted_responses,
+            config,
+            original_messages
+        )
+        
+        # Get arbiter model
+        arbiter_config = config.get("arbiter", {})
+        arbiter_model = arbiter_config.get("model", "gpt-4o")
+        
+        lib_logger.debug(f"[HiveMind] Using arbiter model: {arbiter_model}")
+        
+        # Update config
+        config_copy = config.copy()
+        config_copy["arbiter"] = arbiter_config.copy()
+        config_copy["arbiter"]["model"] = arbiter_model
+        
+        # Stream arbiter
+        arbiter_usage = {}
+        async for chunk in self._call_arbiter_streaming(arbiter_messages, config_copy, request):
+            if isinstance(chunk, dict) and "_hivemind_usage" in chunk:
+                arbiter_usage = chunk["_hivemind_usage"]
+                continue
+            
+            if hasattr(chunk, 'usage') and chunk.usage:
+                # Final chunk - aggregate usage
+                total_usage = {
+                    'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage.get('prompt_tokens', 0),
+                    'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage.get('completion_tokens', 0),
+                    'total_tokens': specialist_usage['total_tokens'] + arbiter_usage.get('total_tokens', 0)
+                }
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in specialist_usage or field in arbiter_usage:
+                        total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                
+                chunk.usage.prompt_tokens = total_usage['prompt_tokens']
+                chunk.usage.completion_tokens = total_usage['completion_tokens']
+                chunk.usage.total_tokens = total_usage['total_tokens']
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in total_usage:
+                        setattr(chunk.usage, field, total_usage[field])
+                
+                lib_logger.info(
+                    f"[HiveMind] Fusion streaming completed. "
+                    f"Total usage: {total_usage['total_tokens']} tokens "
+                    f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage.get('total_tokens', 0)})"
+                )
+            
+            yield chunk
+    
     async def handle_request(self, request, **kwargs):
         """
         Handle an ensemble request (swarm or fusion).
@@ -878,26 +970,31 @@ class EnsembleManager:
                 f"({len(specialists)} specialists, streaming: {is_streaming})"
             )
             
-            # Phase 5: Fusion mode execution
-            # Prepare specialist models
+            # Route based on streaming mode
+            if is_streaming:
+                # Streaming fusion
+                return self._handle_fusion_streaming(
+                    config=config,
+                    request=request,
+                    **kwargs
+                )
+            
+            # Non-streaming fusion
             specialist_models = self._prepare_fusion_models(config, kwargs)
             
             if not specialist_models:
                 raise ValueError(f"[HiveMind] No valid specialists found for fusion '{resolved_id}'")
             
-            # Execute specialists in parallel
             specialist_responses, specialist_usage = await self._execute_parallel(
                 specialist_models, request
             )
             
-            # Format responses with role labels
             formatted_responses = self._format_for_arbiter(
                 specialist_responses,
                 config,
-                specialist_metadata=specialist_models  # Pass specialist metadata for role labels
+                specialist_metadata=specialist_models
             )
             
-            # Build arbiter prompt
             original_messages = kwargs.get("messages", [])
             arbiter_messages = self._build_arbiter_prompt(
                 formatted_responses,
@@ -905,92 +1002,46 @@ class EnsembleManager:
                 original_messages
             )
             
-            # Get arbiter model
             arbiter_config = config.get("arbiter", {})
             arbiter_model = arbiter_config.get("model", "gpt-4o")
             
-            lib_logger.debug(f"[HiveMind] Using arbiter model: {arbiter_model}")
-            
-            # Update config with arbiter model
             config_copy = config.copy()
             config_copy["arbiter"] = arbiter_config.copy()
             config_copy["arbiter"]["model"] = arbiter_model
             
-            # Route based on streaming mode
-            if is_streaming:
-                # Streaming fusion (similar to swarm streaming)
-                arbiter_usage = {}
-                async for chunk in self._call_arbiter_streaming(arbiter_messages, config_copy, request):
-                    if isinstance(chunk, dict) and "_hivemind_usage" in chunk:
-                        arbiter_usage = chunk["_hivemind_usage"]
-                        continue
-                    
-                    if hasattr(chunk, 'usage') and chunk.usage:
-                        # Final chunk - aggregate usage
-                        total_usage = {
-                            'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage.get('prompt_tokens', 0),
-                            'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage.get('completion_tokens', 0),
-                            'total_tokens': specialist_usage['total_tokens'] + arbiter_usage.get('total_tokens', 0)
-                        }
-                        
-                        for field in ['cached_tokens', 'reasoning_tokens']:
-                            if field in specialist_usage or field in arbiter_usage:
-                                total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
-                        
-                        chunk.usage.prompt_tokens = total_usage['prompt_tokens']
-                        chunk.usage.completion_tokens = total_usage['completion_tokens']
-                        chunk.usage.total_tokens = total_usage['total_tokens']
-                        
-                        for field in ['cached_tokens', 'reasoning_tokens']:
-                            if field in total_usage:
-                                setattr(chunk.usage, field, total_usage[field])
-                        
-                        lib_logger.info(
-                            f"[HiveMind] Fusion streaming completed. "
-                            f"Total usage: {total_usage['total_tokens']} tokens "
-                            f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage.get('total_tokens', 0)})"
-                        )
-                    
-                    yield chunk
-                
-                return  # Generator exits
-            else:
-                # Non-streaming fusion
-                arbiter_response, arbiter_usage = await self._call_arbiter(
-                    arbiter_messages,
-                    config_copy,
-                    request
-                )
-                
-                # Aggregate usage
-                total_usage = {
-                    'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
-                    'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
-                    'total_tokens': specialist_usage['total_tokens'] + arbiter_usage['total_tokens']
-                }
+            arbiter_response, arbiter_usage = await self._call_arbiter(
+                arbiter_messages,
+                config_copy,
+                request
+            )
+            
+            # Aggregate usage
+            total_usage = {
+                'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
+                'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
+                'total_tokens': specialist_usage['total_tokens'] + arbiter_usage['total_tokens']
+            }
+            
+            for field in ['cached_tokens', 'reasoning_tokens']:
+                if field in specialist_usage or field in arbiter_usage:
+                    total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
+            
+            if hasattr(arbiter_response, 'usage'):
+                arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
+                arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
+                arbiter_response.usage.total_tokens = total_usage['total_tokens']
                 
                 for field in ['cached_tokens', 'reasoning_tokens']:
-                    if field in specialist_usage or field in arbiter_usage:
-                        total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
-                
-                # Update arbiter response with aggregated usage
-                if hasattr(arbiter_response, 'usage'):
-                    arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
-                    arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
-                    arbiter_response.usage.total_tokens = total_usage['total_tokens']
-                    
-                    for field in ['cached_tokens', 'reasoning_tokens']:
-                        if field in total_usage:
-                            setattr(arbiter_response.usage, field, total_usage[field])
-                
-                lib_logger.info(
-                    f"[HiveMind] Fusion completed successfully. "
-                    f"Total usage: {total_usage['total_tokens']} tokens "
-                    f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
-                )
-                
-                return arbiter_response
-
+                    if field in total_usage:
+                        setattr(arbiter_response.usage, field, total_usage[field])
+            
+            lib_logger.info(
+                f"[HiveMind] Fusion completed successfully. "
+                f"Total usage: {total_usage['total_tokens']} tokens "
+                f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+            )
+            
+            return arbiter_response
         
         elif self._is_swarm_request(resolved_id):
             base_model = self.get_base_model(resolved_id)
