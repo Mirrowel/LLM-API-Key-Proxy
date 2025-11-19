@@ -533,6 +533,163 @@ class EnsembleManager:
         
         return arbiter_response, arbiter_usage
     
+    async def _call_arbiter_streaming(
+        self,
+        messages: List[Dict[str, str]],
+        config: Dict[str, Any],
+        request: Any
+    ):
+        """
+        Call the arbiter model with streaming enabled.
+        
+        Yields arbiter response chunks while tracking usage.
+        Usage aggregation happens at the end of the stream.
+        
+        Args:
+            messages: Constructed arbiter messages
+            config: Swarm or fusion configuration
+            request: Original request object
+        
+        Yields:
+            Response chunks from arbiter (for Phase 3)
+            Final yield includes usage metadata
+        """
+        # Get arbiter model
+        arbiter_config = config.get("arbiter", {})
+        arbiter_model = arbiter_config.get("model", "self")
+        
+        lib_logger.info(f"[HiveMind] Calling arbiter model (streaming): {arbiter_model}")
+        
+        # Build params for arbiter call
+        arbiter_params = {
+            "model": arbiter_model,
+            "messages": messages,
+            "stream": True  # Enable streaming
+        }
+        
+        # Call arbiter through RotatingClient's streaming method
+        import litellm
+        stream_generator = self.rotating_client._streaming_acompletion_with_retry(
+            request=request,
+            **arbiter_params
+        )
+        
+        # Track usage from stream
+        arbiter_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0
+        }
+        
+        # Stream chunks and collect usage
+        async for chunk in stream_generator:
+            # Check if this chunk has usage info (typically the last chunk)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage = chunk.usage
+                arbiter_usage['prompt_tokens'] = getattr(usage, 'prompt_tokens', 0)
+                arbiter_usage['completion_tokens'] = getattr(usage, 'completion_tokens', 0)
+                arbiter_usage['total_tokens'] = getattr(usage, 'total_tokens', 0)
+                
+                # Include other fields
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if hasattr(usage, field):
+                        arbiter_usage[field] = getattr(usage, field, 0)
+            
+            # Yield the chunk to caller
+            yield chunk
+        
+        lib_logger.info(
+            f"[HiveMind] Arbiter streaming completed. Tokens: {arbiter_usage['total_tokens']}"
+        )
+        
+        # Return usage as final metadata
+        # Caller will handle usage aggregation
+        yield {"_hivemind_usage": arbiter_usage}
+    
+    async def _handle_swarm_streaming(
+        self,
+        config: Dict[str, Any],
+        base_model: str,
+        request: Any,
+        **kwargs
+    ):
+        """
+        Handle streaming swarm request.
+        
+        Executes drones in parallel, then streams arbiter response.
+        Aggregates usage and injects into stream.
+        
+        Args:
+            config: Swarm configuration
+            base_model: Base model name
+            request: Original request object
+            **kwargs: Request parameters
+        
+        Yields:
+            Arbiter response chunks with aggregated usage
+        """
+        # Steps 1-4: Same as non-streaming (collect drone responses)
+        drones = self._prepare_drones(config, base_model, kwargs)
+        drone_responses, drone_usage = await self._execute_parallel(drones, request)
+        formatted_responses = self._format_for_arbiter(drone_responses, config)
+        
+        original_messages = kwargs.get("messages", [])
+        arbiter_messages = self._build_arbiter_prompt(
+            formatted_responses,
+            config,
+            original_messages
+        )
+        
+        # Handle "self" arbiter model
+        arbiter_config = config.get("arbiter", {})
+        arbiter_model = arbiter_config.get("model", "self")
+        if arbiter_model == "self":
+            arbiter_model = base_model
+            lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
+        
+        config_copy = config.copy()
+        config_copy["arbiter"] = arbiter_config.copy()
+        config_copy["arbiter"]["model"] = arbiter_model
+        
+        # Call arbiter in streaming mode
+        arbiter_usage = {}
+        async for chunk in self._call_arbiter_streaming(arbiter_messages, config_copy, request):
+            # Check for usage metadata
+            if isinstance(chunk, dict) and "_hivemind_usage" in chunk:
+                arbiter_usage = chunk["_hivemind_usage"]
+                continue  # Don't yield metadata chunk
+            
+            # For SSE chunks, check if this is the final chunk with usage
+            # and update with aggregated usage
+            if hasattr(chunk, 'usage') and chunk.usage:
+                # This is the final chunk - aggregate total usage
+                total_usage = {
+                    'prompt_tokens': drone_usage['prompt_tokens'] + arbiter_usage.get('prompt_tokens', 0),
+                    'completion_tokens': drone_usage['completion_tokens'] + arbiter_usage.get('completion_tokens', 0),
+                    'total_tokens': drone_usage['total_tokens'] + arbiter_usage.get('total_tokens', 0)
+                }
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in drone_usage or field in arbiter_usage:
+                        total_usage[field] = drone_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                
+                # Update chunk usage with aggregated values
+                chunk.usage.prompt_tokens = total_usage['prompt_tokens']
+                chunk.usage.completion_tokens = total_usage['completion_tokens']
+                chunk.usage.total_tokens = total_usage['total_tokens']
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in total_usage:
+                        setattr(chunk.usage, field, total_usage[field])
+                
+                lib_logger.info(
+                    f"[HiveMind] Streaming swarm completed. "
+                    f"Total usage: {total_usage['total_tokens']} tokens "
+                    f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage.get('total_tokens', 0)})"
+                )
+            
+            yield chunk
+    
     async def handle_request(self, request, **kwargs):
         """
         Handle an ensemble request (swarm or fusion).
