@@ -1611,8 +1611,15 @@ class RotatingClient:
         Returns:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
-        # Handle iflow provider: remove stream_options to avoid HTTP 406
         model = kwargs.get("model", "")
+        
+        # Check if this is an ensemble request (HiveMind)
+        if model and self.ensemble_manager.is_ensemble(model):
+            lib_logger.debug(f"[HiveMind] Detected ensemble request: {model}")
+            # Delegate to ensemble manager
+            return self.ensemble_manager.handle_request(request=request, **kwargs)
+        
+        # Handle iflow provider: remove stream_options to avoid HTTP 406
         provider = model.split("/")[0] if "/" in model else ""
         
         if provider == "iflow" and "stream_options" in kwargs:
