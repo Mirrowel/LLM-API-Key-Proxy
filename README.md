@@ -1,18 +1,6 @@
 # Universal LLM API Proxy & Resilience Library [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Mirrowel/LLM-API-Key-Proxy) [![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/Mirrowel/LLM-API-Key-Proxy)
 
-## Easy Setup for Beginners (Windows)
-
-This is the fastest way to get started.
-
-1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest).
-2.  Unzip the downloaded file.
-3.  **Double-click `setup_env.bat`**. A window will open to help you add your API keys. Follow the on-screen instructions.
-4.  **Double-click `proxy_app.exe`**. This will start the proxy server.
-
-Your proxy is now running! You can now use it in your applications.
-
----
 
 ## Detailed Setup and Features
 
@@ -26,26 +14,79 @@ This project provides a powerful solution for developers building complex applic
 -   **Universal API Endpoint**: Simplifies development by providing a single, OpenAI-compatible interface for diverse LLM providers.
 -   **High Availability**: The underlying library ensures your application remains operational by gracefully handling transient provider errors and API key-specific issues.
 -   **Resilient Performance**: A global timeout on all requests prevents your application from hanging on unresponsive provider APIs.
--   **Efficient Concurrency**: Maximizes throughput by allowing a single API key to handle multiple concurrent requests to different models.
+-   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. By default, it supports concurrent requests to *different* models. With configuration (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`), it can also support multiple concurrent requests to the *same* model using the same key.
 -   **Intelligent Key Management**: Optimizes request distribution across your pool of keys by selecting the best available one for each call.
+-   **Automated OAuth Discovery**: Automatically discovers, validates, and manages OAuth credentials from standard provider directories (e.g., `~/.gemini/`, `~/.qwen/`, `~/.iflow/`).
+-   **Stateless Deployment Support**: Deploy easily to platforms like Railway, Render, or Vercel. The new export tool converts complex OAuth credentials (Gemini CLI, Qwen, iFlow) into simple environment variables, removing the need for persistent storage or file uploads.
+-   **Batch Request Processing**: Efficiently aggregates multiple embedding requests into single batch API calls, improving throughput and reducing rate limit hits.
+-   **New Provider Support**: Full support for **iFlow** (API Key & OAuth), **Qwen Code** (API Key & OAuth), and **NVIDIA NIM** with DeepSeek thinking support, including special handling for their API quirks (tool schema cleaning, reasoning support, dedicated logging).
+-   **Duplicate Credential Detection**: Intelligently detects if multiple local credential files belong to the same user account and logs a warning, preventing redundancy in your key pool.
 -   **Escalating Per-Model Cooldowns**: If a key fails for a specific model, it's placed on a temporary, escalating cooldown for that model, allowing it to be used with others.
 -   **Automatic Daily Resets**: Cooldowns and usage statistics are automatically reset daily, making the system self-maintaining.
 -   **Detailed Request Logging**: Enable comprehensive logging for debugging. Each request gets its own directory with full request/response details, streaming chunks, and performance metadata.
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
+-   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
+
 
 ---
 
-## 1. Quick Start (Windows Executable)
+## 1. Quick Start
 
-This is the fastest way to get started for most users on Windows.
+### Windows (Simplest)
 
 1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest).
 2.  Unzip the downloaded file.
-3.  **Run `setup_env.bat`**. A window will open to help you add your API keys. Follow the on-screen instructions.
-4.  **Run `proxy_app.exe`**. This will start the proxy server in a new terminal window.
+3.  **Run `launcher.bat`**. This all-in-one script allows you to:
+    -   Add/Manage credentials interactively.
+    -   Configure the server (Host, Port, Logging).
+    -   Run the proxy server.
+    -   Build the executable from source (if Python is installed).
 
-Your proxy is now running and ready to use at `http://127.0.0.1:8000`.
+### macOS / Linux
+
+**Option A: Using the Executable (Recommended)**
+If you downloaded the pre-compiled binary for your platform, no Python installation is required.
+
+1.  **Download the latest release** from the GitHub Releases page.
+2.  Open a terminal and make the binary executable:
+    ```bash
+    chmod +x proxy_app
+    ```
+3.  **Run the Proxy**:
+    ```bash
+    ./proxy_app --host 0.0.0.0 --port 8000
+    ```
+4.  **Manage Credentials**:
+    ```bash
+    ./proxy_app --add-credential
+    ```
+
+**Option B: Manual Setup (Source Code)**
+If you are running from source, use these commands:
+
+**1. Install Dependencies**
+```bash
+# Ensure you have Python 3.10+ installed
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**2. Add Credentials (Interactive Tool)**
+```bash
+# Equivalent to "Add Credentials"
+export PYTHONPATH=$PYTHONPATH:$(pwd)/src
+python src/proxy_app/main.py --add-credential
+```
+
+**3. Run the Proxy**
+```bash
+# Equivalent to "Run Proxy"
+export PYTHONPATH=$PYTHONPATH:$(pwd)/src
+python src/proxy_app/main.py --host 0.0.0.0 --port 8000
+```
+*To enable logging, add `--enable-request-logging` to the command.*
 
 ---
 
@@ -103,8 +144,82 @@ Now, open the new `.env` file and add your keys.
 
 **Refer to the `.env.example` file for the correct format and a full list of supported providers.**
 
-1.  **`PROXY_API_KEY`**: This is a secret key **you create**. It is used to authorize requests to *your* proxy, preventing unauthorized use.
-2.  **Provider Keys**: These are the API keys you get from LLM providers (like Gemini, OpenAI, etc.). The proxy automatically finds them based on their name (e.g., `GEMINI_API_KEY_1`).
+The proxy supports two types of credentials:
+
+1.  **API Keys**: Standard secret keys from providers like OpenAI, Anthropic, etc.
+2.  **OAuth Credentials**: For services that use OAuth 2.0, like the Gemini CLI.
+
+#### Automated Credential Discovery (Recommended)
+
+For many providers, **no configuration is necessary**. The proxy automatically discovers and manages credentials from their default locations:
+-   **API Keys**: Scans your environment variables for keys matching the format `PROVIDER_API_KEY_1` (e.g., `GEMINI_API_KEY_1`).
+-   **OAuth Credentials**: Scans default system directories (e.g., `~/.gemini/`, `~/.qwen/`, `~/.iflow/`) for all `*.json` credential files.
+
+You only need to create a `.env` file to set your `PROXY_API_KEY` and to override or add credentials if the automatic discovery doesn't suit your needs.
+
+#### Interactive Credential Management Tool
+
+The proxy includes a powerful interactive CLI tool for managing all your credentials. This is the recommended way to set up credentials:
+
+```bash
+python -m rotator_library.credential_tool
+```
+
+**Main Menu Features:**
+
+1. **Add OAuth Credential** - Interactive OAuth flow for Gemini CLI, Qwen Code, and iFlow
+   - Automatically opens your browser for authentication
+   - Handles the entire OAuth flow including callbacks
+   - Saves credentials to the local `oauth_creds/` directory
+   - For Gemini CLI: Automatically discovers or creates a Google Cloud project
+   - For Qwen Code: Uses Device Code flow (you'll enter a code in your browser)
+   - For iFlow: Starts a local callback server on port 11451
+
+2. **Add API Key** - Add standard API keys for any LiteLLM-supported provider
+   - Interactive prompts guide you through the process
+   - Automatically saves to your `.env` file
+   - Supports multiple keys per provider (numbered automatically)
+
+3. **Export Credentials to .env** - The "Stateless Deployment" feature
+   - Converts file-based OAuth credentials into environment variables
+   - Essential for platforms without persistent file storage
+   - Generates a ready-to-paste `.env` block for each credential
+
+**Stateless Deployment Workflow (Railway, Render, Vercel, etc.):**
+
+If you're deploying to a platform without persistent file storage:
+
+1. **Setup credentials locally first**:
+   ```bash
+   python -m rotator_library.credential_tool
+   # Select "Add OAuth Credential" and complete the flow
+   ```
+
+2. **Export to environment variables**:
+   ```bash
+   python -m rotator_library.credential_tool
+   # Select "Export Gemini CLI to .env" (or Qwen/iFlow)
+   # Choose your credential file
+   ```
+
+3. **Copy the generated output**:
+   - The tool creates a file like `gemini_cli_credential_1.env`
+   - Contains all necessary `GEMINI_CLI_*` variables
+
+4. **Paste into your hosting platform**:
+   - Add each variable to your platform's environment settings
+   - Set `SKIP_OAUTH_INIT_CHECK=true` to skip interactive validation
+   - No credential files needed; everything loads from environment variables
+
+**Local-First OAuth Management:**
+
+The proxy uses a "local-first" approach for OAuth credentials:
+
+- **Local Storage**: All OAuth credentials are stored in `oauth_creds/` directory
+- **Automatic Discovery**: On first run, the proxy scans system paths (`~/.gemini/`, `~/.qwen/`, `~/.iflow/`) and imports found credentials
+- **Deduplication**: Intelligently detects duplicate accounts (by email/user ID) and warns you
+- **Priority**: Local files take priority over system-wide credentials
+- **No System Pollution**: Your project's credentials are isolated from global system credentials
 
 **Example `.env` configuration:**
 ```env
@@ -112,18 +227,35 @@ Now, open the new `.env` file and add your keys.
 # This can be any secret string you choose.
 PROXY_API_KEY="a-very-secret-and-unique-key"
 
-# --- Provider API Keys ---
-# Add your keys from various providers below.
-# You can add multiple keys for one provider by numbering them (e.g., _1, _2).
-
+# --- Provider API Keys (Optional) ---
+# The proxy automatically finds keys in your environment variables.
+# You can also define them here. Add multiple keys by numbering them (_1, _2).
 GEMINI_API_KEY_1="YOUR_GEMINI_API_KEY_1"
 GEMINI_API_KEY_2="YOUR_GEMINI_API_KEY_2"
-
 OPENROUTER_API_KEY_1="YOUR_OPENROUTER_API_KEY_1"
 
-NVIDIA_NIM_API_KEY_1="YOUR_NVIDIA_NIM_API_KEY_1"
+# --- OAuth Credentials (Optional) ---
+# The proxy automatically finds credentials in standard system paths.
+# You can override this by specifying a path to your credential file.
+GEMINI_CLI_OAUTH_1="/path/to/your/specific/gemini_creds.json"
 
-CHUTES_API_KEY_1="YOUR_CHUTES_API_KEY_1"
+# --- Gemini CLI: Stateless Deployment Support ---
+# For hosts without file persistence (Railway, Render, etc.), you can provide
+# Gemini CLI credentials directly via environment variables:
+GEMINI_CLI_ACCESS_TOKEN="ya29.your-access-token"
+GEMINI_CLI_REFRESH_TOKEN="1//your-refresh-token"
+GEMINI_CLI_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_EMAIL="your-email@gmail.com"
+# Optional: GEMINI_CLI_PROJECT_ID, GEMINI_CLI_CLIENT_ID, etc.
+# See IMPLEMENTATION_SUMMARY.md for full list of supported variables
+
+# --- Dual Authentication Support ---
+# Some providers (qwen_code, iflow) support BOTH OAuth and direct API keys.
+# You can use either method, or mix both for credential rotation:
+QWEN_CODE_API_KEY_1="your-qwen-api-key"  # Direct API key
+# AND/OR use OAuth: oauth_creds/qwen_code_oauth_1.json
+IFLOW_API_KEY_1="sk-your-iflow-key"      # Direct API key
+# AND/OR use OAuth: oauth_creds/iflow_oauth_1.json
 ```
 
 ### 3. Run the Proxy
@@ -220,17 +352,21 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ## 4. Advanced Topics
 
+### Batch Request Processing
+
+The proxy includes a `Batch Manager` that optimizes high-volume embedding requests.
+- **Automatic Aggregation**: Multiple individual embedding requests are automatically collected into a single batch API call.
+- **Configurable**: Works out of the box, but can be tuned for specific needs.
+- **Benefits**: Significantly reduces the number of HTTP requests to providers, helping you stay within rate limits while improving throughput.
+
 ### How It Works
 
-When a request is made to the proxy, the application uses its core resilience library to ensure the request is handled reliably:
+The proxy is built on a robust architecture:
 
-1.  **Selects an Optimal Key**: The `UsageManager` selects the best available key from your pool. It uses a tiered locking strategy to find a healthy, available key, prioritizing those with the least recent usage. This allows for concurrent requests to different models using the same key, maximizing efficiency.
-2.  **Makes the Request**: The proxy uses the acquired key to make the API call to the target provider via `litellm`.
-3.  **Manages Errors Gracefully**:
-    -   It uses a `classify_error` function to determine the failure type.
-    -   For **transient server errors**, it retries the request with the same key using exponential backoff.
-    -   For **key-specific issues (e.g., authentication or provider-side limits)**, it temporarily places that key on a cooldown for the specific model and seamlessly retries the request with the next available key from the pool.
-4.  **Tracks Usage & Releases Key**: On a successful request, it records usage stats. The key is then released back into the available pool, ready for the next request.
+1.  **Intelligent Routing**: The `UsageManager` selects the best available key from your pool. It prioritizes idle keys first, then keys that can handle concurrency, ensuring optimal load balancing.
+2.  **Resilience & Deadlines**: Every request has a strict deadline (`global_timeout`). If a provider is slow or fails, the proxy retries with a different key immediately, ensuring your application never hangs.
+3.  **Batching**: High-volume embedding requests are automatically aggregated into optimized batches, reducing API calls and staying within rate limits.
+4.  **Deep Observability**: (Optional) Detailed logs capture every byte of the transaction, including raw streaming chunks, for precise debugging of complex agentic interactions.
 
 ### Command-Line Arguments and Scripts
 
@@ -240,10 +376,83 @@ The proxy server can be configured at runtime using the following command-line a
 -   `--port`: The port to run the server on. Defaults to `8000`.
 -   `--enable-request-logging`: A flag to enable detailed, per-request logging. When active, the proxy creates a unique directory for each transaction in the `logs/detailed_logs/` folder, containing the full request, response, streaming chunks, and performance metadata. This is highly recommended for debugging.
 
+### New Provider Highlights
+
+#### **Gemini CLI (Advanced)**
+A powerful provider that mimics the Google Cloud Code extension.
+-   **Zero-Config Project Discovery**: Automatically finds your Google Cloud Project ID or onboards you to a free-tier project if none exists.
+-   **Internal API Access**: Uses high-limit internal endpoints (`cloudcode-pa.googleapis.com`) rather than the public Vertex AI API.
+-   **Smart Rate Limiting**: Automatically falls back to preview models (e.g., `gemini-2.5-pro-preview`) if the main model hits a rate limit.
+
+#### **Qwen Code**
+-   **Dual Authentication**: Use either standard API keys or OAuth 2.0 Device Flow credentials.
+-   **Schema Cleaning**: Automatically removes `strict` and `additionalProperties` from tool schemas to prevent API errors.
+-   **Stream Stability**: Injects a dummy `do_not_call_me` tool to prevent stream corruption issues when no tools are provided.
+-   **Reasoning Support**: Parses `<think>` tags in responses and exposes them as `reasoning_content` (similar to OpenAI's o1 format).
+-   **Dedicated Logging**: Optional per-request file logging to `logs/qwen_code_logs/` for debugging.
+-   **Custom Models**: Define additional models via `QWEN_CODE_MODELS` environment variable (JSON array format).
+
+#### **iFlow**
+-   **Dual Authentication**: Use either standard API keys or OAuth 2.0 Authorization Code Flow.
+-   **Hybrid Auth**: OAuth flow provides an access token, but actual API calls use a separate `apiKey` retrieved from user profile.
+-   **Local Callback Server**: OAuth flow runs a temporary server on port 11451 to capture the redirect.
+-   **Schema Cleaning**: Same as Qwen Code - removes unsupported properties from tool schemas.
+-   **Stream Stability**: Injects placeholder tools to stabilize streaming for empty tool lists.
+-   **Dedicated Logging**: Optional per-request file logging to `logs/iflow_logs/` for debugging proprietary API behaviors.
+-   **Custom Models**: Define additional models via `IFLOW_MODELS` environment variable (JSON array format).
+
+
+### Advanced Configuration
+
+The following advanced settings can be added to your `.env` file:
+
+#### OAuth and Refresh Settings
+
+-   **`OAUTH_REFRESH_INTERVAL`**: Controls how often (in seconds) the background refresher checks for expired OAuth tokens. Default is `3600` (1 hour).
+    ```env
+    OAUTH_REFRESH_INTERVAL=1800  # Check every 30 minutes
+    ```
+
+-   **`SKIP_OAUTH_INIT_CHECK`**: Set to `true` to skip the interactive OAuth setup/validation check on startup. Essential for non-interactive environments like Docker containers or CI/CD pipelines.
+    ```env
+    SKIP_OAUTH_INIT_CHECK=true
+    ```
+
+#### Concurrency Control
+
+-   **`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`**: Set the maximum number of simultaneous requests allowed per API key for a specific provider. Default is `1` (no concurrency). Useful for high-throughput providers.
+    ```env
+    MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3
+    MAX_CONCURRENT_REQUESTS_PER_KEY_ANTHROPIC=2
+    MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=1
+    ```
+
+#### Custom Model Lists
+
+For providers that support custom model definitions (Qwen Code, iFlow), you can override the default model list:
+
+-   **`QWEN_CODE_MODELS`**: JSON array of custom Qwen Code models. These models take priority over hardcoded defaults.
+    ```env
+    QWEN_CODE_MODELS='["qwen3-coder-plus", "qwen3-coder-flash", "custom-model-id"]'
+    ```
+
+-   **`IFLOW_MODELS`**: JSON array of custom iFlow models. These models take priority over hardcoded defaults.
+    ```env
+    IFLOW_MODELS='["glm-4.6", "qwen3-coder-plus", "deepseek-v3.2"]'
+    ```
+
+#### Provider-Specific Settings
+
+-   **`GEMINI_CLI_PROJECT_ID`**: Manually specify a Google Cloud Project ID for Gemini CLI OAuth. Only needed if automatic discovery fails.
+    ```env
+    GEMINI_CLI_PROJECT_ID="your-gcp-project-id"
+    ```
+
 **Example:**
 ```bash
 python src/proxy_app/main.py --host 127.0.0.1 --port 9999 --enable-request-logging
 ```
+
 
 #### Windows Batch Scripts
 
@@ -264,3 +473,43 @@ For convenience on Windows, you can use the provided `.bat` scripts in the root 
 
 -   **Using the Library**: For documentation on how to use the `api-key-manager` library directly in your own Python projects, please refer to its [README.md](src/rotator_library/README.md).
 -   **Technical Details**: For a more in-depth technical explanation of the library's architecture, components, and internal workings, please refer to the [Technical Documentation](DOCUMENTATION.md).
+
+### Advanced Model Filtering (Whitelists & Blacklists)
+
+The proxy provides a powerful way to control which models are available to your applications using environment variables in your `.env` file.
+
+#### How It Works
+
+The filtering logic is applied in this order:
+
+1.  **Whitelist Check**: If a provider has a whitelist defined (`WHITELIST_MODELS_<PROVIDER>`), any model on that list will **always be available**, even if it's on the blacklist.
+2.  **Blacklist Check**: For any model *not* on the whitelist, the proxy checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model is on the blacklist, it will be hidden.
+3.  **Default**: If a model is on neither list, it will be available.
+
+This allows for two powerful patterns:
+
+#### Use Case 1: Pure Whitelist Mode
+
+You can expose *only* the specific models you want. To do this, set the blacklist to `*` to block all models by default, and then add the desired models to the whitelist.
+
+**Example `.env`:**
+```env
+# Block all Gemini models by default
+IGNORE_MODELS_GEMINI="*"
+
+# Only allow gemini-1.5-pro and gemini-1.5-flash
+WHITELIST_MODELS_GEMINI="gemini-1.5-pro-latest,gemini-1.5-flash-latest"
+```
+
+#### Use Case 2: Exemption Mode
+
+You can block a broad category of models and then use the whitelist to make specific exceptions.
+
+**Example `.env`:**
+```env
+# Block all preview models from OpenAI
+IGNORE_MODELS_OPENAI="*-preview*"
+
+# But make an exception for a specific preview model you want to test
+WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
+```

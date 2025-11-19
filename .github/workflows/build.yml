@@ -11,75 +11,110 @@ on:
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
-      - 'setup_env.bat'
+      - 'launcher.bat'
       - '.github/workflows/build.yml'
       - 'cliff.toml'
 
 jobs:
   build:
-    runs-on: windows-latest
-    outputs:
-      sha: ${{ steps.version.outputs.sha }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      id: setup-python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
-    - name: Install dependencies
+    - name: Get pip cache dir
+      id: pip-cache
+      shell: bash
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.pip-cache.outputs.dir }}
+        key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-3.12
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        grep -v -- '-e src/rotator_library' requirements.txt > temp_requirements.txt
+        pip install -r temp_requirements.txt
         pip install pyinstaller
+        pip install -e src/rotator_library
+
+    - name: Get PyInstaller cache directory
+      id: pyinstaller-cache-dir
+      shell: pwsh
+      run: |
+        if ($env:RUNNER_OS -eq 'Windows') {
+          echo "path=$($env:USERPROFILE)\AppData\Local\pyinstaller" >> $env:GITHUB_OUTPUT
+        } elseif ($env:RUNNER_OS -eq 'Linux') {
+          echo "path=$($env:HOME)/.cache/pyinstaller" >> $env:GITHUB_OUTPUT
+        } elseif ($env:RUNNER_OS -eq 'macOS') {
+          echo "path=$($env:HOME)/Library/Application Support/pyinstaller" >> $env:GITHUB_OUTPUT
+        }
+
+    - name: Cache PyInstaller build data
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.pyinstaller-cache-dir.outputs.path }}
+        key: ${{ runner.os }}-pyinstaller-3.12-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pyinstaller-3.12-
 
     - name: Build executable
       run: python src/proxy_app/build.py
 
+    - name: Ensure PyInstaller cache directory exists
+      shell: pwsh
+      run: New-Item -ItemType Directory -Force -Path "${{ steps.pyinstaller-cache-dir.outputs.path }}"
+
     - name: Get short SHA
       id: version
-      shell: pwsh
+      shell: bash
       run: |
-        $sha = git rev-parse --short HEAD
-        echo "sha=$sha" >> $env:GITHUB_OUTPUT
+        sha=$(git rev-parse --short HEAD)
+        echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Prepare files for artifact
-      shell: pwsh
+      shell: bash
       run: |
-        $stagingDir = "staging"
-        mkdir $stagingDir
-        $sourceFiles = @(
-            "src/proxy_app/dist/proxy_app.exe",
-            "setup_env.bat"
-        )
-        foreach ($file in $sourceFiles) {
-            if (Test-Path $file) {
-                echo "Copying '$file' to '$stagingDir'"
-                Copy-Item -Path $file -Destination $stagingDir
-            } else {
-                echo "::error::File not found: $file"
-                exit 1
-            }
-        }
+        stagingDir="staging"
+        mkdir -p $stagingDir
+        cp launcher.bat "$stagingDir/"
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          cp src/proxy_app/dist/proxy_app.exe "$stagingDir/"
+        else
+          cp src/proxy_app/dist/proxy_app "$stagingDir/"
+        fi
         echo "--- Staging directory contents ---"
-        Get-ChildItem -Path $stagingDir -Recurse
+        ls -R $stagingDir
         echo "------------------------------------"
 
     - name: Archive build artifact
       uses: actions/upload-artifact@v4
       with:
-        name: proxy-app-build-${{ steps.version.outputs.sha }}
-        path: |
-          staging/proxy_app.exe
-          staging/setup_env.bat
+        name: proxy-app-build-${{ runner.os }}-${{ steps.version.outputs.sha }}
+        path: staging/
 
   release:
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      WHITELISTED_BRANCHES: "main"
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -89,6 +124,11 @@ jobs:
     - name: Fetch all tags and history
       shell: bash
       run: git fetch --prune --tags
+
+    - name: Get short SHA
+      id: get_sha
+      shell: bash
+      run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     - name: Generate Build Version
       id: version
@@ -108,7 +148,7 @@ jobs:
         BUILD_NUMBER=$((BUILD_COUNT + 1))
         
         # Create the new, sortable version string using the new format
-        VERSION="$DATE_STAMP_NEW-$BUILD_NUMBER-${{ needs.build.outputs.sha }}"
+        VERSION="$DATE_STAMP_NEW-$BUILD_NUMBER-${{ steps.get_sha.outputs.sha }}"
         
         # Define all naming components
         echo "release_title=Build ($BRANCH_NAME): $VERSION" >> $GITHUB_OUTPUT
@@ -117,21 +157,33 @@ jobs:
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
 
-    - name: Download build artifact
+    - name: Download build artifacts
       uses: actions/download-artifact@v4
       with:
-        name: proxy-app-build-${{ needs.build.outputs.sha }}
         path: release-assets
+        pattern: proxy-app-build-*-${{ steps.get_sha.outputs.sha }}
 
     - name: Archive release files
       id: archive
       shell: bash
       run: |
-        ARCHIVE_NAME="LLM-API-Key-Proxy-${{ steps.version.outputs.archive_version_part }}.zip"
-        cd release-assets
-        zip -r ../$ARCHIVE_NAME .
-        cd ..
-        echo "ASSET_PATH=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+        ASSET_PATHS=""
+        for dir in release-assets/proxy-app-build-*; do
+            if [ -d "$dir" ]; then
+                os_name=$(basename "$dir" | cut -d'-' -f4)
+                archive_name="LLM-API-Key-Proxy-${os_name}-${{ steps.version.outputs.archive_version_part }}.zip"
+                (
+                    cd "$dir"
+                    zip -r "../../$archive_name" .
+                )
+                if [ -z "$ASSET_PATHS" ]; then
+                    ASSET_PATHS="$archive_name"
+                else
+                    ASSET_PATHS="$ASSET_PATHS $archive_name"
+                fi
+            fi
+        done
+        echo "ASSET_PATHS=$ASSET_PATHS" >> $GITHUB_OUTPUT
 
     - name: Install git-cliff
       shell: bash
@@ -219,10 +271,10 @@ jobs:
         pwd
         echo ""
         echo "Release assets directory contents:"
-        ls -la release-assets/ || echo "release-assets directory not found"
+        ls -laR release-assets/ || echo "release-assets directory not found"
         echo ""
         echo "All files in current directory:"
-        find . -name "*.exe" -o -name "*.bat" -o -name ".env*" | head -20
+        find . -name "*.zip" | head -20
         echo ""
         echo "Directory structure:"
         find release-assets -type f 2>/dev/null || echo "No files found in release-assets"
@@ -233,24 +285,31 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # Find the executable file
-        EXE_FILE=$(find release-assets -name "proxy_app.exe" -type f | head -1)
-        
-        if [ -n "$EXE_FILE" ]; then
-          BUILD_SIZE=$(du -sh "$EXE_FILE" | cut -f1)
-          echo "✅ Found executable at: $EXE_FILE (Size: $BUILD_SIZE)"
+        # Find executable files and get their sizes
+        WINDOWS_EXE=$(find release-assets -name "proxy_app.exe" -type f | head -1)
+        if [ -n "$WINDOWS_EXE" ]; then
+          WIN_SIZE=$(du -sh "$WINDOWS_EXE" | cut -f1)
         else
-          # Fallback: look for any .exe file
-          EXE_FILE=$(find release-assets -name "*.exe" -type f | head -1)
-          if [ -n "$EXE_FILE" ]; then
-            BUILD_SIZE=$(du -sh "$EXE_FILE" | cut -f1)
-            echo "✅ Found executable at: $EXE_FILE (Size: $BUILD_SIZE)"
-          else
-            BUILD_SIZE="Unknown"
-            echo "⚠️ No executable file found"
-          fi
+          WIN_SIZE="Unknown"
         fi
+        echo "win_build_size=$WIN_SIZE" >> $GITHUB_OUTPUT
         
+        LINUX_EXE=$(find release-assets -path "*/proxy-app-build-Linux-*/proxy_app" -type f | head -1)
+        if [ -n "$LINUX_EXE" ]; then
+          LINUX_SIZE=$(du -sh "$LINUX_EXE" | cut -f1)
+        else
+          LINUX_SIZE="Unknown"
+        fi
+        echo "linux_build_size=$LINUX_SIZE" >> $GITHUB_OUTPUT
+
+        MACOS_EXE=$(find release-assets -path "*/proxy-app-build-macOS-*/proxy_app" -type f | head -1)
+        if [ -n "$MACOS_EXE" ]; then
+          MACOS_SIZE=$(du -sh "$MACOS_EXE" | cut -f1)
+        else
+          MACOS_SIZE="Unknown"
+        fi
+        echo "macos_build_size=$MACOS_SIZE" >> $GITHUB_OUTPUT
+
         COMMIT_COUNT=$(git rev-list --count HEAD)
         
         # Generate rich contributor list
@@ -272,12 +331,13 @@ jobs:
           fi
         done <<< "$CONTRIBUTOR_LOG"
         
-        echo "build_size=$BUILD_SIZE" >> $GITHUB_OUTPUT
         echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
         echo "contributors_list=$CONTRIBUTORS_LIST" >> $GITHUB_OUTPUT
         
         echo "📊 Build metadata:"
-        echo "  - Size: $BUILD_SIZE"
+        echo "  - Size (Windows): $WIN_SIZE"
+        echo "  - Size (Linux): $LINUX_SIZE"
+        echo "  - Size (macOS): $MACOS_SIZE"
         echo "  - Commits: $COMMIT_COUNT"
         echo "  - Contributors: $CONTRIBUTORS_LIST"
 
@@ -299,13 +359,25 @@ jobs:
           CHANGELOG_URL=""
         fi
 
+        # Generate file descriptions
+        FILE_TABLE="| File | Description |\n|------|-------------|\n"
+        FILE_TABLE="$FILE_TABLE| \`proxy_app.exe\` | Main application executable for **Windows**. |\n"
+        FILE_TABLE="$FILE_TABLE| \`proxy_app\` | Main application executable for **Linux** and **macOS**. |\n"
+        FILE_TABLE="$FILE_TABLE| \`launcher.bat\` | A batch script to easily configure and run the proxy on Windows. |"
+
+        # List archives
+        WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
+        LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Linux')
+        MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macOS')
+        ARCHIVE_LIST="- **Windows**: \`$WINDOWS_ARCHIVE\`\n- **Linux**: \`$LINUX_ARCHIVE\`\n- **macOS**: \`$MACOS_ARCHIVE\`"
+
         cat > releasenotes.md <<-EOF
         ## Build Information
         | Field | Value |
         |-------|-------|
         | 📦 **Version** | \`${{ steps.version.outputs.version }}\` |
-        | 💾 **Binary Size** | \`${{ steps.metadata.outputs.build_size }}\` |
-        | 🔗 **Commit** | [\`${{ needs.build.outputs.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
+        | 💾 **Binary Size** | Win: \`${{ steps.metadata.outputs.win_build_size }}\`, Linux: \`${{ steps.metadata.outputs.linux_build_size }}\`, macOS: \`${{ steps.metadata.outputs.macos_build_size }}\` |
+        | 🔗 **Commit** | [\`${{ steps.get_sha.outputs.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
         | 📅 **Build Date** | \`${{ steps.version.outputs.timestamp }}\` |
         | ⚡ **Trigger** | \`${{ github.event_name }}\` |
 
@@ -314,10 +386,11 @@ jobs:
         $CHANGELOG_CONTENT
 
         ### 📁 Included Files
-        | File | Description |
-        |------|-------------|
-        | \`proxy_app.exe\` | Main application executable |
-        | \`setup_env.bat\` | Environment setup script |
+        Each OS-specific archive contains the following files:
+        $FILE_TABLE
+
+        ### 📦 Archives
+        $ARCHIVE_LIST
 
         ## 🔗 Useful Links
         - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
@@ -332,12 +405,43 @@ jobs:
         $CHANGELOG_URL
         EOF
 
+        # Set release flags and notes based on the branch
+        CURRENT_BRANCH="${{ github.ref_name }}"
+        PRERELEASE_FLAG=""
+        LATEST_FLAG="--latest"
+        EXPERIMENTAL_NOTE=""
+
+        # Check if the current branch is in the comma-separated whitelist
+        if ! [[ ",${{ env.WHITELISTED_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
+          PRERELEASE_FLAG="--prerelease"
+          LATEST_FLAG="" # Do not mark non-whitelisted branches as 'latest'
+          EXPERIMENTAL_NOTE=$(cat <<-EOF
+        > [!WARNING]
+        > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
+        > |:---------------------------:|
+        > This release is from the [\`$CURRENT_BRANCH\`](https://github.com/${{ github.repository }}/tree/$CURRENT_BRANCH) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
+        >
+        > **Do not use in production environments.**
+        >
+        > ---
+        >
+        > **Found an issue?** Please [report it here](https://github.com/${{ github.repository }}/issues/new/choose) and include the build version (\`${{ steps.version.outputs.version }}\`) in your report.
+        EOF
+          )
+        fi
+
+        # Prepend the experimental note if it exists
+        if [ -n "$EXPERIMENTAL_NOTE" ]; then
+          echo -e "$EXPERIMENTAL_NOTE\n\n$(cat releasenotes.md)" > releasenotes.md
+        fi
+        
         # Create the release using the notes file
         gh release create ${{ steps.version.outputs.release_tag }} \
           --target ${{ github.sha }} \
           --title "${{ steps.version.outputs.release_title }}" \
           --notes-file releasenotes.md \
-          --latest \
-          ${{ steps.archive.outputs.ASSET_PATH }}
+          $LATEST_FLAG \
+          $PRERELEASE_FLAG \
+          ${{ steps.archive.outputs.ASSET_PATHS }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

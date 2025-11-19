@@ -32,23 +32,57 @@ class GeminiProvider(ProviderInterface):
         Converts generic safety settings to the Gemini-specific format.
         """
         if not settings:
-            return []
+            # Return full defaults if nothing provided
+            return [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+                {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+            ]
 
+        # Default gemini-format settings for merging
+        default_gemini = {
+            "HARM_CATEGORY_HARASSMENT": "OFF",
+            "HARM_CATEGORY_HATE_SPEECH": "OFF",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "OFF",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "OFF",
+            "HARM_CATEGORY_CIVIC_INTEGRITY": "BLOCK_NONE",
+        }
+
+        # If the caller already provided Gemini-style list, merge defaults without overwriting
+        if isinstance(settings, list):
+            existing = {item.get("category"): item for item in settings if isinstance(item, dict) and item.get("category")}
+            merged = list(settings)
+            for cat, thr in default_gemini.items():
+                if cat not in existing:
+                    merged.append({"category": cat, "threshold": thr})
+            return merged
+
+        # Otherwise assume a generic mapping (dict) and convert
         gemini_settings = []
         category_map = {
             "harassment": "HARM_CATEGORY_HARASSMENT",
             "hate_speech": "HARM_CATEGORY_HATE_SPEECH",
             "sexually_explicit": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
             "dangerous_content": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "civic_integrity": "HARM_CATEGORY_CIVIC_INTEGRITY",
         }
 
         for generic_category, threshold in settings.items():
             if generic_category in category_map:
+                thr = (threshold or "").upper()
                 gemini_settings.append({
                     "category": category_map[generic_category],
-                    "threshold": threshold.upper()
+                    "threshold": thr if thr else default_gemini[category_map[generic_category]]
                 })
-        
+
+        # Add any missing defaults
+        present = {s["category"] for s in gemini_settings}
+        for cat, thr in default_gemini.items():
+            if cat not in present:
+                gemini_settings.append({"category": cat, "threshold": thr})
+
         return gemini_settings
 
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
@@ -60,6 +94,10 @@ class GeminiProvider(ProviderInterface):
         3. Applies a default 'thinking' value for specific models if no other reasoning
            parameters are provided, ensuring they 'think' by default.
         """
+        # Set default temperature to 1 if not provided
+        if "temperature" not in payload:
+            payload["temperature"] = 1
+
         custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
         reasoning_effort = payload.get("reasoning_effort")
 

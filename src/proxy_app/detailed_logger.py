@@ -90,7 +90,7 @@ class DetailedLogger:
 
     def _log_metadata(self, response_data: Dict[str, Any]):
         """Logs a summary of the transaction for quick analysis."""
-        usage = response_data.get("body", {}).get("usage", {})
+        usage = response_data.get("body", {}).get("usage") or {}
         model = response_data.get("body", {}).get("model", "N/A")
         finish_reason = "N/A"
         if "choices" in response_data.get("body", {}) and response_data["body"]["choices"]:

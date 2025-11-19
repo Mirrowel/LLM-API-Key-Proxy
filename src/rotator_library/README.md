@@ -5,16 +5,21 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 ## Key Features
 
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
--   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests to *different* models, maximizing throughput while ensuring thread safety. Requests for the *same model* using the same key are queued, preventing conflicts.
+-   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. By default, it supports concurrent requests to *different* models. With configuration (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`), it can also support multiple concurrent requests to the *same* model using the same key.
 -   **Smart Key Management**: Selects the optimal key for each request using a tiered, model-aware locking strategy to distribute load evenly and maximize availability.
--   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit, preventing indefinite hangs.
+-   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit.
+-   **OAuth & API Key Support**: Built-in support for standard API keys and complex OAuth flows.
+    -   **Gemini CLI**: Full OAuth 2.0 web flow with automatic project discovery and free-tier onboarding.
+    -   **Qwen Code**: Device Code flow support.
+    -   **iFlow**: Authorization Code flow with local callback handling.
+-   **Stateless Deployment Ready**: Can load complex OAuth credentials from environment variables, eliminating the need for physical credential files in containerized environments.
 -   **Intelligent Error Handling**:
-    -   **Escalating Per-Model Cooldowns**: If a key fails, it's placed on a temporary, escalating cooldown for that specific model, allowing it to continue being used for others.
-    -   **Deadline-Aware Retries**: Retries requests on transient server errors with exponential backoff, but only if the wait time fits within the global request budget.
-    -   **Key-Level Lockouts**: If a key fails across multiple models, it's temporarily taken out of rotation entirely.
--   **Robust Streaming Support**: The client includes a wrapper for streaming responses that can reassemble fragmented JSON chunks and intelligently detect and handle errors that occur mid-stream.
--   **Detailed Usage Tracking**: Tracks daily and global usage for each key, including token counts and approximate cost, persisted to a JSON file.
--   **Automatic Daily Resets**: Automatically resets cooldowns and archives stats daily to keep the system running smoothly.
+    -   **Escalating Per-Model Cooldowns**: Failed keys are placed on a temporary, escalating cooldown for specific models.
+    -   **Key-Level Lockouts**: Keys failing across multiple models are temporarily removed from rotation.
+    -   **Stream Recovery**: The client detects mid-stream errors (like quota limits) and gracefully handles them.
+-   **Robust Streaming Support**: Includes a wrapper for streaming responses that reassembles fragmented JSON chunks.
+-   **Detailed Usage Tracking**: Tracks daily and global usage for each key, persisted to a JSON file.
+-   **Automatic Daily Resets**: Automatically resets cooldowns and archives stats daily.
 -   **Provider Agnostic**: Works with any provider supported by `litellm`.
 -   **Extensible**: Easily add support for new providers through a simple plugin-based architecture.
 
@@ -35,7 +40,7 @@ This is the main class for interacting with the library. It is designed to be a 
 ```python
 import os
 from dotenv import load_dotenv
-from rotating_api_key_client import RotatingClient
+from rotator_library import RotatingClient
 
 # Load environment variables from .env file
 load_dotenv()
@@ -51,25 +56,43 @@ for key, value in os.environ.items():
             api_keys[provider] = []
         api_keys[provider].append(value)
 
-if not api_keys:
-    raise ValueError("No provider API keys found in environment variables.")
+# Initialize empty dictionary for OAuth credentials (or load from CredentialManager)
+oauth_credentials = {}
 
 client = RotatingClient(
     api_keys=api_keys,
+    oauth_credentials=oauth_credentials,
     max_retries=2,
     usage_file_path="key_usage.json",
-    global_timeout=30  # Default is 30 seconds
+    configure_logging=True,
+    global_timeout=30,
+    abort_on_callback_error=True,
+    litellm_provider_params={},
+    ignore_models={},
+    whitelist_models={},
+    enable_request_logging=False,
+    max_concurrent_requests_per_key={}
 )
 ```
 
--   `api_keys`: A dictionary where keys are provider names (e.g., `"openai"`, `"gemini"`) and values are lists of API keys for that provider.
--   `max_retries`: The number of times to retry a request with the *same key* if a transient server error occurs.
--   `usage_file_path`: The path to the JSON file where key usage data will be stored.
--   `global_timeout`: A hard time limit (in seconds) for the entire request lifecycle. If the total time exceeds this, the request will fail.
+#### Arguments
+
+-   `api_keys` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "openai", "anthropic") to a list of API keys.
+-   `oauth_credentials` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "gemini_cli", "qwen_code") to a list of file paths to OAuth credential JSON files.
+-   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error (e.g., 500, 503) occurs.
+-   `usage_file_path` (`str`, default: `"key_usage.json"`): The path to the JSON file where usage statistics (tokens, cost, success counts) are persisted.
+-   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger. Set to `False` if you want to handle logging configuration manually.
+-   `global_timeout` (`int`, default: `30`): A hard time limit (in seconds) for the entire request lifecycle. If the request (including all retries) takes longer than this, it is aborted.
+-   `abort_on_callback_error` (`bool`, default: `True`): If `True`, any exception raised by `pre_request_callback` will abort the request. If `False`, the error is logged and the request proceeds.
+-   `litellm_provider_params` (`Optional[Dict[str, Any]]`, default: `None`): A dictionary of extra parameters to pass to `litellm` for specific providers.
+-   `ignore_models` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary where keys are provider names and values are lists of model names/patterns to exclude (blacklist). Supports wildcards (e.g., `"*-preview"`).
+-   `whitelist_models` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary where keys are provider names and values are lists of model names/patterns to always include, overriding `ignore_models`.
+-   `enable_request_logging` (`bool`, default: `False`): If `True`, enables detailed per-request file logging (useful for debugging complex interactions).
+-   `max_concurrent_requests_per_key` (`Optional[Dict[str, int]]`, default: `None`): A dictionary defining the maximum number of concurrent requests allowed for a single API key for a specific provider. Defaults to 1 if not specified.
 
 ### Concurrency and Resource Management
 
-The `RotatingClient` is asynchronous and manages an `httpx.AsyncClient` internally. It's crucial to close the client properly to release resources. The recommended way is to use an `async with` block, which handles setup and teardown automatically.
+The `RotatingClient` is asynchronous and manages an `httpx.AsyncClient` internally. It's crucial to close the client properly to release resources. The recommended way is to use an `async with` block.
 
 ```python
 import asyncio
@@ -123,20 +146,62 @@ Calculates the token count for a given text or list of messages using `litellm.t
 
 #### `async def get_available_models(self, provider: str) -> List[str]:`
 
-Fetches a list of available models for a specific provider. Results are cached in memory.
+Fetches a list of available models for a specific provider, applying any configured whitelists or blacklists. Results are cached in memory.
 
 #### `async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:`
 
 Fetches a dictionary of all available models, grouped by provider, or as a single flat list if `grouped=False`.
 
+## Credential Tool
+
+The library includes a utility to manage credentials easily:
+
+```bash
+python -m src.rotator_library.credential_tool
+```
+
+Use this tool to:
+1.  **Initialize OAuth**: Run the interactive login flows for Gemini, Qwen, and iFlow.
+2.  **Export Credentials**: Generate `.env` compatible configuration blocks from your saved OAuth JSON files. This is essential for setting up stateless deployments.
+
+## Provider Specifics
+
+### Qwen Code
+-   **Auth**: Uses OAuth 2.0 Device Flow. Requires manual entry of email/identifier if not returned by the provider.
+-   **Resilience**: Injects a dummy tool (`do_not_call_me`) into requests with no tools to prevent known stream corruption issues on the API.
+-   **Reasoning**: Parses `<think>` tags in the response and exposes them as `reasoning_content`.
+-   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from all tool schemas. Qwen's API has stricter validation than OpenAI's, and these properties cause `400 Bad Request` errors.
+
+### iFlow
+-   **Auth**: Uses Authorization Code Flow with a local callback server (port 11451).
+-   **Key Separation**: Distinguishes between the OAuth `access_token` (used to fetch user info) and the `api_key` (used for actual chat requests).
+-   **Resilience**: Similar to Qwen, injects a placeholder tool to stabilize streaming for empty tool lists.
+-   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from all tool schemas to prevent API validation errors.
+-   **Custom Models**: Supports model definitions via `IFLOW_MODELS` environment variable (JSON array of model IDs or objects).
+
+### NVIDIA NIM
+-   **Discovery**: Dynamically fetches available models from the NVIDIA API.
+-   **Thinking**: Automatically injects the `thinking` parameter into `extra_body` for DeepSeek models (`deepseek-v3.1`, etc.) when `reasoning_effort` is set to low/medium/high.
+
+### Google Gemini (CLI)
+-   **Auth**: Simulates the Google Cloud CLI authentication flow.
+-   **Project Discovery**: Automatically discovers the default Google Cloud Project ID.
+-   **Rate Limits**: Implements smart fallback strategies (e.g., switching from `gemini-1.5-pro` to `gemini-1.5-pro-002`) when rate limits are hit.
+
 ## Error Handling and Cooldowns
 
 The client uses a sophisticated error handling mechanism:
 
--   **Error Classification**: All exceptions from `litellm` are passed through a `classify_error` function to determine their type (`rate_limit`, `authentication`, `server_error`, etc.).
+-   **Error Classification**: All exceptions from `litellm` are passed through a `classify_error` function to determine their type (`rate_limit`, `authentication`, `server_error`, `quota`, `context_length`, etc.).
 -   **Server Errors**: The client will retry the request with the *same key* up to `max_retries` times, using an exponential backoff strategy.
 -   **Key-Specific Errors (Authentication, Quota, etc.)**: The client records the failure in the `UsageManager`, which applies an escalating cooldown to the key for that specific model. The client then immediately acquires a new key and continues its attempt to complete the request.
--   **Key-Level Lockouts**: If a key fails on multiple different models, the `UsageManager` can apply a key-level lockout, taking it out of rotation entirely for a short period.
+-   **Escalating Cooldown Strategy**: Consecutive failures for a key on the same model result in increasing cooldown períods:
+    - 1st failure: 10 seconds
+    - 2nd failure: 30 seconds
+    - 3rd failure: 60 seconds
+    - 4th+ failure: 120 seconds
+-   **Key-Level Lockouts**: If a key fails on multiple different models (3+ distinct models), the `UsageManager` applies a global 5-minute lockout for that key, removing it from rotation entirely.
+-   **Authentication Errors**: Immediate 5-minute global lockout (key is assumed revoked or invalid).
 
 ### Global Timeout and Deadline-Driven Logic
 
@@ -144,7 +209,7 @@ To ensure predictable performance, the client now operates on a strict time budg
 
 -   **Deadline Enforcement**: When a request starts, a `deadline` is set. The entire process, including all key rotations and retries, must complete before this deadline.
 -   **Deadline-Aware Retries**: If a retry requires a wait time that would exceed the remaining budget, the wait is skipped, and the client immediately rotates to the next key.
--   **Silent Internal Errors**: Intermittent failures like provider capacity limits or temporary server errors are logged internally but are **not raised** to the caller. The client will simply rotate to the next key. A non-streaming request will only return `None` (or a streaming request will end) if the global timeout is exceeded or all keys have been exhausted. This creates a more stable experience for the end-user, as they are shielded from transient backend issues.
+-   **Silent Internal Errors**: Intermittent failures like provider capacity limits or temporary server errors are logged internally but are **not raised** to the caller. The client will simply rotate to the next key.
 
 ## Extending with Provider Plugins
 
@@ -160,13 +225,9 @@ from typing import List
 import httpx
 
 class MyProvider(ProviderInterface):
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+    async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         # Logic to fetch and return a list of model names
-        # The model names should be prefixed with the provider name.
-        # e.g., ["my-provider/model-1", "my-provider/model-2"]
-        # Example:
-        # response = await client.get("https://api.myprovider.com/models", headers={"Auth": api_key})
-        # return [f"my-provider/{model['id']}" for model in response.json()]
+        # The credential argument allows using the key to fetch models
         pass
 ```
 
@@ -175,3 +236,4 @@ The system will automatically discover and register your new provider.
 ## Detailed Documentation
 
 For a more in-depth technical explanation of the library's architecture, including the `UsageManager`'s concurrency model and the error classification system, please refer to the [Technical Documentation](../../DOCUMENTATION.md).
+

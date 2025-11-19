@@ -69,7 +69,18 @@ OPENROUTER_API_KEY_1="your-openrouter-key"
 
     - Supported providers: Check LiteLLM docs for a full list and specifics (e.g., GEMINI, OPENROUTER, NVIDIA_NIM).
     - Tip: Start with 1-2 providers to test. Don't share this file publicly!
+
+### Advanced: Stateless Deployment for OAuth Providers (Gemini CLI, Qwen, iFlow)
+If you are using providers that require complex OAuth files (like **Gemini CLI**, **Qwen Code**, or **iFlow**), you don't need to upload the JSON files manually. The proxy includes a tool to "export" these credentials into environment variables.
+
+1.  Run the credential tool locally: `python -m rotator_library.credential_tool`
+2.  Select the "Export ... to .env" option for your provider.
+3.  The tool will generate a file (e.g., `gemini_cli_user_at_gmail.env`) containing variables like `GEMINI_CLI_ACCESS_TOKEN`, `GEMINI_CLI_REFRESH_TOKEN`, etc.
+4.  Copy the contents of this file and paste them directly into your `.env` file or Render's "Environment Variables" section.
+5.  The proxy will automatically detect and use these variables—no file upload required!
+
 4. Save the file. (We'll upload it to Render in Step 5.)
+
 
 ## Step 4: Create a New Web Service on Render
 

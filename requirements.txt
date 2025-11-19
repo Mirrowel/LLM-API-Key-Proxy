@@ -14,5 +14,8 @@ litellm
 filelock
 httpx
 aiofiles
+aiohttp
 
 colorlog
+
+rich
