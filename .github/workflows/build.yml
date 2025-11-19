@@ -360,16 +360,19 @@ jobs:
         fi
 
         # Generate file descriptions
-        FILE_TABLE="| File | Description |\n|------|-------------|\n"
-        FILE_TABLE="$FILE_TABLE| \`proxy_app.exe\` | Main application executable for **Windows**. |\n"
-        FILE_TABLE="$FILE_TABLE| \`proxy_app\` | Main application executable for **Linux** and **macOS**. |\n"
-        FILE_TABLE="$FILE_TABLE| \`launcher.bat\` | A batch script to easily configure and run the proxy on Windows. |"
+        FILE_TABLE="| File | Description |
+        |------|-------------|
+        | \`proxy_app.exe\` | Main application executable for **Windows**. |
+        | \`proxy_app\` | Main application executable for **Linux** and **macOS**. |
+        | \`launcher.bat\` | A batch script to easily configure and run the proxy on Windows. |"
 
         # List archives
         WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
         LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Linux')
         MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macOS')
-        ARCHIVE_LIST="- **Windows**: \`$WINDOWS_ARCHIVE\`\n- **Linux**: \`$LINUX_ARCHIVE\`\n- **macOS**: \`$MACOS_ARCHIVE\`"
+        ARCHIVE_LIST="- **Windows**: \`$WINDOWS_ARCHIVE\`
+        - **Linux**: \`$LINUX_ARCHIVE\`
+        - **macOS**: \`$MACOS_ARCHIVE\`"
 
         cat > releasenotes.md <<-EOF
         ## Build Information
@@ -432,7 +435,10 @@ jobs:
 
         # Prepend the experimental note if it exists
         if [ -n "$EXPERIMENTAL_NOTE" ]; then
-          echo -e "$EXPERIMENTAL_NOTE\n\n$(cat releasenotes.md)" > releasenotes.md
+          echo "$EXPERIMENTAL_NOTE" > releasenotes_temp.md
+          echo "" >> releasenotes_temp.md
+          cat releasenotes.md >> releasenotes_temp.md
+          mv releasenotes_temp.md releasenotes.md
         fi
         
         # Create the release using the notes file
