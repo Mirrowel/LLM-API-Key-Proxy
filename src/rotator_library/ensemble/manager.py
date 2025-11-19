@@ -562,63 +562,103 @@ class EnsembleManager:
         original_messages: List[Dict[str, str]]
     ) -> List[Dict[str, str]]:
         """
-        Build complete messages array for arbiter.
+        Build the complete prompt for the arbiter model.
         
-        Loads strategy template and constructs system prompt + user message.
-        Recursive mode and role context will be added in later phases.
+        Loads the strategy template and constructs the message array.
+        Phase 6: Adds recursive mode instructions for autonomous decision-making.
         
         Args:
-            formatted_responses: Formatted drone responses
+            formatted_responses: Formatted drone/specialist responses
             config: Swarm or fusion configuration
             original_messages: Original user messages
         
         Returns:
-            Complete messages array for arbiter call
+            Complete messages array for arbiter
         """
-        # Get arbiter config
+        lib_logger.debug("[HiveMind] Building arbiter prompt")
+        
+        # Get strategy template
         arbiter_config = config.get("arbiter", {})
         strategy_name = arbiter_config.get("strategy", "synthesis")
         
-        lib_logger.debug(f"[HiveMind] Building arbiter prompt with strategy '{strategy_name}'")
-        
-        # Load strategy template
         strategy_template = self.config_loader.get_strategy(strategy_name)
+        
         if not strategy_template:
             lib_logger.warning(
                 f"[HiveMind] Strategy '{strategy_name}' not found, using default"
             )
-            strategy_template = "Analyze the following responses and create a single, superior answer:\n\n{responses}"
+            strategy_template = "Synthesize the following responses into a single, high-quality answer:\n{responses}"
         
         # Replace {responses} placeholder
         strategy_prompt = strategy_template.replace("{responses}", formatted_responses)
         
+        # Phase 6: Add recursive mode instructions if enabled
+        recursive_config = config.get("recursive_mode", {})
+        if recursive_config.get("enabled", False):
+            consensus_threshold = recursive_config.get("consensus_threshold", 7)
+            
+            recursive_instructions = f"""
+
+AUTONOMOUS DECISION PROTOCOL:
+You have autonomous decision-making authority. Follow this protocol:
+
+1. ASSESSMENT PHASE:
+   - Analyze the provided responses
+   - Rate consensus level (1-10 scale)
+   - Output: [CONSENSUS: X/10]
+
+2. DECISION PHASE:
+   If consensus >= {consensus_threshold}/10:
+     - Proceed directly to synthesis
+   
+   If consensus < {consensus_threshold}/10:
+     - Identify specific conflict points
+     - Output: [CONFLICTS: <brief list>]
+     - For each response, reason internally about how it addresses the conflicts
+     - Output: [CRITIQUE: <your internal reasoning>]
+
+3. SYNTHESIS PHASE:
+   - Create final answer incorporating all insights
+   - Output: [FINAL SYNTHESIS:]
+   - Provide your complete response after this marker
+
+IMPORTANT: Wrap all internal reasoning (CONSENSUS, CONFLICTS, CRITIQUE) in [INTERNAL] tags.
+Only the content after [FINAL SYNTHESIS:] will be shown to the user.
+
+Example format:
+[INTERNAL]
+[CONSENSUS: 5/10]
+[CONFLICTS: Response 1 suggests X, Response 2 suggests Y]
+[CRITIQUE: Analyzing the conflict...]
+[/INTERNAL]
+[FINAL SYNTHESIS:]
+<your complete answer to the user>
+"""
+            strategy_prompt += recursive_instructions
+            lib_logger.info(
+                f"[HiveMind] Recursive mode enabled (consensus threshold: {consensus_threshold}/10)"
+            )
+        
         # Build messages array
-        messages = []
+        messages = [
+            {
+                "role": "system",
+                "content": strategy_prompt
+            }
+        ]
         
-        # System message with strategy
-        messages.append({
-            "role": "system",
-            "content": strategy_prompt
-        })
+        # Add original user query
+        if original_messages:
+            # Find the last user message
+            for msg in reversed(original_messages):
+                if msg.get("role") == "user":
+                    messages.append({
+                        "role": "user",
+                        "content": msg.get("content", "")
+                    })
+                    break
         
-        # Include original user query
-        # Find the last user message from original
-        user_content = ""
-        for msg in reversed(original_messages):
-            if msg.get("role") == "user":
-                user_content = msg.get("content", "")
-                break
-        
-        if user_content:
-            messages.append({
-                "role": "user",
-                "content": f"Original query: {user_content}"
-            })
-        
-        lib_logger.debug(
-            f"[HiveMind] Arbiter prompt constructed: {len(messages)} messages, "
-            f"{len(strategy_prompt)} chars in system prompt"
-        )
+        lib_logger.debug(f"[HiveMind] Arbiter prompt built: {len(messages)} messages")
         
         return messages
     
@@ -701,7 +741,7 @@ class EnsembleManager:
         Call the arbiter model with streaming enabled.
         
         Yields arbiter response chunks while tracking usage.
-        Usage aggregation happens at the end of the stream.
+        Phase 6: Filters [INTERNAL] markers for recursive mode.
         
         Args:
             messages: Constructed arbiter messages
@@ -709,7 +749,7 @@ class EnsembleManager:
             request: Original request object
         
         Yields:
-            Response chunks from arbiter (for Phase 3)
+            Response chunks from arbiter
             Final yield includes usage metadata
         """
         # Get arbiter model
@@ -737,6 +777,11 @@ class EnsembleManager:
             'total_tokens': 0
         }
         
+        # Phase 6: Track recursive mode state
+        recursive_enabled = config.get("recursive_mode", {}).get("enabled", False)
+        in_internal_block = False
+        internal_buffer = []
+        
         # Stream chunks and collect usage
         async for chunk in stream_generator:
             # Check if this chunk has usage info (typically the last chunk)
@@ -751,7 +796,43 @@ class EnsembleManager:
                     if hasattr(usage, field):
                         arbiter_usage[field] = getattr(usage, field, 0)
             
-            # Yield the chunk to caller
+            # Phase 6: Filter [INTERNAL] markers if recursive mode
+            if recursive_enabled and hasattr(chunk, 'choices') and chunk.choices:
+                delta = chunk.choices[0].delta if hasattr(chunk.choices[0], 'delta') else None
+                if delta and hasattr(delta, 'content') and delta.content:
+                    content = delta.content
+                    
+                    # Check for [INTERNAL] start
+                    if '[INTERNAL]' in content:
+                        in_internal_block = True
+                        # Split and yield only content before [INTERNAL]
+                        before_internal = content.split('[INTERNAL]')[0]
+                        if before_internal:
+                            chunk.choices[0].delta.content = before_internal
+                            yield chunk
+                        continue
+                    
+                    # Check for [/INTERNAL] end
+                    if '[/INTERNAL]' in content:
+                        in_internal_block = False
+                        # Process internal buffer for logging
+                        full_internal = ''.join(internal_buffer)
+                        self._log_recursive_markers(full_internal, config)
+                        internal_buffer = []
+                        
+                        # Yield any content after [/INTERNAL]
+                        after_internal = content.split('[/INTERNAL]', 1)[1] if len(content.split('[/INTERNAL]', 1)) > 1 else ''
+                        if after_internal:
+                            chunk.choices[0].delta.content = after_internal
+                            yield chunk
+                        continue
+                    
+                    # If inside internal block, buffer it
+                    if in_internal_block:
+                        internal_buffer.append(content)
+                        continue
+            
+            # Yield the chunk to caller (normal flow or filtered)
             yield chunk
         
         lib_logger.info(
@@ -761,6 +842,46 @@ class EnsembleManager:
         # Return usage as final metadata
         # Caller will handle usage aggregation
         yield {"_hivemind_usage": arbiter_usage}
+    
+    def _log_recursive_markers(self, internal_content: str, config: Dict[str, Any]):
+        """
+        Parse and log recursive mode markers from internal reasoning.
+        
+        Phase 6: Extracts consensus scores, conflicts, and critique reasoning.
+        
+        Args:
+            internal_content: Content between [INTERNAL] tags
+            config: Configuration with recursive threshold
+        """
+        import re
+        
+        # Extract consensus score
+        consensus_match = re.search(r'\[CONSENSUS:\s*(\d+)/10\]', internal_content)
+        if consensus_match:
+            consensus_score = int(consensus_match.group(1))
+            threshold = config.get("recursive_mode", {}).get("consensus_threshold", 7)
+            
+            if consensus_score < threshold:
+                lib_logger.warning(
+                    f"[HiveMind] Recursive mode: Consensus {consensus_score}/10 "
+                    f"(below threshold {threshold}/10) - arbiter performing critique"
+                )
+            else:
+                lib_logger.info(
+                    f"[HiveMind] Recursive mode: Consensus {consensus_score}/10 "
+                    f"(>= threshold {threshold}/10) - proceeding to synthesis"
+                )
+        
+        # Extract conflicts if present
+        conflicts_match = re.search(r'\[CONFLICTS:\s*([^\]]+)\]', internal_content)
+        if conflicts_match:
+            conflicts = conflicts_match.group(1).strip()
+            lib_logger.info(f"[HiveMind] Conflicts identified: {conflicts}")
+        
+        # Log that critique is happening
+        if '[CRITIQUE:' in internal_content:
+            lib_logger.debug("[HiveMind] Arbiter performing internal critique reasoning")
+
     
     async def _handle_swarm_streaming(
         self,
