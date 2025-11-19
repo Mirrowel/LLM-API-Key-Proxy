@@ -1,8 +1,8 @@
-# HiveMind API Reference
+# HiveMind Ensemble API Reference
 
 ## EnsembleManager
 
-Main class for orchestrating HiveMind requests.
+Main class for orchestrating HiveMind Ensemble requests.
 
 ### `__init__(rotating_client, config_dir=None)`
 
@@ -163,7 +163,7 @@ These fields contain the **complete aggregated totals** from all models (drones/
 - `cached_tokens` (int, optional): **Total** cached tokens if supported
 - `reasoning_tokens` (int, optional): **Total** reasoning tokens if supported
 
-**HiveMind-Specific Fields (Supplementary):**
+**HiveMind Ensemble-Specific Fields (Supplementary):**
 
 - `hivemind_details` (dict): **Breakdown information** for observability (does NOT replace standard fields)
 

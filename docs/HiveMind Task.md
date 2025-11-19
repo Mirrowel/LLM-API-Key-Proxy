@@ -1,4 +1,4 @@
-# HiveMind (Swarm/Fusion) Implementation
+# HiveMind Ensemble (Swarm/Fusion) Implementation
 
 ## Phase 1: Core Infrastructure
 - [x] Design and Plan

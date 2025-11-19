@@ -1,8 +1,8 @@
-# HiveMind User Guide
+# HiveMind Ensemble User Guide
 
 ## Overview
 
-**HiveMind** is a powerful ensemble feature that enables parallel model execution with intelligent arbitration. It supports two modes:
+**HiveMind Ensemble** is a powerful feature that enables parallel model execution with intelligent arbitration. It supports two modes:
 
 - **Swarm Mode**: Multiple parallel calls to the **same model** (called "Drones")
 - **Fusion Mode**: Multiple parallel calls to **different models** (called "Specialists")

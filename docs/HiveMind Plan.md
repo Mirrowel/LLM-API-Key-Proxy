@@ -1,8 +1,8 @@
-# HiveMind (Swarm/Fusion) - Implementation Plan (REVISED)
+# HiveMind Ensemble (Swarm/Fusion) - Implementation Plan (REVISED)
 
 ## Goal Description
 
-Implement a sophisticated orchestration engine called "HiveMind" that enables two distinct modes of parallel model execution:
+Implement a sophisticated orchestration engine called "HiveMind Ensemble" that enables two distinct modes of parallel model execution:
 
 1. **Swarm Mode**: Multiple parallel calls to the **same model** (called "Drones") with optional configuration for temperature variation, adversarial critique, and recursive self-correction.
 2. **Fusion Mode**: Multiple parallel calls to **different models** (called "Models" or "Specialists" when roles are assigned) with optional role-based routing and context-aware synthesis.
@@ -13,7 +13,7 @@ Both modes use an "Arbiter" (judge model) to synthesize responses with configura
 
 ## Terminology
 
-- **HiveMind**: The overall feature/system
+- **HiveMind Ensemble**: The overall feature/system (may be shortened to "HiveMind" after first mention)
 - **Swarm**: Parallel execution of the same model
   - **Drone**: Individual instance in a Swarm
 - **Fusion**: Parallel execution of different models  

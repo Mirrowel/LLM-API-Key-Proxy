@@ -1,6 +1,6 @@
-# HiveMind Configuration Guide
+# HiveMind Ensemble Configuration Guide
 
-This directory contains the configuration for HiveMind (Swarm/Fusion) feature.
+This directory contains the configuration for HiveMind Ensemble (Swarm/Fusion) feature.
 
 ## Directory Structure
 
