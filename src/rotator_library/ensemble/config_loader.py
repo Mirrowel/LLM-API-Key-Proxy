@@ -56,8 +56,11 @@ class ConfigLoader:
         # Load role templates
         self._load_roles()
         
+        # Count swarm presets (files in swarms directory)
+        swarm_preset_count = len(list(self.swarms_dir.glob("*.json"))) if self.swarms_dir.exists() else 0
+        
         lib_logger.info(
-            f"[HiveMind] Loaded {len(self.swarm_configs)} swarm configs, "
+            f"[HiveMind] Loaded {swarm_preset_count} swarm presets, "
             f"{len(self.fusion_configs)} fusion configs, "
             f"{len(self.strategies)} strategies, "
             f"{len(self.role_templates)} roles"
