@@ -7,6 +7,7 @@ Loads and validates configurations from the ensemble_configs directory structure
 import os
 import json
 import logging
+import copy
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
@@ -163,8 +164,8 @@ class ConfigLoader:
         Returns:
             Merged configuration dictionary
         """
-        # Start with default
-        config = self.swarm_default.copy() if self.swarm_default else {}
+        # BUGFIX: Use deepcopy to prevent mutations to global default config
+        config = copy.deepcopy(self.swarm_default) if self.swarm_default else {}
         
         # Apply model-specific overrides
         if model in self.swarm_configs:

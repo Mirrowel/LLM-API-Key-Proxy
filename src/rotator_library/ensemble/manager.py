@@ -9,6 +9,7 @@ import logging
 import asyncio
 import random
 import copy
+import re
 from typing import Dict, List, Any, Optional, Set
 
 import litellm
@@ -57,6 +58,9 @@ class EnsembleManager:
         # Cache for provider models (loaded from RotatingClient)
         self._provider_models: Optional[Set[str]] = None
         
+        # Initialize provider models
+        self._load_provider_models()
+        
         lib_logger.info("[HiveMind] EnsembleManager initialized")
     
     def is_ensemble(self, model_id: str) -> bool:
@@ -69,6 +73,15 @@ class EnsembleManager:
         Returns:
             True if this is an ensemble (swarm or fusion), False otherwise
         """
+        # BUGFIX: Check for conflict first (Provider Model Shadowing)
+        # If the model ID exists in provider models, it's NOT an ensemble request
+        # (unless we've already resolved it, but this check is for the raw request)
+        if self._provider_models is None:
+            self._load_provider_models()
+            
+        if model_id in self._provider_models:
+            return False
+
         # Check for fusion ID (exact match)
         if model_id in self.config_loader.fusion_configs:
             return True
@@ -172,14 +185,17 @@ class EnsembleManager:
         This is used for conflict detection.
         """
         try:
-            # Get all available models (this might be async in the actual implementation)
-            # For now, we'll use a synchronous approach
-            # TODO: Handle async model loading properly
             self._provider_models = set()
             
-            # Note: This will be implemented properly when we integrate with RotatingClient
-            # For now, just initialize an empty set
-            lib_logger.debug("[HiveMind] Provider models cache initialized (empty)")
+            # BUGFIX: Populate provider models from RotatingClient.model_definitions
+            if hasattr(self.rotating_client, 'model_definitions'):
+                defs = self.rotating_client.model_definitions.definitions
+                for provider, models in defs.items():
+                    for model_name in models.keys():
+                        self._provider_models.add(model_name)
+                        self._provider_models.add(f"{provider}/{model_name}")
+            
+            lib_logger.debug(f"[HiveMind] Loaded {len(self._provider_models)} provider models for conflict detection")
             
         except Exception as e:
             lib_logger.error(f"[HiveMind] Failed to load provider models: {e}")
@@ -234,14 +250,11 @@ class EnsembleManager:
         
         for i in range(count):
             # Clone the request params
-            drone_params = request_params.copy()
+            # BUGFIX: Use deepcopy to avoid shared mutable state
+            drone_params = copy.deepcopy(request_params)
             
             # Override model with base model (strip [swarm] suffix)
             drone_params["model"] = base_model
-            
-            # Deep copy messages to avoid mutation
-            if "messages" in drone_params:
-                drone_params["messages"] = copy.deepcopy(drone_params["messages"])
             
             # Phase 4: Determine if this drone should be adversarial
             # Last N drones become adversarial
@@ -336,14 +349,11 @@ class EnsembleManager:
                 continue
             
             # Clone request params
-            model_params = request_params.copy()
+            # BUGFIX: Use deepcopy
+            model_params = copy.deepcopy(request_params)
             
             # Set specialist model
             model_params["model"] = specialist_model
-            
-            # Deep copy messages
-            if "messages" in model_params:
-                model_params["messages"] = copy.deepcopy(model_params["messages"])
             
             # Inject role-specific system prompt if provided
             if specialist_prompt and "messages" in model_params:
@@ -796,32 +806,61 @@ Example format:
                     if hasattr(usage, field):
                         arbiter_usage[field] = getattr(usage, field, 0)
             
-            # Phase 6: Filter [INTERNAL] markers if recursive mode
+            # BUGFIX: Robust handling of [INTERNAL] markers to prevent data loss
             if recursive_enabled and hasattr(chunk, 'choices') and chunk.choices:
                 delta = chunk.choices[0].delta if hasattr(chunk.choices[0], 'delta') else None
                 if delta and hasattr(delta, 'content') and delta.content:
                     content = delta.content
                     
-                    # Check for [INTERNAL] start
+                    # Handle [INTERNAL] start
                     if '[INTERNAL]' in content:
-                        in_internal_block = True
-                        # Split and yield only content before [INTERNAL]
-                        before_internal = content.split('[INTERNAL]')[0]
+                        parts = content.split('[INTERNAL]')
+                        before_internal = parts[0]
+                        
+                        # Yield content before marker
                         if before_internal:
                             chunk.choices[0].delta.content = before_internal
                             yield chunk
-                        continue
+                        
+                        in_internal_block = True
+                        
+                        # Handle content after marker (start of internal)
+                        if len(parts) > 1:
+                            remaining = parts[1]
+                            # Check if it also ends in this chunk
+                            if '[/INTERNAL]' in remaining:
+                                internal_parts = remaining.split('[/INTERNAL]')
+                                internal_buffer.append(internal_parts[0])
+                                
+                                # Process buffer
+                                full_internal = ''.join(internal_buffer)
+                                self._log_recursive_markers(full_internal, config)
+                                internal_buffer = []
+                                in_internal_block = False
+                                
+                                # Yield content after [/INTERNAL]
+                                after_internal = internal_parts[1]
+                                if after_internal:
+                                    chunk.choices[0].delta.content = after_internal
+                                    yield chunk
+                            else:
+                                internal_buffer.append(remaining)
+                        
+                        continue # Done with this chunk
                     
-                    # Check for [/INTERNAL] end
-                    if '[/INTERNAL]' in content:
-                        in_internal_block = False
-                        # Process internal buffer for logging
+                    # Handle [/INTERNAL] end (if we are in block)
+                    if in_internal_block and '[/INTERNAL]' in content:
+                        parts = content.split('[/INTERNAL]')
+                        internal_buffer.append(parts[0])
+                        
+                        # Process buffer
                         full_internal = ''.join(internal_buffer)
                         self._log_recursive_markers(full_internal, config)
                         internal_buffer = []
+                        in_internal_block = False
                         
-                        # Yield any content after [/INTERNAL]
-                        after_internal = content.split('[/INTERNAL]', 1)[1] if len(content.split('[/INTERNAL]', 1)) > 1 else ''
+                        # Yield content after marker
+                        after_internal = parts[1]
                         if after_internal:
                             chunk.choices[0].delta.content = after_internal
                             yield chunk
@@ -853,7 +892,6 @@ Example format:
             internal_content: Content between [INTERNAL] tags
             config: Configuration with recursive threshold
         """
-        import re
         
         # Extract consensus score
         consensus_match = re.search(r'\[CONSENSUS:\s*(\d+)/10\]', internal_content)
@@ -924,7 +962,8 @@ Example format:
             arbiter_model = base_model
             lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
         
-        config_copy = config.copy()
+        # BUGFIX: Use deepcopy for config
+        config_copy = copy.deepcopy(config)
         config_copy["arbiter"] = arbiter_config.copy()
         config_copy["arbiter"]["model"] = arbiter_model
         
@@ -1020,7 +1059,8 @@ Example format:
         lib_logger.debug(f"[HiveMind] Using arbiter model: {arbiter_model}")
         
         # Update config
-        config_copy = config.copy()
+        # BUGFIX: Use deepcopy
+        config_copy = copy.deepcopy(config)
         config_copy["arbiter"] = arbiter_config.copy()
         config_copy["arbiter"]["model"] = arbiter_model
         
@@ -1126,7 +1166,8 @@ Example format:
             arbiter_config = config.get("arbiter", {})
             arbiter_model = arbiter_config.get("model", "gpt-4o")
             
-            config_copy = config.copy()
+            # BUGFIX: Use deepcopy
+            config_copy = copy.deepcopy(config)
             config_copy["arbiter"] = arbiter_config.copy()
             config_copy["arbiter"]["model"] = arbiter_model
             
@@ -1211,7 +1252,8 @@ Example format:
                     lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
                 
                 # Update config with resolved arbiter model
-                config_copy = config.copy()
+                # BUGFIX: Use deepcopy
+                config_copy = copy.deepcopy(config)
                 config_copy["arbiter"] = arbiter_config.copy()
                 config_copy["arbiter"]["model"] = arbiter_model
                 
@@ -1255,4 +1297,3 @@ Example format:
         
         else:
             raise ValueError(f"Unknown ensemble type for model: {model_id}")
-
