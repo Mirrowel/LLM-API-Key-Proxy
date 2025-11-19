@@ -6,19 +6,22 @@
       "model": "gpt-4o",
       "role": "Architect",
       "system_prompt": "You are a Software Architect. Focus on architectural patterns, scalability, and system design.",
-      "weight": 1.5
+      "weight": 1.5,
+      "weight_description": "Expert in system design and scalability. Trust for architectural decisions and structural integrity."
     },
     {
       "model": "claude-3-opus",
       "role": "Security Specialist",
       "system_prompt": "You are a Security Expert. Focus on security vulnerabilities, edge cases, and potential exploits.",
-      "weight": 1.2
+      "weight": 1.2,
+      "weight_description": "Expert in security and vulnerability assessment. Trust for identifying security flaws and attack vectors."
     },
     {
       "model": "gemini-1.5-pro",
       "role": "Code Reviewer",
       "system_prompt": "You are a Code Quality Expert. Focus on code quality, performance, and best practices.",
-      "weight": 1.0
+      "weight": 1.0,
+      "weight_description": "Expert in code quality and performance optimization. Trust for maintainability and efficiency concerns."
     }
   ],
   "arbiter": {

@@ -329,7 +329,7 @@ class EnsembleManager:
             request_params: Original request parameters
         
         Returns:
-            List of specialist model configurations
+            List of specialist model configurations with metadata
         """
         specialists = config.get("specialists", [])
         models = []
@@ -342,6 +342,8 @@ class EnsembleManager:
             specialist_role = specialist.get("role", f"Specialist {specialist_num}")
             specialist_prompt = specialist.get("system_prompt", "")
             specialist_weight = specialist.get("weight", 1.0)
+            # MISSING FEATURE FIX: Extract weight description for arbiter context
+            specialist_weight_desc = specialist.get("weight_description", "")
             
             if not specialist_model:
                 lib_logger.warning(
@@ -368,6 +370,7 @@ class EnsembleManager:
             model_params["_specialist_index"] = specialist_num
             model_params["_specialist_role"] = specialist_role
             model_params["_specialist_weight"] = specialist_weight
+            model_params["_specialist_weight_description"] = specialist_weight_desc
             model_params["_total_specialists"] = len(specialists)
             
             models.append(model_params)
@@ -574,18 +577,21 @@ class EnsembleManager:
         self,
         formatted_responses: str,
         config: Dict[str, Any],
-        original_messages: List[Dict[str, str]]
+        original_messages: List[Dict[str, str]],
+        specialist_metadata: Optional[List[Dict[str, Any]]] = None
     ) -> List[Dict[str, str]]:
         """
         Build the complete prompt for the arbiter model.
         
         Loads the strategy template and constructs the message array.
         Phase 6: Adds recursive mode instructions for autonomous decision-making.
+        MISSING FEATURE FIX: Adds specialist expertise context with weights for fusion mode.
         
         Args:
             formatted_responses: Formatted drone/specialist responses
             config: Swarm or fusion configuration
             original_messages: Original user messages
+            specialist_metadata: Optional metadata about specialists (for fusion mode)
         
         Returns:
             Complete messages array for arbiter
@@ -606,6 +612,26 @@ class EnsembleManager:
         
         # Replace {responses} placeholder
         strategy_prompt = strategy_template.replace("{responses}", formatted_responses)
+        
+        # MISSING FEATURE FIX: Add specialist expertise context for fusion mode
+        if specialist_metadata:
+            expertise_lines = ["\n\nSPECIALIST EXPERTISE:"]
+            expertise_lines.append("You are synthesizing responses from specialists with the following expertise:\n")
+            
+            for spec in specialist_metadata:
+                role = spec.get('role', 'Unknown')
+                model = spec.get('model', 'Unknown')
+                weight_desc = spec.get('weight_description', '')
+                
+                if weight_desc:
+                    expertise_lines.append(f"- {role} ({model}): {weight_desc}")
+                else:
+                    expertise_lines.append(f"- {role} ({model}): Subject matter expert")
+            
+            expertise_lines.append("\nConsider each specialist's domain expertise when synthesizing your response.")
+            strategy_prompt += "\n".join(expertise_lines)
+            
+            lib_logger.debug(f"[HiveMind] Added specialist expertise context for {len(specialist_metadata)} specialists")
         
         # Phase 6: Add recursive mode instructions if enabled
         recursive_config = config.get("recursive_mode", {})
