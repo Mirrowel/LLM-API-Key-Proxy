@@ -7,6 +7,11 @@ on:
         description: 'Optional: Manually set the previous tag to generate the changelog from.'
         required: false
         default: ''
+      dry_run:
+        description: 'Dry run mode for pruning (preview without deleting)'
+        required: false
+        type: boolean
+        default: false
   push:
     paths:
       - 'src/proxy_app/**'
@@ -451,3 +456,187 @@ jobs:
           ${{ steps.archive.outputs.ASSET_PATHS }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Prune Old Releases
+      if: always() # Run even if release creation failed (optional, but safer to run only on success usually. Let's stick to default behavior which is success)
+      # Actually, if release creation failed, we probably don't want to prune.
+      # But wait, the user might want to prune even if the new release fails? No, usually we prune to make space for the new one or clean up after.
+      # Let's stick to running only on success of previous steps.
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PRUNE_ENABLED: false
+        PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
+        RETENTION_DAYS_FULL: 1
+        RETENTION_KEEP_ONE_DAILY_OLDER: true
+        RETENTION_MAX_COUNT: 10
+        DRY_RUN: ${{ github.event.inputs.dry_run }}
+        CURRENT_TAG: ${{ steps.version.outputs.release_tag }}
+      run: |
+        # 1. Check if enabled
+        if [ "$PRUNE_ENABLED" != "true" ]; then
+          echo "ℹ️ Pruning is disabled."
+          exit 0
+        fi
+
+        CURRENT_BRANCH="${{ github.ref_name }}"
+        
+        # 2. Check Protected Branches
+        IFS=',' read -ra PROTECTED <<< "$PROTECTED_BRANCHES"
+        for branch in "${PROTECTED[@]}"; do
+          # Trim whitespace
+          branch=$(echo "$branch" | xargs)
+          if [ "$CURRENT_BRANCH" == "$branch" ]; then
+            echo "🛡️ Branch '$CURRENT_BRANCH' is protected. Skipping pruning."
+            exit 0
+          fi
+        done
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✂️ Smart Release Pruning"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Configuration:"
+        echo "  • Retention Window: $RETENTION_DAYS_FULL days (Full retention)"
+        echo "  • Keep Daily Snapshot: $RETENTION_KEEP_ONE_DAILY_OLDER"
+        echo "  • Max Total Releases: $RETENTION_MAX_COUNT"
+        echo "  • Dry Run: $DRY_RUN"
+        echo ""
+
+        # Calculate Cutoff Date (YYYY-MM-DD)
+        # We want to keep releases from Today, Yesterday, ... up to RETENTION_DAYS_FULL days ago.
+        # So if RETENTION_DAYS_FULL is 2, we keep Today (0), 1 day ago, 2 days ago.
+        # Anything strictly OLDER than (Current - 2 days) is candidate for pruning.
+        CUTOFF_DATE=$(date -d "$RETENTION_DAYS_FULL days ago" +%Y-%m-%d)
+        echo "📅 Cutoff Date: $CUTOFF_DATE (Releases older than this are subject to daily thinning)"
+        echo ""
+
+        # Fetch releases
+        # We need tagName and createdAt.
+        # Filter by branch prefix to be safe, though we are on the branch.
+        # Note: gh release list lists releases for the repository. We need to filter by tag pattern.
+        # Tag pattern: $BRANCH_NAME/build-*
+        
+        echo "🔍 Fetching releases for branch '$CURRENT_BRANCH'..."
+        
+        # Get JSON data
+        RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName,createdAt,isDraft,isPrerelease)
+        
+        # Process in a loop to handle logic
+        # We will build a list of "TO_DELETE" and "KEPT"
+        
+        # We need to sort releases by date descending (newest first) to handle the "Max Count" logic correctly.
+        # gh release list usually returns newest first, but let's be sure.
+        
+        # We'll use jq to filter and sort, then process line by line
+        # Filter: tagName starts with "$CURRENT_BRANCH/"
+        
+        FILTERED_RELEASES=$(echo "$RELEASES_JSON" | jq -c --arg branch "$CURRENT_BRANCH/" --arg current_tag "$CURRENT_TAG" '
+          map(select(.tagName | startswith($branch))) |
+          map(select(.tagName != $current_tag)) |
+          sort_by(.createdAt) | reverse
+        ')
+        
+        COUNT=$(echo "$FILTERED_RELEASES" | jq 'length')
+        echo "📦 Found $COUNT historical releases (excluding current build)."
+        
+        if [ "$COUNT" -eq 0 ]; then
+          echo "✅ No old releases to prune."
+          exit 0
+        fi
+
+        # Arrays to track status
+        declare -a TO_DELETE
+        declare -a KEPT_RELEASES
+        
+        # Associative array to track "seen days" for daily snapshot logic
+        declare -A SEEN_DAYS
+
+        # Iterate through releases (Newest to Oldest)
+        while read -r release; do
+          TAG=$(echo "$release" | jq -r '.tagName')
+          CREATED_AT=$(echo "$release" | jq -r '.createdAt')
+          # Convert ISO8601 to YYYY-MM-DD
+          RELEASE_DATE=$(date -d "$CREATED_AT" +%Y-%m-%d)
+          
+          # Logic Check
+          KEEP=false
+          REASON=""
+          
+          # Check 1: Is it within the Full Retention Window?
+          # We compare strings: If RELEASE_DATE >= CUTOFF_DATE
+          if [[ "$RELEASE_DATE" > "$CUTOFF_DATE" ]] || [[ "$RELEASE_DATE" == "$CUTOFF_DATE" ]]; then
+            KEEP=true
+            REASON="Within retention window ($RETENTION_DAYS_FULL days)"
+          else
+            # Check 2: Daily Snapshot
+            if [ "$RETENTION_KEEP_ONE_DAILY_OLDER" == "true" ]; then
+              if [ -z "${SEEN_DAYS[$RELEASE_DATE]}" ]; then
+                KEEP=true
+                REASON="Daily snapshot for $RELEASE_DATE"
+                SEEN_DAYS[$RELEASE_DATE]="seen"
+              else
+                KEEP=false
+                REASON="Redundant build for $RELEASE_DATE"
+              fi
+            else
+              KEEP=false
+              REASON="Older than window and snapshots disabled"
+            fi
+          fi
+          
+          if [ "$KEEP" == "true" ]; then
+            KEPT_RELEASES+=("$TAG")
+            echo "  ✅ KEEP: $TAG ($RELEASE_DATE) - $REASON"
+          else
+            TO_DELETE+=("$TAG")
+            echo "  ❌ PRUNE: $TAG ($RELEASE_DATE) - $REASON"
+          fi
+          
+        done < <(echo "$FILTERED_RELEASES" | jq -c '.[]')
+
+        echo ""
+        echo "📊 Phase 1 Result: ${#KEPT_RELEASES[@]} kept, ${#TO_DELETE[@]} marked for pruning."
+        
+        # Phase 2: Max Count Cap
+        # KEPT_RELEASES is sorted Newest -> Oldest
+        if [ "${#KEPT_RELEASES[@]}" -gt "$RETENTION_MAX_COUNT" ]; then
+          echo "⚠️ Total kept releases (${#KEPT_RELEASES[@]}) exceeds limit ($RETENTION_MAX_COUNT). Trimming oldest..."
+          
+          # The first MAX_COUNT are safe. The rest must go.
+          # Bash array slicing: ${array[@]:start:length}
+          
+          # New kept list is just the first N
+          FINAL_KEPT=("${KEPT_RELEASES[@]:0:$RETENTION_MAX_COUNT}")
+          
+          # The overflow are added to delete list
+          OVERFLOW=("${KEPT_RELEASES[@]:$RETENTION_MAX_COUNT}")
+          
+          for tag in "${OVERFLOW[@]}"; do
+            TO_DELETE+=("$tag")
+            echo "  ❌ PRUNE (Overflow): $tag"
+          done
+          
+          KEPT_RELEASES=("${FINAL_KEPT[@]}")
+        fi
+        
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🗑️ Executing Deletions (${#TO_DELETE[@]} items)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        if [ "${#TO_DELETE[@]}" -eq 0 ]; then
+          echo "✅ Nothing to delete."
+          exit 0
+        fi
+        
+        for tag in "${TO_DELETE[@]}"; do
+          if [ "$DRY_RUN" == "true" ]; then
+             echo "  [DRY RUN] Would delete: $tag"
+          else
+             echo "  Deleting: $tag"
+             gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes || echo "    ⚠️ Failed to delete $tag"
+          fi
+        done
+        
+        echo ""
+        echo "✅ Pruning complete."
