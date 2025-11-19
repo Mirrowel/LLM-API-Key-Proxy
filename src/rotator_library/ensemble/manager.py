@@ -241,6 +241,159 @@ class EnsembleManager:
         
         return drones
     
+    async def _execute_parallel(
+        self,
+        drones: List[Dict[str, Any]],
+        request: Any
+    ) -> tuple:
+        """
+        Execute all drone requests in parallel.
+        
+        Uses asyncio.gather to execute all drones concurrently.
+        Aggregates usage statistics from all successful responses.
+        
+        Args:
+            drones: List of drone configurations
+            request: Original request object
+        
+        Returns:
+            Tuple of (successful_responses, aggregated_usage)
+        """
+        import asyncio
+        
+        lib_logger.info(f"[HiveMind] Executing {len(drones)} drones in parallel...")
+        
+        # Create tasks for all drones
+        tasks = []
+        for i, drone_params in enumerate(drones):
+            # Call acompletion directly (will use RotatingClient's retry logic)
+            # Remove metadata fields before calling
+            clean_params = {k: v for k, v in drone_params.items() if not k.startswith('_')}
+            
+            task = self.rotating_client._execute_with_retry(
+                api_call=None,  # We'll use litellm.acompletion directly
+                request=request,
+                **clean_params
+            )
+            tasks.append(task)
+        
+        # Execute all drones in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        successful_responses = []
+        failed_count = 0
+        aggregated_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0
+        }
+        
+        for i, result in enumerate(results):
+            drone_index = i + 1
+            
+            if isinstance(result, Exception):
+                # Drone failed
+                failed_count += 1
+                lib_logger.error(
+                    f"[HiveMind] Drone {drone_index}/{len(drones)} failed: {result}"
+                )
+                continue
+            
+            # Drone succeeded
+            successful_responses.append(result)
+            
+            # Aggregate usage
+            if hasattr(result, 'usage') and result.usage:
+                usage = result.usage
+                aggregated_usage['prompt_tokens'] += getattr(usage, 'prompt_tokens', 0)
+                aggregated_usage['completion_tokens'] += getattr(usage, 'completion_tokens', 0)
+                aggregated_usage['total_tokens'] += getattr(usage, 'total_tokens', 0)
+                
+                # Include other usage fields if present
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if hasattr(usage, field):
+                        if field not in aggregated_usage:
+                            aggregated_usage[field] = 0
+                        aggregated_usage[field] += getattr(usage, field, 0)
+            
+            lib_logger.debug(
+                f"[HiveMind] Drone {drone_index}/{len(drones)} completed successfully"
+            )
+        
+        # Check if we have at least one successful response
+        if not successful_responses:
+            raise RuntimeError(
+                f"[HiveMind] All {len(drones)} drones failed. Cannot proceed with arbitration."
+            )
+        
+        if failed_count > 0:
+            lib_logger.warning(
+                f"[HiveMind] {failed_count}/{len(drones)} drones failed. "
+                f"Proceeding with {len(successful_responses)} successful responses."
+            )
+        
+        lib_logger.info(
+            f"[HiveMind] Parallel execution complete: {len(successful_responses)}/{len(drones)} succeeded. "
+            f"Total tokens: {aggregated_usage['total_tokens']}"
+        )
+        
+        return successful_responses, aggregated_usage
+    
+    def _format_for_arbiter(
+        self,
+        responses: List[Any],
+        config: Dict[str, Any]
+    ) -> str:
+        """
+        Format drone responses for arbiter consumption.
+        
+        Creates a structured text format with numbered responses.
+        Blind switch and adversarial markers will be added in Phase 4.
+        
+        Args:
+            responses: List of successful drone responses
+            config: Swarm or fusion configuration
+        
+        Returns:
+            Formatted text string for arbiter
+        """
+        lib_logger.debug(f"[HiveMind] Formatting {len(responses)} responses for arbiter")
+        
+        formatted_parts = []
+        
+        for i, response in enumerate(responses):
+            response_num = i + 1
+            
+            # Extract content from response
+            content = ""
+            if hasattr(response, 'choices') and response.choices:
+                # Standard OpenAI-style response
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    content = choice.message.content
+                elif hasattr(choice, 'text'):
+                    content = choice.text
+            
+            if not content:
+                lib_logger.warning(
+                    f"[HiveMind] Response {response_num} has no content, skipping"
+                )
+                continue
+            
+            # Format: "Response N:\n<content>\n"
+            formatted_parts.append(f"Response {response_num}:\n{content}\n")
+        
+        # Join all responses
+        formatted_text = "\n".join(formatted_parts)
+        
+        lib_logger.debug(
+            f"[HiveMind] Formatted {len(formatted_parts)} responses "
+            f"({len(formatted_text)} characters total)"
+        )
+        
+        return formatted_text
+    
     async def handle_request(self, request, **kwargs):
         """
         Handle an ensemble request (swarm or fusion).
