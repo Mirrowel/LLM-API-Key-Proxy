@@ -9,6 +9,7 @@ import logging
 import asyncio
 import random
 import copy
+import time
 import re
 from typing import Dict, List, Any, Optional, Set
 
@@ -418,11 +419,7 @@ class EnsembleManager:
         # Process results
         successful_responses = []
         failed_count = 0
-        aggregated_usage = {
-            'prompt_tokens': 0,
-            'completion_tokens': 0,
-            'total_tokens': 0
-        }
+        aggregated_usage = {}
         
         for i, result in enumerate(results):
             drone_index = i + 1
@@ -438,19 +435,27 @@ class EnsembleManager:
             # Drone succeeded
             successful_responses.append(result)
             
-            # Aggregate usage
+            # Aggregate usage - dynamically sum ALL numeric usage fields
             if hasattr(result, 'usage') and result.usage:
                 usage = result.usage
-                aggregated_usage['prompt_tokens'] += getattr(usage, 'prompt_tokens', 0)
-                aggregated_usage['completion_tokens'] += getattr(usage, 'completion_tokens', 0)
-                aggregated_usage['total_tokens'] += getattr(usage, 'total_tokens', 0)
                 
-                # Include other usage fields if present
-                for field in ['cached_tokens', 'reasoning_tokens']:
-                    if hasattr(usage, field):
-                        if field not in aggregated_usage:
-                            aggregated_usage[field] = 0
-                        aggregated_usage[field] += getattr(usage, field, 0)
+                # Iterate through all attributes of the usage object
+                for attr_name in dir(usage):
+                    # Skip private/magic attributes
+                    if attr_name.startswith('_'):
+                        continue
+                    
+                    try:
+                        attr_value = getattr(usage, attr_name)
+                        
+                        # Only aggregate numeric fields (int or float)
+                        if isinstance(attr_value, (int, float)) and not isinstance(attr_value, bool):
+                            if attr_name not in aggregated_usage:
+                                aggregated_usage[attr_name] = 0
+                            aggregated_usage[attr_name] += attr_value
+                    except (AttributeError, TypeError):
+                        # Skip non-accessible or non-numeric attributes
+                        continue
             
             lib_logger.debug(
                 f"[HiveMind] Drone {drone_index}/{len(drones)} completed successfully"
@@ -717,23 +722,27 @@ Example format:
             **arbiter_params
         )
         
-        # Extract usage
-        arbiter_usage = {
-            'prompt_tokens': 0,
-            'completion_tokens': 0,
-            'total_tokens': 0
-        }
+        # Extract usage - dynamically capture ALL numeric usage fields
+        arbiter_usage = {}
         
         if hasattr(arbiter_response, 'usage') and arbiter_response.usage:
             usage = arbiter_response.usage
-            arbiter_usage['prompt_tokens'] = getattr(usage, 'prompt_tokens', 0)
-            arbiter_usage['completion_tokens'] = getattr(usage, 'completion_tokens', 0)
-            arbiter_usage['total_tokens'] = getattr(usage, 'total_tokens', 0)
             
-            # Include other fields
-            for field in ['cached_tokens', 'reasoning_tokens']:
-                if hasattr(usage, field):
-                    arbiter_usage[field] = getattr(usage, field, 0)
+            # Iterate through all attributes of the usage object
+            for attr_name in dir(usage):
+                # Skip private/magic attributes
+                if attr_name.startswith('_'):
+                    continue
+                
+                try:
+                    attr_value = getattr(usage, attr_name)
+                    
+                    # Only capture numeric fields (int or float)
+                    if isinstance(attr_value, (int, float)) and not isinstance(attr_value, bool):
+                        arbiter_usage[attr_name] = attr_value
+                except (AttributeError, TypeError):
+                    # Skip non-accessible or non-numeric attributes
+                    continue
         
         lib_logger.info(
             f"[HiveMind] Arbiter completed. Tokens: {arbiter_usage['total_tokens']}"
@@ -1126,6 +1135,9 @@ Example format:
             specialists = config.get("specialists", [])
             is_streaming = kwargs.get("stream", False)
             
+            # Phase 6: Track execution start time
+            start_time = time.time()
+            
             lib_logger.info(
                 f"[HiveMind] Processing Fusion request: {resolved_id} "
                 f"({len(specialists)} specialists, streaming: {is_streaming})"
@@ -1177,30 +1189,59 @@ Example format:
                 request
             )
             
-            # Aggregate usage
-            total_usage = {
-                'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
-                'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
-                'total_tokens': specialist_usage['total_tokens'] + arbiter_usage['total_tokens']
+            # Aggregate usage - dynamically sum ALL numeric fields from both sources
+            total_usage = {}
+            
+            # Helper function to merge usage dictionaries
+            for usage_dict in [specialist_usage, arbiter_usage]:
+                for field, value in usage_dict.items():
+                    if field not in total_usage:
+                        total_usage[field] = 0
+                    total_usage[field] += value
+            
+            # Phase 6: Calculate latency and cost
+            end_time = time.time()
+            latency_ms = (end_time - start_time) * 1000
+            
+            # Try to calculate cost using litellm
+            total_cost = 0.0
+            try:
+                total_cost = litellm.completion_cost(completion_response=arbiter_response)
+            except Exception as e:
+                lib_logger.debug(f"[HiveMind] Could not calculate cost: {e}")
+            
+            # Add hivemind_details to usage
+            hivemind_details = {
+                "mode": "fusion",
+                "specialist_count": len(specialists),
+                "specialist_tokens": specialist_usage['total_tokens'],
+                "arbiter_tokens": arbiter_usage['total_tokens'],
+                "total_cost_usd": round(total_cost, 6),
+                "latency_ms": round(latency_ms, 2)
             }
             
-            for field in ['cached_tokens', 'reasoning_tokens']:
-                if field in specialist_usage or field in arbiter_usage:
-                    total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
             
             if hasattr(arbiter_response, 'usage'):
-                arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
-                arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
-                arbiter_response.usage.total_tokens = total_usage['total_tokens']
+                # IMPORTANT: Standard usage fields contain the TOTAL aggregated usage
+                # (specialists + arbiter). This ensures consumers can parse usage normally.
                 
-                for field in ['cached_tokens', 'reasoning_tokens']:
-                    if field in total_usage:
-                        setattr(arbiter_response.usage, field, total_usage[field])
+                # Dynamically set ALL usage fields from total_usage
+                for field, value in total_usage.items():
+                    try:
+                        setattr(arbiter_response.usage, field, value)
+                    except (AttributeError, TypeError):
+                        # Skip if field cannot be set
+                        lib_logger.debug(f"[HiveMind] Could not set usage field '{field}'")
+                
+                # Add hivemind_details as SUPPLEMENTARY breakdown information
+                # This does NOT replace standard fields, but provides additional context
+                arbiter_response.usage.hivemind_details = hivemind_details
             
             lib_logger.info(
                 f"[HiveMind] Fusion completed successfully. "
                 f"Total usage: {total_usage['total_tokens']} tokens "
-                f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+                f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']}). "
+                f"Latency: {latency_ms:.2f}ms, Cost: ${total_cost:.6f}"
             )
             
             return arbiter_response
@@ -1210,6 +1251,9 @@ Example format:
             config = self.config_loader.get_swarm_config(base_model)
             count = config.get("count", 3)
             is_streaming = kwargs.get("stream", False)
+            
+            # Phase 6: Track execution start time
+            start_time = time.time()
             
             lib_logger.info(
                 f"[HiveMind] Processing Swarm request: {resolved_id} "
@@ -1264,33 +1308,59 @@ Example format:
                     request
                 )
                 
-                # Step 7: Aggregate total usage
-                total_usage = {
-                    'prompt_tokens': drone_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
-                    'completion_tokens': drone_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
-                    'total_tokens': drone_usage['total_tokens'] + arbiter_usage['total_tokens']
-                }
+                # Step 7: Aggregate total usage - dynamically sum ALL numeric fields from both sources
+                total_usage = {}
                 
-                # Include other fields if present
-                for field in ['cached_tokens', 'reasoning_tokens']:
-                    if field in drone_usage or field in arbiter_usage:
-                        total_usage[field] = drone_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                # Helper function to merge usage dictionaries
+                for usage_dict in [drone_usage, arbiter_usage]:
+                    for field, value in usage_dict.items():
+                        if field not in total_usage:
+                            total_usage[field] = 0
+                        total_usage[field] += value
+                
+                # Phase 6: Calculate latency and cost
+                end_time = time.time()
+                latency_ms = (end_time - start_time) * 1000
+                
+                # Try to calculate cost using litellm
+                total_cost = 0.0
+                try:
+                    total_cost = litellm.completion_cost(completion_response=arbiter_response)
+                except Exception as e:
+                    lib_logger.debug(f"[HiveMind] Could not calculate cost: {e}")
+                
+                # Add hivemind_details to usage
+                hivemind_details = {
+                    "mode": "swarm",
+                    "drone_count": count,
+                    "drone_tokens": drone_usage['total_tokens'],
+                    "arbiter_tokens": arbiter_usage['total_tokens'],
+                    "total_cost_usd": round(total_cost, 6),
+                    "latency_ms": round(latency_ms, 2)
+                }
                 
                 # Step 8: Update arbiter response with aggregated usage
                 if hasattr(arbiter_response, 'usage'):
-                    # Create a new usage object with aggregated values
-                    arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
-                    arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
-                    arbiter_response.usage.total_tokens = total_usage['total_tokens']
+                    # IMPORTANT: Standard usage fields contain the TOTAL aggregated usage
+                    # (drones + arbiter). This ensures consumers can parse usage normally.
                     
-                    for field in ['cached_tokens', 'reasoning_tokens']:
-                        if field in total_usage:
-                            setattr(arbiter_response.usage, field, total_usage[field])
+                    # Dynamically set ALL usage fields from total_usage
+                    for field, value in total_usage.items():
+                        try:
+                            setattr(arbiter_response.usage, field, value)
+                        except (AttributeError, TypeError):
+                            # Skip if field cannot be set
+                            lib_logger.debug(f"[HiveMind] Could not set usage field '{field}'")
+                    
+                    # Add hivemind_details as SUPPLEMENTARY breakdown information
+                    # This does NOT replace standard fields, but provides additional context
+                    arbiter_response.usage.hivemind_details = hivemind_details
                 
                 lib_logger.info(
                     f"[HiveMind] Swarm completed successfully. "
                     f"Total usage: {total_usage['total_tokens']} tokens "
-                    f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+                    f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']}). "
+                    f"Latency: {latency_ms:.2f}ms, Cost: ${total_cost:.6f}"
                 )
                 
                 return arbiter_response
