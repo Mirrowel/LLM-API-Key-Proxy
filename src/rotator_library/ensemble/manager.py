@@ -488,13 +488,14 @@ class EnsembleManager:
         responses: List[Any],
         config: Dict[str, Any],
         specialist_metadata: Optional[List[Dict[str, Any]]] = None
-    ) -> str:
+    ) -> tuple:
         """
         Format drone/specialist responses for arbiter consumption.
         
         Creates a structured text format with numbered responses.
         Phase 4: Implements Blind Switch to strip model names.
         Phase 5: Adds role labels for fusion specialists.
+        MISSING FEATURE FIX: Extracts specialist metadata for arbiter context.
         
         Args:
             responses: List of successful drone/specialist responses
@@ -502,7 +503,8 @@ class EnsembleManager:
             specialist_metadata: Optional list of specialist metadata (for fusion mode)
         
         Returns:
-            Formatted text string for arbiter
+            Tuple of (formatted_text, metadata_for_arbiter)
+            metadata_for_arbiter is None for swarm mode, list of dicts for fusion mode
         """
         lib_logger.debug(f"[HiveMind] Formatting {len(responses)} responses for arbiter")
         
@@ -511,6 +513,7 @@ class EnsembleManager:
         blind_mode = arbiter_config.get("blind", True)  # Default ON
         
         formatted_parts = []
+        arbiter_metadata = []  # MISSING FEATURE FIX: Collect metadata for arbiter
         
         for i, response in enumerate(responses):
             response_num = i + 1
@@ -538,13 +541,21 @@ class EnsembleManager:
             if specialist_metadata and i < len(specialist_metadata):
                 specialist = specialist_metadata[i]
                 role = specialist.get("_specialist_role", "Unknown")
+                model_name = specialist.get("model", "unknown")
+                weight_desc = specialist.get("_specialist_weight_description", "")
+                
+                # MISSING FEATURE FIX: Build metadata for arbiter context
+                arbiter_metadata.append({
+                    "role": role,
+                    "model": model_name,
+                    "weight_description": weight_desc
+                })
                 
                 if blind_mode:
                     # Blind mode: show role but not model
                     label = f"{role}"
                 else:
                     # Non-blind: show role and model
-                    model_name = specialist.get("model", "unknown")
                     label = f"{role} ({model_name})"
                     
                 lib_logger.debug(
@@ -571,7 +582,10 @@ class EnsembleManager:
             f"({len(formatted_text)} characters total, blind_mode={blind_mode})"
         )
         
-        return formatted_text
+        # Return metadata only if fusion mode
+        metadata_for_arbiter = arbiter_metadata if arbiter_metadata else None
+        
+        return formatted_text, metadata_for_arbiter
     
     def _build_arbiter_prompt(
         self,
@@ -1072,19 +1086,20 @@ Example format:
             specialist_models, request
         )
         
-        # Format responses with role labels
-        formatted_responses = self._format_for_arbiter(
+        # Format responses with role labels and extract metadata
+        formatted_responses, specialist_metadata_for_arbiter = self._format_for_arbiter(
             specialist_responses,
             config,
             specialist_metadata=specialist_models
         )
         
-        # Build arbiter prompt
+        # Build arbiter prompt with specialist expertise context
         original_messages = kwargs.get("messages", [])
         arbiter_messages = self._build_arbiter_prompt(
             formatted_responses,
             config,
-            original_messages
+            original_messages,
+            specialist_metadata=specialist_metadata_for_arbiter  # MISSING FEATURE FIX: Pass metadata
         )
         
         # Get arbiter model
@@ -1188,7 +1203,8 @@ Example format:
                 specialist_models, request
             )
             
-            formatted_responses = self._format_for_arbiter(
+            # Format responses and extract metadata for arbiter
+            formatted_responses, specialist_metadata_for_arbiter = self._format_for_arbiter(
                 specialist_responses,
                 config,
                 specialist_metadata=specialist_models
@@ -1198,7 +1214,8 @@ Example format:
             arbiter_messages = self._build_arbiter_prompt(
                 formatted_responses,
                 config,
-                original_messages
+                original_messages,
+                specialist_metadata=specialist_metadata_for_arbiter  # MISSING FEATURE FIX: Pass metadata
             )
             
             arbiter_config = config.get("arbiter", {})
