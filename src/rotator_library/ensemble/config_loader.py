@@ -37,6 +37,9 @@ class ConfigLoader:
         self.strategies: Dict[str, str] = {}
         self.role_templates: Dict[str, Dict[str, Any]] = {}
         
+        # Track model -> preset mapping for omit_id presets
+        self.omit_id_presets: Dict[str, str] = {}  # {"gpt-4o-mini": "aggressive"}
+        
     def load_all(self) -> None:
         """Load all configurations from the directory structure."""
         lib_logger.info("[HiveMind] Loading ensemble configurations...")
@@ -75,6 +78,7 @@ class ConfigLoader:
         """Load swarm configurations from swarms/ directory.
         
         Only supports preset-based format with 'id' and 'base_models'.
+        Also builds omit_id mapping for default preset resolution.
         """
         if not self.swarms_dir.exists():
             lib_logger.warning(f"[HiveMind] Swarms directory not found: {self.swarms_dir}")
@@ -92,6 +96,34 @@ class ConfigLoader:
         else:
             lib_logger.warning("[HiveMind] No default swarm config found")
         
+        # Build omit_id mapping: scan all presets with omit_id=true
+        for config_file in self.swarms_dir.glob("*.json"):
+            # Skip example files
+            if config_file.stem.endswith('.example'):
+                continue
+                
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                
+                preset_id = config.get("id")
+                omit_id = config.get("omit_id", False)
+                base_models = config.get("base_models", [])
+                
+                if preset_id and omit_id and base_models:
+                    # Register this preset as the default for these models
+                    for model in base_models:
+                        if model in self.omit_id_presets:
+                            lib_logger.warning(
+                                f"[HiveMind] Model '{model}' already has omit_id preset '{self.omit_id_presets[model]}'. "
+                                f"Overriding with '{preset_id}'"
+                            )
+                        self.omit_id_presets[model] = preset_id
+                        lib_logger.debug(f"[HiveMind] Registered '{model}[swarm]' -> preset '{preset_id}'")
+            
+            except Exception as e:
+                lib_logger.warning(f"Failed to process swarm config {config_file.name}: {e}")
+        
         # All swarm configs now use preset-based format (id + base_models)
         # Discovery is handled by get_all_swarm_model_ids()
         # Individual preset configs loaded on-demand via get_swarm_config()
@@ -108,6 +140,10 @@ class ConfigLoader:
             return
         
         for config_file in self.fusions_dir.glob("*.json"):
+            # Skip example files
+            if config_file.stem.endswith('.example'):
+                continue
+                
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
@@ -157,6 +193,10 @@ class ConfigLoader:
             return
         
         for strategy_file in self.strategies_dir.glob("*.txt"):
+            # Skip example files
+            if strategy_file.stem.endswith('.example'):
+                continue
+                
             try:
                 with open(strategy_file, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -182,6 +222,10 @@ class ConfigLoader:
             return
         
         for role_file in self.roles_dir.glob("*.json"):
+            # Skip example files
+            if role_file.stem.endswith('.example'):
+                continue
+                
             try:
                 with open(role_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -232,6 +276,28 @@ class ConfigLoader:
         
         self.role_templates[role_id] = role
         lib_logger.debug(f"[HiveMind] Loaded role template '{role_id}' from array")
+    
+    def get_preset_for_model(self, base_model: str) -> str:
+        """
+        Get the preset ID to use for a model when using model[swarm] syntax.
+        
+        Resolution order:
+        1. If model has an omit_id preset, use that
+        2. Otherwise, use "default"
+        
+        Args:
+            base_model: Base model name (e.g., "gpt-4o-mini")
+        
+        Returns:
+            Preset ID to use
+        """
+        if base_model in self.omit_id_presets:
+            preset = self.omit_id_presets[base_model]
+            lib_logger.debug(f"[HiveMind] Model '{base_model}' using omit_id preset '{preset}'")
+            return preset
+        
+        lib_logger.debug(f"[HiveMind] Model '{base_model}' using default preset")
+        return "default"
     
     def get_swarm_config(self, preset_id: str) -> Dict[str, Any]:
         """
@@ -312,21 +378,31 @@ class ConfigLoader:
         """
         Get all discoverable swarm model variants.
         
-        Generates model IDs from all swarm configs that define base_models.
-        Format: {base_model}-{preset_id}[swarm]
+        Only includes presets with base_models defined.
+        Discovery format depends on omit_id:
+        - omit_id=true: Shows as {base_model}[swarm] (short form only)
+        - omit_id=false: Shows as {base_model}-{preset_id}[swarm] (explicit form only)
+        
+        Note: Explicit form always WORKS at runtime regardless of omit_id,
+        but omit_id controls what appears in /v1/models for discoverability.
         
         Returns:
-            List of swarm model IDs
+            List of swarm model IDs for /v1/models endpoint
         """
         swarm_models = []
         
         for config_file in self.swarms_dir.glob("*.json"):
+            # Skip example files
+            if config_file.stem.endswith('.example'):
+                continue
+                
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     
                     preset_id = config.get("id")
                     base_models = config.get("base_models", [])
+                    omit_id = config.get("omit_id", False)
                     
                     if not preset_id:
                         lib_logger.debug(f"Swarm config {config_file.name} missing 'id', skipping")
@@ -336,9 +412,15 @@ class ConfigLoader:
                         lib_logger.debug(f"Swarm config {preset_id} has no base_models, not discoverable")
                         continue
                     
-                    # Generate model IDs: {base_model}-{preset_id}[swarm]
+                    # Generate model IDs based on omit_id setting
                     for base_model in base_models:
-                        model_id = f"{base_model}-{preset_id}[swarm]"
+                        if omit_id:
+                            # Show short form only (to avoid clutter)
+                            model_id = f"{base_model}[swarm]"
+                        else:
+                            # Show explicit form only
+                            model_id = f"{base_model}-{preset_id}[swarm]"
+                        
                         swarm_models.append(model_id)
                         
             except Exception as e:

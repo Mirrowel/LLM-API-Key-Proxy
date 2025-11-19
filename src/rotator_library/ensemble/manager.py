@@ -107,17 +107,19 @@ class EnsembleManager:
         """
         return model_id.endswith("[swarm]")
     
-    def get_base_model(self, swarm_id: str) -> str:
+    def get_base_model(self, swarm_id: str) -> tuple:
         """
-        Extract base model name from swarm ID.
+        Extract base model name and preset ID from swarm ID.
         
-        Supports new format: {base_model}-{preset_id}[swarm]
+        Supports formats:
+        - {base_model}-{preset_id}[swarm] → (base_model, preset_id)
+        - {base_model}[swarm] → (base_model, omit_id preset or "default")
         
         Args:
-            swarm_id: Swarm model ID (e.g., "gpt-4o-default[swarm]")
+            swarm_id: Swarm model ID (e.g., "gpt-4o-default[swarm]" or "gpt-4o[swarm]")
         
         Returns:
-            Base model name (e.g., "gpt-4o")
+            Tuple of (base_model_name, preset_id)
         """
         # Remove [swarm] suffix first
         if swarm_id.endswith("[swarm]"):
@@ -131,14 +133,16 @@ class EnsembleManager:
             potential_preset = parts[1]
             
             # Check if it's a valid preset ID in our configs
-            # For now, just check if the directory has that config file
             config_file = self.config_loader.swarms_dir / f"{potential_preset}.json"
             if config_file.exists():
                 # This is a preset ID, so base_model is everything before it
-                return parts[0]
+                return parts[0], potential_preset
         
-        # If no preset found or no hyphen, treat entire thing as base_model
-        return swarm_id
+        # No explicit preset: use omit_id preset or default
+        base_model = swarm_id
+        preset_id = self.config_loader.get_preset_for_model(base_model)
+        
+        return base_model, preset_id
     
     def resolve_conflicts(self, ensemble_id: str) -> str:
         """
@@ -1312,8 +1316,8 @@ Example format:
             return arbiter_response
         
         elif self._is_swarm_request(resolved_id):
-            base_model = self.get_base_model(resolved_id)
-            config = self.config_loader.get_swarm_config(base_model)
+            base_model, preset_id = self.get_base_model(resolved_id)
+            config = self.config_loader.get_swarm_config(preset_id)
             count = config.get("count", 3)
             is_streaming = kwargs.get("stream", False)
             
@@ -1322,7 +1326,7 @@ Example format:
             
             lib_logger.info(
                 f"[HiveMind] Processing Swarm request: {resolved_id} "
-                f"(base: {base_model}, {count} drones, streaming: {is_streaming})"
+                f"(base: {base_model}, preset: {preset_id}, {count} drones, streaming: {is_streaming})"
             )
             
             # Phase 3B: Route based on streaming mode

@@ -9,6 +9,7 @@
     "gemini-1.5-pro",
     "gemini-1.5-flash"
   ],
+  "omit_id": false,
   "count": 3,
   
   "temperature_jitter": {
