@@ -32,6 +32,7 @@ from .request_sanitizer import sanitize_request_payload
 from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
+from .model_definitions import ModelDefinitions
 
 
 class StreamedAPIError(Exception):
@@ -118,6 +119,7 @@ class RotatingClient:
         self.ignore_models = ignore_models or {}
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
+        self.model_definitions = ModelDefinitions()
 
         # Store and validate max concurrent requests per key
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
@@ -410,6 +412,42 @@ class RotatingClient:
                 return None
         return self._provider_instances[provider_name]
 
+    def _resolve_model_id(self, model: str, provider: str) -> str:
+        """
+        Resolves the actual model ID to send to the provider.
+        
+        For custom models with name/ID mappings, returns the ID.
+        Otherwise, returns the model name unchanged.
+        
+        Args:
+            model: Full model string with provider (e.g., "iflow/DS-v3.2")
+            provider: Provider name (e.g., "iflow")
+        
+        Returns:
+            Full model string with ID (e.g., "iflow/deepseek-v3.2")
+        """
+        # Extract model name from "provider/model_name" format
+        model_name = model.split('/')[-1] if '/' in model else model
+        
+        # Try to get provider instance to check for model definitions
+        provider_plugin = self._get_provider_instance(provider)
+        
+        # Check if provider has model definitions
+        if provider_plugin and hasattr(provider_plugin, 'model_definitions'):
+            model_id = provider_plugin.model_definitions.get_model_id(provider, model_name)
+            if model_id and model_id != model_name:
+                # Return with provider prefix
+                return f"{provider}/{model_id}"
+        
+        # Fallback: use client's own model definitions
+        model_id = self.model_definitions.get_model_id(provider, model_name)
+        if model_id and model_id != model_name:
+            return f"{provider}/{model_id}"
+        
+        # No conversion needed, return original
+        return model
+
+
     async def _safe_streaming_wrapper(
         self, stream: Any, key: str, model: str, request: Optional[Any] = None
     ) -> AsyncGenerator[Any, None]:
@@ -650,6 +688,14 @@ class RotatingClient:
                     }
 
                 provider_plugin = self._get_provider_instance(provider)
+
+                # Convert model name to ID if custom mapping exists
+                resolved_model = self._resolve_model_id(model, provider)
+                if resolved_model != model:
+                    lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
+                    litellm_kwargs["model"] = resolved_model
+                    # Update the model variable for subsequent logging
+                    model = resolved_model
 
                 # Apply model-specific options for custom providers
                 if provider_plugin and hasattr(provider_plugin, "get_model_options"):
@@ -1024,6 +1070,14 @@ class RotatingClient:
                         }
 
                     provider_plugin = self._get_provider_instance(provider)
+
+                    # Convert model name to ID if custom mapping exists
+                    resolved_model = self._resolve_model_id(model, provider)
+                    if resolved_model != model:
+                        lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
+                        litellm_kwargs["model"] = resolved_model
+                        # Update the model variable for subsequent logging
+                        model = resolved_model
 
                     # Apply model-specific options for custom providers
                     if provider_plugin and hasattr(
