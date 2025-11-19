@@ -299,6 +299,75 @@ class EnsembleManager:
         
         return drones
     
+    def _prepare_fusion_models(
+        self,
+        config: Dict[str, Any],
+        request_params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Prepare specialist model configurations for fusion execution.
+        
+        Each specialist model gets a role-specific system prompt and 
+        processes the same user query.
+        
+        Args:
+            config: Fusion configuration
+            request_params: Original request parameters
+        
+        Returns:
+            List of specialist model configurations
+        """
+        specialists = config.get("specialists", [])
+        models = []
+        
+        lib_logger.debug(f"[HiveMind] Preparing {len(specialists)} specialist models for fusion")
+        
+        for i, specialist in enumerate(specialists):
+            specialist_num = i + 1
+            specialist_model = specialist.get("model")
+            specialist_role = specialist.get("role", f"Specialist {specialist_num}")
+            specialist_prompt = specialist.get("system_prompt", "")
+            specialist_weight = specialist.get("weight", 1.0)
+            
+            if not specialist_model:
+                lib_logger.warning(
+                    f"[HiveMind] Specialist {specialist_num} missing model, skipping"
+                )
+                continue
+            
+            # Clone request params
+            model_params = request_params.copy()
+            
+            # Set specialist model
+            model_params["model"] = specialist_model
+            
+            # Deep copy messages
+            if "messages" in model_params:
+                model_params["messages"] = copy.deepcopy(model_params["messages"])
+            
+            # Inject role-specific system prompt if provided
+            if specialist_prompt and "messages" in model_params:
+                role_message = {
+                    "role": "system",
+                    "content": specialist_prompt
+                }
+                model_params["messages"].insert(0, role_message)
+            
+            # Store specialist metadata
+            model_params["_specialist_index"] = specialist_num
+            model_params["_specialist_role"] = specialist_role
+            model_params["_specialist_weight"] = specialist_weight
+            model_params["_total_specialists"] = len(specialists)
+            
+            models.append(model_params)
+            
+            lib_logger.debug(
+                f"[HiveMind] Specialist {specialist_num}/{len(specialists)}: "
+                f"role={specialist_role}, model={specialist_model}, weight={specialist_weight}"
+            )
+        
+        return models
+    
     async def _execute_parallel(
         self,
         drones: List[Dict[str, Any]],
