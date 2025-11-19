@@ -1774,7 +1774,9 @@ class RotatingClient:
     async def get_all_available_models(
         self, grouped: bool = True
     ) -> Union[Dict[str, List[str]], List[str]]:
-        """Returns a list of all available models, either grouped by provider or as a flat list."""
+        """Returns a list of all available models, either grouped by provider or as a flat list.
+        
+        MISSING FEATURE FIX: Now includes HiveMind fusion models."""
         lib_logger.info("Getting all available models...")
 
         all_providers = list(self.all_credentials.keys())
@@ -1790,6 +1792,13 @@ class RotatingClient:
                 all_provider_models[provider] = []
             else:
                 all_provider_models[provider] = result
+
+        # MISSING FEATURE FIX: Add HiveMind fusion models
+        if self.ensemble_manager:
+            fusion_ids = self.ensemble_manager.config_loader.get_all_fusion_ids()
+            if fusion_ids:
+                all_provider_models["hivemind_fusion"] = fusion_ids
+                lib_logger.info(f"Added {len(fusion_ids)} HiveMind fusion models")
 
         lib_logger.info("Finished getting all available models.")
         if grouped:
