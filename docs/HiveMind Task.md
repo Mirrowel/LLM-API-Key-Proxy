@@ -48,8 +48,8 @@
 - [/] Implement Fusion Features
     - [x] `_prepare_models()` - multi-model setup (implemented as `_prepare_fusion_models`)
     - [x] Role assignment and prompts
-    - [/] Role context for Arbiter (Labels implemented, but explicit expertise context block missing)
-    - [/] Weight system (Weights parsed but not used in arbiter context)
+    - [x] Role context for Arbiter (Labels implemented, but explicit expertise context block missing)
+    - [x] Weight system (Weights parsed but not used in arbiter context)
 - [ ] Testing
     - [ ] Test 2-model fusion
     - [ ] Test role context injection
@@ -75,10 +75,10 @@
     - [x] Latency logging
     - [x] Token usage tracking
     - [x] Rate limit mitigation (Inherited from RotatingClient)
-- [ ] Documentation
-    - [ ] User guide
-    - [ ] Example configs
-    - [ ] API reference
+- [x] Documentation
+    - [x] User guide
+    - [x] Example configs
+    - [x] API reference
 
 ## Verification
 - [ ] Automated Tests
