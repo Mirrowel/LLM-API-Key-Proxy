@@ -259,9 +259,11 @@ class EnsembleManager:
         Returns:
             Tuple of (successful_responses, aggregated_usage)
         """
-        import asyncio
         
         lib_logger.info(f"[HiveMind] Executing {len(drones)} drones in parallel...")
+        
+        # Import litellm for API calls
+        import litellm
         
         # Create tasks for all drones
         tasks = []
@@ -271,7 +273,7 @@ class EnsembleManager:
             clean_params = {k: v for k, v in drone_params.items() if not k.startswith('_')}
             
             task = self.rotating_client._execute_with_retry(
-                api_call=None,  # We'll use litellm.acompletion directly
+                litellm.acompletion,  # Use litellm.acompletion directly
                 request=request,
                 **clean_params
             )
