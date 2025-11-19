@@ -1,46 +1,46 @@
 # HiveMind (Swarm/Fusion) Implementation
 
 ## Phase 1: Core Infrastructure
-- [/] Design and Plan
+- [x] Design and Plan
     - [x] Explore codebase
     - [x] Create comprehensive implementation plan
-- [ ] Create `src/rotator_library/ensemble_manager.py`
-    - [ ] Define `EnsembleManager` class skeleton
-    - [ ] Implement config loading and validation
-    - [ ] Implement `is_ensemble()` detection
-    - [ ] Implement conflict resolution for naming
-- [ ] Modify `src/rotator_library/client.py`
-    - [ ] Initialize `EnsembleManager` in `__init__`
-    - [ ] Integrate into `acompletion()` dispatcher
-    - [ ] Add logging for HiveMind operations
-- [ ] Create `ensemble_config.json`
-    - [ ] Define schema for Fusions
-    - [ ] Define schema for Swarm defaults
-    - [ ] Define arbitration strategies
+- [x] Create `src/rotator_library/ensemble_manager.py`
+    - [x] Define `EnsembleManager` class skeleton
+    - [x] Implement config loading and validation
+    - [x] Implement `is_ensemble()` detection
+    - [x] Implement conflict resolution for naming
+- [x] Modify `src/rotator_library/client.py`
+    - [x] Initialize `EnsembleManager` in `__init__`
+    - [x] Integrate into `acompletion()` dispatcher
+    - [x] Add logging for HiveMind operations
+- [x] Create `ensemble_config.json`
+    - [x] Define schema for Fusions
+    - [x] Define schema for Swarm defaults
+    - [x] Define arbitration strategies
 
 ## Phase 2: Basic Swarm Mode
-- [ ] Implement Swarm Features
-    - [ ] `_prepare_drones()` - basic cloning
-    - [ ] `_execute_parallel()` - asyncio.gather
-    - [ ] `_format_for_arbiter()` - response aggregation
-    - [ ] `_build_arbiter_prompt()` - synthesis strategy
-    - [ ] `_call_arbiter()` - judge execution
-- [ ] Testing
-    - [ ] Test basic 3-drone swarm
-    - [ ] Test arbiter synthesis
-    - [ ] Test partial failures
+- [x] Implement Swarm Features
+    - [x] `_prepare_drones()` - basic cloning
+    - [x] `_execute_parallel()` - asyncio.gather
+    - [x] `_format_for_arbiter()` - response aggregation
+    - [x] `_build_arbiter_prompt()` - synthesis strategy
+    - [x] `_call_arbiter()` - judge execution
+- [x] Testing
+    - [x] Test basic 3-drone swarm
+    - [x] Test arbiter synthesis
+    - [x] Test partial failures
 
 ## Phase 3: Advanced Swarm Features
-- [ ] Temperature Jitter
-    - [ ] Implement jitter logic
-    - [ ] Test randomness and clamping
-- [ ] Adversarial Mode
-    - [ ] Implement adversarial prompt injection
-    - [ ] Test with configurable count
-- [ ] Blind Switch
-    - [ ] Implement response anonymization
-    - [ ] Test with blind=true/false
-- [ ] Confidence Scoring
+- [x] Temperature Jitter
+    - [x] Implement jitter logic
+    - [x] Test randomness and clamping
+- [x] Adversarial Mode
+    - [x] Implement adversarial prompt injection
+    - [x] Test with configurable count
+- [x] Blind Switch
+    - [x] Implement response anonymization
+    - [x] Test with blind=true/false
+- [ ] Confidence Scoring (Moved to Recursive Mode)
     - [ ] Implement score extraction
     - [ ] Add logging for scores
 
