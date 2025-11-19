@@ -169,7 +169,7 @@ runs:
     - name: Install dependencies
       if: steps.check_requirements_file.outputs.exists == 'true'
       shell: bash
-      run: uv pip install --python 3.12 -r requirements.txt
+      run: uv pip install --python 3.12 -r requirements.txt --system
 
     - name: Install opencode
       shell: bash
