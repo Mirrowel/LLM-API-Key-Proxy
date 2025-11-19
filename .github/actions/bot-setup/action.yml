@@ -10,7 +10,7 @@ inputs:
     required: true
   opencode-api-key:
     description: 'The default API key, used for providers that do not have one defined in the custom providers JSON.'
-    required: true
+    required: false
   opencode-model:
     description: 'The main model to use (e.g., openai/gpt-4o or a custom one from custom providers JSON).'
     required: true
