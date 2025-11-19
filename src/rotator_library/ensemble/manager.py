@@ -394,12 +394,148 @@ class EnsembleManager:
         
         return formatted_text
     
+    def _build_arbiter_prompt(
+        self,
+        formatted_responses: str,
+        config: Dict[str, Any],
+        original_messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Build complete messages array for arbiter.
+        
+        Loads strategy template and constructs system prompt + user message.
+        Recursive mode and role context will be added in later phases.
+        
+        Args:
+            formatted_responses: Formatted drone responses
+            config: Swarm or fusion configuration
+            original_messages: Original user messages
+        
+        Returns:
+            Complete messages array for arbiter call
+        """
+        # Get arbiter config
+        arbiter_config = config.get("arbiter", {})
+        strategy_name = arbiter_config.get("strategy", "synthesis")
+        
+        lib_logger.debug(f"[HiveMind] Building arbiter prompt with strategy '{strategy_name}'")
+        
+        # Load strategy template
+        strategy_template = self.config_loader.get_strategy(strategy_name)
+        if not strategy_template:
+            lib_logger.warning(
+                f"[HiveMind] Strategy '{strategy_name}' not found, using default"
+            )
+            strategy_template = "Analyze the following responses and create a single, superior answer:\n\n{responses}"
+        
+        # Replace {responses} placeholder
+        strategy_prompt = strategy_template.replace("{responses}", formatted_responses)
+        
+        # Build messages array
+        messages = []
+        
+        # System message with strategy
+        messages.append({
+            "role": "system",
+            "content": strategy_prompt
+        })
+        
+        # Include original user query
+        # Find the last user message from original
+        user_content = ""
+        for msg in reversed(original_messages):
+            if msg.get("role") == "user":
+                user_content = msg.get("content", "")
+                break
+        
+        if user_content:
+            messages.append({
+                "role": "user",
+                "content": f"Original query: {user_content}"
+            })
+        
+        lib_logger.debug(
+            f"[HiveMind] Arbiter prompt constructed: {len(messages)} messages, "
+            f"{len(strategy_prompt)} chars in system prompt"
+        )
+        
+        return messages
+    
+    async def _call_arbiter(
+        self,
+        messages: List[Dict[str, str]],
+        config: Dict[str, Any],
+        request: Any
+    ) -> tuple:
+        """
+        Call the arbiter model to synthesize responses.
+        
+        Non-streaming version for Phase 2.
+        Streaming support will be added in Phase 3.
+        
+        Args:
+            messages: Constructed arbiter messages
+            config: Swarm or fusion configuration
+            request: Original request object
+        
+        Returns:
+            Tuple of (arbiter_response, arbiter_usage)
+        """
+        # Get arbiter model
+        arbiter_config = config.get("arbiter", {})
+        arbiter_model = arbiter_config.get("model", "self")
+        
+        # If "self", we need to determine which model to use
+        # For swarm, this will be handled by caller
+        # For now, just use as-is
+        
+        lib_logger.info(f"[HiveMind] Calling arbiter model: {arbiter_model}")
+        
+        # Build params for arbiter call
+        arbiter_params = {
+            "model": arbiter_model,
+            "messages": messages,
+            "stream": False  # Non-streaming for Phase 2
+        }
+        
+        # Call arbiter through RotatingClient
+        # Use _execute_with_retry for consistency
+        import litellm
+        arbiter_response = await self.rotating_client._execute_with_retry(
+            litellm.acompletion,
+            request=request,
+            **arbiter_params
+        )
+        
+        # Extract usage
+        arbiter_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0
+        }
+        
+        if hasattr(arbiter_response, 'usage') and arbiter_response.usage:
+            usage = arbiter_response.usage
+            arbiter_usage['prompt_tokens'] = getattr(usage, 'prompt_tokens', 0)
+            arbiter_usage['completion_tokens'] = getattr(usage, 'completion_tokens', 0)
+            arbiter_usage['total_tokens'] = getattr(usage, 'total_tokens', 0)
+            
+            # Include other fields
+            for field in ['cached_tokens', 'reasoning_tokens']:
+                if hasattr(usage, field):
+                    arbiter_usage[field] = getattr(usage, field, 0)
+        
+        lib_logger.info(
+            f"[HiveMind] Arbiter completed. Tokens: {arbiter_usage['total_tokens']}"
+        )
+        
+        return arbiter_response, arbiter_usage
+    
     async def handle_request(self, request, **kwargs):
         """
         Handle an ensemble request (swarm or fusion).
         
         This is the main entry point for ensemble execution.
-        Will be implemented in Phase 2.
         
         Args:
             request: Original request object
@@ -420,7 +556,7 @@ class EnsembleManager:
         if resolved_id in self.config_loader.fusion_configs:
             lib_logger.info(f"[HiveMind] Processing Fusion request: {resolved_id}")
             # TODO: Implement fusion handling in Phase 5
-            raise NotImplementedError("Fusion mode not yet implemented")
+            raise NotImplementedError("Fusion mode not yet implemented (Phase 5)")
         
         elif self._is_swarm_request(resolved_id):
             base_model = self.get_base_model(resolved_id)
@@ -431,8 +567,75 @@ class EnsembleManager:
                 f"[HiveMind] Processing Swarm request: {resolved_id} "
                 f"(base: {base_model}, {count} drones)"
             )
-            # TODO: Implement swarm handling in Phase 2
-            raise NotImplementedError("Swarm mode not yet implemented")
+            
+            # Phase 2F: Wire up full swarm execution
+            # Step 1: Prepare drones
+            drones = self._prepare_drones(config, base_model, kwargs)
+            
+            # Step 2: Execute drones in parallel
+            drone_responses, drone_usage = await self._execute_parallel(drones, request)
+            
+            # Step 3: Format responses for arbiter
+            formatted_responses = self._format_for_arbiter(drone_responses, config)
+            
+            # Step 4: Build arbiter prompt
+            original_messages = kwargs.get("messages", [])
+            arbiter_messages = self._build_arbiter_prompt(
+                formatted_responses,
+                config,
+                original_messages
+            )
+            
+            # Step 5: Handle "self" arbiter model
+            arbiter_config = config.get("arbiter", {})
+            arbiter_model = arbiter_config.get("model", "self")
+            if arbiter_model == "self":
+                arbiter_model = base_model
+                lib_logger.debug(f"[HiveMind] Using self-arbiter: {arbiter_model}")
+            
+            # Update config with resolved arbiter model
+            config_copy = config.copy()
+            config_copy["arbiter"] = arbiter_config.copy()
+            config_copy["arbiter"]["model"] = arbiter_model
+            
+            # Step 6: Call arbiter
+            arbiter_response, arbiter_usage = await self._call_arbiter(
+                arbiter_messages,
+                config_copy,
+                request
+            )
+            
+            # Step 7: Aggregate total usage
+            total_usage = {
+                'prompt_tokens': drone_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
+                'completion_tokens': drone_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
+                'total_tokens': drone_usage['total_tokens'] + arbiter_usage['total_tokens']
+            }
+            
+            # Include other fields if present
+            for field in ['cached_tokens', 'reasoning_tokens']:
+                if field in drone_usage or field in arbiter_usage:
+                    total_usage[field] = drone_usage.get(field, 0) + arbiter_usage.get(field, 0)
+            
+            # Step 8: Update arbiter response with aggregated usage
+            if hasattr(arbiter_response, 'usage'):
+                # Create a new usage object with aggregated values
+                arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
+                arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
+                arbiter_response.usage.total_tokens = total_usage['total_tokens']
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in total_usage:
+                        setattr(arbiter_response.usage, field, total_usage[field])
+            
+            lib_logger.info(
+                f"[HiveMind] Swarm completed successfully. "
+                f"Total usage: {total_usage['total_tokens']} tokens "
+                f"(Drones: {drone_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+            )
+            
+            return arbiter_response
         
         else:
             raise ValueError(f"Unknown ensemble type for model: {model_id}")
+
