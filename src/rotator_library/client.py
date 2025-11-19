@@ -1552,11 +1552,22 @@ class RotatingClient:
         Returns:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
+        # Handle iflow provider: remove stream_options to avoid HTTP 406
+        model = kwargs.get("model", "")
+        provider = model.split("/")[0] if "/" in model else ""
+        
+        if provider == "iflow" and "stream_options" in kwargs:
+            lib_logger.debug("Removing stream_options for iflow provider to avoid HTTP 406")
+            kwargs.pop("stream_options", None)
+        
         if kwargs.get("stream"):
-            if "stream_options" not in kwargs:
-                kwargs["stream_options"] = {}
-            if "include_usage" not in kwargs["stream_options"]:
-                kwargs["stream_options"]["include_usage"] = True
+            # Only add stream_options for providers that support it (excluding iflow)
+            if provider != "iflow":
+                if "stream_options" not in kwargs:
+                    kwargs["stream_options"] = {}
+                if "include_usage" not in kwargs["stream_options"]:
+                    kwargs["stream_options"]["include_usage"] = True
+            
             return self._streaming_acompletion_with_retry(
                 request=request, pre_request_callback=pre_request_callback, **kwargs
             )

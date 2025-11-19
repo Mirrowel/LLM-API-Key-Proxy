@@ -282,12 +282,29 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         """
         Converts a raw iFlow SSE chunk to an OpenAI-compatible chunk.
         Since iFlow is OpenAI-compatible, minimal conversion is needed.
+        
+        CRITICAL FIX: Handle chunks with BOTH usage and choices (final chunk)
+        without early return to ensure finish_reason is properly processed.
         """
         if not isinstance(chunk, dict):
             return
 
-        # Handle usage data
-        if usage_data := chunk.get("usage"):
+        # Get choices and usage data
+        choices = chunk.get("choices", [])
+        usage_data = chunk.get("usage")
+
+        # Handle chunks with BOTH choices and usage (typical for final chunk)
+        # CRITICAL: Process choices FIRST to capture finish_reason, then yield usage
+        if choices and usage_data:
+            # Yield the choice chunk first (contains finish_reason)
+            yield {
+                "choices": choices,
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
+                "created": chunk.get("created", int(time.time()))
+            }
+            # Then yield the usage chunk
             yield {
                 "choices": [], "model": model_id, "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
@@ -300,19 +317,30 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             }
             return
 
-        # Handle content data
-        choices = chunk.get("choices", [])
-        if not choices:
+        # Handle usage-only chunks
+        if usage_data:
+            yield {
+                "choices": [], "model": model_id, "object": "chat.completion.chunk",
+                "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
+                "created": chunk.get("created", int(time.time())),
+                "usage": {
+                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                }
+            }
             return
 
-        # iFlow returns OpenAI-compatible format, so we can mostly pass through
-        yield {
-            "choices": choices,
-            "model": model_id,
-            "object": "chat.completion.chunk",
-            "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
-            "created": chunk.get("created", int(time.time()))
-        }
+        # Handle content-only chunks
+        if choices:
+            # iFlow returns OpenAI-compatible format, so we can mostly pass through
+            yield {
+                "choices": choices,
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
+                "created": chunk.get("created", int(time.time()))
+            }
 
     def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
         """
@@ -429,8 +457,12 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             # CRITICAL: get_api_details returns api_key, NOT access_token
             api_base, api_key = await self.get_api_details(credential_path)
 
+            # Strip provider prefix from model name (e.g., "iflow/Qwen3-Coder-Plus" -> "Qwen3-Coder-Plus")
+            model_name = model.split('/')[-1]
+            kwargs_with_stripped_model = {**kwargs, 'model': model_name}
+
             # Build clean payload with only supported parameters
-            payload = self._build_request_payload(**kwargs)
+            payload = self._build_request_payload(**kwargs_with_stripped_model)
 
             headers = {
                 "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
@@ -487,9 +519,16 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                     # Process successful streaming response
                     async for line in response.aiter_lines():
                         file_logger.log_response_chunk(line)
-                        if line.startswith('data: '):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
+                        
+                        # CRITICAL FIX: Handle both "data:" (no space) and "data: " (with space)
+                        if line.startswith('data:'):
+                            # Extract data after "data:" prefix, handling both formats
+                            if line.startswith('data: '):
+                                data_str = line[6:]  # Skip "data: "
+                            else:
+                                data_str = line[5:]  # Skip "data:"
+                            
+                            if data_str.strip() == "[DONE]":
                                 break
                             try:
                                 chunk = json.loads(data_str)
