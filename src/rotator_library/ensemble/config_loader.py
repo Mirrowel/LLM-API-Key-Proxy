@@ -102,7 +102,12 @@ class ConfigLoader:
                 lib_logger.error(f"[HiveMind] Failed to load swarm config '{config_file.name}': {e}")
     
     def _load_fusion_configs(self) -> None:
-        """Load fusion configurations from fusions/ directory."""
+        """Load fusion configurations from fusions/ directory.
+        
+        Supports two formats:
+        1. Single fusion: {"id": "...", "specialists": [...], ...}
+        2. Multiple fusions: {"fusions": [{"id": "...", ...}, ...]}
+        """
         if not self.fusions_dir.exists():
             lib_logger.warning(f"[HiveMind] Fusions directory not found: {self.fusions_dir}")
             return
@@ -112,25 +117,43 @@ class ConfigLoader:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
-                fusion_id = config.get("id")
-                if not fusion_id:
-                    lib_logger.warning(
-                        f"[HiveMind] Fusion config '{config_file.name}' missing 'id' field"
-                    )
-                    continue
-                
-                # Check for duplicate IDs
-                if fusion_id in self.fusion_configs:
-                    lib_logger.warning(
-                        f"[HiveMind] Duplicate fusion ID '{fusion_id}'. "
-                        f"Config from '{config_file.name}' will override previous."
-                    )
-                
-                self.fusion_configs[fusion_id] = config
-                lib_logger.debug(f"[HiveMind] Loaded fusion config '{fusion_id}'")
+                # Check if this is the new array format
+                if "fusions" in config:
+                    # New format: {"fusions": [...]}
+                    fusions_list = config.get("fusions", [])
+                    if not isinstance(fusions_list, list):
+                        lib_logger.warning(
+                            f"[HiveMind] Config '{config_file.name}' has 'fusions' but it's not a list"
+                        )
+                        continue
+                    
+                    for fusion in fusions_list:
+                        self._register_fusion(fusion, config_file.name)
+                else:
+                    # Old format: {"id": "...", "specialists": [...], ...}
+                    self._register_fusion(config, config_file.name)
                 
             except Exception as e:
                 lib_logger.error(f"[HiveMind] Failed to load fusion config '{config_file.name}': {e}")
+    
+    def _register_fusion(self, fusion: Dict[str, Any], source_file: str) -> None:
+        """Register a single fusion configuration."""
+        fusion_id = fusion.get("id")
+        if not fusion_id:
+            lib_logger.warning(
+                f"[HiveMind] Fusion in '{source_file}' missing 'id' field"
+            )
+            return
+        
+        # Check for duplicate IDs
+        if fusion_id in self.fusion_configs:
+            lib_logger.warning(
+                f"[HiveMind] Duplicate fusion ID '{fusion_id}'. "
+                f"Config from '{source_file}' will override previous."
+            )
+        
+        self.fusion_configs[fusion_id] = fusion
+        lib_logger.debug(f"[HiveMind] Loaded fusion config '{fusion_id}'")
     
     def _load_strategies(self) -> None:
         """Load strategy templates from strategies/ directory."""
@@ -206,8 +229,8 @@ class ConfigLoader:
         return self.strategies.get(strategy_name)
     
     def get_all_fusion_ids(self) -> List[str]:
-        """Get list of all fusion IDs."""
-        return list(self.fusion_configs.keys())
+        """Get list of all fusion IDs with [fusion] suffix."""
+        return [f"{fusion_id}[fusion]" for fusion_id in self.fusion_configs.keys()]
     
     def get_all_swarm_model_ids(self) -> List[str]:
         """

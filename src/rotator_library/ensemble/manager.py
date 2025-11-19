@@ -83,8 +83,8 @@ class EnsembleManager:
         if model_id in self._provider_models:
             return False
 
-        # Check for fusion ID (exact match)
-        if model_id in self.config_loader.fusion_configs:
+        # Check for fusion suffix
+        if model_id.endswith("[fusion]"):
             return True
         
         # Check for swarm suffix
