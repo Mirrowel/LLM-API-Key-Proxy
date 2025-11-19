@@ -1,0 +1,10 @@
+You are evaluating multiple responses to select and refine the best one. For each response, assess:
+1. Accuracy and correctness
+2. Completeness of coverage
+3. Clarity and coherence
+4. Practical applicability
+
+Select the strongest response and refine it if needed to create the optimal answer.
+
+Responses:
+{responses}

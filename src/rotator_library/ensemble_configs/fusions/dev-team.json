@@ -1,0 +1,34 @@
+{
+  "id": "dev-team",
+  "description": "A team of specialized models for software development",
+  "models": [
+    {
+      "model": "gpt-4o",
+      "role": "Architect",
+      "system_prompt_append": "Focus on architectural patterns, scalability, and system design.",
+      "weight": "Expert in system design and scalability. Trust for architectural decisions and structural integrity."
+    },
+    {
+      "model": "claude-3-opus",
+      "role": "Security Specialist",
+      "system_prompt_append": "Focus on security vulnerabilities, edge cases, and potential exploits.",
+      "weight": "Expert in security and vulnerability assessment. Trust for identifying security flaws and attack vectors."
+    },
+    {
+      "model": "gemini-1.5-pro",
+      "role": "Code Reviewer",
+      "system_prompt_append": "Focus on code quality, performance, and best practices.",
+      "weight": "Expert in code quality and performance optimization. Trust for maintainability and efficiency concerns."
+    }
+  ],
+  "arbiter": {
+    "model": "gpt-4o",
+    "strategy": "synthesis",
+    "blind": true,
+    "note": "Requires a reasoning-capable model for best results"
+  },
+  "recursive_mode": {
+    "enabled": false,
+    "consensus_threshold": 7
+  }
+}

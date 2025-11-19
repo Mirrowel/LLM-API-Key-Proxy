@@ -33,6 +33,7 @@ from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
+from .ensemble import EnsembleManager
 
 
 class StreamedAPIError(Exception):
@@ -128,6 +129,10 @@ class RotatingClient:
             if max_val < 1:
                 lib_logger.warning(f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1.")
                 self.max_concurrent_requests_per_key[provider] = 1
+        
+        # Initialize HiveMind ensemble manager
+        self.ensemble_manager = EnsembleManager(rotating_client=self)
+        lib_logger.info("HiveMind ensemble manager initialized")
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
