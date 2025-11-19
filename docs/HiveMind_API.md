@@ -36,19 +36,25 @@ manager.is_ensemble("dev-team")  # True
 manager.is_ensemble("gpt-4o")  # False
 ```
 
-### `get_base_model(swarm_id: str) -> str`
+### `get_base_model(swarm_id: str) -> tuple`
 
-Extract base model name from swarm ID.
+Extract base model name and preset ID from swarm ID.
 
 **Parameters:**
-- `swarm_id` (str): Swarm model ID (e.g., "gemini-1.5-flash[swarm]")
+- `swarm_id` (str): Swarm model ID (e.g., "gpt-4o-aggressive[swarm]", "gpt-4o[swarm]")
 
 **Returns:**
-- `str`: Base model name (e.g., "gemini-1.5-flash")
+- `tuple`: (base_model_name, preset_id)
+  - For `"gpt-4o-aggressive[swarm]"` returns `("gpt-4o", "aggressive")`
+  - For `"gpt-4o[swarm]"` returns `("gpt-4o", "default")` or omit_id preset
 
 **Example:**
 ```python
-base = manager.get_base_model("gpt-4o[swarm]")  # "gpt-4o"
+base, preset = manager.get_base_model("gpt-4o-aggressive[swarm]")  
+# base = "gpt-4o", preset = "aggressive"
+
+base, preset = manager.get_base_model("gpt-4o[swarm]")  
+# base = "gpt-4o", preset = "default" or omit_id preset for gpt-4o
 ```
 
 ### `get_fusion_ids() -> List[str]`
@@ -106,15 +112,34 @@ Load all configurations from directory structure.
 **Side Effects:**
 - Populates `swarm_default`, `swarm_configs`, `fusion_configs`, `strategies`
 
-### `get_swarm_config(model: str) -> Dict[str, Any]`
+### `get_swarm_config(preset_id: str) -> Dict[str, Any]`
 
-Get swarm configuration for a specific model.
+Get swarm configuration for a specific preset.
 
 **Parameters:**
-- `model` (str): Base model name (without [swarm] suffix)
+- `preset_id` (str): Preset ID (e.g., "default", "aggressive")
 
 **Returns:**
-- `Dict[str, Any]`: Merged configuration (default + model-specific)
+- `Dict[str, Any]`: Preset configuration
+
+### `get_preset_for_model(base_model: str) -> str`
+
+Get the preset ID to use when calling `model[swarm]` (short form).
+
+**Parameters:**
+- `base_model` (str): Base model name (e.g., "gpt-4o-mini")
+
+**Returns:**
+- `str`: Preset ID (omit_id preset for this model, or "default")
+
+**Example:**
+```python
+# If aggressive.json has omit_id=true and base_models=["gpt-4o-mini"]
+preset = loader.get_preset_for_model("gpt-4o-mini")  # "aggressive"
+
+# For models without omit_id preset
+preset = loader.get_preset_for_model("claude-3-haiku")  # "default"
+```
 
 ### `get_fusion_config(fusion_id: str) -> Optional[Dict[str, Any]]`
 
@@ -138,10 +163,36 @@ Get strategy template by name.
 
 ### `get_all_fusion_ids() -> List[str]`
 
-Get list of all fusion IDs.
+Get list of all fusion IDs with [fusion] suffix.
 
 **Returns:**
 - `List[str]`: List of fusion identifiers
+
+### `get_all_swarm_model_ids() -> List[str]`
+
+Get all discoverable swarm model variants for /v1/models endpoint.
+
+**Discovery Rules:**
+- Preset WITH `base_models` + `omit_id: true` → `{model}[swarm]`
+- Preset WITH `base_models` + `omit_id: false` → `{model}-{preset}[swarm]`
+- Preset WITHOUT `base_models` → Not included (invisible
+)
+
+**Returns:**
+- `List[str]`: List of swarm model IDs for discovery
+
+**Example:**
+```python
+# With aggressive.json: {"omit_id": true, "base_models": ["gpt-4o-mini"]}
+# With default.json: {"omit_id": false, "base_models": ["gpt-4o", "claude-3-haiku"]}
+
+swarm_ids = loader.get_all_swarm_model_ids()
+# [
+#   "gpt-4o-mini[swarm]",  # From aggressive (omit_id=true)
+#   "gpt-4o-default[swarm]",  # From default (omit_id=false)
+#   "claude-3-haiku-default[swarm]"  # From default (omit_id=false)
+# ]
+```
 
 ---
 
@@ -216,24 +267,32 @@ print(f"Latency: {details['latency_ms']}ms")  # 1523.45
 
 ### Swarm Configuration
 
-**File Location:** `ensemble_configs/swarms/*.json`
+**File Location:** `ensemble_configs/swarms/{preset_id}.json`
+
+**Preset-Based System**: Each swarm preset defines behavior for multiple models via `base_models`.
 
 **Schema:**
 ```json
 {
-  "model": "string (optional, only for model-specific configs)",
-  "suffix": "string (default: '[swarm]')",
-  "count": "integer (default: 3)",
+  "id": "string (REQUIRED, preset identifier, must match filename)",
+  "description": "string (optional)",
+  
+  "base_models": [
+    "string (model IDs for /v1/models discovery)"
+  ],
+  
+  "omit_id": "boolean (default: false, controls discovery format)",
+  "count": "integer (default: 3, number of drones)",
   
   "temperature_jitter": {
     "enabled": "boolean",
-    "delta": "float (temperature variance)"
+    "delta": "float (temperature variance, ±delta)"
   },
   
   "arbiter": {
     "model": "string ('self' or model ID)",
-    "strategy": "string (strategy name)",
-    "blind": "boolean (default: true)"
+    "strategy": "string (strategy template name)",
+    "blind": "boolean (default: true, hides model names)"
   },
   
   "adversarial_config": {
@@ -249,6 +308,15 @@ print(f"Latency: {details['latency_ms']}ms")  # 1523.45
 }
 ```
 
+**Key Fields:**
+- `id`: Preset identifier, used in `{model}-{id}[swarm]` format
+- `base_models`: OPTIONAL. Controls /v1/models discovery only. Does NOT restrict runtime usage.
+- `omit_id`: OPTIONAL. If `true`, shows as `{model}[swarm]` in /v1/models (hides explicit format to reduce clutter)
+
+**Discovery vs Runtime:**
+- **Discovery**: `base_models` and `omit_id` control what appears in /v1/models
+- **Runtime**: Explicit format `{model}-{preset}[swarm]` works with ANY model/preset combo
+
 ### Fusion Configuration
 
 **File Location:** `ensemble_configs/fusions/*.json`
@@ -261,10 +329,12 @@ print(f"Latency: {details['latency_ms']}ms")  # 1523.45
   
   "specialists": [
     {
-      " model": "string (model ID)",
-      "role": "string (specialist role name)",
-      "system_prompt": "string (role-specific instructions)",
-      "weight": "float (importance weight, default: 1.0)"
+      "model": "string (model ID)",
+      "role": "string (optional, specialist role name)",
+      "system_prompt": "string (optional, role-specific instructions)",
+      "weight": "float (optional, importance weight, default: 1.0)",
+      "weight_description": "string (optional, expertise description for arbiter)",
+      "role_template": "string (optional, reference to role template from roles/ directory)"
     }
   ],
   

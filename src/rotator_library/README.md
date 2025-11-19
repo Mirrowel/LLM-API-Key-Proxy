@@ -4,6 +4,13 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 
 ## Key Features
 
+-   **HiveMind Ensemble**: Parallel model execution with intelligent arbitration
+    -   **Swarm Mode**: Execute the same model multiple times with temperature jitter, adversarial prompts, and synthesis
+    -   **Fusion Mode**: Combine responses from different specialized models with role-based routing
+    -   **Recursive Refinement**: Autonomous low-consensus handling with internal critique reasoning
+    -   **Configurable Strategies**: Customizable arbitration strategies for different use cases
+    -   **Role Templates**: Reusable specialist role definitions for consistent fusion configurations
+    -   **Blind Mode**: Option to hide model names from arbiter to reduce bias
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
 -   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. By default, it supports concurrent requests to *different* models. With configuration (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`), it can also support multiple concurrent requests to the *same* model using the same key.
 -   **Smart Key Management**: Selects the optimal key for each request using a tiered, model-aware locking strategy to distribute load evenly and maximize availability.
@@ -135,6 +142,33 @@ async def stream_example():
 
 asyncio.run(stream_example())
 ```
+
+**HiveMind Ensemble Example:**
+
+```python
+async def hivemind_example():
+    async with RotatingClient(api_keys=api_keys) as client:
+        # Swarm Mode: Multiple parallel calls to same model
+        swarm_response = await client.acompletion(
+            model="gpt-4o-mini-default[swarm]",
+            messages=[{"role": "user", "content": "Explain quantum computing"}]
+        )
+        print(swarm_response.choices[0].message.content)
+        print(f"Total tokens: {swarm_response.usage.total_tokens}")
+        print(f"Drones: {swarm_response.usage.hivemind_details['drone_count']}")
+        
+        # Fusion Mode: Multiple specialist models
+        fusion_response = await client.acompletion(
+            model="dev-team[fusion]",
+            messages=[{"role": "user", "content": "Review this API design"}]
+        )
+        print(fusion_response.choices[0].message.content)
+        print(f"Specialists: {fusion_response.usage.hivemind_details['specialist_count']}")
+
+asyncio.run(hivemind_example())
+```
+
+See the [HiveMind User Guide](../../docs/HiveMind_User_Guide.md) and [API Reference](../../docs/HiveMind_API.md) for detailed configuration options.
 
 #### `async def aembedding(self, **kwargs) -> Any:`
 

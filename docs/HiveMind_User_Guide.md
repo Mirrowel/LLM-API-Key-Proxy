@@ -22,9 +22,16 @@ from rotator_library.client import RotatingClient
 
 client = RotatingClient()
 
-# Basic swarm - adds `[swarm]` suffix to any model
+# Short form - uses preset with omit_id=true or default preset
 response = await client.acompletion(
-    model="gpt-4o-mini[swarm]",  # 3 drones by default
+    model="gpt-4o-mini[swarm]",
+    messages=[{"role": "user", "content": "What is quantum computing?"}],
+    stream=False
+)
+
+# Explicit preset format - works with ANY model + ANY preset
+response = await client.acompletion(
+    model="claude-3-haiku-aggressive[swarm]",  # Use 'aggressive' preset
     messages=[{"role": "user", "content": "What is quantum computing?"}],
     stream=False
 )
@@ -62,20 +69,50 @@ print(f"Specialists: {response.usage.hivemind_details['specialist_count']}")
 3. **Arbitration**: An arbiter model synthesizes all responses
 4. **Result**: Returns the arbiter's synthesis
 
+### Preset-Based System
+
+Swarms use a **preset-based configuration** system. Each preset is a JSON file in `ensemble_configs/swarms/` that defines behavior for multiple models.
+
+**Model Name Formats**:
+- **Short form**: `{model}[swarm]` → uses preset with `omit_id: true` OR `default` preset
+- **Explicit form**: `{model}-{preset}[swarm]` → always uses specified preset
+
+**Examples**:
+```python
+# Short form
+await client.acompletion(model="gpt-4o-mini[swarm]", ...)  # Uses omit_id preset or default
+
+# Explicit form
+await client.acompletion(model="gpt-4o-mini-aggressive[swarm]", ...)  # Uses aggressive preset
+await client.acompletion(model="claude-3-haiku-default[swarm]", ...)  # Explicit default
+```
+
+**Key Features**:
+- **`base_models`**: Controls /v1/models discovery (which models appear for this preset)
+- **`omit_id`**: Controls discovery format (short vs explicit in /v1/models)
+- **Runtime**: Explicit format works with ANY model/preset combo regardless of base_models
+
 ### Configuration
 
-Swarm behavior is configured in `src/rotator_library/ensemble_configs/swarms/`:
+Swarm presets in `src/rotator_library/ensemble_configs/swarms/`:
 
-**`default.json`** - Global swarm settings:
+**`default.json`** - Global fallback:
 ```json
 {
-  "suffix": "[swarm]",
+  "id": "default",
+  "description": "Standard balanced settings",
+  "base_models": [
+    "gpt-4o", "gpt-4o-mini",
+    "claude-3-5-sonnet", "claude-3-haiku",
+    "gemini-1.5-pro", "gemini-1.5-flash"
+  ],
+  "omit_id": false,
   "count": 3,
   "temperature_jitter": {
     "enabled": true,
     "delta": 0.2
   },
-  "arb iter": {
+  "arbiter": {
     "model": "self",
     "strategy": "synthesis",
     "blind": true
@@ -92,13 +129,20 @@ Swarm behavior is configured in `src/rotator_library/ensemble_configs/swarms/`:
 }
 ```
 
-**Model-specific configs** (e.g., `gemini-flash.json`):
+**Custom preset** (e.g., `aggressive.json`):
 ```json
 {
-  "model": "gemini-1.5-flash",
-  "arbiter": {
-    "model": "gpt-4o",
-    "strategy": "synthesis"
+  "id": "aggressive",
+  "base_models": ["gpt-4o-mini", "gemini-1.5-flash"],
+  "omit_id": true,  // Shows as model[swarm] in /v1/models
+  "count": 5,
+  "temperature_jitter": {
+    "enabled": true,
+    "delta": 0.3
+  },
+  "adversarial_config": {
+    "enabled": true,
+    "count": 2
   }
 }
 ```
@@ -120,36 +164,48 @@ Each drone gets a slightly different temperature: `base_temp ± delta`
 
 #### Adversarial Mode
 
-Adds critical drones to stress-test solutions:
+Converts the last N drones to critical reviewers:
 
 ```json
 "adversarial_config": {
   "enabled": true,
   "count": 1,
-  "prompt": "You are a Senior Principal Engineer with 15+ years of experience. Your job is to find flaws, edge cases, and potential issues."
+  "prompt": "You are a Senior Principal Engineer. Find flaws, edge cases, and potential issues."
 }
 ```
 
 #### Blind Switch
 
-Removes model names from arbiter input (enabled by default):
+Hides model names from arbiter (enabled by default):
 
 ```json
 "arbiter": {
-  "blind": true  // Arbiter sees "Response 1", not "Response 1 (GPT-4o)"
+  "blind": true  // Arbiter sees "Response 1" instead of "Response 1 (GPT-4o)"
 }
 ```
 
 #### Recursive Mode
 
-Enables autonomous arbiter decision-making for low-consensus scenarios:
+Enables autonomous arbiter critique for low-consensus responses:
 
 ```json
 "recursive_mode": {
   "enabled": true,
-  "consensus_threshold": 7  // If consensus < 7/10, arbiter performs internal critique
+  "consensus_threshold": 7  // If consensus < 7/10, performs internal critique
 }
 ```
+
+#### Discovery vs Runtime
+
+**Discovery (/ v1/models endpoint)**:
+- Preset WITH `base_models` + `omit_id: true` → `{model}[swarm]`
+- Preset WITH `base_models` + `omit_id: false` → `{model}-{preset}[swarm]`
+- Preset WITHOUT `base_models` → Not shown (invisible)
+
+**Runtime (actual API calls)**:
+- Short form `model[swarm]` → Uses omit_id preset OR default
+- Explicit form `model-preset[swarm]` → ALWAYS works with ANY model/preset combo
+- `base_models` has NO runtime restrictions
 
 ---
 

@@ -1,0 +1,39 @@
+ARBITRATION STRATEGY TEMPLATE: {strategy_name}
+
+=== FIELD DOCUMENTATION ===
+This is a plain text file that defines how the arbiter model should synthesize multiple responses.
+
+PLACEHOLDER: {responses}
+- This will be replaced with formatted drone/specialist responses
+- Format: "Response 1:\n<content>\n\nResponse 2:\n<content>\n..."
+- For fusion: "Role (Model):\n<content>\n..." (if blind=false) or "Role:\n<content>\n..." (if blind=true)
+
+SPECIALIST EXPERTISE (Fusion only):
+- If fusion mode, an additional "SPECIALIST EXPERTISE" section is auto-appended
+- Lists each specialist's role, model, and weight_description
+- Helps arbiter understand domain expertise when synthesizing
+
+RECURSIVE MODE:
+- If enabled, additional "AUTONOMOUS DECISION PROTOCOL" instructions are appended
+- Guides arbiter through consensus assessment and conflict resolution
+- Internal reasoning is wrapped in [INTERNAL] tags and hidden from user
+===
+
+=== EXAMPLE STRATEGY ===
+
+You are an expert synthesizer with deep analytical capabilities.
+
+Your task is to analyze the following responses and create a single, superior answer that combines the best insights from each perspective.
+
+{responses}
+
+Guidelines for synthesis:
+1. **Identify Core Insights**: Extract key points and unique perspectives from each response
+2. **Resolve Conflicts**: If responses disagree, evaluate which perspective is most sound based on evidence and reasoning
+3. **Merge Complementary Ideas**: Combine non-conflicting insights into a cohesive whole
+4. **Fill Gaps**: If all responses miss something important, include it based on your own expertise
+5. **Maintain Accuracy**: Never introduce hallucinations - stay grounded in the provided responses
+6. **Ensure Completeness**: Address all aspects of the original query
+7. **Optimize Clarity**: Present the final answer in clear, well-structured language
+
+Your synthesized response should be more comprehensive and insightful than any individual response while maintaining accuracy and coherence.
