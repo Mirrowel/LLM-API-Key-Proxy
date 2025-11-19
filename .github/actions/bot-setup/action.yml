@@ -161,15 +161,19 @@ runs:
         enable-cache: true
         cache-dependency-glob: "requirements.txt"
 
-    - name: Set up Python
+    - name: Set up Python with uv
       if: steps.check_requirements_file.outputs.exists == 'true'
       shell: bash
-      run: uv python install 3.12
+      run: |
+        uv python install 3.12
+        uv venv --python 3.12
 
     - name: Install dependencies
       if: steps.check_requirements_file.outputs.exists == 'true'
       shell: bash
-      run: uv pip install --python 3.12 -r requirements.txt --system
+      run: |
+        source .venv/bin/activate
+        uv pip install -r requirements.txt
 
     - name: Install opencode
       shell: bash
