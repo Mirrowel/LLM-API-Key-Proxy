@@ -45,22 +45,22 @@
     - [ ] Add logging for scores
 
 ## Phase 4: Fusion Mode
-- [ ] Implement Fusion Features
-    - [ ] `_prepare_models()` - multi-model setup
-    - [ ] Role assignment and prompts
-    - [ ] Role context for Arbiter
-    - [ ] Weight system (future)
+- [/] Implement Fusion Features
+    - [x] `_prepare_models()` - multi-model setup (implemented as `_prepare_fusion_models`)
+    - [x] Role assignment and prompts
+    - [/] Role context for Arbiter (Labels implemented, but explicit expertise context block missing)
+    - [/] Weight system (Weights parsed but not used in arbiter context)
 - [ ] Testing
     - [ ] Test 2-model fusion
     - [ ] Test role context injection
     - [ ] Test specialist descriptions
 
 ## Phase 5: Recursive/Reflective Mode
-- [ ] Implement Recursion
-    - [ ] Consensus check logic
-    - [ ] Conflict extraction
-    - [ ] `_trigger_round_2()` implementation
-    - [ ] Max rounds enforcement
+- [x] Implement Recursion (Single-Call Autonomous Mode)
+    - [x] Consensus check logic (via Prompt & Stream Parsing)
+    - [x] Conflict extraction (via Stream Parsing)
+    - [x] `_trigger_round_2()` implementation (Replaced by Autonomous Decision Protocol)
+    - [x] Max rounds enforcement (N/A for Single Call)
 - [ ] Testing
     - [ ] Test low-confidence trigger
     - [ ] Test Round 2 critique
@@ -68,13 +68,13 @@
 
 ## Phase 6: Polish & Edge Cases
 - [ ] Error Handling
-    - [ ] Partial failure handling
+    - [x] Partial failure handling
     - [ ] Arbiter failure fallback
-    - [ ] Infinite recursion prevention
+    - [x] Infinite recursion prevention (N/A)
 - [ ] Performance
-    - [ ] Latency logging
-    - [ ] Token usage tracking
-    - [ ] Rate limit mitigation
+    - [x] Latency logging
+    - [x] Token usage tracking
+    - [x] Rate limit mitigation (Inherited from RotatingClient)
 - [ ] Documentation
     - [ ] User guide
     - [ ] Example configs
