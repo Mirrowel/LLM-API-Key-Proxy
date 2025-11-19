@@ -28,12 +28,14 @@ class ConfigLoader:
         self.swarms_dir = self.config_dir / "swarms"
         self.fusions_dir = self.config_dir / "fusions"
         self.strategies_dir = self.config_dir / "strategies"
+        self.roles_dir = self.config_dir / "roles"
         
         # Loaded configurations
         self.swarm_default: Optional[Dict[str, Any]] = None
         self.swarm_configs: Dict[str, Dict[str, Any]] = {}
         self.fusion_configs: Dict[str, Dict[str, Any]] = {}
         self.strategies: Dict[str, str] = {}
+        self.role_templates: Dict[str, Dict[str, Any]] = {}
         
     def load_all(self) -> None:
         """Load all configurations from the directory structure."""
@@ -51,15 +53,19 @@ class ConfigLoader:
         # Load strategy templates
         self._load_strategies()
         
+        # Load role templates
+        self._load_roles()
+        
         lib_logger.info(
             f"[HiveMind] Loaded {len(self.swarm_configs)} swarm configs, "
             f"{len(self.fusion_configs)} fusion configs, "
-            f"{len(self.strategies)} strategies"
+            f"{len(self.strategies)} strategies, "
+            f"{len(self.role_templates)} roles"
         )
     
     def _ensure_directories(self) -> None:
         """Create config directories if they don't exist."""
-        for directory in [self.swarms_dir, self.fusions_dir, self.strategies_dir]:
+        for directory in [self.swarms_dir, self.fusions_dir, self.strategies_dir, self.roles_dir]:
             directory.mkdir(parents=True, exist_ok=True)
     
     def _load_swarm_configs(self) -> None:
@@ -161,6 +167,69 @@ class ConfigLoader:
                     f"[HiveMind] Failed to load strategy '{strategy_file.name}': {e}"
                 )
     
+    def _load_roles(self) -> None:
+        """Load role templates from roles/ directory.
+        
+        Supports two formats:
+        1. Single role: {"name": "...", "system_prompt": "...", ...}
+        2. Multiple roles: {"roles": [{"name": "...", ...}, ...]}
+        """
+        if not self.roles_dir.exists():
+            lib_logger.warning(f"[HiveMind] Roles directory not found: {self.roles_dir}")
+            return
+        
+        for role_file in self.roles_dir.glob("*.json"):
+            try:
+                with open(role_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Check if this is the new array format
+                if "roles" in data:
+                    # New format: {"roles": [...]}
+                    roles_list = data.get("roles", [])
+                    if not isinstance(roles_list, list):
+                        lib_logger.warning(
+                            f"[HiveMind] Role file '{role_file.name}' has 'roles' but it's not a list"
+                        )
+                        continue
+                    
+                    for role in roles_list:
+                        self._register_role(role, role_file.name)
+                else:
+                    # Old format: {"name": "...", "system_prompt": "...", ...}
+                    # Use filename as role_id
+                    role_id = role_file.stem
+                    self.role_templates[role_id] = data
+                    lib_logger.debug(f"[HiveMind] Loaded role template '{role_id}'")
+                
+            except Exception as e:
+                lib_logger.error(
+                    f"[HiveMind] Failed to load role template '{role_file.name}': {e}"
+                )
+    
+    def _register_role(self, role: Dict[str, Any], source_file: str) -> None:
+        """Register a single role template."""
+        # Use 'name' field as role_id, convert to lowercase with hyphens
+        role_name = role.get("name")
+        if not role_name:
+            lib_logger.warning(
+                f"[HiveMind] Role in '{source_file}' missing 'name' field"
+            )
+            return
+        
+        # Convert name to role_id (e.g., "Security Expert" -> "security-expert")
+        role_id = role_name.lower().replace(" ", "-")
+        
+        # Check for duplicate IDs
+        if role_id in self.role_templates:
+            lib_logger.warning(
+                f"[HiveMind] Duplicate role ID '{role_id}'. "
+                f"Role from '{source_file}' will override previous."
+            )
+        
+        self.role_templates[role_id] = role
+        lib_logger.debug(f"[HiveMind] Loaded role template '{role_id}' from array")
+    
     def get_swarm_config(self, preset_id: str) -> Dict[str, Any]:
         """
         Get swarm configuration for a specific preset.
@@ -219,6 +288,18 @@ class ConfigLoader:
             Strategy template string or None if not found
         """
         return self.strategies.get(strategy_name)
+    
+    def get_role_template(self, role_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get role template by ID.
+        
+        Args:
+            role_id: Role template identifier (e.g., "architect", "security-expert")
+        
+        Returns:
+            Role template dictionary or None if not found
+        """
+        return self.role_templates.get(role_id)
     
     def get_all_fusion_ids(self) -> List[str]:
         """Get list of all fusion IDs with [fusion] suffix."""

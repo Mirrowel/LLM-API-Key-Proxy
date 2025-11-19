@@ -27,8 +27,8 @@
   "arbiter": {
     "model": "gpt-4o",
     "strategy": "synthesis",
-    "blind": false,
-    "note": "Fusion mode typically uses blind=false to preserve role context"
+    "blind": true,
+    "note": "Fusion mode uses blind=true to hide model names while preserving roles"
   },
   "recursive_mode": {
     "enabled": false,

@@ -347,8 +347,21 @@ class EnsembleManager:
         
         for i, specialist in enumerate(specialists):
             specialist_num = i + 1
+            
+            # Resolve role template if specified
+            if "role_template" in specialist:
+                template_id = specialist["role_template"]
+                template = self.config_loader.get_role_template(template_id)
+                
+                if template:
+                    # Merge template with specialist config (specialist overrides template)
+                    specialist = {**template, **specialist}
+                    lib_logger.debug(f"[HiveMind] Resolved role template '{template_id}' for specialist {specialist_num}")
+                else:
+                    lib_logger.warning(f"[HiveMind] Role template '{template_id}' not found for specialist {specialist_num}")
+            
             specialist_model = specialist.get("model")
-            specialist_role = specialist.get("role", f"Specialist {specialist_num}")
+            specialist_role = specialist.get("role", specialist.get("name", f"Specialist {specialist_num}"))
             specialist_prompt = specialist.get("system_prompt", "")
             specialist_weight = specialist.get("weight", 1.0)
             # MISSING FEATURE FIX: Extract weight description for arbiter context
