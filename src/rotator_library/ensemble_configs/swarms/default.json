@@ -1,5 +1,14 @@
 {
-  "suffix": "[swarm]",
+  "id": "default",
+  "description": "Standard swarm configuration with balanced settings",
+  "base_models": [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-3-5-sonnet",
+    "claude-3-haiku",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
+  ],
   "count": 3,
   
   "temperature_jitter": {

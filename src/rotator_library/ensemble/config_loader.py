@@ -208,3 +208,42 @@ class ConfigLoader:
     def get_all_fusion_ids(self) -> List[str]:
         """Get list of all fusion IDs."""
         return list(self.fusion_configs.keys())
+    
+    def get_all_swarm_model_ids(self) -> List[str]:
+        """
+        Get all discoverable swarm model variants.
+        
+        Generates model IDs from all swarm configs that define base_models.
+        Format: {base_model}-{preset_id}[swarm]
+        
+        Returns:
+            List of swarm model IDs
+        """
+        swarm_models = []
+        
+        for config_file in self.swarms_dir.glob("*.json"):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    
+                    preset_id = config.get("id")
+                    base_models = config.get("base_models", [])
+                    
+                    if not preset_id:
+                        lib_logger.debug(f"Swarm config {config_file.name} missing 'id', skipping")
+                        continue
+                    
+                    if not base_models:
+                        lib_logger.debug(f"Swarm config {preset_id} has no base_models, not discoverable")
+                        continue
+                    
+                    # Generate model IDs: {base_model}-{preset_id}[swarm]
+                    for base_model in base_models:
+                        model_id = f"{base_model}-{preset_id}[swarm]"
+                        swarm_models.append(model_id)
+                        
+            except Exception as e:
+                lib_logger.warning(f"Failed to process swarm config {config_file.name}: {e}")
+        
+        lib_logger.info(f"Discovered {len(swarm_models)} swarm model variants")
+        return swarm_models

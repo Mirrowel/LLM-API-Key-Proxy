@@ -97,38 +97,47 @@ class EnsembleManager:
         """
         Check if model ID contains swarm suffix.
         
+        Supports new preset-based format: {base_model}-{preset_id}[swarm]
+        
         Args:
             model_id: Model ID to check
         
         Returns:
             True if this is a swarm request
         """
-        # Get default suffix from config
-        default_suffix = "[swarm]"
-        if self.config_loader.swarm_default:
-            default_suffix = self.config_loader.swarm_default.get("suffix", "[swarm]")
-        
-        return default_suffix in model_id
+        return model_id.endswith("[swarm]")
     
     def get_base_model(self, swarm_id: str) -> str:
         """
         Extract base model name from swarm ID.
         
+        Supports new format: {base_model}-{preset_id}[swarm]
+        
         Args:
-            swarm_id: Swarm model ID (e.g., "gemini-1.5-flash[swarm]")
+            swarm_id: Swarm model ID (e.g., "gpt-4o-default[swarm]")
         
         Returns:
-            Base model name (e.g., "gemini-1.5-flash")
+            Base model name (e.g., "gpt-4o")
         """
-        # Get suffix from config
-        default_suffix = "[swarm]"
-        if self.config_loader.swarm_default:
-            default_suffix = self.config_loader.swarm_default.get("suffix", "[swarm]")
+        # Remove [swarm] suffix first
+        if swarm_id.endswith("[swarm]"):
+            swarm_id = swarm_id[:-7]  # Remove "[swarm]"
         
-        # Remove suffix
-        if default_suffix in swarm_id:
-            return swarm_id.replace(default_suffix, "")
+        # Parse: {base_model}-{preset_id}
+        # preset_id is the last segment after the last hyphen
+        if "-" in swarm_id:
+            # Split and check if last segment is a preset ID
+            parts = swarm_id.rsplit("-", 1)
+            potential_preset = parts[1]
+            
+            # Check if it's a valid preset ID in our configs
+            # For now, just check if the directory has that config file
+            config_file = self.config_loader.swarms_dir / f"{potential_preset}.json"
+            if config_file.exists():
+                # This is a preset ID, so base_model is everything before it
+                return parts[0]
         
+        # If no preset found or no hyphen, treat entire thing as base_model
         return swarm_id
     
     def resolve_conflicts(self, ensemble_id: str) -> str:

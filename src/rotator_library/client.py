@@ -1799,6 +1799,12 @@ class RotatingClient:
             if fusion_ids:
                 all_provider_models["hivemind_fusion"] = fusion_ids
                 lib_logger.info(f"Added {len(fusion_ids)} HiveMind fusion models")
+            
+            # Add HiveMind swarm models
+            swarm_models = self.ensemble_manager.config_loader.get_all_swarm_model_ids()
+            if swarm_models:
+                all_provider_models["hivemind_swarm"] = swarm_models
+                lib_logger.info(f"Added {len(swarm_models)} HiveMind swarm model variants")
 
         lib_logger.info("Finished getting all available models.")
         if grouped:
