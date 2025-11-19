@@ -281,6 +281,10 @@ class QwenAuthBase:
             # OAuth credential: file path to JSON
             lib_logger.debug(f"Using OAuth credentials from file: {credential_identifier}")
             creds = await self._load_credentials(credential_identifier)
+
+            if self._is_token_expired(creds):
+                creds = await self._refresh_token(credential_identifier)
+                
             base_url = creds.get("resource_url", "https://portal.qwen.ai/v1")
             if not base_url.startswith("http"):
                 base_url = f"https://{base_url}"
