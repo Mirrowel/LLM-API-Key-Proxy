@@ -1,31 +1,31 @@
 {
   "id": "dev-team",
   "description": "A team of specialized models for software development",
-  "models": [
+  "specialists": [
     {
       "model": "gpt-4o",
       "role": "Architect",
-      "system_prompt_append": "Focus on architectural patterns, scalability, and system design.",
-      "weight": "Expert in system design and scalability. Trust for architectural decisions and structural integrity."
+      "system_prompt": "You are a Software Architect. Focus on architectural patterns, scalability, and system design.",
+      "weight": 1.5
     },
     {
       "model": "claude-3-opus",
       "role": "Security Specialist",
-      "system_prompt_append": "Focus on security vulnerabilities, edge cases, and potential exploits.",
-      "weight": "Expert in security and vulnerability assessment. Trust for identifying security flaws and attack vectors."
+      "system_prompt": "You are a Security Expert. Focus on security vulnerabilities, edge cases, and potential exploits.",
+      "weight": 1.2
     },
     {
       "model": "gemini-1.5-pro",
       "role": "Code Reviewer",
-      "system_prompt_append": "Focus on code quality, performance, and best practices.",
-      "weight": "Expert in code quality and performance optimization. Trust for maintainability and efficiency concerns."
+      "system_prompt": "You are a Code Quality Expert. Focus on code quality, performance, and best practices.",
+      "weight": 1.0
     }
   ],
   "arbiter": {
     "model": "gpt-4o",
     "strategy": "synthesis",
-    "blind": true,
-    "note": "Requires a reasoning-capable model for best results"
+    "blind": false,
+    "note": "Fusion mode typically uses blind=false to preserve role context"
   },
   "recursive_mode": {
     "enabled": false,

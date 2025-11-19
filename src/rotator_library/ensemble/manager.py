@@ -468,17 +468,20 @@ class EnsembleManager:
     def _format_for_arbiter(
         self,
         responses: List[Any],
-        config: Dict[str, Any]
+        config: Dict[str, Any],
+        specialist_metadata: Optional[List[Dict[str, Any]]] = None
     ) -> str:
         """
-        Format drone responses for arbiter consumption.
+        Format drone/specialist responses for arbiter consumption.
         
         Creates a structured text format with numbered responses.
         Phase 4: Implements Blind Switch to strip model names.
+        Phase 5: Adds role labels for fusion specialists.
         
         Args:
-            responses: List of successful drone responses
+            responses: List of successful drone/specialist responses
             config: Swarm or fusion configuration
+            specialist_metadata: Optional list of specialist metadata (for fusion mode)
         
         Returns:
             Formatted text string for arbiter
@@ -510,19 +513,34 @@ class EnsembleManager:
                 )
                 continue
             
-            # Phase 4: Blind Switch - determine label
-            if blind_mode:
-                # Strip model info, just use "Response N"
-                label = f"Response {response_num}"
+            # Phase 5: Determine label (with fusion role support)
+            label = f"Response {response_num}"
+            
+            # Check if this is fusion mode with specialist metadata
+            if specialist_metadata and i < len(specialist_metadata):
+                specialist = specialist_metadata[i]
+                role = specialist.get("_specialist_role", "Unknown")
+                
+                if blind_mode:
+                    # Blind mode: show role but not model
+                    label = f"{role}"
+                else:
+                    # Non-blind: show role and model
+                    model_name = specialist.get("model", "unknown")
+                    label = f"{role} ({model_name})"
+                    
                 lib_logger.debug(
-                    f"[HiveMind] Blind mode: Response {response_num} anonymized"
+                    f"[HiveMind] Fusion specialist {response_num}: role={role}, blind={blind_mode}"
                 )
             else:
-                # Include model name
-                model_name = "unknown"
-                if hasattr(response, 'model'):
-                    model_name = response.model
-                label = f"Response {response_num} (Model: {model_name})"
+                # Swarm mode fallback
+                if blind_mode:
+                    label = f"Response {response_num}"
+                else:
+                    model_name = "unknown"
+                    if hasattr(response, 'model'):
+                        model_name = response.model
+                    label = f"Response {response_num} (Model: {model_name})"
             
             # Format: "Label:\n<content>\n"
             formatted_parts.append(f"{label}:\n{content}\n")
@@ -851,9 +869,128 @@ class EnsembleManager:
         
         # Determine type
         if resolved_id in self.config_loader.fusion_configs:
-            lib_logger.info(f"[HiveMind] Processing Fusion request: {resolved_id}")
-            # TODO: Implement fusion handling in Phase 5
-            raise NotImplementedError("Fusion mode not yet implemented (Phase 5)")
+            config = self.config_loader.get_fusion_config(resolved_id)
+            specialists = config.get("specialists", [])
+            is_streaming = kwargs.get("stream", False)
+            
+            lib_logger.info(
+                f"[HiveMind] Processing Fusion request: {resolved_id} "
+                f"({len(specialists)} specialists, streaming: {is_streaming})"
+            )
+            
+            # Phase 5: Fusion mode execution
+            # Prepare specialist models
+            specialist_models = self._prepare_fusion_models(config, kwargs)
+            
+            if not specialist_models:
+                raise ValueError(f"[HiveMind] No valid specialists found for fusion '{resolved_id}'")
+            
+            # Execute specialists in parallel
+            specialist_responses, specialist_usage = await self._execute_parallel(
+                specialist_models, request
+            )
+            
+            # Format responses with role labels
+            formatted_responses = self._format_for_arbiter(
+                specialist_responses,
+                config,
+                specialist_metadata=specialist_models  # Pass specialist metadata for role labels
+            )
+            
+            # Build arbiter prompt
+            original_messages = kwargs.get("messages", [])
+            arbiter_messages = self._build_arbiter_prompt(
+                formatted_responses,
+                config,
+                original_messages
+            )
+            
+            # Get arbiter model
+            arbiter_config = config.get("arbiter", {})
+            arbiter_model = arbiter_config.get("model", "gpt-4o")
+            
+            lib_logger.debug(f"[HiveMind] Using arbiter model: {arbiter_model}")
+            
+            # Update config with arbiter model
+            config_copy = config.copy()
+            config_copy["arbiter"] = arbiter_config.copy()
+            config_copy["arbiter"]["model"] = arbiter_model
+            
+            # Route based on streaming mode
+            if is_streaming:
+                # Streaming fusion (similar to swarm streaming)
+                arbiter_usage = {}
+                async for chunk in self._call_arbiter_streaming(arbiter_messages, config_copy, request):
+                    if isinstance(chunk, dict) and "_hivemind_usage" in chunk:
+                        arbiter_usage = chunk["_hivemind_usage"]
+                        continue
+                    
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        # Final chunk - aggregate usage
+                        total_usage = {
+                            'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage.get('prompt_tokens', 0),
+                            'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage.get('completion_tokens', 0),
+                            'total_tokens': specialist_usage['total_tokens'] + arbiter_usage.get('total_tokens', 0)
+                        }
+                        
+                        for field in ['cached_tokens', 'reasoning_tokens']:
+                            if field in specialist_usage or field in arbiter_usage:
+                                total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                        
+                        chunk.usage.prompt_tokens = total_usage['prompt_tokens']
+                        chunk.usage.completion_tokens = total_usage['completion_tokens']
+                        chunk.usage.total_tokens = total_usage['total_tokens']
+                        
+                        for field in ['cached_tokens', 'reasoning_tokens']:
+                            if field in total_usage:
+                                setattr(chunk.usage, field, total_usage[field])
+                        
+                        lib_logger.info(
+                            f"[HiveMind] Fusion streaming completed. "
+                            f"Total usage: {total_usage['total_tokens']} tokens "
+                            f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage.get('total_tokens', 0)})"
+                        )
+                    
+                    yield chunk
+                
+                return  # Generator exits
+            else:
+                # Non-streaming fusion
+                arbiter_response, arbiter_usage = await self._call_arbiter(
+                    arbiter_messages,
+                    config_copy,
+                    request
+                )
+                
+                # Aggregate usage
+                total_usage = {
+                    'prompt_tokens': specialist_usage['prompt_tokens'] + arbiter_usage['prompt_tokens'],
+                    'completion_tokens': specialist_usage['completion_tokens'] + arbiter_usage['completion_tokens'],
+                    'total_tokens': specialist_usage['total_tokens'] + arbiter_usage['total_tokens']
+                }
+                
+                for field in ['cached_tokens', 'reasoning_tokens']:
+                    if field in specialist_usage or field in arbiter_usage:
+                        total_usage[field] = specialist_usage.get(field, 0) + arbiter_usage.get(field, 0)
+                
+                # Update arbiter response with aggregated usage
+                if hasattr(arbiter_response, 'usage'):
+                    arbiter_response.usage.prompt_tokens = total_usage['prompt_tokens']
+                    arbiter_response.usage.completion_tokens = total_usage['completion_tokens']
+                    arbiter_response.usage.total_tokens = total_usage['total_tokens']
+                    
+                    for field in ['cached_tokens', 'reasoning_tokens']:
+                        if field in total_usage:
+                            setattr(arbiter_response.usage, field, total_usage[field])
+                
+                lib_logger.info(
+                    f"[HiveMind] Fusion completed successfully. "
+                    f"Total usage: {total_usage['total_tokens']} tokens "
+                    f"(Specialists: {specialist_usage['total_tokens']}, Arbiter: {arbiter_usage['total_tokens']})"
+                )
+                
+                return arbiter_response
+
         
         elif self._is_swarm_request(resolved_id):
             base_model = self.get_base_model(resolved_id)
