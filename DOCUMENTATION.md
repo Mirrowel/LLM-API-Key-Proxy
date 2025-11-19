@@ -1,12 +1,15 @@
 # Technical Documentation: Universal LLM API Proxy & Resilience Library
 
-This document provides a detailed technical explanation of the project's two main components: the Universal LLM API Proxy and the Resilience Library that powers it.
+This document provides a detailed technical explanation of the project's architecture, internal components, and data flows. It is intended for developers who want to understand how the system achieves high availability and resilience.
 
 ## 1. Architecture Overview
 
 The project is a monorepo containing two primary components:
 
-1.  **The Proxy Application (`proxy_app`)**: This is the user-facing component. It's a FastAPI application that uses `litellm` to create a universal, OpenAI-compatible API. Its primary role is to abstract away the complexity of dealing with multiple LLM providers, offering a single point of entry for applications like agentic coders.
+1.  **The Proxy Application (`proxy_app`)**: This is the user-facing component. It's a FastAPI application that acts as a universal gateway. It uses `litellm` to translate requests to various provider formats and includes:
+    *   **Batch Manager**: Optimizes high-volume embedding requests.
+    *   **Detailed Logger**: Provides per-request file logging for debugging.
+    *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
 2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
 
 This architecture cleanly separates the API interface from the resilience logic, making the library a portable and powerful tool for any application needing robust API key management.
@@ -28,180 +31,356 @@ The client is initialized with your provider API keys, retry settings, and a new
 ```python
 client = RotatingClient(
     api_keys=api_keys,
+    oauth_credentials=oauth_credentials,
     max_retries=2,
-    global_timeout=30  # in seconds
+    usage_file_path="key_usage.json",
+    configure_logging=True,
+    global_timeout=30,
+    abort_on_callback_error=True,
+    litellm_provider_params={},
+    ignore_models={},
+    whitelist_models={},
+    enable_request_logging=False,
+    max_concurrent_requests_per_key={}
 )
 ```
 
--   `global_timeout`: A crucial new parameter that sets a hard time limit for the entire request lifecycle, from the moment `acompletion` is called until a response is returned or the timeout is exceeded.
+-   `api_keys` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of API keys.
+-   `oauth_credentials` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of file paths to OAuth credential JSON files.
+-   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error occurs.
+-   `usage_file_path` (`str`, default: `"key_usage.json"`): The path to the JSON file where usage statistics are persisted.
+-   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger.
+-   `global_timeout` (`int`, default: `30`): A hard time limit (in seconds) for the entire request lifecycle.
+-   `abort_on_callback_error` (`bool`, default: `True`): If `True`, any exception raised by `pre_request_callback` will abort the request.
+-   `litellm_provider_params` (`Optional[Dict[str, Any]]`, default: `None`): Extra parameters to pass to `litellm` for specific providers.
+-   `ignore_models` (`Optional[Dict[str, List[str]]]`, default: `None`): Blacklist of models to exclude (supports wildcards).
+-   `whitelist_models` (`Optional[Dict[str, List[str]]]`, default: `None`): Whitelist of models to always include, overriding `ignore_models`.
+-   `enable_request_logging` (`bool`, default: `False`): If `True`, enables detailed per-request file logging.
+-   `max_concurrent_requests_per_key` (`Optional[Dict[str, int]]`, default: `None`): Max concurrent requests allowed for a single API key per provider.
 
 #### Core Responsibilities
 
-*   Managing a shared `httpx.AsyncClient` for all non-blocking HTTP requests.
-*   Interfacing with the `UsageManager` to acquire and release API keys.
-*   Dynamically loading and using provider-specific plugins from the `providers/` directory.
-*   Executing API calls via `litellm` with a robust, **deadline-driven** retry and key selection strategy.
-*   Providing a safe, stateful wrapper for handling streaming responses.
-*   Filtering available models using configurable whitelists and blacklists.
+*   **Lifecycle Management**: Manages a shared `httpx.AsyncClient` for all non-blocking HTTP requests.
+*   **Key Management**: Interfacing with the `UsageManager` to acquire and release API keys based on load and health.
+*   **Plugin System**: Dynamically loading and using provider-specific plugins from the `providers/` directory.
+*   **Execution Logic**: Executing API calls via `litellm` with a robust, **deadline-driven** retry and key selection strategy.
+*   **Streaming Safety**: Providing a safe, stateful wrapper (`_safe_streaming_wrapper`) for handling streaming responses, buffering incomplete JSON chunks, and detecting mid-stream errors.
+*   **Model Filtering**: Filtering available models using configurable whitelists and blacklists.
+*   **Request Sanitization**: Automatically cleaning invalid parameters (like `dimensions` for non-OpenAI models) via `request_sanitizer.py`.
 
 #### Model Filtering Logic
 
-The `RotatingClient` provides fine-grained control over which models are exposed via the `/v1/models` endpoint. This is handled by the `get_available_models` method, which is called by `get_all_available_models`.
+The `RotatingClient` provides fine-grained control over which models are exposed via the `/v1/models` endpoint. This is handled by the `get_available_models` method.
 
-The logic is as follows:
-1.  The client is initialized with `ignore_models` (blacklist) and `whitelist_models` dictionaries.
-2.  When `get_available_models` is called for a provider, it first fetches all models from the provider's API.
-3.  It then iterates through this list of actual models and applies the following rules:
-    -   **Whitelist Check**: It first checks if the model matches any pattern in the provider's whitelist. If it does, the model is **immediately included** in the final list, and the blacklist is ignored for this model.
-    -   **Blacklist Check**: If the model is *not* on the whitelist, it is then checked against the blacklist. If it matches a pattern, it is excluded.
-    -   **Default**: If a model is on neither list, it is included.
-4.  This ensures that the whitelist always acts as a definitive override to the blacklist.
+The logic applies in the following order:
+1.  **Whitelist Check**: If a provider has a whitelist defined (`WHITELIST_MODELS_<PROVIDER>`), any model on that list will **always be available**, even if it matches a blacklist pattern. This acts as a definitive override.
+2.  **Blacklist Check**: For any model *not* on the whitelist, the client checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model matches a blacklist pattern (supports wildcards like `*-preview`), it is excluded.
+3.  **Default**: If a model is on neither list, it is included.
 
 #### Request Lifecycle: A Deadline-Driven Approach
 
-The request lifecycle has been redesigned around a single, authoritative time budget to ensure predictable performance and prevent requests from hanging indefinitely.
+The request lifecycle has been designed around a single, authoritative time budget to ensure predictable performance:
 
 1.  **Deadline Establishment**: The moment `acompletion` or `aembedding` is called, a `deadline` is calculated: `time.time() + self.global_timeout`. This `deadline` is the absolute point in time by which the entire operation must complete.
+2.  **Deadline-Aware Key Selection**: The main loop checks this deadline before every key acquisition attempt. If the deadline is exceeded, the request fails immediately.
+3.  **Deadline-Aware Key Acquisition**: The `UsageManager` itself takes this `deadline`. It will only wait for a key (if all are busy) until the deadline is reached.
+4.  **Deadline-Aware Retries**: If a transient error occurs (like a 500 or 429), the client calculates the backoff time. If waiting would push the total time past the deadline, the wait is skipped, and the client immediately rotates to the next key.
 
-2.  **Deadline-Aware Key Selection Loop**: The main `while` loop now has a critical secondary condition: `while len(tried_keys) < len(keys_for_provider) and time.time() < deadline:`. The loop will exit immediately if the `deadline` is reached, regardless of how many keys are left to try.
+#### Streaming Resilience
 
-3.  **Deadline-Aware Key Acquisition**: The `self.usage_manager.acquire_key()` method now accepts the `deadline`. The `UsageManager` will not wait indefinitely for a key; if it cannot acquire one before the `deadline` is met, it will raise a `NoAvailableKeysError`, causing the request to fail fast with a "busy" error.
-
-4.  **Deadline-Aware Retries**: When a transient error occurs, the client calculates the necessary `wait_time` for an exponential backoff. It then checks if this wait time fits within the remaining budget (`deadline - time.time()`).
-    -   **If it fits**: It waits (`asyncio.sleep`) and retries with the same key.
-    -   **If it exceeds the budget**: It skips the wait entirely, logs a warning, and immediately rotates to the next key to avoid wasting time.
-
-5.  **Refined Error Propagation**:
-    -   **Fatal Errors**: Invalid requests or authentication errors are raised immediately to the client.
-    -   **Intermittent Errors**: Temporary issues like server errors and provider-side capacity limits are now handled internally. The error is logged, the key is rotated, but the exception is **not** propagated to the end client. This prevents the client from seeing disruptive, intermittent failures.
-    -   **Final Failure**: A non-streaming request will only return `None` (indicating failure) if either a) the global `deadline` is exceeded, or b) all keys for the provider have been tried and have failed. A streaming request will yield a final `[DONE]` with an error message in the same scenarios.
+The `_safe_streaming_wrapper` is a critical component for stability. It:
+*   **Buffers Fragments**: Reads raw chunks from the stream and buffers them until a valid JSON object can be parsed. This handles providers that may split JSON tokens across network packets.
+*   **Error Interception**: Detects if a chunk contains an API error (like a quota limit) instead of content, and raises a specific `StreamedAPIError`.
+*   **Quota Handling**: If a specific "quota exceeded" error is detected mid-stream multiple times, it can terminate the stream gracefully to prevent infinite retry loops on oversized inputs.
 
 ### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management
 
-This class is the stateful core of the library, managing concurrency, usage, and cooldowns.
+This class is the stateful core of the library, managing concurrency, usage tracking, and cooldowns.
 
 #### Key Concepts
 
-*   **Async-Native & Lazy-Loaded**: The class is fully asynchronous, using `aiofiles` for non-blocking file I/O. The usage data from the JSON file is loaded only when the first request is made (`_lazy_init`).
-*   **Fine-Grained Locking**: Each API key is associated with its own `asyncio.Lock` and `asyncio.Condition` object. This allows for a highly granular and efficient locking strategy.
+*   **Async-Native & Lazy-Loaded**: Fully asynchronous, using `aiofiles` for non-blocking file I/O. Usage data is loaded only when needed.
+*   **Fine-Grained Locking**: Each API key has its own `asyncio.Lock` and `asyncio.Condition`. This allows for highly granular control.
 
-#### Tiered Key Acquisition (`acquire_key`)
+#### Tiered Key Acquisition Strategy
 
-This method implements the intelligent logic for selecting the best key for a job, now with deadline awareness.
+The `acquire_key` method uses a sophisticated strategy to balance load:
 
-1.  **Deadline Enforcement**: The entire acquisition process runs in a `while time.time() < deadline:` loop. If a key cannot be found before the deadline, the method raises `NoAvailableKeysError`.
-2.  **Filtering**: It first filters out any keys that are on a global or model-specific cooldown.
-3.  **Tiering**: It categorizes the remaining, valid keys into two tiers:
-    -   **Tier 1 (Ideal)**: Keys that are completely free (not being used by any model).
-    -   **Tier 2 (Acceptable)**: Keys that are currently in use, but for *different models* than the one being requested. This allows a single key to be used for concurrent calls to, for example, `gemini-1.5-pro` and `gemini-1.5-flash`.
-4.  **Selection**: It attempts to acquire a lock on a key, prioritizing Tier 1 over Tier 2. Within each tier, it prioritizes the key with the lowest usage count.
-5.  **Waiting**: If no keys in Tier 1 or Tier 2 can be locked, it means all eligible keys are currently handling requests for the *same model*. The method then `await`s on the `asyncio.Condition` of the best available key. Crucially, this wait is itself timed out by the remaining request budget, preventing indefinite waits.
+1.  **Filtering**: Keys currently on cooldown (global or model-specific) are excluded.
+2.  **Tiering**: Valid keys are split into two tiers:
+    *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
+    *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
+3.  **Prioritization**: Within each tier, keys with the **lowest daily usage** are prioritized to spread costs evenly.
+4.  **Concurrency Limits**: Checks against `max_concurrent` limits to prevent overloading a single key.
 
-#### Failure Handling & Cooldowns (`record_failure`)
+#### Failure Handling & Cooldowns
 
-*   **Escalating Backoff**: When a failure is recorded, it applies a cooldown that increases with the number of consecutive failures for that specific key-model pair (e.g., 10s, 30s, 60s, up to 2 hours).
-*   **Authentication Errors**: These are treated more severely, applying an immediate 5-minute key-level lockout.
-*   **Key-Level Lockouts**: If a single key accumulates 3 or more long-term (2-hour) cooldowns across different models, the manager assumes the key is compromised or disabled and applies a 5-minute global lockout on the key.
+*   **Escalating Backoff**: When a failure occurs, the key gets a temporary cooldown for that specific model. Consecutive failures increase this time (10s -> 30s -> 60s -> 120s).
+*   **Key-Level Lockouts**: If a key accumulates failures across multiple distinct models (3+), it is assumed to be dead/revoked and placed on a global 5-minute lockout.
+*   **Authentication Errors**: Immediate 5-minute global lockout.
 
-### Data Structure
+### 2.3. `batch_manager.py` - Efficient Request Aggregation
 
-The `key_usage.json` file has a more complex structure to store this detailed state:
-```json
-{
-  "api_key_hash": {
-    "daily": {
-      "date": "YYYY-MM-DD",
-      "models": {
-        "gemini/gemini-1.5-pro": {
-          "success_count": 10,
-          "prompt_tokens": 5000,
-          "completion_tokens": 10000,
-          "approx_cost": 0.075
-        }
-      }
-    },
-    "global": { /* ... similar to daily, but accumulates over time ... */ },
-    "model_cooldowns": {
-      "gemini/gemini-1.5-flash": 1719987600.0
-    },
-    "failures": {
-      "gemini/gemini-1.5-flash": {
-        "consecutive_failures": 2
-      }
-    },
-    "key_cooldown_until": null,
-    "last_daily_reset": "YYYY-MM-DD"
-  }
-}
+The `EmbeddingBatcher` class optimizes high-throughput embedding workloads.
+
+*   **Mechanism**: It uses an `asyncio.Queue` to collect incoming requests.
+*   **Triggers**: A batch is dispatched when either:
+    1.  The queue size reaches `batch_size` (default: 64).
+    2.  A time window (`timeout`, default: 0.1s) elapses since the first request in the batch.
+*   **Efficiency**: This reduces dozens of HTTP calls to a single API request, significantly reducing overhead and rate limit usage.
+
+### 2.4. `background_refresher.py` - Automated Token Maintenance
+
+The `BackgroundRefresher` ensures that OAuth tokens (for providers like Gemini CLI, Qwen, iFlow) never expire while the proxy is running.
+
+*   **Periodic Checks**: It runs a background task that wakes up at a configurable interval (default: 3600 seconds/1 hour).
+*   **Proactive Refresh**: It iterates through all loaded OAuth credentials and calls their `proactively_refresh` method to ensure tokens are valid before they are needed.
+
+### 2.6. Credential Management Architecture
+
+The `CredentialManager` class (`credential_manager.py`) centralizes the lifecycle of all API credentials. It adheres to a "Local First" philosophy.
+
+#### 2.6.1. Automated Discovery & Preparation
+
+On startup (unless `SKIP_OAUTH_INIT_CHECK=true`), the manager performs a comprehensive sweep:
+
+1. **System-Wide Scan**: Searches for OAuth credential files in standard locations:
+   - `~/.gemini/` → All `*.json` files (typically `credentials.json`)
+   - `~/.qwen/` → All `*.json` files (typically `oauth_creds.json`)
+   - `~/.iflow/` → All `*. json` files
+
+2. **Local Import**: Valid credentials are **copied** (not moved) to the project's `oauth_creds/` directory with standardized names:
+   -  `gemini_cli_oauth_1.json`, `gemini_cli_oauth_2.json`, etc.
+   - `qwen_code_oauth_1.json`, `qwen_code_oauth_2.json`, etc.
+   - `iflow_oauth_1.json`, `iflow_oauth_2.json`, etc.
+
+3. **Intelligent Deduplication**: 
+   - The manager inspects each credential file for a `_proxy_metadata` field containing the user's email or ID
+   - If this field doesn't exist, it's added during import using provider-specific APIs (e.g., fetching Google account email for Gemini)
+   - Duplicate accounts (same email/ID) are detected and skipped with a warning log
+   - Prevents the same account from being added multiple times, even if the files are in different locations
+
+4. **Isolation**: The project's credentials in `oauth_creds/` are completely isolated from system-wide credentials, preventing cross-contamination
+
+#### 2.6.2. Credential Loading & Stateless Operation
+
+The manager supports loading credentials from two sources, with a clear priority:
+
+**Priority 1: Local Files** (`oauth_creds/` directory)
+- Standard `.json` files are loaded first
+- Naming convention: `{provider}_oauth_{number}.json`
+- Example: `oauth_creds/gemini_cli_oauth_1.json`
+
+**Priority 2: Environment Variables** (Stateless Deployment)
+- If no local files are found, the manager checks for provider-specific environment variables
+- This is the key to "Stateless Deployment" for platforms like Railway, Render, Heroku
+
+**Gemini CLI Environment Variables:**
+```
+GEMINI_CLI_ACCESS_TOKEN
+GEMINI_CLI_REFRESH_TOKEN
+GEMINI_CLI_E XPIRY_DATE
+GEMINI_CLI_EMAIL
+GEMINI_CLI_PROJECT_ID (optional)
+GEMINI_CLI_CLIENT_ID (optional)
 ```
 
-## 3. `error_handler.py`
+**Qwen Code Environment Variables:**
+```
+QWEN_CODE_ACCESS_TOKEN
+QWEN_CODE_REFRESH_TOKEN
+QWEN_CODE_EXPIRY_DATE
+QWEN_CODE_EMAIL
+```
 
-This module provides a centralized function, `classify_error`, which is a significant improvement over simple boolean checks.
+**iFlow Environment Variables:**
+```
+IFLOW_ACCESS_TOKEN
+IFLOW_REFRESH_TOKEN
+IFLOW_EXPIRY_DATE
+IFLOW_EMAIL
+IFLOW_API_KEY
+```
 
-*   It takes a raw exception from `litellm` and returns a `ClassifiedError` data object.
-*   This object contains the `error_type` (e.g., `'rate_limit'`, `'authentication'`), the original exception, the status code, and any `retry_after` information extracted from the error message.
-*   This structured classification allows the `RotatingClient` to make more intelligent decisions about whether to retry with the same key or rotate to a new one.
+**How it works:**
+- If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
+- The credential behaves exactly like a file-based credential (automatic refresh, expiry detection, etc.)
+- No physical files are created or needed on the host system
+- Perfect for ephemeral containers or read-only filesystems
 
-### 2.4. `providers/` - Provider Plugins
+#### 2.6.3. Credential Tool Integration
 
-The provider plugin system allows for easy extension. The `__init__.py` file in this directory dynamically scans for all modules ending in `_provider.py`, imports the provider class from each, and registers it in the `PROVIDER_PLUGINS` dictionary. This makes adding new providers as simple as dropping a new file into the directory.
+The `credential_tool.py` provides a user-friendly CLI interface to the `CredentialManager`:
+
+**Key Functions:**
+1. **OAuth Setup**: Wraps provider-specific `AuthBase` classes (`GeminiAuthBase`, `QwenAuthBase`, `IFlowAuthBase`) to handle interactive login flows
+2. **Credential Export**: Reads local `.json` files and generates `.env` format output for stateless deployment
+3. **API Key Management**: Adds or updates `PROVIDER_API_KEY_N` entries in the `.env` file
 
 ---
 
-## 3. `proxy_app` - The FastAPI Proxy
+### 2.7. Request Sanitizer (`request_sanitizer.py`)
 
-The `proxy_app` directory contains the FastAPI application that serves the `rotator_library`.
+The `sanitize_request_payload` function ensures requests are compatible with each provider's specific requirements:
 
-### 3.1. `main.py` - The FastAPI App
+**Parameter Cleaning Logic:**
 
-This file defines the web server and its endpoints.
+1. **`dimensions` Parameter**:
+   - Only supported by OpenAI's `text-embedding-3-small` and `text-embedding-3-large` models
+   - Automatically removed for all other models to prevent `400 Bad Request` errors
 
-#### Lifespan Management
+2. **`thinking` Parameter** (Gemini-specific):
+   - Format: `{"type": "enabled", "budget_tokens": -1}`
+   - Only valid for `gemini/gemini-2.5-pro` and `gemini/gemini-2.5-flash`
+   - Removed for all other models
 
-The application uses FastAPI's `lifespan` context manager to manage the `RotatingClient` instance. The client is initialized when the application starts and gracefully closed (releasing its `httpx` resources) when the application shuts down. This ensures that a single, stateful client instance is shared across all requests.
+**Provider-Specific Tool Schema Cleaning:**
 
-#### Endpoints
+Implemented in individual provider classes (`QwenCodeProvider`, `IFlowProvider`):
 
-*   `POST /v1/chat/completions`: The main endpoint for chat requests.
-*   `POST /v1/embeddings`: The endpoint for creating embeddings.
-*   `GET /v1/models`: Returns a list of all available models from configured providers.
-*   `GET /v1/providers`: Returns a list of all configured providers.
-*   `POST /v1/token-count`: Calculates the token count for a given message payload.
+- **Recursively removes** unsupported properties from tool function schemas:
+  - `strict`: OpenAI-specific, causes validation errors on Qwen/iFlow
+  - `additionalProperties`: Same issue
+- **Prevents `400 Bad Request` errors** when using complex tool definitions
+- Applied automatically before sending requests to the provider
 
-#### Authentication
+---
 
-All endpoints are protected by the `verify_api_key` dependency, which checks for a valid `Authorization: Bearer <PROXY_API_KEY>` header.
+### 2.8. Error Classification (`error_handler.py`)
 
-#### Streaming Response Handling
+The `ClassifiedError` class wraps all exceptions from `litellm` and categorizes them for intelligent handling:
 
-For streaming requests, the `chat_completions` endpoint returns a `StreamingResponse` whose content is generated by the `streaming_response_wrapper` function. This wrapper serves two purposes:
-1.  It passes the chunks from the `RotatingClient`'s stream directly to the user.
-2.  It aggregates the full response in the background so that it can be logged completely once the stream is finished.
+**Error Types:**
+```python
+class ErrorType(Enum):
+    RATE_LIMIT = "rate_limit"           # 429 errors, temporary backoff needed
+    AUTHENTICATION = "authentication"    # 401/403, invalid/revoked key
+    SERVER_ERROR = "server_error"       # 500/502/503, provider infrastructure issues
+    QUOTA = "quota"                      # Daily/monthly quota exceeded
+    CONTEXT_LENGTH = "context_length"    # Input too long for model
+    CONTENT_FILTER = "content_filter"    # Request blocked by safety filters
+    NOT_FOUND = "not_found"              # Model/endpoint doesn't exist
+    TIMEOUT = "timeout"                  # Request took too long
+    UNKNOWN = "unknown"                  # Unclassified error
+```
 
-### 3.2. `detailed_logger.py` - Comprehensive Transaction Logging
+**Classification Logic:**
 
-To facilitate robust debugging and performance analysis, the proxy includes a powerful detailed logging system, enabled by the `--enable-request-logging` command-line flag. This system is managed by the `DetailedLogger` class in `detailed_logger.py`.
+1. **Status Code Analysis**: Primary classification method
+   - `401`/`403` → `AUTHENTICATION`
+   - `429` → `RATE_LIMIT`
+   - `400` with "context_length" or "tokens" → `CONTEXT_LENGTH`
+   - `400` with "quota" → `QUOTA`
+   - `500`/`502`/`503` → `SERVER_ERROR`
 
-Unlike simple logging, this system creates a **unique directory for every single transaction**, ensuring that all related data is isolated and easy to analyze.
+2. **Message Analysis**: Fallback for ambiguous errors
+   - Searches for keywords like "quota exceeded", "rate limit", "invalid api key"
 
-#### Log Directory Structure
+3. **Provider-Specific Overrides**: Some providers use non-standard error formats
 
-When logging is enabled, each request will generate a new directory inside `logs/detailed_logs/` with a name like `YYYYMMDD_HHMMSS_unique-uuid`. Inside this directory, you will find a complete record of the transaction:
+**Usage in Client:**
+- `AUTHENTICATION` → Immediate 5-minute global lockout
+- `RATE_LIMIT`/`QUOTA` → Escalating per-model cooldown
+- `SERVER_ERROR` → Retry with same key (up to `max_retries`)
+- `CONTEXT_LENGTH`/`CONTENT_FILTER` → Immediate failure (user needs to fix request)
 
--   **`request.json`**: Contains the full incoming request, including HTTP headers and the JSON body.
--   **`streaming_chunks.jsonl`**: For streaming requests, this file contains a timestamped log of every individual data chunk received from the provider. This is invaluable for debugging malformed streams or partial responses.
--   **`final_response.json`**: Contains the complete final response from the provider, including the status code, headers, and full JSON body. For streaming requests, this body is the fully reassembled message.
--   **`metadata.json`**: A summary file for quick analysis, containing:
-    -   `request_id`: The unique identifier for the transaction.
-    -   `duration_ms`: The total time taken for the request to complete.
-    -   `status_code`: The final HTTP status code returned by the provider.
-    -   `model`: The model used for the request.
-    -   `usage`: Token usage statistics (`prompt`, `completion`, `total`).
-    -   `finish_reason`: The reason the model stopped generating tokens.
-    -   `reasoning_found`: A boolean indicating if a `reasoning` field was detected in the response.
-    -   `reasoning_content`: The extracted content of the `reasoning` field, if found.
+---
 
-### 3.3. `build.py`
+### 2.9. Cooldown Management (`cooldown_manager.py`)
 
-This is a utility script for creating a standalone executable of the proxy application using PyInstaller. It includes logic to dynamically find all provider plugins and explicitly include them as hidden imports, ensuring they are bundled into the final executable.
+The `CooldownManager` handles IP or account-level rate limiting that affects all keys for a provider:
+
+**Purpose:**
+- Some providers (like NVIDIA NIM) have rate limits tied to account/IP rather than API key
+- When a 429 error occurs, ALL keys for that provider must be paused
+
+**Key Methods:**
+
+1. **`is_cooling_down(provider: str) -> bool`**:
+   - Checks if a provider is currently in a global cooldown period
+   - Returns `True` if the current time is still within the cooldown window
+
+2. **`start_cooldown(provider: str, duration: int)`**:
+   - Initiates or extends a cooldown for a provider
+   - Duration is typically 60-120 seconds for 429 errors
+
+3. **`get_cooldown_remaining(provider: str) -> float`**:
+   - Returns remaining cooldown time in seconds
+   - Used for logging and diagnostics
+
+**Integration with UsageManager:**
+- When a key fails with `RATE_LIMIT` error type, the client checks if it's likely an IP-level limit
+- If so, `CooldownManager.start_cooldown()` is called for the entire provider
+- All subsequent `acquire_key()` calls for that provider will wait until the cooldown expires
+
+---
+
+## 3. Provider Specific Implementations
+
+The library handles provider idiosyncrasies through specialized "Provider" classes in `src/rotator_library/providers/`.
+
+### 3.1. Gemini CLI (`gemini_cli_provider.py`)
+
+The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
+
+#### Authentication (`gemini_auth_base.py`)
+
+ *   **Device Flow**: Uses a standard OAuth 2.0 flow. The `credential_tool` spins up a local web server (`localhost:8085`) to capture the callback from Google's auth page.
+*   **Token Lifecycle**:
+    *   **Proactive Refresh**: Tokens are refreshed 5 minutes before expiry.
+    *   **Atomic Writes**: Credential files are updated using a temp-file-and-move strategy to prevent corruption during writes.
+    *   **Revocation Handling**: If a `400` or `401` occurs during refresh, the token is marked as revoked, preventing infinite retry loops.
+
+#### Project ID Discovery (Zero-Config)
+
+The provider employs a sophisticated, cached discovery mechanism to find a valid Google Cloud Project ID:
+1.  **Configuration**: Checks `GEMINI_CLI_PROJECT_ID` first.
+2.  **Code Assist API**: Tries `CODE_ASSIST_ENDPOINT:loadCodeAssist`. This returns the project associated with the Cloud Code extension.
+3.  **Onboarding Flow**: If step 2 fails, it triggers the `onboardUser` endpoint. This initiates a Long-Running Operation (LRO) that automatically provisions a free-tier Google Cloud Project for the user. The proxy polls this operation for up to 5 minutes until completion.
+4.  **Resource Manager**: As a final fallback, it lists all active projects via the Cloud Resource Manager API and selects the first one.
+
+#### Rate Limit Handling
+
+*   **Internal Endpoints**: Uses `https://cloudcode-pa.googleapis.com/v1internal`, which typically has higher quotas than the public API.
+*   **Smart Fallback**: If `gemini-2.5-pro` hits a rate limit (`429`), the provider transparently retries the request using `gemini-2.5-pro-preview-06-05`. This fallback chain is configurable in code.
+
+### 3.2. Qwen Code (`qwen_code_provider.py`)
+
+*   **Dual Auth**: Supports both standard API keys (direct) and OAuth (via `QwenAuthBase`).
+*   **Device Flow**: Implements the OAuth Device Authorization Grant (RFC 8628). It displays a code to the user and polls the token endpoint until the user authorizes the device in their browser.
+*   **Dummy Tool Injection**: To work around a Qwen API bug where streams hang if `tools` is empty but `tool_choice` logic is present, the provider injects a benign `do_not_call_me` tool.
+*   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from tool schemas, as Qwen's validation is stricter than OpenAI's.
+*   **Reasoning Parsing**: Detects `<think>` tags in the raw stream and redirects their content to a separate `reasoning_content` field in the delta, mimicking the OpenAI o1 format.
+
+### 3.3. iFlow (`iflow_provider.py`)
+
+*   **Hybrid Auth**: Uses a custom OAuth flow (Authorization Code) to obtain an `access_token`. However, the *actual* API calls use a separate `apiKey` that is retrieved from the user's profile (`/api/oauth/getUserInfo`) using the access token.
+*   **Callback Server**: The auth flow spins up a local server on port `11451` to capture the redirect.
+*   **Token Management**: Automatically refreshes the OAuth token and re-fetches the API key if needed.
+*   **Schema Cleaning**: Similar to Qwen, it aggressively sanitizes tool schemas to prevent 400 errors.
+*   **Dedicated Logging**: Implements `_IFlowFileLogger` to capture raw chunks for debugging proprietary API behaviors.
+
+### 3.4. Google Gemini (`gemini_provider.py`)
+
+*   **Thinking Parameter**: Automatically handles the `thinking` parameter transformation required for Gemini 2.5 models (`thinking` -> `gemini-2.5-pro` reasoning parameter).
+*   **Safety Settings**: Ensures default safety settings (blocking nothing) are applied if not provided, preventing over-sensitive refusals.
+
+---
+
+## 4. Logging & Debugging
+
+### `detailed_logger.py`
+
+To facilitate robust debugging, the proxy includes a comprehensive transaction logging system.
+
+*   **Unique IDs**: Every request generates a UUID.
+*   **Directory Structure**: Logs are stored in `logs/detailed_logs/YYYYMMDD_HHMMSS_{uuid}/`.
+*   **Artifacts**:
+    *   `request.json`: The exact payload sent to the proxy.
+    *   `final_response.json`: The complete reassembled response.
+    *   `streaming_chunks.jsonl`: A line-by-line log of every SSE chunk received from the provider.
+    *   `metadata.json`: Performance metrics (duration, token usage, model used).
+
+This level of detail allows developers to trace exactly why a request failed or why a specific key was rotated.
+
+
