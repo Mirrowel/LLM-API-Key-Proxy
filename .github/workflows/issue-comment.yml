@@ -21,6 +21,7 @@ jobs:
       # If triggered by 'issues', it uses github.event.issue.number.
       # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
 
     steps:
 
@@ -48,11 +49,14 @@ jobs:
             /repos/${{ github.repository }}/issues/${{ env.ISSUE_NUMBER }}/reactions \
             -f content='eyes'
 
+      - name: Save secure prompt from base branch
+        run: cp .github/prompts/issue-comment.md /tmp/issue-comment.md
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ steps.setup.outputs.token }}
-          fetch-depth: 0
+          fetch-depth: 0  # Full history needed for git log, git blame, and other investigation commands
 
       - name: Fetch and Format Full Issue Context
         id: issue_details
@@ -72,10 +76,38 @@ jobs:
           created_at=$(echo "$issue_data" | jq -r .createdAt)
           state=$(echo "$issue_data" | jq -r .state)
           title=$(echo "$issue_data" | jq -r .title)
-          body=$(echo "$issue_data" | jq -r .body)
+          body=$(echo "$issue_data" | jq -r '.body // "(No description provided)"')
 
-          # Prepare comments
-          comments=$(echo "$issue_data" | jq -r 'if (.comments | length) > 0 then .comments[] | "- \(.author.login // "unknown") at \(.createdAt // "N/A"):\n\(.body // "")\n" else "No comments have been posted yet." end')
+          # Prepare comments (exclude ignored bots)
+          total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
+          echo "Debug: total issue comments before filtering = $total_issue_comments"
+          comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
+          if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+            filtered_comments=$(echo "$comments" | grep -c "^- " || true)
+            filtered_comments=${filtered_comments//[^0-9]/}
+            [ -z "$filtered_comments" ] && filtered_comments=0
+            total_issue_comments=${total_issue_comments//[^0-9]/}
+            [ -z "$total_issue_comments" ] && total_issue_comments=0
+            excluded_comments=$(( total_issue_comments - filtered_comments )) || excluded_comments=0
+            echo "✓ Filtered comments: $filtered_comments included, $excluded_comments excluded (ignored bots)"
+            if [ -s "$comments_filter_err" ]; then
+              echo "::debug::jq stderr (issue comments) emitted output:"
+              cat "$comments_filter_err"
+            fi
+          else
+            jq_status=$?
+            echo "::warning::Issue comment filtering failed (exit $jq_status), using unfiltered data"
+            if [ -s "$comments_filter_err" ]; then
+              echo "::warning::jq stderr (issue comments):"
+              cat "$comments_filter_err"
+            else
+              echo "::warning::jq returned no stderr for issue comment filter"
+            fi
+            comments=$(echo "$issue_data" | jq -r 'if (((.comments // []) | length) > 0) then ((.comments[]?) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end')
+            excluded_comments=0
+            echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
+          fi
+          rm -f "$comments_filter_err" || true
 
           # Prepare cross-references
           references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
@@ -114,9 +146,12 @@ jobs:
             {
               "bash": {
                 "gh*": "allow",
-                "git*": "allow"
+                "git*": "allow",
+                "jq*": "allow"
               },
               "webfetch": "deny"
             }
         run: |
-            envsubst < .github/prompts/issue-comment.md | opencode run --share -
+            # Only substitute the variables we intend; leave example $vars and secrets intact
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}'
+            envsubst "$VARS" < /tmp/issue-comment.md | opencode run --share -
