@@ -337,6 +337,17 @@ async def lifespan(app: FastAPI):
     )
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
+    
+    # Warn if no provider credentials are configured
+    if not client.all_credentials:
+        logging.warning("=" * 70)
+        logging.warning("⚠️  NO PROVIDER CREDENTIALS CONFIGURED")
+        logging.warning("The proxy is running but cannot serve any LLM requests.")
+        logging.warning("Launch the credential tool to add API keys or OAuth credentials.")
+        logging.warning("  • Executable: Run with --add-credential flag")
+        logging.warning("  • Source: python src/proxy_app/main.py --add-credential")
+        logging.warning("=" * 70)
+    
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
     litellm.drop_params = True
@@ -747,6 +758,56 @@ async def token_count(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
+    # Define ENV_FILE for onboarding checks
+    ENV_FILE = Path.cwd() / ".env"
+    
+    def needs_onboarding() -> bool:
+        """
+        Check if the proxy needs onboarding (first-time setup).
+        Returns True if onboarding is needed, False otherwise.
+        """
+        # Check 1: Does .env file exist?
+        if not ENV_FILE.is_file():
+            return True
+        
+        # Check 2: Is PROXY_API_KEY set in environment?
+        if not PROXY_API_KEY:
+            return True
+        
+        return False
+
+    def show_onboarding_message():
+        """Display clear explanatory message for why onboarding is needed."""
+        console.clear()  # Clear terminal for clean presentation
+        console.print(Panel.fit(
+            "[bold cyan]🚀 LLM API Key Proxy - First Time Setup[/bold cyan]",
+            border_style="cyan"
+        ))
+        console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
+        
+        console.print("The proxy cannot start because:")
+        if not ENV_FILE.is_file():
+            console.print("  [red]❌ No .env file found[/red]")
+        else:
+            console.print("  [red]❌ PROXY_API_KEY is not set in .env[/red]")
+        
+        console.print("\n[bold]Why this matters:[/bold]")
+        console.print("  • The .env file stores your proxy's authentication key")
+        console.print("  • The PROXY_API_KEY protects your proxy from unauthorized access")
+        console.print("  • Without it, the proxy cannot securely start")
+        
+        console.print("\n[bold]What happens next:[/bold]")
+        console.print("  1. We'll create a .env file with a default PROXY_API_KEY")
+        console.print("  2. You can add LLM provider credentials (API keys or OAuth)")
+        console.print("  3. The proxy will then start normally")
+        
+        console.print("\n[bold yellow]⚠️  Important:[/bold yellow] While provider credentials are optional for startup,")
+        console.print("   the proxy won't do anything useful without them. See [bold cyan]README.md[/bold cyan]")
+        console.print("   for supported providers and setup instructions.\n")
+        
+        console.input("[bold green]Press Enter to launch the credential setup tool...[/bold green]")
+
+    # Check if user explicitly wants to add credentials
     if args.add_credential:
         # Import and call ensure_env_defaults to create .env and PROXY_API_KEY if needed
         from rotator_library.credential_tool import ensure_env_defaults
@@ -755,8 +816,41 @@ if __name__ == "__main__":
         load_dotenv(override=True)
         run_credential_tool()
     else:
+        # Check if onboarding is needed
+        if needs_onboarding():
+            # Import console from rich for better messaging
+            from rich.console import Console
+            from rich.panel import Panel
+            console = Console()
+            
+            # Show clear explanatory message
+            show_onboarding_message()
+            
+            # Launch credential tool automatically
+            from rotator_library.credential_tool import ensure_env_defaults
+            ensure_env_defaults()
+            load_dotenv(override=True)
+            run_credential_tool()
+            
+            # After credential tool exits, reload and re-check
+            load_dotenv(override=True)
+            # Re-read PROXY_API_KEY from environment
+            PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+            
+            # Verify onboarding is complete
+            if needs_onboarding():
+                console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
+                console.print("The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n")
+                sys.exit(1)
+            else:
+                console.print("\n[bold green]✅ Configuration complete![/bold green]")
+                console.print("\nStarting proxy server...\n")
+        
         # Validate PROXY_API_KEY before starting the server
         if not PROXY_API_KEY:
             raise ValueError("PROXY_API_KEY environment variable not set. Please run with --add-credential to set up your environment.")
+        
         import uvicorn
         uvicorn.run(app, host=args.host, port=args.port)
+
+

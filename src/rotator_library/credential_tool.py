@@ -515,6 +515,7 @@ async def main():
     """
     An interactive CLI tool to add new credentials.
     """
+    console.clear()  # Clear terminal when credential tool starts
     ensure_env_defaults()
     console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
     
@@ -593,5 +594,7 @@ async def main():
 def run_credential_tool():
     try:
         asyncio.run(main())
+        console.clear()  # Clear terminal when credential tool exits
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Exiting setup.[/bold yellow]")
+        console.clear()  # Clear terminal on keyboard interrupt too

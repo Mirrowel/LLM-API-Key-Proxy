@@ -88,8 +88,8 @@ class RotatingClient:
         }
 
         if not api_keys and not oauth_credentials:
-            raise ValueError(
-                "No valid credentials provided. Either 'api_keys' or 'oauth_credentials' must be provided and non-empty."
+            lib_logger.warning(
+                "No provider credentials configured. The client will be unable to make any API requests."
             )
 
         self.api_keys = api_keys
