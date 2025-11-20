@@ -88,13 +88,11 @@ def _register_providers():
                 if provider_name == "nvidia":
                     provider_name = "nvidia_nim"
                 PROVIDER_PLUGINS[provider_name] = attribute
-                # print(f"Registered provider: {provider_name}")
+                import logging
+                logging.getLogger('rotator_library').debug(f"Registered provider: {provider_name}")
 
     # Then, create dynamic plugins for custom OpenAI-compatible providers
-    # Load environment variables to find custom providers
-    from dotenv import load_dotenv
-
-    load_dotenv()
+    # Use environment variables directly (load_dotenv already called in main.py)
 
     for env_var in os.environ:
         if env_var.endswith("_API_BASE"):
@@ -128,7 +126,8 @@ def _register_providers():
             # Create and register the plugin class
             plugin_class = create_plugin_class(provider_name)
             PROVIDER_PLUGINS[provider_name] = plugin_class
-            # print(f"Registered dynamic provider: {provider_name}")
+            import logging
+            logging.getLogger('rotator_library').debug(f"Registered dynamic provider: {provider_name}")
 
 
 # Discover and register providers when the package is imported

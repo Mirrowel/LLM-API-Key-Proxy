@@ -27,7 +27,7 @@ def main():
     """
     Constructs and runs the PyInstaller command to build the executable.
     """
-    # Base PyInstaller command
+    # Base PyInstaller command with optimizations
     command = [
         "python",
         "-m",
@@ -39,11 +39,25 @@ def main():
         "../",
         "--paths",
         ".",
+        # Core imports
         "--hidden-import=rotator_library",
         "--hidden-import=tiktoken_ext.openai_public",
         "--hidden-import=tiktoken_ext",
         "--collect-data",
         "litellm",
+        # Optimization: Exclude unused heavy modules
+        "--exclude-module=tkinter",
+        "--exclude-module=matplotlib",
+        "--exclude-module=IPython",
+        "--exclude-module=jupyter",
+        "--exclude-module=notebook",
+        "--exclude-module=PIL.ImageTk",
+        "--exclude-module=setuptools",
+        "--exclude-module=distutils",
+        # Optimization: Enable UPX compression (if available)
+        "--upx-dir=upx" if platform.system() != "Darwin" else "--noupx",  # macOS has issues with UPX
+        # Optimization: Strip debug symbols (smaller binary)
+        "--strip" if platform.system() != "Windows" else "--console",  # Windows gets clean console
     ]
 
     # Add hidden imports for providers

@@ -16,7 +16,6 @@ on:
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
-      - 'launcher.bat'
       - '.github/workflows/build.yml'
       - 'cliff.toml'
 
@@ -97,7 +96,6 @@ jobs:
       run: |
         stagingDir="staging"
         mkdir -p $stagingDir
-        cp launcher.bat "$stagingDir/"
         if [ "${{ runner.os }}" == "Windows" ]; then
           cp src/proxy_app/dist/proxy_app.exe "$stagingDir/"
         else
@@ -367,9 +365,8 @@ jobs:
         # Generate file descriptions
         FILE_TABLE="| File | Description |
         |------|-------------|
-        | \`proxy_app.exe\` | Main application executable for **Windows**. |
-        | \`proxy_app\` | Main application executable for **Linux** and **macOS**. |
-        | \`launcher.bat\` | A batch script to easily configure and run the proxy on Windows. |"
+        | \`proxy_app.exe\` | Main application executable with built-in TUI launcher for **Windows**. |
+        | \`proxy_app\` | Main application executable with built-in TUI launcher for **Linux** and **macOS**. |"
 
         # List archives
         WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')

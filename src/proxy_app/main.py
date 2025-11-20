@@ -1,29 +1,97 @@
-print("Proxy starting...")
-print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+import time
+
+# Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
 import os
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from fastapi.security import APIKeyHeader
-from dotenv import load_dotenv
-import colorlog
 from pathlib import Path
 import sys
-import json
-import time
-from typing import AsyncGenerator, Any, List, Optional, Union
-from pydantic import BaseModel, Field
 import argparse
 import logging
 
-# --- Early Log Level Configuration ---
-# Set the log level for LiteLLM before it's imported to prevent startup spam.
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+# --- Argument Parsing (BEFORE heavy imports) ---
+parser = argparse.ArgumentParser(description="API Key Proxy Server")
+parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
+parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
+parser.add_argument("--enable-request-logging", action="store_true", help="Enable request logging.")
+parser.add_argument("--add-credential", action="store_true", help="Launch the interactive tool to add a new OAuth credential.")
+args, _ = parser.parse_known_args()
 
-import litellm
+# Add the 'src' directory to the Python path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+# Check if we should launch TUI (no arguments = TUI mode)
+if len(sys.argv) == 1:
+    # TUI MODE - Load ONLY what's needed for the launcher (fast path!)
+    from proxy_app.launcher_tui import run_launcher_tui
+    run_launcher_tui()
+    # Launcher modifies sys.argv and returns, or exits if user chose Exit
+    # If we get here, user chose "Run Proxy" and sys.argv is modified
+    # Re-parse arguments with modified sys.argv
+    args = parser.parse_args()
+
+# Check if credential tool mode (also doesn't need heavy proxy imports)
+if args.add_credential:
+    from rotator_library.credential_tool import run_credential_tool
+    run_credential_tool()
+    sys.exit(0)
+
+# If we get here, we're ACTUALLY running the proxy - NOW show startup messages and start timer
+_start_time = time.time()
+print("━" * 70)
+print(f"Starting proxy on {args.host}:{args.port}")
+print(f"Proxy API Key: {'✓ Set' if os.getenv('PROXY_API_KEY') else '✗ Not Set'}")
+print(f"GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+print("━" * 70)
+print("Loading server components...")
+
+
+# Phase 2: Load Rich for loading spinner (lightweight)
+from rich.console import Console
+_console = Console()
+
+# Phase 3: Heavy dependencies with granular loading messages
+print("  → Loading FastAPI framework...")
+with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, Request, HTTPException, Depends
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import StreamingResponse
+    from fastapi.security import APIKeyHeader
+
+print("  → Loading core dependencies...")
+with _console.status("[dim]Loading core dependencies...", spinner="dots"):
+    from dotenv import load_dotenv
+    import colorlog
+    import json
+    from typing import AsyncGenerator, Any, List, Optional, Union
+    from pydantic import BaseModel, Field
+    
+    # --- Early Log Level Configuration ---
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+print("  → Loading LiteLLM library...")
+with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
+    import litellm
+
+# Phase 4: Application imports with granular loading messages  
+print("  → Initializing proxy core...")
+with _console.status("[dim]Initializing proxy core...", spinner="dots"):
+    from rotator_library import RotatingClient
+    from rotator_library.credential_manager import CredentialManager
+    from rotator_library.background_refresher import BackgroundRefresher
+    from proxy_app.request_logger import log_request_to_console
+    from proxy_app.batch_manager import EmbeddingBatcher
+    from proxy_app.detailed_logger import DetailedLogger
+
+print("  → Discovering provider plugins...")
+# Provider lazy loading happens during import, so time it here
+_provider_start = time.time()
+with _console.status("[dim]Discovering provider plugins...", spinner="dots"):
+    from rotator_library import PROVIDER_PLUGINS  # This triggers lazy load via __getattr__
+_provider_time = time.time() - _provider_start
+
+# Get count after import (without timing to avoid double-counting)
+_plugin_count = len(PROVIDER_PLUGINS)
 
 # --- Pydantic Models ---
 class EmbeddingRequest(BaseModel):
@@ -33,8 +101,6 @@ class EmbeddingRequest(BaseModel):
     dimensions: Optional[int] = None
     user: Optional[str] = None
 
-
-# --- Pydantic Models for Model Endpoints ---
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
@@ -45,29 +111,31 @@ class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelCard]
 
-# --- Argument Parsing ---
-parser = argparse.ArgumentParser(description="API Key Proxy Server")
-parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
-parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
-parser.add_argument("--enable-request-logging", action="store_true", help="Enable request logging.")
-parser.add_argument("--add-credential", action="store_true", help="Launch the interactive tool to add a new OAuth credential.")
-args, _ = parser.parse_known_args()
+# Calculate total loading time
+_elapsed = time.time() - _start_time
+print(f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)")
 
 
-# Add the 'src' directory to the Python path to allow importing 'rotating_api_key_client'
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from rotator_library import RotatingClient, PROVIDER_PLUGINS
-from rotator_library.credential_manager import CredentialManager
-from rotator_library.background_refresher import BackgroundRefresher
-from rotator_library.credential_tool import run_credential_tool
-from proxy_app.request_logger import log_request_to_console
-from proxy_app.batch_manager import EmbeddingBatcher
-from proxy_app.detailed_logger import DetailedLogger
+# Note: Debug logging will be added after logging configuration below
 
 # --- Logging Configuration ---
 LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# Configure a console handler with color (INFO and above only, no DEBUG)
+console_handler = colorlog.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+formatter = colorlog.ColoredFormatter(
+    '%(log_color)s%(message)s',
+    log_colors={
+        'DEBUG':    'cyan',
+        'INFO':     'green',
+        'WARNING':  'yellow',
+        'ERROR':    'red',
+        'CRITICAL': 'red,bg_white',
+    }
+)
+console_handler.setFormatter(formatter)
 
 # Configure a file handler for INFO-level logs and higher
 info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
@@ -124,6 +192,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 litellm_logger = logging.getLogger("LiteLLM")
 litellm_logger.handlers = []
 litellm_logger.propagate = False
+
+# Now that logging is configured, log the module load time to debug file only
+logging.debug(f"Modules loaded in {_elapsed:.2f}s")
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -763,7 +835,7 @@ if __name__ == "__main__":
     
     # Check if launcher TUI should be shown (no arguments provided)
     if len(sys.argv) == 1:
-        # No arguments - show launcher TUI
+        # No arguments - show launcher TUI (lazy import)
         from proxy_app.launcher_tui import run_launcher_tui
         run_launcher_tui()
         # Launcher modifies sys.argv and returns, or exits if user chose Exit

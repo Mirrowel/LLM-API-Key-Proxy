@@ -208,6 +208,8 @@ class LauncherTUI:
         self.config = LauncherConfig()
         self.running = True
         self.env_file = Path.cwd() / ".env"
+        # Load .env file to ensure environment variables are available
+        load_dotenv(dotenv_path=self.env_file, override=True)
     
     def needs_onboarding(self) -> bool:
         """Check if onboarding is needed"""
@@ -230,11 +232,12 @@ class LauncherTUI:
         # Check if setup is needed
         show_warning = self.needs_onboarding()
         
-        # Build title
+        # Build title with GitHub link
         self.console.print(Panel.fit(
             "[bold cyan]🚀 LLM API Key Proxy - Interactive Launcher[/bold cyan]",
             border_style="cyan"
         ))
+        self.console.print("[dim]GitHub: [blue underline]https://github.com/Mirrowel/LLM-API-Key-Proxy[/blue underline][/dim]")
         
         # Show warning if needed
         if show_warning:
@@ -288,7 +291,6 @@ class LauncherTUI:
         self.console.print()
         self.console.print("[bold]🎯 Main Menu[/bold]")
         self.console.print()
-        
         if show_warning:
             self.console.print("   1. ▶️  Run Proxy Server")
             self.console.print("   2. ⚙️  Configure Proxy Settings")
@@ -300,13 +302,14 @@ class LauncherTUI:
         
         self.console.print("   4. 📊 View Provider & Advanced Settings")
         self.console.print("   5. 🔄 Reload Configuration")
-        self.console.print("   6. 🚪 Exit")
+        self.console.print("   6. ℹ️  About")
+        self.console.print("   7. 🚪 Exit")
         
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
         
-        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6"], show_choices=False)
+        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6", "7"], show_choices=False)
         
         if choice == "1":
             self.run_proxy()
@@ -321,6 +324,8 @@ class LauncherTUI:
             self.config = LauncherConfig()  # Reload config
             self.console.print("\n[green]✅ Configuration reloaded![/green]")
         elif choice == "6":
+            self.show_about()
+        elif choice == "7":
             self.running = False
             sys.exit(0)
     
@@ -498,6 +503,48 @@ class LauncherTUI:
         # Reload environment after settings tool
         load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
     
+    def show_about(self):
+        """Display About page with project information"""
+        self.console.clear()
+        
+        self.console.print(Panel.fit(
+            "[bold cyan]ℹ️  About LLM API Key Proxy[/bold cyan]",
+            border_style="cyan"
+        ))
+        
+        self.console.print()
+        self.console.print("[bold]📦 Project Information[/bold]")
+        self.console.print("━" * 70)
+        self.console.print("   [bold cyan]LLM API Key Proxy[/bold cyan]")
+        self.console.print("   A lightweight, high-performance proxy server for managing")
+        self.console.print("   LLM API keys with automatic rotation and OAuth support")
+        self.console.print()
+        self.console.print("   [dim]GitHub:[/dim] [blue underline]https://github.com/Mirrowel/LLM-API-Key-Proxy[/blue underline]")
+        
+        self.console.print()
+        self.console.print("[bold]✨ Key Features[/bold]")
+        self.console.print("━" * 70)
+        self.console.print("   • [green]Smart Key Rotation[/green] - Automatic rotation across multiple API keys")
+        self.console.print("   • [green]OAuth Support[/green] - Automated OAuth flows for supported providers")
+        self.console.print("   • [green]Multiple Providers[/green] - Support for 10+ LLM providers")
+        self.console.print("   • [green]Custom Providers[/green] - Easy integration of custom OpenAI-compatible APIs")
+        self.console.print("   • [green]Advanced Filtering[/green] - Model whitelists and ignore lists per provider")
+        self.console.print("   • [green]Concurrency Control[/green] - Per-key rate limiting and request management")
+        self.console.print("   • [green]Cost Tracking[/green] - Track usage and costs across all providers")
+        self.console.print("   • [green]Interactive TUI[/green] - Beautiful terminal interface for easy configuration")
+        
+        self.console.print()
+        self.console.print("[bold]📝 License & Credits[/bold]")
+        self.console.print("━" * 70)
+        self.console.print("   Made with ❤️  by the community")
+        self.console.print("   Open source - contributions welcome!")
+        
+        self.console.print()
+        self.console.print("━" * 70)
+        self.console.print()
+        
+        Prompt.ask("Press Enter to return to main menu", default="")
+    
     def run_proxy(self):
         """Prepare and launch proxy in same window"""
         # Check if forced onboarding needed
@@ -527,6 +574,11 @@ class LauncherTUI:
         # Clear console and modify sys.argv
         self.console.clear()
         self.console.print(f"\n[bold green]🚀 Starting proxy on {self.config.config['host']}:{self.config.config['port']}...[/bold green]\n")
+        
+        # Clear console again to remove the starting message before main.py shows loading details
+        import time
+        time.sleep(0.5)  # Brief pause so user sees the message
+        self.console.clear()
         
         # Reconstruct sys.argv for main.py
         sys.argv = [
