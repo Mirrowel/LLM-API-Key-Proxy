@@ -239,28 +239,43 @@ class LauncherTUI:
         ))
         self.console.print("[dim]GitHub: [blue underline]https://github.com/Mirrowel/LLM-API-Key-Proxy[/blue underline][/dim]")
         
-        # Show warning if needed
+        # Show warning if .env file doesn't exist
         if show_warning:
             self.console.print()
             self.console.print(Panel(
                 Text.from_markup(
-                    "⚠️  [bold yellow]CONFIGURATION REQUIRED[/bold yellow]\n\n"
-                    "The proxy cannot start because:\n"
-                    "  ❌ No .env file found (or)\n"
-                    "  ❌ PROXY_API_KEY is not set in .env\n\n"
+                    "⚠️  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
+                    "The proxy needs initial configuration:\n"
+                    "  ❌ No .env file found\n\n"
                     "Why this matters:\n"
-                    "  • The .env file stores your proxy's authentication key\n"
-                    "  • The PROXY_API_KEY protects your proxy from unauthorized access\n"
-                    "  • Without it, the proxy cannot securely start\n\n"
+                    "  • The .env file stores your credentials and settings\n"
+                    "  • PROXY_API_KEY protects your proxy from unauthorized access\n"
+                    "  • Provider API keys enable LLM access\n\n"
                     "What to do:\n"
                     "  1. Select option \"3. Manage Credentials\" to launch the credential tool\n"
                     "  2. The tool will create .env and set up PROXY_API_KEY automatically\n"
-                    "  3. You can also add LLM provider credentials while you're there\n\n"
-                    "⚠️  Important: While provider credentials are optional for startup,\n"
-                    "   the proxy won't do anything useful without them. See README.md\n"
-                    "   for supported providers and setup instructions."
+                    "  3. You can add provider credentials (API keys or OAuth)\n\n"
+                    "⚠️  Note: The credential tool adds PROXY_API_KEY by default.\n"
+                    "   You can remove it later if you want an unsecured proxy."
                 ),
                 border_style="yellow",
+                expand=False
+            ))
+        # Show security warning if PROXY_API_KEY is missing (but .env exists)
+        elif not os.getenv("PROXY_API_KEY"):
+            self.console.print()
+            self.console.print(Panel(
+                Text.from_markup(
+                    "⚠️  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
+                    "Your proxy is currently UNSECURED!\n"
+                    "Anyone can access it without authentication.\n\n"
+                    "This is a serious security risk if your proxy is accessible\n"
+                    "from the internet or untrusted networks.\n\n"
+                    "👉 [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
+                    "   Use option \"2. Configure Proxy Settings\" → \"3. Set Proxy API Key\"\n"
+                    "   or option \"3. Manage Credentials\""
+                ),
+                border_style="red",
                 expand=False
             ))
         
@@ -271,7 +286,13 @@ class LauncherTUI:
         self.console.print(f"   Host:                {self.config.config['host']}")
         self.console.print(f"   Port:                {self.config.config['port']}")
         self.console.print(f"   Request Logging:     {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}")
-        self.console.print(f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}")
+        
+        # Show actual API key value
+        proxy_key = os.getenv('PROXY_API_KEY')
+        if proxy_key:
+            self.console.print(f"   Proxy API Key:       {proxy_key}")
+        else:
+            self.console.print("   Proxy API Key:       [red]Not Set (INSECURE!)[/red]")
         
         # Show status summary
         self.console.print()

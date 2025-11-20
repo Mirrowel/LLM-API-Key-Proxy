@@ -37,9 +37,17 @@ if args.add_credential:
 
 # If we get here, we're ACTUALLY running the proxy - NOW show startup messages and start timer
 _start_time = time.time()
+
+# Get proxy API key for display
+proxy_api_key = os.getenv("PROXY_API_KEY")
+if proxy_api_key:
+    key_display = f"✓ {proxy_api_key}"
+else:
+    key_display = "✗ Not Set (INSECURE - anyone can access!)"
+
 print("━" * 70)
 print(f"Starting proxy on {args.host}:{args.port}")
-print(f"Proxy API Key: {'✓ Set' if os.getenv('PROXY_API_KEY') else '✗ Not Set'}")
+print(f"Proxy API Key: {key_display}")
 print(f"GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
 print("━" * 70)
 print("Loading server components...")
@@ -113,6 +121,19 @@ class ModelList(BaseModel):
 
 # Calculate total loading time
 _elapsed = time.time() - _start_time
+print(f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)")
+
+# Clear screen and reprint header for clean startup view
+# This pushes loading messages up (still in scroll history) but shows a clean final screen
+import os as _os_module
+_os_module.system('cls' if _os_module.name == 'nt' else 'clear')
+
+# Reprint header
+print("━" * 70)
+print(f"Starting proxy on {args.host}:{args.port}")
+print(f"Proxy API Key: {key_display}")
+print(f"GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+print("━" * 70)
 print(f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)")
 
 
@@ -848,12 +869,9 @@ if __name__ == "__main__":
         Check if the proxy needs onboarding (first-time setup).
         Returns True if onboarding is needed, False otherwise.
         """
-        # Check 1: Does .env file exist?
+        # Only check if .env file exists
+        # PROXY_API_KEY is optional (will show warning if not set)
         if not ENV_FILE.is_file():
-            return True
-        
-        # Check 2: Is PROXY_API_KEY set in environment?
-        if not PROXY_API_KEY:
             return True
         
         return False
@@ -867,25 +885,21 @@ if __name__ == "__main__":
         ))
         console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
         
-        console.print("The proxy cannot start because:")
-        if not ENV_FILE.is_file():
-            console.print("  [red]❌ No .env file found[/red]")
-        else:
-            console.print("  [red]❌ PROXY_API_KEY is not set in .env[/red]")
+        console.print("The proxy needs initial configuration:")
+        console.print("  [red]❌ No .env file found[/red]")
         
         console.print("\n[bold]Why this matters:[/bold]")
-        console.print("  • The .env file stores your proxy's authentication key")
-        console.print("  • The PROXY_API_KEY protects your proxy from unauthorized access")
-        console.print("  • Without it, the proxy cannot securely start")
+        console.print("  • The .env file stores your credentials and settings")
+        console.print("  • PROXY_API_KEY protects your proxy from unauthorized access")
+        console.print("  • Provider API keys enable LLM access")
         
         console.print("\n[bold]What happens next:[/bold]")
-        console.print("  1. We'll create a .env file with a default PROXY_API_KEY")
+        console.print("  1. We'll create a .env file with PROXY_API_KEY")
         console.print("  2. You can add LLM provider credentials (API keys or OAuth)")
         console.print("  3. The proxy will then start normally")
         
-        console.print("\n[bold yellow]⚠️  Important:[/bold yellow] While provider credentials are optional for startup,")
-        console.print("   the proxy won't do anything useful without them. See [bold cyan]README.md[/bold cyan]")
-        console.print("   for supported providers and setup instructions.\n")
+        console.print("\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default.")
+        console.print("   You can remove it later if you want an unsecured proxy.\n")
         
         console.input("[bold green]Press Enter to launch the credential setup tool...[/bold green]")
 
