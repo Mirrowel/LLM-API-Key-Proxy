@@ -25,7 +25,7 @@ lib_logger = logging.getLogger('rotator_library')
 CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56" #https://api.kilocode.ai/extension-config.json
 SCOPE = "openid profile email model.completion"
 TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token"
-REFRESH_EXPIRY_BUFFER_SECONDS = 300
+REFRESH_EXPIRY_BUFFER_SECONDS = 3 * 60 * 60  # 3 hours buffer before expiry
 
 console = Console()
 
@@ -186,9 +186,10 @@ class QwenAuthBase:
 
             creds_from_file = self._credentials_cache[path]
 
-            lib_logger.info(f"Refreshing Qwen OAuth token for '{Path(path).name}'...")
+            lib_logger.debug(f"Refreshing Qwen OAuth token for '{Path(path).name}'...")
             refresh_token = creds_from_file.get("refresh_token")
             if not refresh_token:
+                lib_logger.error(f"No refresh_token found in '{Path(path).name}'")
                 raise ValueError("No refresh_token found in Qwen credentials file.")
 
             # [RETRY LOGIC] Implement exponential backoff for transient errors
@@ -197,6 +198,8 @@ class QwenAuthBase:
             last_error = None
 
             headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
 
@@ -215,6 +218,8 @@ class QwenAuthBase:
                     except httpx.HTTPStatusError as e:
                         last_error = e
                         status_code = e.response.status_code
+                        error_body = e.response.text
+                        lib_logger.error(f"HTTP {status_code} for '{Path(path).name}': {error_body}")
 
                         # [STATUS CODE HANDLING]
                         if status_code in (401, 403):
@@ -265,7 +270,7 @@ class QwenAuthBase:
             creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
             await self._save_credentials(path, creds_from_file)
-            lib_logger.info(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
+            lib_logger.debug(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
             return creds_from_file
 
     async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:

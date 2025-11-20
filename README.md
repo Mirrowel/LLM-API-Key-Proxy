@@ -480,9 +480,9 @@ The following advanced settings can be added to your `.env` file (or configured 
 
 #### OAuth and Refresh Settings
 
--   **`OAUTH_REFRESH_INTERVAL`**: Controls how often (in seconds) the background refresher checks for expired OAuth tokens. Default is `3600` (1 hour).
+-   **`OAUTH_REFRESH_INTERVAL`**: Controls how often (in seconds) the background refresher checks for expired OAuth tokens. Default is `600` (10 minutes).
     ```env
-    OAUTH_REFRESH_INTERVAL=1800  # Check every 30 minutes
+    OAUTH_REFRESH_INTERVAL=600  # Check every 10 minutes
     ```
 
 -   **`SKIP_OAUTH_INIT_CHECK`**: Set to `true` to skip the interactive OAuth setup/validation check on startup. Essential for non-interactive environments like Docker containers or CI/CD pipelines.

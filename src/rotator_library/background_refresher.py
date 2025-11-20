@@ -17,11 +17,11 @@ class BackgroundRefresher:
     """
     def __init__(self, client: 'RotatingClient'):
         try:
-            interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "3600")
+            interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "600")
             self._interval = int(interval_str)
         except ValueError:
-            lib_logger.warning(f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. Falling back to 3600s.")
-            self._interval = 3600
+            lib_logger.warning(f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. Falling back to 600s.")
+            self._interval = 600
         self._client = client
         self._task: Optional[asyncio.Task] = None
 
@@ -46,8 +46,7 @@ class BackgroundRefresher:
         """The main loop for the background task."""
         while True:
             try:
-                await asyncio.sleep(self._interval)
-                lib_logger.info("Running proactive token refresh check...")
+                #lib_logger.info("Running proactive token refresh check...")
 
                 oauth_configs = self._client.get_oauth_credentials()
                 for provider, paths in oauth_configs.items():
@@ -58,6 +57,7 @@ class BackgroundRefresher:
                                 await provider_plugin.proactively_refresh(path)
                             except Exception as e:
                                 lib_logger.error(f"Error during proactive refresh for '{path}': {e}")
+                await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:

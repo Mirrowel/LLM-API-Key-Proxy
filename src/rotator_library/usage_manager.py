@@ -105,7 +105,7 @@ class UsageManager:
                     last_reset_dt is None
                     or last_reset_dt < reset_threshold_today <= now_utc
                 ):
-                    lib_logger.info(f"Performing daily reset for key ...{key[-6:]}")
+                    lib_logger.debug(f"Performing daily reset for key ...{key[-6:]}")
                     needs_saving = True
 
                     # Reset cooldowns

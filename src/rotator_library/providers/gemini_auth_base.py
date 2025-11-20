@@ -23,7 +23,7 @@ CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleuserconten
 CLIENT_SECRET = "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" #https://api.kilocode.ai/extension-config.json
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 USER_INFO_URI = "https://www.googleapis.com/oauth2/v1/userinfo"
-REFRESH_EXPIRY_BUFFER_SECONDS = 300
+REFRESH_EXPIRY_BUFFER_SECONDS = 30 * 60  # 30 minutes buffer before expiry
 
 console = Console()
 
@@ -192,7 +192,7 @@ class GeminiAuthBase:
             if not force and not self._is_token_expired(self._credentials_cache.get(path, creds)):
                 return self._credentials_cache.get(path, creds)
 
-            lib_logger.info(f"Refreshing Gemini OAuth token for '{Path(path).name}' (forced: {force})...")
+            lib_logger.debug(f"Refreshing Gemini OAuth token for '{Path(path).name}' (forced: {force})...")
             refresh_token = creds.get("refresh_token")
             if not refresh_token:
                 raise ValueError("No refresh_token found in credentials file.")
@@ -317,7 +317,7 @@ class GeminiAuthBase:
                 # But log it for debugging purposes
 
             await self._save_credentials(path, creds)
-            lib_logger.info(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.")
+            lib_logger.debug(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.")
             return creds
 
     async def proactively_refresh(self, credential_path: str):

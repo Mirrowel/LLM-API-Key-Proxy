@@ -414,7 +414,7 @@ class IFlowAuthBase:
 
             creds_from_file = self._credentials_cache[path]
 
-            lib_logger.info(f"Refreshing iFlow OAuth token for '{Path(path).name}'...")
+            lib_logger.debug(f"Refreshing iFlow OAuth token for '{Path(path).name}'...")
             refresh_token = creds_from_file.get("refresh_token")
             if not refresh_token:
                 raise ValueError("No refresh_token found in iFlow credentials file.")
@@ -452,6 +452,9 @@ class IFlowAuthBase:
                     except httpx.HTTPStatusError as e:
                         last_error = e
                         status_code = e.response.status_code
+                        error_body = e.response.text
+
+                        lib_logger.error(f"[REFRESH HTTP ERROR] HTTP {status_code} for '{Path(path).name}': {error_body}")
 
                         # [STATUS CODE HANDLING]
                         if status_code in (401, 403):
@@ -522,7 +525,7 @@ class IFlowAuthBase:
             creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
             await self._save_credentials(path, creds_from_file)
-            lib_logger.info(f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'.")
+            lib_logger.debug(f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'.")
             return creds_from_file
 
     async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
