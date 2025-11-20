@@ -574,7 +574,7 @@ class LauncherTUI:
             self.console.print(Panel(
                 Text.from_markup(
                     "⚠️  [bold yellow]Setup Required[/bold yellow]\n\n"
-                    "Cannot start without .env and PROXY_API_KEY.\n"
+                    "Cannot start without .env.\n"
                     "Launching credential tool..."
                 ),
                 border_style="yellow"

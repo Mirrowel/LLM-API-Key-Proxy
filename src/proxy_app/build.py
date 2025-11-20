@@ -52,8 +52,6 @@ def main():
         "--exclude-module=jupyter",
         "--exclude-module=notebook",
         "--exclude-module=PIL.ImageTk",
-        "--exclude-module=setuptools",
-        "--exclude-module=distutils",
         # Optimization: Enable UPX compression (if available)
         "--upx-dir=upx" if platform.system() != "Darwin" else "--noupx",  # macOS has issues with UPX
         # Optimization: Strip debug symbols (smaller binary)
