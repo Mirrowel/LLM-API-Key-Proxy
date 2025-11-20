@@ -761,6 +761,16 @@ if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks
     ENV_FILE = Path.cwd() / ".env"
     
+    # Check if launcher TUI should be shown (no arguments provided)
+    if len(sys.argv) == 1:
+        # No arguments - show launcher TUI
+        from proxy_app.launcher_tui import run_launcher_tui
+        run_launcher_tui()
+        # Launcher modifies sys.argv and returns, or exits if user chose Exit
+        # If we get here, user chose "Run Proxy" and sys.argv is modified
+        # Re-parse arguments with modified sys.argv
+        args = parser.parse_args()
+    
     def needs_onboarding() -> bool:
         """
         Check if the proxy needs onboarding (first-time setup).
