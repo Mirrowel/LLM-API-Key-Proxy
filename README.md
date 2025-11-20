@@ -27,6 +27,7 @@ This project provides a powerful solution for developers building complex applic
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 -   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
+-   **🆕 Interactive Launcher TUI**: Beautiful, cross-platform TUI for configuration and management with an integrated settings tool for advanced configuration.
 
 
 ---
@@ -37,11 +38,15 @@ This project provides a powerful solution for developers building complex applic
 
 1.  **Download the latest release** from the [GitHub Releases page](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest).
 2.  Unzip the downloaded file.
-3.  **Run `launcher.bat`**. This all-in-one script allows you to:
-    -   Add/Manage credentials interactively.
-    -   Configure the server (Host, Port, Logging).
-    -   Run the proxy server.
-    -   Build the executable from source (if Python is installed).
+3.  **Run the executable** (run without arguments). This launches the **interactive TUI launcher** which allows you to:
+    -   🚀 Run the proxy server with your configured settings
+    -   ⚙️ Configure proxy settings (Host, Port, PROXY_API_KEY, Request Logging)
+    -   🔑 Manage credentials (add/edit API keys & OAuth credentials)
+    -   📊 View provider status and advanced settings
+    -   🔧 Configure advanced settings interactively (custom API bases, model definitions, concurrency limits)
+    -   🔄 Reload configuration without restarting
+
+> **Note:** The legacy `launcher.bat` is deprecated.
 
 ### macOS / Linux
 
@@ -53,13 +58,15 @@ If you downloaded the pre-compiled binary for your platform, no Python installat
     ```bash
     chmod +x proxy_app
     ```
-3.  **Run the Proxy**:
+3.  **Run the Interactive Launcher**:
+    ```bash
+    ./proxy_app
+    ```
+    This launches the TUI where you can configure and run the proxy.
+
+4.  **Or run directly with arguments** to bypass the launcher:
     ```bash
     ./proxy_app --host 0.0.0.0 --port 8000
-    ```
-4.  **Manage Credentials**:
-    ```bash
-    ./proxy_app --add-credential
     ```
 
 **Option B: Manual Setup (Source Code)**
@@ -73,16 +80,14 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**2. Add Credentials (Interactive Tool)**
+**2. Launch the Interactive TUI**
 ```bash
-# Equivalent to "Add Credentials"
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
-python src/proxy_app/main.py --add-credential
+python src/proxy_app/main.py
 ```
 
-**3. Run the Proxy**
+**3. Or run directly with arguments to bypass the launcher**
 ```bash
-# Equivalent to "Run Proxy"
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
 python src/proxy_app/main.py --host 0.0.0.0 --port 8000
 ```
@@ -90,7 +95,63 @@ python src/proxy_app/main.py --host 0.0.0.0 --port 8000
 
 ---
 
-## 2. Detailed Setup (From Source)
+## 2. Interactive TUI Launcher
+
+The proxy now includes a powerful **interactive Text User Interface (TUI)** that makes configuration and management effortless.
+
+### Features
+
+- **🎯 Main Menu**:
+  - Run proxy server with saved settings
+  - Configure proxy settings (host, port, API key, logging)
+  - Manage credentials (API keys & OAuth)
+  - View provider & advanced settings status
+  - Reload configuration
+  
+- **🔧 Advanced Settings Tool**:
+  - Configure custom OpenAI-compatible providers
+  - Define provider models (simple or advanced JSON format)
+  - Set concurrency limits per provider
+  - Interactive numbered menus for easy selection
+  - Pending changes system with save/discard options
+
+- **📊 Status Dashboard**:
+  - Shows configured providers and credential counts
+  - Displays custom providers and API bases
+  - Shows active advanced settings
+  - Real-time configuration status
+
+### How to Use
+
+**Running without arguments launches the TUI:**
+```bash
+# Windows
+proxy_app.exe
+
+# macOS/Linux
+./proxy_app
+
+# From source
+python src/proxy_app/main.py
+```
+
+**Running with arguments bypasses the TUI:**
+```bash
+# Direct startup (skips TUI)
+proxy_app.exe --host 0.0.0.0 --port 8000
+```
+
+### Configuration Files
+
+The TUI manages two configuration files:
+- **`launcher_config.json`**: Stores launcher-specific settings (host, port, logging preference)
+- **`.env`**: Stores all credentials and advanced settings (PROXY_API_KEY, provider credentials, custom settings)
+
+All advanced settings configured through the TUI are stored in `.env` for compatibility with manual editing and deployment platforms.
+
+---
+
+## 3. Detailed Setup (From Source)
 
 This guide is for users who want to run the proxy from the source code on any operating system.
 
@@ -163,6 +224,12 @@ The proxy includes a powerful interactive CLI tool for managing all your credent
 
 ```bash
 python -m rotator_library.credential_tool
+```
+
+**Or use the TUI Launcher** (recommended):
+```bash
+python src/proxy_app/main.py
+# Then select "3. 🔑 Manage Credentials"
 ```
 
 **Main Menu Features:**
@@ -258,7 +325,7 @@ IFLOW_API_KEY_1="sk-your-iflow-key"      # Direct API key
 # AND/OR use OAuth: oauth_creds/iflow_oauth_1.json
 ```
 
-### 3. Run the Proxy
+### 4. Run the Proxy
 
 You can run the proxy in two ways:
 
@@ -266,19 +333,24 @@ You can run the proxy in two ways:
 
 A pre-compiled, standalone executable for Windows is available on the [latest GitHub Release](https://github.com/Mirrowel/LLM-API-Key-Proxy/releases/latest). This is the easiest way to get started as it requires no setup.
 
-For the simplest experience, follow the **Easy Setup for Beginners** guide at the top of this document.
+For the simplest experience, follow the **Quick Start** guide at the top of this document.
 
 **B) Running from Source**
 
-Start the server by running the `main.py` script directly.
+Start the server by running the `main.py` script
 
 ```bash
 python src/proxy_app/main.py
 ```
+This launches the interactive TUI launcher by default. To run the proxy directly, use:
+
+```bash
+python src/proxy_app/main.py --host 0.0.0.0 --port 8000
+```
 
 The proxy is now running and available at `http://127.0.0.1:8000`.
 
-### 4. Make a Request
+### 5. Make a Request
 
 You can now send requests to the proxy. The endpoint is `http://127.0.0.1:8000/v1/chat/completions`.
 
@@ -404,7 +476,7 @@ A powerful provider that mimics the Google Cloud Code extension.
 
 ### Advanced Configuration
 
-The following advanced settings can be added to your `.env` file:
+The following advanced settings can be added to your `.env` file (or configured interactively via the TUI Settings Tool):
 
 #### OAuth and Refresh Settings
 
@@ -456,10 +528,9 @@ python src/proxy_app/main.py --host 127.0.0.1 --port 9999 --enable-request-loggi
 
 #### Windows Batch Scripts
 
-For convenience on Windows, you can use the provided `.bat` scripts in the root directory to run the proxy with common configurations:
+For convenience on Windows, you can use the provided `.bat` scripts in the root directory:
 
--   **`start_proxy.bat`**: Starts the proxy on `0.0.0.0:8000` with default settings.
--   **`start_proxy_debug_logging.bat`**: Starts the proxy and automatically enables request logging.
+-   **`launcher.bat`** *(deprecated)*: Legacy launcher with manual menu system. Still functional but superseded by the new TUI.
 
 ### Troubleshooting
 
