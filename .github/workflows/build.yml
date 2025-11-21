@@ -45,7 +45,11 @@ jobs:
       shell: bash
       run: |
         grep -v -- '-e src/rotator_library' requirements.txt > temp_requirements.txt
-        source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          . .venv/Scripts/activate
+        else
+          source .venv/bin/activate
+        fi
         uv pip install -r temp_requirements.txt
         uv pip install pyinstaller
         uv pip install -e src/rotator_library
@@ -73,7 +77,11 @@ jobs:
     - name: Build executable
       shell: bash
       run: |
-        source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          . .venv/Scripts/activate
+        else
+          source .venv/bin/activate
+        fi
         python src/proxy_app/build.py
 
     - name: Ensure PyInstaller cache directory exists
