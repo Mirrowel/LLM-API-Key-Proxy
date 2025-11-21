@@ -29,45 +29,38 @@ jobs:
     - name: Check out repository
       uses: actions/checkout@v4
 
-    - name: Set up Python
-      id: setup-python
-      uses: actions/setup-python@v5
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v4
       with:
-        python-version: '3.12'
+        enable-cache: true
+        cache-dependency-glob: "requirements.txt"
 
-    - name: Get pip cache dir
-      id: pip-cache
+    - name: Set up Python with uv
       shell: bash
       run: |
-        echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
-
-    - name: Cache pip dependencies
-      uses: actions/cache@v4
-      with:
-        path: ${{ steps.pip-cache.outputs.dir }}
-        key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-3.12
+        uv python install 3.12
+        uv venv --python 3.12
 
     - name: Install dependencies
       shell: bash
       run: |
         grep -v -- '-e src/rotator_library' requirements.txt > temp_requirements.txt
-        pip install -r temp_requirements.txt
-        pip install pyinstaller
-        pip install -e src/rotator_library
+        source .venv/bin/activate || . .venv/Scripts/activate
+        uv pip install -r temp_requirements.txt
+        uv pip install pyinstaller
+        uv pip install -e src/rotator_library
 
     - name: Get PyInstaller cache directory
       id: pyinstaller-cache-dir
-      shell: pwsh
+      shell: bash
       run: |
-        if ($env:RUNNER_OS -eq 'Windows') {
-          echo "path=$($env:USERPROFILE)\AppData\Local\pyinstaller" >> $env:GITHUB_OUTPUT
-        } elseif ($env:RUNNER_OS -eq 'Linux') {
-          echo "path=$($env:HOME)/.cache/pyinstaller" >> $env:GITHUB_OUTPUT
-        } elseif ($env:RUNNER_OS -eq 'macOS') {
-          echo "path=$($env:HOME)/Library/Application Support/pyinstaller" >> $env:GITHUB_OUTPUT
-        }
+        if [ "${{ runner.os }}" == "Windows" ]; then
+          echo "path=$USERPROFILE/AppData/Local/pyinstaller" >> $GITHUB_OUTPUT
+        elif [ "${{ runner.os }}" == "Linux" ]; then
+          echo "path=$HOME/.cache/pyinstaller" >> $GITHUB_OUTPUT
+        elif [ "${{ runner.os }}" == "macOS" ]; then
+          echo "path=$HOME/Library/Application Support/pyinstaller" >> $GITHUB_OUTPUT
+        fi
 
     - name: Cache PyInstaller build data
       uses: actions/cache@v4
