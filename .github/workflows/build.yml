@@ -71,7 +71,10 @@ jobs:
           ${{ runner.os }}-pyinstaller-3.12-
 
     - name: Build executable
-      run: python src/proxy_app/build.py
+      shell: bash
+      run: |
+        source .venv/bin/activate || . .venv/Scripts/activate
+        python src/proxy_app/build.py
 
     - name: Ensure PyInstaller cache directory exists
       shell: pwsh
