@@ -20,6 +20,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
 
+from ..utils.headless_detection import is_headless_environment
+
 lib_logger = logging.getLogger('rotator_library')
 
 CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56" #https://api.kilocode.ai/extension-config.json
@@ -196,6 +198,7 @@ class QwenAuthBase:
             max_retries = 3
             new_token_data = None
             last_error = None
+            needs_reauth = False
 
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -221,12 +224,14 @@ class QwenAuthBase:
                         error_body = e.response.text
                         lib_logger.error(f"HTTP {status_code} for '{Path(path).name}': {error_body}")
 
-                        # [STATUS CODE HANDLING]
+                        # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
                         if status_code in (401, 403):
-                            lib_logger.error(f"Refresh token invalid (HTTP {status_code}), marking as revoked")
-                            creds_from_file["refresh_token"] = None
-                            await self._save_credentials(path, creds_from_file)
-                            raise ValueError(f"Refresh token revoked or invalid (HTTP {status_code}). Re-authentication required.")
+                            lib_logger.warning(
+                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                f"Token may have been revoked or expired. Starting re-authentication..."
+                            )
+                            needs_reauth = True
+                            break  # Exit retry loop to trigger re-auth
 
                         elif status_code == 429:
                             retry_after = int(e.response.headers.get("Retry-After", 60))
@@ -255,6 +260,17 @@ class QwenAuthBase:
                             await asyncio.sleep(wait_time)
                             continue
                         raise
+
+            # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
+            if needs_reauth:
+                lib_logger.info(f"Starting re-authentication for '{Path(path).name}'...")
+                try:
+                    # Call initialize_token to trigger OAuth flow
+                    new_creds = await self.initialize_token(path)
+                    return new_creds
+                except Exception as reauth_error:
+                    lib_logger.error(f"Re-authentication failed for '{Path(path).name}': {reauth_error}")
+                    raise ValueError(f"Refresh token invalid and re-authentication failed: {reauth_error}")
 
             if new_token_data is None:
                 raise last_error or Exception("Token refresh failed after all retries")
@@ -377,6 +393,10 @@ class QwenAuthBase:
                         lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
 
                 lib_logger.warning(f"Qwen OAuth token for '{display_name}' needs setup: {reason}.")
+                
+                # [HEADLESS DETECTION] Check if running in headless environment
+                is_headless = is_headless_environment()
+                
                 code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
                 code_challenge = base64.urlsafe_b64encode(
                     hashlib.sha256(code_verifier.encode('utf-8')).digest()
@@ -408,14 +428,32 @@ class QwenAuthBase:
                         lib_logger.error(f"Qwen device code request failed with status {e.response.status_code}: {e.response.text}")
                         raise e
                     
-                    auth_panel_text = Text.from_markup(
-                        "1. Visit the URL below to sign in.\n"
-                        "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
-                        "3. You will be prompted to enter your identifier after authorization."
-                    )
+                    # [HEADLESS SUPPORT] Display appropriate instructions
+                    if is_headless:
+                        auth_panel_text = Text.from_markup(
+                            "Running in headless environment (no GUI detected).\\n"
+                            "Please open the URL below in a browser on another machine to authorize:\\n"
+                            "1. Visit the URL below to sign in.\\n"
+                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\\n"
+                            "3. You will be prompted to enter your identifier after authorization."
+                        )
+                    else:
+                        auth_panel_text = Text.from_markup(
+                            "1. Visit the URL below to sign in.\\n"
+                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\\n"
+                            "3. You will be prompted to enter your identifier after authorization."
+                        )
+                    
                     console.print(Panel(auth_panel_text, title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
-                    console.print(f"[bold]URL:[/bold] [link={dev_data['verification_uri_complete']}]{dev_data['verification_uri_complete']}[/link]\n")
-                    webbrowser.open(dev_data['verification_uri_complete'])
+                    console.print(f"[bold]URL:[/bold] [link={dev_data['verification_uri_complete']}]{dev_data['verification_uri_complete']}[/link]\\n")
+                    
+                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+                    if not is_headless:
+                        try:
+                            webbrowser.open(dev_data['verification_uri_complete'])
+                            lib_logger.info("Browser opened successfully for Qwen OAuth flow")
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to open browser automatically: {e}. Please open the URL manually.")
                     
                     token_data = None
                     start_time = time.time()
@@ -467,14 +505,14 @@ class QwenAuthBase:
                     # Prompt for user identifier and create metadata object if needed
                     if not creds.get("_proxy_metadata", {}).get("email"):
                         try:
-                            prompt_text = Text.from_markup(f"\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]")
+                            prompt_text = Text.from_markup(f"\\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]")
                             email = Prompt.ask(prompt_text)
                             creds["_proxy_metadata"] = {
                                 "email": email.strip(),
                                 "last_check_timestamp": time.time()
                             }
                         except (EOFError, KeyboardInterrupt):
-                            console.print("\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]")
+                            console.print("\\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]")
                             creds["_proxy_metadata"] = {"email": None, "last_check_timestamp": time.time()}
 
                     if path:

@@ -17,6 +17,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from ..utils.headless_detection import is_headless_environment
+
 lib_logger = logging.getLogger('rotator_library')
 
 CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com" #https://api.kilocode.ai/extension-config.json
@@ -50,6 +52,7 @@ class GeminiAuthBase:
         - GEMINI_CLI_UNIVERSE_DOMAIN (optional, defaults to googleapis.com)
         - GEMINI_CLI_EMAIL (optional, defaults to "env-user")
         - GEMINI_CLI_PROJECT_ID (optional)
+        - GEMINI_CLI_TIER (optional)
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
@@ -90,6 +93,11 @@ class GeminiAuthBase:
         project_id = os.getenv("GEMINI_CLI_PROJECT_ID")
         if project_id:
             creds["_proxy_metadata"]["project_id"] = project_id
+        
+        # Add tier if provided
+        tier = os.getenv("GEMINI_CLI_TIER")
+        if tier:
+            creds["_proxy_metadata"]["tier"] = tier
 
         return creds
 
@@ -201,6 +209,7 @@ class GeminiAuthBase:
             max_retries = 3
             new_token_data = None
             last_error = None
+            needs_reauth = False
 
             async with httpx.AsyncClient() as client:
                 for attempt in range(max_retries):
@@ -219,13 +228,14 @@ class GeminiAuthBase:
                         last_error = e
                         status_code = e.response.status_code
 
-                        # [STATUS CODE HANDLING] Handle per-status backoff strategy
+                        # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
                         if status_code == 401 or status_code == 403:
-                            # Invalid credentials - don't retry, invalidate refresh token
-                            lib_logger.error(f"Refresh token invalid (HTTP {status_code}), marking as revoked")
-                            creds["refresh_token"] = None  # Invalidate refresh token
-                            await self._save_credentials(path, creds)
-                            raise ValueError(f"Refresh token revoked or invalid (HTTP {status_code}). Re-authentication required.")
+                            lib_logger.warning(
+                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                f"Token may have been revoked or expired. Starting re-authentication..."
+                            )
+                            needs_reauth = True
+                            break  # Exit retry loop to trigger re-auth
 
                         elif status_code == 429:
                             # Rate limit - honor Retry-After header if present
@@ -258,6 +268,17 @@ class GeminiAuthBase:
                             await asyncio.sleep(wait_time)
                             continue
                         raise
+
+            # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
+            if needs_reauth:
+                lib_logger.info(f"Starting re-authentication for '{Path(path).name}'...")
+                try:
+                    # Call initialize_token to trigger OAuth flow
+                    new_creds = await self.initialize_token(path)
+                    return new_creds
+                except Exception as reauth_error:
+                    lib_logger.error(f"Re-authentication failed for '{Path(path).name}': {reauth_error}")
+                    raise ValueError(f"Refresh token invalid and re-authentication failed: {reauth_error}")
 
             # If we exhausted retries without success
             if new_token_data is None:
@@ -317,7 +338,7 @@ class GeminiAuthBase:
                 # But log it for debugging purposes
 
             await self._save_credentials(path, creds)
-            lib_logger.debug(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.")
+            lib_logger.debug(f"Successfully refreshed Gemini OAuth token for '{Path(path).name}'.") 
             return creds
 
     async def proactively_refresh(self, credential_path: str):
@@ -387,6 +408,10 @@ class GeminiAuthBase:
                         lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
 
                 lib_logger.warning(f"Gemini OAuth token for '{display_name}' needs setup: {reason}.")
+                
+                # [HEADLESS DETECTION] Check if running in headless environment
+                is_headless = is_headless_environment()
+                
                 auth_code_future = asyncio.get_event_loop().create_future()
                 server = None
 
@@ -423,10 +448,30 @@ class GeminiAuthBase:
                         "scope": " ".join(["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]),
                         "access_type": "offline", "response_type": "code", "prompt": "consent"
                     })
-                    auth_panel_text = Text.from_markup("1. Your browser will now open to log in and authorize the application.\n2. If it doesn't, please open the URL below manually.")
+                    
+                    # [HEADLESS SUPPORT] Display appropriate instructions
+                    if is_headless:
+                        auth_panel_text = Text.from_markup(
+                            "Running in headless environment (no GUI detected).\n"
+                            "Please open the URL below in a browser on another machine to authorize:\n"
+                        )
+                    else:
+                        auth_panel_text = Text.from_markup(
+                            "1. Your browser will now open to log in and authorize the application.\n"
+                           "2. If it doesn't open automatically, please open the URL below manually."
+                        )
+                    
                     console.print(Panel(auth_panel_text, title=f"Gemini OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
                     console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
-                    webbrowser.open(auth_url)
+                    
+                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+                    if not is_headless:
+                        try:
+                            webbrowser.open(auth_url)
+                            lib_logger.info("Browser opened successfully for OAuth flow")
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to open browser automatically: {e}. Please open the URL manually.")
+                    
                     with console.status("[bold green]Waiting for you to complete authentication in the browser...[/bold green]", spinner="dots"):
                         auth_code = await asyncio.wait_for(auth_code_future, timeout=300)
                 except asyncio.TimeoutError:

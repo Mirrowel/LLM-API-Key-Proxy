@@ -285,6 +285,7 @@ async def export_gemini_cli_to_env():
             # Extract metadata
             email = creds.get("_proxy_metadata", {}).get("email", "unknown")
             project_id = creds.get("_proxy_metadata", {}).get("project_id", "")
+            tier = creds.get("_proxy_metadata", {}).get("tier", "")
 
             # Generate .env file name
             safe_email = email.replace("@", "_at_").replace(".", "_")
@@ -310,6 +311,10 @@ async def export_gemini_cli_to_env():
             # Add project_id if present
             if project_id:
                 env_lines.append(f"GEMINI_CLI_PROJECT_ID={project_id}")
+            
+            # Add tier if present
+            if tier:
+                env_lines.append(f"GEMINI_CLI_TIER={tier}")
 
             # Write to .env file
             with open(env_filepath, 'w') as f:

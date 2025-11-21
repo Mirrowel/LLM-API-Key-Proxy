@@ -97,19 +97,46 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         """Discovers the Google Cloud Project ID, with caching and onboarding for new accounts."""
         lib_logger.debug(f"Starting project discovery for credential: {credential_path}")
 
+        # Check in-memory cache first
         if credential_path in self.project_id_cache:
             cached_project = self.project_id_cache[credential_path]
             lib_logger.debug(f"Using cached project ID: {cached_project}")
             return cached_project
 
+        # Check for configured project ID override
         if litellm_params.get("project_id"):
             project_id = litellm_params["project_id"]
             lib_logger.info(f"Using configured Gemini CLI project ID: {project_id}")
             self.project_id_cache[credential_path] = project_id
             return project_id
 
+        # [NEW] Load credentials from file to check for persisted project_id and tier
+        try:
+            with open(credential_path, 'r') as f:
+                creds = json.load(f)
+            
+            metadata = creds.get("_proxy_metadata", {})
+            persisted_project_id = metadata.get("project_id")
+            persisted_tier = metadata.get("tier")
+            
+            if persisted_project_id:
+                lib_logger.info(f"Loaded persisted project ID from credential file: {persisted_project_id}")
+                self.project_id_cache[credential_path] = persisted_project_id
+                
+                # Also load tier if available
+                if persisted_tier:
+                    self.project_tier_cache[credential_path] = persisted_tier
+                    lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+                
+                return persisted_project_id
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            lib_logger.debug(f"Could not load persisted project ID from file: {e}")
+
         lib_logger.debug("No cached or configured project ID found, initiating discovery...")
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+
+        discovered_project_id = None
+        discovered_tier = None
 
         async with httpx.AsyncClient() as client:
             # 1. Try discovery endpoint with onboarding logic
@@ -147,6 +174,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     # Cache tier info
                     if selected_tier_id:
                         self.project_tier_cache[credential_path] = selected_tier_id
+                        discovered_tier = selected_tier_id
                         lib_logger.debug(f"Cached tier information: {selected_tier_id}")
 
                     # Log concise message for paid projects
@@ -157,6 +185,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
 
                     self.project_id_cache[credential_path] = project_id
+                    discovered_project_id = project_id
+                    
+                    # [NEW] Persist to credential file
+                    await self._persist_project_metadata(credential_path, project_id, discovered_tier)
+                    
                     return project_id
                 
                 # 2. If no project ID, trigger onboarding
@@ -197,6 +230,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Cache tier info
                 if tier_id:
                     self.project_tier_cache[credential_path] = tier_id
+                    discovered_tier = tier_id
                     lib_logger.debug(f"Cached tier information: {tier_id}")
 
                 # Log concise message for paid projects
@@ -207,6 +241,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     lib_logger.info(f"Successfully onboarded user and discovered project ID: {project_id}")
 
                 self.project_id_cache[credential_path] = project_id
+                discovered_project_id = project_id
+                
+                # [NEW] Persist to credential file
+                await self._persist_project_metadata(credential_path, project_id, discovered_tier)
+                
                 return project_id
 
             except httpx.HTTPStatusError as e:
@@ -240,6 +279,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     lib_logger.info(f"Discovered Gemini project ID from active projects list: {project_id}")
                     lib_logger.debug(f"Selected first active project: {project_id} (out of {len(active_projects)} active projects)")
                     self.project_id_cache[credential_path] = project_id
+                    discovered_project_id = project_id
+                    
+                    # [NEW] Persist to credential file (no tier info from resource manager)
+                    await self._persist_project_metadata(credential_path, project_id, None)
+                    
                     return project_id
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
@@ -256,6 +300,55 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             "  3. Account lacks necessary permissions\n"
             "To manually specify a project, set GEMINI_CLI_PROJECT_ID in your .env file."
         )
+    
+    async def _persist_project_metadata(self, credential_path: str, project_id: str, tier: Optional[str]):
+        """Persists project ID and tier to the credential file for faster future startups."""
+        try:
+            # Load current credentials
+            with open(credential_path, 'r') as f:
+                creds = json.load(f)
+            
+            # Update metadata
+            if "_proxy_metadata" not in creds:
+                creds["_proxy_metadata"] = {}
+            
+            creds["_proxy_metadata"]["project_id"] = project_id
+            if tier:
+                creds["_proxy_metadata"]["tier"] = tier
+            
+            # Save back using the existing save method (handles atomic writes and permissions)
+            self._save_credentials(credential_path, creds)
+            
+            lib_logger.debug(f"Persisted project_id and tier to credential file: {credential_path}")
+        except Exception as e:
+            lib_logger.warning(f"Failed to persist project metadata to credential file: {e}")
+            # Non-fatal - just means slower startup next time
+
+
+    def _check_mixed_tier_warning(self):
+        """Check if mixed free/paid tier credentials are loaded and emit warning."""
+        if not self.project_tier_cache:
+            return  # No tiers loaded yet
+    
+        tiers = set(self.project_tier_cache.values())
+        if len(tiers) <= 1:
+            return  # All same tier or only one credential
+    
+        # Define paid vs free tiers
+        free_tiers = {'free-tier', 'legacy-tier', 'unknown'}
+        paid_tiers = tiers - free_tiers
+    
+        # Check if we have both free and paid
+        has_free = bool(tiers & free_tiers)
+        has_paid = bool(paid_tiers)
+    
+        if has_free and has_paid:
+            lib_logger.warning(
+                f"Mixed Gemini tier credentials detected! You have both free-tier and paid-tier "
+                f"(e.g., gemini-advanced) credentials loaded. Tiers found: {', '.join(sorted(tiers))}. "
+                f"This may cause unexpected behavior with model availability and rate limits."
+            )
+
     def has_custom_logic(self) -> bool:
         return True
 
@@ -939,6 +1032,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         Environment variable models always win and are never deduplicated, even if they
         share the same ID (to support different configs like temperature, etc.)
         """
+        # Check for mixed tier credentials and warn if detected
+        self._check_mixed_tier_warning()
+        
         models = []
         env_var_ids = set()  # Track IDs from env vars to prevent hardcoded/dynamic duplicates
 

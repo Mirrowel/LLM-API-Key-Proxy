@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
+from ..utils.headless_detection import is_headless_environment
 
 lib_logger = logging.getLogger('rotator_library')
 
@@ -423,6 +424,7 @@ class IFlowAuthBase:
             max_retries = 3
             new_token_data = None
             last_error = None
+            needs_reauth = False
 
             # Create Basic Auth header
             auth_string = f"{IFLOW_CLIENT_ID}:{IFLOW_CLIENT_SECRET}"
@@ -457,11 +459,14 @@ class IFlowAuthBase:
                         lib_logger.error(f"[REFRESH HTTP ERROR] HTTP {status_code} for '{Path(path).name}': {error_body}")
 
                         # [STATUS CODE HANDLING]
+                        # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
                         if status_code in (401, 403):
-                            lib_logger.error(f"Refresh token invalid (HTTP {status_code}), marking as revoked")
-                            creds_from_file["refresh_token"] = None
-                            await self._save_credentials(path, creds_from_file)
-                            raise ValueError(f"Refresh token revoked or invalid (HTTP {status_code}). Re-authentication required.")
+                            lib_logger.warning(
+                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                f"Token may have been revoked or expired. Starting re-authentication..."
+                            )
+                            needs_reauth = True
+                            break  # Exit retry loop to trigger re-auth
 
                         elif status_code == 429:
                             retry_after = int(e.response.headers.get("Retry-After", 60))
@@ -490,6 +495,17 @@ class IFlowAuthBase:
                             await asyncio.sleep(wait_time)
                             continue
                         raise
+
+            # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
+            if needs_reauth:
+                lib_logger.info(f"Starting re-authentication for '{Path(path).name}'...")
+                try:
+                    # Call initialize_token to trigger OAuth flow
+                    new_creds = await self.initialize_token(path)
+                    return new_creds
+                except Exception as reauth_error:
+                    lib_logger.error(f"Re-authentication failed for '{Path(path).name}': {reauth_error}")
+                    raise ValueError(f"Refresh token invalid and re-authentication failed: {reauth_error}")
 
             if new_token_data is None:
                 raise last_error or Exception("Token refresh failed after all retries")
@@ -640,6 +656,9 @@ class IFlowAuthBase:
 
                 # Interactive OAuth flow
                 lib_logger.warning(f"iFlow OAuth token for '{display_name}' needs setup: {reason}.")
+                
+                # [HEADLESS DETECTION] Check if running in headless environment
+                is_headless = is_headless_environment()
 
                 # Generate random state for CSRF protection
                 state = secrets.token_urlsafe(32)
@@ -660,17 +679,32 @@ class IFlowAuthBase:
                 try:
                     await callback_server.start(expected_state=state)
 
-                    # Display instructions to user
-                    auth_panel_text = Text.from_markup(
-                        "1. Visit the URL below to sign in with your phone number.\n"
-                        "2. [bold]Authorize the application[/bold] to access your account.\n"
-                        "3. You will be automatically redirected after authorization."
-                    )
+                    # [HEADLESS SUPPORT] Display appropriate instructions
+                    if is_headless:
+                        auth_panel_text = Text.from_markup(
+                            "Running in headless environment (no GUI detected).\\n"
+                            "Please open the URL below in a browser on another machine to authorize:\\n"
+                            "1. Visit the URL below to sign in with your phone number.\\n"
+                            "2. [bold]Authorize the application[/bold] to access your account.\\n"
+                            "3. You will be automatically redirected after authorization."
+                        )
+                    else:
+                        auth_panel_text = Text.from_markup(
+                            "1. Visit the URL below to sign in with your phone number.\\n"
+                            "2. [bold]Authorize the application[/bold] to access your account.\\n"
+                            "3. You will be automatically redirected after authorization."
+                        )
+                    
                     console.print(Panel(auth_panel_text, title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
-                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
+                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\\n")
 
-                    # Open browser
-                    webbrowser.open(auth_url)
+                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+                    if not is_headless:
+                        try:
+                            webbrowser.open(auth_url)
+                            lib_logger.info("Browser opened successfully for iFlow OAuth flow")
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to open browser automatically: {e}. Please open the URL manually.")
 
                     # Wait for callback
                     with console.status("[bold green]Waiting for authorization in the browser...[/bold green]", spinner="dots"):
