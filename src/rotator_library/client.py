@@ -33,6 +33,7 @@ from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
+from .ensemble import EnsembleManager
 
 
 class StreamedAPIError(Exception):
@@ -128,6 +129,9 @@ class RotatingClient:
             if max_val < 1:
                 lib_logger.warning(f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1.")
                 self.max_concurrent_requests_per_key[provider] = 1
+        
+        # Initialize HiveMind ensemble manager
+        self.ensemble_manager = EnsembleManager(rotating_client=self)
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
@@ -1637,8 +1641,15 @@ class RotatingClient:
         Returns:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
-        # Handle iflow provider: remove stream_options to avoid HTTP 406
         model = kwargs.get("model", "")
+        
+        # Check if this is an ensemble request (HiveMind)
+        if model and self.ensemble_manager.is_ensemble(model):
+            lib_logger.debug(f"[HiveMind] Detected ensemble request: {model}")
+            # Delegate to ensemble manager
+            return self.ensemble_manager.handle_request(request=request, **kwargs)
+        
+        # Handle iflow provider: remove stream_options to avoid HTTP 406
         provider = model.split("/")[0] if "/" in model else ""
         
         if provider == "iflow" and "stream_options" in kwargs:
@@ -1786,7 +1797,9 @@ class RotatingClient:
     async def get_all_available_models(
         self, grouped: bool = True
     ) -> Union[Dict[str, List[str]], List[str]]:
-        """Returns a list of all available models, either grouped by provider or as a flat list."""
+        """Returns a list of all available models, either grouped by provider or as a flat list.
+        
+        MISSING FEATURE FIX: Now includes HiveMind fusion models."""
         lib_logger.info("Getting all available models...")
 
         all_providers = list(self.all_credentials.keys())
@@ -1802,6 +1815,19 @@ class RotatingClient:
                 all_provider_models[provider] = []
             else:
                 all_provider_models[provider] = result
+
+        # MISSING FEATURE FIX: Add HiveMind fusion models
+        if self.ensemble_manager:
+            fusion_ids = self.ensemble_manager.config_loader.get_all_fusion_ids()
+            if fusion_ids:
+                all_provider_models["hivemind_fusion"] = fusion_ids
+                lib_logger.info(f"Added {len(fusion_ids)} HiveMind fusion models")
+            
+            # Add HiveMind swarm models
+            swarm_models = self.ensemble_manager.config_loader.get_all_swarm_model_ids()
+            if swarm_models:
+                all_provider_models["hivemind_swarm"] = swarm_models
+                lib_logger.info(f"Added {len(swarm_models)} HiveMind swarm model variants")
 
         lib_logger.info("Finished getting all available models.")
         if grouped:

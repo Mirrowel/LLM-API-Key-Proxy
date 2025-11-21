@@ -1,0 +1,65 @@
+{
+  "id": "aggressive",
+  "description": "High diversity swarm with adversarial critique. Use for complex problems requiring multiple perspectives and critical analysis.",
+  
+  "_FIELD_DOCUMENTATION": "=== SWARM PRESET CONFIGURATION ===",
+  "_id": "REQUIRED. Preset identifier. Must match filename (e.g., 'aggressive' for aggressive.json). Used in model name: {base_model}-{id}[swarm]",
+  "_description": "OPTIONAL. Human-readable description of this preset's purpose and characteristics.",
+  
+  "_base_models": "OPTIONAL. List of models this preset applies to. Controls /v1/models discovery. If omitted, preset is invisible but still usable with explicit syntax.",
+  "base_models": [
+    "gpt-4o-mini",
+    "gemini-1.5-flash", 
+    "claude-3-haiku"
+  ],
+  
+  "_omit_id": "OPTIONAL (default: false). If true, shows as {model}[swarm] in /v1/models instead of {model}-{id}[swarm]. Becomes the default preset for these models. Explicit format always works regardless of this setting.",
+  "omit_id": false,
+  
+  "_count": "REQUIRED. Number of parallel drone executions (2-10 recommended). More drones = more diversity but higher cost.",
+  "count": 5,
+  
+  "_temperature_jitter": "OPTIONAL. Adds random temperature variation to each drone for increased response diversity.",
+  "temperature_jitter": {
+    "_enabled": "Enable/disable jitter",
+    "enabled": true,
+    
+    "_delta": "Maximum temperature deviation (±delta). Each drone gets base_temp ± random(0, delta). Clamped to [0.0, 2.0]",
+    "delta": 0.3
+  },
+  
+  "_adversarial_config": "OPTIONAL. Dedicates the last N drones as critical reviewers with a custom prompt.",
+  "adversarial_config": {
+    "_enabled": "Enable/disable adversarial drones",
+    "enabled": true,
+    
+    "_count": "Number of drones to convert to adversarial mode (taken from the end of the drone list)",
+    "count": 2,
+    
+    "_prompt": "System prompt injected into adversarial drones. Should instruct them to find flaws, edge cases, and issues.",
+    "prompt": "You are a Senior Principal Engineer with 15+ years of experience. Your role is to find edge cases, security vulnerabilities, performance bottlenecks, and incorrect assumptions. Be thorough and critical in your analysis. Focus on:\n- Edge cases that could cause failures\n- Security implications and potential exploits\n- Performance and scalability concerns\n- Maintainability and code quality issues\n- Incorrect assumptions in the solution\n\nProvide constructive criticism to improve the solution."
+  },
+  
+  "_arbiter": "REQUIRED. Configuration for the model that synthesizes all drone responses into a final answer.",
+  "arbiter": {
+    "_model": "'self' uses the base model as arbiter. Or specify explicit model (e.g., 'gpt-4o', 'claude-3-5-sonnet'). Should be a reasoning-capable model.",
+    "model": "self",
+    
+    "_strategy": "Name of strategy template file (from strategies/ directory, without .txt extension). Default: 'synthesis'",
+    "strategy": "synthesis",
+    
+    "_blind": "If true, hides model names from arbiter to reduce bias. Still shows drone numbers (Response 1, Response 2, etc.)",
+    "blind": true
+  },
+  
+  "_recursive_mode": "OPTIONAL. Enables autonomous arbiter critique when consensus is low. Requires reasoning-capable arbiter.",
+  "recursive_mode": {
+    "_enabled": "Enable/disable recursive refinement",
+    "enabled": true,
+    
+    "_consensus_threshold": "Threshold (1-10 scale). If arbiter detects consensus < threshold, performs internal critique before synthesis.",
+    "consensus_threshold": 6,
+    
+    "_note": "Arbiter internally evaluates consensus, identifies conflicts, critiques responses, then synthesizes. Internal reasoning is logged but hidden from user output."
+  }
+}
