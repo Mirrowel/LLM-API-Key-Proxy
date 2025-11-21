@@ -5,6 +5,13 @@ import logging
 
 lib_logger = logging.getLogger('rotator_library')
 
+# Import console for user-visible output
+try:
+    from rich.console import Console
+    console = Console()
+except ImportError:
+    console = None
+
 def is_headless_environment() -> bool:
     """
     Detects if the current environment is headless (no GUI available).
@@ -20,10 +27,11 @@ def is_headless_environment() -> bool:
     """
     headless_indicators = []
     
-    # Check DISPLAY for Linux/Unix GUI availability
-    display = os.getenv("DISPLAY")
-    if display is None or display.strip() == "":
-        headless_indicators.append("No DISPLAY variable (Linux/Unix headless)")
+    # Check DISPLAY for Linux/Unix GUI availability (skip on Windows)
+    if os.name != 'nt':  # Only check DISPLAY on non-Windows systems
+        display = os.getenv("DISPLAY")
+        if display is None or display.strip() == "":
+            headless_indicators.append("No DISPLAY variable (Linux/Unix headless)")
     
     # Check for SSH connection
     if os.getenv("SSH_CONNECTION") or os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"):
@@ -62,8 +70,15 @@ def is_headless_environment() -> bool:
     is_headless = len(headless_indicators) > 0
     
     if is_headless:
+        # Log to logger
         lib_logger.info(f"Headless environment detected: {'; '.join(headless_indicators)}")
+        
+        # Print to console for user visibility
+        if console:
+            console.print(f"[yellow]ℹ Headless environment detected:[/yellow] {'; '.join(headless_indicators)}")
+            console.print("[yellow]→ Browser will NOT open automatically. Please use the URL below.[/yellow]\n")
     else:
+        # Only log to debug, no console output
         lib_logger.debug("GUI environment detected, browser auto-open will be attempted")
     
     return is_headless

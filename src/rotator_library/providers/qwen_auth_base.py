@@ -431,21 +431,21 @@ class QwenAuthBase:
                     # [HEADLESS SUPPORT] Display appropriate instructions
                     if is_headless:
                         auth_panel_text = Text.from_markup(
-                            "Running in headless environment (no GUI detected).\\n"
-                            "Please open the URL below in a browser on another machine to authorize:\\n"
-                            "1. Visit the URL below to sign in.\\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\\n"
+                            "Running in headless environment (no GUI detected).\n"
+                            "Please open the URL below in a browser on another machine to authorize:\n"
+                            "1. Visit the URL below to sign in.\n"
+                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
                             "3. You will be prompted to enter your identifier after authorization."
                         )
                     else:
                         auth_panel_text = Text.from_markup(
-                            "1. Visit the URL below to sign in.\\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\\n"
+                            "1. Visit the URL below to sign in.\n"
+                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
                             "3. You will be prompted to enter your identifier after authorization."
                         )
                     
                     console.print(Panel(auth_panel_text, title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
-                    console.print(f"[bold]URL:[/bold] [link={dev_data['verification_uri_complete']}]{dev_data['verification_uri_complete']}[/link]\\n")
+                    console.print(f"[bold]URL:[/bold] [link={dev_data['verification_uri_complete']}]{dev_data['verification_uri_complete']}[/link]\n")
                     
                     # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
                     if not is_headless:

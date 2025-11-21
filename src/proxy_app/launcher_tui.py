@@ -512,8 +512,34 @@ class LauncherTUI:
     
     def launch_credential_tool(self):
         """Launch credential management tool"""
-        from rotator_library.credential_tool import run_credential_tool
-        run_credential_tool()
+        import time
+        
+        # CRITICAL: Show full loading UI to replace the 6-7 second blank wait
+        self.console.clear()
+        
+        _start_time = time.time()
+        
+        # Show the same header as standalone mode
+        self.console.print("━" * 70)
+        self.console.print("Interactive Credential Setup Tool")
+        self.console.print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+        self.console.print("━" * 70)
+        self.console.print("Loading credential management components...")
+        
+        # Now import with spinner (this is where the 6-7 second delay happens)
+        with self.console.status("Initializing credential tool...", spinner="dots"):
+            from rotator_library.credential_tool import run_credential_tool, _ensure_providers_loaded
+            _, PROVIDER_PLUGINS = _ensure_providers_loaded()
+        self.console.print("✓ Credential tool initialized")
+
+        _elapsed = time.time() - _start_time
+        self.console.print(f"✓ Tool ready in {_elapsed:.2f}s ({len(PROVIDER_PLUGINS)} providers available)")
+        
+        # Small delay to let user see the ready message
+        time.sleep(0.5)
+        
+        # Run the tool with from_launcher=True to skip duplicate loading screen
+        run_credential_tool(from_launcher=True)
         # Reload environment after credential tool
         load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
     

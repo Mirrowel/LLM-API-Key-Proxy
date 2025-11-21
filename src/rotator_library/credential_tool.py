@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 from pathlib import Path
 from dotenv import set_key, get_key
 
-from .provider_factory import get_provider_auth_class, get_available_providers
-from .providers import PROVIDER_PLUGINS
+# NOTE: Heavy imports (provider_factory, PROVIDER_PLUGINS) are deferred 
+# to avoid 6-7 second delay before showing loading screen
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -19,8 +20,21 @@ OAUTH_BASE_DIR.mkdir(exist_ok=True)
 # Use a direct path to the .env file in the project root
 ENV_FILE = Path.cwd() / ".env"
 
-
 console = Console()
+
+# Global variables for lazily loaded modules
+_provider_factory = None
+_provider_plugins = None
+
+def _ensure_providers_loaded():
+    """Lazy load provider modules only when needed"""
+    global _provider_factory, _provider_plugins
+    if _provider_factory is None:
+        from . import provider_factory as pf
+        from .providers import PROVIDER_PLUGINS as pp
+        _provider_factory = pf
+        _provider_plugins = pp
+    return _provider_factory, _provider_plugins
 
 def ensure_env_defaults():
     """
@@ -83,6 +97,7 @@ async def setup_api_key():
 
     # Discover custom providers and add them to the list
     # Note: gemini_cli is OAuth-only, but qwen_code and iflow support both OAuth and API keys
+    _, PROVIDER_PLUGINS = _ensure_providers_loaded()
     oauth_only_providers = {'gemini_cli'}
     discovered_providers = {
         p.replace('_', ' ').title(): p.upper() + "_API_KEY"
@@ -172,7 +187,8 @@ async def setup_new_credential(provider_name: str):
     Interactively sets up a new OAuth credential for a given provider.
     """
     try:
-        auth_class = get_provider_auth_class(provider_name)
+        provider_factory, _ = _ensure_providers_loaded()
+        auth_class = provider_factory.get_provider_auth_class(provider_name)
         auth_instance = auth_class()
 
         # Build display name for better user experience
@@ -516,15 +532,25 @@ async def export_iflow_to_env():
         console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
 
 
-async def main():
+async def main(clear_on_start=True):
     """
     An interactive CLI tool to add new credentials.
+    
+    Args:
+        clear_on_start: If False, skip initial screen clear (used when called from launcher 
+                       to preserve the loading screen)
     """
-    console.clear()  # Clear terminal when credential tool starts
     ensure_env_defaults()
-    console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
+    
+    # Only show header if we're clearing (standalone mode)
+    if clear_on_start:
+        console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
     
     while True:
+        # Clear screen between menu selections for cleaner UX
+        console.clear()
+        console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
+        
         console.print(Panel(
             Text.from_markup(
                 "1. Add OAuth Credential\n"
@@ -547,7 +573,8 @@ async def main():
             break
 
         if setup_type == "1":
-            available_providers = get_available_providers()
+            provider_factory, _ = _ensure_providers_loaded()
+            available_providers = provider_factory.get_available_providers()
             oauth_friendly_names = {
                 "gemini_cli": "Gemini CLI (OAuth)",
                 "qwen_code": "Qwen Code (OAuth - also supports API keys)",
@@ -577,28 +604,77 @@ async def main():
                     display_name = oauth_friendly_names.get(provider_name, provider_name.replace('_', ' ').title())
                     console.print(f"\nStarting OAuth setup for [bold cyan]{display_name}[/bold cyan]...")
                     await setup_new_credential(provider_name)
+                    # Don't clear after OAuth - user needs to see full flow
+                    console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+                    input()
                 else:
                     console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+                    await asyncio.sleep(1.5)
             except ValueError:
                 console.print("[bold red]Invalid input. Please enter a number or 'b'.[/bold red]")
+                await asyncio.sleep(1.5)
 
         elif setup_type == "2":
             await setup_api_key()
+            #console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
 
         elif setup_type == "3":
             await export_gemini_cli_to_env()
+            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
 
         elif setup_type == "4":
             await export_qwen_code_to_env()
+            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
 
         elif setup_type == "5":
             await export_iflow_to_env()
+            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
 
-        console.print("\n" + "="*50 + "\n")
+def run_credential_tool(from_launcher=False):
+    """
+    Entry point for credential tool.
+    
+    Args:
+        from_launcher: If True, skip loading screen (launcher already showed it)
+    """
+    # Check if we need to show loading screen
+    if not from_launcher:
+        # Standalone mode - show full loading UI
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
+        _start_time = time.time()
+        
+        # Phase 1: Show initial message
+        print("━" * 70)
+        print("Interactive Credential Setup Tool")
+        print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
+        print("━" * 70)
+        print("Loading credential management components...")
+        
+        # Phase 2: Load dependencies with spinner
+        with console.status("Loading authentication providers...", spinner="dots"):
+            _ensure_providers_loaded()
+        console.print("✓ Authentication providers loaded")
 
-def run_credential_tool():
+        with console.status("Initializing credential tool...", spinner="dots"):
+            time.sleep(0.2)  # Brief pause for UI consistency
+        console.print("✓ Credential tool initialized")
+        
+        _elapsed = time.time() - _start_time
+        _, PROVIDER_PLUGINS = _ensure_providers_loaded()
+        print(f"✓ Tool ready in {_elapsed:.2f}s ({len(PROVIDER_PLUGINS)} providers available)")
+        
+        # Small delay to let user see the ready message
+        time.sleep(0.5)
+    
+    # Run the main async event loop
+    # If from launcher, don't clear screen at start to preserve loading messages
     try:
-        asyncio.run(main())
+        asyncio.run(main(clear_on_start=not from_launcher))
         console.clear()  # Clear terminal when credential tool exits
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Exiting setup.[/bold yellow]")

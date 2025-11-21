@@ -682,21 +682,21 @@ class IFlowAuthBase:
                     # [HEADLESS SUPPORT] Display appropriate instructions
                     if is_headless:
                         auth_panel_text = Text.from_markup(
-                            "Running in headless environment (no GUI detected).\\n"
-                            "Please open the URL below in a browser on another machine to authorize:\\n"
-                            "1. Visit the URL below to sign in with your phone number.\\n"
-                            "2. [bold]Authorize the application[/bold] to access your account.\\n"
+                            "Running in headless environment (no GUI detected).\n"
+                            "Please open the URL below in a browser on another machine to authorize:\n"
+                            "1. Visit the URL below to sign in with your phone number.\n"
+                            "2. [bold]Authorize the application[/bold] to access your account.\n"
                             "3. You will be automatically redirected after authorization."
                         )
                     else:
                         auth_panel_text = Text.from_markup(
-                            "1. Visit the URL below to sign in with your phone number.\\n"
-                            "2. [bold]Authorize the application[/bold] to access your account.\\n"
+                            "1. Visit the URL below to sign in with your phone number.\n"
+                            "2. [bold]Authorize the application[/bold] to access your account.\n"
                             "3. You will be automatically redirected after authorization."
                         )
                     
                     console.print(Panel(auth_panel_text, title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
-                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\\n")
+                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
 
                     # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
                     if not is_headless:
