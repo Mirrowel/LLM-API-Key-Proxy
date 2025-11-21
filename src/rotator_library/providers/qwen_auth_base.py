@@ -39,6 +39,13 @@ class QwenAuthBase:
         # [BACKOFF TRACKING] Track consecutive failures per credential
         self._refresh_failures: Dict[str, int] = {}  # Track consecutive failures per credential
         self._next_refresh_after: Dict[str, float] = {}  # Track backoff timers (Unix timestamp)
+        
+        # [QUEUE SYSTEM] Sequential refresh processing
+        self._refresh_queue: asyncio.Queue = asyncio.Queue()
+        self._queued_credentials: set = set()  # Track credentials already in queue
+        self._unavailable_credentials: set = set()  # Mark credentials unavailable during re-auth
+        self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
+        self._queue_processor_task: Optional[asyncio.Task] = None  # Background worker task
 
     def _load_from_env(self) -> Optional[Dict[str, Any]]:
         """
@@ -327,36 +334,10 @@ class QwenAuthBase:
         if not os.path.isfile(credential_identifier):
             return  # Direct API key, no refresh needed
 
-        # [BACKOFF] Check if refresh is in backoff period
-        now = time.time()
-        if credential_identifier in self._next_refresh_after:
-            backoff_until = self._next_refresh_after[credential_identifier]
-            if now < backoff_until:
-                remaining = int(backoff_until - now)
-                lib_logger.debug(f"Skipping refresh for '{Path(credential_identifier).name}' (in backoff for {remaining}s)")
-                return
-
         creds = await self._load_credentials(credential_identifier)
         if self._is_token_expired(creds):
-            try:
-                await self._refresh_token(credential_identifier)
-                # [SUCCESS] Clear failure tracking
-                self._refresh_failures.pop(credential_identifier, None)
-                self._next_refresh_after.pop(credential_identifier, None)
-                lib_logger.debug(f"Successfully refreshed '{Path(credential_identifier).name}', cleared failure tracking")
-            except Exception as e:
-                # [FAILURE] Increment failure count and set exponential backoff
-                failures = self._refresh_failures.get(credential_identifier, 0) + 1
-                self._refresh_failures[credential_identifier] = failures
-
-                # Exponential backoff: 5min → 10min → 20min → max 1 hour
-                backoff_seconds = min(300 * (2 ** (failures - 1)), 3600)
-                self._next_refresh_after[credential_identifier] = now + backoff_seconds
-
-                lib_logger.error(
-                    f"Refresh failed for '{Path(credential_identifier).name}' "
-                    f"(attempt {failures}). Next retry in {backoff_seconds}s. Error: {e}"
-                )
+            # Queue for refresh with needs_reauth=False (automated refresh)
+            await self._queue_refresh(credential_identifier, force=False, needs_reauth=False)
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
         # [FIX RACE CONDITION] Protect lock creation with a master lock
@@ -364,6 +345,92 @@ class QwenAuthBase:
             if path not in self._refresh_locks:
                 self._refresh_locks[path] = asyncio.Lock()
             return self._refresh_locks[path]
+
+    def is_credential_available(self, path: str) -> bool:
+        """Check if a credential is available for rotation (not queued/refreshing)."""
+        return path not in self._unavailable_credentials
+
+    async def _ensure_queue_processor_running(self):
+        """Lazily starts the queue processor if not already running."""
+        if self._queue_processor_task is None or self._queue_processor_task.done():
+            self._queue_processor_task = asyncio.create_task(self._process_refresh_queue())
+
+    async def _queue_refresh(self, path: str, force: bool = False, needs_reauth: bool = False):
+        """Add a credential to the refresh queue if not already queued.
+        
+        Args:
+            path: Credential file path
+            force: Force refresh even if not expired
+            needs_reauth: True if full re-authentication needed (bypasses backoff)
+        """
+        # IMPORTANT: Only check backoff for simple automated refreshes
+        # Re-authentication (interactive OAuth) should BYPASS backoff since it needs user input
+        if not needs_reauth:
+            now = time.time()
+            if path in self._next_refresh_after:
+                backoff_until = self._next_refresh_after[path]
+                if now < backoff_until:
+                    # Credential is in backoff for automated refresh, do not queue
+                    remaining = int(backoff_until - now)
+                    lib_logger.debug(f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)")
+                    return
+        
+        async with self._queue_tracking_lock:
+            if path not in self._queued_credentials:
+                self._queued_credentials.add(path)
+                self._unavailable_credentials.add(path)  # Mark as unavailable
+                await self._refresh_queue.put((path, force, needs_reauth))
+                await self._ensure_queue_processor_running()
+
+    async def _process_refresh_queue(self):
+        """Background worker that processes refresh requests sequentially."""
+        while True:
+            path = None
+            try:
+                # Wait for an item with timeout to allow graceful shutdown
+                try:
+                    path, force, needs_reauth = await asyncio.wait_for(
+                        self._refresh_queue.get(), 
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # No items for 60s, exit to save resources
+                    self._queue_processor_task = None
+                    return
+                
+                try:
+                    # Perform the actual refresh (still using per-credential lock)
+                    async with await self._get_lock(path):
+                        # Re-check if still expired (may have changed since queueing)
+                        creds = self._credentials_cache.get(path)
+                        if creds and not self._is_token_expired(creds):
+                            # No longer expired, mark as available
+                            async with self._queue_tracking_lock:
+                                self._unavailable_credentials.discard(path)
+                            continue
+                        
+                        # Perform refresh
+                        if not creds:
+                            creds = await self._load_credentials(path)
+                        await self._refresh_token(path, force=force)
+                        
+                        # SUCCESS: Mark as available again
+                        async with self._queue_tracking_lock:
+                            self._unavailable_credentials.discard(path)
+                        
+                finally:
+                    # Remove from queued set
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+                    self._refresh_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                lib_logger.error(f"Error in queue processor: {e}")
+                # Even on error, mark as available (backoff will prevent immediate retry)
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.discard(path)
 
     async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
         """Initiates device flow if tokens are missing or invalid."""

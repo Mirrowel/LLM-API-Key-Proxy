@@ -630,6 +630,18 @@ class RotatingClient:
         # multiple keys have the same usage stats.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
+        
+        # Filter out credentials that are unavailable (queued for re-auth)
+        provider_plugin = self._get_provider_instance(provider)
+        if provider_plugin and hasattr(provider_plugin, 'is_credential_available'):
+            available_creds = [
+                cred for cred in credentials_for_provider
+                if provider_plugin.is_credential_available(cred)
+            ]
+            if available_creds:
+                credentials_for_provider = available_creds
+            # If all credentials are unavailable, keep the original list
+            # (better to try unavailable creds than fail immediately)
 
         tried_creds = set()
         last_exception = None
@@ -992,6 +1004,18 @@ class RotatingClient:
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
+        
+        # Filter out credentials that are unavailable (queued for re-auth)
+        provider_plugin = self._get_provider_instance(provider)
+        if provider_plugin and hasattr(provider_plugin, 'is_credential_available'):
+            available_creds = [
+                cred for cred in credentials_for_provider
+                if provider_plugin.is_credential_available(cred)
+            ]
+            if available_creds:
+                credentials_for_provider = available_creds
+            # If all credentials are unavailable, keep the original list
+            # (better to try unavailable creds than fail immediately)
 
         deadline = time.time() + self.global_timeout
         tried_creds = set()
