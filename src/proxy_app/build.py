@@ -1,4 +1,5 @@
 import os
+import sys
 import platform
 import subprocess
 
@@ -29,7 +30,7 @@ def main():
     """
     # Base PyInstaller command with optimizations
     command = [
-        "python",
+        sys.executable,
         "-m",
         "PyInstaller",
         "--onefile",

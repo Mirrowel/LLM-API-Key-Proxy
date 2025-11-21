@@ -39,20 +39,15 @@ jobs:
       shell: bash
       run: |
         uv python install 3.12
-        uv venv --python 3.12
+        uv venv
 
     - name: Install dependencies
       shell: bash
       run: |
         grep -v -- '-e src/rotator_library' requirements.txt > temp_requirements.txt
-        if [ "${{ runner.os }}" == "Windows" ]; then
-          . .venv/Scripts/activate
-        else
-          source .venv/bin/activate
-        fi
-        uv pip install -r temp_requirements.txt
-        uv pip install pyinstaller
-        uv pip install -e src/rotator_library
+        uv pip install --python .venv -r temp_requirements.txt
+        uv pip install --python .venv pyinstaller
+        uv pip install --python .venv -e src/rotator_library
 
     - name: Get PyInstaller cache directory
       id: pyinstaller-cache-dir
@@ -78,11 +73,10 @@ jobs:
       shell: bash
       run: |
         if [ "${{ runner.os }}" == "Windows" ]; then
-          . .venv/Scripts/activate
+          .venv/Scripts/python src/proxy_app/build.py
         else
-          source .venv/bin/activate
+          .venv/bin/python src/proxy_app/build.py
         fi
-        python src/proxy_app/build.py
 
     - name: Ensure PyInstaller cache directory exists
       shell: pwsh
