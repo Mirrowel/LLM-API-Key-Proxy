@@ -356,14 +356,18 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         """
         Returns a list of model names to try in order for rate limit fallback.
         First model in list is the original model, subsequent models are fallback options.
+        
+        Since all fallbacks have been deprecated, this now only returns the base model.
+        The fallback logic will check if there are actual fallbacks available.
         """
         # Remove provider prefix if present
         model_name = model.split('/')[-1].replace(':thinking', '')
 
         # Define fallback chains for models with preview versions
+        # All fallbacks have been deprecated, so only base models are returned
         fallback_chains = {
-            "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-pro-preview-06-05"],
-            "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-2.5-flash-preview-05-20"],
+            "gemini-2.5-pro": ["gemini-2.5-pro"],
+            "gemini-2.5-flash": ["gemini-2.5-flash"],
             # Add more fallback chains as needed
         }
 
@@ -903,15 +907,23 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             return logging_stream_wrapper()
 
-        # Try each model in fallback order on rate limit
+        # Check if there are actual fallback models available
+        # If fallback_models is empty or contains only the base model (no actual fallbacks), skip fallback logic
+        has_fallbacks = len(fallback_models) > 1 and any(model != fallback_models[0] for model in fallback_models[1:])
+        
         lib_logger.debug(f"Fallback models available: {fallback_models}")
+        if not has_fallbacks:
+            lib_logger.debug("No actual fallback models available, proceeding with single model attempt")
+        
         last_error = None
         for idx, attempt_model in enumerate(fallback_models):
             is_fallback = idx > 0
             if is_fallback:
                 lib_logger.info(f"Gemini CLI rate limited, retrying with fallback model: {attempt_model}")
-            elif len(fallback_models) > 1:
+            elif has_fallbacks:
                 lib_logger.debug(f"Attempting primary model: {attempt_model} (with {len(fallback_models)-1} fallback(s) available)")
+            else:
+                lib_logger.debug(f"Attempting model: {attempt_model} (no fallbacks available)")
 
             try:
                 response_gen = await do_call(attempt_model, is_fallback)
