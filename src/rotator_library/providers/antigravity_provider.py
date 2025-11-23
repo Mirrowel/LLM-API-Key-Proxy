@@ -8,6 +8,8 @@ import asyncio
 import random
 import uuid
 import copy
+import threading
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
@@ -320,75 +322,102 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         return system_instruction, gemini_contents
 
     # ============================================================================
-    # THINKING/REASONING CONFIGURATION
+    # REASONING CONFIGURATION (GEMINI 2.5 & 3 ONLY)
     # ============================================================================
 
     def _map_reasoning_effort_to_thinking_config(
         self,
         reasoning_effort: Optional[str],
-        model: str
+        model: str,
+        custom_reasoning_budget: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
-        Map OpenAI reasoning_effort to Gemini thinking configuration.
-        Handles Gemini 3 thinkingLevel vs other models thinkingBudget.
+        Map reasoning_effort to thinking configuration for Gemini 2.5 and 3 models.
+        
+        IMPORTANT: This function ONLY applies to Gemini 2.5 and 3 models.
+        For other models (e.g., Claude via Antigravity), it returns None.
+        
+        Gemini 2.5 and 3 use separate budgeting systems:
+        - Gemini 2.5: thinkingBudget (integer tokens, based on Gemini CLI logic)
+        - Gemini 3: thinkingLevel (string: "low" or "high")
+        
+        Default behavior (no reasoning_effort):
+        - Gemini 2.5: thinkingBudget=-1 (auto mode)
+        - Gemini 3: thinkingLevel="high" (always enabled at high level)
         
         Args:
-            reasoning_effort: OpenAI reasoning_effort value
+            reasoning_effort: Effort level ('low', 'medium', 'high', 'disable', or None)
             model: Model name (public alias)
+            custom_reasoning_budget: If True, use full budgets; if False, divide by 4
             
         Returns:
-            Dictionary with thinkingConfig or None
+            Dict with thinkingConfig or None if not a Gemini 2.5/3 model
         """
         internal_model = self._alias_to_model_name(model)
+        
+        # Detect model family - ONLY support gemini-2.5 and gemini-3
+        # For other models (Claude, etc.), return None without filtering
+        is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal_model.startswith("gemini-3-")
         
-        # Default for gemini-3-pro-preview when no reasoning_effort specified
-        if not reasoning_effort:
-            if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-high":
-                return {
-                    "thinkingBudget": -1,
-                    "include_thoughts": True
-                }
+        # Return None for unsupported models - no reasoning config changes
+        if not is_gemini_25 and not is_gemini_3:
             return None
         
-        if reasoning_effort == "none":
-            return {
-                "thinkingBudget": 0,
-                "include_thoughts": False
-            }
+        # ========================================================================
+        # GEMINI 2.5: Use Gemini CLI logic with thinkingBudget
+        # ========================================================================
+        if is_gemini_25:
+            # Default: auto mode
+            if not reasoning_effort:
+                return {"thinkingBudget": -1, "include_thoughts": True}
+            
+            # Disable thinking
+            if reasoning_effort == "disable":
+                return {"thinkingBudget": 0, "include_thoughts": False}
+            
+            # Model-specific budgets (same as Gemini CLI)
+            if "gemini-2.5-pro" in model:
+                budgets = {"low": 8192, "medium": 16384, "high": 32768}
+            elif "gemini-2.5-flash" in model:
+                budgets = {"low": 6144, "medium": 12288, "high": 24576}
+            else:
+                # Fallback for other gemini-2.5 models
+                budgets = {"low": 1024, "medium": 2048, "high": 4096}
+            
+            budget = budgets.get(reasoning_effort, -1)  # -1 for invalid/auto
+            
+            # Apply custom_reasoning_budget toggle
+            # If False (default), divide by 4 like Gemini CLI
+            if not custom_reasoning_budget:
+                budget = budget // 4
+            
+            return {"thinkingBudget": budget, "include_thoughts": True}
         
-        if reasoning_effort == "auto":
-            # Auto always uses thinkingBudget=-1, even for Gemini 3
-            return {
-                "thinkingBudget": -1,
-                "include_thoughts": True
-            }
-        
+        # ========================================================================
+        # GEMINI 3: Use STRING thinkingLevel ("low" or "high")
+        # ========================================================================
         if is_gemini_3:
-            # Gemini 3: Use thinkingLevel
-            level_map = {
-                "low": "low",
-                "medium": "high",  # Medium not released yet, map to high
-                "high": "high"
-            }
-            level = level_map.get(reasoning_effort, "high")
-            return {
-                "thinkingLevel": level,
-                "include_thoughts": True
-            }
-        else:
-            # Non-Gemini-3: Use thinkingBudget with normalization
-            budget_map = {
-                "low": 1024,
-                "medium": 8192,
-                "high": 32768
-            }
-            budget = budget_map.get(reasoning_effort, -1)
-            # TODO: Add model-specific normalization via model registry
-            return {
-                "thinkingBudget": budget,
-                "include_thoughts": True
-            }
+            # Default: Always use "high" if not specified
+            # Gemini 3 cannot be disabled - always has thinking enabled
+            if not reasoning_effort:
+                return {"thinkingLevel": "high", "include_thoughts": True}
+            
+            # Map reasoning effort to string level
+            # Note: "disable" is ignored - Gemini 3 cannot disable thinking
+            if reasoning_effort == "low":
+                level = "low"
+            # Medium level not yet available - map to high
+            # When medium is released, uncomment the following line:
+            # elif reasoning_effort == "medium":
+            #     level = "medium"
+            else:
+                # "medium", "high", "disable", or any invalid value → "high"
+                level = "high"
+            
+            return {"thinkingLevel": level, "include_thoughts": True}
+        
+        return None
 
     # ============================================================================
     # TOOL RESPONSE GROUPING
@@ -477,71 +506,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 new_contents.append(function_response_content)
         
         return new_contents
-
-
-    # ============================================================================
-    # REASONING PARAMETER HANDLING
-    # ============================================================================
-
-    def _map_reasoning_effort_to_thinking_config(
-        self, 
-        reasoning_effort: Optional[str], 
-        model: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Map reasoning_effort parameter to thinkingConfig for Gemini models.
-        
-        This enables default thinking for Gemini 2.5 and 3 models, allowing
-        them to use internal reasoning/thinking capabilities.
-        
-        Args:
-            reasoning_effort: Optional reasoning effort level ('low', 'medium', 'high', 'disable', or None)
-            model: Model name (public alias)
-            
-        Returns:
-            thinkingConfig dict if applicable, None otherwise
-        """
-        # Only apply to gemini-2.5 and gemini-3 model families
-        if "gemini-2.5" not in model and "gemini-3" not in model:
-            return None
-        
-        # If no reasoning_effort provided, enable default thinking (auto mode)
-        if reasoning_effort is None:
-            # For Gemini 3, use thinkingLevel
-            if "gemini-3" in model:
-                return {"thinkingLevel": 1, "include_thoughts": True}
-            # For Gemini 2.5, use thinkingBudget in auto mode (-1)
-            else:
-                return {"thinkingBudget": -1, "include_thoughts": True}
-        
-        # Handle explicit disable
-        if reasoning_effort == "disable":
-            if "gemini-3" in model:
-                return {"thinkingLevel": 0, "include_thoughts": False}
-            else:
-                return {"thinkingBudget": 0, "include_thoughts": False}
-        
-        # Map reasoning effort to budget for Gemini 2.5
-        if "gemini-2.5" in model:
-            if "gemini-2.5-pro" in model:
-                budgets = {"low": 8192, "medium": 16384, "high": 32768}
-            elif "gemini-2.5-flash" in model:
-                budgets = {"low": 6144, "medium": 12288, "high": 24576}
-            else:
-                # Fallback for other gemini-2.5 models
-                budgets = {"low": 1024, "medium": 2048, "high": 4096}
-            
-            budget = budgets.get(reasoning_effort, -1)  # -1 = auto for invalid values
-            # Note: Not dividing by 4 like Gemini CLI does, using full budget
-            return {"thinkingBudget": budget, "include_thoughts": True}
-        
-        # For Gemini 3, map to thinkingLevel
-        if "gemini-3" in model:
-            levels = {"low": 1, "medium": 2, "high": 3}
-            level = levels.get(reasoning_effort, 1)  # Default to level 1
-            return {"thinkingLevel": level, "include_thoughts": True}
-        
-        return None
 
     # ============================================================================
     # ANTIGRAVITY REQUEST TRANSFORMATION
@@ -946,8 +910,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if top_p is not None:
             generation_config["topP"] = top_p
         
+        # Extract custom_reasoning_budget toggle
+        # Check kwargs first, then headers if not found
+        custom_reasoning_budget = kwargs.get("custom_reasoning_budget", False)
+        
         # Handle thinking config
-        thinking_config = self._map_reasoning_effort_to_thinking_config(reasoning_effort, model)
+        thinking_config = self._map_reasoning_effort_to_thinking_config(
+            reasoning_effort, 
+            model,
+            custom_reasoning_budget
+        )
         if thinking_config:
             generation_config.setdefault("thinkingConfig", {}).update(thinking_config)
         
