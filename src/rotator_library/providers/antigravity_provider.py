@@ -8,6 +8,8 @@ import asyncio
 import random
 import uuid
 import copy
+from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .antigravity_auth_base import AntigravityAuthBase
@@ -36,6 +38,64 @@ HARDCODED_MODELS = [
     "gemini-2.5-computer-use-preview-10-2025"
 ]
 
+# Logging configuration
+LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
+ANTIGRAVITY_LOGS_DIR = LOGS_DIR / "antigravity_logs"
+
+
+class _AntigravityFileLogger:
+    """A simple file logger for a single Antigravity transaction."""
+    def __init__(self, model_name: str, enabled: bool = True):
+        self.enabled = enabled
+        if not self.enabled:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        request_id = str(uuid.uuid4())
+        # Sanitize model name for directory
+        safe_model_name = model_name.replace('/', '_').replace(':', '_')
+        self.log_dir = ANTIGRAVITY_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            lib_logger.error(f"Failed to create Antigravity log directory: {e}")
+            self.enabled = False
+
+    def log_request(self, payload: Dict[str, Any]):
+        """Logs the request payload sent to Antigravity."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "request_payload.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_AntigravityFileLogger: Failed to write request: {e}")
+
+    def log_response_chunk(self, chunk: str):
+        """Logs a raw chunk from the Antigravity response stream."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
+                f.write(chunk + "\n")
+        except Exception as e:
+            lib_logger.error(f"_AntigravityFileLogger: Failed to write response chunk: {e}")
+
+    def log_error(self, error_message: str):
+        """Logs an error message."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
+        except Exception as e:
+            lib_logger.error(f"_AntigravityFileLogger: Failed to write error: {e}")
+
+    def log_final_response(self, response_data: Dict[str, Any]):
+        """Logs the final, reassembled response."""
+        if not self.enabled: return
+        try:
+            with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
+                json.dump(response_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            lib_logger.error(f"_AntigravityFileLogger: Failed to write final response: {e}")
 
 class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     """
@@ -418,6 +478,71 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         return new_contents
 
+
+    # ============================================================================
+    # REASONING PARAMETER HANDLING
+    # ============================================================================
+
+    def _map_reasoning_effort_to_thinking_config(
+        self, 
+        reasoning_effort: Optional[str], 
+        model: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Map reasoning_effort parameter to thinkingConfig for Gemini models.
+        
+        This enables default thinking for Gemini 2.5 and 3 models, allowing
+        them to use internal reasoning/thinking capabilities.
+        
+        Args:
+            reasoning_effort: Optional reasoning effort level ('low', 'medium', 'high', 'disable', or None)
+            model: Model name (public alias)
+            
+        Returns:
+            thinkingConfig dict if applicable, None otherwise
+        """
+        # Only apply to gemini-2.5 and gemini-3 model families
+        if "gemini-2.5" not in model and "gemini-3" not in model:
+            return None
+        
+        # If no reasoning_effort provided, enable default thinking (auto mode)
+        if reasoning_effort is None:
+            # For Gemini 3, use thinkingLevel
+            if "gemini-3" in model:
+                return {"thinkingLevel": 1, "include_thoughts": True}
+            # For Gemini 2.5, use thinkingBudget in auto mode (-1)
+            else:
+                return {"thinkingBudget": -1, "include_thoughts": True}
+        
+        # Handle explicit disable
+        if reasoning_effort == "disable":
+            if "gemini-3" in model:
+                return {"thinkingLevel": 0, "include_thoughts": False}
+            else:
+                return {"thinkingBudget": 0, "include_thoughts": False}
+        
+        # Map reasoning effort to budget for Gemini 2.5
+        if "gemini-2.5" in model:
+            if "gemini-2.5-pro" in model:
+                budgets = {"low": 8192, "medium": 16384, "high": 32768}
+            elif "gemini-2.5-flash" in model:
+                budgets = {"low": 6144, "medium": 12288, "high": 24576}
+            else:
+                # Fallback for other gemini-2.5 models
+                budgets = {"low": 1024, "medium": 2048, "high": 4096}
+            
+            budget = budgets.get(reasoning_effort, -1)  # -1 = auto for invalid values
+            # Note: Not dividing by 4 like Gemini CLI does, using full budget
+            return {"thinkingBudget": budget, "include_thoughts": True}
+        
+        # For Gemini 3, map to thinkingLevel
+        if "gemini-3" in model:
+            levels = {"low": 1, "medium": 2, "high": 3}
+            level = levels.get(reasoning_effort, 1)  # Default to level 1
+            return {"thinkingLevel": level, "include_thoughts": True}
+        
+        return None
+
     # ============================================================================
     # ANTIGRAVITY REQUEST TRANSFORMATION
     # ============================================================================
@@ -483,7 +608,21 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         part["thoughtSignature"] = "skip_thought_signature_validator"
                     # If thoughtSignature already exists, preserve it (important for Gemini 3)
         
-        # 7. Handle Claude models (special tool schema conversion)
+        # ========================================================================
+        # IMPORTANT: CLAUDE SCHEMA HANDLING - REQUIRES INVESTIGATION
+        # ========================================================================
+        # WARNING: This code block may be incorrect!
+        # 
+        # INVESTIGATION REQUIRED BEFORE MAKING CHANGES:
+        # - Test Claude model access through Antigravity with tools
+        # - Verify whether parametersJsonSchema → parameters conversion is needed
+        # - The Go reference suggests Antigravity expects parametersJsonSchema for ALL models
+        #
+        # Current behavior: Converts parametersJsonSchema back to parameters for Claude models
+        # Potential issue: Antigravity may actually expect parametersJsonSchema for Claude too
+        #
+        # DO NOT MODIFY without first confirming actual API behavior!
+        # ========================================================================
         if internal_model.startswith("claude-sonnet-"):
             # For Claude models, convert parametersJsonSchema back to parameters
             for tool in antigravity_payload["request"].get("tools", []):
@@ -776,8 +915,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         temperature = kwargs.get("temperature")
         top_p = kwargs.get("top_p")
         max_tokens = kwargs.get("max_tokens")
+        enable_request_logging = kwargs.pop("enable_request_logging", False)
         
         lib_logger.info(f"Antigravity completion: model={model}, stream={stream}, messages={len(messages)}")
+        
+        # Create file logger
+        file_logger = _AntigravityFileLogger(
+            model_name=model,
+            enabled=enable_request_logging
+        )
         
         # Step 1: Transform messages (OpenAI → Gemini CLI)
         system_instruction, gemini_contents = self._transform_messages(messages)
@@ -828,6 +974,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Step 3: Transform to Antigravity format
         antigravity_payload = self._transform_to_antigravity_format(gemini_cli_payload, model)
         
+        # Log the request
+        file_logger.log_request(antigravity_payload)
+        
         # Step 4: Make API call
         access_token = await self.get_valid_token(credential_path)
         base_url = self._get_current_base_url()
@@ -844,9 +993,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         try:
             if stream:
-                return self._handle_streaming(client, url, headers, antigravity_payload, model)
+                return self._handle_streaming(client, url, headers, antigravity_payload, model, file_logger)
             else:
-                return await self._handle_non_streaming(client, url, headers, antigravity_payload, model)
+                return await self._handle_non_streaming(client, url, headers, antigravity_payload, model, file_logger)
         except Exception as e:
             # Try fallback URL if available
             if self._try_next_base_url():
@@ -867,13 +1016,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         url: str,
         headers: Dict[str, str],
         payload: Dict[str, Any],
-        model: str
+        model: str,
+        file_logger: Optional[_AntigravityFileLogger] = None
     ) -> litellm.ModelResponse:
         """Handle non-streaming completion."""
         response = await client.post(url, headers=headers, json=payload, timeout=120.0)
         response.raise_for_status()
         
         antigravity_response = response.json()
+        
+        # Log response
+        if file_logger:
+            file_logger.log_final_response(antigravity_response)
         
         # Unwrap Antigravity envelope
         gemini_response = self._unwrap_antigravity_response(antigravity_response)
@@ -887,13 +1041,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         url: str,
         headers: Dict[str, str],
         payload: Dict[str, Any],
-        model: str
+        model: str,
+        file_logger: Optional[_AntigravityFileLogger] = None
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion."""
         async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
             response.raise_for_status()
             
             async for line in response.aiter_lines():
+                # Log raw chunk
+                if file_logger:
+                    file_logger.log_response_chunk(line)
+                
                 if line.startswith("data: "):
                     data_str = line[6:]
                     if data_str == "[DONE]":
@@ -910,5 +1069,107 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         
                         yield openai_chunk
                     except json.JSONDecodeError:
+                        if file_logger:
+                            file_logger.log_error(f"Failed to parse chunk: {data_str[:100]}")
                         lib_logger.warning(f"Failed to parse Antigravity chunk: {data_str[:100]}")
                         continue
+
+    # ============================================================================
+    # TOKEN COUNTING
+    # ============================================================================
+
+    async def count_tokens(
+        self,
+        client: httpx.AsyncClient,
+        credential_path: str,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        litellm_params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, int]:
+        """
+        Counts tokens for the given prompt using the Antigravity :countTokens endpoint.
+        
+        Args:
+            client: The HTTP client to use
+            credential_path: Path to the credential file
+            model: Model name to use for token counting
+            messages: List of messages in OpenAI format
+            tools: Optional list of tool definitions
+            litellm_params: Optional additional parameters
+        
+        Returns:
+            Dict with 'prompt_tokens' and 'total_tokens' counts
+        """
+        # Get auth token
+        access_token = await self.get_valid_token(credential_path)
+        
+        # Convert public alias to internal name
+        internal_model = self._alias_to_model_name(model)
+        
+        # Transform messages to Gemini format
+        system_instruction, contents = self._transform_messages(messages)
+        
+        # Build Gemini CLI payload
+        gemini_cli_payload = {
+            "contents": contents
+        }
+        
+        if system_instruction:
+            gemini_cli_payload["systemInstruction"] = system_instruction
+        
+        if tools:
+            # Transform tools to Gemini format
+            gemini_tools = []
+            for tool in tools:
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    schema = _build_vertex_schema(parameters=func.get("parameters", {}))
+                    gemini_tools.append({
+                        "functionDeclarations": [{
+                            "name": func.get("name", ""),
+                            "description": func.get("description", ""),
+                            "parametersJsonSchema": schema
+                        }]
+                    })
+            if gemini_tools:
+                gemini_cli_payload["tools"] = gemini_tools
+        
+        # Wrap in Antigravity envelope
+        antigravity_payload = {
+            "project": self.generate_project_id(),
+            "userAgent": "antigravity",
+            "requestId": self.generate_request_id(),
+            "model": internal_model,
+            "request": gemini_cli_payload
+        }
+        
+        # Make the request
+        base_url = self._get_current_base_url()
+        url = f"{base_url}:countTokens"
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            response = await client.post(url, headers=headers, json=antigravity_payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Unwrap Antigravity response
+            unwrapped = self._unwrap_antigravity_response(data)
+            
+            # Extract token counts from response
+            total_tokens = unwrapped.get('totalTokens', 0)
+            
+            return {
+                'prompt_tokens': total_tokens,
+                'total_tokens': total_tokens,
+            }
+        
+        except httpx.HTTPStatusError as e:
+            lib_logger.error(f"Failed to count tokens: {e}")
+            # Return 0 on error rather than raising
+            return {'prompt_tokens': 0, 'total_tokens': 0}
