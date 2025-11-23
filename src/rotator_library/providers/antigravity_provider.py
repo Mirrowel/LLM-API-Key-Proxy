@@ -48,9 +48,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     Key features:
     - Model aliasing (gemini-3-pro-high ↔ gemini-3-pro-preview)
     - Gemini 3 thinkingLevel support
-    - Thinking signature preservation for multi-turn conversations
+    - ThoughtSignature preservation for multi-turn conversations
+    - Reasoning content separation (thought=true parts)
     - Sophisticated tool response grouping
     - Base URL fallback (sandbox → production)
+    
+    Gemini 3 Special Mechanics:
+    1. ThinkingLevel: Uses thinkingLevel (low/high) instead of thinkingBudget for Gemini 3 models
+    2. ThoughtSignature: Function calls include thoughtSignature="skip_thought_signature_validator"
+       - This is a CONSTANT validation bypass flag, not a session key
+       - Preserved across conversation turns to maintain reasoning continuity
+       - Filtered from responses to prevent exposing encrypted internal data
+    3. Reasoning Content: Text parts with thought=true flag are separated into reasoning_content
+    4. Token Counting: thoughtsTokenCount is included in prompt_tokens and reported as reasoning_tokens
     """
     skip_cost_calculation = True
 
@@ -220,6 +230,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                                 args_dict = {}
                             
                             # Add function call part with thoughtSignature
+                            # ThoughtSignature is required for Gemini to process function calls correctly
+                            # The constant "skip_thought_signature_validator" tells Gemini to bypass signature validation
+                            # This is preserved across conversation turns to maintain reasoning continuity
                             func_call_part = {
                                 "functionCall": {
                                     "name": tool_call["function"]["name"],
@@ -530,7 +543,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _gemini_to_openai_chunk(self, gemini_chunk: Dict[str, Any], model: str) -> litellm.ModelResponse:
         """
         Convert a single Gemini response chunk to OpenAI format.
-        Based on GeminiCliProvider logic.
+        
+        Handles Gemini 3 special mechanics:
+        - Filters thoughtSignature parts (encrypted reasoning data)
+        - Separates reasoning content (thought=true) from regular content
+        - Includes thoughtsTokenCount in usage metadata
         
         Args:
             gemini_chunk: Gemini response chunk
@@ -553,14 +570,27 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         candidate = candidates[0]
         content_parts = candidate.get("content", {}).get("parts", [])
         
-        # Extract text, tool calls, and thinking
+        # Extract text, tool calls, and reasoning content
         text_content = ""
+        reasoning_content = ""
         tool_calls = []
         
         for part in content_parts:
-            # Extract text
+            # CRITICAL: Skip parts with thoughtSignature (encrypted reasoning data)
+            # This prevents exposing internal Gemini reasoning signatures to clients
+            if "thoughtSignature" in part and part["thoughtSignature"]:
+                continue
+            
+            # Extract text - separate regular content from reasoning/thinking
             if "text" in part:
-                text_content += part["text"]
+                # Check for thought flag (Gemini 3 reasoning indicator)
+                thought = part.get("thought")
+                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                    # This is reasoning/thinking content
+                    reasoning_content += part["text"]
+                else:
+                    # Regular content
+                    text_content += part["text"]
             
             # Extract function calls (tool calls)
             if "functionCall" in part:
@@ -578,6 +608,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         delta = {}
         if text_content:
             delta["content"] = text_content
+        if reasoning_content:
+            # OpenAI o1-style reasoning content field
+            delta["reasoning_content"] = reasoning_content
         if tool_calls:
             delta["tool_calls"] = tool_calls
         
@@ -599,11 +632,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         usage_metadata = gemini_chunk.get("usageMetadata", {})
         usage = None
         if usage_metadata:
+            # Get token counts
+            prompt_tokens = usage_metadata.get("promptTokenCount", 0)
+            thoughts_tokens = usage_metadata.get("thoughtsTokenCount", 0)
+            completion_tokens = usage_metadata.get("candidatesTokenCount", 0)
+            
+            # OpenAI o1-style token counting: thoughts are included in prompt_tokens
             usage = {
-                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
+                "prompt_tokens": prompt_tokens + thoughts_tokens,
+                "completion_tokens": completion_tokens,
                 "total_tokens": usage_metadata.get("totalTokenCount", 0)
             }
+            
+            # Add reasoning tokens details if thinking was used
+            if thoughts_tokens > 0:
+                if "completion_tokens_details" not in usage:
+                    usage["completion_tokens_details"] = {}
+                usage["completion_tokens_details"]["reasoning_tokens"] = thoughts_tokens
         
         return litellm.ModelResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
