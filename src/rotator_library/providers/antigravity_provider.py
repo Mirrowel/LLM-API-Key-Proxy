@@ -820,6 +820,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         reasoning_content = ""
         tool_calls = []
         
+        # Track if we've seen a signature yet (for parallel tool call handling)
+        # Per Gemini 3 spec: only FIRST tool call in parallel gets signature
+        first_signature_seen = False
+        
         for part in content_parts:
             has_function_call = "functionCall" in part
             has_text = "text" in part
@@ -852,13 +856,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     }
                 }
                 
-                # Store signature in server-side cache (if enabled and signature exists)
-                if has_signature and self._enable_signature_cache:
+                # Handle thoughtSignature if present
+                # CRITICAL FIX: Cache and passthrough are INDEPENDENT toggles
+                if has_signature and not first_signature_seen:
+                    # Only first tool call gets signature (parallel call handling)
+                    first_signature_seen = True
                     signature = part["thoughtSignature"]
-                    self._signature_cache.store(tool_call_id, signature)
-                    lib_logger.debug(f"Stored thoughtSignature in cache for {tool_call_id}")
                     
-                    # Include in response if client passthrough enabled
+                    # Option 1: Store in server-side cache (if enabled)
+                    if self._enable_signature_cache:
+                        self._signature_cache.store(tool_call_id, signature)
+                        lib_logger.debug(f"Stored thoughtSignature in cache for {tool_call_id}")
+                    
+                    # Option 2: Pass to client (if enabled) - INDEPENDENT of cache!
                     if self._preserve_signatures_in_client:
                         tool_call["thought_signature"] = signature
                 
