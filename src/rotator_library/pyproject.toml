@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rotating-api-key-client"
-version = "0.9"
+name = "rotator_library"
+version = "0.95"
 authors = [
     { name="Mirrowel", email="nuh@uh.com" },
 ]
