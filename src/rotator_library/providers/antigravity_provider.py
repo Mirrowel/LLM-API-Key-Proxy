@@ -18,8 +18,6 @@ from .antigravity_auth_base import AntigravityAuthBase
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
-# Removed: from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
-# Using direct parameter passthrough instead, matching Go reference implementation
 
 lib_logger = logging.getLogger('rotator_library')
 
@@ -304,39 +302,25 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         return internal_model.startswith("gemini-3-") or model.startswith("gemini-3-")
 
     @staticmethod
-    def _normalize_json_schema(schema: Any) -> Any:
+    def _normalize_type_arrays(schema: Any) -> Any:
         """
-        Normalize JSON Schema for Proto-based Antigravity API.
-        
-        The Proto-based API doesn't support array values for the 'type' field.
-        This function converts `"type": ["string", "null"]` → `"type": "string"`.
-        
-        Args:
-            schema: JSON schema object (dict, list, or primitive)
-            
-        Returns:
-            Normalized schema
+        Normalize type arrays in JSON Schema for Proto-based Antigravity API.
+        Converts `"type": ["string", "null"]` → `"type": "string"`.
         """
         if isinstance(schema, dict):
-            # Make a copy to avoid modifying the original
             normalized = {}
             for key, value in schema.items():
                 if key == "type" and isinstance(value, list):
-                    # Convert array type to single type
-                    # Take the first non-"null" type, or the first type if all are "null"
+                    # Take first non-null type
                     non_null_types = [t for t in value if t != "null"]
                     normalized[key] = non_null_types[0] if non_null_types else value[0]
                 else:
-                    # Recursively normalize nested structures
-                    normalized[key] = AntigravityProvider._normalize_json_schema(value)
+                    normalized[key] = AntigravityProvider._normalize_type_arrays(value)
             return normalized
         elif isinstance(schema, list):
-            # Recursively normalize list items
-            return [AntigravityProvider._normalize_json_schema(item) for item in schema]
+            return [AntigravityProvider._normalize_type_arrays(item) for item in schema]
         else:
-            # Primitive value - return as-is
             return schema
-
 
     # ============================================================================
     # RANDOM ID GENERATION
@@ -371,9 +355,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _transform_messages(self, messages: List[Dict[str, Any]], model: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Transform OpenAI messages to Gemini CLI format.
-        Reused from GeminiCliProvider with modifications for Antigravity.
-        
-        UPDATED: Now handles thoughtSignature preservation with 3-tier fallback:
+        Handles thoughtSignature preservation with 3-tier fallback:
         1. Use client-provided signature (if present)
         2. Fall back to server-side cache
         3. Use bypass constant as last resort
@@ -784,27 +766,53 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     # Add signature to function calls OR preserve if already exists
                     if "functionCall" in part and "thoughtSignature" not in part:
                         part["thoughtSignature"] = "skip_thought_signature_validator"
-                    # If thoughtSignature already exists, preserve it (important for Gemini 3)
         
-        # 7. CRITICAL: Claude-specific tool schema transformation
-        # Claude models need 'parameters' NOT 'parametersJsonSchema' (opposite of Gemini)
+        # 7. CLAUDE-SPECIFIC TOOL SCHEMA TRANSFORMATION
         # Reference: Go implementation antigravity_executor.go lines 672-684
+        # For Claude models: parametersJsonSchema → parameters, remove $schema
         if internal_model.startswith("claude-sonnet-"):
+            lib_logger.debug(f"Applying Claude-specific tool schema transformation for {internal_model}")
             tools = antigravity_payload["request"].get("tools", [])
-            for tool_idx, tool in enumerate(tools):
+            
+            for tool in tools:
                 function_declarations = tool.get("functionDeclarations", [])
-                for func_idx, func_decl in enumerate(function_declarations):
+                for func_decl in function_declarations:
                     if "parametersJsonSchema" in func_decl:
-                        # Convert parametersJsonSchema → parameters for Claude
                         params = func_decl["parametersJsonSchema"]
                         
-                        # Remove $schema if present (Claude doesn't support it)
-                        if isinstance(params, dict):
-                            params.pop("$schema", None)
+                        # CRITICAL: Claude requires clean JSON Schema draft 2020-12
+                        # Recursively remove ALL incompatible fields
+                        def clean_claude_schema(schema):
+                            """Recursively remove fields Claude doesn't support."""
+                            if not isinstance(schema, dict):
+                                return schema
+                            
+                            # Fields that break Claude's JSON Schema validation
+                            incompatible = {'$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern'}
+                            cleaned = {}
+                            
+                            for key, value in schema.items():
+                                if key in incompatible:
+                                    continue  # Skip incompatible fields
+                                
+                                if isinstance(value, dict):
+                                    cleaned[key] = clean_claude_schema(value)
+                                elif isinstance(value, list):
+                                    cleaned[key] = [
+                                        clean_claude_schema(item) if isinstance(item, dict) else item
+                                        for item in value
+                                    ]
+                                else:
+                                    cleaned[key] = value
+                            
+                            return cleaned
                         
-                        # Set as 'parameters' and remove 'parametersJsonSchema'
-                        antigravity_payload["request"]["tools"][tool_idx]["functionDeclarations"][func_idx]["parameters"] = params
-                        del antigravity_payload["request"]["tools"][tool_idx]["functionDeclarations"][func_idx]["parametersJsonSchema"]
+                        # Clean the schema
+                        params = clean_claude_schema(params) if isinstance(params, dict) else params
+                        
+                        # Rename parametersJsonSchema → parameters for Claude
+                        func_decl["parameters"] = params
+                        del func_decl["parametersJsonSchema"]
         
         return antigravity_payload
 
@@ -922,7 +930,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 tool_call_index += 1  # Increment for next tool call
                 
                 # Handle thoughtSignature if present
-                # CRITICAL FIX: Cache and passthrough are INDEPENDENT toggles
                 if has_signature and not first_signature_seen:
                     # Only first tool call gets signature (parallel call handling)
                     first_signature_seen = True
@@ -1069,11 +1076,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             access_token = await self.get_valid_token(credential_path)
             base_url = self._get_current_base_url()
             
-            # Generate required IDs
-            project_id = self.generate_project_id()
-            request_id = self.generate_request_id()
-            
-            # Fetch models endpoint
             url = f"{base_url}/fetchAvailableModels"
             
             headers = {
@@ -1082,12 +1084,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             }
             
             payload = {
-                "project": project_id,
-                "requestId": request_id,
+                "project": self.generate_project_id(),
+                "requestId": self.generate_request_id(),
                 "userAgent": "antigravity"
             }
-            
-            lib_logger.debug(f"Fetching Antigravity models from: {url}")
             
             response = await client.post(url, json=payload, headers=headers, timeout=30.0)
             response.raise_for_status()
@@ -1222,6 +1222,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         # Remove OpenAI-specific fields that Antigravity doesn't support
                         schema.pop("$schema", None)
                         schema.pop("strict", None)
+                        # CRITICAL: Normalize type arrays for protobuf compatibility
+                        # Converts ["string", "null"] → "string" to avoid "Proto field is not repeating" errors
+                        schema = self._normalize_type_arrays(schema)
                         func_decl["parametersJsonSchema"] = schema
                     else:
                         # No parameters provided - set default empty schema (matching Go lines 318-323)
@@ -1411,19 +1414,33 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             gemini_cli_payload["systemInstruction"] = system_instruction
         
         if tools:
-            # Transform tools to Gemini format
+            # Transform tools - same as in acompletion
             gemini_tools = []
             for tool in tools:
                 if tool.get("type") == "function":
                     func = tool.get("function", {})
-                    schema = _build_vertex_schema(parameters=func.get("parameters", {}))
+                    parameters = func.get("parameters")
+                    
+                    func_decl = {
+                        "name": func.get("name", ""),
+                        "description": func.get("description", "")
+                    }
+                    
+                    if parameters and isinstance(parameters, dict):
+                        schema = dict(parameters)
+                        schema.pop("$schema", None)
+                        schema.pop("strict", None)
+                        func_decl["parametersJsonSchema"] = schema
+                    else:
+                        func_decl["parametersJsonSchema"] = {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    
                     gemini_tools.append({
-                        "functionDeclarations": [{
-                            "name": func.get("name", ""),
-                            "description": func.get("description", ""),
-                            "parametersJsonSchema": schema
-                        }]
+                        "functionDeclarations": [func_decl]
                     })
+            
             if gemini_tools:
                 gemini_cli_payload["tools"] = gemini_tools
         
