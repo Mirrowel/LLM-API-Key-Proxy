@@ -18,7 +18,8 @@ from .antigravity_auth_base import AntigravityAuthBase
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
-from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
+# Removed: from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
+# Using direct parameter passthrough instead, matching Go reference implementation
 
 lib_logger = logging.getLogger('rotator_library')
 
@@ -301,6 +302,41 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         internal_model = self._alias_to_model_name(model)
         return internal_model.startswith("gemini-3-") or model.startswith("gemini-3-")
+
+    @staticmethod
+    def _normalize_json_schema(schema: Any) -> Any:
+        """
+        Normalize JSON Schema for Proto-based Antigravity API.
+        
+        The Proto-based API doesn't support array values for the 'type' field.
+        This function converts `"type": ["string", "null"]` → `"type": "string"`.
+        
+        Args:
+            schema: JSON schema object (dict, list, or primitive)
+            
+        Returns:
+            Normalized schema
+        """
+        if isinstance(schema, dict):
+            # Make a copy to avoid modifying the original
+            normalized = {}
+            for key, value in schema.items():
+                if key == "type" and isinstance(value, list):
+                    # Convert array type to single type
+                    # Take the first non-"null" type, or the first type if all are "null"
+                    non_null_types = [t for t in value if t != "null"]
+                    normalized[key] = non_null_types[0] if non_null_types else value[0]
+                else:
+                    # Recursively normalize nested structures
+                    normalized[key] = AntigravityProvider._normalize_json_schema(value)
+            return normalized
+        elif isinstance(schema, list):
+            # Recursively normalize list items
+            return [AntigravityProvider._normalize_json_schema(item) for item in schema]
+        else:
+            # Primitive value - return as-is
+            return schema
+
 
     # ============================================================================
     # RANDOM ID GENERATION
@@ -750,30 +786,25 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         part["thoughtSignature"] = "skip_thought_signature_validator"
                     # If thoughtSignature already exists, preserve it (important for Gemini 3)
         
-        # ========================================================================
-        # IMPORTANT: CLAUDE SCHEMA HANDLING - REQUIRES INVESTIGATION
-        # ========================================================================
-        # WARNING: This code block may be incorrect!
-        # 
-        # INVESTIGATION REQUIRED BEFORE MAKING CHANGES:
-        # - Test Claude model access through Antigravity with tools
-        # - Verify whether parametersJsonSchema → parameters conversion is needed
-        # - The Go reference suggests Antigravity expects parametersJsonSchema for ALL models
-        #
-        # Current behavior: Converts parametersJsonSchema back to parameters for Claude models
-        # Potential issue: Antigravity may actually expect parametersJsonSchema for Claude too
-        #
-        # DO NOT MODIFY without first confirming actual API behavior!
-        # ========================================================================
+        # 7. CRITICAL: Claude-specific tool schema transformation
+        # Claude models need 'parameters' NOT 'parametersJsonSchema' (opposite of Gemini)
+        # Reference: Go implementation antigravity_executor.go lines 672-684
         if internal_model.startswith("claude-sonnet-"):
-            # For Claude models, convert parametersJsonSchema back to parameters
-            for tool in antigravity_payload["request"].get("tools", []):
-                for func_decl in tool.get("functionDeclarations", []):
+            tools = antigravity_payload["request"].get("tools", [])
+            for tool_idx, tool in enumerate(tools):
+                function_declarations = tool.get("functionDeclarations", [])
+                for func_idx, func_decl in enumerate(function_declarations):
                     if "parametersJsonSchema" in func_decl:
-                        func_decl["parameters"] = func_decl.pop("parametersJsonSchema")
-                        # Remove $schema if present
-                        if "parameters" in func_decl and "$schema" in func_decl["parameters"]:
-                            del func_decl["parameters"]["$schema"]
+                        # Convert parametersJsonSchema → parameters for Claude
+                        params = func_decl["parametersJsonSchema"]
+                        
+                        # Remove $schema if present (Claude doesn't support it)
+                        if isinstance(params, dict):
+                            params.pop("$schema", None)
+                        
+                        # Set as 'parameters' and remove 'parametersJsonSchema'
+                        antigravity_payload["request"]["tools"][tool_idx]["functionDeclarations"][func_idx]["parameters"] = params
+                        del antigravity_payload["request"]["tools"][tool_idx]["functionDeclarations"][func_idx]["parametersJsonSchema"]
         
         return antigravity_payload
 
@@ -1167,20 +1198,42 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if generation_config:
             gemini_cli_payload["generationConfig"] = generation_config
         
-        # Add tools
+        # Add tools - using Go reference implementation approach
+        # Go code (line 298-328): renames 'parameters' -> 'parametersJsonSchema' and removes 'strict'
         if tools:
             gemini_tools = []
             for tool in tools:
                 if tool.get("type") == "function":
                     func = tool.get("function", {})
-                    schema = _build_vertex_schema(parameters=func.get("parameters", {}))
+                    
+                    # Get parameters dict (may be missing)
+                    parameters = func.get("parameters")
+                    
+                    # Build function declaration
+                    func_decl = {
+                        "name": func.get("name", ""),
+                        "description": func.get("description", "")
+                    }
+                    
+                    # Handle parameters -> parametersJsonSchema conversion (matching Go)
+                    if parameters and isinstance(parameters, dict):
+                        # Make a copy to avoid modifying original
+                        schema = dict(parameters)
+                        # Remove OpenAI-specific fields that Antigravity doesn't support
+                        schema.pop("$schema", None)
+                        schema.pop("strict", None)
+                        func_decl["parametersJsonSchema"] = schema
+                    else:
+                        # No parameters provided - set default empty schema (matching Go lines 318-323)
+                        func_decl["parametersJsonSchema"] = {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    
                     gemini_tools.append({
-                        "functionDeclarations": [{
-                            "name": func.get("name", ""),
-                            "description": func.get("description", ""),
-                            "parametersJsonSchema": schema
-                        }]
+                        "functionDeclarations": [func_decl]
                     })
+            
             if gemini_tools:
                 gemini_cli_payload["tools"] = gemini_tools
         
