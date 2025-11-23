@@ -219,6 +219,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "true"  # Default ON for testing
         ).lower() in ("true", "1", "yes")
         
+        # Check if dynamic model discovery is enabled (default: OFF due to endpoint instability)
+        self._enable_dynamic_model_discovery = os.getenv(
+            "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS",
+            "false"  # Default OFF - use hardcoded list
+        ).lower() in ("true", "1", "yes")
+        
         if self._preserve_signatures_in_client:
             lib_logger.info("Antigravity: thoughtSignature client passthrough ENABLED")
         else:
@@ -228,6 +234,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             lib_logger.info(f"Antigravity: thoughtSignature server-side cache ENABLED (TTL: {cache_ttl}s)")
         else:
             lib_logger.info("Antigravity: thoughtSignature server-side cache DISABLED")
+        
+        if self._enable_dynamic_model_discovery:
+            lib_logger.info("Antigravity: Dynamic model discovery ENABLED (may fail if endpoint unavailable)")
+        else:
+            lib_logger.info("Antigravity: Dynamic model discovery DISABLED (using hardcoded model list)")
 
     # ============================================================================
     # MODEL ALIAS SYSTEM
@@ -938,10 +949,25 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             response["usage"] = usage
         
         return response
-
+            
     # ============================================================================
     # PROVIDER INTERFACE IMPLEMENTATION
     # ============================================================================
+
+    async def get_valid_token(self, credential_identifier: str) -> str:
+        """
+        Get a valid access token for the credential.
+        
+        Args:
+            credential_identifier: Credential file path or "env"
+            
+        Returns:
+            Access token string
+        """
+        creds = await self._load_credentials(credential_identifier)
+        if self._is_token_expired(creds):
+            creds = await self._refresh_token(credential_identifier, creds)
+        return creds['access_token']
 
     def has_custom_logic(self) -> bool:
         """Antigravity uses custom translation logic."""
@@ -964,8 +990,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         Fetch available models from Antigravity.
         
-        For Antigravity, we use the fetchAvailableModels endpoint and apply
-        alias mapping to convert internal names to public names.
+        For Antigravity, we can optionally use the fetchAvailableModels endpoint and apply
+        alias mapping to convert internal names to public names. However, this endpoint is
+        often unavailable (404), so dynamic discovery is disabled by default.
+        
+        Set ANTIGRAVITY_ENABLE_DYNAMIC_MODELS=true to enable dynamic discovery.
         
         Args:
             api_key: Credential path (not a traditional API key)
@@ -974,6 +1003,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Returns:
             List of public model names
         """
+        # If dynamic discovery is disabled, immediately return hardcoded list
+        if not self._enable_dynamic_model_discovery:
+            lib_logger.debug("Using hardcoded Antigravity model list (dynamic discovery disabled)")
+            return [f"antigravity/{m}" for m in HARDCODED_MODELS]
+        
+        # Dynamic discovery enabled - attempt to fetch from API
         credential_path = api_key  # For OAuth providers, this is the credential path
         
         try:
@@ -1013,18 +1048,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     if internal_name:
                         public_name = self._model_name_to_alias(internal_name)
                         if public_name:  # Skip excluded models (empty string)
-                            models.append(public_name)
+                            models.append(f"antigravity/{public_name}")
             
             if models:
-                lib_logger.info(f"Discovered {len(models)} Antigravity models")
+                lib_logger.info(f"Discovered {len(models)} Antigravity models via dynamic discovery")
                 return models
             else:
                 lib_logger.warning("No models returned from Antigravity, using hardcoded list")
-                return HARDCODED_MODELS
+                return [f"antigravity/{m}" for m in HARDCODED_MODELS]
                 
         except Exception as e:
             lib_logger.warning(f"Failed to fetch Antigravity models: {e}, using hardcoded list")
-            return HARDCODED_MODELS
+            return [f"antigravity/{m}" for m in HARDCODED_MODELS]
 
     async def acompletion(
         self,
