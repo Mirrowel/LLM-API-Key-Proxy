@@ -359,10 +359,25 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if messages and messages[0].get('role') == 'system':
             system_prompt_content = messages.pop(0).get('content', '')
             if system_prompt_content:
-                system_instruction = {
-                    "role": "user",
-                    "parts": [{"text": system_prompt_content}]
-                }
+                # Handle both string and list-based system content
+                system_parts = []
+                if isinstance(system_prompt_content, str):
+                    system_parts.append({"text": system_prompt_content})
+                elif isinstance(system_prompt_content, list):
+                    # Multi-part system content (strip cache_control)
+                    for item in system_prompt_content:
+                        if item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text:
+                                # Skip cache_control - Claude-specific field
+                                system_parts.append({"text": text})
+                
+                if system_parts:
+                    system_instruction = {
+                        "role": "user",
+                        "parts": system_parts
+                    }
+
 
         # Build tool call ID to name mapping
         tool_call_id_to_name = {}
@@ -390,6 +405,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         if item.get("type") == "text":
                             text = item.get("text", "")
                             if text:
+                                # Strip Claude-specific cache_control field
+                                # This field causes 400 errors with Antigravity
                                 parts.append({"text": text})
                         elif item.get("type") == "image_url":
                             # Handle image data URLs
@@ -459,15 +476,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 function_name = tool_call_id_to_name.get(tool_call_id, "unknown_function")
                 tool_content = msg.get("content", "{}")
                 
+                # Parse tool content - if it's JSON, use parsed value; otherwise use as-is
                 try:
-                    response_data = json.loads(tool_content)
+                    parsed_content = json.loads(tool_content)
                 except (json.JSONDecodeError, TypeError):
-                    response_data = {"result": tool_content}
-                
+                    parsed_content = tool_content
+
                 parts.append({
                     "functionResponse": {
                         "name": function_name,
-                        "response": response_data
+                        "response": {
+                            "result": parsed_content
+                        }
                     }
                 })
 
@@ -620,7 +640,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         # Create merged function response content
                         function_response_content = {
                             "parts": group_responses,
-                            "role": "function"  # Changed from tool
+                            "role": "user"
                         }
                         new_contents.append(function_response_content)
                         
@@ -659,7 +679,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 
                 function_response_content = {
                     "parts": group_responses,
-                    "role": "function"
+                    "role": "user"
                 }
                 new_contents.append(function_response_content)
         
@@ -834,6 +854,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Track if we've seen a signature yet (for parallel tool call handling)
         # Per Gemini 3 spec: only FIRST tool call in parallel gets signature
         first_signature_seen = False
+        tool_call_index = 0  # Track index for OpenAI streaming format
         
         for part in content_parts:
             has_function_call = "functionCall" in part
@@ -861,11 +882,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 tool_call = {
                     "id": tool_call_id,
                     "type": "function",
+                    "index": tool_call_index,  # REQUIRED for OpenAI streaming format
                     "function": {
                         "name": func_call.get("name", ""),
                         "arguments": json.dumps(func_call.get("args", {}))
                     }
                 }
+                tool_call_index += 1  # Increment for next tool call
                 
                 # Handle thoughtSignature if present
                 # CRITICAL FIX: Cache and passthrough are INDEPENDENT toggles
@@ -1084,6 +1107,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         # Extract key parameters
         model = kwargs.get("model", "gemini-2.5-pro")
+        
+        # Strip provider prefix from model name (e.g., "antigravity/claude-sonnet-4-5-thinking" -> "claude-sonnet-4-5-thinking")
+        if "/" in model:
+            model = model.split("/")[-1]
+        
         messages = kwargs.get("messages", [])
         stream = kwargs.get("stream", False)
         credential_path = kwargs.pop("credential_identifier", kwargs.get("api_key", ""))
@@ -1168,12 +1196,28 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         endpoint = ":streamGenerateContent" if stream else ":generateContent"
         url = f"{base_url}{endpoint}"
-        
+
+        # Add query parameter for streaming (required by Antigravity API)
+        if stream:
+            url = f"{url}?alt=sse"
+
+        # Extract host from base_url for Host header (required by Google's API)
+        from urllib.parse import urlparse
+        parsed_url = urlparse(base_url)
+        host = parsed_url.netloc if parsed_url.netloc else base_url.replace("https://", "").replace("http://", "").rstrip("/")
+
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Host": host,  # CRITICAL: Required by Antigravity API
+            "User-Agent": "antigravity/1.11.5"  # Match Go implementation
         }
-        
+
+        if stream:
+            headers["Accept"] = "text/event-stream"
+        else:
+            headers["Accept"] = "application/json"
+
         lib_logger.debug(f"Antigravity request to: {url}")
         
         try:
@@ -1231,6 +1275,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion."""
         async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
+            # Log error response body for debugging if request failed
+            if response.status_code >= 400:
+                try:
+                    error_body = await response.aread()
+                    lib_logger.error(f"Antigravity API error {response.status_code}: {error_body.decode('utf-8', errors='replace')}")
+                except Exception as e:
+                    lib_logger.error(f"Failed to read error response body: {e}")
+            
             response.raise_for_status()
             
             async for line in response.aiter_lines():
@@ -1252,7 +1304,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         # Convert to OpenAI format
                         openai_chunk = self._gemini_to_openai_chunk(gemini_chunk, model)
                         
-                        yield openai_chunk
+                        # Convert dict to ModelResponse object
+                        model_response = litellm.ModelResponse(**openai_chunk)
+                        yield model_response
                     except json.JSONDecodeError:
                         if file_logger:
                             file_logger.log_error(f"Failed to parse chunk: {data_str[:100]}")

@@ -311,13 +311,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             # Update metadata
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}
-            
+
             creds["_proxy_metadata"]["project_id"] = project_id
             if tier:
                 creds["_proxy_metadata"]["tier"] = tier
             
             # Save back using the existing save method (handles atomic writes and permissions)
-            self._save_credentials(credential_path, creds)
+            await self._save_credentials(credential_path, creds)
             
             lib_logger.debug(f"Persisted project_id and tier to credential file: {credential_path}")
         except Exception as e:
