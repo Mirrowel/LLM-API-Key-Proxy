@@ -99,6 +99,75 @@ class _AntigravityFileLogger:
         except Exception as e:
             lib_logger.error(f"_AntigravityFileLogger: Failed to write final response: {e}")
 
+class ThoughtSignatureCache:
+    """
+    Server-side cache for thoughtSignatures to maintain Gemini 3 conversation context.
+    
+    Maps tool_call_id → thoughtSignature to preserve encrypted reasoning signatures
+    across turns, even if clients don't support the thought_signature field.
+    
+    Features:
+    - TTL-based expiration to prevent memory growth
+    - Thread-safe for concurrent access
+    - Automatic cleanup of expired entries
+    """
+    
+    def __init__(self, ttl_seconds: int = 3600):
+        """
+        Initialize the signature cache.
+        
+        Args:
+            ttl_seconds: Time-to-live for cache entries in seconds (default: 1 hour)
+        """
+        self._cache: Dict[str, Tuple[str, float]] = {}  # {call_id: (signature, timestamp)}
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+    
+    def store(self, tool_call_id: str, signature: str):
+        """
+        Store a signature for a tool call ID.
+        
+        Args:
+            tool_call_id: Unique identifier for the tool call
+            signature: Encrypted thoughtSignature from Antigravity API
+        """
+        with self._lock:
+            self._cache[tool_call_id] = (signature, time.time())
+            self._cleanup_expired()
+    
+    def retrieve(self, tool_call_id: str) -> Optional[str]:
+        """
+        Retrieve signature for a tool call ID.
+        
+        Args:
+            tool_call_id: Unique identifier for the tool call
+            
+        Returns:
+            The signature if found and not expired, None otherwise
+        """
+        with self._lock:
+            if tool_call_id not in self._cache:
+                return None
+            
+            signature, timestamp = self._cache[tool_call_id]
+            if time.time() - timestamp > self._ttl:
+                del self._cache[tool_call_id]
+                return None
+            
+            return signature
+    
+    def _cleanup_expired(self):
+        """Remove expired entries from cache."""
+        now = time.time()
+        expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._cache[k]
+    
+    def clear(self):
+        """Clear all cached signatures."""
+        with self._lock:
+            self._cache.clear()
+
 class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     """
     Antigravity provider implementation for Gemini models.
@@ -131,6 +200,32 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self.model_definitions = ModelDefinitions()
         self._current_base_url = BASE_URLS[0]  # Start with daily sandbox
         self._base_url_index = 0
+        
+        # Initialize thoughtSignature cache for Gemini 3 multi-turn conversations
+        cache_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_CACHE_TTL", "3600"))
+        self._signature_cache = ThoughtSignatureCache(ttl_seconds=cache_ttl)
+        
+        # Check if client passthrough is enabled (default: TRUE for testing)
+        self._preserve_signatures_in_client = os.getenv(
+            "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES", 
+            "true"  # Default ON for testing
+        ).lower() in ("true", "1", "yes")
+        
+        # Check if server-side cache is enabled (default: TRUE for testing)
+        self._enable_signature_cache = os.getenv(
+            "ANTIGRAVITY_ENABLE_SIGNATURE_CACHE",
+            "true"  # Default ON for testing
+        ).lower() in ("true", "1", "yes")
+        
+        if self._preserve_signatures_in_client:
+            lib_logger.info("Antigravity: thoughtSignature client passthrough ENABLED")
+        else:
+            lib_logger.info("Antigravity: thoughtSignature client passthrough DISABLED")
+        
+        if self._enable_signature_cache:
+            lib_logger.info(f"Antigravity: thoughtSignature server-side cache ENABLED (TTL: {cache_ttl}s)")
+        else:
+            lib_logger.info("Antigravity: thoughtSignature server-side cache DISABLED")
 
     # ============================================================================
     # MODEL ALIAS SYSTEM
@@ -183,6 +278,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         }
         return reverse_map.get(alias, alias)
 
+    def _is_gemini_3_model(self, model: str) -> bool:
+        """
+        Check if model is Gemini 3 (requires thoughtSignature preservation).
+        
+        Args:
+            model: Model name (public alias)
+            
+        Returns:
+            True if this is a Gemini 3 model
+        """
+        internal_model = self._alias_to_model_name(model)
+        return internal_model.startswith("gemini-3-") or model.startswith("gemini-3-")
+
     # ============================================================================
     # RANDOM ID GENERATION
     # ============================================================================
@@ -213,11 +321,20 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     # MESSAGE TRANSFORMATION (OpenAI → Gemini CLI format)
     # ============================================================================
 
-    def _transform_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _transform_messages(self, messages: List[Dict[str, Any]], model: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Transform OpenAI messages to Gemini CLI format.
         Reused from GeminiCliProvider with modifications for Antigravity.
         
+        UPDATED: Now handles thoughtSignature preservation with 3-tier fallback:
+        1. Use client-provided signature (if present)
+        2. Fall back to server-side cache
+        3. Use bypass constant as last resort
+        
+        Args:
+            messages: List of OpenAI-formatted messages
+            model: Model name for Gemini 3 detection
+            
         Returns:
             Tuple of (system_instruction, gemini_contents)
         """
@@ -244,7 +361,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     if tool_call.get("type") == "function":
                         tool_call_id_to_name[tool_call["id"]] = tool_call["function"]["name"]
 
-        # Convert each message
+        #Convert each message
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
@@ -291,34 +408,64 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             except (json.JSONDecodeError, TypeError):
                                 args_dict = {}
                             
-                            # Add function call part with thoughtSignature
-                            # ThoughtSignature is required for Gemini to process function calls correctly
-                            # The constant "skip_thought_signature_validator" tells Gemini to bypass signature validation
-                            # This is preserved across conversation turns to maintain reasoning continuity
+                            tool_call_id = tool_call.get("id", "")
+                            
                             func_call_part = {
                                 "functionCall": {
                                     "name": tool_call["function"]["name"],
                                     "args": args_dict
-                                },
-                                "thoughtSignature": "skip_thought_signature_validator"
+                                }
                             }
+                            
+                            # PRIORITY 1: Use client-provided signature if available
+                            client_signature = tool_call.get("thought_signature")
+                            
+                            # PRIORITY 2: Fall back to server-side cache
+                            if not client_signature and tool_call_id and self._enable_signature_cache:
+                                client_signature = self._signature_cache.retrieve(tool_call_id)
+                                if client_signature:
+                                    lib_logger.debug(f"Retrieved thoughtSignature from cache for {tool_call_id}")
+                            
+                            # PRIORITY 3: Use bypass constant as last resort
+                            if client_signature:
+                                func_call_part["thoughtSignature"] = client_signature
+                            else:
+                                func_call_part["thoughtSignature"] = "skip_thought_signature_validator"
+                                
+                                # WARNING: Missing signature for Gemini 3
+                                if self._is_gemini_3_model(model):
+                                    lib_logger.warning(
+                                        f"Gemini 3 tool call '{tool_call_id}' missing thoughtSignature. "
+                                        f"Client didn't provide it and cache lookup failed. "
+                                        f"Using bypass - reasoning quality may degrade."
+                                    )
+                            
                             parts.append(func_call_part)
 
             elif role == "tool":
-                tool_call_id = msg.get("tool_call_id")
-                function_name = tool_call_id_to_name.get(tool_call_id)
-                if function_name:
-                    # Wrap the tool response in a 'result' object
-                    response_content = {"result": content}
-                    parts.append({"functionResponse": {"name": function_name, "response": response_content}})
+                # Tool responses grouped by function name
+                tool_call_id = msg.get("tool_call_id", "")
+                function_name = tool_call_id_to_name.get(tool_call_id, "unknown_function")
+                tool_content = msg.get("content", "{}")
+                
+                try:
+                    response_data = json.loads(tool_content)
+                except (json.JSONDecodeError, TypeError):
+                    response_data = {"result": tool_content}
+                
+                parts.append({
+                    "functionResponse": {
+                        "name": function_name,
+                        "response": response_data
+                    }
+                })
 
             if parts:
-                gemini_contents.append({"role": gemini_role, "parts": parts})
-
-        # Ensure first message is from user
-        if not gemini_contents or gemini_contents[0]['role'] != 'user':
-            gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
-
+                gemini_contents.append({
+                    "role": gemini_role,
+                    "parts": parts
+                })
+        
         return system_instruction, gemini_contents
 
     # ============================================================================
@@ -643,106 +790,117 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # For both streaming and non-streaming, response is in 'response' field
         return antigravity_response.get("response", antigravity_response)
 
-    def _gemini_to_openai_chunk(self, gemini_chunk: Dict[str, Any], model: str) -> litellm.ModelResponse:
+    def _gemini_to_openai_chunk(self, gemini_chunk: Dict[str, Any], model: str) -> Dict[str, Any]:
         """
-        Convert a single Gemini response chunk to OpenAI format.
+        Convert a Gemini API response chunk to OpenAI format.
         
-        Handles Gemini 3 special mechanics:
-        - Filters thoughtSignature parts (encrypted reasoning data)
-        - Separates reasoning content (thought=true) from regular content
-        - Includes thoughtsTokenCount in usage metadata
+        UPDATED: Now preserves thoughtSignatures for Gemini 3 multi-turn conversations:
+        - Stores signatures in server-side cache (if enabled)
+        - Includes signatures in response (if client passthrough enabled)
+        - Filters standalone signature parts (no functionCall/text)
         
         Args:
-            gemini_chunk: Gemini response chunk
-            model: Model name
+            gemini_chunk: Gemini API response chunk
+            model: Model name for Gemini 3 detection
             
         Returns:
-            OpenAI-format ModelResponse
+            OpenAI-compatible response chunk
         """
-        # Extract candidate
+        # Extract the main response structure
         candidates = gemini_chunk.get("candidates", [])
         if not candidates:
-            # Empty chunk, return minimal response
-            return litellm.ModelResponse(
-                id=f"chatcmpl-{uuid.uuid4()}",
-                created=int(time.time()),
-                model=model,
-                choices=[]
-            )
+            return {}
         
         candidate = candidates[0]
-        content_parts = candidate.get("content", {}).get("parts", [])
+        content = candidate.get("content", {})
+        content_parts = content.get("parts", [])
         
-        # Extract text, tool calls, and reasoning content
+        # Build delta components
         text_content = ""
         reasoning_content = ""
         tool_calls = []
         
         for part in content_parts:
-            # CRITICAL: Skip parts with thoughtSignature (encrypted reasoning data)
-            # This prevents exposing internal Gemini reasoning signatures to clients
-            if "thoughtSignature" in part and part["thoughtSignature"]:
-                continue
+            has_function_call = "functionCall" in part
+            has_text = "text" in part
+            has_signature = "thoughtSignature" in part and part["thoughtSignature"]
             
-            # Extract text - separate regular content from reasoning/thinking
-            if "text" in part:
-                # Check for thought flag (Gemini 3 reasoning indicator)
+            # FIXED: Only skip if ONLY signature (standalone encryption part)
+            # Previously this filtered out ALL function calls with signatures!
+            if has_signature and not has_function_call and not has_text:
+                continue  # Skip standalone signature parts
+            
+            # Process text content
+            if has_text:
                 thought = part.get("thought")
                 if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
-                    # This is reasoning/thinking content
                     reasoning_content += part["text"]
                 else:
-                    # Regular content
                     text_content += part["text"]
             
-            # Extract function calls (tool calls)
-            if "functionCall" in part:
+            # Process function calls (NOW WORKS with signatures!)
+            if has_function_call:
                 func_call = part["functionCall"]
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                
+                tool_call = {
+                    "id": tool_call_id,
                     "type": "function",
                     "function": {
                         "name": func_call.get("name", ""),
                         "arguments": json.dumps(func_call.get("args", {}))
                     }
-                })
+                }
+                
+                # Store signature in server-side cache (if enabled and signature exists)
+                if has_signature and self._enable_signature_cache:
+                    signature = part["thoughtSignature"]
+                    self._signature_cache.store(tool_call_id, signature)
+                    lib_logger.debug(f"Stored thoughtSignature in cache for {tool_call_id}")
+                    
+                    # Include in response if client passthrough enabled
+                    if self._preserve_signatures_in_client:
+                        tool_call["thought_signature"] = signature
+                
+                tool_calls.append(tool_call)
         
         # Build delta
         delta = {}
         if text_content:
             delta["content"] = text_content
         if reasoning_content:
-            # OpenAI o1-style reasoning content field
             delta["reasoning_content"] = reasoning_content
         if tool_calls:
             delta["tool_calls"] = tool_calls
+            delta["role"] = "assistant"
+        elif text_content or reasoning_content:
+            delta["role"] = "assistant"
         
-        # Get finish reason
-        finish_reason = candidate.get("finishReason", "").lower() if candidate.get("finishReason") else None
-        if finish_reason == "stop":
-            finish_reason = "stop"
-        elif finish_reason == "max_tokens":
-            finish_reason = "length"
+        # Handle finish reason
+        finish_reason = candidate.get("finishReason")
+        if finish_reason:
+            # Map Gemini finish reasons to OpenAI
+            finish_reason_map = {
+                "STOP": "stop",
+                "MAX_TOKENS": "length",
+                "SAFETY": "content_filter",
+                "RECITATION": "content_filter",
+                "OTHER": "stop"
+            }
+            finish_reason = finish_reason_map.get(finish_reason, "stop")
+            if tool_calls:
+                finish_reason = "tool_calls"
         
-        # Build choice
-        choice = {
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason
-        }
-        
-        # Extract usage (if present)
-        usage_metadata = gemini_chunk.get("usageMetadata", {})
+        # Build usage metadata
         usage = None
+        usage_metadata = gemini_chunk.get("usageMetadata", {})
         if usage_metadata:
-            # Get token counts
             prompt_tokens = usage_metadata.get("promptTokenCount", 0)
             thoughts_tokens = usage_metadata.get("thoughtsTokenCount", 0)
             completion_tokens = usage_metadata.get("candidatesTokenCount", 0)
             
-            # OpenAI o1-style token counting: thoughts are included in prompt_tokens
             usage = {
-                "prompt_tokens": prompt_tokens + thoughts_tokens,
+                "prompt_tokens": prompt_tokens + thoughts_tokens,  # Include thoughts in prompt
                 "completion_tokens": completion_tokens,
                 "total_tokens": usage_metadata.get("totalTokenCount", 0)
             }
@@ -753,13 +911,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     usage["completion_tokens_details"] = {}
                 usage["completion_tokens_details"]["reasoning_tokens"] = thoughts_tokens
         
-        return litellm.ModelResponse(
-            id=f"chatcmpl-{uuid.uuid4()}",
-            created=int(time.time()),
-            model=model,
-            choices=[choice],
-            usage=usage
-        )
+        # Build final response
+        response = {
+            "id": gemini_chunk.get("responseId", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        }
+        
+        if usage:
+            response["usage"] = usage
+        
+        return response
 
     # ============================================================================
     # PROVIDER INTERFACE IMPLEMENTATION
@@ -890,7 +1058,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         )
         
         # Step 1: Transform messages (OpenAI → Gemini CLI)
-        system_instruction, gemini_contents = self._transform_messages(messages)
+        system_instruction, gemini_contents = self._transform_messages(messages, model=model)
         
         # Apply tool response grouping
         gemini_contents = self._fix_tool_response_grouping(gemini_contents)
@@ -1080,7 +1248,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         internal_model = self._alias_to_model_name(model)
         
         # Transform messages to Gemini format
-        system_instruction, contents = self._transform_messages(messages)
+        system_instruction, contents = self._transform_messages(messages, model=internal_model)
         
         # Build Gemini CLI payload
         gemini_cli_payload = {
