@@ -37,7 +37,9 @@ HARDCODED_MODELS = [
     "gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
     "gemini-3-pro-image-preview",
-    "gemini-2.5-computer-use-preview-10-2025"
+    "gemini-2.5-computer-use-preview-10-2025",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking"
 ]
 
 # Logging configuration
@@ -245,8 +247,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "rev19-uic3-1p": "gemini-2.5-computer-use-preview-10-2025",
             "gemini-3-pro-image": "gemini-3-pro-image-preview",
             "gemini-3-pro-high": "gemini-3-pro-preview",
-            "claude-sonnet-4-5": "gemini-claude-sonnet-4-5",
-            "claude-sonnet-4-5-thinking": "gemini-claude-sonnet-4-5-thinking",
+            # Claude models: no aliasing needed (public name = internal name)
         }
         
         # Filter out excluded models (return empty string to skip)
@@ -273,8 +274,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "gemini-2.5-computer-use-preview-10-2025": "rev19-uic3-1p",
             "gemini-3-pro-image-preview": "gemini-3-pro-image",
             "gemini-3-pro-preview": "gemini-3-pro-high",
-            "gemini-claude-sonnet-4-5": "claude-sonnet-4-5",
-            "gemini-claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
+            # Claude models: no aliasing needed (public name = internal name)
         }
         return reverse_map.get(alias, alias)
 
