@@ -98,7 +98,7 @@ async def setup_api_key():
     # Discover custom providers and add them to the list
     # Note: gemini_cli is OAuth-only, but qwen_code and iflow support both OAuth and API keys
     _, PROVIDER_PLUGINS = _ensure_providers_loaded()
-    oauth_only_providers = {'gemini_cli'}
+    oauth_only_providers = {'gemini_cli', 'antigravity'}
     discovered_providers = {
         p.replace('_', ' ').title(): p.upper() + "_API_KEY"
         for p in PROVIDER_PLUGINS.keys()
@@ -195,7 +195,8 @@ async def setup_new_credential(provider_name: str):
         oauth_friendly_names = {
             "gemini_cli": "Gemini CLI (OAuth)",
             "qwen_code": "Qwen Code (OAuth - also supports API keys)",
-            "iflow": "iFlow (OAuth - also supports API keys)"
+            "iflow": "iFlow (OAuth - also supports API keys)",
+            "antigravity": "Antigravity (OAuth)"
         }
         display_name = oauth_friendly_names.get(provider_name, provider_name.replace('_', ' ').title())
 
@@ -578,7 +579,8 @@ async def main(clear_on_start=True):
             oauth_friendly_names = {
                 "gemini_cli": "Gemini CLI (OAuth)",
                 "qwen_code": "Qwen Code (OAuth - also supports API keys)",
-                "iflow": "iFlow (OAuth - also supports API keys)"
+                "iflow": "iFlow (OAuth - also supports API keys)",
+                "antigravity": "Antigravity (OAuth)",
             }
             
             provider_text = Text()

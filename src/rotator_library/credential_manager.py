@@ -14,6 +14,7 @@ DEFAULT_OAUTH_DIRS = {
     "gemini_cli": Path.home() / ".gemini",
     "qwen_code": Path.home() / ".qwen",
     "iflow": Path.home() / ".iflow",
+    "antigravity": Path.home() / ".antigravity",
     # Add other providers like 'claude' here if they have a standard CLI path
 }
 
