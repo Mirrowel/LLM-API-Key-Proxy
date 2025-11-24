@@ -10,6 +10,8 @@ import uuid
 import copy
 import threading
 import os
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
@@ -44,6 +46,11 @@ HARDCODED_MODELS = [
 # Logging configuration
 LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
 ANTIGRAVITY_LOGS_DIR = LOGS_DIR / "antigravity_logs"
+
+# Cache configuration
+CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "cache"
+ANTIGRAVITY_CACHE_DIR = CACHE_DIR / "antigravity"
+ANTIGRAVITY_CACHE_FILE = ANTIGRAVITY_CACHE_DIR / "thought_signatures.json"
 
 
 class _AntigravityFileLogger:
@@ -108,37 +115,289 @@ class ThoughtSignatureCache:
     across turns, even if clients don't support the thought_signature field.
     
     Features:
-    - TTL-based expiration to prevent memory growth
+    - Dual-TTL system: 1hr memory, 24hr disk
+    - Async disk persistence with batched writes
+    - Background cleanup task for expired entries
     - Thread-safe for concurrent access
-    - Automatic cleanup of expired entries
+    - Fallback to disk when not in memory
+    - High concurrency support with asyncio locks
     """
     
-    def __init__(self, ttl_seconds: int = 3600):
+    def __init__(self, memory_ttl_seconds: int = 3600, disk_ttl_seconds: int = 86400):
         """
-        Initialize the signature cache.
+        Initialize the signature cache with disk persistence.
         
         Args:
-            ttl_seconds: Time-to-live for cache entries in seconds (default: 1 hour)
+            memory_ttl_seconds: Time-to-live for memory cache entries (default: 1 hour)
+            disk_ttl_seconds: Time-to-live for disk cache entries (default: 24 hours)
         """
-        self._cache: Dict[str, Tuple[str, float]] = {}  # {call_id: (signature, timestamp)}
-        self._ttl = ttl_seconds
-        self._lock = threading.Lock()
+        # In-memory cache: {call_id: (signature, timestamp)}
+        self._cache: Dict[str, Tuple[str, float]] = {}
+        self._memory_ttl = memory_ttl_seconds
+        self._disk_ttl = disk_ttl_seconds
+        self._lock = asyncio.Lock()
+        self._disk_lock = asyncio.Lock()
+        
+        # Disk persistence configuration
+        self._cache_file = ANTIGRAVITY_CACHE_FILE
+        self._enable_disk_persistence = os.getenv(
+            "ANTIGRAVITY_ENABLE_SIGNATURE_CACHE",
+            "true"
+        ).lower() in ("true", "1", "yes")
+        
+        # Async write configuration
+        self._dirty = False  # Flag for pending writes
+        self._write_interval = int(os.getenv("ANTIGRAVITY_CACHE_WRITE_INTERVAL", "60"))
+        self._cleanup_interval = int(os.getenv("ANTIGRAVITY_CACHE_CLEANUP_INTERVAL", "1800"))
+        
+        # Background tasks
+        self._writer_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._running = False
+        
+        # Statistics
+        self._stats = {
+            "memory_hits": 0,
+            "disk_hits": 0,
+            "misses": 0,
+            "writes": 0
+        }
+        
+        # Initialize
+        if self._enable_disk_persistence:
+            lib_logger.debug(
+                f"ThoughtSignatureCache: Disk persistence ENABLED "
+                f"(memory_ttl={memory_ttl_seconds}s, disk_ttl={disk_ttl_seconds}s, "
+                f"write_interval={self._write_interval}s)"
+            )
+            # Schedule async initialization
+            asyncio.create_task(self._async_init())
+        else:
+            lib_logger.debug("ThoughtSignatureCache: Disk persistence DISABLED (memory-only mode)")
+    
+    async def _async_init(self):
+        """Async initialization: load from disk and start background tasks."""
+        try:
+            await self._load_from_disk()
+            await self._start_background_tasks()
+        except Exception as e:
+            lib_logger.error(f"ThoughtSignatureCache async init failed: {e}")
+    
+    async def _load_from_disk(self):
+        """Load cache from disk file (with TTL validation)."""
+        if not self._enable_disk_persistence:
+            return
+        
+        if not self._cache_file.exists():
+            lib_logger.debug("No existing cache file found, starting fresh")
+            return
+        
+        try:
+            async with self._disk_lock:
+                # Read cache file
+                with open(self._cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Validate version
+                if data.get("version") != "1.0":
+                    lib_logger.warning(f"Cache file version mismatch, ignoring")
+                    return
+                
+                # Load entries with disk TTL validation
+                now = time.time()
+                entries = data.get("entries", {})
+                loaded = 0
+                expired = 0
+                
+                for call_id, entry in entries.items():
+                    timestamp = entry.get("timestamp", 0)
+                    age = now - timestamp
+                    
+                    # Check against DISK TTL (24 hours)
+                    if age <= self._disk_ttl:
+                        signature = entry.get("signature", "")
+                        if signature:
+                            self._cache[call_id] = (signature, timestamp)
+                            loaded += 1
+                    else:
+                        expired += 1
+                
+                lib_logger.debug(
+                    f"ThoughtSignatureCache: Loaded {loaded} signatures from disk "
+                    f"({expired} expired entries removed)"
+                )
+                
+        except json.JSONDecodeError as e:
+            lib_logger.warning(f"Cache file corrupted, starting fresh: {e}")
+        except Exception as e:
+            lib_logger.error(f"Failed to load cache from disk: {e}")
+    
+    async def _save_to_disk(self):
+        """Persist cache to disk using atomic write."""
+        if not self._enable_disk_persistence:
+            return
+        
+        try:
+            async with self._disk_lock:
+                # Ensure cache directory exists
+                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Build cache data structure
+                cache_data = {
+                    "version": "1.0",
+                    "memory_ttl_seconds": self._memory_ttl,
+                    "disk_ttl_seconds": self._disk_ttl,
+                    "entries": {
+                        call_id: {
+                            "signature": sig,
+                            "timestamp": ts
+                        }
+                        for call_id, (sig, ts) in self._cache.items()
+                    },
+                    "statistics": {
+                        "total_entries": len(self._cache),
+                        "last_write": time.time(),
+                        "memory_hits": self._stats["memory_hits"],
+                        "disk_hits": self._stats["disk_hits"],
+                        "misses": self._stats["misses"],
+                        "writes": self._stats["writes"]
+                    }
+                }
+                
+                # Atomic write using tempfile pattern (same as OAuth credentials)
+                parent_dir = self._cache_file.parent
+                tmp_fd = None
+                tmp_path = None
+                
+                try:
+                    # Create temp file in same directory
+                    tmp_fd, tmp_path = tempfile.mkstemp(
+                        dir=parent_dir,
+                        prefix='.tmp_',
+                        suffix='.json',
+                        text=True
+                    )
+                    
+                    # Write JSON to temp file
+                    with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                        json.dump(cache_data, f, indent=2)
+                        tmp_fd = None  # fdopen closes the fd
+                    
+                    # Set secure permissions (owner read/write only)
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                    except (OSError, AttributeError):
+                        # Windows may not support chmod, ignore
+                        pass
+                    
+                    # Atomic move (overwrites target if exists)
+                    shutil.move(tmp_path, self._cache_file)
+                    tmp_path = None  # Successfully moved
+                    
+                    self._stats["writes"] += 1
+                    lib_logger.debug(f"Saved {len(self._cache)} signatures to disk")
+                    
+                except Exception as e:
+                    lib_logger.error(f"Failed to save cache to disk: {e}")
+                    # Clean up temp file if it still exists
+                    if tmp_fd is not None:
+                        try:
+                            os.close(tmp_fd)
+                        except:
+                            pass
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except:
+                            pass
+                    raise
+                    
+        except Exception as e:
+            lib_logger.error(f"Disk save operation failed: {e}")
+    
+    async def _start_background_tasks(self):
+        """Start background writer and cleanup tasks."""
+        if not self._enable_disk_persistence or self._running:
+            return
+        
+        self._running = True
+        
+        # Start async writer task
+        self._writer_task = asyncio.create_task(self._writer_loop())
+        lib_logger.debug(f"Started background writer task (interval: {self._write_interval}s)")
+        
+        # Start cleanup task
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        lib_logger.debug(f"Started background cleanup task (interval: {self._cleanup_interval}s)")
+    
+    async def _writer_loop(self):
+        """Background task: periodically flush dirty cache to disk."""
+        try:
+            while self._running:
+                await asyncio.sleep(self._write_interval)
+                
+                if self._dirty:
+                    try:
+                        await self._save_to_disk()
+                        self._dirty = False
+                    except Exception as e:
+                        lib_logger.error(f"Background writer error: {e}")
+        except asyncio.CancelledError:
+            lib_logger.debug("Background writer task cancelled")
+        except Exception as e:
+            lib_logger.error(f"Background writer crashed: {e}")
+    
+    async def _cleanup_loop(self):
+        """Background task: periodically clean up expired entries."""
+        try:
+            while self._running:
+                await asyncio.sleep(self._cleanup_interval)
+                
+                try:
+                    await self._cleanup_expired()
+                except Exception as e:
+                    lib_logger.error(f"Background cleanup error: {e}")
+        except asyncio.CancelledError:
+            lib_logger.debug("Background cleanup task cancelled")
+        except Exception as e:
+            lib_logger.error(f"Background cleanup crashed: {e}")
+    
+    async def _cleanup_expired(self):
+        """Remove expired entries from memory cache (based on memory TTL)."""
+        async with self._lock:
+            now = time.time()
+            expired = [
+                k for k, (_, ts) in self._cache.items()
+                if now - ts > self._memory_ttl
+            ]
+            
+            for k in expired:
+                del self._cache[k]
+            
+            if expired:
+                self._dirty = True  # Mark for disk save
+                lib_logger.debug(f"Cleaned up {len(expired)} expired signatures from memory")
     
     def store(self, tool_call_id: str, signature: str):
         """
-        Store a signature for a tool call ID.
+        Store a signature for a tool call ID (sync wrapper for async storage).
         
         Args:
             tool_call_id: Unique identifier for the tool call
             signature: Encrypted thoughtSignature from Antigravity API
         """
-        with self._lock:
+        # Create task for async storage
+        asyncio.create_task(self._async_store(tool_call_id, signature))
+    
+    async def _async_store(self, tool_call_id: str, signature: str):
+        """Async implementation of store."""
+        async with self._lock:
             self._cache[tool_call_id] = (signature, time.time())
-            self._cleanup_expired()
+            self._dirty = True  # Mark for disk write
     
     def retrieve(self, tool_call_id: str) -> Optional[str]:
         """
-        Retrieve signature for a tool call ID.
+        Retrieve signature for a tool call ID (sync method).
         
         Args:
             tool_call_id: Unique identifier for the tool call
@@ -146,28 +405,97 @@ class ThoughtSignatureCache:
         Returns:
             The signature if found and not expired, None otherwise
         """
-        with self._lock:
-            if tool_call_id not in self._cache:
-                return None
-            
+        # Try memory cache first (sync access is safe for read)
+        if tool_call_id in self._cache:
             signature, timestamp = self._cache[tool_call_id]
-            if time.time() - timestamp > self._ttl:
+            if time.time() - timestamp <= self._memory_ttl:
+                self._stats["memory_hits"] += 1
+                return signature
+            else:
+                # Expired in memory, remove it
                 del self._cache[tool_call_id]
-                return None
-            
-            return signature
+                self._dirty = True
+        
+        # Not in memory - schedule async disk lookup
+        # For now, return None (disk fallback happens on next request)
+        # This is intentional to avoid blocking the sync caller
+        self._stats["misses"] += 1
+        
+        # Schedule background disk check (non-blocking)
+        if self._enable_disk_persistence:
+            asyncio.create_task(self._check_disk_fallback(tool_call_id))
+        
+        return None
     
-    def _cleanup_expired(self):
-        """Remove expired entries from cache."""
-        now = time.time()
-        expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._ttl]
-        for k in expired:
-            del self._cache[k]
+    async def _check_disk_fallback(self, tool_call_id: str):
+        """Check disk for signature and load into memory if found."""
+        try:
+            # Reload from disk if file exists
+            if self._cache_file.exists():
+                async with self._disk_lock:
+                    with open(self._cache_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    entries = data.get("entries", {})
+                    if tool_call_id in entries:
+                        entry = entries[tool_call_id]
+                        timestamp = entry.get("timestamp", 0)
+                        
+                        # Check disk TTL (24 hours)
+                        if time.time() - timestamp <= self._disk_ttl:
+                            signature = entry.get("signature", "")
+                            if signature:
+                                # Load into memory cache
+                                async with self._lock:
+                                    self._cache[tool_call_id] = (signature, timestamp)
+                                    self._stats["disk_hits"] += 1
+                                lib_logger.debug(f"Loaded signature {tool_call_id} from disk")
+        except Exception as e:
+            lib_logger.debug(f"Disk fallback check failed: {e}")
     
-    def clear(self):
-        """Clear all cached signatures."""
-        with self._lock:
+    async def clear(self):
+        """Clear all cached signatures (memory and disk)."""
+        async with self._lock:
             self._cache.clear()
+            self._dirty = True
+        
+        if self._enable_disk_persistence:
+            await self._save_to_disk()
+    
+    async def shutdown(self):
+        """Graceful shutdown: flush pending writes and stop background tasks."""
+        lib_logger.info("ThoughtSignatureCache shutting down...")
+        
+        # Stop background tasks
+        self._running = False
+        
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush pending writes
+        if self._dirty and self._enable_disk_persistence:
+            lib_logger.info("Flushing pending cache writes...")
+            await self._save_to_disk()
+        
+        lib_logger.info(
+            f"ThoughtSignatureCache shutdown complete "
+            f"(stats: mem_hits={self._stats['memory_hits']}, "
+            f"disk_hits={self._stats['disk_hits']}, "
+            f"misses={self._stats['misses']}, "
+            f"writes={self._stats['writes']})"
+        )
+
 
 class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     """
@@ -203,8 +531,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._base_url_index = 0
         
         # Initialize thoughtSignature cache for Gemini 3 multi-turn conversations
-        cache_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_CACHE_TTL", "3600"))
-        self._signature_cache = ThoughtSignatureCache(ttl_seconds=cache_ttl)
+        memory_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_CACHE_TTL", "3600"))
+        disk_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_DISK_TTL", "86400"))
+        self._signature_cache = ThoughtSignatureCache(
+            memory_ttl_seconds=memory_ttl,
+            disk_ttl_seconds=disk_ttl
+        )
         
         # Check if client passthrough is enabled (default: TRUE for testing)
         self._preserve_signatures_in_client = os.getenv(
@@ -225,19 +557,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         ).lower() in ("true", "1", "yes")
         
         if self._preserve_signatures_in_client:
-            lib_logger.info("Antigravity: thoughtSignature client passthrough ENABLED")
+            lib_logger.debug("Antigravity: thoughtSignature client passthrough ENABLED")
         else:
-            lib_logger.info("Antigravity: thoughtSignature client passthrough DISABLED")
+            lib_logger.debug("Antigravity: thoughtSignature client passthrough DISABLED")
         
         if self._enable_signature_cache:
-            lib_logger.info(f"Antigravity: thoughtSignature server-side cache ENABLED (TTL: {cache_ttl}s)")
+            lib_logger.debug(f"Antigravity: thoughtSignature server-side cache ENABLED (memory_ttl={memory_ttl}s, disk_ttl={disk_ttl}s)")
         else:
-            lib_logger.info("Antigravity: thoughtSignature server-side cache DISABLED")
+            lib_logger.debug("Antigravity: thoughtSignature server-side cache DISABLED")
         
         if self._enable_dynamic_model_discovery:
-            lib_logger.info("Antigravity: Dynamic model discovery ENABLED (may fail if endpoint unavailable)")
+            lib_logger.debug("Antigravity: Dynamic model discovery ENABLED (may fail if endpoint unavailable)")
         else:
-            lib_logger.info("Antigravity: Dynamic model discovery DISABLED (using hardcoded model list)")
+            lib_logger.debug("Antigravity: Dynamic model discovery DISABLED (using hardcoded model list)")
         
         # Check if Gemini 3 tool fix is enabled (default: ON for testing)
         # This applies the "Quad-Lock" catch-all strategy to prevent tool hallucination
@@ -282,12 +614,12 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         )
         
         if self._enable_gemini3_tool_fix:
-            lib_logger.info(f"Antigravity: Gemini 3 tool fix ENABLED")
+            lib_logger.debug(f"Antigravity: Gemini 3 tool fix ENABLED")
             lib_logger.debug(f"  - Namespace prefix: '{self._gemini3_tool_prefix}'")
             lib_logger.debug(f"  - Description prompt: '{self._gemini3_description_prompt[:50]}...'")
             lib_logger.debug(f"  - System instruction: {'ENABLED' if self._gemini3_system_instruction else 'DISABLED'} ({len(self._gemini3_system_instruction)} chars)")
         else:
-            lib_logger.info("Antigravity: Gemini 3 tool fix DISABLED (using default tool schemas)")
+            lib_logger.debug("Antigravity: Gemini 3 tool fix DISABLED (using default tool schemas)")
 
 
 
@@ -799,7 +1131,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                 original_name = func_decl.get("name", "")
                 if original_name:
                     func_decl["name"] = f"{self._gemini3_tool_prefix}{original_name}"
-                    lib_logger.debug(f"Gemini 3 namespace: {original_name} -> {self._gemini3_tool_prefix}{original_name}")
+                    #lib_logger.debug(f"Gemini 3 namespace: {original_name} -> {self._gemini3_tool_prefix}{original_name}")
         
         return modified_tools
 
@@ -895,7 +1227,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                 description = func_decl.get("description", "")
                 func_decl["description"] = description + signature_str
                 
-                lib_logger.debug(f"Gemini 3 signature injection: {func_decl.get('name', '')} - {len(param_list)} params")
+                #lib_logger.debug(f"Gemini 3 signature injection: {func_decl.get('name', '')} - {len(param_list)} params")
         
         return modified_tools
 
@@ -1231,6 +1563,161 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             response["usage"] = usage
         
         return response
+    
+    def _gemini_to_openai_non_streaming(self, gemini_response: Dict[str, Any], model: str) -> Dict[str, Any]:
+        """
+        Convert a Gemini API response to OpenAI non-streaming format.
+        
+        This is specifically for non-streaming completions where we need 'message' instead of 'delta'.
+        
+        Args:
+            gemini_response: Gemini API response
+            model: Model name for Gemini 3 detection
+            
+        Returns:
+            OpenAI-compatible non-streaming response
+        """
+        # Extract the main response structure
+        candidates = gemini_response.get("candidates", [])
+        if not candidates:
+            return {}
+        
+        candidate = candidates[0]
+        content = candidate.get("content", {})
+        content_parts = content.get("parts", [])
+        
+        # Build message components
+        text_content = ""
+        reasoning_content = ""
+        tool_calls = []
+        
+        # Track if we've seen a signature yet (for parallel tool call handling)
+        first_signature_seen = False
+        
+        for part in content_parts:
+            has_function_call = "functionCall" in part
+            has_text = "text" in part
+            has_signature = "thoughtSignature" in part and part["thoughtSignature"]
+            
+            # Skip standalone signature parts
+            if has_signature and not has_function_call and not has_text:
+                continue
+            
+            # Process text content
+            if has_text:
+                thought = part.get("thought")
+                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                    reasoning_content += part["text"]
+                else:
+                    text_content += part["text"]
+            
+            # Process function calls
+            if has_function_call:
+                func_call = part["functionCall"]
+                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                
+                # Get tool name and strip gemini3_ namespace if present
+                tool_name = func_call.get("name", "")
+                if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
+                    tool_name = self._strip_gemini3_namespace_from_name(tool_name)
+                
+                tool_call = {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(func_call.get("args", {}))
+                    }
+                }
+                
+                # Handle thoughtSignature if present
+                if has_signature and not first_signature_seen:
+                    first_signature_seen = True
+                    signature = part["thoughtSignature"]
+                    
+                    # Store in server-side cache
+                    if self._enable_signature_cache:
+                        self._signature_cache.store(tool_call_id, signature)
+                        lib_logger.debug(f"Stored thoughtSignature in cache for {tool_call_id}")
+                    
+                    # Pass to client if enabled
+                    if self._preserve_signatures_in_client:
+                        tool_call["thought_signature"] = signature
+                
+                tool_calls.append(tool_call)
+        
+        # Build message object (not delta!)
+        message = {"role": "assistant"}
+        
+        if text_content:
+            message["content"] = text_content
+        elif not tool_calls:
+            # If no text and no tool calls, set content to empty string
+            message["content"] = ""
+        
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+        
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            # Don't set content if we have tool calls (OpenAI convention)
+            if "content" in message:
+                message.pop("content")
+        
+        # Handle finish reason
+        finish_reason = candidate.get("finishReason")
+        if finish_reason:
+            # Map Gemini finish reasons to OpenAI
+            finish_reason_map = {
+                "STOP": "stop",
+                "MAX_TOKENS": "length",
+                "SAFETY": "content_filter",
+                "RECITATION": "content_filter",
+                "OTHER": "stop"
+            }
+            finish_reason = finish_reason_map.get(finish_reason, "stop")
+            if tool_calls:
+                finish_reason = "tool_calls"
+        
+        # Build usage metadata
+        usage = None
+        usage_metadata = gemini_response.get("usageMetadata", {})
+        if usage_metadata:
+            prompt_tokens = usage_metadata.get("promptTokenCount", 0)
+            thoughts_tokens = usage_metadata.get("thoughtsTokenCount", 0)
+            completion_tokens = usage_metadata.get("candidatesTokenCount", 0)
+            
+            usage = {
+                "prompt_tokens": prompt_tokens + thoughts_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": usage_metadata.get("totalTokenCount", 0)
+            }
+            
+            # Add reasoning tokens details if thinking was used
+            if thoughts_tokens > 0:
+                if "completion_tokens_details" not in usage:
+                    usage["completion_tokens_details"] = {}
+                usage["completion_tokens_details"]["reasoning_tokens"] = thoughts_tokens
+        
+        # Build final response
+        response = {
+            "id": gemini_response.get("responseId", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
+            "object": "chat.completion",  # Non-streaming uses chat.completion, not chunk
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,  # message, not delta!
+                "finish_reason": finish_reason
+            }]
+        }
+        
+        if usage:
+            response["usage"] = usage
+        
+        return response
+
+
             
     # ============================================================================
     # PROVIDER INTERFACE IMPLEMENTATION
@@ -1374,7 +1861,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         max_tokens = kwargs.get("max_tokens")
         enable_request_logging = kwargs.pop("enable_request_logging", False)
         
-        lib_logger.info(f"Antigravity completion: model={model}, stream={stream}, messages={len(messages)}")
+        #lib_logger.debug(f"Antigravity completion: model={model}, stream={stream}, messages={len(messages)}")
         
         # Create file logger
         file_logger = _AntigravityFileLogger(
@@ -1424,7 +1911,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                     "parts": [{"text": gemini3_instruction}]
                 }
             
-            lib_logger.debug("Gemini 3 system instruction injection applied")
+            #lib_logger.debug("Gemini 3 system instruction injection applied")
 
         
         
@@ -1499,7 +1986,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                 # Apply Gemini 3 specific tool transformations (ONLY for gemini-3-* models)
                 # This implements the "Double-Lock" catch-all strategy to prevent tool hallucination
                 if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
-                    lib_logger.info(f"Applying Gemini 3 catch-all tool transformations for {model}")
+                    #lib_logger.debug(f"Applying Gemini 3 catch-all tool transformations for {model}")
                     
                     # Strategy 1: Namespace prefixing (breaks association with training data)
                     gemini_cli_payload["tools"] = self._apply_gemini3_namespace_to_tools(
@@ -1546,7 +2033,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         else:
             headers["Accept"] = "application/json"
 
-        lib_logger.debug(f"Antigravity request to: {url}")
+        #lib_logger.debug(f"Antigravity request to: {url}")
         
         try:
             if stream:
@@ -1589,8 +2076,11 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         # Unwrap Antigravity envelope
         gemini_response = self._unwrap_antigravity_response(antigravity_response)
         
-        # Convert to OpenAI format
-        return self._gemini_to_openai_chunk(gemini_response, model)
+        # Convert to OpenAI non-streaming format (returns dict with 'message' not 'delta')
+        openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
+        
+        # Convert dict to ModelResponse object for non-streaming
+        return litellm.ModelResponse(**openai_response)
 
     async def _handle_streaming(
         self,
