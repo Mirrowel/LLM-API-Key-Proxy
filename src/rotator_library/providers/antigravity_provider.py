@@ -238,6 +238,58 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             lib_logger.info("Antigravity: Dynamic model discovery ENABLED (may fail if endpoint unavailable)")
         else:
             lib_logger.info("Antigravity: Dynamic model discovery DISABLED (using hardcoded model list)")
+        
+        # Check if Gemini 3 tool fix is enabled (default: ON for testing)
+        # This applies the "Quad-Lock" catch-all strategy to prevent tool hallucination
+        self._enable_gemini3_tool_fix = os.getenv(
+            "ANTIGRAVITY_GEMINI3_TOOL_FIX",
+            "true"  # Default ON - applies namespace + signature injection
+        ).lower() in ("true", "1", "yes")
+        
+        # Gemini 3 fix configuration - customize the fix components
+        # Namespace prefix for tool names (Strategy 1)
+        self._gemini3_tool_prefix = os.getenv(
+            "ANTIGRAVITY_GEMINI3_TOOL_PREFIX",
+            "gemini3_"  # Default prefix
+        )
+        
+        # Description prompt format (Strategy 2)
+        # Use {params} as placeholder for parameter list
+        self._gemini3_description_prompt = os.getenv(
+            "ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT",
+            "\n\nSTRICT PARAMETERS: {params}."  # Default format
+        )
+        
+        # System instruction text (Strategy 3)
+        # Set to empty string to disable system instruction injection
+        self._gemini3_system_instruction = os.getenv(
+            "ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION",
+            # Default: comprehensive tool usage instructions
+            """CRITICAL TOOL USAGE INSTRUCTIONS:
+You are operating in a custom environment where tool definitions differ from your training data.
+You MUST follow these rules strictly:
+
+1. DO NOT use your internal training data to guess tool parameters
+2. ONLY use the exact parameter structure defined in the tool schema
+3. If a tool takes a 'files' parameter, it is ALWAYS an array of objects with specific properties, NEVER a simple array of strings
+4. If a tool edits code, it takes structured JSON objects with specific fields, NEVER raw diff strings or plain text
+5. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
+6. Array parameters have specific item types - check the schema's 'items' field for the exact structure
+7. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+
+If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully. Your training data about common tool names like 'read_file' or 'apply_diff' does NOT apply here.
+"""
+        )
+        
+        if self._enable_gemini3_tool_fix:
+            lib_logger.info(f"Antigravity: Gemini 3 tool fix ENABLED")
+            lib_logger.debug(f"  - Namespace prefix: '{self._gemini3_tool_prefix}'")
+            lib_logger.debug(f"  - Description prompt: '{self._gemini3_description_prompt[:50]}...'")
+            lib_logger.debug(f"  - System instruction: {'ENABLED' if self._gemini3_system_instruction else 'DISABLED'} ({len(self._gemini3_system_instruction)} chars)")
+        else:
+            lib_logger.info("Antigravity: Gemini 3 tool fix DISABLED (using default tool schemas)")
+
+
 
     # ============================================================================
     # MODEL ALIAS SYSTEM
@@ -456,9 +508,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             
                             tool_call_id = tool_call.get("id", "")
                             
+                            # Get function name and add configured prefix if needed (Gemini 3 specific)
+                            function_name = tool_call["function"]["name"]
+                            if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
+                                # Client sends original names, we need to prefix for API consistency
+                                function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                            
                             func_call_part = {
                                 "functionCall": {
-                                    "name": tool_call["function"]["name"],
+                                    "name": function_name,
                                     "args": args_dict,
                                     "id": tool_call_id  # ← ADD THIS LINE - Antigravity needs it for Claude!
                                 }
@@ -495,6 +553,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 tool_call_id = msg.get("tool_call_id", "")
                 function_name = tool_call_id_to_name.get(tool_call_id, "unknown_function")
                 tool_content = msg.get("content", "{}")
+                
+                # Add configured prefix to function response name if needed (Gemini 3 specific)
+                if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
+                    # Client sends responses for original names, we need to prefix for API consistency
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
                 
                 # Parse tool content - if it's JSON, use parsed value; otherwise use as-is
                 try:
@@ -705,6 +768,153 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 new_contents.append(function_response_content)
         
         return new_contents
+
+    # ============================================================================
+    # GEMINI 3 TOOL TRANSFORMATION (Catch-All Fix for Hallucination)
+    # ============================================================================
+
+    def _apply_gemini3_namespace_to_tools(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Apply namespace prefix to all tool names for Gemini 3 (Strategy 1: Namespace).
+        
+        This breaks the model's association with training data by prepending 'gemini3_'
+        to every tool name, forcing it to read the schema definition instead of using
+        its internal knowledge.
+        
+        Args:
+            tools: List of tool definitions (Gemini format with functionDeclarations)
+            
+        Returns:
+            Modified tools with prefixed names
+        """
+        if not tools:
+            return tools
+            
+        modified_tools = copy.deepcopy(tools)
+        
+        for tool in modified_tools:
+            function_declarations = tool.get("functionDeclarations", [])
+            for func_decl in function_declarations:
+                # Prepend namespace to tool name
+                original_name = func_decl.get("name", "")
+                if original_name:
+                    func_decl["name"] = f"{self._gemini3_tool_prefix}{original_name}"
+                    lib_logger.debug(f"Gemini 3 namespace: {original_name} -> {self._gemini3_tool_prefix}{original_name}")
+        
+        return modified_tools
+
+    def _inject_signature_into_tool_descriptions(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Inject parameter signatures into tool descriptions for Gemini 3 (Strategy 2: Signature Injection).
+        
+        This strategy appends the expected parameter structure into the description text,
+        creating a natural language enforcement of the schema that models pay close attention to.
+        
+        Args:
+            tools: List of tool definitions (Gemini format with functionDeclarations)
+            
+        Returns:
+            Modified tools with enriched descriptions
+        """
+        if not tools:
+            return tools
+            
+        modified_tools = copy.deepcopy(tools)
+        
+        for tool in modified_tools:
+            function_declarations = tool.get("functionDeclarations", [])
+            for func_decl in function_declarations:
+                # Get parameter schema
+                schema = func_decl.get("parametersJsonSchema", {})
+                if not schema or not isinstance(schema, dict):
+                    continue
+                
+                # Extract required parameters
+                required_params = schema.get("required", [])
+                properties = schema.get("properties", {})
+                
+                if not properties:
+                    continue
+                
+                # Build parameter list with type hints
+                param_list = []
+                for prop_name, prop_data in properties.items():
+                    if not isinstance(prop_data, dict):
+                        continue
+                        
+                    type_hint = prop_data.get("type", "unknown")
+                    
+                    # Handle arrays specially (critical for read_file/apply_diff issues)
+                    if type_hint == "array":
+                        items_schema = prop_data.get("items", {})
+                        if isinstance(items_schema, dict):
+                            item_type = items_schema.get("type", "unknown")
+                            
+                            # Check if it's an array of objects - RECURSE into nested properties
+                            if item_type == "object":
+                                # Extract nested properties for explicit visibility
+                                nested_props = items_schema.get("properties", {})
+                                nested_required = items_schema.get("required", [])
+                                
+                                if nested_props:
+                                    # Build nested property list with types
+                                    nested_list = []
+                                    for nested_name, nested_data in nested_props.items():
+                                        if not isinstance(nested_data, dict):
+                                            continue
+                                        nested_type = nested_data.get("type", "unknown")
+                                        
+                                        # Mark nested required fields
+                                        if nested_name in nested_required:
+                                            nested_list.append(f"{nested_name}: {nested_type} REQUIRED")
+                                        else:
+                                            nested_list.append(f"{nested_name}: {nested_type}")
+                                    
+                                    # Format as ARRAY_OF_OBJECTS[key1: type1, key2: type2]
+                                    nested_str = ", ".join(nested_list)
+                                    type_hint = f"ARRAY_OF_OBJECTS[{nested_str}]"
+                                else:
+                                    # No properties defined - just generic objects
+                                    type_hint = "ARRAY_OF_OBJECTS"
+                            else:
+                                type_hint = f"ARRAY_OF_{item_type.upper()}"
+                        else:
+                            type_hint = "ARRAY"
+                    
+                    # Mark required parameters
+                    if prop_name in required_params:
+                        param_list.append(f"{prop_name} ({type_hint}, REQUIRED)")
+                    else:
+                        param_list.append(f"{prop_name} ({type_hint})")
+                
+                # Create strict signature string using configurable template
+                # Replace {params} placeholder with actual parameter list
+                signature_str = self._gemini3_description_prompt.replace("{params}", ", ".join(param_list))
+                
+                # Inject into description
+                description = func_decl.get("description", "")
+                func_decl["description"] = description + signature_str
+                
+                lib_logger.debug(f"Gemini 3 signature injection: {func_decl.get('name', '')} - {len(param_list)} params")
+        
+        return modified_tools
+
+    def _strip_gemini3_namespace_from_name(self, tool_name: str) -> str:
+        """
+        Strip the configured namespace prefix from a tool name.
+        
+        This reverses the namespace transformation applied in the request,
+        ensuring the client receives the original tool names.
+        
+        Args:
+            tool_name: Tool name (possibly with configured prefix)
+            
+        Returns:
+            Original tool name without prefix
+        """
+        if tool_name and tool_name.startswith(self._gemini3_tool_prefix):
+            return tool_name[len(self._gemini3_tool_prefix):]
+        return tool_name
 
     # ============================================================================
     # ANTIGRAVITY REQUEST TRANSFORMATION
@@ -924,12 +1134,17 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 func_call = part["functionCall"]
                 tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
                 
+                # Get tool name and strip gemini3_ namespace if present (Gemini 3 specific)
+                tool_name = func_call.get("name", "")
+                if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
+                    tool_name = self._strip_gemini3_namespace_from_name(tool_name)
+                
                 tool_call = {
                     "id": tool_call_id,
                     "type": "function",
                     "index": tool_call_index,  # REQUIRED for OpenAI streaming format
                     "function": {
-                        "name": func_call.get("name", ""),
+                        "name": tool_name,
                         "arguments": json.dumps(func_call.get("args", {}))
                     }
                 }
@@ -1181,10 +1396,45 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if system_instruction:
             gemini_cli_payload["system_instruction"] = system_instruction
         
+        # Apply Gemini 3 system instruction injection (Strategy 3) if fix is enabled
+        # This prepends critical tool usage instructions to override model's training data
+        if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix and tools:
+            gemini3_instruction = self._gemini3_system_instruction
+            
+            if "system_instruction" in gemini_cli_payload:
+                # Prepend to existing system instruction
+                existing_instruction = gemini_cli_payload["system_instruction"]
+                if isinstance(existing_instruction, dict) and "parts" in existing_instruction:
+                    # System instruction with parts structure
+                    gemini3_part = {"text": gemini3_instruction}
+                    existing_instruction["parts"].insert(0, gemini3_part)
+                else:
+                    # Shouldn't happen, but handle gracefully
+                    gemini_cli_payload["system_instruction"] = {
+                        "role": "user",
+                        "parts": [
+                            {"text": gemini3_instruction},
+                            {"text": str(existing_instruction)}
+                        ]
+                    }
+            else:
+                # Create new system instruction with Gemini 3 instructions
+                gemini_cli_payload["system_instruction"] = {
+                    "role": "user",
+                    "parts": [{"text": gemini3_instruction}]
+                }
+            
+            lib_logger.debug("Gemini 3 system instruction injection applied")
+
+        
+        
         # Add generation config
         generation_config = {}
-        if temperature is not None:
-            generation_config["temperature"] = temperature
+        
+        # Temperature handling: Default to 1.0, override 0 to 1.0
+        # Low temperature (especially 0) makes models deterministic and prone to following
+        # training data patterns instead of actual schemas, which causes tool hallucination
+        
         if top_p is not None:
             generation_config["topP"] = top_p
         
@@ -1245,6 +1495,22 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             
             if gemini_tools:
                 gemini_cli_payload["tools"] = gemini_tools
+                
+                # Apply Gemini 3 specific tool transformations (ONLY for gemini-3-* models)
+                # This implements the "Double-Lock" catch-all strategy to prevent tool hallucination
+                if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
+                    lib_logger.info(f"Applying Gemini 3 catch-all tool transformations for {model}")
+                    
+                    # Strategy 1: Namespace prefixing (breaks association with training data)
+                    gemini_cli_payload["tools"] = self._apply_gemini3_namespace_to_tools(
+                        gemini_cli_payload["tools"]
+                    )
+                    
+                    # Strategy 2: Signature injection (natural language schema enforcement)
+                    gemini_cli_payload["tools"] = self._inject_signature_into_tool_descriptions(
+                        gemini_cli_payload["tools"]
+                    )
+
         
         # Step 3: Transform to Antigravity format
         antigravity_payload = self._transform_to_antigravity_format(gemini_cli_payload, model)
