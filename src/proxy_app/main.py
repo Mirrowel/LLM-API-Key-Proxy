@@ -652,6 +652,22 @@ async def chat_completions(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
+        # Global temperature=0 override (controlled by .env variable, default: OFF)
+        # Low temperature makes models deterministic and prone to following training data
+        # instead of actual schemas, which can cause tool hallucination
+        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
+        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
+        
+        if override_temp_zero in ("remove", "set", "true", "1", "yes") and "temperature" in request_data and request_data["temperature"] == 0:
+            if override_temp_zero == "remove":
+                # Remove temperature key entirely
+                del request_data["temperature"]
+                logging.debug("OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request")
+            else:
+                # Set to 1.0 (for "set", "true", "1", "yes")
+                request_data["temperature"] = 1.0
+                logging.debug("OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0")
+
         # If logging is enabled, perform all logging operations using the parsed data.
         if logger:
             logger.log_request(headers=request.headers, body=request_data)
