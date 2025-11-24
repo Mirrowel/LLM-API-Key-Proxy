@@ -355,7 +355,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _transform_messages(self, messages: List[Dict[str, Any]], model: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Transform OpenAI messages to Gemini CLI format.
-        Handles thoughtSignature preservation with 3-tier fallback:
+        Handles thoughtSignature preservation with 3-tier fallback (GEMINI 3 ONLY):
         1. Use client-provided signature (if present)
         2. Fall back to server-side cache
         3. Use bypass constant as last resort
@@ -459,27 +459,29 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             func_call_part = {
                                 "functionCall": {
                                     "name": tool_call["function"]["name"],
-                                    "args": args_dict
+                                    "args": args_dict,
+                                    "id": tool_call_id  # ← ADD THIS LINE - Antigravity needs it for Claude!
                                 }
                             }
                             
-                            # PRIORITY 1: Use client-provided signature if available
-                            client_signature = tool_call.get("thought_signature")
-                            
-                            # PRIORITY 2: Fall back to server-side cache
-                            if not client_signature and tool_call_id and self._enable_signature_cache:
-                                client_signature = self._signature_cache.retrieve(tool_call_id)
-                                if client_signature:
-                                    lib_logger.debug(f"Retrieved thoughtSignature from cache for {tool_call_id}")
-                            
-                            # PRIORITY 3: Use bypass constant as last resort
-                            if client_signature:
-                                func_call_part["thoughtSignature"] = client_signature
-                            else:
-                                func_call_part["thoughtSignature"] = "skip_thought_signature_validator"
+                            # thoughtSignature handling (GEMINI 3 ONLY)
+                            # Claude and other models don't support this field!
+                            if self._is_gemini_3_model(model):
+                                # PRIORITY 1: Use client-provided signature if available
+                                client_signature = tool_call.get("thought_signature")
                                 
-                                # WARNING: Missing signature for Gemini 3
-                                if self._is_gemini_3_model(model):
+                                # PRIORITY 2: Fall back to server-side cache
+                                if not client_signature and tool_call_id and self._enable_signature_cache:
+                                    client_signature = self._signature_cache.retrieve(tool_call_id)
+                                    if client_signature:
+                                        lib_logger.debug(f"Retrieved thoughtSignature from cache for {tool_call_id}")
+                                
+                                # PRIORITY 3: Use bypass constant as last resort
+                                if client_signature:
+                                    func_call_part["thoughtSignature"] = client_signature
+                                else:
+                                    func_call_part["thoughtSignature"] = "skip_thought_signature_validator"
+                                    # WARNING: Missing signature for Gemini 3
                                     lib_logger.warning(
                                         f"Gemini 3 tool call '{tool_call_id}' missing thoughtSignature. "
                                         f"Client didn't provide it and cache lookup failed. "
@@ -505,7 +507,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         "name": function_name,
                         "response": {
                             "result": parsed_content
-                        }
+                        },
+                        "id": tool_call_id  # ← ADD THIS LINE - Antigravity needs it for Claude!
                     }
                 })
 
@@ -759,13 +762,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 # Set thinkingBudget to -1 (auto/dynamic)
                 thinking_config["thinkingBudget"] = -1
         
-        # 6. Preserve/add thoughtSignature to ALL function calls in model role content
-        for content in antigravity_payload["request"].get("contents", []):
-            if content.get("role") == "model":
-                for part in content.get("parts", []):
-                    # Add signature to function calls OR preserve if already exists
-                    if "functionCall" in part and "thoughtSignature" not in part:
-                        part["thoughtSignature"] = "skip_thought_signature_validator"
+        # 6. Preserve/add thoughtSignature to function calls in model role content (GEMINI 3 ONLY)
+        # thoughtSignature is a Gemini 3 feature for preserving reasoning context in multi-turn conversations
+        # DO NOT add this for Claude or other models - they don't support it!
+        if internal_model.startswith("gemini-3-"):
+            for content in antigravity_payload["request"].get("contents", []):
+                if content.get("role") == "model":
+                    for part in content.get("parts", []):
+                        # Add signature to function calls OR preserve if already exists
+                        if "functionCall" in part and "thoughtSignature" not in part:
+                            part["thoughtSignature"] = "skip_thought_signature_validator"
         
         # 7. CLAUDE-SPECIFIC TOOL SCHEMA TRANSFORMATION
         # Reference: Go implementation antigravity_executor.go lines 672-684
