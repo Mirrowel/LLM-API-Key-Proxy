@@ -401,6 +401,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._enable_dynamic_models = _env_bool("ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False)
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
         self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
+        self._enable_thinking_sanitization = _env_bool("ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION", True)
         
         # Gemini 3 tool fix configuration
         self._gemini3_tool_prefix = os.getenv("ANTIGRAVITY_GEMINI3_TOOL_PREFIX", "gemini3_")
@@ -431,7 +432,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         lib_logger.debug(
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
-            f"gemini3_fix={self._enable_gemini3_tool_fix}, claude_fix={self._enable_claude_tool_fix}"
+            f"gemini3_fix={self._enable_gemini3_tool_fix}, claude_fix={self._enable_claude_tool_fix}, "
+            f"thinking_sanitization={self._enable_thinking_sanitization}"
         )
     
     # =========================================================================
@@ -511,6 +513,295 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             key_parts.append(f"text_{text_hash}")
         
         return "thinking_" + "_".join(key_parts) if key_parts else None
+    
+    # =========================================================================
+    # THINKING MODE SANITIZATION
+    # =========================================================================
+    
+    def _analyze_conversation_state(
+        self,
+        messages: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Analyze conversation state to detect tool use loops and thinking mode issues.
+        
+        Returns:
+            {
+                "in_tool_loop": bool - True if we're in an incomplete tool use loop
+                "last_assistant_idx": int - Index of last assistant message
+                "last_assistant_has_thinking": bool - Whether last assistant msg has thinking
+                "last_assistant_has_tool_calls": bool - Whether last assistant msg has tool calls
+                "pending_tool_results": bool - Whether there are tool results after last assistant
+                "thinking_block_indices": List[int] - Indices of messages with thinking/reasoning
+            }
+        """
+        state = {
+            "in_tool_loop": False,
+            "last_assistant_idx": -1,
+            "last_assistant_has_thinking": False,
+            "last_assistant_has_tool_calls": False,
+            "pending_tool_results": False,
+            "thinking_block_indices": [],
+        }
+        
+        # Find last assistant message and analyze the conversation
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            
+            if role == "assistant":
+                state["last_assistant_idx"] = i
+                state["last_assistant_has_tool_calls"] = bool(msg.get("tool_calls"))
+                # Check for thinking/reasoning content
+                has_thinking = bool(msg.get("reasoning_content"))
+                # Also check for thinking in content array (some formats)
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "thinking":
+                            has_thinking = True
+                            break
+                state["last_assistant_has_thinking"] = has_thinking
+                if has_thinking:
+                    state["thinking_block_indices"].append(i)
+            elif role == "tool":
+                # Tool result after an assistant message with tool calls = in tool loop
+                if state["last_assistant_has_tool_calls"]:
+                    state["pending_tool_results"] = True
+        
+        # We're in a tool loop if:
+        # 1. Last assistant message had tool calls
+        # 2. There are tool results after it
+        # 3. There's no final text response yet (the conversation ends with tool results)
+        if state["pending_tool_results"] and messages:
+            last_msg = messages[-1]
+            if last_msg.get("role") == "tool":
+                state["in_tool_loop"] = True
+        
+        return state
+    
+    def _sanitize_thinking_for_claude(
+        self,
+        messages: List[Dict[str, Any]],
+        thinking_enabled: bool
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Sanitize thinking blocks in conversation history for Claude compatibility.
+        
+        Handles the following scenarios per Claude docs:
+        1. If thinking is disabled, remove all thinking blocks from conversation
+        2. If thinking is enabled:
+           a. In a tool use loop WITH thinking: preserve it (same mode continues)
+           b. In a tool use loop WITHOUT thinking: this is INVALID toggle - force disable
+           c. Not in tool loop: strip old thinking, new response adds thinking naturally
+        
+        Per Claude docs:
+        - "If thinking is enabled, the final assistant turn must start with a thinking block"
+        - "If thinking is disabled, the final assistant turn must not contain any thinking blocks"
+        - Tool use loops are part of a single assistant turn
+        - You CANNOT toggle thinking mid-turn
+        
+        The key insight: We only force-disable thinking when TOGGLING it ON mid-turn.
+        If thinking was already enabled (assistant has thinking), we preserve.
+        If thinking was disabled (assistant has no thinking), enabling it now is invalid.
+        
+        Returns:
+            Tuple of (sanitized_messages, force_disable_thinking)
+            - sanitized_messages: The cleaned message list
+            - force_disable_thinking: If True, thinking must be disabled for this request
+        """
+        messages = copy.deepcopy(messages)
+        state = self._analyze_conversation_state(messages)
+        
+        lib_logger.debug(
+            f"[Thinking Sanitization] thinking_enabled={thinking_enabled}, "
+            f"in_tool_loop={state['in_tool_loop']}, "
+            f"last_assistant_has_thinking={state['last_assistant_has_thinking']}, "
+            f"last_assistant_has_tool_calls={state['last_assistant_has_tool_calls']}"
+        )
+        
+        if not thinking_enabled:
+            # CASE 1: Thinking is disabled - strip ALL thinking blocks
+            return self._strip_all_thinking_blocks(messages), False
+        
+        # CASE 2: Thinking is enabled
+        if state["in_tool_loop"]:
+            # We're in a tool use loop (conversation ends with tool_result)
+            # Per Claude docs: entire assistant turn must operate in single thinking mode
+            
+            if state["last_assistant_has_thinking"]:
+                # Last assistant turn HAD thinking - this is valid!
+                # Thinking was enabled when tool was called, continue with thinking enabled.
+                # Only keep thinking for the current turn (last assistant + following tools)
+                lib_logger.debug(
+                    "[Thinking Sanitization] Tool loop with existing thinking - preserving."
+                )
+                return self._preserve_current_turn_thinking(
+                    messages, state["last_assistant_idx"]
+                ), False
+            else:
+                # Last assistant turn DID NOT have thinking, but thinking is NOW enabled
+                # This is the INVALID case: toggling thinking ON mid-turn
+                # 
+                # Per Claude docs, this causes:
+                # "Expected `thinking` or `redacted_thinking`, but found `tool_use`."
+                #
+                # SOLUTION: Inject a synthetic assistant message to CLOSE the tool loop.
+                # This allows Claude to start a fresh turn WITH thinking.
+                # 
+                # The synthetic message summarizes the tool results, allowing the model
+                # to respond naturally with thinking enabled on what is now a "new" turn.
+                lib_logger.info(
+                    "[Thinking Sanitization] Closing tool loop with synthetic response. "
+                    "This allows thinking to be enabled on the new turn."
+                )
+                return self._close_tool_loop_for_thinking(messages), False
+        else:
+            # Not in a tool loop - this is the simple case
+            # The conversation doesn't end with tool_result, so we're starting fresh.
+            # Strip thinking from old turns (API ignores them anyway).
+            # New response will include thinking naturally.
+            
+            if state["last_assistant_idx"] >= 0 and not state["last_assistant_has_thinking"]:
+                if state["last_assistant_has_tool_calls"]:
+                    # Last assistant made tool calls but no thinking
+                    # This could be from context compression, model switch, or
+                    # the assistant responded after tool results (completing the turn)
+                    lib_logger.debug(
+                        "[Thinking Sanitization] Last assistant has completed tool_calls but no thinking. "
+                        "This is likely from context compression or completed tool loop. "
+                        "New response will include thinking."
+                    )
+            
+            # Strip thinking from old turns, let new response add thinking naturally
+            return self._strip_old_turn_thinking(messages, state["last_assistant_idx"]), False
+    
+    def _strip_all_thinking_blocks(
+        self,
+        messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Remove all thinking/reasoning content from messages."""
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                # Remove reasoning_content field
+                msg.pop("reasoning_content", None)
+                
+                # Remove thinking blocks from content array
+                content = msg.get("content")
+                if isinstance(content, list):
+                    filtered = [
+                        item for item in content
+                        if not (isinstance(item, dict) and item.get("type") == "thinking")
+                    ]
+                    # If filtering leaves empty list, we need to preserve message structure
+                    # to maintain user/assistant alternation. Use empty string as placeholder
+                    # (will result in empty "text" part which is valid).
+                    if not filtered:
+                        # Only if there are no tool_calls either - otherwise message is valid
+                        if not msg.get("tool_calls"):
+                            msg["content"] = ""
+                        else:
+                            msg["content"] = None  # tool_calls exist, content not needed
+                    else:
+                        msg["content"] = filtered
+        return messages
+    
+    def _strip_old_turn_thinking(
+        self,
+        messages: List[Dict[str, Any]],
+        last_assistant_idx: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Strip thinking from old turns but preserve for the last assistant turn.
+        
+        Per Claude docs: "thinking blocks from previous turns are removed from context"
+        This mimics the API behavior and prevents issues.
+        """
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and i < last_assistant_idx:
+                # Old turn - strip thinking
+                msg.pop("reasoning_content", None)
+                content = msg.get("content")
+                if isinstance(content, list):
+                    filtered = [
+                        item for item in content
+                        if not (isinstance(item, dict) and item.get("type") == "thinking")
+                    ]
+                    # Preserve message structure with empty string if needed
+                    if not filtered:
+                        msg["content"] = "" if not msg.get("tool_calls") else None
+                    else:
+                        msg["content"] = filtered
+        return messages
+    
+    def _preserve_current_turn_thinking(
+        self,
+        messages: List[Dict[str, Any]],
+        last_assistant_idx: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Preserve thinking only for the current (last) assistant turn.
+        Strip from all previous turns.
+        """
+        # Same as strip_old_turn_thinking - we keep the last turn intact
+        return self._strip_old_turn_thinking(messages, last_assistant_idx)
+    
+    def _close_tool_loop_for_thinking(
+        self,
+        messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Close an incomplete tool loop by injecting a synthetic assistant response.
+        
+        This is used when:
+        - We're in a tool loop (conversation ends with tool_result)
+        - The tool call was made WITHOUT thinking (e.g., by Gemini or non-thinking Claude)
+        - We NOW want to enable thinking
+        
+        By injecting a synthetic response that "closes" the previous turn,
+        Claude can start a fresh turn with thinking enabled.
+        
+        The synthetic message is minimal and factual - it just acknowledges
+        the tool results were received, allowing the model to process them
+        with thinking on the new turn.
+        """
+        # Strip any old thinking first
+        messages = self._strip_all_thinking_blocks(messages)
+        
+        # Collect tool results from the end of the conversation
+        tool_results = []
+        for msg in reversed(messages):
+            if msg.get("role") == "tool":
+                tool_results.append(msg)
+            elif msg.get("role") == "assistant":
+                break  # Stop at the assistant that made the tool calls
+        
+        tool_results.reverse()  # Put back in order
+        
+        # Safety check: if no tool results found, this shouldn't have been called
+        # But handle gracefully with a generic message
+        if not tool_results:
+            lib_logger.warning(
+                "[Thinking Sanitization] _close_tool_loop_for_thinking called but no tool results found. "
+                "This may indicate malformed conversation history."
+            )
+            synthetic_content = "[Processing previous context.]"
+        elif len(tool_results) == 1:
+            synthetic_content = "[Tool execution completed. Processing results.]"
+        else:
+            synthetic_content = f"[{len(tool_results)} tool executions completed. Processing results.]"
+        
+        # Inject the synthetic assistant message to close the loop
+        synthetic_msg = {
+            "role": "assistant",
+            "content": synthetic_content
+        }
+        messages.append(synthetic_msg)
+        
+        lib_logger.debug(
+            f"[Thinking Sanitization] Injected synthetic closure: '{synthetic_content}'"
+        )
+        
+        return messages
     
     # =========================================================================
     # REASONING CONFIGURATION
@@ -691,9 +982,43 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         parts = []
         content = msg.get("content")
         tool_calls = msg.get("tool_calls", [])
+        reasoning_content = msg.get("reasoning_content")
         
-        # Try to inject cached thinking for Claude
-        if self._is_claude(model) and self._enable_signature_cache:
+        # Handle reasoning_content if present (from original Claude response with thinking)
+        if reasoning_content and self._is_claude(model):
+            # Add thinking part with cached signature
+            thinking_part = {
+                "text": reasoning_content,
+                "thought": True,
+            }
+            # Try to get signature from cache
+            cache_key = self._generate_thinking_cache_key(
+                content if isinstance(content, str) else "",
+                tool_calls
+            )
+            cached_sig = None
+            if cache_key:
+                cached_json = self._thinking_cache.retrieve(cache_key)
+                if cached_json:
+                    try:
+                        cached_data = json.loads(cached_json)
+                        cached_sig = cached_data.get("thought_signature", "")
+                    except json.JSONDecodeError:
+                        pass
+            
+            if cached_sig:
+                thinking_part["thoughtSignature"] = cached_sig
+                parts.append(thinking_part)
+                lib_logger.debug(f"Added reasoning_content with cached signature ({len(reasoning_content)} chars)")
+            else:
+                # No cached signature - skip the thinking block
+                # This can happen if context was compressed and signature was lost
+                lib_logger.warning(
+                    f"Skipping reasoning_content - no valid signature found. "
+                    f"This may cause issues if thinking is enabled."
+                )
+        elif self._is_claude(model) and self._enable_signature_cache and not reasoning_content:
+            # Fallback: Try to inject cached thinking for Claude (original behavior)
             thinking_parts = self._get_cached_thinking(content, tool_calls)
             parts.extend(thinking_parts)
         
@@ -753,6 +1078,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 first_func_in_msg = False
             
             parts.append(func_part)
+        
+        # Safety: ensure we return at least one part to maintain role alternation
+        # This handles edge cases like assistant messages that had only thinking content
+        # which got stripped, leaving the message otherwise empty
+        if not parts:
+            # Use a minimal text part - can happen after thinking is stripped
+            parts.append({"text": ""})
+            lib_logger.debug(
+                "[Transform] Added empty text part to maintain role alternation"
+            )
         
         return parts
     
@@ -1582,6 +1917,26 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Create logger
         file_logger = AntigravityFileLogger(model, enable_logging)
+        
+        # Determine if thinking is enabled for this request
+        # Thinking is enabled if reasoning_effort is set (and not "disable") for Claude
+        thinking_enabled = False
+        if self._is_claude(model):
+            # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"
+            thinking_enabled = reasoning_effort is not None and reasoning_effort != "disable"
+        
+        # Sanitize thinking blocks for Claude to prevent 400 errors
+        # This handles: context compression, model switching, mid-turn thinking toggle
+        # Returns (sanitized_messages, force_disable_thinking)
+        force_disable_thinking = False
+        if self._is_claude(model) and self._enable_thinking_sanitization:
+            messages, force_disable_thinking = self._sanitize_thinking_for_claude(messages, thinking_enabled)
+            
+            # If we're in a mid-turn thinking toggle situation, we MUST disable thinking
+            # for this request. Thinking will naturally resume on the next turn.
+            if force_disable_thinking:
+                thinking_enabled = False
+                reasoning_effort = "disable"  # Force disable for this request
         
         # Transform messages
         system_instruction, gemini_contents = self._transform_messages(messages, model)

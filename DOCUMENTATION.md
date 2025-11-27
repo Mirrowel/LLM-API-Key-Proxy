@@ -458,11 +458,62 @@ ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
 ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES=true  # Include signatures in client responses
 ANTIGRAVITY_ENABLE_DYNAMIC_MODELS=false  # Use API model discovery
 ANTIGRAVITY_GEMINI3_TOOL_FIX=true  # Enable Gemini 3 hallucination prevention
+ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable Claude thinking mode auto-correction
 
 # Gemini 3 tool fix customization
 ANTIGRAVITY_GEMINI3_TOOL_PREFIX="gemini3_"  # Namespace prefix
 ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT="\n\nSTRICT PARAMETERS: {params}."
 ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
+```
+
+#### Claude Extended Thinking Sanitization
+
+The provider includes automatic sanitization for Claude's extended thinking mode, handling common error scenarios:
+
+**Problem**: Claude's extended thinking API requires strict consistency in thinking blocks:
+- If thinking is enabled, the final assistant turn must start with a thinking block
+- If thinking is disabled, no thinking blocks can be present in the final turn
+- Tool use loops are part of a single "assistant turn"
+- You **cannot** toggle thinking mode mid-turn (this is invalid per Claude API)
+
+**Scenarios Handled**:
+
+| Scenario | Action |
+|----------|--------|
+| Tool loop WITH thinking + thinking enabled | Preserve thinking, continue normally |
+| Tool loop WITHOUT thinking + thinking enabled | **Inject synthetic closure** to start fresh turn with thinking |
+| Thinking disabled | Strip all thinking blocks |
+| Normal conversation (no tool loop) | Strip old thinking, new response adds thinking naturally |
+
+**Solution**: The `_sanitize_thinking_for_claude()` method:
+- Analyzes conversation state to detect incomplete tool use loops
+- When enabling thinking in a tool loop that started without thinking:
+  - Injects a minimal synthetic assistant message: `"[Tool execution completed. Processing results.]"`
+  - This **closes** the previous turn, allowing Claude to start a **fresh turn with thinking**
+- Strips thinking from old turns (Claude API ignores them anyway)
+- Preserves thinking when the turn was started with thinking enabled
+
+**Key Insight**: Instead of force-disabling thinking, we close the tool loop with a synthetic message. This allows seamless model switching (e.g., Gemini → Claude with thinking) without losing the ability to think.
+
+**Example**:
+```
+Before sanitization:
+  User: "What's the weather?"
+  Assistant: [tool_use: get_weather]     ← Made by Gemini (no thinking)
+  User: [tool_result: "20C sunny"]
+
+After sanitization (thinking enabled):
+  User: "What's the weather?"
+  Assistant: [tool_use: get_weather]
+  User: [tool_result: "20C sunny"]
+  Assistant: "[Tool execution completed. Processing results.]"  ← INJECTED
+  
+  → Claude now starts a NEW turn and CAN think!
+```
+
+**Configuration**:
+```env
+ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable/disable auto-correction
 ```
 
 #### File Logging

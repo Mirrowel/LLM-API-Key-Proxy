@@ -28,7 +28,7 @@ This project provides a powerful solution for developers building complex applic
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 -   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
 
--   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 2.5, Gemini 3, and Claude Sonnet 4.5 models with advanced features like thought signature caching and tool hallucination prevention.
+-   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 2.5, Gemini 3, and Claude Sonnet 4.5 models with advanced features like thought signature caching and tool hallucination prevention. However - Sonnet 4.5 Thinking with native tool calls is very skittish, so if you have compaction or switch the model (or toggle thinking) mid task - it will error 400 on you, as claude needs it's previous thinking block. With compaction - it will be destroyed. There is a system to maybe catch all this, but i am hurting my head here trying to come up with a solution that makes sense.
 -   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
 -   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.
 -   **🆕 Enhanced Gemini CLI**: Improved project discovery, paid vs free tier detection, and Gemini 3 support with thoughtSignature caching.
