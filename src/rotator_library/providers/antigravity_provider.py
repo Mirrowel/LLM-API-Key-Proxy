@@ -61,8 +61,7 @@ AVAILABLE_MODELS = [
     "gemini-3-pro-preview",
     "gemini-3-pro-image-preview",
     "gemini-2.5-computer-use-preview-10-2025",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-thinking",
+    "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
@@ -885,7 +884,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self,
         gemini_payload: Dict[str, Any],
         model: str,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Transform Gemini CLI payload to complete Antigravity format.
@@ -894,8 +894,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             gemini_payload: Request in Gemini CLI format
             model: Model name (public alias)
             max_tokens: Max output tokens (including thinking)
+            reasoning_effort: Reasoning effort level (determines -thinking variant for Claude)
         """
         internal_model = self._alias_to_internal(model)
+        
+        # Map base Claude model to -thinking variant when reasoning_effort is provided
+        if self._is_claude(internal_model) and reasoning_effort:
+            if internal_model == "claude-sonnet-4-5" and not internal_model.endswith("-thinking"):
+                internal_model = "claude-sonnet-4-5-thinking"
         
         # Wrap in Antigravity envelope
         antigravity_payload = {
@@ -1372,7 +1378,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 gemini_payload["tools"] = self._inject_signature_into_descriptions(gemini_payload["tools"])
         
         # Transform to Antigravity format
-        payload = self._transform_to_antigravity_format(gemini_payload, model, max_tokens)
+        payload = self._transform_to_antigravity_format(gemini_payload, model, max_tokens, reasoning_effort)
         file_logger.log_request(payload)
         
         # Make API call
