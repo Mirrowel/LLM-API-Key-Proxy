@@ -1,5 +1,6 @@
 # src/rotator_library/providers/gemini_cli_provider.py
 
+import copy
 import json
 import httpx
 import logging
@@ -8,10 +9,10 @@ import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
+from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
-from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
 import os
 from pathlib import Path
 import uuid
@@ -81,8 +82,48 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro-preview"
 ]
+
+# Cache directory for Gemini CLI
+CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "cache" / "gemini_cli"
+GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
+
+# Gemini 3 tool fix system instruction (prevents hallucination)
+DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """CRITICAL TOOL USAGE INSTRUCTIONS:
+You are operating in a custom environment where tool definitions differ from your training data.
+You MUST follow these rules strictly:
+
+1. DO NOT use your internal training data to guess tool parameters
+2. ONLY use the exact parameter structure defined in the tool schema
+3. If a tool takes a 'files' parameter, it is ALWAYS an array of objects with specific properties, NEVER a simple array of strings
+4. If a tool edits code, it takes structured JSON objects with specific fields, NEVER raw diff strings or plain text
+5. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
+6. Array parameters have specific item types - check the schema's 'items' field for the exact structure
+7. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+
+If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully. Your training data about common tool names like 'read_file' or 'apply_diff' does NOT apply here.
+"""
+
+# Gemini finish reason mapping
+FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "OTHER": "stop",
+}
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Get boolean from environment variable."""
+    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
+
+
+def _env_int(key: str, default: int) -> int:
+    """Get integer from environment variable."""
+    return int(os.getenv(key, str(default)))
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
@@ -92,6 +133,52 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         self.model_definitions = ModelDefinitions()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
         self.project_tier_cache: Dict[str, str] = {} # Cache project tier per credential path
+        
+        # Gemini 3 configuration from environment
+        memory_ttl = _env_int("GEMINI_CLI_SIGNATURE_CACHE_TTL", 3600)
+        disk_ttl = _env_int("GEMINI_CLI_SIGNATURE_DISK_TTL", 86400)
+        
+        # Initialize signature cache for Gemini 3 thoughtSignatures
+        self._signature_cache = ProviderCache(
+            GEMINI3_SIGNATURE_CACHE_FILE, memory_ttl, disk_ttl,
+            env_prefix="GEMINI_CLI_SIGNATURE"
+        )
+        
+        # Gemini 3 feature flags
+        self._preserve_signatures_in_client = _env_bool("GEMINI_CLI_PRESERVE_THOUGHT_SIGNATURES", True)
+        self._enable_signature_cache = _env_bool("GEMINI_CLI_ENABLE_SIGNATURE_CACHE", True)
+        self._enable_gemini3_tool_fix = _env_bool("GEMINI_CLI_GEMINI3_TOOL_FIX", True)
+        
+        # Gemini 3 tool fix configuration
+        self._gemini3_tool_prefix = os.getenv("GEMINI_CLI_GEMINI3_TOOL_PREFIX", "gemini3_")
+        self._gemini3_description_prompt = os.getenv(
+            "GEMINI_CLI_GEMINI3_DESCRIPTION_PROMPT",
+            "\n\nSTRICT PARAMETERS: {params}."
+        )
+        self._gemini3_system_instruction = os.getenv(
+            "GEMINI_CLI_GEMINI3_SYSTEM_INSTRUCTION",
+            DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
+        )
+        
+        lib_logger.debug(
+            f"GeminiCli config: signatures_in_client={self._preserve_signatures_in_client}, "
+            f"cache={self._enable_signature_cache}, gemini3_fix={self._enable_gemini3_tool_fix}"
+        )
+
+    # =========================================================================
+    # MODEL UTILITIES
+    # =========================================================================
+    
+    def _is_gemini_3(self, model: str) -> bool:
+        """Check if model is Gemini 3 (requires special handling)."""
+        model_name = model.split('/')[-1].replace(':thinking', '')
+        return model_name.startswith("gemini-3-")
+    
+    def _strip_gemini3_prefix(self, name: str) -> str:
+        """Strip the Gemini 3 namespace prefix from a tool name."""
+        if name and name.startswith(self._gemini3_tool_prefix):
+            return name[len(self._gemini3_tool_prefix):]
+        return name
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
         """
@@ -513,9 +600,20 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         # Return fallback chain if available, otherwise just return the original model
         return fallback_chains.get(model_name, [model_name])
 
-    def _transform_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _transform_messages(self, messages: List[Dict[str, Any]], model: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Transform OpenAI messages to Gemini CLI format.
+        
+        Handles:
+        - System instruction extraction
+        - Multi-part content (text, images)
+        - Tool calls and responses
+        - Gemini 3 thoughtSignature preservation
+        """
+        messages = copy.deepcopy(messages)  # Don't mutate original
         system_instruction = None
         gemini_contents = []
+        is_gemini_3 = self._is_gemini_3(model)
         
         # Separate system prompt from other messages
         if messages and messages[0].get('role') == 'system':
@@ -580,15 +678,53 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                 args_dict = json.loads(tool_call["function"]["arguments"])
                             except (json.JSONDecodeError, TypeError):
                                 args_dict = {}
-                            parts.append({"functionCall": {"name": tool_call["function"]["name"], "args": args_dict}})
+                            
+                            tool_id = tool_call.get("id", "")
+                            func_name = tool_call["function"]["name"]
+                            
+                            # Add prefix for Gemini 3
+                            if is_gemini_3 and self._enable_gemini3_tool_fix:
+                                func_name = f"{self._gemini3_tool_prefix}{func_name}"
+                            
+                            func_part = {
+                                "functionCall": {
+                                    "name": func_name,
+                                    "args": args_dict,
+                                    "id": tool_id
+                                }
+                            }
+                            
+                            # Add thoughtSignature for Gemini 3
+                            if is_gemini_3:
+                                sig = tool_call.get("thought_signature")
+                                if not sig and tool_id and self._enable_signature_cache:
+                                    sig = self._signature_cache.retrieve(tool_id)
+                                
+                                if sig:
+                                    func_part["thoughtSignature"] = sig
+                                else:
+                                    func_part["thoughtSignature"] = "skip_thought_signature_validator"
+                                    lib_logger.warning(f"Missing thoughtSignature for {tool_id}, using bypass")
+                            
+                            parts.append(func_part)
 
             elif role == "tool":
                 tool_call_id = msg.get("tool_call_id")
                 function_name = tool_call_id_to_name.get(tool_call_id)
                 if function_name:
+                    # Add prefix for Gemini 3
+                    if is_gemini_3 and self._enable_gemini3_tool_fix:
+                        function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                    
                     # Wrap the tool response in a 'result' object
                     response_content = {"result": content}
-                    parts.append({"functionResponse": {"name": function_name, "response": response_content}})
+                    parts.append({
+                        "functionResponse": {
+                            "name": function_name,
+                            "response": response_content,
+                            "id": tool_call_id
+                        }
+                    })
 
             if parts:
                 gemini_contents.append({"role": gemini_role, "parts": parts})
@@ -599,19 +735,42 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         return system_instruction, gemini_contents
 
     def _handle_reasoning_parameters(self, payload: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+        """
+        Map reasoning_effort to thinking configuration.
+        
+        - Gemini 2.5: thinkingBudget (integer tokens)
+        - Gemini 3: thinkingLevel (string: "low"/"high")
+        """
         custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
         reasoning_effort = payload.get("reasoning_effort")
 
         if "thinkingConfig" in payload.get("generationConfig", {}):
             return None
 
-        # Only apply reasoning logic to the gemini-2.5 model family
-        if "gemini-2.5" not in model:
+        is_gemini_25 = "gemini-2.5" in model
+        is_gemini_3 = self._is_gemini_3(model)
+
+        # Only apply reasoning logic to supported models
+        if not (is_gemini_25 or is_gemini_3):
             payload.pop("reasoning_effort", None)
             payload.pop("custom_reasoning_budget", None)
             return None
+        
+        # Gemini 3: String-based thinkingLevel
+        if is_gemini_3:
+            # Clean up the original payload
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
+            
+            if reasoning_effort == "low":
+                return {"thinkingLevel": "low", "include_thoughts": True}
+            return {"thinkingLevel": "high", "include_thoughts": True}
 
+        # Gemini 2.5: Integer thinkingBudget
         if not reasoning_effort:
+            # Clean up the original payload
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
             return {"thinkingBudget": -1, "include_thoughts": True}
 
         # If reasoning_effort is provided, calculate the budget
@@ -637,8 +796,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return {"thinkingBudget": budget, "include_thoughts": True}
 
-    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
-        #lib_logger.debug(f"Converting Gemini chunk: {json.dumps(chunk)}")
+    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str, accumulator: Optional[Dict[str, Any]] = None):
+        """
+        Convert Gemini response chunk to OpenAI streaming format.
+        
+        Args:
+            chunk: Gemini API response chunk
+            model_id: Model name
+            accumulator: Optional dict to accumulate data for post-processing (signatures, etc.)
+        """
         response_data = chunk.get('response', chunk)
         candidates = response_data.get('candidates', [])
         if not candidates:
@@ -646,17 +812,34 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         candidate = candidates[0]
         parts = candidate.get('content', {}).get('parts', [])
+        is_gemini_3 = self._is_gemini_3(model_id)
+        first_sig_seen = False
 
         for part in parts:
             delta = {}
             finish_reason = None
+            
+            has_func = 'functionCall' in part
+            has_text = 'text' in part
+            has_sig = bool(part.get('thoughtSignature'))
+            is_thought = part.get('thought') is True or (isinstance(part.get('thought'), str) and str(part.get('thought')).lower() == 'true')
+            
+            # Skip standalone signature parts (no function, no meaningful text)
+            if has_sig and not has_func and (not has_text or not part.get('text')):
+                continue
 
-            if 'functionCall' in part:
+            if has_func:
                 function_call = part['functionCall']
                 function_name = function_call.get('name', 'unknown')
-                # Generate unique ID with nanosecond precision
-                tool_call_id = f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
-                delta['tool_calls'] = [{
+                
+                # Strip Gemini 3 prefix from tool name
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = self._strip_gemini3_prefix(function_name)
+                
+                # Use provided ID or generate unique one with nanosecond precision
+                tool_call_id = function_call.get('id') or f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
+                
+                tool_call = {
                     "index": 0,
                     "id": tool_call_id,
                     "type": "function",
@@ -664,11 +847,25 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         "name": function_name,
                         "arguments": json.dumps(function_call.get('args', {}))
                     }
-                }]
-            elif 'text' in part:
+                }
+                
+                # Handle thoughtSignature for Gemini 3
+                if is_gemini_3 and has_sig and not first_sig_seen:
+                    first_sig_seen = True
+                    sig = part['thoughtSignature']
+                    
+                    if self._enable_signature_cache:
+                        self._signature_cache.store(tool_call_id, sig)
+                        lib_logger.debug(f"Stored signature for {tool_call_id}")
+                    
+                    if self._preserve_signatures_in_client:
+                        tool_call["thought_signature"] = sig
+                
+                delta['tool_calls'] = [tool_call]
+                
+            elif has_text:
                 # Use an explicit check for the 'thought' flag, as its type can be inconsistent
-                thought = part.get('thought')
-                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                if is_thought:
                     delta['reasoning_content'] = part['text']
                 else:
                     delta['content'] = part['text']
@@ -678,14 +875,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             raw_finish_reason = candidate.get('finishReason')
             if raw_finish_reason:
-                mapping = {'STOP': 'stop', 'MAX_TOKENS': 'length', 'SAFETY': 'content_filter'}
-                finish_reason = mapping.get(raw_finish_reason, 'stop')
+                finish_reason = FINISH_REASON_MAP.get(raw_finish_reason, 'stop')
+                # Use tool_calls if we have function calls
+                if delta.get('tool_calls'):
+                    finish_reason = 'tool_calls'
 
             choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
             
             openai_chunk = {
                 "choices": [choice], "model": model_id, "object": "chat.completion.chunk",
-                "id": f"chatcmpl-geminicli-{time.time()}", "created": int(time.time())
+                "id": chunk.get("responseId", f"chatcmpl-geminicli-{time.time()}"), "created": int(time.time())
             }
 
             if 'usageMetadata' in response_data:
@@ -843,12 +1042,18 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return schema
 
-    def _transform_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _transform_tool_schemas(self, tools: List[Dict[str, Any]], model: str = "") -> List[Dict[str, Any]]:
         """
         Transforms a list of OpenAI-style tool schemas into the format required by the Gemini CLI API.
         This uses a custom schema transformer instead of litellm's generic one.
+        
+        For Gemini 3 models, also applies:
+        - Namespace prefix to tool names
+        - Parameter signature injection into descriptions
         """
         transformed_declarations = []
+        is_gemini_3 = self._is_gemini_3(model)
+        
         for tool in tools:
             if tool.get("type") == "function" and "function" in tool:
                 new_function = json.loads(json.dumps(tool["function"]))
@@ -865,19 +1070,108 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     # Set default empty schema if neither exists
                     new_function["parametersJsonSchema"] = {"type": "object", "properties": {}}
 
+                # Gemini 3 specific transformations
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    # Add namespace prefix to tool names
+                    name = new_function.get("name", "")
+                    if name:
+                        new_function["name"] = f"{self._gemini3_tool_prefix}{name}"
+                    
+                    # Inject parameter signature into description
+                    new_function = self._inject_signature_into_description(new_function)
+
                 transformed_declarations.append(new_function)
         
         return transformed_declarations
 
-    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _inject_signature_into_description(self, func_decl: Dict[str, Any]) -> Dict[str, Any]:
+        """Inject parameter signatures into tool description for Gemini 3."""
+        schema = func_decl.get("parametersJsonSchema", {})
+        if not schema:
+            return func_decl
+        
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+        
+        if not properties:
+            return func_decl
+        
+        param_list = []
+        for prop_name, prop_data in properties.items():
+            if not isinstance(prop_data, dict):
+                continue
+            
+            type_hint = self._format_type_hint(prop_data)
+            is_required = prop_name in required
+            param_list.append(
+                f"{prop_name} ({type_hint}{', REQUIRED' if is_required else ''})"
+            )
+        
+        if param_list:
+            sig_str = self._gemini3_description_prompt.replace(
+                "{params}", ", ".join(param_list)
+            )
+            func_decl["description"] = func_decl.get("description", "") + sig_str
+        
+        return func_decl
+
+    def _format_type_hint(self, prop_data: Dict[str, Any]) -> str:
+        """Format a type hint for a property schema."""
+        type_hint = prop_data.get("type", "unknown")
+        
+        if type_hint == "array":
+            items = prop_data.get("items", {})
+            if isinstance(items, dict):
+                item_type = items.get("type", "unknown")
+                if item_type == "object":
+                    nested_props = items.get("properties", {})
+                    nested_req = items.get("required", [])
+                    if nested_props:
+                        nested_list = []
+                        for n, d in nested_props.items():
+                            if isinstance(d, dict):
+                                t = d.get("type", "unknown")
+                                req = " REQUIRED" if n in nested_req else ""
+                                nested_list.append(f"{n}: {t}{req}")
+                        return f"ARRAY_OF_OBJECTS[{', '.join(nested_list)}]"
+                    return "ARRAY_OF_OBJECTS"
+                return f"ARRAY_OF_{item_type.upper()}"
+            return "ARRAY"
+        
+        return type_hint
+
+    def _inject_gemini3_system_instruction(self, request_payload: Dict[str, Any]) -> None:
+        """Inject Gemini 3 tool fix system instruction if tools are present."""
+        if not request_payload.get("request", {}).get("tools"):
+            return
+        
+        existing_system = request_payload.get("request", {}).get("systemInstruction")
+        
+        if existing_system:
+            # Prepend to existing system instruction
+            existing_parts = existing_system.get("parts", [])
+            if existing_parts and existing_parts[0].get("text"):
+                existing_parts[0]["text"] = self._gemini3_system_instruction + "\n\n" + existing_parts[0]["text"]
+            else:
+                existing_parts.insert(0, {"text": self._gemini3_system_instruction})
+        else:
+            # Create new system instruction
+            request_payload["request"]["systemInstruction"] = {
+                "role": "user",
+                "parts": [{"text": self._gemini3_system_instruction}]
+            }
+
+    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]], model: str = "") -> Optional[Dict[str, Any]]:
         """
         Translates OpenAI's `tool_choice` to Gemini's `toolConfig`.
+        Handles Gemini 3 namespace prefixes for specific tool selection.
         """
         if not tool_choice:
             return None
 
         config = {}
         mode = "AUTO"  # Default to auto
+        is_gemini_3 = self._is_gemini_3(model)
 
         if isinstance(tool_choice, str):
             if tool_choice == "auto":
@@ -889,6 +1183,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             function_name = tool_choice.get("function", {}).get("name")
             if function_name:
+                # Add Gemini 3 prefix if needed
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                
                 mode = "ANY" # Force a call, but only to this function
                 config["functionCallingConfig"] = {
                     "mode": mode,
@@ -930,6 +1228,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 model_name=model_name,
                 enabled=enable_request_logging
             )
+            
+            is_gemini_3 = self._is_gemini_3(model_name)
 
             gen_config = {
                 "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
@@ -945,7 +1245,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if thinking_config:
                 gen_config["thinkingConfig"] = thinking_config
 
-            system_instruction, contents = self._transform_messages(kwargs.get("messages", []))
+            system_instruction, contents = self._transform_messages(kwargs.get("messages", []), model_name)
             request_payload = {
                 "model": model_name,
                 "project": project_id,
@@ -959,15 +1259,19 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 request_payload["request"]["systemInstruction"] = system_instruction
 
             if "tools" in kwargs and kwargs["tools"]:
-                function_declarations = self._transform_tool_schemas(kwargs["tools"])
+                function_declarations = self._transform_tool_schemas(kwargs["tools"], model_name)
                 if function_declarations:
                     request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
 
             # [NEW] Handle tool_choice translation
             if "tool_choice" in kwargs and kwargs["tool_choice"]:
-                tool_config = self._translate_tool_choice(kwargs["tool_choice"])
+                tool_config = self._translate_tool_choice(kwargs["tool_choice"], model_name)
                 if tool_config:
                     request_payload["request"]["toolConfig"] = tool_config
+            
+            # Inject Gemini 3 system instruction if using tools
+            if is_gemini_3 and self._enable_gemini3_tool_fix:
+                self._inject_gemini3_system_instruction(request_payload)
 
             # Add default safety settings to prevent content filtering
             if "safetySettings" not in request_payload["request"]:

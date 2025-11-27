@@ -55,12 +55,12 @@ BASE_URLS = [
 
 # Available models via Antigravity
 AVAILABLE_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    #"gemini-2.5-pro",
+    #"gemini-2.5-flash",
+    #"gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
-    "gemini-3-pro-image-preview",
-    "gemini-2.5-computer-use-preview-10-2025",
+    #"gemini-3-pro-image-preview",
+    #"gemini-2.5-computer-use-preview-10-2025",
     "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
 ]
 
