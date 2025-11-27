@@ -77,64 +77,103 @@ class GoogleOAuthBase:
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = None  # Background worker task
 
-    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+    def _parse_env_credential_path(self, path: str) -> Optional[str]:
+        """
+        Parse a virtual env:// path and return the credential index.
+        
+        Supported formats:
+        - "env://provider/0" - Legacy single credential (no index in env var names)
+        - "env://provider/1" - First numbered credential (PROVIDER_1_ACCESS_TOKEN)
+        - "env://provider/2" - Second numbered credential, etc.
+        
+        Returns:
+            The credential index as string ("0" for legacy, "1", "2", etc. for numbered)
+            or None if path is not an env:// path
+        """
+        if not path.startswith("env://"):
+            return None
+        
+        # Parse: env://provider/index
+        parts = path[6:].split("/")  # Remove "env://" prefix
+        if len(parts) >= 2:
+            return parts[1]  # Return the index
+        return "0"  # Default to legacy format
+
+    def _load_from_env(self, credential_index: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Load OAuth credentials from environment variables for stateless deployments.
 
-        Expected environment variables:
-        - {ENV_PREFIX}_ACCESS_TOKEN (required)
-        - {ENV_PREFIX}_REFRESH_TOKEN (required)
-        - {ENV_PREFIX}_EXPIRY_DATE (optional, defaults to 0)
-        - {ENV_PREFIX}_CLIENT_ID (optional, uses default)
-        - {ENV_PREFIX}_CLIENT_SECRET (optional, uses default)
-        - {ENV_PREFIX}_TOKEN_URI (optional, uses default)
-        - {ENV_PREFIX}_UNIVERSE_DOMAIN (optional, defaults to googleapis.com)
-        - {ENV_PREFIX}_EMAIL (optional, defaults to "env-user")
-        - {ENV_PREFIX}_PROJECT_ID (optional)
-        - {ENV_PREFIX}_TIER (optional)
+        Supports two formats:
+        1. Legacy (credential_index="0" or None): PROVIDER_ACCESS_TOKEN
+        2. Numbered (credential_index="1", "2", etc.): PROVIDER_1_ACCESS_TOKEN, PROVIDER_2_ACCESS_TOKEN
+
+        Expected environment variables (for numbered format with index N):
+        - {ENV_PREFIX}_{N}_ACCESS_TOKEN (required)
+        - {ENV_PREFIX}_{N}_REFRESH_TOKEN (required)
+        - {ENV_PREFIX}_{N}_EXPIRY_DATE (optional, defaults to 0)
+        - {ENV_PREFIX}_{N}_CLIENT_ID (optional, uses default)
+        - {ENV_PREFIX}_{N}_CLIENT_SECRET (optional, uses default)
+        - {ENV_PREFIX}_{N}_TOKEN_URI (optional, uses default)
+        - {ENV_PREFIX}_{N}_UNIVERSE_DOMAIN (optional, defaults to googleapis.com)
+        - {ENV_PREFIX}_{N}_EMAIL (optional, defaults to "env-user-{N}")
+        - {ENV_PREFIX}_{N}_PROJECT_ID (optional)
+        - {ENV_PREFIX}_{N}_TIER (optional)
+
+        For legacy format (index="0" or None), omit the _{N}_ part.
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
         """
-        access_token = os.getenv(f"{self.ENV_PREFIX}_ACCESS_TOKEN")
-        refresh_token = os.getenv(f"{self.ENV_PREFIX}_REFRESH_TOKEN")
+        # Determine the env var prefix based on credential index
+        if credential_index and credential_index != "0":
+            # Numbered format: PROVIDER_N_ACCESS_TOKEN
+            prefix = f"{self.ENV_PREFIX}_{credential_index}"
+            default_email = f"env-user-{credential_index}"
+        else:
+            # Legacy format: PROVIDER_ACCESS_TOKEN
+            prefix = self.ENV_PREFIX
+            default_email = "env-user"
+        
+        access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
+        refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
 
         # Both access and refresh tokens are required
         if not (access_token and refresh_token):
             return None
 
-        lib_logger.debug(f"Loading {self.ENV_PREFIX} credentials from environment variables")
+        lib_logger.debug(f"Loading {prefix} credentials from environment variables")
 
         # Parse expiry_date as float, default to 0 if not present
-        expiry_str = os.getenv(f"{self.ENV_PREFIX}_EXPIRY_DATE", "0")
+        expiry_str = os.getenv(f"{prefix}_EXPIRY_DATE", "0")
         try:
             expiry_date = float(expiry_str)
         except ValueError:
-            lib_logger.warning(f"Invalid {self.ENV_PREFIX}_EXPIRY_DATE value: {expiry_str}, using 0")
+            lib_logger.warning(f"Invalid {prefix}_EXPIRY_DATE value: {expiry_str}, using 0")
             expiry_date = 0
 
         creds = {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "expiry_date": expiry_date,
-            "client_id": os.getenv(f"{self.ENV_PREFIX}_CLIENT_ID", self.CLIENT_ID),
-            "client_secret": os.getenv(f"{self.ENV_PREFIX}_CLIENT_SECRET", self.CLIENT_SECRET),
-            "token_uri": os.getenv(f"{self.ENV_PREFIX}_TOKEN_URI", self.TOKEN_URI),
-            "universe_domain": os.getenv(f"{self.ENV_PREFIX}_UNIVERSE_DOMAIN", "googleapis.com"),
+            "client_id": os.getenv(f"{prefix}_CLIENT_ID", self.CLIENT_ID),
+            "client_secret": os.getenv(f"{prefix}_CLIENT_SECRET", self.CLIENT_SECRET),
+            "token_uri": os.getenv(f"{prefix}_TOKEN_URI", self.TOKEN_URI),
+            "universe_domain": os.getenv(f"{prefix}_UNIVERSE_DOMAIN", "googleapis.com"),
             "_proxy_metadata": {
-                "email": os.getenv(f"{self.ENV_PREFIX}_EMAIL", "env-user"),
+                "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
-                "loaded_from_env": True  # Flag to indicate env-based credentials
+                "loaded_from_env": True,  # Flag to indicate env-based credentials
+                "env_credential_index": credential_index or "0"  # Track which env credential this is
             }
         }
 
         # Add project_id if provided
-        project_id = os.getenv(f"{self.ENV_PREFIX}_PROJECT_ID")
+        project_id = os.getenv(f"{prefix}_PROJECT_ID")
         if project_id:
             creds["_proxy_metadata"]["project_id"] = project_id
         
         # Add tier if provided
-        tier = os.getenv(f"{self.ENV_PREFIX}_TIER")
+        tier = os.getenv(f"{prefix}_TIER")
         if tier:
             creds["_proxy_metadata"]["tier"] = tier
 
@@ -148,7 +187,19 @@ class GoogleOAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
 
-            # First, try loading from environment variables
+            # Check if this is a virtual env:// path
+            credential_index = self._parse_env_credential_path(path)
+            if credential_index is not None:
+                # Load from environment variables with specific index
+                env_creds = self._load_from_env(credential_index)
+                if env_creds:
+                    lib_logger.info(f"Using {self.ENV_PREFIX} credentials from environment variables (index: {credential_index})")
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
+                else:
+                    raise IOError(f"Environment variables for {self.ENV_PREFIX} credential index {credential_index} not found")
+
+            # For file paths, first try loading from legacy env vars (for backwards compatibility)
             env_creds = self._load_from_env()
             if env_creds:
                 lib_logger.info(f"Using {self.ENV_PREFIX} credentials from environment variables")
@@ -168,6 +219,8 @@ class GoogleOAuthBase:
                 return creds
             except FileNotFoundError:
                 raise IOError(f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'")
+            except Exception as e:
+                raise IOError(f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}")
             except Exception as e:
                 raise IOError(f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}")
 

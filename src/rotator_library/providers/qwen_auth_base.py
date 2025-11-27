@@ -47,46 +47,78 @@ class QwenAuthBase:
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = None  # Background worker task
 
-    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+    def _parse_env_credential_path(self, path: str) -> Optional[str]:
+        """
+        Parse a virtual env:// path and return the credential index.
+        
+        Supported formats:
+        - "env://provider/0" - Legacy single credential (no index in env var names)
+        - "env://provider/1" - First numbered credential (QWEN_CODE_1_ACCESS_TOKEN)
+        
+        Returns:
+            The credential index as string, or None if path is not an env:// path
+        """
+        if not path.startswith("env://"):
+            return None
+        
+        parts = path[6:].split("/")
+        if len(parts) >= 2:
+            return parts[1]
+        return "0"
+
+    def _load_from_env(self, credential_index: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Load OAuth credentials from environment variables for stateless deployments.
 
-        Expected environment variables:
-        - QWEN_CODE_ACCESS_TOKEN (required)
-        - QWEN_CODE_REFRESH_TOKEN (required)
-        - QWEN_CODE_EXPIRY_DATE (optional, defaults to 0)
-        - QWEN_CODE_RESOURCE_URL (optional, defaults to https://portal.qwen.ai/v1)
-        - QWEN_CODE_EMAIL (optional, defaults to "env-user")
+        Supports two formats:
+        1. Legacy (credential_index="0" or None): QWEN_CODE_ACCESS_TOKEN
+        2. Numbered (credential_index="1", "2", etc.): QWEN_CODE_1_ACCESS_TOKEN, etc.
+
+        Expected environment variables (for numbered format with index N):
+        - QWEN_CODE_{N}_ACCESS_TOKEN (required)
+        - QWEN_CODE_{N}_REFRESH_TOKEN (required)
+        - QWEN_CODE_{N}_EXPIRY_DATE (optional, defaults to 0)
+        - QWEN_CODE_{N}_RESOURCE_URL (optional, defaults to https://portal.qwen.ai/v1)
+        - QWEN_CODE_{N}_EMAIL (optional, defaults to "env-user-{N}")
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
         """
-        access_token = os.getenv("QWEN_CODE_ACCESS_TOKEN")
-        refresh_token = os.getenv("QWEN_CODE_REFRESH_TOKEN")
+        # Determine the env var prefix based on credential index
+        if credential_index and credential_index != "0":
+            prefix = f"QWEN_CODE_{credential_index}"
+            default_email = f"env-user-{credential_index}"
+        else:
+            prefix = "QWEN_CODE"
+            default_email = "env-user"
+        
+        access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
+        refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
 
         # Both access and refresh tokens are required
         if not (access_token and refresh_token):
             return None
 
-        lib_logger.debug("Loading Qwen Code credentials from environment variables")
+        lib_logger.debug(f"Loading Qwen Code credentials from environment variables (prefix: {prefix})")
 
         # Parse expiry_date as float, default to 0 if not present
-        expiry_str = os.getenv("QWEN_CODE_EXPIRY_DATE", "0")
+        expiry_str = os.getenv(f"{prefix}_EXPIRY_DATE", "0")
         try:
             expiry_date = float(expiry_str)
         except ValueError:
-            lib_logger.warning(f"Invalid QWEN_CODE_EXPIRY_DATE value: {expiry_str}, using 0")
+            lib_logger.warning(f"Invalid {prefix}_EXPIRY_DATE value: {expiry_str}, using 0")
             expiry_date = 0
 
         creds = {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "expiry_date": expiry_date,
-            "resource_url": os.getenv("QWEN_CODE_RESOURCE_URL", "https://portal.qwen.ai/v1"),
+            "resource_url": os.getenv(f"{prefix}_RESOURCE_URL", "https://portal.qwen.ai/v1"),
             "_proxy_metadata": {
-                "email": os.getenv("QWEN_CODE_EMAIL", "env-user"),
+                "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
-                "loaded_from_env": True  # Flag to indicate env-based credentials
+                "loaded_from_env": True,
+                "env_credential_index": credential_index or "0"
             }
         }
 
@@ -115,11 +147,21 @@ class QwenAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
 
-            # First, try loading from environment variables
+            # Check if this is a virtual env:// path
+            credential_index = self._parse_env_credential_path(path)
+            if credential_index is not None:
+                env_creds = self._load_from_env(credential_index)
+                if env_creds:
+                    lib_logger.info(f"Using Qwen Code credentials from environment variables (index: {credential_index})")
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
+                else:
+                    raise IOError(f"Environment variables for Qwen Code credential index {credential_index} not found")
+
+            # For file paths, try loading from legacy env vars first
             env_creds = self._load_from_env()
             if env_creds:
                 lib_logger.info("Using Qwen Code credentials from environment variables")
-                # Cache env-based credentials using the path as key
                 self._credentials_cache[path] = env_creds
                 return env_creds
 

@@ -158,47 +158,79 @@ class IFlowAuthBase:
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = None  # Background worker task
 
-    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+    def _parse_env_credential_path(self, path: str) -> Optional[str]:
+        """
+        Parse a virtual env:// path and return the credential index.
+        
+        Supported formats:
+        - "env://provider/0" - Legacy single credential (no index in env var names)
+        - "env://provider/1" - First numbered credential (IFLOW_1_ACCESS_TOKEN)
+        
+        Returns:
+            The credential index as string, or None if path is not an env:// path
+        """
+        if not path.startswith("env://"):
+            return None
+        
+        parts = path[6:].split("/")
+        if len(parts) >= 2:
+            return parts[1]
+        return "0"
+
+    def _load_from_env(self, credential_index: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Load OAuth credentials from environment variables for stateless deployments.
 
-        Expected environment variables:
-        - IFLOW_ACCESS_TOKEN (required)
-        - IFLOW_REFRESH_TOKEN (required)
-        - IFLOW_API_KEY (required - critical for iFlow!)
-        - IFLOW_EXPIRY_DATE (optional, defaults to empty string)
-        - IFLOW_EMAIL (optional, defaults to "env-user")
-        - IFLOW_TOKEN_TYPE (optional, defaults to "Bearer")
-        - IFLOW_SCOPE (optional, defaults to "read write")
+        Supports two formats:
+        1. Legacy (credential_index="0" or None): IFLOW_ACCESS_TOKEN
+        2. Numbered (credential_index="1", "2", etc.): IFLOW_1_ACCESS_TOKEN, etc.
+
+        Expected environment variables (for numbered format with index N):
+        - IFLOW_{N}_ACCESS_TOKEN (required)
+        - IFLOW_{N}_REFRESH_TOKEN (required)
+        - IFLOW_{N}_API_KEY (required - critical for iFlow!)
+        - IFLOW_{N}_EXPIRY_DATE (optional, defaults to empty string)
+        - IFLOW_{N}_EMAIL (optional, defaults to "env-user-{N}")
+        - IFLOW_{N}_TOKEN_TYPE (optional, defaults to "Bearer")
+        - IFLOW_{N}_SCOPE (optional, defaults to "read write")
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
         """
-        access_token = os.getenv("IFLOW_ACCESS_TOKEN")
-        refresh_token = os.getenv("IFLOW_REFRESH_TOKEN")
-        api_key = os.getenv("IFLOW_API_KEY")
+        # Determine the env var prefix based on credential index
+        if credential_index and credential_index != "0":
+            prefix = f"IFLOW_{credential_index}"
+            default_email = f"env-user-{credential_index}"
+        else:
+            prefix = "IFLOW"
+            default_email = "env-user"
+        
+        access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
+        refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
+        api_key = os.getenv(f"{prefix}_API_KEY")
 
         # All three are required for iFlow
         if not (access_token and refresh_token and api_key):
             return None
 
-        lib_logger.debug("Loading iFlow credentials from environment variables")
+        lib_logger.debug(f"Loading iFlow credentials from environment variables (prefix: {prefix})")
 
         # Parse expiry_date as string (ISO 8601 format)
-        expiry_str = os.getenv("IFLOW_EXPIRY_DATE", "")
+        expiry_str = os.getenv(f"{prefix}_EXPIRY_DATE", "")
 
         creds = {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "api_key": api_key,  # Critical for iFlow!
             "expiry_date": expiry_str,
-            "email": os.getenv("IFLOW_EMAIL", "env-user"),
-            "token_type": os.getenv("IFLOW_TOKEN_TYPE", "Bearer"),
-            "scope": os.getenv("IFLOW_SCOPE", "read write"),
+            "email": os.getenv(f"{prefix}_EMAIL", default_email),
+            "token_type": os.getenv(f"{prefix}_TOKEN_TYPE", "Bearer"),
+            "scope": os.getenv(f"{prefix}_SCOPE", "read write"),
             "_proxy_metadata": {
-                "email": os.getenv("IFLOW_EMAIL", "env-user"),
+                "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
-                "loaded_from_env": True  # Flag to indicate env-based credentials
+                "loaded_from_env": True,
+                "env_credential_index": credential_index or "0"
             }
         }
 
@@ -227,11 +259,21 @@ class IFlowAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
 
-            # First, try loading from environment variables
+            # Check if this is a virtual env:// path
+            credential_index = self._parse_env_credential_path(path)
+            if credential_index is not None:
+                env_creds = self._load_from_env(credential_index)
+                if env_creds:
+                    lib_logger.info(f"Using iFlow credentials from environment variables (index: {credential_index})")
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
+                else:
+                    raise IOError(f"Environment variables for iFlow credential index {credential_index} not found")
+
+            # For file paths, try loading from legacy env vars first
             env_creds = self._load_from_env()
             if env_creds:
                 lib_logger.info("Using iFlow credentials from environment variables")
-                # Cache env-based credentials using the path as key
                 self._credentials_cache[path] = env_creds
                 return env_creds
 
