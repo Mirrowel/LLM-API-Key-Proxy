@@ -672,15 +672,15 @@ async def chat_completions(
         if logger:
             logger.log_request(headers=request.headers, body=request_data)
 
-            # Extract and log specific reasoning parameters for monitoring.
-            model = request_data.get("model")
-            generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
-            reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
-            custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
+        # Extract and log specific reasoning parameters for monitoring.
+        model = request_data.get("model")
+        generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
+        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
+        custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
 
-            logging.getLogger("rotator_library").info(
-                f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
-            )
+        logging.getLogger("rotator_library").debug(
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+        )
 
         # Log basic request info to console (this is a separate, simpler logger).
         log_request_to_console(

@@ -186,15 +186,27 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
 
 
 def _clean_claude_schema(schema: Any) -> Any:
-    """Recursively remove fields that Claude's JSON Schema validation doesn't support."""
+    """
+    Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
+    - Removes unsupported fields ($schema, additionalProperties, etc.)
+    - Converts 'const' to 'enum' with single value (supported equivalent)
+    """
     if not isinstance(schema, dict):
         return schema
     
-    incompatible = {'$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern'}
+    # Fields not supported by Antigravity/Google's Proto-based API
+    incompatible = {
+        '$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern',
+    }
     cleaned = {}
     
+    # Handle 'const' by converting to 'enum' with single value
+    if 'const' in schema:
+        const_value = schema['const']
+        cleaned['enum'] = [const_value]
+    
     for key, value in schema.items():
-        if key in incompatible:
+        if key in incompatible or key == 'const':
             continue
         if isinstance(value, dict):
             cleaned[key] = _clean_claude_schema(value)
