@@ -168,6 +168,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
     
     Antigravity sometimes returns tool arguments with JSON-stringified values:
     {"files": "[{...}]"} instead of {"files": [{...}]}.
+    
+    Additionally handles malformed double-encoded JSON where Antigravity
+    returns strings like '[{...}]}' (extra trailing '}').
     """
     if isinstance(obj, dict):
         return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
@@ -175,13 +178,49 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
         return [_recursively_parse_json_strings(item) for item in obj]
     elif isinstance(obj, str):
         stripped = obj.strip()
-        if (stripped.startswith('{') and stripped.endswith('}')) or \
-           (stripped.startswith('[') and stripped.endswith(']')):
-            try:
-                parsed = json.loads(obj)
-                return _recursively_parse_json_strings(parsed)
-            except (json.JSONDecodeError, ValueError):
-                pass
+        # Check if it looks like JSON (starts with { or [)
+        if stripped and stripped[0] in ('{', '['):
+            # Try standard parsing first
+            if (stripped.startswith('{') and stripped.endswith('}')) or \
+               (stripped.startswith('[') and stripped.endswith(']')):
+                try:
+                    parsed = json.loads(obj)
+                    return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            
+            # Handle malformed JSON: array that doesn't end with ]
+            # e.g., '[{"path": "..."}]}' instead of '[{"path": "..."}]'
+            if stripped.startswith('[') and not stripped.endswith(']'):
+                try:
+                    # Find the last ] and truncate there
+                    last_bracket = stripped.rfind(']')
+                    if last_bracket > 0:
+                        cleaned = stripped[:last_bracket+1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            
+            # Handle malformed JSON: object that doesn't end with }
+            if stripped.startswith('{') and not stripped.endswith('}'):
+                try:
+                    # Find the last } and truncate there
+                    last_brace = stripped.rfind('}')
+                    if last_brace > 0:
+                        cleaned = stripped[:last_brace+1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
     return obj
 
 
