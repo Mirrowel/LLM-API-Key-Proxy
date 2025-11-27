@@ -87,6 +87,16 @@ FINISH_REASON_MAP = {
     "OTHER": "stop",
 }
 
+# Default safety settings - disable content filtering for all categories
+# Per CLIProxyAPI: these are attached to prevent safety blocks during API calls
+DEFAULT_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+]
+
 # Directory paths
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 LOGS_DIR = _BASE_DIR / "logs" / "antigravity_logs"
@@ -1471,8 +1481,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Add session ID
         antigravity_payload["request"]["sessionId"] = _generate_session_id()
         
-        # Remove unsupported fields
-        antigravity_payload["request"].pop("safetySettings", None)
+        # Add default safety settings to prevent content filtering
+        # Only add if not already present in the payload
+        if "safetySettings" not in antigravity_payload["request"]:
+            antigravity_payload["request"]["safetySettings"] = copy.deepcopy(DEFAULT_SAFETY_SETTINGS)
         
         # Handle max_tokens - only apply to Claude, or if explicitly set for others
         gen_config = antigravity_payload["request"].get("generationConfig", {})
