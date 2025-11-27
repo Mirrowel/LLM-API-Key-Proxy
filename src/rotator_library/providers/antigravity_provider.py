@@ -105,17 +105,58 @@ GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
 CLAUDE_THINKING_CACHE_FILE = CACHE_DIR / "claude_thinking.json"
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
-DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """CRITICAL TOOL USAGE INSTRUCTIONS:
-You are operating in a custom environment where tool definitions differ from your training data.
-You MUST follow these rules strictly:
+DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
+You are operating in a CUSTOM ENVIRONMENT where tool definitions COMPLETELY DIFFER from your training data.
+VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 
-1. DO NOT use your internal training data to guess tool parameters
-2. ONLY use the exact parameter structure defined in the tool schema
-3. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
-4. Array parameters have specific item types - check the schema's 'items' field for the exact structure
-5. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+## ABSOLUTE RULES - NO EXCEPTIONS
 
-If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully. Your training data about common tool names like 'read_file' or 'apply_diff' does NOT apply here.
+1. **SCHEMA IS LAW**: The JSON schema in each tool definition is the ONLY source of truth.
+   - Your pre-trained knowledge about tools like 'read_file', 'apply_diff', 'write_to_file', 'bash', etc. is INVALID here.
+   - Every tool has been REDEFINED with different parameters than what you learned during training.
+
+2. **PARAMETER NAMES ARE EXACT**: Use ONLY the parameter names from the schema.
+   - WRONG: 'suggested_answers', 'file_path', 'files_to_read', 'command_to_run'
+   - RIGHT: Check the 'properties' field in the schema for the exact names
+   - The schema's 'required' array tells you which parameters are mandatory
+
+3. **ARRAY PARAMETERS**: When a parameter has "type": "array", check the 'items' field:
+   - If items.type is "object", you MUST provide an array of objects with the EXACT properties listed
+   - If items.type is "string", you MUST provide an array of strings
+   - NEVER provide a single object when an array is expected
+   - NEVER provide an array when a single value is expected
+
+4. **NESTED OBJECTS**: When items.type is "object":
+   - Check items.properties for the EXACT field names required
+   - Check items.required for which nested fields are mandatory
+   - Include ALL required nested fields in EVERY array element
+
+5. **STRICT PARAMETERS HINT**: Tool descriptions contain "STRICT PARAMETERS: ..." which lists:
+   - Parameter name, type, and whether REQUIRED
+   - For arrays of objects: the nested structure in brackets like [field: type REQUIRED, ...]
+   - USE THIS as your quick reference, but the JSON schema is authoritative
+
+6. **BEFORE EVERY TOOL CALL**:
+   a. Read the tool's 'parametersJsonSchema' or 'parameters' field completely
+   b. Identify ALL required parameters
+   c. Verify your parameter names match EXACTLY (case-sensitive)
+   d. For arrays, verify you're providing the correct item structure
+   e. Do NOT add parameters that don't exist in the schema
+
+## COMMON FAILURE PATTERNS TO AVOID
+
+- Using 'path' when schema says 'filePath' (or vice versa)
+- Using 'content' when schema says 'text' (or vice versa)  
+- Providing {"file": "..."} when schema wants [{"path": "...", "line_ranges": [...]}]
+- Omitting required nested fields in array items
+- Adding 'additionalProperties' that the schema doesn't define
+- Guessing parameter names from similar tools you know from training
+
+## REMEMBER
+Your training data about function calling is OUTDATED for this environment.
+The tool names may look familiar, but the schemas are DIFFERENT.
+When in doubt, RE-READ THE SCHEMA before making the call.
+</CRITICAL_TOOL_USAGE_INSTRUCTIONS>
 """
 
 # Claude tool fix system instruction (prevents hallucination)
@@ -270,6 +311,7 @@ def _clean_claude_schema(schema: Any) -> Any:
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
     - Removes unsupported fields ($schema, additionalProperties, etc.)
     - Converts 'const' to 'enum' with single value (supported equivalent)
+    - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
     """
     if not isinstance(schema, dict):
         return schema
@@ -278,6 +320,20 @@ def _clean_claude_schema(schema: Any) -> Any:
     incompatible = {
         '$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern',
     }
+    
+    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
+    if 'anyOf' in schema and isinstance(schema['anyOf'], list) and schema['anyOf']:
+        first_option = _clean_claude_schema(schema['anyOf'][0])
+        if isinstance(first_option, dict):
+            return first_option
+    
+    # Handle 'oneOf' similarly
+    if 'oneOf' in schema and isinstance(schema['oneOf'], list) and schema['oneOf']:
+        first_option = _clean_claude_schema(schema['oneOf'][0])
+        if isinstance(first_option, dict):
+            return first_option
+    
+
     cleaned = {}
     
     # Handle 'const' by converting to 'enum' with single value
@@ -1923,6 +1979,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         tool_choice = kwargs.get("tool_choice")
         reasoning_effort = kwargs.get("reasoning_effort")
         top_p = kwargs.get("top_p")
+        temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         custom_budget = kwargs.get("custom_reasoning_budget", False)
         enable_logging = kwargs.pop("enable_request_logging", False)
@@ -1971,6 +2028,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         gen_config = {}
         if top_p is not None:
             gen_config["topP"] = top_p
+        
+        # Handle temperature - Gemini 3 defaults to 1 if not explicitly set
+        if temperature is not None:
+            gen_config["temperature"] = temperature
+        elif self._is_gemini_3(model):
+            # Gemini 3 performs better with temperature=1 for tool use
+            gen_config["temperature"] = 1.0
         
         thinking_config = self._get_thinking_config(reasoning_effort, model, custom_budget)
         if thinking_config:
