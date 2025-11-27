@@ -100,6 +100,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.background_refresher import BackgroundRefresher
+    from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import DetailedLogger
@@ -123,14 +124,58 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
 class ModelCard(BaseModel):
+    """Basic model card for minimal response."""
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "Mirro-Proxy"
 
+class ModelCapabilities(BaseModel):
+    """Model capability flags."""
+    tool_choice: bool = False
+    function_calling: bool = False
+    reasoning: bool = False
+    vision: bool = False
+    system_messages: bool = True
+    prompt_caching: bool = False
+    assistant_prefill: bool = False
+
+class EnrichedModelCard(BaseModel):
+    """Extended model card with pricing and capabilities."""
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "unknown"
+    # Pricing (optional - may not be available for all models)
+    input_cost_per_token: Optional[float] = None
+    output_cost_per_token: Optional[float] = None
+    cache_read_input_token_cost: Optional[float] = None
+    cache_creation_input_token_cost: Optional[float] = None
+    # Limits (optional)
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    context_window: Optional[int] = None
+    # Capabilities
+    mode: str = "chat"
+    supported_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    supported_output_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    capabilities: Optional[ModelCapabilities] = None
+    # Debug info (optional)
+    _sources: Optional[List[str]] = None
+    _match_type: Optional[str] = None
+    
+    class Config:
+        extra = "allow"  # Allow extra fields from the service
+
 class ModelList(BaseModel):
+    """List of models response."""
     object: str = "list"
     data: List[ModelCard]
+
+class EnrichedModelList(BaseModel):
+    """List of enriched models with pricing and capabilities."""
+    object: str = "list"
+    data: List[EnrichedModelCard]
 
 # Calculate total loading time
 _elapsed = time.time() - _start_time
@@ -470,6 +515,12 @@ async def lifespan(app: FastAPI):
     else:
         app.state.embedding_batcher = None
         logging.info("RotatingClient initialized (EmbeddingBatcher disabled).")
+    
+    # Start model info service in background (fetches pricing/capabilities data)
+    # This runs asynchronously and doesn't block proxy startup
+    model_info_service = await init_model_info_service()
+    app.state.model_info_service = model_info_service
+    logging.info("Model info service started (fetching pricing data in background).")
         
     yield
     
@@ -477,6 +528,10 @@ async def lifespan(app: FastAPI):
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
     await client.close()
+    
+    # Stop model info service
+    if hasattr(app.state, 'model_info_service') and app.state.model_info_service:
+        await app.state.model_info_service.stop()
     
     if app.state.embedding_batcher:
         logging.info("RotatingClient and EmbeddingBatcher closed.")
@@ -847,17 +902,73 @@ async def embeddings(
 def read_root():
     return {"Status": "API Key Proxy is running"}
 
-@app.get("/v1/models", response_model=ModelList)
+@app.get("/v1/models")
 async def list_models(
+    request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key)
+    _=Depends(verify_api_key),
+    enriched: bool = True,
 ):
     """
     Returns a list of available models in the OpenAI-compatible format.
+    
+    Query Parameters:
+        enriched: If True (default), returns detailed model info with pricing and capabilities.
+                  If False, returns minimal OpenAI-compatible response.
     """
     model_ids = await client.get_all_available_models(grouped=False)
-    model_cards = [ModelCard(id=model_id) for model_id in model_ids]
-    return ModelList(data=model_cards)
+    
+    if enriched and hasattr(request.app.state, 'model_info_service'):
+        model_info_service = request.app.state.model_info_service
+        if model_info_service.is_ready():
+            # Return enriched model data
+            enriched_data = model_info_service.enrich_model_list(model_ids)
+            return {"object": "list", "data": enriched_data}
+    
+    # Fallback to basic model cards
+    model_cards = [{"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "Mirro-Proxy"} for model_id in model_ids]
+    return {"object": "list", "data": model_cards}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(
+    model_id: str,
+    request: Request,
+    _=Depends(verify_api_key),
+):
+    """
+    Returns detailed information about a specific model.
+    
+    Path Parameters:
+        model_id: The model ID (e.g., "anthropic/claude-3-opus", "openrouter/openai/gpt-4")
+    """
+    if hasattr(request.app.state, 'model_info_service'):
+        model_info_service = request.app.state.model_info_service
+        if model_info_service.is_ready():
+            info = model_info_service.get_model_info(model_id)
+            if info:
+                return info.to_dict()
+    
+    # Return basic info if service not ready or model not found
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": model_id.split("/")[0] if "/" in model_id else "unknown",
+    }
+
+
+@app.get("/v1/model-info/stats")
+async def model_info_stats(
+    request: Request,
+    _=Depends(verify_api_key),
+):
+    """
+    Returns statistics about the model info service (for monitoring/debugging).
+    """
+    if hasattr(request.app.state, 'model_info_service'):
+        return request.app.state.model_info_service.get_stats()
+    return {"error": "Model info service not initialized"}
 
 
 @app.get("/v1/providers")
@@ -890,6 +1001,101 @@ async def token_count(
     except Exception as e:
         logging.error(f"Token count failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/cost-estimate")
+async def cost_estimate(
+    request: Request,
+    _=Depends(verify_api_key)
+):
+    """
+    Estimates the cost for a request based on token counts and model pricing.
+    
+    Request body:
+        {
+            "model": "anthropic/claude-3-opus",
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "cache_read_tokens": 0,       # optional
+            "cache_creation_tokens": 0    # optional
+        }
+    
+    Returns:
+        {
+            "model": "anthropic/claude-3-opus",
+            "cost": 0.0375,
+            "currency": "USD",
+            "pricing": {
+                "input_cost_per_token": 0.000015,
+                "output_cost_per_token": 0.000075
+            },
+            "source": "model_info_service"  # or "litellm_fallback"
+        }
+    """
+    try:
+        data = await request.json()
+        model = data.get("model")
+        prompt_tokens = data.get("prompt_tokens", 0)
+        completion_tokens = data.get("completion_tokens", 0)
+        cache_read_tokens = data.get("cache_read_tokens", 0)
+        cache_creation_tokens = data.get("cache_creation_tokens", 0)
+        
+        if not model:
+            raise HTTPException(status_code=400, detail="'model' is required.")
+        
+        result = {
+            "model": model,
+            "cost": None,
+            "currency": "USD",
+            "pricing": {},
+            "source": None
+        }
+        
+        # Try model info service first
+        if hasattr(request.app.state, 'model_info_service'):
+            model_info_service = request.app.state.model_info_service
+            if model_info_service.is_ready():
+                cost = model_info_service.calculate_cost(
+                    model, prompt_tokens, completion_tokens,
+                    cache_read_tokens, cache_creation_tokens
+                )
+                if cost is not None:
+                    cost_info = model_info_service.get_cost_info(model)
+                    result["cost"] = cost
+                    result["pricing"] = cost_info or {}
+                    result["source"] = "model_info_service"
+                    return result
+        
+        # Fallback to litellm
+        try:
+            import litellm
+            # Create a mock response for cost calculation
+            model_info = litellm.get_model_info(model)
+            input_cost = model_info.get("input_cost_per_token", 0)
+            output_cost = model_info.get("output_cost_per_token", 0)
+            
+            if input_cost or output_cost:
+                cost = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
+                result["cost"] = cost
+                result["pricing"] = {
+                    "input_cost_per_token": input_cost,
+                    "output_cost_per_token": output_cost
+                }
+                result["source"] = "litellm_fallback"
+                return result
+        except Exception:
+            pass
+        
+        result["source"] = "unknown"
+        result["error"] = "Pricing data not available for this model"
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Cost estimate failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks
