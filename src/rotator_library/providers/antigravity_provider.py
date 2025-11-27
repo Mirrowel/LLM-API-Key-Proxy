@@ -50,7 +50,9 @@ ANTIGRAVITY_LOGS_DIR = LOGS_DIR / "antigravity_logs"
 # Cache configuration
 CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "cache"
 ANTIGRAVITY_CACHE_DIR = CACHE_DIR / "antigravity"
-ANTIGRAVITY_CACHE_FILE = ANTIGRAVITY_CACHE_DIR / "thought_signatures.json"
+# Separate cache files for different data types
+GEMINI3_SIGNATURE_CACHE_FILE = ANTIGRAVITY_CACHE_DIR / "gemini3_signatures.json"
+CLAUDE_THINKING_CACHE_FILE = ANTIGRAVITY_CACHE_DIR / "claude_thinking.json"
 
 
 class _AntigravityFileLogger:
@@ -107,12 +109,13 @@ class _AntigravityFileLogger:
         except Exception as e:
             lib_logger.error(f"_AntigravityFileLogger: Failed to write final response: {e}")
 
-class ThoughtSignatureCache:
+class AntigravityCache:
     """
-    Server-side cache for thoughtSignatures to maintain Gemini 3 conversation context.
+    Server-side cache for Antigravity conversation state preservation.
     
-    Maps tool_call_id → thoughtSignature to preserve encrypted reasoning signatures
-    across turns, even if clients don't support the thought_signature field.
+    Supports two types of cached data:
+    1. Gemini 3: thoughtSignatures (tool_call_id → encrypted signature)
+    2. Claude: Thinking content (composite_key → thinking text + signature)
     
     Features:
     - Dual-TTL system: 1hr memory, 24hr disk
@@ -123,15 +126,16 @@ class ThoughtSignatureCache:
     - High concurrency support with asyncio locks
     """
     
-    def __init__(self, memory_ttl_seconds: int = 3600, disk_ttl_seconds: int = 86400):
+    def __init__(self, cache_file: Path, memory_ttl_seconds: int = 3600, disk_ttl_seconds: int = 86400):
         """
-        Initialize the signature cache with disk persistence.
+        Initialize the cache with disk persistence.
         
         Args:
+            cache_file: Path to cache file for disk persistence
             memory_ttl_seconds: Time-to-live for memory cache entries (default: 1 hour)
             disk_ttl_seconds: Time-to-live for disk cache entries (default: 24 hours)
         """
-        # In-memory cache: {call_id: (signature, timestamp)}
+        # In-memory cache: {cache_key: (data, timestamp)}
         self._cache: Dict[str, Tuple[str, float]] = {}
         self._memory_ttl = memory_ttl_seconds
         self._disk_ttl = disk_ttl_seconds
@@ -139,7 +143,7 @@ class ThoughtSignatureCache:
         self._disk_lock = asyncio.Lock()
         
         # Disk persistence configuration
-        self._cache_file = ANTIGRAVITY_CACHE_FILE
+        self._cache_file = cache_file
         self._enable_disk_persistence = os.getenv(
             "ANTIGRAVITY_ENABLE_SIGNATURE_CACHE",
             "true"
@@ -530,10 +534,20 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._current_base_url = BASE_URLS[0]  # Start with daily sandbox
         self._base_url_index = 0
         
-        # Initialize thoughtSignature cache for Gemini 3 multi-turn conversations
+        # Initialize caches for conversation state preservation
         memory_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_CACHE_TTL", "3600"))
         disk_ttl = int(os.getenv("ANTIGRAVITY_SIGNATURE_DISK_TTL", "86400"))
-        self._signature_cache = ThoughtSignatureCache(
+        
+        # Cache for Gemini 3 thoughtSignatures
+        self._signature_cache = AntigravityCache(
+            cache_file=GEMINI3_SIGNATURE_CACHE_FILE,
+            memory_ttl_seconds=memory_ttl,
+            disk_ttl_seconds=disk_ttl
+        )
+        
+        # Cache for Claude thinking content
+        self._thinking_cache = AntigravityCache(
+            cache_file=CLAUDE_THINKING_CACHE_FILE,
             memory_ttl_seconds=memory_ttl,
             disk_ttl_seconds=disk_ttl
         )
@@ -621,6 +635,46 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         else:
             lib_logger.debug("Antigravity: Gemini 3 tool fix DISABLED (using default tool schemas)")
 
+
+    def _generate_thinking_cache_key(self, text_content: str, tool_calls: List[Dict]) -> Optional[str]:
+        """
+        Generate stable cache key from response content for Claude thinking preservation.
+        
+        Uses composite key strategy:
+        - If tool calls exist: Use first tool call ID (most reliable)
+        - If text exists: Use text hash
+        - If both: Combine both for maximum uniqueness
+        
+        Args:
+            text_content: Regular text from response
+            tool_calls: List of tool calls with IDs
+        
+        Returns:
+            Cache key string, or None if no cacheable content
+        """
+        import hashlib
+        key_parts = []
+        
+        # Priority 1: Tool call IDs (most stable - we generate these)
+        if tool_calls and len(tool_calls) > 0:
+            first_tool_id = tool_calls[0].get("id", "")
+            if first_tool_id:
+                # Remove 'call_' prefix if present for shorter key
+                tool_id_short = first_tool_id.replace("call_", "")
+                key_parts.append(f"tool_{tool_id_short}")
+        
+        # Priority 2: Text hash (for text-only or mixed responses)
+        if text_content:
+            # Use first 200 chars for stability (longer text may vary slightly)
+            text_hash = hashlib.md5(text_content[:200].encode()).hexdigest()[:16]
+            key_parts.append(f"text_{text_hash}")
+        
+        # Combine parts
+        if key_parts:
+            return "thinking_" + "_".join(key_parts)
+        
+        # Shouldn't happen - responses always have text or tools
+        return None
 
 
     # ============================================================================
@@ -828,6 +882,51 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                                     lib_logger.warning(f"Failed to parse image data URL: {e}")
 
             elif role == "assistant":
+                # Try to retrieve cached thinking for Claude models
+                thinking_to_inject = None
+                cache_key = None
+                
+                if model.startswith("claude-") and self._enable_signature_cache:
+                    # Build cache key from incoming message
+                    msg_text = content if isinstance(content, str) else ""
+                    msg_tools = msg.get("tool_calls", [])
+                    
+                    cache_key = self._generate_thinking_cache_key(msg_text, msg_tools)
+                    
+                    if cache_key:
+                        cached_json = self._thinking_cache.retrieve(cache_key)
+                        if cached_json:
+                            try:
+                                thinking_to_inject = json.loads(cached_json)
+                                lib_logger.debug(f"✓ Retrieved thinking from cache: {cache_key[:50]}...")
+                            except json.JSONDecodeError:
+                                lib_logger.warning(f"Failed to parse cached thinking for: {cache_key}")
+                
+                # Inject thinking FIRST if we have it
+                if thinking_to_inject:
+                    thinking_text = thinking_to_inject.get("thinking_text", "")
+                    thought_sig = thinking_to_inject.get("thought_signature", "")
+                    
+                    if thinking_text:
+                        thinking_part = {
+                            "text": thinking_text,
+                            "thought": True
+                        }
+                        
+                        # Add signature if available, otherwise use skip validator
+                        if thought_sig:
+                            thinking_part["thoughtSignature"] = thought_sig
+                        else:
+                            thinking_part["thoughtSignature"] = "skip_thought_signature_validator"
+                            lib_logger.debug("Using skip validator for missing signature")
+                        
+                        parts.append(thinking_part)
+                        lib_logger.debug(
+                            f"✅ Injected {len(thinking_text)} chars of thinking "
+                            f"(sig={'yes' if thought_sig else 'fallback'})"
+                        )
+                
+                # Then add regular content
                 if isinstance(content, str) and content:
                     parts.append({"text": content})
                 if msg.get("tool_calls"):
@@ -983,7 +1082,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             # Apply custom_reasoning_budget toggle
             # If False (default), divide by 4 like Gemini CLI
             if not custom_reasoning_budget:
-                budget = budget // 4
+                budget = budget // 6
             
             return {"thinkingBudget": budget, "include_thoughts": True}
         
@@ -1449,7 +1548,12 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             # Primitive types (int, bool, None, etc.) - return as-is
             return obj
 
-    def _gemini_to_openai_chunk(self, gemini_chunk: Dict[str, Any], model: str) -> Dict[str, Any]:
+    def _gemini_to_openai_chunk(
+        self, 
+        gemini_chunk: Dict[str, Any], 
+        model: str,
+        stream_accumulator: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Convert a Gemini API response chunk to OpenAI format.
         
@@ -1462,9 +1566,15 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         - Recursively parses JSON-stringified values before serialization
         - Prevents "Unexpected non-whitespace character after JSON" errors
         
+        Claude Thinking Caching:
+        - For Claude models, thinking content is accumulated across all chunks
+        - The stream_accumulator collects reasoning_content and thought_signature
+        - Caching happens AFTER the full stream is processed (in _handle_streaming)
+        
         Args:
             gemini_chunk: Gemini API response chunk
             model: Model name for Gemini 3 detection
+            stream_accumulator: Optional dict to accumulate streaming data for post-processing
             
         Returns:
             OpenAI-compatible response chunk
@@ -1492,24 +1602,36 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             has_function_call = "functionCall" in part
             has_text = "text" in part
             has_signature = "thoughtSignature" in part and part["thoughtSignature"]
+            is_thought = part.get("thought") is True or (isinstance(part.get("thought"), str) and part.get("thought").lower() == 'true')
             
-            # FIXED: Only skip if ONLY signature (standalone encryption part)
-            # Previously this filtered out ALL function calls with signatures!
-            if has_signature and not has_function_call and not has_text:
-                continue  # Skip standalone signature parts
+            # Accumulate thought signature from thinking parts (Claude caching)
+            # The signature appears on the LAST thinking part (the one with empty text after all thinking)
+            if has_signature and is_thought and stream_accumulator is not None:
+                stream_accumulator["thought_signature"] = part["thoughtSignature"]
+            
+            # Skip standalone signature-only parts (empty thinking parts with just signature)
+            if has_signature and not has_function_call and (not has_text or part.get("text") == ""):
+                continue
             
             # Process text content
             if has_text:
-                thought = part.get("thought")
-                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                if is_thought:
                     reasoning_content += part["text"]
+                    # Accumulate reasoning for Claude caching
+                    if stream_accumulator is not None:
+                        stream_accumulator["reasoning_content"] += part["text"]
                 else:
                     text_content += part["text"]
+                    # Accumulate text content for cache key generation
+                    if stream_accumulator is not None:
+                        stream_accumulator["text_content"] += part["text"]
             
             # Process function calls (NOW WORKS with signatures!)
             if has_function_call:
                 func_call = part["functionCall"]
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                
+                # Use ID from Antigravity if provided, otherwise generate
+                tool_call_id = func_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
                 
                 # Get tool name and strip gemini3_ namespace if present (Gemini 3 specific)
                 tool_name = func_call.get("name", "")
@@ -1527,7 +1649,11 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                 }
                 tool_call_index += 1  # Increment for next tool call
                 
-                # Handle thoughtSignature if present
+                # Accumulate tool calls for Claude caching
+                if stream_accumulator is not None:
+                    stream_accumulator["tool_calls"].append(tool_call)
+                
+                # Handle thoughtSignature if present (on function call part)
                 if has_signature and not first_signature_seen:
                     # Only first tool call gets signature (parallel call handling)
                     first_signature_seen = True
@@ -1570,7 +1696,11 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             finish_reason = finish_reason_map.get(finish_reason, "stop")
             if tool_calls:
                 finish_reason = "tool_calls"
-        
+            
+            # Mark stream as complete for accumulator
+            if stream_accumulator is not None:
+                stream_accumulator["is_complete"] = True
+
         # Build usage metadata
         usage = None
         usage_metadata = gemini_chunk.get("usageMetadata", {})
@@ -1614,6 +1744,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         Convert a Gemini API response to OpenAI non-streaming format.
         
         This is specifically for non-streaming completions where we need 'message' instead of 'delta'.
+        Also handles Claude thinking caching for non-streaming responses.
         
         Args:
             gemini_response: Gemini API response
@@ -1635,6 +1766,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         text_content = ""
         reasoning_content = ""
         tool_calls = []
+        thought_signature = ""  # Track signature for Claude caching
         
         # Track if we've seen a signature yet (for parallel tool call handling)
         first_signature_seen = False
@@ -1643,15 +1775,19 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             has_function_call = "functionCall" in part
             has_text = "text" in part
             has_signature = "thoughtSignature" in part and part["thoughtSignature"]
+            is_thought = part.get("thought") is True or (isinstance(part.get("thought"), str) and part.get("thought").lower() == 'true')
             
-            # Skip standalone signature parts
-            if has_signature and not has_function_call and not has_text:
+            # Capture thought signature (appears on last thinking part)
+            if has_signature and is_thought:
+                thought_signature = part["thoughtSignature"]
+            
+            # Skip standalone signature parts (empty thinking parts with just signature)
+            if has_signature and not has_function_call and (not has_text or part.get("text") == ""):
                 continue
             
             # Process text content
             if has_text:
-                thought = part.get("thought")
-                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                if is_thought:
                     reasoning_content += part["text"]
                 else:
                     text_content += part["text"]
@@ -1659,7 +1795,9 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             # Process function calls
             if has_function_call:
                 func_call = part["functionCall"]
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                
+                # Use ID from Antigravity if provided, otherwise generate
+                tool_call_id = func_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
                 
                 # Get tool name and strip gemini3_ namespace if present
                 tool_name = func_call.get("name", "")
@@ -1683,7 +1821,7 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                     }
                 }
                 
-                # Handle thoughtSignature if present
+                # Handle thoughtSignature if present (on function call part)
                 if has_signature and not first_signature_seen:
                     first_signature_seen = True
                     signature = part["thoughtSignature"]
@@ -1698,6 +1836,27 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                         tool_call["thought_signature"] = signature
                 
                 tool_calls.append(tool_call)
+        
+        # Cache Claude thinking content for non-streaming responses
+        if reasoning_content and model.startswith("claude-") and self._enable_signature_cache:
+            cache_key = self._generate_thinking_cache_key(text_content, tool_calls)
+            
+            if cache_key:
+                thinking_data = {
+                    "thinking_text": reasoning_content,
+                    "thought_signature": thought_signature,
+                    "text_preview": text_content[:100] if text_content else "",
+                    "tool_ids": [tc.get("id", "") for tc in tool_calls] if tool_calls else [],
+                    "timestamp": time.time()
+                }
+                
+                self._thinking_cache.store(cache_key, json.dumps(thinking_data))
+                lib_logger.info(
+                    f"✓ Cached Claude thinking (non-streaming): {cache_key[:50]}... "
+                    f"(reasoning={len(reasoning_content)} chars, "
+                    f"tools={len(tool_calls)}, "
+                    f"sig={'yes' if thought_signature else 'no'})"
+                )
         
         # Build message object (not delta!)
         message = {"role": "assistant"}
@@ -2144,7 +2303,24 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         model: str,
         file_logger: Optional[_AntigravityFileLogger] = None
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
-        """Handle streaming completion."""
+        """
+        Handle streaming completion.
+        
+        For Claude models with thinking enabled:
+        - Accumulates reasoning content and thought signature across all chunks
+        - Caches the complete thinking data AFTER the stream is fully processed
+        - Uses a generator wrapper to ensure post-stream caching happens
+        """
+        # Create stream accumulator for Claude thinking caching
+        # This collects data across all chunks so we can cache after stream completes
+        stream_accumulator = {
+            "reasoning_content": "",
+            "thought_signature": "",
+            "text_content": "",
+            "tool_calls": [],
+            "is_complete": False
+        } if model.startswith("claude-") and self._enable_signature_cache else None
+        
         async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
             # Log error response body for debugging if request failed
             if response.status_code >= 400:
@@ -2172,8 +2348,12 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                         # Unwrap Antigravity envelope
                         gemini_chunk = self._unwrap_antigravity_response(antigravity_chunk)
                         
-                        # Convert to OpenAI format
-                        openai_chunk = self._gemini_to_openai_chunk(gemini_chunk, model)
+                        # Convert to OpenAI format (with accumulator for Claude)
+                        openai_chunk = self._gemini_to_openai_chunk(
+                            gemini_chunk, 
+                            model, 
+                            stream_accumulator
+                        )
                         
                         # Convert dict to ModelResponse object
                         model_response = litellm.ModelResponse(**openai_chunk)
@@ -2183,6 +2363,64 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                             file_logger.log_error(f"Failed to parse chunk: {data_str[:100]}")
                         lib_logger.warning(f"Failed to parse Antigravity chunk: {data_str[:100]}")
                         continue
+        
+        # After stream completes: cache Claude thinking content
+        if stream_accumulator and stream_accumulator.get("reasoning_content"):
+            await self._cache_claude_thinking_after_stream(stream_accumulator, model)
+    
+    async def _cache_claude_thinking_after_stream(
+        self, 
+        accumulator: Dict[str, Any],
+        model: str
+    ):
+        """
+        Cache Claude thinking content after the complete stream has been processed.
+        
+        This is called after ALL streaming chunks have been received, ensuring we have:
+        - Complete reasoning content (accumulated from all thought=true parts)
+        - The thoughtSignature (appears on the final thinking part)
+        - All tool calls with their IDs (for cache key generation)
+        - Complete text content (for cache key generation)
+        
+        Args:
+            accumulator: Dict with accumulated stream data
+            model: Model name (for logging)
+        """
+        reasoning_content = accumulator.get("reasoning_content", "")
+        thought_signature = accumulator.get("thought_signature", "")
+        text_content = accumulator.get("text_content", "")
+        tool_calls = accumulator.get("tool_calls", [])
+        
+        if not reasoning_content:
+            lib_logger.debug("No reasoning content to cache")
+            return
+        
+        # Generate cache key from the accumulated response data
+        cache_key = self._generate_thinking_cache_key(text_content, tool_calls)
+        
+        if not cache_key:
+            lib_logger.warning("Could not generate cache key for Claude thinking")
+            return
+        
+        # Build cache data
+        thinking_data = {
+            "thinking_text": reasoning_content,
+            "thought_signature": thought_signature,
+            "text_preview": text_content[:100] if text_content else "",
+            "tool_ids": [tc.get("id", "") for tc in tool_calls] if tool_calls else [],
+            "timestamp": time.time()
+        }
+        
+        # Store in cache
+        self._thinking_cache.store(cache_key, json.dumps(thinking_data))
+        
+        lib_logger.info(
+            f"✓ Cached Claude thinking after stream: {cache_key[:50]}... "
+            f"(reasoning={len(reasoning_content)} chars, "
+            f"text={len(text_content)} chars, "
+            f"tools={len(tool_calls)}, "
+            f"sig={'yes' if thought_signature else 'no'})"
+        )
 
     # ============================================================================
     # TOKEN COUNTING
