@@ -393,7 +393,23 @@ class RotatingClient:
         return os.getenv(api_base_env) is not None
 
     def _get_provider_instance(self, provider_name: str):
-        """Lazily initializes and returns a provider instance."""
+        """
+        Lazily initializes and returns a provider instance.
+        Only initializes providers that have configured credentials.
+        
+        Args:
+            provider_name: The name of the provider to get an instance for.
+        
+        Returns:
+            Provider instance if credentials exist, None otherwise.
+        """
+        # Only initialize providers for which we have credentials
+        if provider_name not in self.all_credentials:
+            lib_logger.debug(
+                f"Skipping provider '{provider_name}' initialization: no credentials configured"
+            )
+            return None
+        
         if provider_name not in self._provider_instances:
             if provider_name in self._provider_plugins:
                 self._provider_instances[provider_name] = self._provider_plugins[
