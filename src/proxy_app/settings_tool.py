@@ -166,6 +166,184 @@ class ConcurrencyManager:
         self.settings.remove(key)
 
 
+# =============================================================================
+# PROVIDER-SPECIFIC SETTINGS DEFINITIONS
+# =============================================================================
+
+# Antigravity provider environment variables
+ANTIGRAVITY_SETTINGS = {
+    "ANTIGRAVITY_SIGNATURE_CACHE_TTL": {
+        "type": "int",
+        "default": 3600,
+        "description": "Memory cache TTL for Gemini 3 thought signatures (seconds)",
+    },
+    "ANTIGRAVITY_SIGNATURE_DISK_TTL": {
+        "type": "int",
+        "default": 86400,
+        "description": "Disk cache TTL for Gemini 3 thought signatures (seconds)",
+    },
+    "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES": {
+        "type": "bool",
+        "default": True,
+        "description": "Preserve thought signatures in client responses",
+    },
+    "ANTIGRAVITY_ENABLE_SIGNATURE_CACHE": {
+        "type": "bool",
+        "default": True,
+        "description": "Enable signature caching for multi-turn conversations",
+    },
+    "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS": {
+        "type": "bool",
+        "default": False,
+        "description": "Enable dynamic model discovery from API",
+    },
+    "ANTIGRAVITY_GEMINI3_TOOL_FIX": {
+        "type": "bool",
+        "default": True,
+        "description": "Enable Gemini 3 tool hallucination prevention",
+    },
+    "ANTIGRAVITY_CLAUDE_TOOL_FIX": {
+        "type": "bool",
+        "default": True,
+        "description": "Enable Claude tool hallucination prevention",
+    },
+    "ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION": {
+        "type": "bool",
+        "default": True,
+        "description": "Sanitize thinking blocks for Claude multi-turn conversations",
+    },
+    "ANTIGRAVITY_GEMINI3_TOOL_PREFIX": {
+        "type": "str",
+        "default": "gemini3_",
+        "description": "Prefix added to tool names for Gemini 3 disambiguation",
+    },
+    "ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT": {
+        "type": "str",
+        "default": "\n\nSTRICT PARAMETERS: {params}.",
+        "description": "Template for strict parameter hints in tool descriptions",
+    },
+    "ANTIGRAVITY_CLAUDE_DESCRIPTION_PROMPT": {
+        "type": "str",
+        "default": "\n\nSTRICT PARAMETERS: {params}.",
+        "description": "Template for Claude strict parameter hints in tool descriptions",
+    },
+}
+
+# Gemini CLI provider environment variables
+GEMINI_CLI_SETTINGS = {
+    "GEMINI_CLI_SIGNATURE_CACHE_TTL": {
+        "type": "int",
+        "default": 3600,
+        "description": "Memory cache TTL for thought signatures (seconds)",
+    },
+    "GEMINI_CLI_SIGNATURE_DISK_TTL": {
+        "type": "int",
+        "default": 86400,
+        "description": "Disk cache TTL for thought signatures (seconds)",
+    },
+    "GEMINI_CLI_PRESERVE_THOUGHT_SIGNATURES": {
+        "type": "bool",
+        "default": True,
+        "description": "Preserve thought signatures in client responses",
+    },
+    "GEMINI_CLI_ENABLE_SIGNATURE_CACHE": {
+        "type": "bool",
+        "default": True,
+        "description": "Enable signature caching for multi-turn conversations",
+    },
+    "GEMINI_CLI_GEMINI3_TOOL_FIX": {
+        "type": "bool",
+        "default": True,
+        "description": "Enable Gemini 3 tool hallucination prevention",
+    },
+    "GEMINI_CLI_GEMINI3_TOOL_PREFIX": {
+        "type": "str",
+        "default": "gemini3_",
+        "description": "Prefix added to tool names for Gemini 3 disambiguation",
+    },
+    "GEMINI_CLI_GEMINI3_DESCRIPTION_PROMPT": {
+        "type": "str",
+        "default": "\n\nSTRICT PARAMETERS: {params}.",
+        "description": "Template for strict parameter hints in tool descriptions",
+    },
+    "GEMINI_CLI_PROJECT_ID": {
+        "type": "str",
+        "default": "",
+        "description": "GCP Project ID for paid tier users (required for paid tiers)",
+    },
+}
+
+# Map provider names to their settings definitions
+PROVIDER_SETTINGS_MAP = {
+    "antigravity": ANTIGRAVITY_SETTINGS,
+    "gemini_cli": GEMINI_CLI_SETTINGS,
+}
+
+
+class ProviderSettingsManager:
+    """Manages provider-specific configuration settings"""
+    
+    def __init__(self, settings: AdvancedSettings):
+        self.settings = settings
+    
+    def get_available_providers(self) -> List[str]:
+        """Get list of providers with specific settings available"""
+        return list(PROVIDER_SETTINGS_MAP.keys())
+    
+    def get_provider_settings_definitions(self, provider: str) -> Dict[str, Dict[str, Any]]:
+        """Get settings definitions for a provider"""
+        return PROVIDER_SETTINGS_MAP.get(provider, {})
+    
+    def get_current_value(self, key: str, definition: Dict[str, Any]) -> Any:
+        """Get current value of a setting from environment"""
+        env_value = os.getenv(key)
+        if env_value is None:
+            return definition.get("default")
+        
+        setting_type = definition.get("type", "str")
+        try:
+            if setting_type == "bool":
+                return env_value.lower() in ("true", "1", "yes")
+            elif setting_type == "int":
+                return int(env_value)
+            else:
+                return env_value
+        except (ValueError, AttributeError):
+            return definition.get("default")
+    
+    def get_all_current_values(self, provider: str) -> Dict[str, Any]:
+        """Get all current values for a provider"""
+        definitions = self.get_provider_settings_definitions(provider)
+        values = {}
+        for key, definition in definitions.items():
+            values[key] = self.get_current_value(key, definition)
+        return values
+    
+    def set_value(self, key: str, value: Any, definition: Dict[str, Any]):
+        """Set a setting value, converting to string for .env storage"""
+        setting_type = definition.get("type", "str")
+        if setting_type == "bool":
+            str_value = "true" if value else "false"
+        else:
+            str_value = str(value)
+        self.settings.set(key, str_value)
+    
+    def reset_to_default(self, key: str):
+        """Remove a setting to reset it to default"""
+        self.settings.remove(key)
+    
+    def get_modified_settings(self, provider: str) -> Dict[str, Any]:
+        """Get settings that differ from defaults"""
+        definitions = self.get_provider_settings_definitions(provider)
+        modified = {}
+        for key, definition in definitions.items():
+            current = self.get_current_value(key, definition)
+            default = definition.get("default")
+            if current != default:
+                modified[key] = current
+        return modified
+
+
 class SettingsTool:
     """Main settings tool TUI"""
     
@@ -175,6 +353,7 @@ class SettingsTool:
         self.provider_mgr = CustomProviderManager(self.settings)
         self.model_mgr = ModelDefinitionManager(self.settings)
         self.concurrency_mgr = ConcurrencyManager(self.settings)
+        self.provider_settings_mgr = ProviderSettingsManager(self.settings)
         self.running = True
     
     def get_available_providers(self) -> List[str]:
@@ -223,8 +402,9 @@ class SettingsTool:
         self.console.print("   1. 🌐 Custom Provider API Bases")
         self.console.print("   2. 📦 Provider Model Definitions")
         self.console.print("   3. ⚡ Concurrency Limits")
-        self.console.print("   4. 💾 Save & Exit")
-        self.console.print("   5. 🚫 Exit Without Saving")
+        self.console.print("   4. 🔬 Provider-Specific Settings")
+        self.console.print("   5. 💾 Save & Exit")
+        self.console.print("   6. 🚫 Exit Without Saving")
         
         self.console.print()
         self.console.print("━" * 70)
@@ -238,7 +418,7 @@ class SettingsTool:
         self.console.print("[dim]⚠️  Model filters not supported - edit .env for IGNORE_MODELS_* / WHITELIST_MODELS_*[/dim]")
         self.console.print()
         
-        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5"], show_choices=False)
+        choice = Prompt.ask("Select option", choices=["1", "2", "3", "4", "5", "6"], show_choices=False)
         
         if choice == "1":
             self.manage_custom_providers()
@@ -247,8 +427,10 @@ class SettingsTool:
         elif choice == "3":
             self.manage_concurrency_limits()
         elif choice == "4":
-            self.save_and_exit()
+            self.manage_provider_settings()
         elif choice == "5":
+            self.save_and_exit()
+        elif choice == "6":
             self.exit_without_saving()
     
     def manage_custom_providers(self):
@@ -630,6 +812,195 @@ class SettingsTool:
                 self.console.print()
         
         input("Press Enter to return...")
+    
+    def manage_provider_settings(self):
+        """Manage provider-specific settings (Antigravity, Gemini CLI)"""
+        while True:
+            self.console.clear()
+            
+            available_providers = self.provider_settings_mgr.get_available_providers()
+            
+            self.console.print(Panel.fit(
+                "[bold cyan]🔬 Provider-Specific Settings[/bold cyan]",
+                border_style="cyan"
+            ))
+            
+            self.console.print()
+            self.console.print("[bold]📋 Available Providers with Custom Settings[/bold]")
+            self.console.print("━" * 70)
+            
+            for provider in available_providers:
+                modified = self.provider_settings_mgr.get_modified_settings(provider)
+                status = f"[yellow]{len(modified)} modified[/yellow]" if modified else "[dim]defaults[/dim]"
+                display_name = provider.replace("_", " ").title()
+                self.console.print(f"   • {display_name:20} {status}")
+            
+            self.console.print()
+            self.console.print("━" * 70)
+            self.console.print()
+            self.console.print("[bold]⚙️  Select Provider to Configure[/bold]")
+            self.console.print()
+            
+            for idx, provider in enumerate(available_providers, 1):
+                display_name = provider.replace("_", " ").title()
+                self.console.print(f"   {idx}. {display_name}")
+            self.console.print(f"   {len(available_providers) + 1}. ↩️  Back to Settings Menu")
+            
+            self.console.print()
+            self.console.print("━" * 70)
+            self.console.print()
+            
+            choices = [str(i) for i in range(1, len(available_providers) + 2)]
+            choice = Prompt.ask("Select option", choices=choices, show_choices=False)
+            choice_idx = int(choice)
+            
+            if choice_idx == len(available_providers) + 1:
+                break
+            
+            provider = available_providers[choice_idx - 1]
+            self._manage_single_provider_settings(provider)
+    
+    def _manage_single_provider_settings(self, provider: str):
+        """Manage settings for a single provider"""
+        while True:
+            self.console.clear()
+            
+            display_name = provider.replace("_", " ").title()
+            definitions = self.provider_settings_mgr.get_provider_settings_definitions(provider)
+            current_values = self.provider_settings_mgr.get_all_current_values(provider)
+            
+            self.console.print(Panel.fit(
+                f"[bold cyan]🔬 {display_name} Settings[/bold cyan]",
+                border_style="cyan"
+            ))
+            
+            self.console.print()
+            self.console.print("[bold]📋 Current Settings[/bold]")
+            self.console.print("━" * 70)
+            
+            # Display all settings with current values
+            settings_list = list(definitions.keys())
+            for idx, key in enumerate(settings_list, 1):
+                definition = definitions[key]
+                current = current_values.get(key)
+                default = definition.get("default")
+                setting_type = definition.get("type", "str")
+                description = definition.get("description", "")
+                
+                # Format value display
+                if setting_type == "bool":
+                    value_display = "[green]✓ Enabled[/green]" if current else "[red]✗ Disabled[/red]"
+                elif setting_type == "int":
+                    value_display = f"[cyan]{current}[/cyan]"
+                else:
+                    value_display = f"[cyan]{current or '(not set)'}[/cyan]" if current else "[dim](not set)[/dim]"
+                
+                # Check if modified from default
+                modified = current != default
+                mod_marker = "[yellow]*[/yellow]" if modified else " "
+                
+                # Short key name for display (strip provider prefix)
+                short_key = key.replace(f"{provider.upper()}_", "")
+                
+                self.console.print(f"  {mod_marker}{idx:2}. {short_key:35} {value_display}")
+                self.console.print(f"       [dim]{description}[/dim]")
+            
+            self.console.print()
+            self.console.print("━" * 70)
+            self.console.print("[dim]* = modified from default[/dim]")
+            self.console.print()
+            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print()
+            self.console.print("   E. ✏️  Edit a Setting")
+            self.console.print("   R. 🔄 Reset Setting to Default")
+            self.console.print("   A. 🔄 Reset All to Defaults")
+            self.console.print("   B. ↩️  Back to Provider Selection")
+            
+            self.console.print()
+            self.console.print("━" * 70)
+            self.console.print()
+            
+            choice = Prompt.ask("Select action", choices=["e", "r", "a", "b", "E", "R", "A", "B"], show_choices=False).lower()
+            
+            if choice == "b":
+                break
+            elif choice == "e":
+                self._edit_provider_setting(provider, settings_list, definitions)
+            elif choice == "r":
+                self._reset_provider_setting(provider, settings_list, definitions)
+            elif choice == "a":
+                self._reset_all_provider_settings(provider, settings_list)
+    
+    def _edit_provider_setting(self, provider: str, settings_list: List[str], definitions: Dict[str, Dict[str, Any]]):
+        """Edit a single provider setting"""
+        self.console.print("\n[bold]Select setting number to edit:[/bold]")
+        
+        choices = [str(i) for i in range(1, len(settings_list) + 1)]
+        choice = IntPrompt.ask("Setting number", choices=choices)
+        key = settings_list[choice - 1]
+        definition = definitions[key]
+        
+        current = self.provider_settings_mgr.get_current_value(key, definition)
+        default = definition.get("default")
+        setting_type = definition.get("type", "str")
+        short_key = key.replace(f"{provider.upper()}_", "")
+        
+        self.console.print(f"\n[bold]Editing: {short_key}[/bold]")
+        self.console.print(f"Current value: [cyan]{current}[/cyan]")
+        self.console.print(f"Default value: [dim]{default}[/dim]")
+        self.console.print(f"Type: {setting_type}")
+        
+        if setting_type == "bool":
+            new_value = Confirm.ask("\nEnable this setting?", default=current)
+            self.provider_settings_mgr.set_value(key, new_value, definition)
+            status = "enabled" if new_value else "disabled"
+            self.console.print(f"\n[green]✅ {short_key} {status}![/green]")
+        elif setting_type == "int":
+            new_value = IntPrompt.ask("\nNew value", default=current)
+            self.provider_settings_mgr.set_value(key, new_value, definition)
+            self.console.print(f"\n[green]✅ {short_key} set to {new_value}![/green]")
+        else:
+            new_value = Prompt.ask("\nNew value", default=str(current) if current else "").strip()
+            if new_value:
+                self.provider_settings_mgr.set_value(key, new_value, definition)
+                self.console.print(f"\n[green]✅ {short_key} updated![/green]")
+            else:
+                self.console.print("\n[yellow]No changes made[/yellow]")
+        
+        input("\nPress Enter to continue...")
+    
+    def _reset_provider_setting(self, provider: str, settings_list: List[str], definitions: Dict[str, Dict[str, Any]]):
+        """Reset a single provider setting to default"""
+        self.console.print("\n[bold]Select setting number to reset:[/bold]")
+        
+        choices = [str(i) for i in range(1, len(settings_list) + 1)]
+        choice = IntPrompt.ask("Setting number", choices=choices)
+        key = settings_list[choice - 1]
+        definition = definitions[key]
+        
+        default = definition.get("default")
+        short_key = key.replace(f"{provider.upper()}_", "")
+        
+        if Confirm.ask(f"\nReset {short_key} to default ({default})?"):
+            self.provider_settings_mgr.reset_to_default(key)
+            self.console.print(f"\n[green]✅ {short_key} reset to default![/green]")
+        else:
+            self.console.print("\n[yellow]No changes made[/yellow]")
+        
+        input("\nPress Enter to continue...")
+    
+    def _reset_all_provider_settings(self, provider: str, settings_list: List[str]):
+        """Reset all provider settings to defaults"""
+        display_name = provider.replace("_", " ").title()
+        
+        if Confirm.ask(f"\n[bold red]Reset ALL {display_name} settings to defaults?[/bold red]"):
+            for key in settings_list:
+                self.provider_settings_mgr.reset_to_default(key)
+            self.console.print(f"\n[green]✅ All {display_name} settings reset to defaults![/green]")
+        else:
+            self.console.print("\n[yellow]No changes made[/yellow]")
+        
+        input("\nPress Enter to continue...")
     
     def manage_concurrency_limits(self):
         """Manage concurrency limits"""
