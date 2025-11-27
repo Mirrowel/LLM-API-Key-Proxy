@@ -926,17 +926,15 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         custom_reasoning_budget: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
-        Map reasoning_effort to thinking configuration for Gemini 2.5 and 3 models.
+        Map reasoning_effort to thinking configuration for Gemini 2.5, Gemini 3, and Claude models.
         
-        IMPORTANT: This function ONLY applies to Gemini 2.5 and 3 models.
-        For other models (e.g., Claude via Antigravity), it returns None.
-        
-        Gemini 2.5 and 3 use separate budgeting systems:
+        Supports thinking/reasoning via Antigravity for:
         - Gemini 2.5: thinkingBudget (integer tokens, based on Gemini CLI logic)
         - Gemini 3: thinkingLevel (string: "low" or "high")
+        - Claude: thinkingBudget (same as Gemini 2.5, proxied by Antigravity backend)
         
         Default behavior (no reasoning_effort):
-        - Gemini 2.5: thinkingBudget=-1 (auto mode)
+        - Gemini 2.5 & Claude: thinkingBudget=-1 (auto mode)
         - Gemini 3: thinkingLevel="high" (always enabled at high level)
         
         Args:
@@ -945,23 +943,23 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             custom_reasoning_budget: If True, use full budgets; if False, divide by 4
             
         Returns:
-            Dict with thinkingConfig or None if not a Gemini 2.5/3 model
+            Dict with thinkingConfig or None if model doesn't support thinking
         """
         internal_model = self._alias_to_model_name(model)
         
-        # Detect model family - ONLY support gemini-2.5 and gemini-3
-        # For other models (Claude, etc.), return None without filtering
+        # Detect model family
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal_model.startswith("gemini-3-")
+        is_claude = "claude" in model.lower()
         
-        # Return None for unsupported models - no reasoning config changes
-        if not is_gemini_25 and not is_gemini_3:
+        # Only Gemini 2.5, Gemini 3, and Claude support thinking via Antigravity
+        if not is_gemini_25 and not is_gemini_3 and not is_claude:
             return None
         
         # ========================================================================
-        # GEMINI 2.5: Use Gemini CLI logic with thinkingBudget
+        # GEMINI 2.5 & CLAUDE: Use thinkingBudget (INTEGER)
         # ========================================================================
-        if is_gemini_25:
+        if is_gemini_25 or is_claude:
             # Default: auto mode
             if not reasoning_effort:
                 return {"thinkingBudget": -1, "include_thoughts": True}
@@ -970,8 +968,9 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
             if reasoning_effort == "disable":
                 return {"thinkingBudget": 0, "include_thoughts": False}
             
-            # Model-specific budgets (same as Gemini CLI)
-            if "gemini-2.5-pro" in model:
+            # Model-specific budgets
+            # Claude uses Gemini 2.5 pro budgets (high-quality thinking)
+            if "gemini-2.5-pro" in model or is_claude:
                 budgets = {"low": 8192, "medium": 16384, "high": 32768}
             elif "gemini-2.5-flash" in model:
                 budgets = {"low": 6144, "medium": 12288, "high": 24576}
@@ -1408,6 +1407,48 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         # For both streaming and non-streaming, response is in 'response' field
         return antigravity_response.get("response", antigravity_response)
 
+    @staticmethod
+    def _recursively_parse_json_strings(obj: Any) -> Any:
+        """
+        Recursively parse JSON strings in nested data structures.
+        
+        Antigravity (especially for Claude models) sometimes returns tool arguments
+        with JSON-stringified values: {"files": "[{...}]"} instead of {"files": [{...}]}.
+        This causes double-encoding when we call json.dumps() on it.
+        
+        This function recursively detects and parses such strings to restore proper structure.
+        
+        Args:
+            obj: Any value (dict, list, str, etc.)
+            
+        Returns:
+            Parsed version with JSON strings converted to their object form
+        """
+        if isinstance(obj, dict):
+            # Recursively process dictionary values
+            return {k: AntigravityProvider._recursively_parse_json_strings(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            # Recursively process list items
+            return [AntigravityProvider._recursively_parse_json_strings(item) for item in obj]
+        elif isinstance(obj, str):
+            # Check if this string looks like JSON
+            stripped = obj.strip()
+            if (stripped.startswith('{') and stripped.endswith('}')) or \
+               (stripped.startswith('[') and stripped.endswith(']')):
+                try:
+                    # Attempt to parse as JSON
+                    parsed = json.loads(obj)
+                    # Recursively process the parsed result (it might contain more JSON strings)
+                    return AntigravityProvider._recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    # Not valid JSON, return as-is
+                    return obj
+            else:
+                return obj
+        else:
+            # Primitive types (int, bool, None, etc.) - return as-is
+            return obj
+
     def _gemini_to_openai_chunk(self, gemini_chunk: Dict[str, Any], model: str) -> Dict[str, Any]:
         """
         Convert a Gemini API response chunk to OpenAI format.
@@ -1416,6 +1457,10 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
         - Stores signatures in server-side cache (if enabled)
         - Includes signatures in response (if client passthrough enabled)
         - Filters standalone signature parts (no functionCall/text)
+        
+        FIXED: Handles Antigravity's double-encoded JSON in tool arguments
+        - Recursively parses JSON-stringified values before serialization
+        - Prevents "Unexpected non-whitespace character after JSON" errors
         
         Args:
             gemini_chunk: Gemini API response chunk
@@ -1621,12 +1666,20 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
                 if self._is_gemini_3_model(model) and self._enable_gemini3_tool_fix:
                     tool_name = self._strip_gemini3_namespace_from_name(tool_name)
                 
+                # Get raw args from Antigravity
+                raw_args = func_call.get("args", {})
+                
+                # FIX: Recursively parse JSON-stringified values
+                # Antigravity (especially Claude) returns: {"files": "[{...}]"}
+                # We need to parse these strings before calling json.dumps()
+                parsed_args = self._recursively_parse_json_strings(raw_args)
+                
                 tool_call = {
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
                         "name": tool_name,
-                        "arguments": json.dumps(func_call.get("args", {}))
+                        "arguments": json.dumps(parsed_args)
                     }
                 }
                 
