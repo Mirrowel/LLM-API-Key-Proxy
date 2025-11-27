@@ -92,19 +92,58 @@ CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "cache" / "ge
 GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
-DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """CRITICAL TOOL USAGE INSTRUCTIONS:
-You are operating in a custom environment where tool definitions differ from your training data.
-You MUST follow these rules strictly:
+DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
+You are operating in a CUSTOM ENVIRONMENT where tool definitions COMPLETELY DIFFER from your training data.
+VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 
-1. DO NOT use your internal training data to guess tool parameters
-2. ONLY use the exact parameter structure defined in the tool schema
-3. If a tool takes a 'files' parameter, it is ALWAYS an array of objects with specific properties, NEVER a simple array of strings
-4. If a tool edits code, it takes structured JSON objects with specific fields, NEVER raw diff strings or plain text
-5. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
-6. Array parameters have specific item types - check the schema's 'items' field for the exact structure
-7. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+## ABSOLUTE RULES - NO EXCEPTIONS
 
-If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully. Your training data about common tool names like 'read_file' or 'apply_diff' does NOT apply here.
+1. **SCHEMA IS LAW**: The JSON schema in each tool definition is the ONLY source of truth.
+   - Your pre-trained knowledge about tools like 'read_file', 'apply_diff', 'write_to_file', 'bash', etc. is INVALID here.
+   - Every tool has been REDEFINED with different parameters than what you learned during training.
+
+2. **PARAMETER NAMES ARE EXACT**: Use ONLY the parameter names from the schema.
+   - WRONG: 'suggested_answers', 'file_path', 'files_to_read', 'command_to_run'
+   - RIGHT: Check the 'properties' field in the schema for the exact names
+   - The schema's 'required' array tells you which parameters are mandatory
+
+3. **ARRAY PARAMETERS**: When a parameter has "type": "array", check the 'items' field:
+   - If items.type is "object", you MUST provide an array of objects with the EXACT properties listed
+   - If items.type is "string", you MUST provide an array of strings
+   - NEVER provide a single object when an array is expected
+   - NEVER provide an array when a single value is expected
+
+4. **NESTED OBJECTS**: When items.type is "object":
+   - Check items.properties for the EXACT field names required
+   - Check items.required for which nested fields are mandatory
+   - Include ALL required nested fields in EVERY array element
+
+5. **STRICT PARAMETERS HINT**: Tool descriptions contain "STRICT PARAMETERS: ..." which lists:
+   - Parameter name, type, and whether REQUIRED
+   - For arrays of objects: the nested structure in brackets like [field: type REQUIRED, ...]
+   - USE THIS as your quick reference, but the JSON schema is authoritative
+
+6. **BEFORE EVERY TOOL CALL**:
+   a. Read the tool's 'parametersJsonSchema' or 'parameters' field completely
+   b. Identify ALL required parameters
+   c. Verify your parameter names match EXACTLY (case-sensitive)
+   d. For arrays, verify you're providing the correct item structure
+   e. Do NOT add parameters that don't exist in the schema
+
+## COMMON FAILURE PATTERNS TO AVOID
+
+- Using 'path' when schema says 'filePath' (or vice versa)
+- Using 'content' when schema says 'text' (or vice versa)  
+- Providing {"file": "..."} when schema wants [{"path": "...", "line_ranges": [...]}]
+- Omitting required nested fields in array items
+- Adding 'additionalProperties' that the schema doesn't define
+- Guessing parameter names from similar tools you know from training
+
+## REMEMBER
+Your training data about function calling is OUTDATED for this environment.
+The tool names may look familiar, but the schemas are DIFFERENT.
+When in doubt, RE-READ THE SCHEMA before making the call.
+</CRITICAL_TOOL_USAGE_INSTRUCTIONS>
 """
 
 # Gemini finish reason mapping
@@ -150,12 +189,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         self._preserve_signatures_in_client = _env_bool("GEMINI_CLI_PRESERVE_THOUGHT_SIGNATURES", True)
         self._enable_signature_cache = _env_bool("GEMINI_CLI_ENABLE_SIGNATURE_CACHE", True)
         self._enable_gemini3_tool_fix = _env_bool("GEMINI_CLI_GEMINI3_TOOL_FIX", True)
+        self._gemini3_enforce_strict_schema = _env_bool("GEMINI_CLI_GEMINI3_STRICT_SCHEMA", True)
         
         # Gemini 3 tool fix configuration
         self._gemini3_tool_prefix = os.getenv("GEMINI_CLI_GEMINI3_TOOL_PREFIX", "gemini3_")
         self._gemini3_description_prompt = os.getenv(
             "GEMINI_CLI_GEMINI3_DESCRIPTION_PROMPT",
-            "\n\nSTRICT PARAMETERS: {params}."
+            "\n\n⚠️ STRICT PARAMETERS (use EXACTLY as shown): {params}. Do NOT use parameters from your training data - use ONLY these parameter names."
         )
         self._gemini3_system_instruction = os.getenv(
             "GEMINI_CLI_GEMINI3_SYSTEM_INSTRUCTION",
@@ -164,7 +204,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         lib_logger.debug(
             f"GeminiCli config: signatures_in_client={self._preserve_signatures_in_client}, "
-            f"cache={self._enable_signature_cache}, gemini3_fix={self._enable_gemini3_tool_fix}"
+            f"cache={self._enable_signature_cache}, gemini3_fix={self._enable_gemini3_tool_fix}, "
+            f"gemini3_strict_schema={self._gemini3_enforce_strict_schema}"
         )
 
     # =========================================================================
@@ -1145,6 +1186,31 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return schema
 
+    def _enforce_strict_schema(self, schema: Any) -> Any:
+        """
+        Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
+        
+        Adds 'additionalProperties: false' recursively to all object schemas,
+        which tells the model it CANNOT add properties not in the schema.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        
+        result = {}
+        for key, value in schema.items():
+            if isinstance(value, dict):
+                result[key] = self._enforce_strict_schema(value)
+            elif isinstance(value, list):
+                result[key] = [self._enforce_strict_schema(item) if isinstance(item, dict) else item for item in value]
+            else:
+                result[key] = value
+        
+        # Add additionalProperties: false to object schemas
+        if result.get("type") == "object" and "properties" in result:
+            result["additionalProperties"] = False
+        
+        return result
+
     def _transform_tool_schemas(self, tools: List[Dict[str, Any]], model: str = "") -> List[Dict[str, Any]]:
         """
         Transforms a list of OpenAI-style tool schemas into the format required by the Gemini CLI API.
@@ -1153,6 +1219,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         For Gemini 3 models, also applies:
         - Namespace prefix to tool names
         - Parameter signature injection into descriptions
+        - Strict schema enforcement (additionalProperties: false)
         """
         transformed_declarations = []
         is_gemini_3 = self._is_gemini_3(model)
@@ -1179,6 +1246,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     name = new_function.get("name", "")
                     if name:
                         new_function["name"] = f"{self._gemini3_tool_prefix}{name}"
+                    
+                    # Enforce strict schema (additionalProperties: false)
+                    if self._gemini3_enforce_strict_schema and "parametersJsonSchema" in new_function:
+                        new_function["parametersJsonSchema"] = self._enforce_strict_schema(new_function["parametersJsonSchema"])
                     
                     # Inject parameter signature into description
                     new_function = self._inject_signature_into_description(new_function)
@@ -1218,9 +1289,20 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return func_decl
 
-    def _format_type_hint(self, prop_data: Dict[str, Any]) -> str:
-        """Format a type hint for a property schema."""
+    def _format_type_hint(self, prop_data: Dict[str, Any], depth: int = 0) -> str:
+        """Format a detailed type hint for a property schema."""
         type_hint = prop_data.get("type", "unknown")
+        
+        # Handle enum values - show allowed options
+        if "enum" in prop_data:
+            enum_vals = prop_data["enum"]
+            if len(enum_vals) <= 5:
+                return f"string ENUM[{', '.join(repr(v) for v in enum_vals)}]"
+            return f"string ENUM[{len(enum_vals)} options]"
+        
+        # Handle const values
+        if "const" in prop_data:
+            return f"string CONST={repr(prop_data['const'])}"
         
         if type_hint == "array":
             items = prop_data.get("items", {})
@@ -1233,13 +1315,29 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         nested_list = []
                         for n, d in nested_props.items():
                             if isinstance(d, dict):
-                                t = d.get("type", "unknown")
+                                # Recursively format nested types (limit depth)
+                                if depth < 1:
+                                    t = self._format_type_hint(d, depth + 1)
+                                else:
+                                    t = d.get("type", "unknown")
                                 req = " REQUIRED" if n in nested_req else ""
                                 nested_list.append(f"{n}: {t}{req}")
                         return f"ARRAY_OF_OBJECTS[{', '.join(nested_list)}]"
                     return "ARRAY_OF_OBJECTS"
                 return f"ARRAY_OF_{item_type.upper()}"
             return "ARRAY"
+        
+        if type_hint == "object":
+            nested_props = prop_data.get("properties", {})
+            nested_req = prop_data.get("required", [])
+            if nested_props and depth < 1:
+                nested_list = []
+                for n, d in nested_props.items():
+                    if isinstance(d, dict):
+                        t = d.get("type", "unknown")
+                        req = " REQUIRED" if n in nested_req else ""
+                        nested_list.append(f"{n}: {t}{req}")
+                return f"object{{{', '.join(nested_list)}}}"
         
         return type_hint
 

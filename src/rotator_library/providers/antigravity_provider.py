@@ -317,8 +317,14 @@ def _clean_claude_schema(schema: Any) -> Any:
         return schema
     
     # Fields not supported by Antigravity/Google's Proto-based API
+    # Note: Claude via Antigravity rejects JSON Schema draft 2020-12 validation keywords
     incompatible = {
         '$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern',
+        'minLength', 'maxLength', 'minimum', 'maximum', 'default',
+        'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'format',
+        'minProperties', 'maxProperties', 'uniqueItems', 'contentEncoding',
+        'contentMediaType', 'contentSchema', 'deprecated', 'readOnly', 'writeOnly',
+        'examples', '$id', '$ref', '$defs', 'definitions', 'title',
     }
     
     # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
