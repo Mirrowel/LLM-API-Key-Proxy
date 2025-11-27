@@ -589,7 +589,10 @@ async def streaming_response_wrapper(
                                     final_message["function_call"]["arguments"] += value["arguments"]
                         
                         else: # Generic key handling for other data like 'reasoning'
-                            if key not in final_message:
+                            # FIX: Role should always replace, never concatenate
+                            if key == "role":
+                                final_message[key] = value
+                            elif key not in final_message:
                                 final_message[key] = value
                             elif isinstance(final_message.get(key), str):
                                 final_message[key] += value
