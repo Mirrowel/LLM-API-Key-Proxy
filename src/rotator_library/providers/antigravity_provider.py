@@ -64,7 +64,7 @@ AVAILABLE_MODELS = [
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
-DEFAULT_MAX_OUTPUT_TOKENS = 16384
+DEFAULT_MAX_OUTPUT_TOKENS = 32384
 
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
