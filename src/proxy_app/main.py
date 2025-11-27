@@ -38,6 +38,10 @@ if args.add_credential:
 # If we get here, we're ACTUALLY running the proxy - NOW show startup messages and start timer
 _start_time = time.time()
 
+# Load .env early so PROXY_API_KEY is available for display
+from dotenv import load_dotenv
+load_dotenv()
+
 # Get proxy API key for display
 proxy_api_key = os.getenv("PROXY_API_KEY")
 if proxy_api_key:
