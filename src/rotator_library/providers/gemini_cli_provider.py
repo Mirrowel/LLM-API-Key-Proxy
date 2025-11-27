@@ -870,7 +870,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         for part in parts:
             delta = {}
-            finish_reason = None
             
             has_func = 'functionCall' in part
             has_text = 'text' in part
@@ -892,8 +891,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Use provided ID or generate unique one with nanosecond precision
                 tool_call_id = function_call.get('id') or f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
                 
+                # Get current tool index from accumulator (default 0) and increment
+                current_tool_idx = accumulator.get('tool_idx', 0) if accumulator else 0
+                
                 tool_call = {
-                    "index": 0,
+                    "index": current_tool_idx,
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
@@ -915,6 +917,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         tool_call["thought_signature"] = sig
                 
                 delta['tool_calls'] = [tool_call]
+                # Mark that we've sent tool calls and increment tool_idx
+                if accumulator is not None:
+                    accumulator['has_tool_calls'] = True
+                    accumulator['tool_idx'] = current_tool_idx + 1
                 
             elif has_text:
                 # Use an explicit check for the 'thought' flag, as its type can be inconsistent
@@ -926,14 +932,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if not delta:
                 continue
 
-            raw_finish_reason = candidate.get('finishReason')
-            if raw_finish_reason:
-                finish_reason = FINISH_REASON_MAP.get(raw_finish_reason, 'stop')
-                # Use tool_calls if we have function calls
-                if delta.get('tool_calls'):
-                    finish_reason = 'tool_calls'
+            # Mark that we have tool calls for accumulator tracking
+            # finish_reason determination is handled by the client
+            
+            # Mark stream complete if we have usageMetadata
+            is_final_chunk = 'usageMetadata' in response_data
+            if is_final_chunk and accumulator is not None:
+                accumulator['is_complete'] = True
 
-            choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            # Build choice - don't include finish_reason, let client handle it
+            choice = {"index": 0, "delta": delta}
             
             openai_chunk = {
                 "choices": [choice], "model": model_id, "object": "chat.completion.chunk",
@@ -1020,9 +1028,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
                     final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
 
-            # Get finish reason from the last chunk that has it
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+            # Note: chunks don't include finish_reason (client handles it)
+            # This is kept for compatibility but shouldn't trigger
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -1039,6 +1046,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if field not in final_message:
                 final_message[field] = None
 
+        # Determine finish_reason based on content (same logic as client.py)
+        # tool_calls wins, otherwise stop
+        if aggregated_tool_calls:
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop"
+        
         # Construct the final response
         final_choice = {
             "index": 0,
@@ -1343,6 +1357,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
 
             async def stream_handler():
+                # Track state across chunks for tool indexing
+                accumulator = {"has_tool_calls": False, "tool_idx": 0, "is_complete": False}
+                
                 final_headers = auth_header.copy()
                 final_headers.update({
                     "User-Agent": "google-api-nodejs-client/9.15.1",
@@ -1362,10 +1379,24 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                 if data_str == "[DONE]": break
                                 try:
                                     chunk = json.loads(data_str)
-                                    for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                    for openai_chunk in self._convert_chunk_to_openai(chunk, model, accumulator):
                                         yield litellm.ModelResponse(**openai_chunk)
                                 except json.JSONDecodeError:
                                     lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
+                        
+                        # Emit final chunk if stream ended without usageMetadata
+                        # Client will determine the correct finish_reason
+                        if not accumulator.get("is_complete"):
+                            final_chunk = {
+                                "id": f"chatcmpl-geminicli-{time.time()}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                                # Include minimal usage to signal this is the final chunk
+                                "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
+                            }
+                            yield litellm.ModelResponse(**final_chunk)
 
                 except httpx.HTTPStatusError as e:
                     error_body = None

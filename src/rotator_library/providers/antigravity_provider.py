@@ -16,7 +16,6 @@ Key Features:
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import hashlib
 import json
@@ -58,7 +57,7 @@ AVAILABLE_MODELS = [
     #"gemini-2.5-pro",
     #"gemini-2.5-flash",
     #"gemini-2.5-flash-lite",
-    "gemini-3-pro-preview",
+    "gemini-3-pro-preview",  # Internally mapped to -low/-high variant based on thinkingLevel
     #"gemini-3-pro-image-preview",
     #"gemini-2.5-computer-use-preview-10-2025",
     "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
@@ -71,12 +70,13 @@ DEFAULT_MAX_OUTPUT_TOKENS = 16384
 MODEL_ALIAS_MAP = {
     "rev19-uic3-1p": "gemini-2.5-computer-use-preview-10-2025",
     "gemini-3-pro-image": "gemini-3-pro-image-preview",
+    "gemini-3-pro-low": "gemini-3-pro-preview",
     "gemini-3-pro-high": "gemini-3-pro-preview",
 }
 MODEL_ALIAS_REVERSE = {v: k for k, v in MODEL_ALIAS_MAP.items()}
 
 # Models to exclude from dynamic discovery
-EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-3-pro-low", "gemini-2.5-pro"}
+EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-2.5-pro"}
 
 # Gemini finish reason mapping
 FINISH_REASON_MAP = {
@@ -101,13 +101,26 @@ You MUST follow these rules strictly:
 
 1. DO NOT use your internal training data to guess tool parameters
 2. ONLY use the exact parameter structure defined in the tool schema
-3. If a tool takes a 'files' parameter, it is ALWAYS an array of objects with specific properties, NEVER a simple array of strings
-4. If a tool edits code, it takes structured JSON objects with specific fields, NEVER raw diff strings or plain text
-5. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
-6. Array parameters have specific item types - check the schema's 'items' field for the exact structure
-7. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+3. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
+4. Array parameters have specific item types - check the schema's 'items' field for the exact structure
+5. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
 
 If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully. Your training data about common tool names like 'read_file' or 'apply_diff' does NOT apply here.
+"""
+
+# Claude tool fix system instruction (prevents hallucination)
+DEFAULT_CLAUDE_SYSTEM_INSTRUCTION = """CRITICAL TOOL USAGE INSTRUCTIONS:
+You are operating in a custom environment where tool definitions differ from your training data.
+You MUST follow these rules strictly:
+
+1. DO NOT use your internal training data to guess tool parameters
+2. ONLY use the exact parameter structure defined in the tool schema
+3. Parameter names in schemas are EXACT - do not substitute with similar names from your training (e.g., use 'follow_up' not 'suggested_answers')
+4. Array parameters have specific item types - check the schema's 'items' field for the exact structure
+5. When you see "STRICT PARAMETERS" in a tool description, those type definitions override any assumptions
+6. Tool use in agentic workflows is REQUIRED - you must call tools with the exact parameters specified in the schema
+
+If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully.
 """
 
 
@@ -169,8 +182,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
     Antigravity sometimes returns tool arguments with JSON-stringified values:
     {"files": "[{...}]"} instead of {"files": [{...}]}.
     
-    Additionally handles malformed double-encoded JSON where Antigravity
-    returns strings like '[{...}]}' (extra trailing '}').
+    Additionally handles:
+    - Malformed double-encoded JSON (extra trailing '}' or ']')
+    - Escaped string content (\n, \t, \", etc.)
     """
     if isinstance(obj, dict):
         return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
@@ -178,6 +192,23 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
         return [_recursively_parse_json_strings(item) for item in obj]
     elif isinstance(obj, str):
         stripped = obj.strip()
+        
+        # Check if string contains common escape sequences that need unescaping
+        # This handles cases where diff content or other text has literal \n instead of newlines
+        if '\\n' in obj or '\\t' in obj or '\\"' in obj or '\\\\' in obj:
+            try:
+                # Use json.loads with quotes to properly unescape the string
+                # This converts \n -> newline, \t -> tab, \" -> quote, etc.
+                unescaped = json.loads(f'"{obj}"')
+                lib_logger.debug(
+                    f"[Antigravity] Unescaped string content: "
+                    f"{len(obj) - len(unescaped)} chars changed"
+                )
+                return unescaped
+            except (json.JSONDecodeError, ValueError):
+                # If unescaping fails, continue with original processing
+                pass
+        
         # Check if it looks like JSON (starts with { or [)
         if stripped and stripped[0] in ('{', '['):
             # Try standard parsing first
@@ -215,7 +246,7 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                         cleaned = stripped[:last_brace+1]
                         parsed = json.loads(cleaned)
                         lib_logger.warning(
-                            f"Auto-corrected malformed JSON string: "
+                            f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
                         return _recursively_parse_json_strings(parsed)
@@ -369,6 +400,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._enable_signature_cache = _env_bool("ANTIGRAVITY_ENABLE_SIGNATURE_CACHE", True)
         self._enable_dynamic_models = _env_bool("ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False)
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
+        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
         
         # Gemini 3 tool fix configuration
         self._gemini3_tool_prefix = os.getenv("ANTIGRAVITY_GEMINI3_TOOL_PREFIX", "gemini3_")
@@ -381,6 +413,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
         )
         
+        # Claude tool fix configuration (separate from Gemini 3)
+        self._claude_description_prompt = os.getenv(
+            "ANTIGRAVITY_CLAUDE_DESCRIPTION_PROMPT",
+            "\n\nSTRICT PARAMETERS: {params}."
+        )
+        self._claude_system_instruction = os.getenv(
+            "ANTIGRAVITY_CLAUDE_SYSTEM_INSTRUCTION",
+            DEFAULT_CLAUDE_SYSTEM_INSTRUCTION
+        )
+        
         # Log configuration
         self._log_config()
     
@@ -389,7 +431,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         lib_logger.debug(
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
-            f"gemini3_fix={self._enable_gemini3_tool_fix}"
+            f"gemini3_fix={self._enable_gemini3_tool_fix}, claude_fix={self._enable_claude_tool_fix}"
         )
     
     # =========================================================================
@@ -558,7 +600,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     if tc.get("type") == "function":
-                        tool_id_to_name[tc["id"]] = tc["function"]["name"]
+                        tc_id = tc["id"]
+                        tc_name = tc["function"]["name"]
+                        tool_id_to_name[tc_id] = tc_name
+                        #lib_logger.debug(f"[ID Mapping] Registered tool_call: id={tc_id}, name={tc_name}")
         
         # Convert each message
         for msg in messages:
@@ -654,6 +699,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             tool_id = tc.get("id", "")
             func_name = tc["function"]["name"]
             
+            #lib_logger.debug(
+            #    f"[ID Transform] Converting assistant tool_call to functionCall: "
+            #    f"id={tool_id}, name={func_name}"
+            #)
+
             # Add prefix for Gemini 3
             if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
                 func_name = f"{self._gemini3_tool_prefix}{func_name}"
@@ -728,6 +778,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
         
+        # Log ID lookup
+        if tool_id not in tool_id_to_name:
+            lib_logger.warning(
+                f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
+                f"Available IDs: {list(tool_id_to_name.keys())}"
+            )
+        #else:
+            #lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
+        
         # Add prefix for Gemini 3
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
@@ -758,10 +817,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         Converts linear format (call, response, call, response)
         to grouped format (model with calls, user with all responses).
+        
+        IMPORTANT: Preserves ID-based pairing to prevent mismatches.
         """
         new_contents = []
-        pending_groups = []
-        collected_responses = []
+        pending_groups = []  # List of {"ids": [id1, id2, ...], "call_indices": [...]}
+        collected_responses = {}  # Dict mapping ID -> response_part
         
         for content in contents:
             role = content.get("role")
@@ -770,15 +831,33 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             response_parts = [p for p in parts if "functionResponse" in p]
             
             if response_parts:
-                collected_responses.extend(response_parts)
+                # Collect responses by ID (ignore duplicates - keep first occurrence)
+                for resp in response_parts:
+                    resp_id = resp.get("functionResponse", {}).get("id", "")
+                    if resp_id:
+                        if resp_id in collected_responses:
+                            lib_logger.warning(
+                                f"[Grouping] Duplicate response ID detected: {resp_id}. "
+                                f"Ignoring duplicate - this may indicate malformed conversation history."
+                            )
+                            continue
+                        #lib_logger.debug(f"[Grouping] Collected response for ID: {resp_id}")
+                        collected_responses[resp_id] = resp
                 
-                # Try to satisfy pending groups
+                # Try to satisfy pending groups (newest first)
                 for i in range(len(pending_groups) - 1, -1, -1):
                     group = pending_groups[i]
-                    if len(collected_responses) >= group["count"]:
-                        group_responses = collected_responses[:group["count"]]
-                        collected_responses = collected_responses[group["count"]:]
+                    group_ids = group["ids"]
+                    
+                    # Check if we have ALL responses for this group
+                    if all(gid in collected_responses for gid in group_ids):
+                        # Extract responses in the same order as the function calls
+                        group_responses = [collected_responses.pop(gid) for gid in group_ids]
                         new_contents.append({"parts": group_responses, "role": "user"})
+                        #lib_logger.debug(
+                        #    f"[Grouping] Satisfied group with {len(group_responses)} responses: "
+                        #    f"ids={group_ids}"
+                        #)
                         pending_groups.pop(i)
                         break
                 continue
@@ -787,16 +866,32 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 func_calls = [p for p in parts if "functionCall" in p]
                 new_contents.append(content)
                 if func_calls:
-                    pending_groups.append({"count": len(func_calls)})
+                    call_ids = [fc.get("functionCall", {}).get("id", "") for fc in func_calls]
+                    call_ids = [cid for cid in call_ids if cid]  # Filter empty IDs
+                    if call_ids:
+                        lib_logger.debug(f"[Grouping] Created pending group expecting {len(call_ids)} responses: ids={call_ids}")
+                        pending_groups.append({"ids": call_ids, "call_indices": list(range(len(func_calls)))})
             else:
                 new_contents.append(content)
         
-        # Handle remaining groups
+        # Handle remaining groups (shouldn't happen in well-formed conversations)
         for group in pending_groups:
-            if len(collected_responses) >= group["count"]:
-                group_responses = collected_responses[:group["count"]]
-                collected_responses = collected_responses[group["count"]:]
+            group_ids = group["ids"]
+            available_ids = [gid for gid in group_ids if gid in collected_responses]
+            if available_ids:
+                group_responses = [collected_responses.pop(gid) for gid in available_ids]
                 new_contents.append({"parts": group_responses, "role": "user"})
+                lib_logger.warning(
+                    f"[Grouping] Partial group satisfaction: expected {len(group_ids)}, "
+                    f"got {len(available_ids)} responses"
+                )
+        
+        # Warn about unmatched responses
+        if collected_responses:
+            lib_logger.warning(
+                f"[Grouping] {len(collected_responses)} unmatched responses remaining: "
+                f"ids={list(collected_responses.keys())}"
+            )
         
         return new_contents
     
@@ -823,11 +918,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     
     def _inject_signature_into_descriptions(
         self,
-        tools: List[Dict[str, Any]]
+        tools: List[Dict[str, Any]],
+        description_prompt: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Inject parameter signatures into tool descriptions for Gemini 3."""
+        """Inject parameter signatures into tool descriptions for Gemini 3 & Claude."""
         if not tools:
             return tools
+        
+        # Use provided prompt or default to Gemini 3 prompt
+        prompt_template = description_prompt or self._gemini3_description_prompt
         
         modified = copy.deepcopy(tools)
         for tool in modified:
@@ -854,7 +953,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     )
                 
                 if param_list:
-                    sig_str = self._gemini3_description_prompt.replace(
+                    sig_str = prompt_template.replace(
                         "{params}", ", ".join(param_list)
                     )
                     func_decl["description"] = func_decl.get("description", "") + sig_str
@@ -891,6 +990,42 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if name and name.startswith(self._gemini3_tool_prefix):
             return name[len(self._gemini3_tool_prefix):]
         return name
+    
+    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]], model: str = "") -> Optional[Dict[str, Any]]:
+        """
+        Translates OpenAI's `tool_choice` to Gemini's `toolConfig`.
+        Handles Gemini 3 namespace prefixes for specific tool selection.
+        """
+        if not tool_choice:
+            return None
+
+        config = {}
+        mode = "AUTO"  # Default to auto
+        is_gemini_3 = self._is_gemini_3(model)
+
+        if isinstance(tool_choice, str):
+            if tool_choice == "auto":
+                mode = "AUTO"
+            elif tool_choice == "none":
+                mode = "NONE"
+            elif tool_choice == "required":
+                mode = "ANY"
+        elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            function_name = tool_choice.get("function", {}).get("name")
+            if function_name:
+                # Add Gemini 3 prefix if needed
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                
+                mode = "ANY"  # Force a call, but only to this function
+                config["functionCallingConfig"] = {
+                    "mode": mode,
+                    "allowedFunctionNames": [function_name]
+                }
+                return config
+
+        config["functionCallingConfig"] = {"mode": mode}
+        return config
     
     # =========================================================================
     # REQUEST TRANSFORMATION
@@ -936,7 +1071,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         gemini_payload: Dict[str, Any],
         model: str,
         max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None
+        reasoning_effort: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Transform Gemini CLI payload to complete Antigravity format.
@@ -953,6 +1089,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if self._is_claude(internal_model) and reasoning_effort:
             if internal_model == "claude-sonnet-4-5" and not internal_model.endswith("-thinking"):
                 internal_model = "claude-sonnet-4-5-thinking"
+        
+        # Map gemini-3-pro-preview to -low/-high variant based on thinking config
+        if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-preview":
+            # Check thinking config to determine variant
+            thinking_config = gemini_payload.get("generationConfig", {}).get("thinkingConfig", {})
+            thinking_level = thinking_config.get("thinkingLevel", "high")
+            if thinking_level == "low":
+                internal_model = "gemini-3-pro-low"
+            else:
+                internal_model = "gemini-3-pro-high"
         
         # Wrap in Antigravity envelope
         antigravity_payload = {
@@ -983,10 +1129,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         antigravity_payload["request"]["generationConfig"] = gen_config
         
-        # Set toolConfig mode
-        tool_config = antigravity_payload["request"].setdefault("toolConfig", {})
-        func_config = tool_config.setdefault("functionCallingConfig", {})
-        func_config["mode"] = "VALIDATED"
+        # Set toolConfig based on tool_choice parameter
+        tool_config_result = self._translate_tool_choice(tool_choice, model)
+        if tool_config_result:
+            antigravity_payload["request"]["toolConfig"] = tool_config_result
+        else:
+            # Default to AUTO if no tool_choice specified
+            tool_config = antigravity_payload["request"].setdefault("toolConfig", {})
+            func_config = tool_config.setdefault("functionCallingConfig", {})
+            func_config["mode"] = "AUTO"
         
         # Handle Gemini 3 thinking logic
         if not internal_model.startswith("gemini-3-"):
@@ -1053,7 +1204,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         reasoning_content = ""
         tool_calls = []
         first_sig_seen = False
-        tool_idx = 0
+        # Use accumulator's tool_idx if available, otherwise use local counter
+        tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
         
         for part in content_parts:
             has_func = "functionCall" in part
@@ -1099,23 +1251,29 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if tool_calls:
             delta["tool_calls"] = tool_calls
             delta["role"] = "assistant"
+            # Update tool_idx for next chunk
+            if accumulator is not None:
+                accumulator["tool_idx"] = tool_idx
         elif text_content or reasoning_content:
             delta["role"] = "assistant"
         
-        # Handle finish reason
-        finish_reason = self._map_finish_reason(candidate.get("finishReason"), bool(tool_calls))
-        if finish_reason and accumulator is not None:
+        # Build usage if present
+        usage = self._build_usage(chunk.get("usageMetadata", {}))
+        
+        # Mark completion when we see usageMetadata
+        if chunk.get("usageMetadata") and accumulator is not None:
             accumulator["is_complete"] = True
         
-        # Build usage
-        usage = self._build_usage(chunk.get("usageMetadata", {}))
+        # Build choice - just translate, don't include finish_reason
+        # Client will handle finish_reason logic
+        choice = {"index": 0, "delta": delta}
         
         response = {
             "id": chunk.get("responseId", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+            "choices": [choice]
         }
         
         if usage:
@@ -1188,12 +1346,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         finish_reason = self._map_finish_reason(candidate.get("finishReason"), bool(tool_calls))
         usage = self._build_usage(response.get("usageMetadata", {}))
         
+        # For non-streaming, always include finish_reason (should always be present)
         result = {
             "id": response.get("responseId", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}]
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason or "stop"}]
         }
         
         if usage:
@@ -1211,6 +1370,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """Extract and format a tool call from a response part."""
         func_call = part["functionCall"]
         tool_id = func_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        
+        #lib_logger.debug(f"[ID Extraction] Extracting tool call: id={tool_id}, raw_id={func_call.get('id')}")
         
         tool_name = func_call.get("name", "")
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
@@ -1383,6 +1544,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         stream = kwargs.get("stream", False)
         credential_path = kwargs.pop("credential_identifier", kwargs.get("api_key", ""))
         tools = kwargs.get("tools")
+        tool_choice = kwargs.get("tool_choice")
         reasoning_effort = kwargs.get("reasoning_effort")
         top_p = kwargs.get("top_p")
         max_tokens = kwargs.get("max_tokens")
@@ -1402,9 +1564,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if system_instruction:
             gemini_payload["system_instruction"] = system_instruction
         
-        # Inject Gemini 3 system instruction
-        if self._is_gemini_3(model) and self._enable_gemini3_tool_fix and tools:
-            self._inject_gemini3_system_instruction(gemini_payload)
+        # Inject tool usage hardening system instructions
+        if tools:
+            if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                self._inject_tool_hardening_instruction(gemini_payload, self._gemini3_system_instruction)
+            elif self._is_claude(model) and self._enable_claude_tool_fix:
+                self._inject_tool_hardening_instruction(gemini_payload, self._claude_system_instruction)
         
         # Add generation config
         gen_config = {}
@@ -1423,13 +1588,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if gemini_tools:
             gemini_payload["tools"] = gemini_tools
             
-            # Apply Gemini 3 tool transformations
+            # Apply tool transformations
             if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                # Gemini 3: namespace prefix + parameter signatures
                 gemini_payload["tools"] = self._apply_gemini3_namespace(gemini_payload["tools"])
-                gemini_payload["tools"] = self._inject_signature_into_descriptions(gemini_payload["tools"])
+                gemini_payload["tools"] = self._inject_signature_into_descriptions(
+                    gemini_payload["tools"],
+                    self._gemini3_description_prompt
+                )
+            elif self._is_claude(model) and self._enable_claude_tool_fix:
+                # Claude: parameter signatures only (no namespace prefix)
+                gemini_payload["tools"] = self._inject_signature_into_descriptions(
+                    gemini_payload["tools"],
+                    self._claude_description_prompt
+                )
         
         # Transform to Antigravity format
-        payload = self._transform_to_antigravity_format(gemini_payload, model, max_tokens, reasoning_effort)
+        payload = self._transform_to_antigravity_format(gemini_payload, model, max_tokens, reasoning_effort, tool_choice)
         file_logger.log_request(payload)
         
         # Make API call
@@ -1467,12 +1642,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
             raise
     
-    def _inject_gemini3_system_instruction(self, payload: Dict[str, Any]) -> None:
-        """Inject Gemini 3 system instruction for tool fix."""
-        if not self._gemini3_system_instruction:
+    def _inject_tool_hardening_instruction(self, payload: Dict[str, Any], instruction_text: str) -> None:
+        """Inject tool usage hardening system instruction for Gemini 3 & Claude."""
+        if not instruction_text:
             return
         
-        instruction_part = {"text": self._gemini3_system_instruction}
+        instruction_part = {"text": instruction_text}
         
         if "system_instruction" in payload:
             existing = payload["system_instruction"]
@@ -1518,13 +1693,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion."""
+        # Accumulator tracks state across chunks for caching and tool indexing
         accumulator = {
             "reasoning_content": "",
             "thought_signature": "",
             "text_content": "",
             "tool_calls": [],
-            "is_complete": False
-        } if self._is_claude(model) and self._enable_signature_cache else None
+            "tool_idx": 0,  # Track tool call index across chunks
+            "is_complete": False  # Track if we received usageMetadata
+        }
         
         async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
             if response.status_code >= 400:
@@ -1556,8 +1733,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             file_logger.log_error(f"Parse error: {data_str[:100]}")
                         continue
         
+        # If stream ended without usageMetadata chunk, emit a final chunk with finish_reason
+        # Emit final chunk if stream ended without usageMetadata
+        # Client will determine the correct finish_reason based on accumulated state
+        if not accumulator.get("is_complete"):
+            final_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                # Include minimal usage to signal this is the final chunk
+                "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
+            }
+            yield litellm.ModelResponse(**final_chunk)
+        
         # Cache Claude thinking after stream completes
-        if accumulator and accumulator.get("reasoning_content"):
+        if self._is_claude(model) and self._enable_signature_cache and accumulator.get("reasoning_content"):
             self._cache_thinking(
                 accumulator["reasoning_content"],
                 accumulator["thought_signature"],

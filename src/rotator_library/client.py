@@ -495,11 +495,19 @@ class RotatingClient:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
         and distinguishes between content and streamed errors.
+        
+        FINISH_REASON HANDLING:
+        Providers just translate chunks - this wrapper handles ALL finish_reason logic:
+        1. Strip finish_reason from intermediate chunks (litellm defaults to "stop")
+        2. Track accumulated_finish_reason with priority: tool_calls > length/content_filter > stop
+        3. Only emit finish_reason on final chunk (detected by usage.completion_tokens > 0)
         """
         last_usage = None
         stream_completed = False
         stream_iterator = stream.__aiter__()
         json_buffer = ""
+        accumulated_finish_reason = None  # Track strongest finish_reason across chunks
+        has_tool_calls = False  # Track if ANY tool calls were seen in stream
 
         try:
             while True:
@@ -507,26 +515,64 @@ class RotatingClient:
                     lib_logger.info(
                         f"Client disconnected. Aborting stream for credential ...{key[-6:]}."
                     )
-                    # Do not yield [DONE] because the client is gone.
-                    # The 'finally' block will handle key release.
                     break
 
                 try:
                     chunk = await stream_iterator.__anext__()
                     if json_buffer:
-                        # If we are about to discard a buffer, it means data was likely lost.
-                        # Log this as a warning to make it visible.
                         lib_logger.warning(
                             f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}"
                         )
                         json_buffer = ""
 
-                    yield f"data: {json.dumps(chunk.dict())}\n\n"
+                    # Convert chunk to dict, handling both litellm.ModelResponse and raw dicts
+                    if hasattr(chunk, "dict"):
+                        chunk_dict = chunk.dict()
+                    elif hasattr(chunk, "model_dump"):
+                        chunk_dict = chunk.model_dump()
+                    else:
+                        chunk_dict = chunk
+                    
+                    # === FINISH_REASON LOGIC ===
+                    # Providers send raw chunks without finish_reason logic.
+                    # This wrapper determines finish_reason based on accumulated state.
+                    if "choices" in chunk_dict and chunk_dict["choices"]:
+                        choice = chunk_dict["choices"][0]
+                        delta = choice.get("delta", {})
+                        usage = chunk_dict.get("usage", {})
+                        
+                        # Track tool_calls across ALL chunks - if we ever see one, finish_reason must be tool_calls
+                        if delta.get("tool_calls"):
+                            has_tool_calls = True
+                            accumulated_finish_reason = "tool_calls"
+                        
+                        # Detect final chunk: has usage with completion_tokens > 0
+                        has_completion_tokens = (
+                            usage and 
+                            isinstance(usage, dict) and 
+                            usage.get("completion_tokens", 0) > 0
+                        )
+                        
+                        if has_completion_tokens:
+                            # FINAL CHUNK: Determine correct finish_reason
+                            if has_tool_calls:
+                                # Tool calls always win
+                                choice["finish_reason"] = "tool_calls"
+                            elif accumulated_finish_reason:
+                                # Use accumulated reason (length, content_filter, etc.)
+                                choice["finish_reason"] = accumulated_finish_reason
+                            else:
+                                # Default to stop
+                                choice["finish_reason"] = "stop"
+                        else:
+                            # INTERMEDIATE CHUNK: Never emit finish_reason
+                            # (litellm.ModelResponse defaults to "stop" which is wrong)
+                            choice["finish_reason"] = None
+                    
+                    yield f"data: {json.dumps(chunk_dict)}\n\n"
 
                     if hasattr(chunk, "usage") and chunk.usage:
-                        last_usage = (
-                            chunk.usage
-                        )  # Overwrite with the latest (cumulative)
+                        last_usage = chunk.usage
 
                 except StopAsyncIteration:
                     stream_completed = True

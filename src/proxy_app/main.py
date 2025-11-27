@@ -608,6 +608,9 @@ async def streaming_response_wrapper(
             # --- Final Response Construction ---
             if aggregated_tool_calls:
                 final_message["tool_calls"] = list(aggregated_tool_calls.values())
+                # CRITICAL FIX: Override finish_reason when tool_calls exist
+                # This ensures OpenCode and other agentic systems continue the conversation loop
+                finish_reason = "tool_calls"
 
             # Ensure standard fields are present for consistent logging
             for field in ["content", "tool_calls", "function_call"]:
