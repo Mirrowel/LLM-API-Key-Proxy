@@ -63,7 +63,29 @@ class RotatingClient:
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
+        rotation_tolerance: float = 3.0,
     ):
+        """
+        Initialize the RotatingClient with intelligent credential rotation.
+        
+        Args:
+            api_keys: Dictionary mapping provider names to lists of API keys
+            oauth_credentials: Dictionary mapping provider names to OAuth credential paths
+            max_retries: Maximum number of retry attempts per credential
+            usage_file_path: Path to store usage statistics
+            configure_logging: Whether to configure library logging
+            global_timeout: Global timeout for requests in seconds
+            abort_on_callback_error: Whether to abort on pre-request callback errors
+            litellm_provider_params: Provider-specific parameters for LiteLLM
+            ignore_models: Models to ignore/blacklist per provider
+            whitelist_models: Models to explicitly whitelist per provider
+            enable_request_logging: Whether to enable detailed request logging
+            max_concurrent_requests_per_key: Max concurrent requests per key by provider
+            rotation_tolerance: Tolerance for weighted random credential rotation.
+                - 0.0: Deterministic, least-used credential always selected
+                - 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
+                - 5.0+: High randomness, more unpredictable selection patterns
+        """
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -108,7 +130,10 @@ class RotatingClient:
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
-        self.usage_manager = UsageManager(file_path=usage_file_path)
+        self.usage_manager = UsageManager(
+            file_path=usage_file_path,
+            rotation_tolerance=rotation_tolerance
+        )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
         self._provider_instances = {}

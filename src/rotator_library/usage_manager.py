@@ -3,6 +3,7 @@ import os
 import time
 import logging
 import asyncio
+import random
 from datetime import date, datetime, timezone, time as dt_time
 from typing import Any, Dict, List, Optional, Set
 import aiofiles
@@ -20,15 +21,48 @@ if not lib_logger.handlers:
 class UsageManager:
     """
     Manages usage statistics and cooldowns for API keys with asyncio-safe locking,
-    asynchronous file I/O, and a lazy-loading mechanism for usage data.
+    asynchronous file I/O, lazy-loading mechanism, and weighted random credential rotation.
+    
+    The credential rotation strategy can be configured via the `rotation_tolerance` parameter:
+    
+    - **tolerance = 0.0**: Deterministic least-used selection. The credential with
+      the lowest usage count is always selected. This provides predictable, perfectly balanced
+      load distribution but may be vulnerable to fingerprinting.
+      
+    - **tolerance = 2.0 - 4.0 (default, recommended)**: Balanced weighted randomness. Credentials are selected
+      randomly with weights biased toward less-used ones. Credentials within 2 uses of the
+      maximum can still be selected with reasonable probability. This provides security through
+      unpredictability while maintaining good load balance.
+      
+    - **tolerance = 5.0+**: High randomness. Even heavily-used credentials have significant
+      selection probability. Useful for stress testing or maximum unpredictability, but may
+      result in less balanced load distribution.
+      
+    The weight formula is: `weight = (max_usage - credential_usage) + tolerance + 1`
+    
+    This ensures lower-usage credentials are preferred while tolerance controls how much
+    randomness is introduced into the selection process.
     """
 
     def __init__(
         self,
         file_path: str = "key_usage.json",
         daily_reset_time_utc: Optional[str] = "03:00",
+        rotation_tolerance: float = 0.0,
     ):
+        """
+        Initialize the UsageManager.
+        
+        Args:
+            file_path: Path to the usage data JSON file
+            daily_reset_time_utc: Time in UTC when daily stats should reset (HH:MM format)
+            rotation_tolerance: Tolerance for weighted random credential rotation.
+                - 0.0: Deterministic, least-used credential always selected
+                - tolerance = 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
+                - 5.0+: High randomness, more unpredictable selection patterns
+        """
         self.file_path = file_path
+        self.rotation_tolerance = rotation_tolerance
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
         self._data_lock = asyncio.Lock()
@@ -160,6 +194,63 @@ class UsageManager:
                     "models_in_use": {},  # Dict[model_name, concurrent_count]
                 }
 
+    def _select_weighted_random(
+        self,
+        candidates: List[tuple],
+        tolerance: float
+    ) -> str:
+        """
+        Selects a credential using weighted random selection based on usage counts.
+        
+        Args:
+            candidates: List of (credential_id, usage_count) tuples
+            tolerance: Tolerance value for weight calculation
+            
+        Returns:
+            Selected credential ID
+            
+        Formula:
+            weight = (max_usage - credential_usage) + tolerance + 1
+            
+        This formula ensures:
+            - Lower usage = higher weight = higher selection probability
+            - Tolerance adds variability: higher tolerance means more randomness
+            - The +1 ensures all credentials have at least some chance of selection
+        """
+        if not candidates:
+            raise ValueError("Cannot select from empty candidate list")
+        
+        if len(candidates) == 1:
+            return candidates[0][0]
+        
+        # Extract usage counts
+        usage_counts = [usage for _, usage in candidates]
+        max_usage = max(usage_counts)
+        
+        # Calculate weights using the formula: (max - current) + tolerance + 1
+        weights = []
+        for credential, usage in candidates:
+            weight = (max_usage - usage) + tolerance + 1
+            weights.append(weight)
+        
+        # Log weight distribution for debugging
+        if lib_logger.isEnabledFor(logging.DEBUG):
+            total_weight = sum(weights)
+            weight_info = ", ".join(
+                f"...{cred[-6:]}: w={w:.1f} ({w/total_weight*100:.1f}%)"
+                for (cred, _), w in zip(candidates, weights)
+            )
+            #lib_logger.debug(f"Weighted selection candidates: {weight_info}")
+        
+        # Random selection with weights
+        selected_credential = random.choices(
+            [cred for cred, _ in candidates],
+            weights=weights,
+            k=1
+        )[0]
+        
+        return selected_credential
+
     async def acquire_key(
         self, available_keys: List[str], model: str, deadline: float,
         max_concurrent: int = 1,
@@ -244,9 +335,21 @@ class UsageManager:
                         elif key_state["models_in_use"].get(model, 0) < max_concurrent:
                             tier2_keys.append((key, usage_count))
                     
-                    # Sort by usage within each tier
-                    tier1_keys.sort(key=lambda x: x[1])
-                    tier2_keys.sort(key=lambda x: x[1])
+                    # Apply weighted random selection or deterministic sorting
+                    selection_method = "weighted-random" if self.rotation_tolerance > 0 else "least-used"
+                    
+                    if self.rotation_tolerance > 0:
+                        # Weighted random selection within each tier
+                        if tier1_keys:
+                            selected_key = self._select_weighted_random(tier1_keys, self.rotation_tolerance)
+                            tier1_keys = [(k, u) for k, u in tier1_keys if k == selected_key]
+                        if tier2_keys:
+                            selected_key = self._select_weighted_random(tier2_keys, self.rotation_tolerance)
+                            tier2_keys = [(k, u) for k, u in tier2_keys if k == selected_key]
+                    else:
+                        # Deterministic: sort by usage within each tier
+                        tier1_keys.sort(key=lambda x: x[1])
+                        tier2_keys.sort(key=lambda x: x[1])
                     
                     # Try to acquire from Tier 1 first
                     for key, usage in tier1_keys:
@@ -255,7 +358,8 @@ class UsageManager:
                             if not state["models_in_use"]:
                                 state["models_in_use"][model] = 1
                                 lib_logger.info(
-                                    f"Acquired Priority-{priority_level} Tier-1 key ...{key[-6:]} for model {model} (usage: {usage})"
+                                    f"Acquired Priority-{priority_level} Tier-1 key ...{key[-6:]} for model {model} "
+                                    f"(selection: {selection_method}, usage: {usage})"
                                 )
                                 return key
                     
@@ -268,7 +372,7 @@ class UsageManager:
                                 state["models_in_use"][model] = current_count + 1
                                 lib_logger.info(
                                     f"Acquired Priority-{priority_level} Tier-2 key ...{key[-6:]} for model {model} "
-                                    f"(concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                    f"(selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
                                 )
                                 return key
                 
@@ -325,22 +429,36 @@ class UsageManager:
                         elif key_state["models_in_use"].get(model, 0) < max_concurrent:
                             tier2_keys.append((key, usage_count))
 
-                tier1_keys.sort(key=lambda x: x[1])
-                tier2_keys.sort(key=lambda x: x[1])
+                # Apply weighted random selection or deterministic sorting
+                selection_method = "weighted-random" if self.rotation_tolerance > 0 else "least-used"
+                
+                if self.rotation_tolerance > 0:
+                    # Weighted random selection within each tier
+                    if tier1_keys:
+                        selected_key = self._select_weighted_random(tier1_keys, self.rotation_tolerance)
+                        tier1_keys = [(k, u) for k, u in tier1_keys if k == selected_key]
+                    if tier2_keys:
+                        selected_key = self._select_weighted_random(tier2_keys, self.rotation_tolerance)
+                        tier2_keys = [(k, u) for k, u in tier2_keys if k == selected_key]
+                else:
+                    # Deterministic: sort by usage within each tier
+                    tier1_keys.sort(key=lambda x: x[1])
+                    tier2_keys.sort(key=lambda x: x[1])
 
                 # Attempt to acquire a key from Tier 1 first.
-                for key, _ in tier1_keys:
+                for key, usage in tier1_keys:
                     state = self.key_states[key]
                     async with state["lock"]:
                         if not state["models_in_use"]:
                             state["models_in_use"][model] = 1
                             lib_logger.info(
-                                f"Acquired Tier 1 key ...{key[-6:]} for model {model}"
+                                f"Acquired Tier 1 key ...{key[-6:]} for model {model} "
+                                f"(selection: {selection_method}, usage: {usage})"
                             )
                             return key
 
                 # If no Tier 1 keys are available, try Tier 2.
-                for key, _ in tier2_keys:
+                for key, usage in tier2_keys:
                     state = self.key_states[key]
                     async with state["lock"]:
                         current_count = state["models_in_use"].get(model, 0)
@@ -348,7 +466,7 @@ class UsageManager:
                             state["models_in_use"][model] = current_count + 1
                             lib_logger.info(
                                 f"Acquired Tier 2 key ...{key[-6:]} for model {model} "
-                                f"(concurrent: {state['models_in_use'][model]}/{max_concurrent})"
+                                f"(selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
                             )
                             return key
 
