@@ -1438,8 +1438,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Build request payload
         request_payload = {
-            "model": model_name,
-            "project": project_id,
             "request": {
                 "contents": contents,
             },
