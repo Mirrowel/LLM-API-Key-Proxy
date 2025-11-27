@@ -533,6 +533,143 @@ async def export_iflow_to_env():
         console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
 
 
+async def export_antigravity_to_env():
+    """
+    Export an Antigravity credential JSON file to .env format.
+    Generates one .env file per credential.
+    """
+    console.print(Panel("[bold cyan]Export Antigravity Credential to .env[/bold cyan]", expand=False))
+
+    # Find all antigravity credentials
+    antigravity_files = list(OAUTH_BASE_DIR.glob("antigravity_oauth_*.json"))
+
+    if not antigravity_files:
+        console.print(Panel("No Antigravity credentials found. Please add one first using 'Add OAuth Credential'.",
+                          style="bold red", title="No Credentials"))
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_file in enumerate(antigravity_files):
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            cred_text.append(f"  {i + 1}. {cred_file.name} ({email})\n")
+        except Exception as e:
+            cred_text.append(f"  {i + 1}. {cred_file.name} (error reading: {e})\n")
+
+    console.print(Panel(cred_text, title="Available Antigravity Credentials", style="bold blue"))
+
+    choice = Prompt.ask(
+        Text.from_markup("[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"),
+        choices=[str(i + 1) for i in range(len(antigravity_files))] + ["b"],
+        show_choices=False
+    )
+
+    if choice.lower() == 'b':
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(antigravity_files):
+            cred_file = antigravity_files[choice_index]
+
+            # Load the credential
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Generate .env file name
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"antigravity_{safe_email}.env"
+            env_filepath = OAUTH_BASE_DIR / env_filename
+
+            # Build .env content
+            env_lines = [
+                f"# Antigravity Credential for: {email}",
+                f"# Generated from: {cred_file.name}",
+                f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                f"ANTIGRAVITY_ACCESS_TOKEN={creds.get('access_token', '')}",
+                f"ANTIGRAVITY_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+                f"ANTIGRAVITY_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+                f"ANTIGRAVITY_CLIENT_ID={creds.get('client_id', '')}",
+                f"ANTIGRAVITY_CLIENT_SECRET={creds.get('client_secret', '')}",
+                f"ANTIGRAVITY_TOKEN_URI={creds.get('token_uri', 'https://oauth2.googleapis.com/token')}",
+                f"ANTIGRAVITY_UNIVERSE_DOMAIN={creds.get('universe_domain', 'googleapis.com')}",
+                f"ANTIGRAVITY_EMAIL={email}",
+            ]
+
+            # Write to .env file
+            with open(env_filepath, 'w') as f:
+                f.write('\n'.join(env_lines))
+
+            success_text = Text.from_markup(
+                f"Successfully exported credential to [bold yellow]'{env_filepath}'[/bold yellow]\n\n"
+                f"To use this credential:\n"
+                f"1. Copy [bold yellow]{env_filepath.name}[/bold yellow] to your deployment environment\n"
+                f"2. Load the variables: [bold cyan]export $(cat {env_filepath.name} | grep -v '^#' | xargs)[/bold cyan]\n"
+                f"3. Or source it: [bold cyan]source {env_filepath.name}[/bold cyan]\n"
+                f"4. The Antigravity provider will automatically use these environment variables"
+            )
+            console.print(Panel(success_text, style="bold green", title="Success"))
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print("[bold red]Invalid input. Please enter a number or 'b'.[/bold red]")
+    except Exception as e:
+        console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
+
+
+async def export_credentials_submenu():
+    """
+    Submenu for credential export options.
+    """
+    while True:
+        console.clear()
+        console.print(Panel("[bold cyan]Export Credentials to .env[/bold cyan]", title="--- API Key Proxy ---", expand=False))
+        
+        console.print(Panel(
+            Text.from_markup(
+                "1. Export Gemini CLI credential\n"
+                "2. Export Qwen Code credential\n"
+                "3. Export iFlow credential\n"
+                "4. Export Antigravity credential"
+            ),
+            title="Choose credential type to export",
+            style="bold blue"
+        ))
+
+        export_choice = Prompt.ask(
+            Text.from_markup("[bold]Please select an option or type [red]'b'[/red] to go back[/bold]"),
+            choices=["1", "2", "3", "4", "b"],
+            show_choices=False
+        )
+
+        if export_choice.lower() == 'b':
+            break
+
+        if export_choice == "1":
+            await export_gemini_cli_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "2":
+            await export_qwen_code_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "3":
+            await export_iflow_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "4":
+            await export_antigravity_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+
+
 async def main(clear_on_start=True):
     """
     An interactive CLI tool to add new credentials.
@@ -556,9 +693,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "1. Add OAuth Credential\n"
                 "2. Add API Key\n"
-                "3. Export Gemini CLI credential to .env\n"
-                "4. Export Qwen Code credential to .env\n"
-                "5. Export iFlow credential to .env"
+                "3. Export Credentials"
             ),
             title="Choose credential type",
             style="bold blue"
@@ -566,7 +701,7 @@ async def main(clear_on_start=True):
 
         setup_type = Prompt.ask(
             Text.from_markup("[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"),
-            choices=["1", "2", "3", "4", "5", "q"],
+            choices=["1", "2", "3", "q"],
             show_choices=False
         )
 
@@ -622,19 +757,7 @@ async def main(clear_on_start=True):
             input()
 
         elif setup_type == "3":
-            await export_gemini_cli_to_env()
-            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
-            input()
-
-        elif setup_type == "4":
-            await export_qwen_code_to_env()
-            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
-            input()
-
-        elif setup_type == "5":
-            await export_iflow_to_env()
-            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
-            input()
+            await export_credentials_submenu()
 
 def run_credential_tool(from_launcher=False):
     """
