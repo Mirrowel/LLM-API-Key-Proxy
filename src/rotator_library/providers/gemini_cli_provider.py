@@ -13,6 +13,7 @@ from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
+from ..error_handler import extract_retry_after_from_body
 import os
 from pathlib import Path
 import uuid
@@ -124,6 +125,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 def _env_int(key: str, default: int) -> int:
     """Get integer from environment variable."""
     return int(os.getenv(key, str(default)))
+
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
@@ -684,11 +686,21 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     if tool_call.get("type") == "function":
                         tool_call_id_to_name[tool_call["id"]] = tool_call["function"]["name"]
 
+        # Process messages and consolidate consecutive tool responses
+        # Per Gemini docs: parallel function responses must be in a single user message,
+        # not interleaved as separate messages
+        pending_tool_parts = []  # Accumulate tool responses
+        
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
             parts = []
-            gemini_role = "model" if role == "assistant" else "tool" if role == "tool" else "user"
+            gemini_role = "model" if role == "assistant" else "user"  # tool -> user in Gemini
+
+            # If we have pending tool parts and hit a non-tool message, flush them first
+            if pending_tool_parts and role != "tool":
+                gemini_contents.append({"role": "user", "parts": pending_tool_parts})
+                pending_tool_parts = []
 
             if role == "user":
                 if isinstance(content, str):
@@ -725,6 +737,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if isinstance(content, str):
                     parts.append({"text": content})
                 if msg.get("tool_calls"):
+                    # Track if we've seen the first function call in this message
+                    # Per Gemini docs: Only the FIRST parallel function call gets a signature
+                    first_func_in_msg = True
                     for tool_call in msg["tool_calls"]:
                         if tool_call.get("type") == "function":
                             try:
@@ -748,6 +763,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                             }
                             
                             # Add thoughtSignature for Gemini 3
+                            # Per Gemini docs: Only the FIRST parallel function call gets a signature.
+                            # Subsequent parallel calls should NOT have a thoughtSignature field.
                             if is_gemini_3:
                                 sig = tool_call.get("thought_signature")
                                 if not sig and tool_id and self._enable_signature_cache:
@@ -755,9 +772,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                 
                                 if sig:
                                     func_part["thoughtSignature"] = sig
-                                else:
+                                elif first_func_in_msg:
+                                    # Only add bypass to the first function call if no sig available
                                     func_part["thoughtSignature"] = "skip_thought_signature_validator"
-                                    lib_logger.warning(f"Missing thoughtSignature for {tool_id}, using bypass")
+                                    lib_logger.warning(f"Missing thoughtSignature for first func call {tool_id}, using bypass")
+                                # Subsequent parallel calls: no signature field at all
+                                
+                                first_func_in_msg = False
                             
                             parts.append(func_part)
 
@@ -771,16 +792,23 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     
                     # Wrap the tool response in a 'result' object
                     response_content = {"result": content}
-                    parts.append({
+                    # Accumulate tool responses - they'll be combined into one user message
+                    pending_tool_parts.append({
                         "functionResponse": {
                             "name": function_name,
                             "response": response_content,
                             "id": tool_call_id
                         }
                     })
+                # Don't add parts here - tool responses are handled via pending_tool_parts
+                continue
 
             if parts:
                 gemini_contents.append({"role": gemini_role, "parts": parts})
+
+        # Flush any remaining tool parts at end of messages
+        if pending_tool_parts:
+            gemini_contents.append({"role": "user", "parts": pending_tool_parts})
 
         if not gemini_contents or gemini_contents[0]['role'] != 'user':
             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
@@ -866,7 +894,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         candidate = candidates[0]
         parts = candidate.get('content', {}).get('parts', [])
         is_gemini_3 = self._is_gemini_3(model_id)
-        first_sig_seen = False
 
         for part in parts:
             delta = {}
@@ -905,8 +932,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 }
                 
                 # Handle thoughtSignature for Gemini 3
-                if is_gemini_3 and has_sig and not first_sig_seen:
-                    first_sig_seen = True
+                # Store signature for each tool call (needed for parallel tool calls)
+                if is_gemini_3 and has_sig:
                     sig = part['thoughtSignature']
                     
                     if self._enable_signature_cache:
@@ -1369,6 +1396,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 })
                 try:
                     async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
+                        # Read and log error body before raise_for_status for better debugging
+                        if response.status_code >= 400:
+                            try:
+                                error_body = await response.aread()
+                                lib_logger.error(f"Gemini CLI API error {response.status_code}: {error_body.decode()}")
+                                file_logger.log_error(f"API error {response.status_code}: {error_body.decode()}")
+                            except Exception:
+                                pass
+                        
                         # This will raise an HTTPStatusError for 4xx/5xx responses
                         response.raise_for_status()
 
@@ -1405,16 +1441,24 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                             error_body = e.response.text
                         except Exception:
                             pass
-                    log_line = f"Stream handler HTTPStatusError: {str(e)}"
+                    
+                    # Only log to file logger (for detailed logging)
                     if error_body:
-                        log_line = f"{log_line} | response_body={error_body}"
-                    file_logger.log_error(log_line)
+                        file_logger.log_error(f"HTTPStatusError {e.response.status_code}: {error_body}")
+                    else:
+                        file_logger.log_error(f"HTTPStatusError {e.response.status_code}: {str(e)}")
+                    
                     if e.response.status_code == 429:
-                        # Pass the raw response object to the exception. Do not read the
-                        # response body here as it will close the stream and cause a
-                        # 'StreamClosed' error in the client's stream reader.
+                        # Extract retry-after time from the error body
+                        retry_after = extract_retry_after_from_body(error_body)
+                        retry_info = f" (retry after {retry_after}s)" if retry_after else ""
+                        error_msg = f"Gemini CLI rate limit exceeded{retry_info}"
+                        if error_body:
+                            error_msg = f"{error_msg} | {error_body}"
+                        # Only log at debug level - rotation happens silently
+                        lib_logger.debug(f"Gemini CLI 429 rate limit: retry_after={retry_after}s")
                         raise RateLimitError(
-                            message=f"Gemini CLI rate limit exceeded: {e.request.url}",
+                            message=error_msg,
                             llm_provider="gemini_cli",
                             model=model,
                             response=e.response
@@ -1451,7 +1495,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         for idx, attempt_model in enumerate(fallback_models):
             is_fallback = idx > 0
             if is_fallback:
-                lib_logger.info(f"Gemini CLI rate limited, retrying with fallback model: {attempt_model}")
+                # Silent rotation - only log at debug level
+                lib_logger.debug(f"Rate limited on previous model, trying fallback: {attempt_model}")
             elif has_fallbacks:
                 lib_logger.debug(f"Attempting primary model: {attempt_model} (with {len(fallback_models)-1} fallback(s) available)")
             else:
@@ -1473,8 +1518,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if idx + 1 < len(fallback_models):
                     lib_logger.debug(f"Rate limit hit on {attempt_model}, trying next fallback...")
                     continue
-                # If this was the last fallback option, raise the error
-                lib_logger.error(f"Rate limit hit on all fallback models (tried {len(fallback_models)} models)")
+                # If this was the last fallback option, log error and raise
+                lib_logger.warning(f"Rate limit exhausted on all fallback models (tried {len(fallback_models)} models)")
                 raise
 
         # Should not reach here, but raise last error if we do

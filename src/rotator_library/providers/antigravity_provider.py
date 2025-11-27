@@ -605,22 +605,37 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         tool_id_to_name[tc_id] = tc_name
                         #lib_logger.debug(f"[ID Mapping] Registered tool_call: id={tc_id}, name={tc_name}")
         
-        # Convert each message
+        # Convert each message, consolidating consecutive tool responses
+        # Per Gemini docs: parallel function responses must be in a single user message
+        pending_tool_parts = []
+        
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
             parts = []
+            
+            # Flush pending tool parts before non-tool message
+            if pending_tool_parts and role != "tool":
+                gemini_contents.append({"role": "user", "parts": pending_tool_parts})
+                pending_tool_parts = []
             
             if role == "user":
                 parts = self._transform_user_message(content)
             elif role == "assistant":
                 parts = self._transform_assistant_message(msg, model, tool_id_to_name)
             elif role == "tool":
-                parts = self._transform_tool_message(msg, model, tool_id_to_name)
+                tool_parts = self._transform_tool_message(msg, model, tool_id_to_name)
+                # Accumulate tool responses instead of adding individually
+                pending_tool_parts.extend(tool_parts)
+                continue
             
             if parts:
-                gemini_role = "model" if role == "assistant" else "user" if role == "tool" else "user"
+                gemini_role = "model" if role == "assistant" else "user"
                 gemini_contents.append({"role": gemini_role, "parts": parts})
+        
+        # Flush any remaining tool parts
+        if pending_tool_parts:
+            gemini_contents.append({"role": "user", "parts": pending_tool_parts})
         
         return system_instruction, gemini_contents
     
@@ -687,6 +702,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             parts.append({"text": content})
         
         # Add tool calls
+        # Track if we've seen the first function call in this message
+        # Per Gemini docs: Only the FIRST parallel function call gets a signature
+        first_func_in_msg = True
         for tc in tool_calls:
             if tc.get("type") != "function":
                 continue
@@ -717,6 +735,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             }
             
             # Add thoughtSignature for Gemini 3
+            # Per Gemini docs: Only the FIRST parallel function call gets a signature.
+            # Subsequent parallel calls should NOT have a thoughtSignature field.
             if self._is_gemini_3(model):
                 sig = tc.get("thought_signature")
                 if not sig and tool_id and self._enable_signature_cache:
@@ -724,9 +744,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 
                 if sig:
                     func_part["thoughtSignature"] = sig
-                else:
+                elif first_func_in_msg:
+                    # Only add bypass to the first function call if no sig available
                     func_part["thoughtSignature"] = "skip_thought_signature_validator"
-                    lib_logger.warning(f"Missing thoughtSignature for {tool_id}, using bypass")
+                    lib_logger.warning(f"Missing thoughtSignature for first func call {tool_id}, using bypass")
+                # Subsequent parallel calls: no signature field at all
+                
+                first_func_in_msg = False
             
             parts.append(func_part)
         
@@ -1146,13 +1170,20 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 del thinking_config["thinkingLevel"]
                 thinking_config["thinkingBudget"] = -1
         
-        # Add thoughtSignature to function calls for Gemini 3
+        # Ensure first function call in each model message has a thoughtSignature for Gemini 3
+        # Per Gemini docs: Only the FIRST parallel function call gets a signature
         if internal_model.startswith("gemini-3-"):
             for content in antigravity_payload["request"].get("contents", []):
                 if content.get("role") == "model":
+                    first_func_seen = False
                     for part in content.get("parts", []):
-                        if "functionCall" in part and "thoughtSignature" not in part:
-                            part["thoughtSignature"] = "skip_thought_signature_validator"
+                        if "functionCall" in part:
+                            if not first_func_seen:
+                                # First function call in this message - needs a signature
+                                if "thoughtSignature" not in part:
+                                    part["thoughtSignature"] = "skip_thought_signature_validator"
+                                first_func_seen = True
+                            # Subsequent parallel calls: leave as-is (no signature)
         
         # Claude-specific tool schema transformation
         if internal_model.startswith("claude-sonnet-"):
@@ -1203,7 +1234,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         text_content = ""
         reasoning_content = ""
         tool_calls = []
-        first_sig_seen = False
         # Use accumulator's tool_idx if available, otherwise use local counter
         tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
         
@@ -1235,8 +1265,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if has_func:
                 tool_call = self._extract_tool_call(part, model, tool_idx, accumulator)
                 
-                if has_sig and not first_sig_seen:
-                    first_sig_seen = True
+                # Store signature for each tool call (needed for parallel tool calls)
+                if has_sig:
                     self._handle_tool_signature(tool_call, part["thoughtSignature"])
                 
                 tool_calls.append(tool_call)
@@ -1298,7 +1328,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         reasoning_content = ""
         tool_calls = []
         thought_sig = ""
-        first_sig_seen = False
         
         for part in content_parts:
             has_func = "functionCall" in part
@@ -1321,8 +1350,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if has_func:
                 tool_call = self._extract_tool_call(part, model, len(tool_calls))
                 
-                if has_sig and not first_sig_seen:
-                    first_sig_seen = True
+                # Store signature for each tool call (needed for parallel tool calls)
+                if has_sig:
                     self._handle_tool_signature(tool_call, part["thoughtSignature"])
                 
                 tool_calls.append(tool_call)

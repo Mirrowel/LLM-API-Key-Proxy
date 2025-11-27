@@ -17,6 +17,42 @@ from litellm.exceptions import (
 )
 
 
+def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
+    """
+    Extract the retry-after time from an API error response body.
+    
+    Handles various error formats including:
+    - Gemini CLI: "Your quota will reset after 39s."
+    - Generic: "quota will reset after 120s", "retry after 60s"
+    
+    Args:
+        error_body: The raw error response body
+        
+    Returns:
+        The retry time in seconds, or None if not found
+    """
+    if not error_body:
+        return None
+    
+    # Pattern to match various "reset after Xs" or "retry after Xs" formats
+    patterns = [
+        r"quota will reset after\s*(\d+)s",
+        r"reset after\s*(\d+)s",
+        r"retry after\s*(\d+)s",
+        r"try again in\s*(\d+)\s*seconds?",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, error_body, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except (ValueError, IndexError):
+                continue
+    
+    return None
+
+
 class NoAvailableKeysError(Exception):
     """Raised when no API keys are available for a request after waiting."""
 
@@ -106,6 +142,8 @@ def get_retry_after(error: Exception) -> Optional[int]:
         r"wait for\s*(\d+)\s*seconds?",
         r'"retryDelay":\s*"(\d+)s"',
         r"x-ratelimit-reset:?\s*(\d+)",
+        r"quota will reset after\s*(\d+)s",  # Gemini CLI rate limit format
+        r"reset after\s*(\d+)s",  # Generic reset after format
     ]
 
     for pattern in patterns:
