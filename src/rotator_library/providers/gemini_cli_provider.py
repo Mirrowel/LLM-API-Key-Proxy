@@ -308,26 +308,30 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             lib_logger.debug(f"Found configured project_id override: {configured_project_id}")
 
         # Load credentials from file to check for persisted project_id and tier
-        try:
-            with open(credential_path, 'r') as f:
-                creds = json.load(f)
-            
-            metadata = creds.get("_proxy_metadata", {})
-            persisted_project_id = metadata.get("project_id")
-            persisted_tier = metadata.get("tier")
-            
-            if persisted_project_id:
-                lib_logger.info(f"Loaded persisted project ID from credential file: {persisted_project_id}")
-                self.project_id_cache[credential_path] = persisted_project_id
+        # Skip for env:// paths (environment-based credentials don't persist to files)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is None:
+            # Only try to load from file if it's not an env:// path
+            try:
+                with open(credential_path, 'r') as f:
+                    creds = json.load(f)
                 
-                # Also load tier if available
-                if persisted_tier:
-                    self.project_tier_cache[credential_path] = persisted_tier
-                    lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+                metadata = creds.get("_proxy_metadata", {})
+                persisted_project_id = metadata.get("project_id")
+                persisted_tier = metadata.get("tier")
                 
-                return persisted_project_id
-        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-            lib_logger.debug(f"Could not load persisted project ID from file: {e}")
+                if persisted_project_id:
+                    lib_logger.info(f"Loaded persisted project ID from credential file: {persisted_project_id}")
+                    self.project_id_cache[credential_path] = persisted_project_id
+                    
+                    # Also load tier if available
+                    if persisted_tier:
+                        self.project_tier_cache[credential_path] = persisted_tier
+                        lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+                    
+                    return persisted_project_id
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                lib_logger.debug(f"Could not load persisted project ID from file: {e}")
 
         lib_logger.debug("No cached or configured project ID found, initiating discovery...")
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
@@ -625,6 +629,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     
     async def _persist_project_metadata(self, credential_path: str, project_id: str, tier: Optional[str]):
         """Persists project ID and tier to the credential file for faster future startups."""
+        # Skip persistence for env:// paths (environment-based credentials)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is not None:
+            lib_logger.debug(f"Skipping project metadata persistence for env:// credential path: {credential_path}")
+            return
+        
         try:
             # Load current credentials
             with open(credential_path, 'r') as f:
