@@ -57,6 +57,7 @@ client = RotatingClient(
 -   `whitelist_models` (`Optional[Dict[str, List[str]]]`, default: `None`): Whitelist of models to always include, overriding `ignore_models`.
 -   `enable_request_logging` (`bool`, default: `False`): If `True`, enables detailed per-request file logging.
 -   `max_concurrent_requests_per_key` (`Optional[Dict[str, int]]`, default: `None`): Max concurrent requests allowed for a single API key per provider.
+-   `rotation_tolerance` (`float`, default: `3.0`): Controls the credential rotation strategy. See Section 2.2 for details.
 
 #### Core Responsibilities
 
@@ -110,8 +111,16 @@ The `acquire_key` method uses a sophisticated strategy to balance load:
 2.  **Tiering**: Valid keys are split into two tiers:
     *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
     *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
-3.  **Prioritization**: Within each tier, keys with the **lowest daily usage** are prioritized to spread costs evenly.
+3.  **Selection Strategy** (configurable via `rotation_tolerance`):
+    *   **Deterministic (tolerance=0.0)**: Within each tier, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
+    *   **Weighted Random (tolerance>0, default)**: Keys are selected randomly with weights biased toward less-used ones:
+        - Formula: `weight = (max_usage - credential_usage) + tolerance + 1`
+        - `tolerance=2.0` (recommended): Balanced randomness - credentials within 2 uses of the maximum can still be selected with reasonable probability
+        - `tolerance=5.0+`: High randomness - even heavily-used credentials have significant probability
+        - **Security Benefit**: Unpredictable selection patterns make rate limit detection and fingerprinting harder
+        - **Load Balance**: Lower-usage credentials still preferred, maintaining reasonable distribution
 4.  **Concurrency Limits**: Checks against `max_concurrent` limits to prevent overloading a single key.
+5.  **Priority Groups**: When credential prioritization is enabled, higher-tier credentials (lower priority numbers) are tried first before moving to lower tiers.
 
 #### Failure Handling & Cooldowns
 
@@ -312,6 +321,243 @@ The `CooldownManager` handles IP or account-level rate limiting that affects all
 - When a key fails with `RATE_LIMIT` error type, the client checks if it's likely an IP-level limit
 - If so, `CooldownManager.start_cooldown()` is called for the entire provider
 - All subsequent `acquire_key()` calls for that provider will wait until the cooldown expires
+
+
+### 2.10. Credential Prioritization System (`client.py` & `usage_manager.py`)
+
+The library now includes an intelligent credential prioritization system that automatically detects credential tiers and ensures optimal credential selection for each request.
+
+**Key Concepts:**
+
+- **Provider-Level Priorities**: Providers can implement `get_credential_priority()` to return a priority level (1=highest, 10=lowest) for each credential
+- **Model-Level Requirements**: Providers can implement `get_model_tier_requirement()` to specify minimum priority required for specific models
+- **Automatic Filtering**: The client automatically filters out incompatible credentials before making requests
+- **Priority-Aware Selection**: The `UsageManager` prioritizes higher-tier credentials (lower numbers) within the same priority group
+
+**Implementation Example (Gemini CLI):**
+
+```python
+def get_credential_priority(self, credential: str) -> Optional[int]:
+    """Returns priority based on Gemini tier."""
+    tier = self.project_tier_cache.get(credential)
+    if not tier:
+        return None  # Not yet discovered
+    
+    # Paid tiers get highest priority
+    if tier not in ['free-tier', 'legacy-tier', 'unknown']:
+        return 1
+    
+    # Free tier gets lower priority
+    if tier == 'free-tier':
+        return 2
+    
+    return 10
+
+def get_model_tier_requirement(self, model: str) -> Optional[int]:
+    """Returns minimum priority required for model."""
+    if model.startswith("gemini-3-"):
+        return 1  # Only paid tier (priority 1) credentials
+    
+    return None  # All other models have no restrictions
+```
+
+**Usage Manager Integration:**
+
+The `acquire_key()` method has been enhanced to:
+1. Group credentials by priority level
+2. Try highest priority group first (priority 1, then 2, etc.)
+3. Within each group, use existing tier1/tier2 logic (idle keys first, then busy keys)
+4. Load balance within priority groups by usage count
+5. Only move to next priority if all higher-priority credentials are exhausted
+
+**Benefits:**
+
+- Ensures paid-tier credentials are always used for premium models
+- Prevents failed requests due to tier restrictions
+- Optimal cost distribution (free tier used when possible, paid when required)
+- Graceful fallback if primary credentials are unavailable
+
+---
+
+### 2.11. Provider Cache System (`providers/provider_cache.py`)
+
+A modular, shared caching system for providers to persist conversation state across requests.
+
+**Architecture:**
+
+- **Dual-TTL Design**: Short-lived memory cache (default: 1 hour) + longer-lived disk persistence (default: 24 hours)
+- **Background Persistence**: Batched disk writes every 60 seconds (configurable)
+- **Automatic Cleanup**: Background task removes expired entries from memory cache
+
+### 3.5. Antigravity (`antigravity_provider.py`)
+
+The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini and Claude models.
+
+#### Architecture
+
+- **Unified Streaming/Non-Streaming**: Single code path handles both response types with optimal transformations
+- **Thought Signature Caching**: Server-side caching of encrypted signatures for multi-turn Gemini 3 conversations
+- **Model-Specific Logic**: Automatic configuration based on model type (Gemini 2.5, Gemini 3, Claude)
+
+#### Model Support
+
+**Gemini 2.5 (Pro/Flash):**
+- Uses `thinkingBudget` parameter (integer tokens: -1 for auto, 0 to disable, or specific value)
+- Standard safety settings and toolConfig
+- Stream processing with thinking content separation
+
+**Gemini 3 (Pro/Image):**
+- Uses `thinkingLevel` parameter (string: "low" or "high")
+- **Tool Hallucination Prevention**:
+  - Automatic system instruction injection explaining custom tool schema rules
+  - Parameter signature injection into tool descriptions (e.g., "STRICT PARAMETERS: files (ARRAY_OF_OBJECTS[path: string REQUIRED, ...])")
+  - Namespace prefix for tool names (`gemini3_` prefix) to avoid training data conflicts
+  - Malformed JSON auto-correction (handles extra trailing braces)
+- **ThoughtSignature Management**:
+  - Caching signatures from responses for reuse in follow-up messages
+  - Automatic injection into functionCalls for multi-turn conversations
+  - Fallback to bypass value if signature unavailable
+
+**Claude Sonnet 4.5:**
+- Proxied through Antigravity API (uses internal model name `claude-sonnet-4-5-thinking`)
+- Uses `thinkingBudget` parameter like Gemini 2.5
+- **Thinking Preservation**: Caches thinking content using composite keys (tool_call_id + text_hash)
+- **Schema Cleaning**: Removes unsupported properties (`$schema`, `additionalProperties`, `const` → `enum`)
+
+#### Base URL Fallback
+
+Automatic fallback chain for resilience:
+1. `daily-cloudcode-pa.sandbox.googleapis.com` (primary sandbox)
+2. `autopush-cloudcode-pa.sandbox.googleapis.com` (fallback sandbox)
+3. `cloudcode-pa.googleapis.com` (production fallback)
+
+#### Message Transformation
+
+**OpenAI → Gemini Format:**
+- System messages → `systemInstruction` with parts array
+- Multi-part content (text + images) → `inlineData` format
+- Tool calls → `functionCall` with args and id
+- Tool responses → `functionResponse` with name and response
+- ThoughtSignatures preserved/injected as needed
+
+**Tool Response Grouping:**
+- Converts linear format (call, response, call, response) to grouped format
+- Groups all function calls in one `model` message
+- Groups all responses in one `user` message
+- Required for Antigravity API compatibility
+
+#### Configuration (Environment Variables)
+
+```env
+# Cache control
+ANTIGRAVITY_SIGNATURE_CACHE_TTL=3600  # Memory cache TTL
+ANTIGRAVITY_SIGNATURE_DISK_TTL=86400  # Disk cache TTL
+ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
+
+# Feature flags
+ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES=true  # Include signatures in client responses
+ANTIGRAVITY_ENABLE_DYNAMIC_MODELS=false  # Use API model discovery
+ANTIGRAVITY_GEMINI3_TOOL_FIX=true  # Enable Gemini 3 hallucination prevention
+
+# Gemini 3 tool fix customization
+ANTIGRAVITY_GEMINI3_TOOL_PREFIX="gemini3_"  # Namespace prefix
+ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT="\n\nSTRICT PARAMETERS: {params}."
+ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
+```
+
+#### File Logging
+
+Optional transaction logging for debugging:
+- Enabled via `enable_request_logging` parameter
+- Creates `logs/antigravity_logs/TIMESTAMP_MODEL_UUID/` directory per request
+- Logs: `request_payload.json`, `response_stream.log`, `final_response.json`, `error.log`
+
+---
+
+
+- **Atomic Disk Writes**: Uses temp-file-and-move pattern to prevent corruption
+
+**Key Methods:**
+
+1. **`store(key, value)`**: Synchronously queues value for storage (schedules async write)
+2. **`retrieve(key)`**: Synchronously retrieves from memory, optionally schedules disk fallback
+3. **`store_async(key, value)`**: Awaitable storage for guaranteed persistence
+4. **`retrieve_async(key)`**: Awaitable retrieval with disk fallback
+
+**Use Cases:**
+
+- **Gemini 3 ThoughtSignatures**: Caching tool call signatures for multi-turn conversations
+- **Claude Thinking**: Preserving thinking content for consistency across conversation turns
+- **Any Transient State**: Generic key-value storage for provider-specific needs
+
+**Configuration (Environment Variables):**
+
+```env
+# Cache control (prefix can be customized per cache instance)
+PROVIDER_CACHE_ENABLE=true
+PROVIDER_CACHE_WRITE_INTERVAL=60  # seconds between disk writes
+PROVIDER_CACHE_CLEANUP_INTERVAL=1800  # 30 min between cleanups
+
+# Gemini 3 specific
+GEMINI_CLI_SIGNATURE_CACHE_ENABLE=true
+GEMINI_CLI_SIGNATURE_CACHE_TTL=3600  # 1 hour memory TTL
+GEMINI_CLI_SIGNATURE_DISK_TTL=86400  # 24 hours disk TTL
+```
+
+**File Structure:**
+
+```
+cache/
+├── gemini_cli/
+│   └── gemini3_signatures.json
+└── antigravity/
+    ├── gemini3_signatures.json
+    └── claude_thinking.json
+```
+
+---
+
+### 2.12. Google OAuth Base (`providers/google_oauth_base.py`)
+
+A refactored, reusable OAuth2 base class that eliminates code duplication across Google-based providers.
+
+**Refactoring Benefits:**
+
+- **Single Source of Truth**: All OAuth logic centralized in one class
+- **Easy Provider Addition**: New providers only need to override constants
+- **Consistent Behavior**: Token refresh, expiry handling, and validation work identically across providers
+- **Maintainability**: OAuth bugs fixed once apply to all inheriting providers
+
+**Provider Implementation:**
+
+```python
+class AntigravityAuthBase(GoogleOAuthBase):
+    # Required overrides
+    CLIENT_ID = "antigravity-client-id"
+    CLIENT_SECRET = "antigravity-secret"
+    OAUTH_SCOPES = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/cclog",  # Antigravity-specific
+        "https://www.googleapis.com/auth/experimentsandconfigs",
+    ]
+    ENV_PREFIX = "ANTIGRAVITY"  # Used for env var loading
+    
+    # Optional overrides (defaults provided)
+    CALLBACK_PORT = 51121
+    CALLBACK_PATH = "/oauthcallback"
+```
+
+**Inherited Features:**
+
+- Automatic token refresh with exponential backoff
+- Invalid grant re-authentication flow
+- Stateless deployment support (env var loading)
+- Atomic credential file writes
+- Headless environment detection
+- Sequential refresh queue processing
+
+---
+
 
 ---
 
