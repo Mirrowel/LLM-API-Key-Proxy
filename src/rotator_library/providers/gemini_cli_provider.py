@@ -998,7 +998,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
-        This replaces the non-existent litellm.utils.stream_to_completion_response function.
+        
+        Key improvements:
+        - Determines finish_reason based on accumulated state
+        - Priority: tool_calls > chunk's finish_reason (length, content_filter, etc.) > stop
+        - Properly initializes tool_calls with type field
         """
         if not chunks:
             raise ValueError("No chunks provided for reassembly")
@@ -1007,7 +1011,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         final_message = {"role": "assistant"}
         aggregated_tool_calls = {}
         usage_data = None
-        finish_reason = None
+        chunk_finish_reason = None  # Track finish_reason from chunks
 
         # Get the first chunk for basic response metadata
         first_chunk = chunks[0]
@@ -1035,11 +1039,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             # Aggregate tool calls
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
-                    index = tc_chunk["index"]
+                    index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                    if "type" in tc_chunk:
+                        aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
                         if "name" in tc_chunk["function"] and tc_chunk["function"]["name"] is not None:
                             aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
@@ -1055,8 +1061,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
                     final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
 
-            # Note: chunks don't include finish_reason (client handles it)
-            # This is kept for compatibility but shouldn't trigger
+            # Track finish_reason from chunks (respects length, content_filter, etc.)
+            if choice.get("finish_reason"):
+                chunk_finish_reason = choice["finish_reason"]
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -1073,10 +1080,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if field not in final_message:
                 final_message[field] = None
 
-        # Determine finish_reason based on content (same logic as client.py)
-        # tool_calls wins, otherwise stop
+        # Determine finish_reason based on accumulated state
+        # Priority: tool_calls wins if present, then chunk's finish_reason (length, content_filter, etc.), then default to "stop"
         if aggregated_tool_calls:
             finish_reason = "tool_calls"
+        elif chunk_finish_reason:
+            finish_reason = chunk_finish_reason
         else:
             finish_reason = "stop"
         
