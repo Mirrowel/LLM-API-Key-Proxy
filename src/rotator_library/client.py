@@ -672,6 +672,73 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+        
+        # [NEW] Filter by model tier requirement and build priority map
+        credential_priorities = None
+        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+            required_tier = provider_plugin.get_model_tier_requirement(model)
+            if required_tier is not None:
+                # Filter OUT only credentials we KNOW are too low priority
+                # Keep credentials with unknown priority (None) - they might be high priority
+                incompatible_creds = []
+                compatible_creds = []
+                unknown_creds = []
+                
+                for cred in credentials_for_provider:
+                    if hasattr(provider_plugin, 'get_credential_priority'):
+                        priority = provider_plugin.get_credential_priority(cred)
+                        if priority is None:
+                            # Unknown priority - keep it, will be discovered on first use
+                            unknown_creds.append(cred)
+                        elif priority <= required_tier:
+                            # Known compatible priority
+                            compatible_creds.append(cred)
+                        else:
+                            # Known incompatible priority (too low)
+                            incompatible_creds.append(cred)
+                    else:
+                        # Provider doesn't support priorities - keep all
+                        unknown_creds.append(cred)
+                
+                # If we have any known-compatible or unknown credentials, use them
+                tier_compatible_creds = compatible_creds + unknown_creds
+                if tier_compatible_creds:
+                    credentials_for_provider = tier_compatible_creds
+                    if compatible_creds and unknown_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
+                        )
+                    elif compatible_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible credentials."
+                        )
+                    else:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
+                        )
+                elif incompatible_creds:
+                    # Only known-incompatible credentials remain
+                    lib_logger.warning(
+                        f"Model {model} requires priority <= {required_tier} credentials, "
+                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
+                        f"Request will likely fail."
+                    )
+        
+        # Build priority map for usage_manager
+        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+            credential_priorities = {}
+            for cred in credentials_for_provider:
+                priority = provider_plugin.get_credential_priority(cred)
+                if priority is not None:
+                    credential_priorities[cred] = priority
+            
+            if credential_priorities:
+                lib_logger.debug(
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                )
 
         while (
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
@@ -710,7 +777,8 @@ class RotatingClient:
                 max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
                     available_keys=creds_to_try, model=model, deadline=deadline,
-                    max_concurrent=max_concurrent
+                    max_concurrent=max_concurrent,
+                    credential_priorities=credential_priorities
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -1047,6 +1115,73 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+        
+        # [NEW] Filter by model tier requirement and build priority map
+        credential_priorities = None
+        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+            required_tier = provider_plugin.get_model_tier_requirement(model)
+            if required_tier is not None:
+                # Filter OUT only credentials we KNOW are too low priority
+                # Keep credentials with unknown priority (None) - they might be high priority
+                incompatible_creds = []
+                compatible_creds = []
+                unknown_creds = []
+                
+                for cred in credentials_for_provider:
+                    if hasattr(provider_plugin, 'get_credential_priority'):
+                        priority = provider_plugin.get_credential_priority(cred)
+                        if priority is None:
+                            # Unknown priority - keep it, will be discovered on first use
+                            unknown_creds.append(cred)
+                        elif priority <= required_tier:
+                            # Known compatible priority
+                            compatible_creds.append(cred)
+                        else:
+                            # Known incompatible priority (too low)
+                            incompatible_creds.append(cred)
+                    else:
+                        # Provider doesn't support priorities - keep all
+                        unknown_creds.append(cred)
+                
+                # If we have any known-compatible or unknown credentials, use them
+                tier_compatible_creds = compatible_creds + unknown_creds
+                if tier_compatible_creds:
+                    credentials_for_provider = tier_compatible_creds
+                    if compatible_creds and unknown_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
+                        )
+                    elif compatible_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible credentials."
+                        )
+                    else:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
+                        )
+                elif incompatible_creds:
+                    # Only known-incompatible credentials remain
+                    lib_logger.warning(
+                        f"Model {model} requires priority <= {required_tier} credentials, "
+                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
+                        f"Request will likely fail."
+                    )
+        
+        # Build priority map for usage_manager
+        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+            credential_priorities = {}
+            for cred in credentials_for_provider:
+                priority = provider_plugin.get_credential_priority(cred)
+                if priority is not None:
+                    credential_priorities[cred] = priority
+            
+            if credential_priorities:
+                lib_logger.debug(
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                )
 
         try:
             while (
@@ -1086,7 +1221,8 @@ class RotatingClient:
                     max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                     current_cred = await self.usage_manager.acquire_key(
                         available_keys=creds_to_try, model=model, deadline=deadline,
-                        max_concurrent=max_concurrent
+                        max_concurrent=max_concurrent,
+                        credential_priorities=credential_priorities
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)

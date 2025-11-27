@@ -166,6 +166,59 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         )
 
     # =========================================================================
+    # CREDENTIAL PRIORITIZATION
+    # =========================================================================
+    
+    def get_credential_priority(self, credential: str) -> Optional[int]:
+        """
+        Returns priority based on Gemini tier.
+        Paid tiers: priority 1 (highest)
+        Free/Legacy tiers: priority 2
+        Unknown: priority 10 (lowest)
+        
+        Args:
+            credential: The credential path
+        
+        Returns:
+            Priority level (1-10) or None if tier not yet discovered
+        """
+        tier = self.project_tier_cache.get(credential)
+        if not tier:
+            return None  # Not yet discovered
+        
+        # Paid tiers get highest priority
+        if tier not in ['free-tier', 'legacy-tier', 'unknown']:
+            return 1
+        
+        # Free tier gets lower priority
+        if tier == 'free-tier':
+            return 2
+        
+        # Legacy and unknown get even lower
+        return 10
+    
+    def get_model_tier_requirement(self, model: str) -> Optional[int]:
+        """
+        Returns the minimum priority tier required for a model.
+        Gemini 3 requires paid tier (priority 1).
+        
+        Args:
+            model: The model name (with or without provider prefix)
+        
+        Returns:
+            Minimum required priority level or None if no restrictions
+        """
+        model_name = model.split('/')[-1].replace(':thinking', '')
+        
+        # Gemini 3 requires paid tier
+        if model_name.startswith("gemini-3-"):
+            return 1  # Only priority 1 (paid) credentials
+        
+        return None  # All other models have no restrictions
+
+
+
+    # =========================================================================
     # MODEL UTILITIES
     # =========================================================================
     

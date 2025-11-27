@@ -162,11 +162,31 @@ class UsageManager:
 
     async def acquire_key(
         self, available_keys: List[str], model: str, deadline: float,
-        max_concurrent: int = 1
+        max_concurrent: int = 1,
+        credential_priorities: Optional[Dict[str, int]] = None
     ) -> str:
         """
         Acquires the best available key using a tiered, model-aware locking strategy,
-        respecting a global deadline.
+        respecting a global deadline and credential priorities.
+        
+        Priority Logic:
+        - Groups credentials by priority level (1=highest, 2=lower, etc.)
+        - Always tries highest priority (lowest number) first
+        - Within same priority, sorts by usage count (load balancing)
+        - Only moves to next priority if all higher-priority keys exhausted/busy
+        
+        Args:
+            available_keys: List of credential identifiers to choose from
+            model: Model name being requested
+            deadline: Timestamp after which to stop trying
+            max_concurrent: Maximum concurrent requests allowed per credential
+            credential_priorities: Optional dict mapping credentials to priority levels (1=highest)
+        
+        Returns:
+            Selected credential identifier
+        
+        Raises:
+            NoAvailableKeysError: If no key could be acquired within the deadline
         """
         await self._lazy_init()
         await self._reset_daily_stats_if_needed()
@@ -174,78 +194,180 @@ class UsageManager:
 
         # This loop continues as long as the global deadline has not been met.
         while time.time() < deadline:
-            tier1_keys, tier2_keys = [], []
             now = time.time()
 
-            # First, filter the list of available keys to exclude any on cooldown.
-            async with self._data_lock:
-                for key in available_keys:
-                    key_data = self._usage_data.get(key, {})
-
-                    if (key_data.get("key_cooldown_until") or 0) > now or (
-                        key_data.get("model_cooldowns", {}).get(model) or 0
-                    ) > now:
-                        continue
-
-                    # Prioritize keys based on their current usage to ensure load balancing.
-                    usage_count = (
-                        key_data.get("daily", {})
-                        .get("models", {})
-                        .get(model, {})
-                        .get("success_count", 0)
+            # Group credentials by priority level (if priorities provided)
+            if credential_priorities:
+                # Group keys by priority level
+                priority_groups = {}
+                async with self._data_lock:
+                    for key in available_keys:
+                        key_data = self._usage_data.get(key, {})
+                        
+                        # Skip keys on cooldown
+                        if (key_data.get("key_cooldown_until") or 0) > now or (
+                            key_data.get("model_cooldowns", {}).get(model) or 0
+                        ) > now:
+                            continue
+                        
+                        # Get priority for this key (default to 999 if not specified)
+                        priority = credential_priorities.get(key, 999)
+                        
+                        # Get usage count for load balancing within priority groups
+                        usage_count = (
+                            key_data.get("daily", {})
+                            .get("models", {})
+                            .get(model, {})
+                            .get("success_count", 0)
+                        )
+                        
+                        # Group by priority
+                        if priority not in priority_groups:
+                            priority_groups[priority] = []
+                        priority_groups[priority].append((key, usage_count))
+                
+                # Try priority groups in order (1, 2, 3, ...)
+                sorted_priorities = sorted(priority_groups.keys())
+                
+                for priority_level in sorted_priorities:
+                    keys_in_priority = priority_groups[priority_level]
+                    
+                    # Within each priority group, use existing tier1/tier2 logic
+                    tier1_keys, tier2_keys = [], []
+                    for key, usage_count in keys_in_priority:
+                        key_state = self.key_states[key]
+                        
+                        # Tier 1: Completely idle keys (preferred)
+                        if not key_state["models_in_use"]:
+                            tier1_keys.append((key, usage_count))
+                        # Tier 2: Keys that can accept more concurrent requests
+                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                            tier2_keys.append((key, usage_count))
+                    
+                    # Sort by usage within each tier
+                    tier1_keys.sort(key=lambda x: x[1])
+                    tier2_keys.sort(key=lambda x: x[1])
+                    
+                    # Try to acquire from Tier 1 first
+                    for key, usage in tier1_keys:
+                        state = self.key_states[key]
+                        async with state["lock"]:
+                            if not state["models_in_use"]:
+                                state["models_in_use"][model] = 1
+                                lib_logger.info(
+                                    f"Acquired Priority-{priority_level} Tier-1 key ...{key[-6:]} for model {model} (usage: {usage})"
+                                )
+                                return key
+                    
+                    # Then try Tier 2
+                    for key, usage in tier2_keys:
+                        state = self.key_states[key]
+                        async with state["lock"]:
+                            current_count = state["models_in_use"].get(model, 0)
+                            if current_count < max_concurrent:
+                                state["models_in_use"][model] = current_count + 1
+                                lib_logger.info(
+                                    f"Acquired Priority-{priority_level} Tier-2 key ...{key[-6:]} for model {model} "
+                                    f"(concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                )
+                                return key
+                
+                # If we get here, all priority groups were exhausted but keys might become available
+                # Collect all keys across all priorities for waiting
+                all_potential_keys = []
+                for keys_list in priority_groups.values():
+                    all_potential_keys.extend(keys_list)
+                
+                if not all_potential_keys:
+                    lib_logger.warning(
+                        "No keys are eligible (all on cooldown or filtered out). Waiting before re-evaluating."
                     )
-                    key_state = self.key_states[key]
-
-                    # Tier 1: Completely idle keys (preferred).
-                    if not key_state["models_in_use"]:
-                        tier1_keys.append((key, usage_count))
-                    # Tier 2: Keys that can accept more concurrent requests for this model.
-                    elif key_state["models_in_use"].get(model, 0) < max_concurrent:
-                        tier2_keys.append((key, usage_count))
-
-            tier1_keys.sort(key=lambda x: x[1])
-            tier2_keys.sort(key=lambda x: x[1])
-
-            # Attempt to acquire a key from Tier 1 first.
-            for key, _ in tier1_keys:
-                state = self.key_states[key]
-                async with state["lock"]:
-                    if not state["models_in_use"]:
-                        state["models_in_use"][model] = 1
-                        lib_logger.info(
-                            f"Acquired Tier 1 key ...{key[-6:]} for model {model}"
-                        )
-                        return key
-
-            # If no Tier 1 keys are available, try Tier 2.
-            for key, _ in tier2_keys:
-                state = self.key_states[key]
-                async with state["lock"]:
-                    current_count = state["models_in_use"].get(model, 0)
-                    if current_count < max_concurrent:
-                        state["models_in_use"][model] = current_count + 1
-                        lib_logger.info(
-                            f"Acquired Tier 2 key ...{key[-6:]} for model {model} "
-                            f"(concurrent: {state['models_in_use'][model]}/{max_concurrent})"
-                        )
-                        return key
-
-            # If all eligible keys are locked, wait for a key to be released.
-            lib_logger.info(
-                "All eligible keys are currently locked for this model. Waiting..."
-            )
-
-            all_potential_keys = tier1_keys + tier2_keys
-            if not all_potential_keys:
-                lib_logger.warning(
-                    "No keys are eligible (all on cooldown). Waiting before re-evaluating."
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Wait for the highest priority key with lowest usage
+                best_priority = min(priority_groups.keys())
+                best_priority_keys = priority_groups[best_priority]
+                best_wait_key = min(best_priority_keys, key=lambda x: x[1])[0]
+                wait_condition = self.key_states[best_wait_key]["condition"]
+                
+                lib_logger.info(
+                    f"All Priority-{best_priority} keys are busy. Waiting for highest priority credential to become available..."
                 )
-                await asyncio.sleep(1)
-                continue
+                
+            else:
+                # Original logic when no priorities specified
+                tier1_keys, tier2_keys = [], []
 
-            # Wait on the condition of the key with the lowest current usage.
-            best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
-            wait_condition = self.key_states[best_wait_key]["condition"]
+                # First, filter the list of available keys to exclude any on cooldown.
+                async with self._data_lock:
+                    for key in available_keys:
+                        key_data = self._usage_data.get(key, {})
+
+                        if (key_data.get("key_cooldown_until") or 0) > now or (
+                            key_data.get("model_cooldowns", {}).get(model) or 0
+                        ) > now:
+                            continue
+
+                        # Prioritize keys based on their current usage to ensure load balancing.
+                        usage_count = (
+                            key_data.get("daily", {})
+                            .get("models", {})
+                            .get(model, {})
+                            .get("success_count", 0)
+                        )
+                        key_state = self.key_states[key]
+
+                        # Tier 1: Completely idle keys (preferred).
+                        if not key_state["models_in_use"]:
+                            tier1_keys.append((key, usage_count))
+                        # Tier 2: Keys that can accept more concurrent requests for this model.
+                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                            tier2_keys.append((key, usage_count))
+
+                tier1_keys.sort(key=lambda x: x[1])
+                tier2_keys.sort(key=lambda x: x[1])
+
+                # Attempt to acquire a key from Tier 1 first.
+                for key, _ in tier1_keys:
+                    state = self.key_states[key]
+                    async with state["lock"]:
+                        if not state["models_in_use"]:
+                            state["models_in_use"][model] = 1
+                            lib_logger.info(
+                                f"Acquired Tier 1 key ...{key[-6:]} for model {model}"
+                            )
+                            return key
+
+                # If no Tier 1 keys are available, try Tier 2.
+                for key, _ in tier2_keys:
+                    state = self.key_states[key]
+                    async with state["lock"]:
+                        current_count = state["models_in_use"].get(model, 0)
+                        if current_count < max_concurrent:
+                            state["models_in_use"][model] = current_count + 1
+                            lib_logger.info(
+                                f"Acquired Tier 2 key ...{key[-6:]} for model {model} "
+                                f"(concurrent: {state['models_in_use'][model]}/{max_concurrent})"
+                            )
+                            return key
+
+                # If all eligible keys are locked, wait for a key to be released.
+                lib_logger.info(
+                    "All eligible keys are currently locked for this model. Waiting..."
+                )
+
+                all_potential_keys = tier1_keys + tier2_keys
+                if not all_potential_keys:
+                    lib_logger.warning(
+                        "No keys are eligible (all on cooldown). Waiting before re-evaluating."
+                    )
+                    await asyncio.sleep(1)
+                    continue
+
+                # Wait on the condition of the key with the lowest current usage.
+                best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
+                wait_condition = self.key_states[best_wait_key]["condition"]
 
             try:
                 async with wait_condition:
@@ -265,6 +387,8 @@ class UsageManager:
         raise NoAvailableKeysError(
             f"Could not acquire a key for model {model} within the global time budget."
         )
+
+
 
     async def release_key(self, key: str, model: str):
         """Releases a key's lock for a specific model and notifies waiting tasks."""
