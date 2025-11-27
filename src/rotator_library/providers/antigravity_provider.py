@@ -199,7 +199,7 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                         cleaned = stripped[:last_bracket+1]
                         parsed = json.loads(cleaned)
                         lib_logger.warning(
-                            f"Auto-corrected malformed JSON string: "
+                            f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
                         return _recursively_parse_json_strings(parsed)
@@ -369,11 +369,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._enable_signature_cache = _env_bool("ANTIGRAVITY_ENABLE_SIGNATURE_CACHE", True)
         self._enable_dynamic_models = _env_bool("ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False)
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
-        
-        # Thinking mode toggling behavior
-        self._auto_inject_turn_completion = _env_bool("ANTIGRAVITY_AUTO_INJECT_TURN_COMPLETION", True)
-        self._auto_suppress_thinking = _env_bool("ANTIGRAVITY_AUTO_SUPPRESS_THINKING", False)
-        self._turn_completion_placeholder = os.getenv("ANTIGRAVITY_TURN_COMPLETION_TEXT", "...")
         
         # Gemini 3 tool fix configuration
         self._gemini3_tool_prefix = os.getenv("ANTIGRAVITY_GEMINI3_TOOL_PREFIX", "gemini3_")
@@ -1368,142 +1363,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         return [f"antigravity/{m}" for m in AVAILABLE_MODELS]
     
-    # =========================================================================
-    # THINKING MODE TOGGLING HELPERS
-    # =========================================================================
-    
-    def _detect_incomplete_tool_turn(self, messages: List[Dict[str, Any]]) -> Optional[int]:
-        """
-        Detect if messages end with an incomplete tool use loop.
-        
-        An incomplete tool turn is when:
-        - Last message is a tool result
-        - The assistant message that made the tool call hasn't been completed
-          with a final text response
-        
-        Returns:
-            Index of the assistant message with tool_calls if incomplete turn detected,
-            None otherwise
-        """
-        if len(messages) < 2:
-            return None
-        
-        # Last message must be tool result
-        if messages[-1].get("role") != "tool":
-            return None
-        
-        # Find the assistant message that made the tool call
-        for i in range(len(messages) - 2, -1, -1):
-            msg = messages[i]
-            if msg.get("role") == "assistant":
-                if msg.get("tool_calls"):
-                    # Check if turn was completed by a subsequent assistant message
-                    for j in range(i + 1, len(messages)):
-                        if messages[j].get("role") == "assistant" and not messages[j].get("tool_calls"):
-                            return None  # Turn completed
-                    
-                    # Incomplete turn found
-                    lib_logger.debug(
-                        f"Detected incomplete tool turn: assistant message at index {i} "
-                        f"has tool_calls, but no completing text response found"
-                    )
-                    return i
-                else:
-                    # Found completing assistant message
-                    return None
-        
-        return None
-    
-    def _inject_turn_completion(
-        self,
-        messages: List[Dict[str, Any]],
-        incomplete_turn_index: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Inject a completing assistant message to close an incomplete tool use turn.
-        
-        Args:
-            messages: Original message list
-            incomplete_turn_index: Index of the assistant message with tool_calls
-            
-        Returns:
-            Modified message list with injected completion
-        """
-        completion_msg = {
-            "role": "assistant",
-            "content": self._turn_completion_placeholder
-        }
-        
-        # Append to close the turn
-        modified_messages = messages.copy()
-        modified_messages.append(completion_msg)
-        
-        lib_logger.info(
-            f"Injected turn-completing assistant message ('{self._turn_completion_placeholder}') "
-            f"to enable thinking mode. Original tool use started at message index {incomplete_turn_index}."
-        )
-        
-        return modified_messages
-    
-    def _handle_thinking_mode_toggle(
-        self,
-        messages: List[Dict[str, Any]],
-        model: str,
-        reasoning_effort: Optional[str]
-    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        """
-        Handle thinking mode toggling when switching models mid-conversation.
-        
-        When switching to Claude with thinking enabled, but the conversation has
-        an incomplete tool use loop from another model, either:
-        1. Inject a completing message to close the turn (if auto_inject enabled)
-        2. Suppress thinking mode (if auto_suppress enabled)
-        3. Let it fail with API error (if both disabled)
-        
-        Args:
-            messages: Original message list
-            model: Target model
-            reasoning_effort: Requested reasoning effort level
-            
-        Returns:
-            (modified_messages, modified_reasoning_effort)
-        """
-        # Only applies when trying to enable thinking on Claude
-        if not self._is_claude(model) or not reasoning_effort:
-            return messages, reasoning_effort
-        
-        incomplete_turn_index = self._detect_incomplete_tool_turn(messages)
-        if incomplete_turn_index is None:
-            # No incomplete turn - proceed normally
-            return messages, reasoning_effort
-        
-        # Strategy 1: Auto-inject turn completion (preferred)
-        if self._auto_inject_turn_completion:
-            lib_logger.info(
-                "Model switch to Claude with thinking detected mid-tool-use-loop. "
-                "Injecting turn completion to enable thinking mode."
-            )
-            modified_messages = self._inject_turn_completion(messages, incomplete_turn_index)
-            return modified_messages, reasoning_effort
-        
-        # Strategy 2: Auto-suppress thinking
-        if self._auto_suppress_thinking:
-            lib_logger.warning(
-                f"Model switch to Claude with thinking detected mid-tool-use-loop. "
-                f"Suppressing reasoning_effort={reasoning_effort} to avoid API error. "
-                f"Set ANTIGRAVITY_AUTO_INJECT_TURN_COMPLETION=true to inject completion instead."
-            )
-            return messages, None
-        
-        # Strategy 3: Let it fail (user wants to handle it themselves)
-        lib_logger.warning(
-            "Model switch to Claude with thinking detected mid-tool-use-loop. "
-            "Both auto-injection and auto-suppression are disabled. "
-            "Request will likely fail with API error. "
-            f"Enable ANTIGRAVITY_AUTO_INJECT_TURN_COMPLETION or ANTIGRAVITY_AUTO_SUPPRESS_THINKING."
-        )
-        return messages, reasoning_effort
-    
     async def acompletion(
         self,
         client: httpx.AsyncClient,
@@ -1532,13 +1391,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Create logger
         file_logger = AntigravityFileLogger(model, enable_logging)
-        
-        # Handle thinking mode toggling for model switches
-        messages, reasoning_effort = self._handle_thinking_mode_toggle(messages, model, reasoning_effort)
-        if reasoning_effort != kwargs.get("reasoning_effort"):
-            kwargs["reasoning_effort"] = reasoning_effort
-        if messages != kwargs.get("messages"):
-            kwargs["messages"] = messages
         
         # Transform messages
         system_instruction, gemini_contents = self._transform_messages(messages, model)
