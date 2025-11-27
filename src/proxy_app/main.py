@@ -42,31 +42,23 @@ _start_time = time.time()
 from dotenv import load_dotenv
 from glob import glob
 
-# [DEBUG-REMOVE] Diagnostic logging for .env loading
-print(f"[DEBUG-REMOVE] Current working directory: {Path.cwd()}")
-print(f"[DEBUG-REMOVE] __file__ location: {Path(__file__).resolve().parent}")
-
 # Load main .env first
-_main_env_path = Path.cwd() / ".env"
-print(f"[DEBUG-REMOVE] Looking for main .env at: {_main_env_path}")
-print(f"[DEBUG-REMOVE] Main .env exists: {_main_env_path.exists()}")
 load_dotenv()
 
 # Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
 _root_dir = Path.cwd()
 _env_files_found = list(_root_dir.glob("*.env"))
-print(f"[DEBUG-REMOVE] Found {len(_env_files_found)} .env files in {_root_dir}:")
-for _ef in _env_files_found:
-    print(f"[DEBUG-REMOVE]   - {_ef.name}")
-
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
-        print(f"[DEBUG-REMOVE] Loading additional .env file: {_env_file}")
         load_dotenv(_env_file, override=False)  # Don't override existing values
+
+# Log discovered .env files for deployment verification
+if _env_files_found:
+    _env_names = [_ef.name for _ef in _env_files_found]
+    print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
 
 # Get proxy API key for display
 proxy_api_key = os.getenv("PROXY_API_KEY")
-print(f"[DEBUG-REMOVE] PROXY_API_KEY from environment: {'SET' if proxy_api_key else 'NOT SET'}")
 if proxy_api_key:
     key_display = f"✓ {proxy_api_key}"
 else:
@@ -302,16 +294,12 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 
 # Discover API keys from environment variables
 api_keys = {}
-print("[DEBUG-REMOVE] === Discovering API keys from environment ===")
 for key, value in os.environ.items():
     if "_API_KEY" in key and key != "PROXY_API_KEY":
         provider = key.split("_API_KEY")[0].lower()
         if provider not in api_keys:
             api_keys[provider] = []
         api_keys[provider].append(value)
-        print(f"[DEBUG-REMOVE] Found API key: {key} for provider '{provider}'")
-
-print(f"[DEBUG-REMOVE] Total providers with API keys: {list(api_keys.keys())}")
 
 # Load model ignore lists from environment variables
 ignore_models = {}
@@ -355,15 +343,8 @@ async def lifespan(app: FastAPI):
 
     # The CredentialManager now handles all discovery, including .env overrides.
     # We pass all environment variables to it for this purpose.
-    print("[DEBUG-REMOVE] === Creating CredentialManager ===")
-    print(f"[DEBUG-REMOVE] Total environment variables: {len(os.environ)}")
     cred_manager = CredentialManager(os.environ)
     oauth_credentials = cred_manager.discover_and_prepare()
-    
-    print(f"[DEBUG-REMOVE] === OAuth credentials discovered ===")
-    print(f"[DEBUG-REMOVE] Providers with OAuth credentials: {list(oauth_credentials.keys())}")
-    for provider, paths in oauth_credentials.items():
-        print(f"[DEBUG-REMOVE]   {provider}: {len(paths)} credential(s) - {paths}")
 
     if not skip_oauth_init and oauth_credentials:
         logging.info("Starting OAuth credential validation and deduplication...")
@@ -507,9 +488,6 @@ async def lifespan(app: FastAPI):
     }
 
     # The client now uses the root logger configuration
-    print(f"[DEBUG-REMOVE] === Initializing RotatingClient ===")
-    print(f"[DEBUG-REMOVE] API keys providers: {list(api_keys.keys())}")
-    print(f"[DEBUG-REMOVE] OAuth providers: {list(oauth_credentials.keys())}")
     client = RotatingClient(
         api_keys=api_keys,
         oauth_credentials=oauth_credentials, # Pass OAuth config
@@ -520,9 +498,12 @@ async def lifespan(app: FastAPI):
         enable_request_logging=ENABLE_REQUEST_LOGGING,
         max_concurrent_requests_per_key=max_concurrent_requests_per_key
     )
-    print(f"[DEBUG-REMOVE] RotatingClient.all_credentials keys: {list(client.all_credentials.keys())}")
-    for provider, creds in client.all_credentials.items():
-        print(f"[DEBUG-REMOVE]   {provider}: {len(creds)} credential(s)")
+    
+    # Log loaded credentials summary (compact, always visible for deployment verification)
+    _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
+    _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
+    _total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
+    print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
     

@@ -58,24 +58,12 @@ class CredentialManager:
         """
         env_credentials: Dict[str, Set[str]] = {}
         
-        # [DEBUG-REMOVE] Log all environment variable keys for OAuth providers
-        print(f"[DEBUG-REMOVE] === Scanning environment for OAuth credentials ===")
-        print(f"[DEBUG-REMOVE] ENV_OAUTH_PROVIDERS: {list(ENV_OAUTH_PROVIDERS.keys())}")
-        
         for provider, env_prefix in ENV_OAUTH_PROVIDERS.items():
             found_indices: Set[str] = set()
-            print(f"[DEBUG-REMOVE] Scanning for provider '{provider}' with prefix '{env_prefix}'")
             
             # Check for numbered credentials (PROVIDER_N_ACCESS_TOKEN pattern)
             # Pattern: ANTIGRAVITY_1_ACCESS_TOKEN, ANTIGRAVITY_2_ACCESS_TOKEN, etc.
             numbered_pattern = re.compile(rf"^{env_prefix}_(\d+)_ACCESS_TOKEN$")
-            
-            # [DEBUG-REMOVE] Show all matching environment variable keys
-            matching_keys = [k for k in self.env_vars.keys() if env_prefix in k]
-            if matching_keys:
-                print(f"[DEBUG-REMOVE]   Found {len(matching_keys)} keys with '{env_prefix}': {matching_keys}")
-            else:
-                print(f"[DEBUG-REMOVE]   No keys found with '{env_prefix}' prefix")
             
             for key in self.env_vars.keys():
                 match = numbered_pattern.match(key)
@@ -85,30 +73,20 @@ class CredentialManager:
                     refresh_key = f"{env_prefix}_{index}_REFRESH_TOKEN"
                     if refresh_key in self.env_vars and self.env_vars[refresh_key]:
                         found_indices.add(index)
-                        print(f"[DEBUG-REMOVE]   ✓ Found numbered credential {index} for {provider}")
-                    else:
-                        print(f"[DEBUG-REMOVE]   ✗ Missing REFRESH_TOKEN for {provider} credential {index}")
             
             # Check for legacy single credential (PROVIDER_ACCESS_TOKEN pattern)
             # Only use this if no numbered credentials exist
             if not found_indices:
                 access_key = f"{env_prefix}_ACCESS_TOKEN"
                 refresh_key = f"{env_prefix}_REFRESH_TOKEN"
-                print(f"[DEBUG-REMOVE]   Checking legacy format: {access_key}, {refresh_key}")
                 if (access_key in self.env_vars and self.env_vars[access_key] and
                     refresh_key in self.env_vars and self.env_vars[refresh_key]):
                     # Use "0" as the index for legacy single credential
                     found_indices.add("0")
-                    print(f"[DEBUG-REMOVE]   ✓ Found legacy single credential for {provider}")
-                else:
-                    print(f"[DEBUG-REMOVE]   ✗ No legacy credential found for {provider}")
             
             if found_indices:
                 env_credentials[provider] = found_indices
                 lib_logger.info(f"Found {len(found_indices)} env-based credential(s) for {provider}")
-                print(f"[DEBUG-REMOVE]   RESULT: {len(found_indices)} credential(s) registered for {provider}")
-            else:
-                print(f"[DEBUG-REMOVE]   RESULT: No credentials found for {provider}")
         
         # Convert to virtual paths
         result: Dict[str, List[str]] = {}
