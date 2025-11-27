@@ -115,8 +115,13 @@ class RotatingClient:
             )
 
         self.api_keys = api_keys
-        self.credential_manager = CredentialManager(oauth_credentials)
-        self.oauth_credentials = self.credential_manager.discover_and_prepare()
+        # Use provided oauth_credentials directly if available (already discovered by main.py)
+        # Only call discover_and_prepare() if no credentials were passed
+        if oauth_credentials:
+            self.oauth_credentials = oauth_credentials
+        else:
+            self.credential_manager = CredentialManager(os.environ)
+            self.oauth_credentials = self.credential_manager.discover_and_prepare()
         self.background_refresher = BackgroundRefresher(self)
         self.oauth_providers = set(self.oauth_credentials.keys())
 

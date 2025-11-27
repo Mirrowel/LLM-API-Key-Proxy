@@ -713,6 +713,288 @@ async def export_antigravity_to_env():
         console.print(Panel(f"An error occurred during export: {e}", style="bold red", title="Error"))
 
 
+def _build_gemini_cli_env_lines(creds: dict, cred_number: int) -> list[str]:
+    """Build .env lines for a Gemini CLI credential."""
+    email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+    project_id = creds.get("_proxy_metadata", {}).get("project_id", "")
+    tier = creds.get("_proxy_metadata", {}).get("tier", "")
+    
+    extra_fields = {}
+    if project_id:
+        extra_fields["PROJECT_ID"] = project_id
+    if tier:
+        extra_fields["TIER"] = tier
+    
+    env_lines, _ = _build_env_export_content(
+        provider_prefix="GEMINI_CLI",
+        cred_number=cred_number,
+        creds=creds,
+        email=email,
+        extra_fields=extra_fields,
+        include_client_creds=True
+    )
+    return env_lines
+
+
+def _build_qwen_code_env_lines(creds: dict, cred_number: int) -> list[str]:
+    """Build .env lines for a Qwen Code credential."""
+    email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+    numbered_prefix = f"QWEN_CODE_{cred_number}"
+    
+    env_lines = [
+        f"# QWEN_CODE Credential #{cred_number} for: {email}",
+        f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"{numbered_prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+        f"{numbered_prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+        f"{numbered_prefix}_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+        f"{numbered_prefix}_RESOURCE_URL={creds.get('resource_url', 'https://portal.qwen.ai/v1')}",
+        f"{numbered_prefix}_EMAIL={email}",
+    ]
+    return env_lines
+
+
+def _build_iflow_env_lines(creds: dict, cred_number: int) -> list[str]:
+    """Build .env lines for an iFlow credential."""
+    email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+    numbered_prefix = f"IFLOW_{cred_number}"
+    
+    env_lines = [
+        f"# IFLOW Credential #{cred_number} for: {email}",
+        f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"{numbered_prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+        f"{numbered_prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+        f"{numbered_prefix}_API_KEY={creds.get('api_key', '')}",
+        f"{numbered_prefix}_EXPIRY_DATE={creds.get('expiry_date', '')}",
+        f"{numbered_prefix}_EMAIL={email}",
+        f"{numbered_prefix}_TOKEN_TYPE={creds.get('token_type', 'Bearer')}",
+        f"{numbered_prefix}_SCOPE={creds.get('scope', 'read write')}",
+    ]
+    return env_lines
+
+
+def _build_antigravity_env_lines(creds: dict, cred_number: int) -> list[str]:
+    """Build .env lines for an Antigravity credential."""
+    email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+    
+    env_lines, _ = _build_env_export_content(
+        provider_prefix="ANTIGRAVITY",
+        cred_number=cred_number,
+        creds=creds,
+        email=email,
+        extra_fields=None,
+        include_client_creds=True
+    )
+    return env_lines
+
+
+async def export_all_provider_credentials(provider_name: str):
+    """
+    Export all credentials for a specific provider to individual .env files.
+    """
+    provider_config = {
+        "gemini_cli": ("GEMINI_CLI", _build_gemini_cli_env_lines),
+        "qwen_code": ("QWEN_CODE", _build_qwen_code_env_lines),
+        "iflow": ("IFLOW", _build_iflow_env_lines),
+        "antigravity": ("ANTIGRAVITY", _build_antigravity_env_lines),
+    }
+    
+    if provider_name not in provider_config:
+        console.print(f"[bold red]Unknown provider: {provider_name}[/bold red]")
+        return
+    
+    prefix, build_func = provider_config[provider_name]
+    display_name = prefix.replace("_", " ").title()
+    
+    console.print(Panel(f"[bold cyan]Export All {display_name} Credentials[/bold cyan]", expand=False))
+    
+    # Find all credentials for this provider
+    cred_files = sorted(list(OAUTH_BASE_DIR.glob(f"{provider_name}_oauth_*.json")))
+    
+    if not cred_files:
+        console.print(Panel(f"No {display_name} credentials found.", style="bold red", title="No Credentials"))
+        return
+    
+    exported_count = 0
+    for cred_file in cred_files:
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+            cred_number = _get_credential_number_from_filename(cred_file.name)
+            
+            # Generate .env file name
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"{provider_name}_{cred_number}_{safe_email}.env"
+            env_filepath = OAUTH_BASE_DIR / env_filename
+            
+            # Build and write .env content
+            env_lines = build_func(creds, cred_number)
+            with open(env_filepath, 'w') as f:
+                f.write('\n'.join(env_lines))
+            
+            console.print(f"  ✓ Exported [cyan]{cred_file.name}[/cyan] → [yellow]{env_filename}[/yellow]")
+            exported_count += 1
+            
+        except Exception as e:
+            console.print(f"  ✗ Failed to export {cred_file.name}: {e}")
+    
+    console.print(Panel(
+        f"Successfully exported {exported_count}/{len(cred_files)} {display_name} credentials to individual .env files.",
+        style="bold green", title="Export Complete"
+    ))
+
+
+async def combine_provider_credentials(provider_name: str):
+    """
+    Combine all credentials for a specific provider into a single .env file.
+    """
+    provider_config = {
+        "gemini_cli": ("GEMINI_CLI", _build_gemini_cli_env_lines),
+        "qwen_code": ("QWEN_CODE", _build_qwen_code_env_lines),
+        "iflow": ("IFLOW", _build_iflow_env_lines),
+        "antigravity": ("ANTIGRAVITY", _build_antigravity_env_lines),
+    }
+    
+    if provider_name not in provider_config:
+        console.print(f"[bold red]Unknown provider: {provider_name}[/bold red]")
+        return
+    
+    prefix, build_func = provider_config[provider_name]
+    display_name = prefix.replace("_", " ").title()
+    
+    console.print(Panel(f"[bold cyan]Combine All {display_name} Credentials[/bold cyan]", expand=False))
+    
+    # Find all credentials for this provider
+    cred_files = sorted(list(OAUTH_BASE_DIR.glob(f"{provider_name}_oauth_*.json")))
+    
+    if not cred_files:
+        console.print(Panel(f"No {display_name} credentials found.", style="bold red", title="No Credentials"))
+        return
+    
+    combined_lines = [
+        f"# Combined {display_name} Credentials",
+        f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Total credentials: {len(cred_files)}",
+        "#",
+        "# Copy all lines below into your main .env file",
+        "",
+    ]
+    
+    combined_count = 0
+    for cred_file in cred_files:
+        try:
+            with open(cred_file, 'r') as f:
+                creds = json.load(f)
+            
+            cred_number = _get_credential_number_from_filename(cred_file.name)
+            env_lines = build_func(creds, cred_number)
+            
+            combined_lines.extend(env_lines)
+            combined_lines.append("")  # Blank line between credentials
+            combined_count += 1
+            
+        except Exception as e:
+            console.print(f"  ✗ Failed to process {cred_file.name}: {e}")
+    
+    # Write combined file
+    combined_filename = f"{provider_name}_all_combined.env"
+    combined_filepath = OAUTH_BASE_DIR / combined_filename
+    
+    with open(combined_filepath, 'w') as f:
+        f.write('\n'.join(combined_lines))
+    
+    console.print(Panel(
+        Text.from_markup(
+            f"Successfully combined {combined_count} {display_name} credentials into:\n"
+            f"[bold yellow]{combined_filepath}[/bold yellow]\n\n"
+            f"[bold]To use:[/bold] Copy the contents into your main .env file."
+        ),
+        style="bold green", title="Combine Complete"
+    ))
+
+
+async def combine_all_credentials():
+    """
+    Combine ALL credentials from ALL providers into a single .env file.
+    """
+    console.print(Panel("[bold cyan]Combine All Provider Credentials[/bold cyan]", expand=False))
+    
+    provider_config = {
+        "gemini_cli": ("GEMINI_CLI", _build_gemini_cli_env_lines),
+        "qwen_code": ("QWEN_CODE", _build_qwen_code_env_lines),
+        "iflow": ("IFLOW", _build_iflow_env_lines),
+        "antigravity": ("ANTIGRAVITY", _build_antigravity_env_lines),
+    }
+    
+    combined_lines = [
+        "# Combined All Provider Credentials",
+        f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "#",
+        "# Copy all lines below into your main .env file",
+        "",
+    ]
+    
+    total_count = 0
+    provider_counts = {}
+    
+    for provider_name, (prefix, build_func) in provider_config.items():
+        cred_files = sorted(list(OAUTH_BASE_DIR.glob(f"{provider_name}_oauth_*.json")))
+        
+        if not cred_files:
+            continue
+        
+        display_name = prefix.replace("_", " ").title()
+        combined_lines.append(f"# ===== {display_name} Credentials =====")
+        combined_lines.append("")
+        
+        provider_count = 0
+        for cred_file in cred_files:
+            try:
+                with open(cred_file, 'r') as f:
+                    creds = json.load(f)
+                
+                cred_number = _get_credential_number_from_filename(cred_file.name)
+                env_lines = build_func(creds, cred_number)
+                
+                combined_lines.extend(env_lines)
+                combined_lines.append("")
+                provider_count += 1
+                total_count += 1
+                
+            except Exception as e:
+                console.print(f"  ✗ Failed to process {cred_file.name}: {e}")
+        
+        provider_counts[display_name] = provider_count
+    
+    if total_count == 0:
+        console.print(Panel("No credentials found to combine.", style="bold red", title="No Credentials"))
+        return
+    
+    # Write combined file
+    combined_filename = "all_providers_combined.env"
+    combined_filepath = OAUTH_BASE_DIR / combined_filename
+    
+    with open(combined_filepath, 'w') as f:
+        f.write('\n'.join(combined_lines))
+    
+    # Build summary
+    summary_lines = [f"  • {name}: {count} credential(s)" for name, count in provider_counts.items()]
+    summary = "\n".join(summary_lines)
+    
+    console.print(Panel(
+        Text.from_markup(
+            f"Successfully combined {total_count} credentials from {len(provider_counts)} providers:\n"
+            f"{summary}\n\n"
+            f"[bold]Output file:[/bold] [yellow]{combined_filepath}[/yellow]\n\n"
+            f"[bold]To use:[/bold] Copy the contents into your main .env file."
+        ),
+        style="bold green", title="Combine Complete"
+    ))
+
+
 async def export_credentials_submenu():
     """
     Submenu for credential export options.
@@ -723,24 +1005,39 @@ async def export_credentials_submenu():
         
         console.print(Panel(
             Text.from_markup(
+                "[bold]Individual Exports:[/bold]\n"
                 "1. Export Gemini CLI credential\n"
                 "2. Export Qwen Code credential\n"
                 "3. Export iFlow credential\n"
-                "4. Export Antigravity credential"
+                "4. Export Antigravity credential\n"
+                "\n"
+                "[bold]Bulk Exports (per provider):[/bold]\n"
+                "5. Export ALL Gemini CLI credentials\n"
+                "6. Export ALL Qwen Code credentials\n"
+                "7. Export ALL iFlow credentials\n"
+                "8. Export ALL Antigravity credentials\n"
+                "\n"
+                "[bold]Combine Credentials:[/bold]\n"
+                "9. Combine all Gemini CLI into one file\n"
+                "10. Combine all Qwen Code into one file\n"
+                "11. Combine all iFlow into one file\n"
+                "12. Combine all Antigravity into one file\n"
+                "13. Combine ALL providers into one file"
             ),
-            title="Choose credential type to export",
+            title="Choose export option",
             style="bold blue"
         ))
 
         export_choice = Prompt.ask(
             Text.from_markup("[bold]Please select an option or type [red]'b'[/red] to go back[/bold]"),
-            choices=["1", "2", "3", "4", "b"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "b"],
             show_choices=False
         )
 
         if export_choice.lower() == 'b':
             break
 
+        # Individual exports
         if export_choice == "1":
             await export_gemini_cli_to_env()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
@@ -755,6 +1052,45 @@ async def export_credentials_submenu():
             input()
         elif export_choice == "4":
             await export_antigravity_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        # Bulk exports (all credentials for a provider)
+        elif export_choice == "5":
+            await export_all_provider_credentials("gemini_cli")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "6":
+            await export_all_provider_credentials("qwen_code")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "7":
+            await export_all_provider_credentials("iflow")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "8":
+            await export_all_provider_credentials("antigravity")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        # Combine per provider
+        elif export_choice == "9":
+            await combine_provider_credentials("gemini_cli")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "10":
+            await combine_provider_credentials("qwen_code")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "11":
+            await combine_provider_credentials("iflow")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "12":
+            await combine_provider_credentials("antigravity")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        # Combine all providers
+        elif export_choice == "13":
+            await combine_all_credentials()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
 

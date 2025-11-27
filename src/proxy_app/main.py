@@ -38,9 +38,18 @@ if args.add_credential:
 # If we get here, we're ACTUALLY running the proxy - NOW show startup messages and start timer
 _start_time = time.time()
 
-# Load .env early so PROXY_API_KEY is available for display
+# Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
+from glob import glob
+
+# Load main .env first
 load_dotenv()
+
+# Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
+_root_dir = Path.cwd()
+for _env_file in sorted(_root_dir.glob("*.env")):
+    if _env_file.name != ".env":  # Skip main .env (already loaded)
+        load_dotenv(_env_file, override=False)  # Don't override existing values
 
 # Get proxy API key for display
 proxy_api_key = os.getenv("PROXY_API_KEY")
@@ -298,6 +307,11 @@ async def lifespan(app: FastAPI):
             if provider not in credentials_to_initialize:
                 credentials_to_initialize[provider] = []
             for path in paths:
+                # Skip env-based credentials (virtual paths) - they don't have metadata files
+                if path.startswith("env://"):
+                    credentials_to_initialize[provider].append(path)
+                    continue
+                    
                 try:
                     with open(path, 'r') as f:
                         data = json.load(f)
@@ -399,19 +413,20 @@ async def lifespan(app: FastAPI):
                     final_oauth_credentials[provider] = []
                 final_oauth_credentials[provider].append(path)
 
-                # Update metadata
-                try:
-                    with open(path, 'r+') as f:
-                        data = json.load(f)
-                        metadata = data.get("_proxy_metadata", {})
-                        metadata["email"] = email
-                        metadata["last_check_timestamp"] = time.time()
-                        data["_proxy_metadata"] = metadata
-                        f.seek(0)
-                        json.dump(data, f, indent=2)
-                        f.truncate()
-                except Exception as e:
-                    logging.error(f"Failed to update metadata for '{path}': {e}")
+                # Update metadata (skip for env-based credentials - they don't have files)
+                if not path.startswith("env://"):
+                    try:
+                        with open(path, 'r+') as f:
+                            data = json.load(f)
+                            metadata = data.get("_proxy_metadata", {})
+                            metadata["email"] = email
+                            metadata["last_check_timestamp"] = time.time()
+                            data["_proxy_metadata"] = metadata
+                            f.seek(0)
+                            json.dump(data, f, indent=2)
+                            f.truncate()
+                    except Exception as e:
+                        logging.error(f"Failed to update metadata for '{path}': {e}")
 
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
