@@ -316,12 +316,25 @@ class QwenAuthBase:
                 try:
                     # Call initialize_token to trigger OAuth flow
                     new_creds = await self.initialize_token(path)
+                    # Clear backoff on successful re-auth
+                    self._refresh_failures.pop(path, None)
+                    self._next_refresh_after.pop(path, None)
                     return new_creds
                 except Exception as reauth_error:
                     lib_logger.error(f"Re-authentication failed for '{Path(path).name}': {reauth_error}")
+                    # [BACKOFF TRACKING] Increment failure count and set backoff timer
+                    self._refresh_failures[path] = self._refresh_failures.get(path, 0) + 1
+                    backoff_seconds = min(300, 30 * (2 ** self._refresh_failures[path]))  # Max 5 min backoff
+                    self._next_refresh_after[path] = time.time() + backoff_seconds
+                    lib_logger.debug(f"Setting backoff for '{Path(path).name}': {backoff_seconds}s")
                     raise ValueError(f"Refresh token invalid and re-authentication failed: {reauth_error}")
 
             if new_token_data is None:
+                # [BACKOFF TRACKING] Increment failure count and set backoff timer
+                self._refresh_failures[path] = self._refresh_failures.get(path, 0) + 1
+                backoff_seconds = min(300, 30 * (2 ** self._refresh_failures[path]))  # Max 5 min backoff
+                self._next_refresh_after[path] = time.time() + backoff_seconds
+                lib_logger.debug(f"Setting backoff for '{Path(path).name}': {backoff_seconds}s")
                 raise last_error or Exception("Token refresh failed after all retries")
 
             creds_from_file["access_token"] = new_token_data["access_token"]
@@ -333,6 +346,16 @@ class QwenAuthBase:
             if "_proxy_metadata" not in creds_from_file:
                 creds_from_file["_proxy_metadata"] = {}
             creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
+            # [VALIDATION] Verify required fields exist after refresh
+            required_fields = ["access_token", "refresh_token"]
+            missing_fields = [field for field in required_fields if not creds_from_file.get(field)]
+            if missing_fields:
+                raise ValueError(f"Refreshed credentials missing required fields: {missing_fields}")
+
+            # [BACKOFF TRACKING] Clear failure count on successful refresh
+            self._refresh_failures.pop(path, None)
+            self._next_refresh_after.pop(path, None)
 
             await self._save_credentials(path, creds_from_file)
             lib_logger.debug(f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'.")
@@ -370,10 +393,13 @@ class QwenAuthBase:
     async def proactively_refresh(self, credential_identifier: str):
         """
         Proactively refreshes tokens if they're close to expiry.
-        Only applies to OAuth credentials (file paths). Direct API keys are skipped.
+        Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
         """
-        # Only refresh if it's an OAuth credential (file path)
-        if not os.path.isfile(credential_identifier):
+        # Check if it's an env:// virtual path (OAuth credentials from environment)
+        is_env_path = credential_identifier.startswith("env://")
+        
+        # Only refresh if it's an OAuth credential (file path or env:// path)
+        if not is_env_path and not os.path.isfile(credential_identifier):
             return  # Direct API key, no refresh needed
 
         creds = await self._load_credentials(credential_identifier)
