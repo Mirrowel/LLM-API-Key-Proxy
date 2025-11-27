@@ -473,8 +473,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._gemini3_tool_prefix = os.getenv("ANTIGRAVITY_GEMINI3_TOOL_PREFIX", "gemini3_")
         self._gemini3_description_prompt = os.getenv(
             "ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT",
-            "\n\nSTRICT PARAMETERS: {params}."
+            "\n\n⚠️ STRICT PARAMETERS (use EXACTLY as shown): {params}. Do NOT use parameters from your training data - use ONLY these parameter names."
         )
+        self._gemini3_enforce_strict_schema = _env_bool("ANTIGRAVITY_GEMINI3_STRICT_SCHEMA", True)
         self._gemini3_system_instruction = os.getenv(
             "ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION",
             DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
@@ -498,8 +499,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         lib_logger.debug(
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
-            f"gemini3_fix={self._enable_gemini3_tool_fix}, claude_fix={self._enable_claude_tool_fix}, "
-            f"thinking_sanitization={self._enable_thinking_sanitization}"
+            f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
+            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
         )
     
     # =========================================================================
@@ -1341,6 +1342,43 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         return modified
     
+    def _enforce_strict_schema(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
+        
+        Adds 'additionalProperties: false' recursively to all object schemas,
+        which tells the model it CANNOT add properties not in the schema.
+        """
+        if not tools:
+            return tools
+        
+        def enforce_strict(schema: Any) -> Any:
+            if not isinstance(schema, dict):
+                return schema
+            
+            result = {}
+            for key, value in schema.items():
+                if isinstance(value, dict):
+                    result[key] = enforce_strict(value)
+                elif isinstance(value, list):
+                    result[key] = [enforce_strict(item) if isinstance(item, dict) else item for item in value]
+                else:
+                    result[key] = value
+            
+            # Add additionalProperties: false to object schemas
+            if result.get("type") == "object" and "properties" in result:
+                result["additionalProperties"] = False
+            
+            return result
+        
+        modified = copy.deepcopy(tools)
+        for tool in modified:
+            for func_decl in tool.get("functionDeclarations", []):
+                if "parametersJsonSchema" in func_decl:
+                    func_decl["parametersJsonSchema"] = enforce_strict(func_decl["parametersJsonSchema"])
+        
+        return modified
+    
     def _inject_signature_into_descriptions(
         self,
         tools: List[Dict[str, Any]],
@@ -1385,9 +1423,20 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         return modified
     
-    def _format_type_hint(self, prop_data: Dict[str, Any]) -> str:
-        """Format a type hint for a property schema."""
+    def _format_type_hint(self, prop_data: Dict[str, Any], depth: int = 0) -> str:
+        """Format a detailed type hint for a property schema."""
         type_hint = prop_data.get("type", "unknown")
+        
+        # Handle enum values - show allowed options
+        if "enum" in prop_data:
+            enum_vals = prop_data["enum"]
+            if len(enum_vals) <= 5:
+                return f"string ENUM[{', '.join(repr(v) for v in enum_vals)}]"
+            return f"string ENUM[{len(enum_vals)} options]"
+        
+        # Handle const values
+        if "const" in prop_data:
+            return f"string CONST={repr(prop_data['const'])}"
         
         if type_hint == "array":
             items = prop_data.get("items", {})
@@ -1400,13 +1449,29 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         nested_list = []
                         for n, d in nested_props.items():
                             if isinstance(d, dict):
-                                t = d.get("type", "unknown")
+                                # Recursively format nested types (limit depth)
+                                if depth < 1:
+                                    t = self._format_type_hint(d, depth + 1)
+                                else:
+                                    t = d.get("type", "unknown")
                                 req = " REQUIRED" if n in nested_req else ""
                                 nested_list.append(f"{n}: {t}{req}")
                         return f"ARRAY_OF_OBJECTS[{', '.join(nested_list)}]"
                     return "ARRAY_OF_OBJECTS"
                 return f"ARRAY_OF_{item_type.upper()}"
             return "ARRAY"
+        
+        if type_hint == "object":
+            nested_props = prop_data.get("properties", {})
+            nested_req = prop_data.get("required", [])
+            if nested_props and depth < 1:
+                nested_list = []
+                for n, d in nested_props.items():
+                    if isinstance(d, dict):
+                        t = d.get("type", "unknown")
+                        req = " REQUIRED" if n in nested_req else ""
+                        nested_list.append(f"{n}: {t}{req}")
+                return f"object{{{', '.join(nested_list)}}}"
         
         return type_hint
     
@@ -2050,8 +2115,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             
             # Apply tool transformations
             if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
-                # Gemini 3: namespace prefix + parameter signatures
+                # Gemini 3: namespace prefix + strict schema + parameter signatures
                 gemini_payload["tools"] = self._apply_gemini3_namespace(gemini_payload["tools"])
+                if self._gemini3_enforce_strict_schema:
+                    gemini_payload["tools"] = self._enforce_strict_schema(gemini_payload["tools"])
                 gemini_payload["tools"] = self._inject_signature_into_descriptions(
                     gemini_payload["tools"],
                     self._gemini3_description_prompt
