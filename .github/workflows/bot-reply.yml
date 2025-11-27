@@ -490,16 +490,18 @@ jobs:
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0  # Full history needed for git operations and code analysis
 
-      - name: Generate PR Diff for First Review
-        if: steps.context.outputs.IS_PR == 'true' && steps.review_type.outputs.is_first_review == 'true'
-        id: first_review_diff
+      - name: Generate PR Diffs (Full and Incremental)
+        if: steps.context.outputs.IS_PR == 'true'
+        id: generate_diffs
         env:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           BASE_BRANCH="${BASE_BRANCH}"
           CURRENT_SHA="${PR_HEAD_SHA}"
-          DIFF_CONTENT=""
-          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
+          LAST_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
+          
+          # Always generate full diff against base branch
           echo "Generating full PR diff against base branch: $BASE_BRANCH"
           if git fetch origin "$BASE_BRANCH":refs/remotes/origin/"$BASE_BRANCH" 2>/dev/null; then
             if MERGE_BASE=$(git merge-base origin/"$BASE_BRANCH" "$CURRENT_SHA" 2>/dev/null); then
@@ -510,6 +512,7 @@ jobs:
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
                 echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+                echo "Full diff generated ($(echo "$DIFF_CONTENT" | wc -l) lines)"
               else
                 echo "(Diff generation failed. Please refer to the changed files list above.)" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               fi
@@ -519,32 +522,28 @@ jobs:
           else
             echo "(Base branch not available for diff. Please refer to the changed files list above.)" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           fi
-
-      - name: Generate Incremental Diff
-        if: steps.context.outputs.IS_PR == 'true' && steps.review_type.outputs.is_first_review == 'false' && steps.review_type.outputs.last_reviewed_sha != ''
-        id: incremental_diff
-        run: |
-          LAST_SHA=${{ steps.review_type.outputs.last_reviewed_sha }}
-          CURRENT_SHA="${PR_HEAD_SHA}"
-          DIFF_CONTENT=""
-          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
-          echo "Attempting to generate incremental diff from $LAST_SHA to $CURRENT_SHA"
-          if git fetch origin $LAST_SHA 2>/dev/null || git cat-file -e $LAST_SHA^{commit} 2>/dev/null; then
-            if DIFF_CONTENT=$(git diff --patch $LAST_SHA..$CURRENT_SHA 2>/dev/null); then
-              DIFF_SIZE=${#DIFF_CONTENT}
-              if [ $DIFF_SIZE -gt 500000 ]; then
-                TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - Changes are very large. Showing first 500KB only.]'
-                DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
+          
+          # Generate incremental diff if this is a follow-up review
+          if [ -n "$LAST_SHA" ]; then
+            echo "Generating incremental diff from $LAST_SHA to $CURRENT_SHA"
+            if git fetch origin $LAST_SHA 2>/dev/null || git cat-file -e $LAST_SHA^{commit} 2>/dev/null; then
+              if DIFF_CONTENT=$(git diff --patch $LAST_SHA..$CURRENT_SHA 2>/dev/null); then
+                DIFF_SIZE=${#DIFF_CONTENT}
+                if [ $DIFF_SIZE -gt 500000 ]; then
+                  TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - Changes are very large. Showing first 500KB only.]'
+                  DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
+                fi
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+                echo "Incremental diff generated ($(echo "$DIFF_CONTENT" | wc -l) lines)"
+              else
+                echo "(Unable to generate incremental diff.)" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
               fi
-              echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             else
-              echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+              echo "(Last reviewed SHA not accessible for incremental diff.)" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             fi
           else
-            echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            echo "(No previous review - incremental diff not applicable.)" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
           fi
-          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
-          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
 
       - name: Checkout repository (for issues)
         if: steps.context.outputs.IS_PR == 'false'
@@ -577,13 +576,13 @@ jobs:
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
             if [ "${{ steps.context.outputs.IS_PR }}" = "true" ]; then
-              if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
-                DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
-              else
-                DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
-              fi
+              FULL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+              INCREMENTAL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+              LAST_REVIEWED_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
             else
-              DIFF_FILE_PATH=""
+              FULL_DIFF_PATH=""
+              INCREMENTAL_DIFF_PATH=""
+              LAST_REVIEWED_SHA=""
             fi
-            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $DIFF_FILE_PATH'
-            DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/bot-reply.md | opencode run --share -
+            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA'
+            FULL_DIFF_PATH="$FULL_DIFF_PATH" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS" < /tmp/bot-reply.md | opencode run --share -
