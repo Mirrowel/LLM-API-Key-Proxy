@@ -326,7 +326,7 @@ jobs:
       - name: Generate PR Diff
         id: diff
         run: |
-          mkdir -p "/tmp/mirrobot_files"
+          mkdir -p "$GITHUB_WORKSPACE/mirrobot_files"
           
           # Get base branch from PR
           pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json baseRefName)
@@ -356,22 +356,22 @@ jobs:
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
                 
-                echo "$DIFF_CONTENT" > "/tmp/mirrobot_files/pr_diff.txt"
-                echo "diff_path=/tmp/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
               else
                 echo "::warning::Could not generate diff. Using changed files list only."
-                echo "(Diff generation failed. Please refer to the changed files list.)" > "/tmp/mirrobot_files/pr_diff.txt"
-                echo "diff_path=/tmp/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+                echo "(Diff generation failed. Please refer to the changed files list.)" > "$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
               fi
             else
               echo "::warning::Could not find merge base."
-              echo "(No common ancestor found.)" > "/tmp/mirrobot_files/pr_diff.txt"
-              echo "diff_path=/tmp/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+              echo "(No common ancestor found.)" > "$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt"
+              echo "diff_path=$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
             fi
           else
             echo "::warning::Could not fetch base branch."
-            echo "(Base branch not available for diff.)" > "/tmp/mirrobot_files/pr_diff.txt"
-            echo "diff_path=/tmp/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+            echo "(Base branch not available for diff.)" > "$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt"
+            echo "diff_path=$GITHUB_WORKSPACE/mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}

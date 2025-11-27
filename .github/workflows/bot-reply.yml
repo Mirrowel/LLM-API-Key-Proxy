@@ -496,7 +496,7 @@ jobs:
         env:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
         run: |
-          mkdir -p "/tmp/mirrobot_files"
+          mkdir -p "$GITHUB_WORKSPACE/mirrobot_files"
           BASE_BRANCH="${BASE_BRANCH}"
           CURRENT_SHA="${PR_HEAD_SHA}"
           LAST_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
@@ -511,16 +511,16 @@ jobs:
                   TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - PR is very large. Showing first 500KB only. Review scaled to high-impact areas.]'
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
-                echo "$DIFF_CONTENT" > "/tmp/mirrobot_files/first_review_diff.txt"
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
                 echo "Full diff generated ($(echo "$DIFF_CONTENT" | wc -l) lines)"
               else
-                echo "(Diff generation failed. Please refer to the changed files list above.)" > "/tmp/mirrobot_files/first_review_diff.txt"
+                echo "(Diff generation failed. Please refer to the changed files list above.)" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
               fi
             else
-              echo "(No common ancestor found. This might be a new branch or orphaned commits.)" > "/tmp/mirrobot_files/first_review_diff.txt"
+              echo "(No common ancestor found. This might be a new branch or orphaned commits.)" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
             fi
           else
-            echo "(Base branch not available for diff. Please refer to the changed files list above.)" > "/tmp/mirrobot_files/first_review_diff.txt"
+            echo "(Base branch not available for diff. Please refer to the changed files list above.)" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
           fi
           
           # Generate incremental diff if this is a follow-up review
@@ -533,16 +533,16 @@ jobs:
                   TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - Changes are very large. Showing first 500KB only.]'
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
-                echo "$DIFF_CONTENT" > "/tmp/mirrobot_files/incremental_diff.txt"
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
                 echo "Incremental diff generated ($(echo "$DIFF_CONTENT" | wc -l) lines)"
               else
-                echo "(Unable to generate incremental diff.)" > "/tmp/mirrobot_files/incremental_diff.txt"
+                echo "(Unable to generate incremental diff.)" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
               fi
             else
-              echo "(Last reviewed SHA not accessible for incremental diff.)" > "/tmp/mirrobot_files/incremental_diff.txt"
+              echo "(Last reviewed SHA not accessible for incremental diff.)" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
             fi
           else
-            echo "(No previous review - incremental diff not applicable.)" > "/tmp/mirrobot_files/incremental_diff.txt"
+            echo "(No previous review - incremental diff not applicable.)" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
           fi
 
       - name: Checkout repository (for issues)
@@ -576,8 +576,8 @@ jobs:
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
             if [ "${{ steps.context.outputs.IS_PR }}" = "true" ]; then
-              FULL_DIFF_PATH="/tmp/mirrobot_files/first_review_diff.txt"
-              INCREMENTAL_DIFF_PATH="/tmp/mirrobot_files/incremental_diff.txt"
+              FULL_DIFF_PATH="$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+              INCREMENTAL_DIFF_PATH="$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
               LAST_REVIEWED_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
             else
               FULL_DIFF_PATH=""
