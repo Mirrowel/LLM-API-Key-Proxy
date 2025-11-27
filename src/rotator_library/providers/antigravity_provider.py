@@ -23,8 +23,6 @@ import json
 import logging
 import os
 import random
-import shutil
-import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -37,6 +35,7 @@ import litellm
 
 from .provider_interface import ProviderInterface
 from .antigravity_auth_base import AntigravityAuthBase
+from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 
 
@@ -269,272 +268,6 @@ class AntigravityFileLogger:
             lib_logger.error(f"Failed to append to {filename}: {e}")
 
 
-# =============================================================================
-# SIGNATURE CACHE
-# =============================================================================
-
-class AntigravityCache:
-    """
-    Server-side cache for Antigravity conversation state preservation.
-    
-    Supports two types of cached data:
-    - Gemini 3: thoughtSignatures (tool_call_id → encrypted signature)
-    - Claude: Thinking content (composite_key → thinking text + signature)
-    
-    Features:
-    - Dual-TTL system: 1hr memory, 24hr disk
-    - Async disk persistence with batched writes
-    - Background cleanup task for expired entries
-    """
-    
-    def __init__(
-        self,
-        cache_file: Path,
-        memory_ttl_seconds: int = 3600,
-        disk_ttl_seconds: int = 86400
-    ):
-        # In-memory cache: {cache_key: (data, timestamp)}
-        self._cache: Dict[str, Tuple[str, float]] = {}
-        self._memory_ttl = memory_ttl_seconds
-        self._disk_ttl = disk_ttl_seconds
-        self._lock = asyncio.Lock()
-        self._disk_lock = asyncio.Lock()
-        
-        # Disk persistence
-        self._cache_file = cache_file
-        self._enable_disk = _env_bool("ANTIGRAVITY_ENABLE_SIGNATURE_CACHE", True)
-        self._dirty = False
-        self._write_interval = _env_int("ANTIGRAVITY_CACHE_WRITE_INTERVAL", 60)
-        self._cleanup_interval = _env_int("ANTIGRAVITY_CACHE_CLEANUP_INTERVAL", 1800)
-        
-        # Background tasks
-        self._writer_task: Optional[asyncio.Task] = None
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._running = False
-        
-        # Statistics
-        self._stats = {"memory_hits": 0, "disk_hits": 0, "misses": 0, "writes": 0}
-        
-        if self._enable_disk:
-            lib_logger.debug(
-                f"AntigravityCache: Disk persistence enabled "
-                f"(memory_ttl={memory_ttl_seconds}s, disk_ttl={disk_ttl_seconds}s)"
-            )
-            asyncio.create_task(self._async_init())
-        else:
-            lib_logger.debug("AntigravityCache: Memory-only mode")
-    
-    async def _async_init(self) -> None:
-        """Async initialization: load from disk and start background tasks."""
-        try:
-            await self._load_from_disk()
-            await self._start_background_tasks()
-        except Exception as e:
-            lib_logger.error(f"Cache async init failed: {e}")
-    
-    async def _load_from_disk(self) -> None:
-        """Load cache from disk file with TTL validation."""
-        if not self._enable_disk or not self._cache_file.exists():
-            return
-        
-        try:
-            async with self._disk_lock:
-                with open(self._cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                if data.get("version") != "1.0":
-                    lib_logger.warning("Cache version mismatch, starting fresh")
-                    return
-                
-                now = time.time()
-                entries = data.get("entries", {})
-                loaded = expired = 0
-                
-                for call_id, entry in entries.items():
-                    age = now - entry.get("timestamp", 0)
-                    if age <= self._disk_ttl:
-                        sig = entry.get("signature", "")
-                        if sig:
-                            self._cache[call_id] = (sig, entry["timestamp"])
-                            loaded += 1
-                    else:
-                        expired += 1
-                
-                lib_logger.debug(f"Loaded {loaded} entries from disk ({expired} expired)")
-        except json.JSONDecodeError as e:
-            lib_logger.warning(f"Cache file corrupted: {e}")
-        except Exception as e:
-            lib_logger.error(f"Failed to load cache: {e}")
-    
-    async def _save_to_disk(self) -> None:
-        """Persist cache to disk using atomic write."""
-        if not self._enable_disk:
-            return
-        
-        try:
-            async with self._disk_lock:
-                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-                
-                cache_data = {
-                    "version": "1.0",
-                    "memory_ttl_seconds": self._memory_ttl,
-                    "disk_ttl_seconds": self._disk_ttl,
-                    "entries": {
-                        cid: {"signature": sig, "timestamp": ts}
-                        for cid, (sig, ts) in self._cache.items()
-                    },
-                    "statistics": {
-                        "total_entries": len(self._cache),
-                        "last_write": time.time(),
-                        **self._stats
-                    }
-                }
-                
-                # Atomic write
-                parent_dir = self._cache_file.parent
-                tmp_fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix='.tmp_', suffix='.json')
-                
-                try:
-                    with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-                        json.dump(cache_data, f, indent=2)
-                    
-                    try:
-                        os.chmod(tmp_path, 0o600)
-                    except (OSError, AttributeError):
-                        pass
-                    
-                    shutil.move(tmp_path, self._cache_file)
-                    self._stats["writes"] += 1
-                    lib_logger.debug(f"Saved {len(self._cache)} entries to disk")
-                except Exception:
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                    raise
-        except Exception as e:
-            lib_logger.error(f"Disk save failed: {e}")
-    
-    async def _start_background_tasks(self) -> None:
-        """Start background writer and cleanup tasks."""
-        if not self._enable_disk or self._running:
-            return
-        
-        self._running = True
-        self._writer_task = asyncio.create_task(self._writer_loop())
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        lib_logger.debug("Started background cache tasks")
-    
-    async def _writer_loop(self) -> None:
-        """Background task: periodically flush dirty cache to disk."""
-        try:
-            while self._running:
-                await asyncio.sleep(self._write_interval)
-                if self._dirty:
-                    try:
-                        await self._save_to_disk()
-                        self._dirty = False
-                    except Exception as e:
-                        lib_logger.error(f"Background writer error: {e}")
-        except asyncio.CancelledError:
-            pass
-    
-    async def _cleanup_loop(self) -> None:
-        """Background task: periodically clean up expired entries."""
-        try:
-            while self._running:
-                await asyncio.sleep(self._cleanup_interval)
-                await self._cleanup_expired()
-        except asyncio.CancelledError:
-            pass
-    
-    async def _cleanup_expired(self) -> None:
-        """Remove expired entries from memory cache."""
-        async with self._lock:
-            now = time.time()
-            expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._memory_ttl]
-            for k in expired:
-                del self._cache[k]
-            if expired:
-                self._dirty = True
-                lib_logger.debug(f"Cleaned up {len(expired)} expired entries")
-    
-    def store(self, key: str, value: str) -> None:
-        """Store a value (sync wrapper for async storage)."""
-        asyncio.create_task(self._async_store(key, value))
-    
-    async def _async_store(self, key: str, value: str) -> None:
-        """Async implementation of store."""
-        async with self._lock:
-            self._cache[key] = (value, time.time())
-            self._dirty = True
-    
-    def retrieve(self, key: str) -> Optional[str]:
-        """Retrieve a value by key (sync method)."""
-        if key in self._cache:
-            value, timestamp = self._cache[key]
-            if time.time() - timestamp <= self._memory_ttl:
-                self._stats["memory_hits"] += 1
-                return value
-            else:
-                del self._cache[key]
-                self._dirty = True
-        
-        self._stats["misses"] += 1
-        if self._enable_disk:
-            asyncio.create_task(self._check_disk_fallback(key))
-        return None
-    
-    async def _check_disk_fallback(self, key: str) -> None:
-        """Check disk for key and load into memory if found."""
-        try:
-            if not self._cache_file.exists():
-                return
-            
-            async with self._disk_lock:
-                with open(self._cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                entries = data.get("entries", {})
-                if key in entries:
-                    entry = entries[key]
-                    ts = entry.get("timestamp", 0)
-                    if time.time() - ts <= self._disk_ttl:
-                        sig = entry.get("signature", "")
-                        if sig:
-                            async with self._lock:
-                                self._cache[key] = (sig, ts)
-                                self._stats["disk_hits"] += 1
-                            lib_logger.debug(f"Loaded {key} from disk")
-        except Exception as e:
-            lib_logger.debug(f"Disk fallback failed: {e}")
-    
-    async def clear(self) -> None:
-        """Clear all cached data."""
-        async with self._lock:
-            self._cache.clear()
-            self._dirty = True
-        if self._enable_disk:
-            await self._save_to_disk()
-    
-    async def shutdown(self) -> None:
-        """Graceful shutdown: flush pending writes and stop background tasks."""
-        lib_logger.info("AntigravityCache shutting down...")
-        self._running = False
-        
-        for task in (self._writer_task, self._cleanup_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        
-        if self._dirty and self._enable_disk:
-            await self._save_to_disk()
-        
-        lib_logger.info(
-            f"Cache shutdown complete (stats: mem_hits={self._stats['memory_hits']}, "
-            f"disk_hits={self._stats['disk_hits']}, misses={self._stats['misses']})"
-        )
 
 
 # =============================================================================
@@ -571,12 +304,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         memory_ttl = _env_int("ANTIGRAVITY_SIGNATURE_CACHE_TTL", 3600)
         disk_ttl = _env_int("ANTIGRAVITY_SIGNATURE_DISK_TTL", 86400)
         
-        # Initialize caches
-        self._signature_cache = AntigravityCache(
-            GEMINI3_SIGNATURE_CACHE_FILE, memory_ttl, disk_ttl
+        # Initialize caches using shared ProviderCache
+        self._signature_cache = ProviderCache(
+            GEMINI3_SIGNATURE_CACHE_FILE, memory_ttl, disk_ttl,
+            env_prefix="ANTIGRAVITY_SIGNATURE"
         )
-        self._thinking_cache = AntigravityCache(
-            CLAUDE_THINKING_CACHE_FILE, memory_ttl, disk_ttl
+        self._thinking_cache = ProviderCache(
+            CLAUDE_THINKING_CACHE_FILE, memory_ttl, disk_ttl,
+            env_prefix="ANTIGRAVITY_THINKING"
         )
         
         # Feature flags
