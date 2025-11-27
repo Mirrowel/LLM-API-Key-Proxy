@@ -487,7 +487,7 @@ jobs:
           CURRENT_SHA="${PR_HEAD_SHA}"
           DIFF_CONTENT=""
           # Ensure dedicated diff folder exists in the workspace (hidden to avoid accidental use)
-          mkdir -p "$GITHUB_WORKSPACE/mirrobot_files"
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           
           echo "Generating full PR diff against base branch: $BASE_BRANCH"
           
@@ -512,24 +512,24 @@ jobs:
                   DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
                 fi
                 # Write diff directly into the repository workspace in the dedicated folder
-                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               else
                 echo "::warning::Could not generate diff. Using changed files list only."
                 DIFF_CONTENT="(Diff generation failed. Please refer to the changed files list above.)"
                 # Write fallback diff directly into the workspace folder
-                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               fi
             else
             echo "::warning::Could not find merge base between $BASE_BRANCH and $CURRENT_SHA."
             DIFF_CONTENT="(No common ancestor found. This might be a new branch or orphaned commits.)"
             # Write fallback diff content directly into the repository workspace folder
-            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
             fi
           else
             echo "::warning::Could not fetch base branch $BASE_BRANCH. Using changed files list only."
             DIFF_CONTENT="(Base branch not available for diff. Please refer to the changed files list above.)"
             # Write error-case diff directly into the repository workspace folder
-            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+            echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           fi
           
         env:
@@ -543,7 +543,7 @@ jobs:
           CURRENT_SHA="${PR_HEAD_SHA}"
           DIFF_CONTENT=""
           # Ensure dedicated diff folder exists in the workspace (hidden to avoid accidental use)
-          mkdir -p "$GITHUB_WORKSPACE/mirrobot_files"
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           echo "Attempting to generate incremental diff from $LAST_SHA to $CURRENT_SHA"
           
           # Fetch the last reviewed commit, handle potential errors (e.g., rebased/force-pushed commit)
@@ -563,21 +563,21 @@ jobs:
                 DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
               fi
               # Write incremental diff directly into the repository workspace folder
-              echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
+              echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             else
               echo "::warning::Could not generate diff between $LAST_SHA and $CURRENT_SHA. Possible rebase/force-push. AI will perform full review."
               # Ensure an empty incremental diff file exists in the workspace folder as fallback
-              echo "" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
+              echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             fi
           else
             echo "::warning::Failed to fetch last reviewed SHA: $LAST_SHA. This can happen if the commit was part of a force-push or rebase. The AI will perform a full review as a fallback."
             # Ensure an empty incremental diff file exists in the workspace folder when last-SHA fetch fails
-            echo "" > "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
+            echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
           fi
           
           # Ensure workspace diff files exist even on edge cases (in the hidden folder)
-          [ -f "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt" ] || touch "$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
-          [ -f "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt" ] || touch "$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
+          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+          [ -f "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt" ] || touch "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
 
 
       - name: Assemble Review Prompt
@@ -592,9 +592,9 @@ jobs:
         run: |
           # Build DIFF_FILE_PATH pointing to the generated diff in the repository workspace
           if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
-            DIFF_FILE_PATH="$GITHUB_WORKSPACE/mirrobot_files/first_review_diff.txt"
+            DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           else
-            DIFF_FILE_PATH="$GITHUB_WORKSPACE/mirrobot_files/incremental_diff.txt"
+            DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
@@ -629,6 +629,74 @@ jobs:
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          
+          # Validate diff files exist and search for them if not found
+          echo "=== Diff File Validation ==="
+          
+          # Determine which diff file should be used
+          if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+            EXPECTED_DIFF_FILE="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+            DIFF_TYPE="Full review"
+          else
+            EXPECTED_DIFF_FILE="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            DIFF_TYPE="Incremental"
+          fi
+          
+          echo "Expected diff file ($DIFF_TYPE): $EXPECTED_DIFF_FILE"
+          echo ""
+          
+          # Search in common locations
+          SEARCH_PATHS=(
+            "$GITHUB_WORKSPACE/.mirrobot_files"
+            "$GITHUB_WORKSPACE/mirrobot_files"
+            "/tmp/mirrobot_files"
+            "/tmp/.mirrobot_files"
+            "$PWD/.mirrobot_files"
+            "$PWD/mirrobot_files"
+          )
+          
+          echo "Searching for diff files in potential locations:"
+          for search_dir in "${SEARCH_PATHS[@]}"; do
+            if [ -d "$search_dir" ]; then
+              echo "✓ Directory exists: $search_dir"
+              if [ -f "$search_dir/first_review_diff.txt" ]; then
+                echo "  ✓ Found: $search_dir/first_review_diff.txt ($(wc -l < "$search_dir/first_review_diff.txt") lines)"
+              fi
+              if [ -f "$search_dir/incremental_diff.txt" ]; then
+                echo "  ✓ Found: $search_dir/incremental_diff.txt ($(wc -l < "$search_dir/incremental_diff.txt") lines)"
+              fi
+            else
+              echo "✗ Directory not found: $search_dir"
+            fi
+          done
+          
+          echo ""
+          echo "Current working directory: $PWD"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          echo ""
+          
+          # Check if expected file exists
+          if [ ! -f "$EXPECTED_DIFF_FILE" ]; then
+            echo "⚠️  WARNING: Expected diff file not found at: $EXPECTED_DIFF_FILE"
+            # Try to find it
+            if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+              FOUND=$(find "$GITHUB_WORKSPACE" /tmp -name "first_review_diff.txt" 2>/dev/null | head -n 1)
+            else
+              FOUND=$(find "$GITHUB_WORKSPACE" /tmp -name "incremental_diff.txt" 2>/dev/null | head -n 1)
+            fi
+            if [ -n "$FOUND" ]; then
+              echo "   Found alternative location: $FOUND"
+              echo "   This path will be in the assembled prompt"
+            else
+              echo "   ❌ File not found anywhere!"
+            fi
+          else
+            echo "✓ Expected diff file exists: $EXPECTED_DIFF_FILE ($(wc -l < "$EXPECTED_DIFF_FILE") lines)"
+          fi
+          
+          echo "=== End Validation ==="
+          echo ""
+          
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
 
       - name: Verify AI Review Footers
