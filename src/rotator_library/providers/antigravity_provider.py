@@ -1012,14 +1012,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         parts = []
         
         if isinstance(content, str):
-            if content:
-                parts.append({"text": content})
+            if content.strip():
+                parts.append({"text": content.strip()})
         elif isinstance(content, list):
             for item in content:
                 if item.get("type") == "text":
                     text = item.get("text", "")
-                    if text:
-                        parts.append({"text": text})
+                    if text.strip():
+                        parts.append({"text": text.strip()})
                 elif item.get("type") == "image_url":
                     image_part = self._parse_image_url(item.get("image_url", {}))
                     if image_part:
