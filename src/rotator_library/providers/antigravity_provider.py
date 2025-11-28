@@ -1838,13 +1838,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         message = {"role": "assistant"}
         if text_content:
             message["content"] = text_content
-        elif not tool_calls:
-            message["content"] = ""
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
             message.pop("content", None)
+        elif not text_content and not reasoning_content:
+            # Only set empty content if there's no text AND no reasoning
+            message["content"] = ""
         
         finish_reason = self._map_finish_reason(candidate.get("finishReason"), bool(tool_calls))
         usage = self._build_usage(response.get("usageMetadata", {}))
