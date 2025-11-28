@@ -932,7 +932,7 @@ async def list_models(
     
     if enriched and hasattr(request.app.state, 'model_info_service'):
         model_info_service = request.app.state.model_info_service
-        if model_info_service.is_ready():
+        if model_info_service.is_ready:
             # Return enriched model data
             enriched_data = model_info_service.enrich_model_list(model_ids)
             return {"object": "list", "data": enriched_data}
@@ -956,7 +956,7 @@ async def get_model(
     """
     if hasattr(request.app.state, 'model_info_service'):
         model_info_service = request.app.state.model_info_service
-        if model_info_service.is_ready():
+        if model_info_service.is_ready:
             info = model_info_service.get_model_info(model_id)
             if info:
                 return info.to_dict()
@@ -1066,7 +1066,7 @@ async def cost_estimate(
         # Try model info service first
         if hasattr(request.app.state, 'model_info_service'):
             model_info_service = request.app.state.model_info_service
-            if model_info_service.is_ready():
+            if model_info_service.is_ready:
                 cost = model_info_service.calculate_cost(
                     model, prompt_tokens, completion_tokens,
                     cache_read_tokens, cache_creation_tokens
