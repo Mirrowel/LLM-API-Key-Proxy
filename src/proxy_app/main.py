@@ -951,7 +951,7 @@ async def list_models(
     
     if enriched and hasattr(request.app.state, 'model_info_service'):
         model_info_service = request.app.state.model_info_service
-        if model_info_service.is_ready():
+        if model_info_service.is_ready:
             # Return enriched model data
             enriched_data = model_info_service.enrich_model_list(model_ids)
             return {"object": "list", "data": enriched_data}
