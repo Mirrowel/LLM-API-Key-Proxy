@@ -112,6 +112,8 @@ def _register_providers():
                 "chutes",
                 "iflow",
                 "qwen_code",
+                "gemini_cli",
+                "antigravity",
             ]:
                 continue
 

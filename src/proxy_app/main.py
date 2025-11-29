@@ -38,6 +38,25 @@ if args.add_credential:
 # If we get here, we're ACTUALLY running the proxy - NOW show startup messages and start timer
 _start_time = time.time()
 
+# Load all .env files from root folder (main .env first, then any additional *.env files)
+from dotenv import load_dotenv
+from glob import glob
+
+# Load main .env first
+load_dotenv()
+
+# Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
+_root_dir = Path.cwd()
+_env_files_found = list(_root_dir.glob("*.env"))
+for _env_file in sorted(_root_dir.glob("*.env")):
+    if _env_file.name != ".env":  # Skip main .env (already loaded)
+        load_dotenv(_env_file, override=False)  # Don't override existing values
+
+# Log discovered .env files for deployment verification
+if _env_files_found:
+    _env_names = [_ef.name for _ef in _env_files_found]
+    print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
+
 # Get proxy API key for display
 proxy_api_key = os.getenv("PROXY_API_KEY")
 if proxy_api_key:
@@ -87,6 +106,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.background_refresher import BackgroundRefresher
+    from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import DetailedLogger
@@ -110,14 +130,58 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
 class ModelCard(BaseModel):
+    """Basic model card for minimal response."""
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "Mirro-Proxy"
 
+class ModelCapabilities(BaseModel):
+    """Model capability flags."""
+    tool_choice: bool = False
+    function_calling: bool = False
+    reasoning: bool = False
+    vision: bool = False
+    system_messages: bool = True
+    prompt_caching: bool = False
+    assistant_prefill: bool = False
+
+class EnrichedModelCard(BaseModel):
+    """Extended model card with pricing and capabilities."""
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "unknown"
+    # Pricing (optional - may not be available for all models)
+    input_cost_per_token: Optional[float] = None
+    output_cost_per_token: Optional[float] = None
+    cache_read_input_token_cost: Optional[float] = None
+    cache_creation_input_token_cost: Optional[float] = None
+    # Limits (optional)
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    context_window: Optional[int] = None
+    # Capabilities
+    mode: str = "chat"
+    supported_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    supported_output_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    capabilities: Optional[ModelCapabilities] = None
+    # Debug info (optional)
+    _sources: Optional[List[str]] = None
+    _match_type: Optional[str] = None
+    
+    class Config:
+        extra = "allow"  # Allow extra fields from the service
+
 class ModelList(BaseModel):
+    """List of models response."""
     object: str = "list"
     data: List[ModelCard]
+
+class EnrichedModelList(BaseModel):
+    """List of enriched models with pricing and capabilities."""
+    object: str = "list"
+    data: List[EnrichedModelCard]
 
 # Calculate total loading time
 _elapsed = time.time() - _start_time
@@ -294,6 +358,11 @@ async def lifespan(app: FastAPI):
             if provider not in credentials_to_initialize:
                 credentials_to_initialize[provider] = []
             for path in paths:
+                # Skip env-based credentials (virtual paths) - they don't have metadata files
+                if path.startswith("env://"):
+                    credentials_to_initialize[provider].append(path)
+                    continue
+                    
                 try:
                     with open(path, 'r') as f:
                         data = json.load(f)
@@ -395,19 +464,20 @@ async def lifespan(app: FastAPI):
                     final_oauth_credentials[provider] = []
                 final_oauth_credentials[provider].append(path)
 
-                # Update metadata
-                try:
-                    with open(path, 'r+') as f:
-                        data = json.load(f)
-                        metadata = data.get("_proxy_metadata", {})
-                        metadata["email"] = email
-                        metadata["last_check_timestamp"] = time.time()
-                        data["_proxy_metadata"] = metadata
-                        f.seek(0)
-                        json.dump(data, f, indent=2)
-                        f.truncate()
-                except Exception as e:
-                    logging.error(f"Failed to update metadata for '{path}': {e}")
+                # Update metadata (skip for env-based credentials - they don't have files)
+                if not path.startswith("env://"):
+                    try:
+                        with open(path, 'r+') as f:
+                            data = json.load(f)
+                            metadata = data.get("_proxy_metadata", {})
+                            metadata["email"] = email
+                            metadata["last_check_timestamp"] = time.time()
+                            data["_proxy_metadata"] = metadata
+                            f.seek(0)
+                            json.dump(data, f, indent=2)
+                            f.truncate()
+                    except Exception as e:
+                        logging.error(f"Failed to update metadata for '{path}': {e}")
 
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
@@ -428,6 +498,12 @@ async def lifespan(app: FastAPI):
         enable_request_logging=ENABLE_REQUEST_LOGGING,
         max_concurrent_requests_per_key=max_concurrent_requests_per_key
     )
+    
+    # Log loaded credentials summary (compact, always visible for deployment verification)
+    _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
+    _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
+    _total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
+    print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
     
@@ -451,6 +527,12 @@ async def lifespan(app: FastAPI):
     else:
         app.state.embedding_batcher = None
         logging.info("RotatingClient initialized (EmbeddingBatcher disabled).")
+    
+    # Start model info service in background (fetches pricing/capabilities data)
+    # This runs asynchronously and doesn't block proxy startup
+    model_info_service = await init_model_info_service()
+    app.state.model_info_service = model_info_service
+    logging.info("Model info service started (fetching pricing data in background).")
         
     yield
     
@@ -458,6 +540,10 @@ async def lifespan(app: FastAPI):
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
     await client.close()
+    
+    # Stop model info service
+    if hasattr(app.state, 'model_info_service') and app.state.model_info_service:
+        await app.state.model_info_service.stop()
     
     if app.state.embedding_batcher:
         logging.info("RotatingClient and EmbeddingBatcher closed.")
@@ -589,7 +675,10 @@ async def streaming_response_wrapper(
                                     final_message["function_call"]["arguments"] += value["arguments"]
                         
                         else: # Generic key handling for other data like 'reasoning'
-                            if key not in final_message:
+                            # FIX: Role should always replace, never concatenate
+                            if key == "role":
+                                final_message[key] = value
+                            elif key not in final_message:
                                 final_message[key] = value
                             elif isinstance(final_message.get(key), str):
                                 final_message[key] += value
@@ -605,6 +694,9 @@ async def streaming_response_wrapper(
             # --- Final Response Construction ---
             if aggregated_tool_calls:
                 final_message["tool_calls"] = list(aggregated_tool_calls.values())
+                # CRITICAL FIX: Override finish_reason when tool_calls exist
+                # This ensures OpenCode and other agentic systems continue the conversation loop
+                finish_reason = "tool_calls"
 
             # Ensure standard fields are present for consistent logging
             for field in ["content", "tool_calls", "function_call"]:
@@ -652,19 +744,35 @@ async def chat_completions(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
+        # Global temperature=0 override (controlled by .env variable, default: OFF)
+        # Low temperature makes models deterministic and prone to following training data
+        # instead of actual schemas, which can cause tool hallucination
+        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
+        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
+        
+        if override_temp_zero in ("remove", "set", "true", "1", "yes") and "temperature" in request_data and request_data["temperature"] == 0:
+            if override_temp_zero == "remove":
+                # Remove temperature key entirely
+                del request_data["temperature"]
+                logging.debug("OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request")
+            else:
+                # Set to 1.0 (for "set", "true", "1", "yes")
+                request_data["temperature"] = 1.0
+                logging.debug("OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0")
+
         # If logging is enabled, perform all logging operations using the parsed data.
         if logger:
             logger.log_request(headers=request.headers, body=request_data)
 
-            # Extract and log specific reasoning parameters for monitoring.
-            model = request_data.get("model")
-            generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
-            reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
-            custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
+        # Extract and log specific reasoning parameters for monitoring.
+        model = request_data.get("model")
+        generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
+        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
+        custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
 
-            logging.getLogger("rotator_library").info(
-                f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
-            )
+        logging.getLogger("rotator_library").debug(
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+        )
 
         # Log basic request info to console (this is a separate, simpler logger).
         log_request_to_console(
@@ -806,17 +914,73 @@ async def embeddings(
 def read_root():
     return {"Status": "API Key Proxy is running"}
 
-@app.get("/v1/models", response_model=ModelList)
+@app.get("/v1/models")
 async def list_models(
+    request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key)
+    _=Depends(verify_api_key),
+    enriched: bool = True,
 ):
     """
     Returns a list of available models in the OpenAI-compatible format.
+    
+    Query Parameters:
+        enriched: If True (default), returns detailed model info with pricing and capabilities.
+                  If False, returns minimal OpenAI-compatible response.
     """
     model_ids = await client.get_all_available_models(grouped=False)
-    model_cards = [ModelCard(id=model_id) for model_id in model_ids]
-    return ModelList(data=model_cards)
+    
+    if enriched and hasattr(request.app.state, 'model_info_service'):
+        model_info_service = request.app.state.model_info_service
+        if model_info_service.is_ready:
+            # Return enriched model data
+            enriched_data = model_info_service.enrich_model_list(model_ids)
+            return {"object": "list", "data": enriched_data}
+    
+    # Fallback to basic model cards
+    model_cards = [{"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "Mirro-Proxy"} for model_id in model_ids]
+    return {"object": "list", "data": model_cards}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(
+    model_id: str,
+    request: Request,
+    _=Depends(verify_api_key),
+):
+    """
+    Returns detailed information about a specific model.
+    
+    Path Parameters:
+        model_id: The model ID (e.g., "anthropic/claude-3-opus", "openrouter/openai/gpt-4")
+    """
+    if hasattr(request.app.state, 'model_info_service'):
+        model_info_service = request.app.state.model_info_service
+        if model_info_service.is_ready:
+            info = model_info_service.get_model_info(model_id)
+            if info:
+                return info.to_dict()
+    
+    # Return basic info if service not ready or model not found
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": model_id.split("/")[0] if "/" in model_id else "unknown",
+    }
+
+
+@app.get("/v1/model-info/stats")
+async def model_info_stats(
+    request: Request,
+    _=Depends(verify_api_key),
+):
+    """
+    Returns statistics about the model info service (for monitoring/debugging).
+    """
+    if hasattr(request.app.state, 'model_info_service'):
+        return request.app.state.model_info_service.get_stats()
+    return {"error": "Model info service not initialized"}
 
 
 @app.get("/v1/providers")
@@ -849,6 +1013,101 @@ async def token_count(
     except Exception as e:
         logging.error(f"Token count failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/cost-estimate")
+async def cost_estimate(
+    request: Request,
+    _=Depends(verify_api_key)
+):
+    """
+    Estimates the cost for a request based on token counts and model pricing.
+    
+    Request body:
+        {
+            "model": "anthropic/claude-3-opus",
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "cache_read_tokens": 0,       # optional
+            "cache_creation_tokens": 0    # optional
+        }
+    
+    Returns:
+        {
+            "model": "anthropic/claude-3-opus",
+            "cost": 0.0375,
+            "currency": "USD",
+            "pricing": {
+                "input_cost_per_token": 0.000015,
+                "output_cost_per_token": 0.000075
+            },
+            "source": "model_info_service"  # or "litellm_fallback"
+        }
+    """
+    try:
+        data = await request.json()
+        model = data.get("model")
+        prompt_tokens = data.get("prompt_tokens", 0)
+        completion_tokens = data.get("completion_tokens", 0)
+        cache_read_tokens = data.get("cache_read_tokens", 0)
+        cache_creation_tokens = data.get("cache_creation_tokens", 0)
+        
+        if not model:
+            raise HTTPException(status_code=400, detail="'model' is required.")
+        
+        result = {
+            "model": model,
+            "cost": None,
+            "currency": "USD",
+            "pricing": {},
+            "source": None
+        }
+        
+        # Try model info service first
+        if hasattr(request.app.state, 'model_info_service'):
+            model_info_service = request.app.state.model_info_service
+            if model_info_service.is_ready:
+                cost = model_info_service.calculate_cost(
+                    model, prompt_tokens, completion_tokens,
+                    cache_read_tokens, cache_creation_tokens
+                )
+                if cost is not None:
+                    cost_info = model_info_service.get_cost_info(model)
+                    result["cost"] = cost
+                    result["pricing"] = cost_info or {}
+                    result["source"] = "model_info_service"
+                    return result
+        
+        # Fallback to litellm
+        try:
+            import litellm
+            # Create a mock response for cost calculation
+            model_info = litellm.get_model_info(model)
+            input_cost = model_info.get("input_cost_per_token", 0)
+            output_cost = model_info.get("output_cost_per_token", 0)
+            
+            if input_cost or output_cost:
+                cost = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
+                result["cost"] = cost
+                result["pricing"] = {
+                    "input_cost_per_token": input_cost,
+                    "output_cost_per_token": output_cost
+                }
+                result["source"] = "litellm_fallback"
+                return result
+        except Exception:
+            pass
+        
+        result["source"] = "unknown"
+        result["error"] = "Pricing data not available for this model"
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Cost estimate failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks

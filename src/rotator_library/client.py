@@ -63,7 +63,29 @@ class RotatingClient:
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
+        rotation_tolerance: float = 3.0,
     ):
+        """
+        Initialize the RotatingClient with intelligent credential rotation.
+        
+        Args:
+            api_keys: Dictionary mapping provider names to lists of API keys
+            oauth_credentials: Dictionary mapping provider names to OAuth credential paths
+            max_retries: Maximum number of retry attempts per credential
+            usage_file_path: Path to store usage statistics
+            configure_logging: Whether to configure library logging
+            global_timeout: Global timeout for requests in seconds
+            abort_on_callback_error: Whether to abort on pre-request callback errors
+            litellm_provider_params: Provider-specific parameters for LiteLLM
+            ignore_models: Models to ignore/blacklist per provider
+            whitelist_models: Models to explicitly whitelist per provider
+            enable_request_logging: Whether to enable detailed request logging
+            max_concurrent_requests_per_key: Max concurrent requests per key by provider
+            rotation_tolerance: Tolerance for weighted random credential rotation.
+                - 0.0: Deterministic, least-used credential always selected
+                - 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
+                - 5.0+: High randomness, more unpredictable selection patterns
+        """
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -93,8 +115,13 @@ class RotatingClient:
             )
 
         self.api_keys = api_keys
-        self.credential_manager = CredentialManager(oauth_credentials)
-        self.oauth_credentials = self.credential_manager.discover_and_prepare()
+        # Use provided oauth_credentials directly if available (already discovered by main.py)
+        # Only call discover_and_prepare() if no credentials were passed
+        if oauth_credentials:
+            self.oauth_credentials = oauth_credentials
+        else:
+            self.credential_manager = CredentialManager(os.environ)
+            self.oauth_credentials = self.credential_manager.discover_and_prepare()
         self.background_refresher = BackgroundRefresher(self)
         self.oauth_providers = set(self.oauth_credentials.keys())
 
@@ -108,7 +135,10 @@ class RotatingClient:
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
-        self.usage_manager = UsageManager(file_path=usage_file_path)
+        self.usage_manager = UsageManager(
+            file_path=usage_file_path,
+            rotation_tolerance=rotation_tolerance
+        )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
         self._provider_instances = {}
@@ -393,7 +423,23 @@ class RotatingClient:
         return os.getenv(api_base_env) is not None
 
     def _get_provider_instance(self, provider_name: str):
-        """Lazily initializes and returns a provider instance."""
+        """
+        Lazily initializes and returns a provider instance.
+        Only initializes providers that have configured credentials.
+        
+        Args:
+            provider_name: The name of the provider to get an instance for.
+        
+        Returns:
+            Provider instance if credentials exist, None otherwise.
+        """
+        # Only initialize providers for which we have credentials
+        if provider_name not in self.all_credentials:
+            lib_logger.debug(
+                f"Skipping provider '{provider_name}' initialization: no credentials configured"
+            )
+            return None
+        
         if provider_name not in self._provider_instances:
             if provider_name in self._provider_plugins:
                 self._provider_instances[provider_name] = self._provider_plugins[
@@ -454,11 +500,19 @@ class RotatingClient:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
         and distinguishes between content and streamed errors.
+        
+        FINISH_REASON HANDLING:
+        Providers just translate chunks - this wrapper handles ALL finish_reason logic:
+        1. Strip finish_reason from intermediate chunks (litellm defaults to "stop")
+        2. Track accumulated_finish_reason with priority: tool_calls > length/content_filter > stop
+        3. Only emit finish_reason on final chunk (detected by usage.completion_tokens > 0)
         """
         last_usage = None
         stream_completed = False
         stream_iterator = stream.__aiter__()
         json_buffer = ""
+        accumulated_finish_reason = None  # Track strongest finish_reason across chunks
+        has_tool_calls = False  # Track if ANY tool calls were seen in stream
 
         try:
             while True:
@@ -466,26 +520,64 @@ class RotatingClient:
                     lib_logger.info(
                         f"Client disconnected. Aborting stream for credential ...{key[-6:]}."
                     )
-                    # Do not yield [DONE] because the client is gone.
-                    # The 'finally' block will handle key release.
                     break
 
                 try:
                     chunk = await stream_iterator.__anext__()
                     if json_buffer:
-                        # If we are about to discard a buffer, it means data was likely lost.
-                        # Log this as a warning to make it visible.
                         lib_logger.warning(
                             f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}"
                         )
                         json_buffer = ""
 
-                    yield f"data: {json.dumps(chunk.dict())}\n\n"
+                    # Convert chunk to dict, handling both litellm.ModelResponse and raw dicts
+                    if hasattr(chunk, "dict"):
+                        chunk_dict = chunk.dict()
+                    elif hasattr(chunk, "model_dump"):
+                        chunk_dict = chunk.model_dump()
+                    else:
+                        chunk_dict = chunk
+                    
+                    # === FINISH_REASON LOGIC ===
+                    # Providers send raw chunks without finish_reason logic.
+                    # This wrapper determines finish_reason based on accumulated state.
+                    if "choices" in chunk_dict and chunk_dict["choices"]:
+                        choice = chunk_dict["choices"][0]
+                        delta = choice.get("delta", {})
+                        usage = chunk_dict.get("usage", {})
+                        
+                        # Track tool_calls across ALL chunks - if we ever see one, finish_reason must be tool_calls
+                        if delta.get("tool_calls"):
+                            has_tool_calls = True
+                            accumulated_finish_reason = "tool_calls"
+                        
+                        # Detect final chunk: has usage with completion_tokens > 0
+                        has_completion_tokens = (
+                            usage and 
+                            isinstance(usage, dict) and 
+                            usage.get("completion_tokens", 0) > 0
+                        )
+                        
+                        if has_completion_tokens:
+                            # FINAL CHUNK: Determine correct finish_reason
+                            if has_tool_calls:
+                                # Tool calls always win
+                                choice["finish_reason"] = "tool_calls"
+                            elif accumulated_finish_reason:
+                                # Use accumulated reason (length, content_filter, etc.)
+                                choice["finish_reason"] = accumulated_finish_reason
+                            else:
+                                # Default to stop
+                                choice["finish_reason"] = "stop"
+                        else:
+                            # INTERMEDIATE CHUNK: Never emit finish_reason
+                            # (litellm.ModelResponse defaults to "stop" which is wrong)
+                            choice["finish_reason"] = None
+                    
+                    yield f"data: {json.dumps(chunk_dict)}\n\n"
 
                     if hasattr(chunk, "usage") and chunk.usage:
-                        last_usage = (
-                            chunk.usage
-                        )  # Overwrite with the latest (cumulative)
+                        last_usage = chunk.usage
 
                 except StopAsyncIteration:
                     stream_completed = True
@@ -656,6 +748,73 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+        
+        # [NEW] Filter by model tier requirement and build priority map
+        credential_priorities = None
+        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+            required_tier = provider_plugin.get_model_tier_requirement(model)
+            if required_tier is not None:
+                # Filter OUT only credentials we KNOW are too low priority
+                # Keep credentials with unknown priority (None) - they might be high priority
+                incompatible_creds = []
+                compatible_creds = []
+                unknown_creds = []
+                
+                for cred in credentials_for_provider:
+                    if hasattr(provider_plugin, 'get_credential_priority'):
+                        priority = provider_plugin.get_credential_priority(cred)
+                        if priority is None:
+                            # Unknown priority - keep it, will be discovered on first use
+                            unknown_creds.append(cred)
+                        elif priority <= required_tier:
+                            # Known compatible priority
+                            compatible_creds.append(cred)
+                        else:
+                            # Known incompatible priority (too low)
+                            incompatible_creds.append(cred)
+                    else:
+                        # Provider doesn't support priorities - keep all
+                        unknown_creds.append(cred)
+                
+                # If we have any known-compatible or unknown credentials, use them
+                tier_compatible_creds = compatible_creds + unknown_creds
+                if tier_compatible_creds:
+                    credentials_for_provider = tier_compatible_creds
+                    if compatible_creds and unknown_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
+                        )
+                    elif compatible_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible credentials."
+                        )
+                    else:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
+                        )
+                elif incompatible_creds:
+                    # Only known-incompatible credentials remain
+                    lib_logger.warning(
+                        f"Model {model} requires priority <= {required_tier} credentials, "
+                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
+                        f"Request will likely fail."
+                    )
+        
+        # Build priority map for usage_manager
+        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+            credential_priorities = {}
+            for cred in credentials_for_provider:
+                priority = provider_plugin.get_credential_priority(cred)
+                if priority is not None:
+                    credential_priorities[cred] = priority
+            
+            if credential_priorities:
+                lib_logger.debug(
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                )
 
         while (
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
@@ -694,7 +853,8 @@ class RotatingClient:
                 max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
                     available_keys=creds_to_try, model=model, deadline=deadline,
-                    max_concurrent=max_concurrent
+                    max_concurrent=max_concurrent,
+                    credential_priorities=credential_priorities
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -1031,6 +1191,73 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
+        
+        # [NEW] Filter by model tier requirement and build priority map
+        credential_priorities = None
+        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+            required_tier = provider_plugin.get_model_tier_requirement(model)
+            if required_tier is not None:
+                # Filter OUT only credentials we KNOW are too low priority
+                # Keep credentials with unknown priority (None) - they might be high priority
+                incompatible_creds = []
+                compatible_creds = []
+                unknown_creds = []
+                
+                for cred in credentials_for_provider:
+                    if hasattr(provider_plugin, 'get_credential_priority'):
+                        priority = provider_plugin.get_credential_priority(cred)
+                        if priority is None:
+                            # Unknown priority - keep it, will be discovered on first use
+                            unknown_creds.append(cred)
+                        elif priority <= required_tier:
+                            # Known compatible priority
+                            compatible_creds.append(cred)
+                        else:
+                            # Known incompatible priority (too low)
+                            incompatible_creds.append(cred)
+                    else:
+                        # Provider doesn't support priorities - keep all
+                        unknown_creds.append(cred)
+                
+                # If we have any known-compatible or unknown credentials, use them
+                tier_compatible_creds = compatible_creds + unknown_creds
+                if tier_compatible_creds:
+                    credentials_for_provider = tier_compatible_creds
+                    if compatible_creds and unknown_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
+                        )
+                    elif compatible_creds:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(compatible_creds)} known-compatible credentials."
+                        )
+                    else:
+                        lib_logger.info(
+                            f"Model {model} requires priority <= {required_tier}. "
+                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
+                        )
+                elif incompatible_creds:
+                    # Only known-incompatible credentials remain
+                    lib_logger.warning(
+                        f"Model {model} requires priority <= {required_tier} credentials, "
+                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
+                        f"Request will likely fail."
+                    )
+        
+        # Build priority map for usage_manager
+        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+            credential_priorities = {}
+            for cred in credentials_for_provider:
+                priority = provider_plugin.get_credential_priority(cred)
+                if priority is not None:
+                    credential_priorities[cred] = priority
+            
+            if credential_priorities:
+                lib_logger.debug(
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                )
 
         try:
             while (
@@ -1070,7 +1297,8 @@ class RotatingClient:
                     max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                     current_cred = await self.usage_manager.acquire_key(
                         available_keys=creds_to_try, model=model, deadline=deadline,
-                        max_concurrent=max_concurrent
+                        max_concurrent=max_concurrent,
+                        credential_priorities=credential_priorities
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)

@@ -79,6 +79,37 @@ If you are using providers that require complex OAuth files (like **Gemini CLI**
 4.  Copy the contents of this file and paste them directly into your `.env` file or Render's "Environment Variables" section.
 5.  The proxy will automatically detect and use these variables—no file upload required!
 
+
+### Advanced: Antigravity OAuth Provider
+
+The Antigravity provider requires OAuth2 authentication similar to Gemini CLI. It provides access to:
+- Gemini 2.5 models (Pro/Flash)
+- Gemini 3 models (Pro/Image-preview) - **requires paid-tier Google Cloud project**
+- Claude Sonnet 4.5 via Google's Antigravity proxy
+
+**Setting up Antigravity locally:**
+1. Run the credential tool: `python -m rotator_library.credential_tool`
+2. Select "Add OAuth Credential" and choose "Antigravity"
+3. Complete the OAuth flow in your browser
+4. The credential is saved to `oauth_creds/antigravity_oauth_1.json`
+
+**Exporting for stateless deployment:**
+1. Run: `python -m rotator_library.credential_tool`
+2. Select "Export Antigravity to .env"
+3. Copy the generated environment variables to your deployment platform:
+   ```env
+   ANTIGRAVITY_ACCESS_TOKEN="..."
+   ANTIGRAVITY_REFRESH_TOKEN="..."
+   ANTIGRAVITY_EXPIRY_DATE="..."
+   ANTIGRAVITY_EMAIL="your-email@gmail.com"
+   ```
+
+**Important Notes:**
+- Antigravity uses Google OAuth with additional scopes for cloud platform access
+- Gemini 3 models require a paid-tier Google Cloud project (free tier will fail)
+- The provider automatically handles thought signature caching for multi-turn conversations
+- Tool hallucination prevention is enabled by default for Gemini 3 models
+
 4. Save the file. (We'll upload it to Render in Step 5.)
 
 

@@ -7,9 +7,11 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
 -   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. By default, it supports concurrent requests to *different* models. With configuration (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`), it can also support multiple concurrent requests to the *same* model using the same key.
 -   **Smart Key Management**: Selects the optimal key for each request using a tiered, model-aware locking strategy to distribute load evenly and maximize availability.
+-   **Configurable Rotation Strategy**: Choose between deterministic least-used selection (perfect balance) or default weighted random selection (unpredictable, harder to fingerprint).
 -   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit.
 -   **OAuth & API Key Support**: Built-in support for standard API keys and complex OAuth flows.
-    -   **Gemini CLI**: Full OAuth 2.0 web flow with automatic project discovery and free-tier onboarding.
+    -   **Gemini CLI**: Full OAuth 2.0 web flow with automatic project discovery, free-tier onboarding, and credential prioritization (paid vs free tier).
+    -   **Antigravity**: Full OAuth 2.0 support for Gemini 3, Gemini 2.5, and Claude Sonnet 4.5 models with thought signature caching(Full support for Gemini 3 and Claude models). **First on the scene to provide full support for Gemini 3** via Antigravity with advanced features like thought signature caching and tool hallucination prevention.
     -   **Qwen Code**: Device Code flow support.
     -   **iFlow**: Authorization Code flow with local callback handling.
 -   **Stateless Deployment Ready**: Can load complex OAuth credentials from environment variables, eliminating the need for physical credential files in containerized environments.
@@ -17,11 +19,15 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
     -   **Escalating Per-Model Cooldowns**: Failed keys are placed on a temporary, escalating cooldown for specific models.
     -   **Key-Level Lockouts**: Keys failing across multiple models are temporarily removed from rotation.
     -   **Stream Recovery**: The client detects mid-stream errors (like quota limits) and gracefully handles them.
+-   **Credential Prioritization**: Automatic tier detection and priority-based credential selection (e.g., paid tier credentials used first for models that require them).
+-   **Advanced Model Requirements**: Support for model-tier restrictions (e.g., Gemini 3 requires paid-tier credentials).
 -   **Robust Streaming Support**: Includes a wrapper for streaming responses that reassembles fragmented JSON chunks.
 -   **Detailed Usage Tracking**: Tracks daily and global usage for each key, persisted to a JSON file.
 -   **Automatic Daily Resets**: Automatically resets cooldowns and archives stats daily.
 -   **Provider Agnostic**: Works with any provider supported by `litellm`.
 -   **Extensible**: Easily add support for new providers through a simple plugin-based architecture.
+-   **Temperature Override**: Global temperature=0 override to prevent tool hallucination with low-temperature settings.
+-   **Shared OAuth Base**: Refactored OAuth implementation with reusable [`GoogleOAuthBase`](providers/google_oauth_base.py) for multiple providers.
 
 ## Installation
 
@@ -71,7 +77,8 @@ client = RotatingClient(
     ignore_models={},
     whitelist_models={},
     enable_request_logging=False,
-    max_concurrent_requests_per_key={}
+    max_concurrent_requests_per_key={},
+    rotation_tolerance=2.0  # 0.0=deterministic, 2.0=recommended random
 )
 ```
 
@@ -89,6 +96,17 @@ client = RotatingClient(
 -   `whitelist_models` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary where keys are provider names and values are lists of model names/patterns to always include, overriding `ignore_models`.
 -   `enable_request_logging` (`bool`, default: `False`): If `True`, enables detailed per-request file logging (useful for debugging complex interactions).
 -   `max_concurrent_requests_per_key` (`Optional[Dict[str, int]]`, default: `None`): A dictionary defining the maximum number of concurrent requests allowed for a single API key for a specific provider. Defaults to 1 if not specified.
+-   `rotation_tolerance` (`float`, default: `0.0`): Controls credential rotation strategy:
+    - `0.0`: **Deterministic** - Always selects the least-used credential for perfect load balance.
+    - `2.0` (default, recommended): **Weighted Random** - Randomly selects credentials with bias toward less-used ones. Provides unpredictability (harder to fingerprint) while maintaining good balance.
+    - `5.0+`: **High Randomness** - Even heavily-used credentials have significant selection probability. Maximum unpredictability.
+    
+    The weight formula is: `weight = (max_usage - credential_usage) + tolerance + 1`
+    
+    **Use Cases:**
+    - `0.0`: When perfect load balance is critical
+    - `2.0`: When avoiding fingerprinting/rate limit detection is important
+    - `5.0+`: For stress testing or maximum unpredictability
 
 ### Concurrency and Resource Management
 
@@ -185,8 +203,26 @@ Use this tool to:
 
 ### Google Gemini (CLI)
 -   **Auth**: Simulates the Google Cloud CLI authentication flow.
--   **Project Discovery**: Automatically discovers the default Google Cloud Project ID.
+-   **Project Discovery**: Automatically discovers the default Google Cloud Project ID with enhanced onboarding flow.
+-   **Credential Prioritization**: Automatic detection and prioritization of paid vs free tier credentials.
+-   **Model Tier Requirements**: Gemini 3 models automatically filtered to paid-tier credentials only.
+-   **Gemini 3 Support**: Full support for Gemini 3 models with:
+    - `thinkingLevel` configuration (low/high)
+    - Tool hallucination prevention via system instruction injection
+    - ThoughtSignature caching for multi-turn conversations
+    - Parameter signature injection into tool descriptions
 -   **Rate Limits**: Implements smart fallback strategies (e.g., switching from `gemini-1.5-pro` to `gemini-1.5-pro-002`) when rate limits are hit.
+
+### Antigravity
+-   **Auth**: Uses OAuth 2.0 flow similar to Gemini CLI, with Antigravity-specific credentials and scopes.
+-   **Models**: Supports Gemini 2.5 (Pro/Flash), Gemini 3 (Pro/Image), and Claude Sonnet 4.5 via Google's internal Antigravity API.
+-   **Thought Signature Caching**: Server-side caching of `thoughtSignature` data for multi-turn conversations with Gemini 3 models.
+-   **Tool Hallucination Prevention**: Automatic injection of system instructions and parameter signatures for Gemini 3 to prevent tool parameter hallucination.
+-   **Thinking Support**:
+    - Gemini 2.5: Uses `thinkingBudget` (integer tokens)
+    - Gemini 3: Uses `thinkingLevel` (string: "low"/"high")
+    - Claude: Uses `thinkingBudget` via Antigravity proxy
+-   **Base URL Fallback**: Automatic fallback between sandbox and production endpoints.
 
 ## Error Handling and Cooldowns
 

@@ -1,5 +1,6 @@
 # src/rotator_library/providers/iflow_provider.py
 
+import copy
 import json
 import time
 import os
@@ -203,7 +204,6 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         Removes unsupported properties from tool schemas to prevent API errors.
         Similar to Qwen Code implementation.
         """
-        import copy
         cleaned_tools = []
 
         for tool in tools:
@@ -345,6 +345,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
     def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
+        
+        Key improvements:
+        - Determines finish_reason based on accumulated state (tool_calls vs stop)
+        - Properly initializes tool_calls with type field
+        - Handles usage data extraction from chunks
         """
         if not chunks:
             raise ValueError("No chunks provided for reassembly")
@@ -353,7 +358,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         final_message = {"role": "assistant"}
         aggregated_tool_calls = {}
         usage_data = None
-        finish_reason = None
+        chunk_finish_reason = None  # Track finish_reason from chunks (but we'll override)
 
         # Get the first chunk for basic response metadata
         first_chunk = chunks[0]
@@ -378,12 +383,13 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                     final_message["reasoning_content"] = ""
                 final_message["reasoning_content"] += delta["reasoning_content"]
 
-            # Aggregate tool calls
+            # Aggregate tool calls with proper initialization
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
-                    index = tc_chunk["index"]
+                    index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
-                        aggregated_tool_calls[index] = {"function": {"name": "", "arguments": ""}}
+                        # Initialize with type field for OpenAI compatibility
+                        aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
                     if "type" in tc_chunk:
@@ -403,9 +409,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
                     final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
 
-            # Get finish reason from the last chunk that has it
+            # Track finish_reason from chunks (for reference only)
             if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+                chunk_finish_reason = choice["finish_reason"]
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -421,6 +427,15 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         for field in ["content", "tool_calls", "function_call"]:
             if field not in final_message:
                 final_message[field] = None
+
+        # Determine finish_reason based on accumulated state
+        # Priority: tool_calls wins if present, then chunk's finish_reason, then default to "stop"
+        if aggregated_tool_calls:
+            finish_reason = "tool_calls"
+        elif chunk_finish_reason:
+            finish_reason = chunk_finish_reason
+        else:
+            finish_reason = "stop"
 
         # Construct the final response
         final_choice = {

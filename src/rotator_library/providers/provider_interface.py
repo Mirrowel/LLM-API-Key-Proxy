@@ -67,3 +67,48 @@ class ProviderInterface(ABC):
         Proactively refreshes a token if it's nearing expiry.
         """
         pass
+    
+    # [NEW] Credential Prioritization System
+    def get_credential_priority(self, credential: str) -> Optional[int]:
+        """
+        Returns the priority level for a credential.
+        Lower numbers = higher priority (1 is highest).
+        Returns None if provider doesn't use priorities.
+        
+        This allows providers to auto-detect credential tiers (e.g., paid vs free)
+        and ensure higher-tier credentials are always tried first.
+        
+        Args:
+            credential: The credential identifier (API key or path)
+        
+        Returns:
+            Priority level (1-10) or None if no priority system
+            
+        Example:
+            For Gemini CLI:
+            - Paid tier credentials: priority 1 (highest)
+            - Free tier credentials: priority 2
+            - Unknown tier: priority 10 (lowest)
+        """
+        return None
+    
+    def get_model_tier_requirement(self, model: str) -> Optional[int]:
+        """
+        Returns the minimum priority tier required for a model.
+        If a model requires priority 1, only credentials with priority <= 1 can use it.
+        
+        This allows providers to restrict certain models to specific credential tiers.
+        For example, Gemini 3 models require paid-tier credentials.
+        
+        Args:
+            model: The model name (with or without provider prefix)
+        
+        Returns:
+            Minimum required priority level or None if no restrictions
+            
+        Example:
+            For Gemini CLI:
+            - gemini-3-*: requires priority 1 (paid tier only)
+            - gemini-2.5-*: no restriction (None)
+        """
+        return None
