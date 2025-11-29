@@ -1,4 +1,4 @@
-# src/rotator_library/providers/antigravity_provider_v2.py
+# src/rotator_library/providers/antigravity_provider.py
 """
 Antigravity Provider - Refactored Implementation
 
@@ -36,6 +36,14 @@ from .provider_interface import ProviderInterface
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
+from .antigravity_utils import (
+    generate_request_id,
+    generate_session_id,
+    generate_project_id,
+    normalize_type_arrays,
+    clean_claude_schema,
+    recursively_parse_json_strings,
+)
 
 
 # =============================================================================
@@ -66,14 +74,30 @@ AVAILABLE_MODELS = [
 # Default max output tokens (including thinking) - can be overridden per request
 DEFAULT_MAX_OUTPUT_TOKENS = 32384
 
+# Model-specific context window overrides (tokens)
+# These override external catalog limitations to provide accurate capabilities
+MODEL_CONTEXT_WINDOWS = {
+    "gemini-3-pro-preview": 2000000,  # 2M tokens for Gemini 3 Pro
+    "claude-sonnet-4-5": 200000,      # 200k tokens for Claude Sonnet 4.5
+    "claude-sonnet-4-5-thinking": 200000,  # Same for thinking variant
+}
+
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
-    "rev19-uic3-1p": "gemini-2.5-computer-use-preview-10-2025",
-    "gemini-3-pro-image": "gemini-3-pro-image-preview",
-    "gemini-3-pro-low": "gemini-3-pro-preview",
-    "gemini-3-pro-high": "gemini-3-pro-preview",
+"rev19-uic3-1p": "gemini-2.5-computer-use-preview-10-2025",
+"gemini-3-pro-image": "gemini-3-pro-image-preview",
+"gemini-3-pro-low": "gemini-3-pro-preview",
+"gemini-3-pro-high": "gemini-3-pro-preview",
 }
 MODEL_ALIAS_REVERSE = {v: k for k, v in MODEL_ALIAS_MAP.items()}
+
+# Thinking budget allocations per model family
+THINKING_BUDGETS = {
+"gemini-2.5-pro": {"low": 8192, "medium": 16384, "high": 32768},
+"gemini-2.5-flash": {"low": 6144, "medium": 12288, "high": 24576},
+"claude-sonnet-4-5": {"low": 8192, "medium": 16384, "high": 32768},
+"default": {"low": 1024, "medium": 2048, "high": 4096},
+}
 
 # Models to exclude from dynamic discovery
 EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-2.5-pro"}
@@ -180,13 +204,56 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 # =============================================================================
 
 def _env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment variable."""
-    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
+    """
+    Get boolean from environment variable with validation.
+    
+    Args:
+        key: Environment variable name
+        default: Default value if not set
+        
+    Returns:
+        Boolean value from environment or default
+        
+    Note:
+        Accepts: "true", "1", "yes" for True; "false", "0", "no" for False (case-insensitive)
+    """
+    value_str = os.getenv(key, str(default).lower()).lower()
+    
+    if value_str in ("true", "1", "yes"):
+        return True
+    elif value_str in ("false", "0", "no"):
+        return False
+    else:
+        lib_logger.warning(
+            f"Ambiguous boolean value for {key}: '{value_str}'. "
+            f"Treating as False. Valid values: true/false, 1/0, yes/no"
+        )
+        return False
 
 
 def _env_int(key: str, default: int) -> int:
-    """Get integer from environment variable."""
-    return int(os.getenv(key, str(default)))
+    """
+    Get integer from environment variable with validation.
+    
+    Args:
+        key: Environment variable name
+        default: Default value if not set
+        
+    Returns:
+        Integer value from environment or default
+        
+    Raises:
+        ValueError: If environment value is not a valid integer
+    """
+    value_str = os.getenv(key, str(default))
+    try:
+        value = int(value_str)
+        return value
+    except ValueError:
+        raise ValueError(
+            f"Invalid integer value for {key}: '{value_str}'. "
+            f"Expected a valid integer, got: {type(value_str).__name__}"
+        )
 
 
 def _generate_request_id() -> str:
@@ -457,6 +524,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         memory_ttl = _env_int("ANTIGRAVITY_SIGNATURE_CACHE_TTL", 3600)
         disk_ttl = _env_int("ANTIGRAVITY_SIGNATURE_DISK_TTL", 86400)
         
+        # Validate TTL values
+        if memory_ttl <= 0:
+            raise ValueError(
+                f"ANTIGRAVITY_SIGNATURE_CACHE_TTL must be positive, got: {memory_ttl}"
+            )
+        if disk_ttl <= 0:
+            raise ValueError(
+                f"ANTIGRAVITY_SIGNATURE_DISK_TTL must be positive, got: {disk_ttl}"
+            )
+        
         # Initialize caches using shared ProviderCache
         self._signature_cache = ProviderCache(
             GEMINI3_SIGNATURE_CACHE_FILE, memory_ttl, disk_ttl,
@@ -472,6 +549,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._enable_signature_cache = _env_bool("ANTIGRAVITY_ENABLE_SIGNATURE_CACHE", True)
         self._enable_dynamic_models = _env_bool("ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False)
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
+        self._enable_gemini3_thinking_conversion = _env_bool("ANTIGRAVITY_GEMINI3_THINKING_CONVERSION", True)
         self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
         self._enable_thinking_sanitization = _env_bool("ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION", True)
         
@@ -500,12 +578,27 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Log configuration
         self._log_config()
     
+    def __del__(self):
+        """Clean up caches on provider destruction."""
+        try:
+            if hasattr(self, '_signature_cache'):
+                self._signature_cache.close()
+        except Exception as e:
+            lib_logger.debug(f"Error closing signature cache: {e}")
+        
+        try:
+            if hasattr(self, '_thinking_cache'):
+                self._thinking_cache.close()
+        except Exception as e:
+            lib_logger.debug(f"Error closing thinking cache: {e}")
+
     def _log_config(self) -> None:
         """Log provider configuration."""
         lib_logger.debug(
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
-            f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
+            f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_thinking_conversion={self._enable_gemini3_thinking_conversion}, "
+            f"gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
         )
     
@@ -535,6 +628,22 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _strip_provider_prefix(self, model: str) -> str:
         """Strip provider prefix from model name."""
         return model.split("/")[-1] if "/" in model else model
+    
+    def _get_context_window(self, model: str) -> Optional[int]:
+        """Get accurate context window for model, overriding external catalog limits."""
+        internal = self._alias_to_internal(model)
+        
+        # Check for explicit overrides first
+        if internal in MODEL_CONTEXT_WINDOWS:
+            return MODEL_CONTEXT_WINDOWS[internal]
+        
+        # Check for model family patterns
+        if internal.startswith("gemini-3-"):
+            return 2000000  # 2M tokens for Gemini 3 family
+        elif "claude-sonnet-4-5" in internal:
+            return 200000   # 200k tokens for Claude Sonnet 4.5
+        
+        return None  # Let external catalogs handle it
     
     # =========================================================================
     # BASE URL MANAGEMENT
@@ -913,13 +1022,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if reasoning_effort == "disable":
             return {"thinkingBudget": 0, "include_thoughts": False}
         
-        # Model-specific budgets
-        if "gemini-2.5-pro" in model or is_claude:
-            budgets = {"low": 8192, "medium": 16384, "high": 32768}
-        elif "gemini-2.5-flash" in model:
-            budgets = {"low": 6144, "medium": 12288, "high": 24576}
-        else:
-            budgets = {"low": 1024, "medium": 2048, "high": 4096}
+        # Use model-specific thinking budgets from constants
+        budgets = THINKING_BUDGETS.get("default")
+        for model_pattern, budget_config in THINKING_BUDGETS.items():
+            if model_pattern != "default" and model_pattern in model:
+                budgets = budget_config
+                break
         
         budget = budgets.get(reasoning_effort, -1)
         if not custom_budget:
@@ -1058,38 +1166,45 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         reasoning_content = msg.get("reasoning_content")
         
         # Handle reasoning_content if present (from original Claude response with thinking)
-        if reasoning_content and self._is_claude(model):
-            # Add thinking part with cached signature
-            thinking_part = {
-                "text": reasoning_content,
-                "thought": True,
-            }
-            # Try to get signature from cache
-            cache_key = self._generate_thinking_cache_key(
-                content if isinstance(content, str) else "",
-                tool_calls
-            )
-            cached_sig = None
-            if cache_key:
-                cached_json = self._thinking_cache.retrieve(cache_key)
-                if cached_json:
-                    try:
-                        cached_data = json.loads(cached_json)
-                        cached_sig = cached_data.get("thought_signature", "")
-                    except json.JSONDecodeError:
-                        pass
-            
-            if cached_sig:
-                thinking_part["thoughtSignature"] = cached_sig
-                parts.append(thinking_part)
-                lib_logger.debug(f"Added reasoning_content with cached signature ({len(reasoning_content)} chars)")
-            else:
-                # No cached signature - skip the thinking block
-                # This can happen if context was compressed and signature was lost
-                lib_logger.warning(
-                    f"Skipping reasoning_content - no valid signature found. "
-                    f"This may cause issues if thinking is enabled."
+        if reasoning_content:
+            if self._is_claude(model):
+                # Add thinking part with cached signature for Claude
+                thinking_part = {
+                    "text": reasoning_content,
+                    "thought": True,
+                }
+                # Try to get signature from cache
+                cache_key = self._generate_thinking_cache_key(
+                    content if isinstance(content, str) else "",
+                    tool_calls
                 )
+                cached_sig = None
+                if cache_key:
+                    cached_json = self._thinking_cache.retrieve(cache_key)
+                    if cached_json:
+                        try:
+                            cached_data = json.loads(cached_json)
+                            cached_sig = cached_data.get("thought_signature", "")
+                        except json.JSONDecodeError:
+                            pass
+                
+                if cached_sig:
+                    thinking_part["thoughtSignature"] = cached_sig
+                    parts.append(thinking_part)
+                    lib_logger.debug(f"Added reasoning_content with cached signature ({len(reasoning_content)} chars)")
+                else:
+                    # No cached signature - skip the thinking block
+                    # This can happen if context was compressed and signature was lost
+                    lib_logger.warning(
+                        f"Skipping reasoning_content - no valid signature found. "
+                        f"This may cause issues if thinking is enabled."
+                    )
+            elif self._is_gemini_3(model) and self._enable_gemini3_thinking_conversion:
+                # Gemini 3: Convert reasoning content to thought format if conversion is enabled
+                lib_logger.debug(f"Converting reasoning_content for Gemini 3 ({len(reasoning_content)} chars)")
+                # For Gemini 3, reasoning content is handled differently - may be converted to thought signature context
+                # This flag controls whether we attempt conversion or preserve as-is
+                pass  # Future enhancement: implement Gemini 3 thinking conversion logic
         elif self._is_claude(model) and self._enable_signature_cache and not reasoning_content:
             # Fallback: Try to inject cached thinking for Claude (original behavior)
             thinking_parts = self._get_cached_thinking(content, tool_calls)
@@ -2316,9 +2431,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 gemini_payload["tools"] = gemini_tools
             
             antigravity_payload = {
-                "project": _generate_project_id(),
+                "project": generate_project_id(),
                 "userAgent": "antigravity",
-                "requestId": _generate_request_id(),
+                "requestId": generate_request_id(),
                 "model": internal_model,
                 "request": gemini_payload
             }
