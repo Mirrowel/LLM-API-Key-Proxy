@@ -1,0 +1,64 @@
+{
+  "id": "dev-team",
+  "description": "Software development team with specialized roles and expertise",
+  
+  "_FIELD_DOCUMENTATION": "=== FUSION CONFIGURATION ===",
+  "_id": "REQUIRED. Fusion identifier. Used in model name as: {id}[fusion]",
+  "_description": "OPTIONAL. Human-readable description of this fusion's purpose.",
+  
+  "_specialists": "REQUIRED. Array of specialist model configurations. Each specialist processes the same query with a specialized role/perspective.",
+  "specialists": [
+    {
+      "_model": "REQUIRED. Provider/model ID (e.g., 'gpt-4o', 'anthropic/claude-3-5-sonnet', 'gemini/gemini-1.5-pro')",
+      "model": "gpt-4o",
+      
+      "_role": "OPTIONAL. Display name for this specialist. Used in arbiter input as 'Role: {response}'. Default: 'Specialist {index}'",
+      "role": "Architect",
+      
+      "_system_prompt": "OPTIONAL. Role-specific instructions injected as system message. Defines this specialist's perspective/expertise.",
+      "system_prompt": "You are a Software Architect with deep expertise in system design, scalability, and architectural patterns. Focus on:\n- System design and component architecture\n- Scalability and performance considerations\n- Design patterns and best practices\n- Technology stack decisions\n- Long-term maintainability\n\nProvide architectural guidance and recommendations.",
+      
+      "_weight": "OPTIONAL (default: 1.0). Numeric importance for future weighted synthesis. Currently used for metadata only.",
+      "weight": 1.5,
+      
+      "_weight_description": "OPTIONAL. Natural language description of this specialist's expertise. Injected into arbiter context to guide synthesis.",
+      "weight_description": "Expert in architecture and scalability. Trust for design decisions, system architecture, and performance considerations.",
+      
+      "_role_template": "OPTIONAL. Reference to reusable role template from roles/ directory. Template fields are merged (specialist config overrides template). Cannot be used together with explicit role/system_prompt.",
+      "role_template": null
+    },
+    {
+      "model": "claude-3-5-sonnet",
+      
+      "_role_template_usage": "Example of using a role template instead of inline configuration",
+      "role_template": "security-expert",
+      
+      "_note": "When using role_template, you can still override fields like model, weight, etc. The template provides role, system_prompt, weight_description as defaults."
+    },
+    {
+      "model": "gemini/gemini-1.5-pro",
+      "role": "Code Reviewer",
+      "system_prompt": "You are a Senior Code Reviewer focused on code quality, maintainability, and best practices. Analyze:\n- Code clarity and readability\n- Error handling and edge cases\n- Testing strategy and coverage\n- Documentation and comments\n- DRY, SOLID, and other principles\n\nProvide actionable code review feedback.",
+      "weight": 1.2,
+      "weight_description": "Expert in code quality and maintainability. Trust for code review, testing, and best practices."
+    }
+  ],
+  
+  "_arbiter": "REQUIRED. Configuration for the model that synthesizes specialist responses.",
+  "arbiter": {
+    "_model": "'self' uses first specialist model. Or specify explicit model. Should be reasoning-capable for complex synthesis.",
+    "model": "gpt-4o",
+    
+    "_strategy": "Strategy template name (from strategies/ directory). Default: 'synthesis'. Try 'code_review' for development tasks.",
+    "strategy": "synthesis",
+    
+    "_blind": "If true, hides model names from arbiter (shows roles only). If false, shows both role and model. Default: false for fusions.",
+    "blind": false
+  },
+  
+  "_recursive_mode": "OPTIONAL. Same as swarm recursive mode. Enables autonomous critique for low-consensus scenarios.",
+  "recursive_mode": {
+    "enabled": false,
+    "consensus_threshold": 7
+  }
+}

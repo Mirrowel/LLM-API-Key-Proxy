@@ -12,6 +12,11 @@ This project provides a powerful solution for developers building complex applic
 ## Features
 
 -   **Universal API Endpoint**: Simplifies development by providing a single, OpenAI-compatible interface for diverse LLM providers.
+-   **HiveMind Ensemble**: Parallel model execution with intelligent arbitration in two modes:
+    -   **Swarm Mode**: Run multiple copies of the same model with temperature jitter, adversarial critique, and consensus-based synthesis
+    -   **Fusion Mode**: Combine responses from different specialized models with role-based routing and weighted synthesis
+    -   **Recursive Refinement**: Autonomous arbiter decision-making for low-consensus scenarios with internal critique reasoning
+    -   **Streaming Support**: Full streaming support with real-time arbiter synthesis
 -   **High Availability**: The underlying library ensures your application remains operational by gracefully handling transient provider errors and API key-specific issues.
 -   **Resilient Performance**: A global timeout on all requests prevents your application from hanging on unresponsive provider APIs.
 -   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. By default, it supports concurrent requests to *different* models. With configuration (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`), it can also support multiple concurrent requests to the *same* model using the same key.
@@ -412,11 +417,56 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 }'
 ```
 
+### HiveMind Ensemble - Parallel Model Execution
+
+HiveMind enables you to run multiple models in parallel with intelligent arbitration. Use the `[swarm]` suffix or pre-configured fusion IDs.
+
+**Swarm Mode** (same model, multiple executions):
+```bash
+# Explicit preset format
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer a-very-secret-and-unique-key" \
+-d '{
+    "model": "gpt-4o-mini-aggressive[swarm]",
+    "messages": [{"role": "user", "content": "Explain quantum computing"}]
+}'
+
+# Short format (requires omit_id: true in preset)
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer a-very-secret-and-unique-key" \
+-d '{
+    "model": "gpt-4o-mini[swarm]",
+    "messages": [{"role": "user", "content": "Explain quantum computing"}]
+}'
+```
+
+**Fusion Mode** (multiple specialist models):
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer a-very-secret-and-unique-key" \
+-d '{
+    "model": "dev-team[fusion]",
+    "messages": [{"role": "user", "content": "Review this API design"}]
+}'
+```
+
+HiveMind automatically:
+- Executes models in parallel
+- Applies temperature jitter for diversity (Swarm mode)
+- Routes to specialized models with role prompts (Fusion mode)
+- Synthesizes responses using an arbiter model
+- Aggregates usage and cost across all calls
+
+For detailed configuration and advanced features, see the [HiveMind User Guide](docs/HiveMind_User_Guide.md).
+
 ### Available API Endpoints
 
 -   `POST /v1/chat/completions`: The main endpoint for making chat requests.
 -   `POST /v1/embeddings`: The endpoint for creating embeddings.
--   `GET /v1/models`: Returns a list of all available models from your configured providers.
+-   `GET /v1/models`: Returns a list of all available models from your configured providers (includes HiveMind fusions and swarms).
 -   `GET /v1/providers`: Returns a list of all configured providers.
 -   `POST /v1/token-count`: Calculates the token count for a given message payload.
 

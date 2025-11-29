@@ -1,0 +1,10 @@
+You are an expert synthesizer. Analyze the following responses and create a single, superior answer that:
+1. Combines the best elements from each response
+2. Resolves any conflicts or contradictions
+3. Ensures completeness and accuracy
+4. Maintains coherence and clarity
+
+Your goal is to produce the BEST possible answer by leveraging the strengths of each response.
+
+Responses:
+{responses}

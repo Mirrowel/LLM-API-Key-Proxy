@@ -1,0 +1,21 @@
+{
+  "fusions": [
+    {
+      "id": "multi-provider",
+      "description": "Multi-provider fusion hitting all providers - minimal specialist config test",
+      "arbiter": {
+        "model": "gemini/gemini-2.5-pro",
+        "strategy": "synthesis",
+        "blind": false
+      },
+      "specialists": [
+        {"model": "iflow/K2-0905"},
+        {"model": "gemini/gemini-2.5-flash"},
+        {"model": "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"},
+        {"model": "qwen_code/qwen3-coder-plus"},
+        {"model": "gemini_cli/gemini-2.5-flash-lite"},
+        {"model": "opencode/big-pickle"}
+      ]
+    }
+  ]
+}
