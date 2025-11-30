@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import os
-import random
 import time
 import uuid
 from datetime import datetime
@@ -256,175 +255,9 @@ def _env_int(key: str, default: int) -> int:
         )
 
 
-def _generate_request_id() -> str:
-    """Generate Antigravity request ID: agent-{uuid}"""
-    return f"agent-{uuid.uuid4()}"
-
-
-def _generate_session_id() -> str:
-    """Generate Antigravity session ID: -{random_number}"""
-    n = random.randint(1_000_000_000_000_000_000, 9_999_999_999_999_999_999)
-    return f"-{n}"
-
-
-def _generate_project_id() -> str:
-    """Generate fake project ID: {adj}-{noun}-{random}"""
-    adjectives = ["useful", "bright", "swift", "calm", "bold"]
-    nouns = ["fuze", "wave", "spark", "flow", "core"]
-    return f"{random.choice(adjectives)}-{random.choice(nouns)}-{uuid.uuid4().hex[:5]}"
-
-
-def _normalize_type_arrays(schema: Any) -> Any:
-    """
-    Normalize type arrays in JSON Schema for Proto-based Antigravity API.
-    Converts `"type": ["string", "null"]` → `"type": "string"`.
-    """
-    if isinstance(schema, dict):
-        normalized = {}
-        for key, value in schema.items():
-            if key == "type" and isinstance(value, list):
-                non_null = [t for t in value if t != "null"]
-                normalized[key] = non_null[0] if non_null else value[0]
-            else:
-                normalized[key] = _normalize_type_arrays(value)
-        return normalized
-    elif isinstance(schema, list):
-        return [_normalize_type_arrays(item) for item in schema]
-    return schema
-
-
-def _recursively_parse_json_strings(obj: Any) -> Any:
-    """
-    Recursively parse JSON strings in nested data structures.
-    
-    Antigravity sometimes returns tool arguments with JSON-stringified values:
-    {"files": "[{...}]"} instead of {"files": [{...}]}.
-    
-    Additionally handles:
-    - Malformed double-encoded JSON (extra trailing '}' or ']')
-    - Escaped string content (\n, \t, \", etc.)
-    """
-    if isinstance(obj, dict):
-        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_recursively_parse_json_strings(item) for item in obj]
-    elif isinstance(obj, str):
-        stripped = obj.strip()
-        
-        # Check if string contains common escape sequences that need unescaping
-        # This handles cases where diff content or other text has literal \n instead of newlines
-        if '\\n' in obj or '\\t' in obj or '\\"' in obj or '\\\\' in obj:
-            try:
-                # Use json.loads with quotes to properly unescape the string
-                # This converts \n -> newline, \t -> tab, \" -> quote, etc.
-                unescaped = json.loads(f'"{obj}"')
-                lib_logger.debug(
-                    f"[Antigravity] Unescaped string content: "
-                    f"{len(obj) - len(unescaped)} chars changed"
-                )
-                return unescaped
-            except (json.JSONDecodeError, ValueError):
-                # If unescaping fails, continue with original processing
-                pass
-        
-        # Check if it looks like JSON (starts with { or [)
-        if stripped and stripped[0] in ('{', '['):
-            # Try standard parsing first
-            if (stripped.startswith('{') and stripped.endswith('}')) or \
-               (stripped.startswith('[') and stripped.endswith(']')):
-                try:
-                    parsed = json.loads(obj)
-                    return _recursively_parse_json_strings(parsed)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            
-            # Handle malformed JSON: array that doesn't end with ]
-            # e.g., '[{"path": "..."}]}' instead of '[{"path": "..."}]'
-            if stripped.startswith('[') and not stripped.endswith(']'):
-                try:
-                    # Find the last ] and truncate there
-                    last_bracket = stripped.rfind(']')
-                    if last_bracket > 0:
-                        cleaned = stripped[:last_bracket+1]
-                        parsed = json.loads(cleaned)
-                        lib_logger.warning(
-                            f"[Antigravity] Auto-corrected malformed JSON string: "
-                            f"truncated {len(stripped) - len(cleaned)} extra chars"
-                        )
-                        return _recursively_parse_json_strings(parsed)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            
-            # Handle malformed JSON: object that doesn't end with }
-            if stripped.startswith('{') and not stripped.endswith('}'):
-                try:
-                    # Find the last } and truncate there
-                    last_brace = stripped.rfind('}')
-                    if last_brace > 0:
-                        cleaned = stripped[:last_brace+1]
-                        parsed = json.loads(cleaned)
-                        lib_logger.warning(
-                            f"[Antigravity] Auto-corrected malformed JSON string: "
-                            f"truncated {len(stripped) - len(cleaned)} extra chars"
-                        )
-                        return _recursively_parse_json_strings(parsed)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-    return obj
-
-
-def _clean_claude_schema(schema: Any) -> Any:
-    """
-    Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
-    - Removes unsupported fields ($schema, additionalProperties, etc.)
-    - Converts 'const' to 'enum' with single value (supported equivalent)
-    - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
-    """
-    if not isinstance(schema, dict):
-        return schema
-    
-    # Fields not supported by Antigravity/Google's Proto-based API
-    # Note: Claude via Antigravity rejects JSON Schema draft 2020-12 validation keywords
-    incompatible = {
-        '$schema', 'additionalProperties', 'minItems', 'maxItems', 'pattern',
-        'minLength', 'maxLength', 'minimum', 'maximum', 'default',
-        'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'format',
-        'minProperties', 'maxProperties', 'uniqueItems', 'contentEncoding',
-        'contentMediaType', 'contentSchema', 'deprecated', 'readOnly', 'writeOnly',
-        'examples', '$id', '$ref', '$defs', 'definitions', 'title',
-    }
-    
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    if 'anyOf' in schema and isinstance(schema['anyOf'], list) and schema['anyOf']:
-        first_option = _clean_claude_schema(schema['anyOf'][0])
-        if isinstance(first_option, dict):
-            return first_option
-    
-    # Handle 'oneOf' similarly
-    if 'oneOf' in schema and isinstance(schema['oneOf'], list) and schema['oneOf']:
-        first_option = _clean_claude_schema(schema['oneOf'][0])
-        if isinstance(first_option, dict):
-            return first_option
-    
-
-    cleaned = {}
-    
-    # Handle 'const' by converting to 'enum' with single value
-    if 'const' in schema:
-        const_value = schema['const']
-        cleaned['enum'] = [const_value]
-    
-    for key, value in schema.items():
-        if key in incompatible or key == 'const':
-            continue
-        if isinstance(value, dict):
-            cleaned[key] = _clean_claude_schema(value)
-        elif isinstance(value, list):
-            cleaned[key] = [_clean_claude_schema(item) if isinstance(item, dict) else item for item in value]
-        else:
-            cleaned[key] = value
-    
-    return cleaned
+# Note: Helper functions (generate_request_id, generate_session_id, generate_project_id,
+# normalize_type_arrays, clean_claude_schema, recursively_parse_json_strings) have been
+# moved to the antigravity_utils subpackage for better code organization.
 
 
 # =============================================================================
@@ -1668,7 +1501,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 schema = dict(params)
                 schema.pop("$schema", None)
                 schema.pop("strict", None)
-                schema = _normalize_type_arrays(schema)
+                schema = normalize_type_arrays(schema)
                 func_decl["parametersJsonSchema"] = schema
             else:
                 func_decl["parametersJsonSchema"] = {"type": "object", "properties": {}}
@@ -1713,15 +1546,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Wrap in Antigravity envelope
         antigravity_payload = {
-            "project": _generate_project_id(),
+            "project": generate_project_id(),
             "userAgent": "antigravity",
-            "requestId": _generate_request_id(),
+            "requestId": generate_request_id(),
             "model": internal_model,
             "request": copy.deepcopy(gemini_payload)
         }
         
         # Add session ID
-        antigravity_payload["request"]["sessionId"] = _generate_session_id()
+        antigravity_payload["request"]["sessionId"] = generate_session_id()
         
         # Add default safety settings to prevent content filtering
         # Only add if not already present in the payload
@@ -1787,7 +1620,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             for func_decl in tool.get("functionDeclarations", []):
                 if "parametersJsonSchema" in func_decl:
                     params = func_decl["parametersJsonSchema"]
-                    params = _clean_claude_schema(params) if isinstance(params, dict) else params
+                    params = clean_claude_schema(params) if isinstance(params, dict) else params
                     func_decl["parameters"] = params
                     del func_decl["parametersJsonSchema"]
     
@@ -1997,7 +1830,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             tool_name = self._strip_gemini3_prefix(tool_name)
         
         raw_args = func_call.get("args", {})
-        parsed_args = _recursively_parse_json_strings(raw_args)
+        parsed_args = recursively_parse_json_strings(raw_args)
         
         tool_call = {
             "id": tool_id,
@@ -2118,8 +1951,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 "Content-Type": "application/json"
             }
             payload = {
-                "project": _generate_project_id(),
-                "requestId": _generate_request_id(),
+                "project": generate_project_id(),
+                "requestId": generate_request_id(),
                 "userAgent": "antigravity"
             }
             
@@ -2297,10 +2130,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 if self._try_next_base_url():
                     lib_logger.warning(f"Server error {e.response.status_code}, retrying with fallback URL")
                     url = f"{self._get_base_url()}{endpoint}"
-                    if stream:
-                        return self._handle_streaming(client, url, headers, payload, model, file_logger)
-                    else:
-                        return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
+                    try:
+                        if stream:
+                            return self._handle_streaming(client, url, headers, payload, model, file_logger)
+                        else:
+                            return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
+                    except Exception as retry_error:
+                        lib_logger.error(f"Fallback URL also failed: {retry_error}")
+                        raise litellm.ServiceUnavailableError(
+                            f"All Antigravity endpoints failed. Primary: {e.response.status_code}, Fallback: {retry_error}"
+                        )
                 raise litellm.ServiceUnavailableError(
                     f"Antigravity API server error: {e.response.status_code}"
                 )
@@ -2317,10 +2156,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if self._try_next_base_url():
                 lib_logger.warning(f"Connection failed, trying fallback URL: {e}")
                 url = f"{self._get_base_url()}{endpoint}"
-                if stream:
-                    return self._handle_streaming(client, url, headers, payload, model, file_logger)
-                else:
-                    return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
+                try:
+                    if stream:
+                        return self._handle_streaming(client, url, headers, payload, model, file_logger)
+                    else:
+                        return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
+                except Exception as retry_error:
+                    lib_logger.error(f"Fallback URL also failed: {retry_error}")
+                    raise litellm.APIConnectionError(
+                        f"All Antigravity endpoints failed. Primary: {e}, Fallback: {retry_error}"
+                    )
             raise litellm.APIConnectionError(f"Failed to connect to Antigravity API: {e}")
         except httpx.TimeoutException as e:
             raise litellm.Timeout(f"Request timeout: {e}")

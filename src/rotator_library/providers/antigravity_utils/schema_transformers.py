@@ -31,6 +31,10 @@ def normalize_type_arrays(schema: Any) -> Any:
         normalized = {}
         for key, value in schema.items():
             if key == "type" and isinstance(value, list):
+                # Guard against empty list to prevent IndexError
+                if not value:
+                    normalized[key] = value
+                    continue
                 # Remove "null" from type array and take first non-null type
                 non_null = [t for t in value if t != "null"]
                 normalized[key] = non_null[0] if non_null else value[0]
@@ -84,27 +88,27 @@ def clean_claude_schema(schema: Any) -> Any:
         'examples', '$id', '$ref', '$defs', 'definitions', 'title',
     }
     
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    if 'anyOf' in schema and isinstance(schema['anyOf'], list) and schema['anyOf']:
-        first_option = clean_claude_schema(schema['anyOf'][0])
-        if isinstance(first_option, dict):
-            return first_option
-    
-    # Handle 'oneOf' similarly
-    if 'oneOf' in schema and isinstance(schema['oneOf'], list) and schema['oneOf']:
-        first_option = clean_claude_schema(schema['oneOf'][0])
-        if isinstance(first_option, dict):
-            return first_option
-    
-
     cleaned = {}
     
+    # Handle 'anyOf'/'oneOf' by merging first option into schema
+    base_schema = dict(schema)
+    for key in ['anyOf', 'oneOf']:
+        if key in base_schema and isinstance(base_schema[key], list) and base_schema[key]:
+            first_option = clean_claude_schema(base_schema[key][0])
+            if isinstance(first_option, dict):
+                # Merge first option, prioritizing explicit fields in base schema
+                for opt_key, opt_value in first_option.items():
+                    if opt_key not in base_schema or opt_key == key:
+                        base_schema[opt_key] = opt_value
+            # Remove anyOf/oneOf from base schema
+            base_schema.pop(key, None)
+    
     # Handle 'const' by converting to 'enum' with single value
-    if 'const' in schema:
-        const_value = schema['const']
+    if 'const' in base_schema:
+        const_value = base_schema['const']
         cleaned['enum'] = [const_value]
     
-    for key, value in schema.items():
+    for key, value in base_schema.items():
         if key in incompatible or key == 'const':
             continue
         if isinstance(value, dict):
