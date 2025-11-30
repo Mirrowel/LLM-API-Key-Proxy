@@ -2138,9 +2138,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if models:
                 lib_logger.info(f"Discovered {len(models)} models")
                 return models
+        except httpx.HTTPStatusError as e:
+            lib_logger.warning(f"Model discovery HTTP error {e.response.status_code}: {e}")
+        except httpx.TimeoutException as e:
+            lib_logger.warning(f"Model discovery timeout: {e}")
+        except httpx.ConnectError as e:
+            lib_logger.warning(f"Model discovery connection error: {e}")
+        except json.JSONDecodeError as e:
+            lib_logger.warning(f"Model discovery invalid JSON response: {e}")
         except Exception as e:
-            lib_logger.warning(f"Dynamic model discovery failed: {e}")
+            lib_logger.warning(f"Model discovery unexpected error: {e}")
         
+        # Fallback to hardcoded models on any error
         return [f"antigravity/{m}" for m in AVAILABLE_MODELS]
     
     async def acompletion(
@@ -2281,15 +2290,42 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 return self._handle_streaming(client, url, headers, payload, model, file_logger)
             else:
                 return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
-        except Exception as e:
+        except httpx.HTTPStatusError as e:
+            # Handle HTTP errors with specific status codes
+            if e.response.status_code >= 500:
+                # Server errors - try fallback URL
+                if self._try_next_base_url():
+                    lib_logger.warning(f"Server error {e.response.status_code}, retrying with fallback URL")
+                    url = f"{self._get_base_url()}{endpoint}"
+                    if stream:
+                        return self._handle_streaming(client, url, headers, payload, model, file_logger)
+                    else:
+                        return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
+                raise litellm.ServiceUnavailableError(
+                    f"Antigravity API server error: {e.response.status_code}"
+                )
+            elif e.response.status_code == 401:
+                raise litellm.AuthenticationError(f"Invalid authentication credentials: {e}")
+            elif e.response.status_code == 429:
+                raise litellm.RateLimitError(f"Rate limit exceeded: {e}")
+            elif e.response.status_code == 400:
+                raise litellm.BadRequestError(f"Invalid request parameters: {e}")
+            else:
+                raise litellm.APIError(f"API request failed with status {e.response.status_code}: {e}")
+        except httpx.ConnectError as e:
+            # Connection failures - try fallback URL
             if self._try_next_base_url():
-                lib_logger.warning(f"Retrying with fallback URL: {e}")
+                lib_logger.warning(f"Connection failed, trying fallback URL: {e}")
                 url = f"{self._get_base_url()}{endpoint}"
                 if stream:
                     return self._handle_streaming(client, url, headers, payload, model, file_logger)
                 else:
                     return await self._handle_non_streaming(client, url, headers, payload, model, file_logger)
-            raise
+            raise litellm.APIConnectionError(f"Failed to connect to Antigravity API: {e}")
+        except httpx.TimeoutException as e:
+            raise litellm.Timeout(f"Request timeout: {e}")
+        except json.JSONDecodeError as e:
+            raise litellm.APIError(f"Invalid JSON response from API: {e}")
     
     def _inject_tool_hardening_instruction(self, payload: Dict[str, Any], instruction_text: str) -> None:
         """Inject tool usage hardening system instruction for Gemini 3 & Claude."""
@@ -2320,17 +2356,33 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None
     ) -> litellm.ModelResponse:
         """Handle non-streaming completion."""
-        response = await client.post(url, headers=headers, json=payload, timeout=120.0)
-        response.raise_for_status()
-        
-        data = response.json()
-        if file_logger:
-            file_logger.log_final_response(data)
-        
-        gemini_response = self._unwrap_response(data)
-        openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
-        
-        return litellm.ModelResponse(**openai_response)
+        try:
+            response = await client.post(url, headers=headers, json=payload, timeout=120.0)
+            response.raise_for_status()
+            
+            data = response.json()
+            if file_logger:
+                file_logger.log_final_response(data)
+            
+            gemini_response = self._unwrap_response(data)
+            openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
+            
+            return litellm.ModelResponse(**openai_response)
+        except httpx.HTTPStatusError as e:
+            # Let the error propagate with specific status codes
+            if e.response.status_code == 401:
+                raise litellm.AuthenticationError(f"Authentication failed: {e}")
+            elif e.response.status_code == 429:
+                raise litellm.RateLimitError(f"Rate limit exceeded: {e}")
+            elif e.response.status_code >= 500:
+                raise litellm.ServiceUnavailableError(f"Server error: {e}")
+            elif e.response.status_code == 400:
+                raise litellm.BadRequestError(f"Invalid request: {e}")
+            raise litellm.APIError(f"HTTP error {e.response.status_code}: {e}")
+        except httpx.TimeoutException as e:
+            raise litellm.Timeout(f"Request timeout after 120 seconds: {e}")
+        except json.JSONDecodeError as e:
+            raise litellm.APIError(f"Invalid JSON in API response: {e}")
     
     async def _handle_streaming(
         self,
@@ -2452,6 +2504,21 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             total = unwrapped.get('totalTokens', 0)
             
             return {'prompt_tokens': total, 'total_tokens': total}
+        except httpx.HTTPStatusError as e:
+            lib_logger.error(f"Token counting HTTP error {e.response.status_code}: {e}")
+            return {'prompt_tokens': 0, 'total_tokens': 0}
+        except httpx.TimeoutException as e:
+            lib_logger.error(f"Token counting timeout: {e}")
+            return {'prompt_tokens': 0, 'total_tokens': 0}
+        except httpx.ConnectError as e:
+            lib_logger.error(f"Token counting connection error: {e}")
+            return {'prompt_tokens': 0, 'total_tokens': 0}
+        except json.JSONDecodeError as e:
+            lib_logger.error(f"Token counting invalid JSON response: {e}")
+            return {'prompt_tokens': 0, 'total_tokens': 0}
+        except KeyError as e:
+            lib_logger.error(f"Token counting missing expected field: {e}")
+            return {'prompt_tokens': 0, 'total_tokens': 0}
         except Exception as e:
-            lib_logger.error(f"Token counting failed: {e}")
+            lib_logger.error(f"Token counting unexpected error: {e}")
             return {'prompt_tokens': 0, 'total_tokens': 0}
