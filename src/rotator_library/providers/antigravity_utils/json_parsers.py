@@ -46,22 +46,6 @@ def recursively_parse_json_strings(obj: Any) -> Any:
     elif isinstance(obj, str):
         stripped = obj.strip()
         
-        # Check if string contains common escape sequences that need unescaping
-        # This handles cases where diff content or other text has literal \n instead of newlines
-        if '\\n' in obj or '\\t' in obj or '\\"' in obj or '\\\\' in obj:
-            try:
-                # Use json.loads with quotes to properly unescape the string
-                # This converts \n -> newline, \t -> tab, \" -> quote, etc.
-                unescaped = json.loads(f'"{obj}"')
-                lib_logger.debug(
-                    f"[Antigravity] Unescaped string content: "
-                    f"{len(obj) - len(unescaped)} chars changed"
-                )
-                return unescaped
-            except (json.JSONDecodeError, ValueError):
-                # If unescaping fails, continue with original processing
-                pass
-        
         # Check if it looks like JSON (starts with { or [)
         if stripped and stripped[0] in ('{', '['):
             # Try standard parsing first
@@ -105,4 +89,20 @@ def recursively_parse_json_strings(obj: Any) -> Any:
                         return recursively_parse_json_strings(parsed)
                 except (json.JSONDecodeError, ValueError):
                     pass
+        
+        # For non-JSON strings, check if they contain escape sequences that need unescaping
+        # This handles cases where diff content or other text has literal \n instead of newlines
+        if '\\n' in obj or '\\t' in obj or '\\"' in obj or '\\\\' in obj:
+            try:
+                # Use json.loads with quotes to properly unescape the string
+                # This converts \n -> newline, \t -> tab, \" -> quote, etc.
+                unescaped = json.loads(f'"{obj}"')
+                lib_logger.debug(
+                    f"[Antigravity] Unescaped string content: "
+                    f"{len(obj) - len(unescaped)} chars changed"
+                )
+                return unescaped
+            except (json.JSONDecodeError, ValueError):
+                # If unescaping fails, continue with original processing
+                pass
     return obj

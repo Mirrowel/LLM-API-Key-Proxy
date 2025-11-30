@@ -59,16 +59,16 @@ def validate_completion_params(
             raise ValueError(f"Message at index {i} missing required 'content' field")
         
         # Validate role
-        valid_roles = {'user', 'assistant', 'system'}
+        valid_roles = {'user', 'assistant', 'system', 'tool'}
         if message['role'] not in valid_roles:
             raise ValueError(
                 f"Message at index {i} has invalid role '{message['role']}'. "
                 f"Must be one of: {', '.join(valid_roles)}"
             )
         
-        # Validate content
-        if not isinstance(message['content'], str):
-            raise TypeError(f"Message content must be a string, got {type(message['content']).__name__}")
+        # Validate content - can be string or list (for multimodal content)
+        if not isinstance(message['content'], (str, list)):
+            raise TypeError(f"Message content must be a string or list, got {type(message['content']).__name__}")
     
     # Validate numeric parameters
     if 'temperature' in kwargs and kwargs['temperature'] is not None:
@@ -217,7 +217,7 @@ def validate_reasoning_effort(reasoning_effort: Optional[str]) -> None:
         ValueError: If reasoning_effort is invalid
     """
     if reasoning_effort is not None:
-        valid_levels = {'low', 'medium', 'high'}
+        valid_levels = {'low', 'medium', 'high', 'disable'}
         if reasoning_effort not in valid_levels:
             raise ValueError(
                 f"reasoning_effort must be one of {', '.join(valid_levels)}, got '{reasoning_effort}'"
