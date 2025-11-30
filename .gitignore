@@ -128,3 +128,12 @@ cache/antigravity/thought_signatures.json
 logs/
 cache/
 *.env
+
+# OAuth credentials
+oauth_creds/
+
+# AI assistant configuration and personal development files
+.roo/
+AGENTS.md
+antigravity_provider_refactoring_plan.md
+antigravity_refactoring_implementation_plan.md
