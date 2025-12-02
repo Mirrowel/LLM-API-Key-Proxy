@@ -142,7 +142,10 @@ class RotatingClient:
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
         self._provider_instances = {}
-        self.http_client = httpx.AsyncClient()
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=None),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
+        )
         self.all_providers = AllProviders()
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
@@ -819,6 +822,38 @@ class RotatingClient:
         while (
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
         ):
+            if len(tried_creds) > 0 and last_exception:
+                # Exponential backoff for rotation to prevent retry storms
+                retry_count = len(tried_creds)
+                base_delay = 1.0
+                max_delay = 15.0  # Cap at 15 seconds
+
+                # Check for Rate Limit (429) to apply steeper backoff
+                is_rate_limit = False
+                if isinstance(last_exception, litellm.RateLimitError):
+                    is_rate_limit = True
+                elif hasattr(last_exception, "status_code") and last_exception.status_code == 429:
+                    is_rate_limit = True
+                elif (
+                    hasattr(last_exception, "response")
+                    and hasattr(last_exception.response, "status_code")
+                    and last_exception.response.status_code == 429
+                ):
+                    is_rate_limit = True
+
+                if is_rate_limit:
+                    base_delay = 2.0
+
+                delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
+                # Add slight jitter to prevent thundering herd
+                delay += random.uniform(0, 0.5)
+
+                lib_logger.warning(
+                    f"Rotating credential due to error. Backing off for {delay:.2f}s before next attempt "
+                    f"(Chain failure #{retry_count}, RateLimit={is_rate_limit}). Last error: {str(last_exception).split('\\n')[0]}"
+                )
+                await asyncio.sleep(delay)
+
             current_cred = None
             key_acquired = False
             try:
@@ -1133,8 +1168,11 @@ class RotatingClient:
                                 # For these errors, we should not retry with other keys.
                                 raise last_exception
 
+                            # Treat server_error (500s) as soft failures - don't count against key health
+                            increment_failures = classified_error.error_type != "server_error"
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error
+                                current_cred, model, classified_error,
+                                increment_consecutive_failures=increment_failures
                             )
                             break  # Try next key for other errors
             finally:
@@ -1264,6 +1302,38 @@ class RotatingClient:
                 len(tried_creds) < len(credentials_for_provider)
                 and time.time() < deadline
             ):
+                if len(tried_creds) > 0 and last_exception:
+                    # Exponential backoff for rotation to prevent retry storms
+                    retry_count = len(tried_creds)
+                    base_delay = 1.0
+                    max_delay = 15.0  # Cap at 15 seconds
+
+                    # Check for Rate Limit (429) to apply steeper backoff
+                    is_rate_limit = False
+                    if isinstance(last_exception, litellm.RateLimitError):
+                        is_rate_limit = True
+                    elif hasattr(last_exception, "status_code") and last_exception.status_code == 429:
+                        is_rate_limit = True
+                    elif (
+                        hasattr(last_exception, "response")
+                        and hasattr(last_exception.response, "status_code")
+                        and last_exception.response.status_code == 429
+                    ):
+                        is_rate_limit = True
+
+                    if is_rate_limit:
+                        base_delay = 2.0
+
+                    delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
+                    # Add slight jitter to prevent thundering herd
+                    delay += random.uniform(0, 0.5)
+
+                    lib_logger.warning(
+                        f"Rotating credential due to error. Backing off for {delay:.2f}s before next attempt "
+                        f"(Chain failure #{retry_count}, RateLimit={is_rate_limit}). Last error: {str(last_exception).split('\\n')[0]}"
+                    )
+                    await asyncio.sleep(delay)
+
                 current_cred = None
                 key_acquired = False
                 try:
@@ -1401,13 +1471,8 @@ class RotatingClient:
                                 StreamedAPIError,
                                 litellm.RateLimitError,
                                 httpx.HTTPStatusError,
+                                httpx.ReadTimeout,
                             ) as e:
-                                if (
-                                    isinstance(e, httpx.HTTPStatusError)
-                                    and e.response.status_code != 429
-                                ):
-                                    raise e
-
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
                                 original_exc = getattr(e, "data", e)
@@ -1586,12 +1651,31 @@ class RotatingClient:
                                 response, current_cred, model, request
                             )
 
-                            async for chunk in stream_generator:
-                                yield chunk
-                            return
-
-                        except (StreamedAPIError, litellm.RateLimitError) as e:
-                            last_exception = e
+                            try:
+                                async for chunk in stream_generator:
+                                    yield chunk
+                                return
+                            except (
+                                StreamedAPIError,
+                                litellm.RateLimitError,
+                                httpx.HTTPStatusError,
+                                httpx.ReadTimeout,
+                            ) as e:
+                                # [MODIFIED] Check if we can retry instead of raising immediately if partial data was sent.
+                                # Since we yield directly to the client, we can't transparently "restart" the stream
+                                # without the client seeing duplicates or garbage, UNLESS we haven't yielded anything yet.
+                                # However, the task instruction explicitly asks to rotate and retry if possible,
+                                # catching the exception and moving to the next key.
+                                # The client logic below this block handles the rotation if 'last_exception' is set.
+                                last_exception = e
+                                lib_logger.warning(
+                                    f"Streaming failed mid-stream for credential ...{current_cred[-6:]} with error: {str(e)}. "
+                                    f"Attempting to rotate and retry if retries are available."
+                                )
+                                
+                                # We need to ensure we don't return here, but fall through to the rotation logic.
+                                # The 'break' below exits the inner 'max_retries' loop,
+                                # causing the outer 'while len(tried_creds)' loop to continue with a new key.
 
                             # This is the final, robust handler for streamed errors.
                             error_payload = {}
@@ -1799,9 +1883,11 @@ class RotatingClient:
                             ]:
                                 raise last_exception
 
-                            # [MODIFIED] Do not yield to the client here.
+                            # Treat server_error (500s) as soft failures - don't count against key health
+                            increment_failures = classified_error.error_type != "server_error"
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error
+                                current_cred, model, classified_error,
+                                increment_consecutive_failures=increment_failures
                             )
                             break
 

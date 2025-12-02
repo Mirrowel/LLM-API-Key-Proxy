@@ -1,21 +1,6 @@
-# src/rotator_library/providers/antigravity_provider_v2.py
-"""
-Antigravity Provider - Refactored Implementation
-
-A clean, well-structured provider for Google's Antigravity API, supporting:
-- Gemini 2.5 (Pro/Flash) with thinkingBudget
-- Gemini 3 (Pro/Image) with thinkingLevel
-- Claude (Sonnet 4.5) via Antigravity proxy
-
-Key Features:
-- Unified streaming/non-streaming handling
-- Server-side thought signature caching
-- Automatic base URL fallback
-- Gemini 3 tool hallucination prevention
-"""
-
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -447,6 +432,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     
     def __init__(self):
         super().__init__()
+        
+        # Concurrency management
+        # Heuristic: 2 concurrent requests per credential to avoid rate limits
+        # We start with a default and update when credentials are loaded/discovered
+        self._concurrency_limit = 10
+        self._semaphore = asyncio.Semaphore(self._concurrency_limit)
+        
         self.model_definitions = ModelDefinitions()
         
         # Base URL management
@@ -499,6 +491,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Log configuration
         self._log_config()
+
+        # Circuit Breaker / Model Blacklist
+        self._model_failures: Dict[str, int] = {}
+        self._model_blacklist: Dict[str, float] = {}
+        self._max_consecutive_failures = 5
+        self._blacklist_duration = 300  # 5 minutes
     
     def _log_config(self) -> None:
         """Log provider configuration."""
@@ -512,7 +510,38 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     # =========================================================================
     # MODEL UTILITIES
     # =========================================================================
-    
+
+    def _is_model_blacklisted(self, model: str) -> bool:
+        """Check if model is currently blacklisted."""
+        if model not in self._model_blacklist:
+            return False
+        
+        expiry = self._model_blacklist[model]
+        if time.time() > expiry:
+            del self._model_blacklist[model]
+            self._model_failures[model] = 0
+            lib_logger.info(f"Model {model} blacklist expired, re-enabling.")
+            return False
+        return True
+
+    def _record_success(self, model: str) -> None:
+        """Reset failure count on successful request."""
+        if self._model_failures.get(model, 0) > 0:
+             self._model_failures[model] = 0
+             lib_logger.debug(f"Model {model} request successful, failure count reset.")
+
+    def _record_failure(self, model: str, status_code: int = 0) -> None:
+        """Record a failure and potentially blacklist the model."""
+        if status_code >= 500:
+            self._model_failures[model] = self._model_failures.get(model, 0) + 1
+            count = self._model_failures[model]
+            lib_logger.warning(f"Model {model} 5xx error detected. Failure count: {count}")
+            
+            if count >= self._max_consecutive_failures:
+                expiry = time.time() + self._blacklist_duration
+                self._model_blacklist[model] = expiry
+                lib_logger.error(f"Model {model} blacklisted until {datetime.fromtimestamp(expiry)}")
+
     def _alias_to_internal(self, alias: str) -> str:
         """Convert public alias to internal model name."""
         return MODEL_ALIAS_REVERSE.get(alias, alias)
@@ -1963,6 +1992,49 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._thinking_cache.store(cache_key, json.dumps(data))
         lib_logger.info(f"Cached thinking: {cache_key[:50]}...")
     
+    def _parse_retry_delay_from_error(self, error_body: Union[str, bytes, Dict[str, Any]]) -> Optional[float]:
+        """
+        Parse retryDelay from Antigravity error response.
+        
+        Expected format: {"error": {"details": [{"retryDelay": "48.88s"}]}}
+        
+        Args:
+            error_body: Error response body as string, bytes, or dict
+            
+        Returns:
+            Delay in seconds as a float, or None if not found
+        """
+        try:
+            # Normalize to dict
+            if isinstance(error_body, bytes):
+                error_body = error_body.decode('utf-8')
+            
+            if isinstance(error_body, str):
+                error_data = json.loads(error_body)
+            else:
+                error_data = error_body
+            
+            # Parse: error.details[].retryDelay
+            details = error_data.get("error", {}).get("details", [])
+            if details and isinstance(details, list):
+                for detail in details:
+                    if isinstance(detail, dict):
+                        retry_delay = detail.get("retryDelay")
+                        if retry_delay:
+                            # Format: "48.88s" - strip 's' and convert to float
+                            if isinstance(retry_delay, str) and retry_delay.endswith('s'):
+                                delay_seconds = float(retry_delay[:-1])
+                                lib_logger.info(f"Parsed retryDelay from error: {delay_seconds}s")
+                                return delay_seconds
+                            elif isinstance(retry_delay, (int, float)):
+                                lib_logger.info(f"Parsed retryDelay from error: {retry_delay}s")
+                                return float(retry_delay)
+            
+            return None
+        except Exception as e:
+            lib_logger.debug(f"Failed to parse retryDelay from error: {e}")
+            return None
+    
     # =========================================================================
     # PROVIDER INTERFACE IMPLEMENTATION
     # =========================================================================
@@ -1983,6 +2055,20 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         token = await self.get_valid_token(credential_identifier)
         return {"Authorization": f"Bearer {token}"}
     
+    def update_concurrency_limit(self, credential_count: int) -> None:
+        """
+        Update concurrency limit based on available credentials.
+        Rule: 2 concurrent requests per credential.
+        """
+        new_limit = max(1, credential_count * 2)
+        if new_limit != self._concurrency_limit:
+            lib_logger.info(f"Updating Antigravity concurrency limit: {self._concurrency_limit} -> {new_limit}")
+            self._concurrency_limit = new_limit
+            # Recreate semaphore with new limit
+            # Note: This is a simple reset; actively running requests aren't affected
+            # but the new limit applies to subsequent acquisitions
+            self._semaphore = asyncio.Semaphore(self._concurrency_limit)
+
     async def get_models(
         self,
         api_key: str,
@@ -2007,7 +2093,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 "userAgent": "antigravity"
             }
             
-            response = await client.post(url, json=payload, headers=headers, timeout=30.0)
+            response = await client.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=None)
+            )
             response.raise_for_status()
             data = response.json()
             
@@ -2036,13 +2127,40 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Handle completion requests for Antigravity.
         
         Main entry point that:
-        1. Extracts parameters and transforms messages
-        2. Builds Antigravity request payload
-        3. Makes API call with fallback logic
-        4. Transforms response to OpenAI format
+        1. Checks concurrency limits (fails fast if full)
+        2. Extracts parameters and transforms messages
+        3. Builds Antigravity request payload
+        4. Makes API call with fallback logic
+        5. Transforms response to OpenAI format
         """
+        # Check global concurrency limit
+        if self._semaphore.locked():
+             # Fail fast if at capacity
+             raise litellm.ServiceUnavailableError(
+                 message="Antigravity provider at max capacity. Please try again later.",
+                 headers={"Retry-After": "5"}
+             )
+
+        # Semaphore acquisition pushed down to _handle_streaming/non_streaming
+        # to ensure it covers the full duration of streaming responses.
+        return await self._execute_acompletion(client, **kwargs)
+
+    async def _execute_acompletion(
+        self,
+        client: httpx.AsyncClient,
+        **kwargs
+    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+        """Internal execution method wrapped by semaphore."""
         # Extract parameters
         model = self._strip_provider_prefix(kwargs.get("model", "gemini-2.5-pro"))
+
+        # Check blacklist
+        if self._is_model_blacklisted(model):
+             raise litellm.ServiceUnavailableError(
+                 message=f"Model {model} is temporarily blacklisted due to repeated upstream failures.",
+                 headers={"Retry-After": "60"}
+             )
+
         messages = kwargs.get("messages", [])
         stream = kwargs.get("stream", False)
         credential_path = kwargs.pop("credential_identifier", kwargs.get("api_key", ""))
@@ -2204,17 +2322,49 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None
     ) -> litellm.ModelResponse:
         """Handle non-streaming completion."""
-        response = await client.post(url, headers=headers, json=payload, timeout=120.0)
-        response.raise_for_status()
-        
-        data = response.json()
-        if file_logger:
-            file_logger.log_final_response(data)
-        
-        gemini_response = self._unwrap_response(data)
-        openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
-        
-        return litellm.ModelResponse(**openai_response)
+        async with self._semaphore:
+            try:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=None)
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # Parse retryDelay from error response body
+                retry_delay = None
+                try:
+                    error_body = e.response.content
+                    retry_delay = self._parse_retry_delay_from_error(error_body)
+                except Exception as parse_err:
+                    lib_logger.debug(f"Failed to parse error body for retryDelay: {parse_err}")
+                
+                # If we have a retry delay, create RateLimitError with it
+                if retry_delay is not None and e.response.status_code in (429, 500, 503):
+                    lib_logger.warning(
+                        f"Antigravity error {e.response.status_code} with retryDelay={retry_delay}s"
+                    )
+                    # Create a new RateLimitError with the parsed delay
+                    rate_limit_error = litellm.RateLimitError(
+                        message=f"Rate limit error: {str(e)}",
+                        response=e.response
+                    )
+                    # Attach retry_after for classify_error to extract
+                    rate_limit_error.retry_after = int(retry_delay)
+                    raise rate_limit_error from e
+                
+                # Re-raise original error if no retry delay or not a rate limit
+                raise
+            
+            data = response.json()
+            if file_logger:
+                file_logger.log_final_response(data)
+            
+            gemini_response = self._unwrap_response(data)
+            openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
+            
+            return litellm.ModelResponse(**openai_response)
     
     async def _handle_streaming(
         self,
@@ -2236,59 +2386,70 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "is_complete": False  # Track if we received usageMetadata
         }
         
-        async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
-            if response.status_code >= 400:
-                try:
-                    error_body = await response.aread()
-                    lib_logger.error(f"API error {response.status_code}: {error_body.decode()}")
-                except Exception:
-                    pass
-            
-            response.raise_for_status()
-            
-            async for line in response.aiter_lines():
-                if file_logger:
-                    file_logger.log_response_chunk(line)
-                
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
+        async with self._semaphore:
+            try:
+                async with client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=None)
+                ) as response:
+                    if response.status_code >= 400:
+                        try:
+                            error_body = await response.aread()
+                            lib_logger.error(f"API error {response.status_code}: {error_body.decode()}")
+                        except Exception:
+                            pass
                     
-                    try:
-                        chunk = json.loads(data_str)
-                        gemini_chunk = self._unwrap_response(chunk)
-                        openai_chunk = self._gemini_to_openai_chunk(gemini_chunk, model, accumulator)
-                        
-                        yield litellm.ModelResponse(**openai_chunk)
-                    except json.JSONDecodeError:
+                    response.raise_for_status()
+                    
+                    async for line in response.aiter_lines():
                         if file_logger:
-                            file_logger.log_error(f"Parse error: {data_str[:100]}")
-                        continue
-        
-        # If stream ended without usageMetadata chunk, emit a final chunk with finish_reason
-        # Emit final chunk if stream ended without usageMetadata
-        # Client will determine the correct finish_reason based on accumulated state
-        if not accumulator.get("is_complete"):
-            final_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-                # Include minimal usage to signal this is the final chunk
-                "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
-            }
-            yield litellm.ModelResponse(**final_chunk)
-        
-        # Cache Claude thinking after stream completes
-        if self._is_claude(model) and self._enable_signature_cache and accumulator.get("reasoning_content"):
-            self._cache_thinking(
-                accumulator["reasoning_content"],
-                accumulator["thought_signature"],
-                accumulator["text_content"],
-                accumulator["tool_calls"]
-            )
+                            file_logger.log_response_chunk(line)
+                        
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                break
+                            
+                            try:
+                                chunk = json.loads(data_str)
+                                gemini_chunk = self._unwrap_response(chunk)
+                                openai_chunk = self._gemini_to_openai_chunk(gemini_chunk, model, accumulator)
+                                
+                                yield litellm.ModelResponse(**openai_chunk)
+                            except json.JSONDecodeError:
+                                if file_logger:
+                                    file_logger.log_error(f"Parse error: {data_str[:100]}")
+                                continue
+                
+                # If stream ended without usageMetadata chunk, emit a final chunk with finish_reason
+                # Emit final chunk if stream ended without usageMetadata
+                # Client will determine the correct finish_reason based on accumulated state
+                if not accumulator.get("is_complete"):
+                    final_chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                        # Include minimal usage to signal this is the final chunk
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
+                    }
+                    yield litellm.ModelResponse(**final_chunk)
+                
+                # Cache Claude thinking after stream completes
+                if self._is_claude(model) and self._enable_signature_cache and accumulator.get("reasoning_content"):
+                    self._cache_thinking(
+                        accumulator["reasoning_content"],
+                        accumulator["thought_signature"],
+                        accumulator["text_content"],
+                        accumulator["tool_calls"]
+                    )
+            except GeneratorExit:
+                lib_logger.warning("Client disconnected early")
+                raise
     
     async def count_tokens(
         self,
@@ -2328,7 +2489,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 "Content-Type": "application/json"
             }
             
-            response = await client.post(url, headers=headers, json=antigravity_payload, timeout=30)
+            response = await client.post(
+                url,
+                headers=headers,
+                json=antigravity_payload,
+                timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=None)
+            )
             response.raise_for_status()
             
             data = response.json()
