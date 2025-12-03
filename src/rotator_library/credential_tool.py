@@ -548,7 +548,7 @@ async def main(clear_on_start=True):
     
     while True:
         # Clear screen between menu selections for cleaner UX
-        console.clear()
+        os.system('cls' if os.name == 'nt' else 'clear')
         console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
         
         console.print(Panel(
@@ -675,7 +675,7 @@ def run_credential_tool(from_launcher=False):
     # If from launcher, don't clear screen at start to preserve loading messages
     try:
         asyncio.run(main(clear_on_start=not from_launcher))
-        console.clear()  # Clear terminal when credential tool exits
+        os.system('cls' if os.name == 'nt' else 'clear')  # Clear terminal when credential tool exits
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Exiting setup.[/bold yellow]")
-        console.clear()  # Clear terminal on keyboard interrupt too
+        os.system('cls' if os.name == 'nt' else 'clear')  # Clear terminal on keyboard interrupt too

@@ -16,6 +16,17 @@ from dotenv import load_dotenv, set_key
 console = Console()
 
 
+def clear_screen():
+    """
+    Cross-platform terminal clear that works robustly on both 
+    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    
+    Uses native OS commands instead of ANSI escape sequences:
+    - Windows (conhost & Windows Terminal): cls
+    - Unix-like systems (Linux, Mac): clear
+    """
+    os.system('cls' if os.name == 'nt' else 'clear')
+
 class LauncherConfig:
     """Manages launcher_config.json (host, port, logging only)"""
     
@@ -222,7 +233,7 @@ class LauncherTUI:
     
     def show_main_menu(self):
         """Display main menu and handle selection"""
-        self.console.clear()
+        clear_screen()
         
         # Detect all settings
         settings = SettingsDetector.get_all_settings()
@@ -353,7 +364,7 @@ class LauncherTUI:
     def show_config_menu(self):
         """Display configuration sub-menu"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             self.console.print(Panel.fit(
                 "[bold cyan]⚙️  Proxy Configuration[/bold cyan]",
@@ -414,7 +425,7 @@ class LauncherTUI:
     
     def show_provider_settings_menu(self):
         """Display provider/advanced settings (read-only + launch tool)"""
-        self.console.clear()
+        clear_screen()
         
         settings = SettingsDetector.get_all_settings()
         credentials = settings["credentials"]
@@ -472,7 +483,7 @@ class LauncherTUI:
             self.console.print("━" * 70)
             for provider, limit in concurrency.items():
                 self.console.print(f"   • {provider:15} {limit} requests/key")
-            self.console.print(f"   • Default:        1 request/key (all others)")
+            self.console.print("   • Default:        1 request/key (all others)")
         
         # Model Filters (basic info only)
         if filters:
@@ -515,7 +526,7 @@ class LauncherTUI:
         import time
         
         # CRITICAL: Show full loading UI to replace the 6-7 second blank wait
-        self.console.clear()
+        clear_screen()
         
         _start_time = time.time()
         
@@ -552,7 +563,7 @@ class LauncherTUI:
     
     def show_about(self):
         """Display About page with project information"""
-        self.console.clear()
+        clear_screen()
         
         self.console.print(Panel.fit(
             "[bold cyan]ℹ️  About LLM API Key Proxy[/bold cyan]",
@@ -596,7 +607,7 @@ class LauncherTUI:
         """Prepare and launch proxy in same window"""
         # Check if forced onboarding needed
         if self.needs_onboarding():
-            self.console.clear()
+            clear_screen()
             self.console.print(Panel(
                 Text.from_markup(
                     "⚠️  [bold yellow]Setup Required[/bold yellow]\n\n"
@@ -619,13 +630,13 @@ class LauncherTUI:
                 return
         
         # Clear console and modify sys.argv
-        self.console.clear()
+        clear_screen()
         self.console.print(f"\n[bold green]🚀 Starting proxy on {self.config.config['host']}:{self.config.config['port']}...[/bold green]\n")
         
         # Clear console again to remove the starting message before main.py shows loading details
         import time
         time.sleep(0.5)  # Brief pause so user sees the message
-        self.console.clear()
+        clear_screen()
         
         # Reconstruct sys.argv for main.py
         sys.argv = [

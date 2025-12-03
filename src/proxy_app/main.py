@@ -878,7 +878,7 @@ if __name__ == "__main__":
 
     def show_onboarding_message():
         """Display clear explanatory message for why onboarding is needed."""
-        console.clear()  # Clear terminal for clean presentation
+        os.system('cls' if os.name == 'nt' else 'clear')  # Clear terminal for clean presentation
         console.print(Panel.fit(
             "[bold cyan]🚀 LLM API Key Proxy - First Time Setup[/bold cyan]",
             border_style="cyan"
