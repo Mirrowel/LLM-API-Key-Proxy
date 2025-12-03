@@ -15,6 +15,18 @@ from dotenv import set_key, unset_key
 console = Console()
 
 
+def clear_screen():
+    """
+    Cross-platform terminal clear that works robustly on both 
+    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    
+    Uses native OS commands instead of ANSI escape sequences:
+    - Windows (conhost & Windows Terminal): cls
+    - Unix-like systems (Linux, Mac): clear
+    """
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
 class AdvancedSettings:
     """Manages pending changes to .env"""
     
@@ -389,7 +401,7 @@ class SettingsTool:
     
     def show_main_menu(self):
         """Display settings categories"""
-        self.console.clear()
+        clear_screen()
         
         self.console.print(Panel.fit(
             "[bold cyan]🔧 Advanced Settings Configuration[/bold cyan]",
@@ -436,7 +448,7 @@ class SettingsTool:
     def manage_custom_providers(self):
         """Manage custom provider API bases"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             providers = self.provider_mgr.get_current_providers()
             
@@ -533,7 +545,7 @@ class SettingsTool:
     def manage_model_definitions(self):
         """Manage provider model definitions"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             all_providers = self.model_mgr.get_all_providers_with_models()
             
@@ -710,7 +722,7 @@ class SettingsTool:
             current_models = {m: {} for m in current_models}
         
         while True:
-            self.console.clear()
+            clear_screen()
             self.console.print(f"[bold]Editing models for: {provider}[/bold]\n")
             self.console.print("Current models:")
             for i, (name, definition) in enumerate(current_models.items(), 1):
@@ -788,7 +800,7 @@ class SettingsTool:
             input("\nPress Enter to continue...")
             return
         
-        self.console.clear()
+        clear_screen()
         self.console.print(f"[bold]Provider: {provider}[/bold]\n")
         self.console.print("[bold]📦 Configured Models:[/bold]")
         self.console.print("━" * 50)
@@ -816,7 +828,7 @@ class SettingsTool:
     def manage_provider_settings(self):
         """Manage provider-specific settings (Antigravity, Gemini CLI)"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             available_providers = self.provider_settings_mgr.get_available_providers()
             
@@ -863,7 +875,7 @@ class SettingsTool:
     def _manage_single_provider_settings(self, provider: str):
         """Manage settings for a single provider"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             display_name = provider.replace("_", " ").title()
             definitions = self.provider_settings_mgr.get_provider_settings_definitions(provider)
@@ -1005,7 +1017,7 @@ class SettingsTool:
     def manage_concurrency_limits(self):
         """Manage concurrency limits"""
         while True:
-            self.console.clear()
+            clear_screen()
             
             limits = self.concurrency_mgr.get_current_limits()
             
