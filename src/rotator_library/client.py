@@ -35,6 +35,25 @@ from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 
 
+def _format_credential_for_display(credential: str) -> str:
+    """
+    Format a credential for display in logs.
+    
+    For file-based credentials (OAuth JSON files), returns the full basename.
+    For API key strings, returns the last 6 characters.
+    
+    Args:
+        credential: The credential string (either a file path or API key)
+    
+    Returns:
+        A display-safe string representation of the credential
+    """
+    if os.path.isfile(credential):
+        return os.path.basename(credential)
+    else:
+        return credential[-6:]
+
+
 class StreamedAPIError(Exception):
     """Custom exception to signal an API error received over a stream."""
 
@@ -521,7 +540,7 @@ class RotatingClient:
             while True:
                 if request and await request.is_disconnected():
                     lib_logger.info(
-                        f"Client disconnected. Aborting stream for credential ...{key[-6:]}."
+                        f"Client disconnected. Aborting stream for credential {_format_credential_for_display(key)}."
                     )
                     break
 
@@ -679,7 +698,7 @@ class RotatingClient:
             # Catch any other unexpected errors during streaming.
             lib_logger.error(f"Caught unexpected exception of type: {type(e).__name__}")
             lib_logger.error(
-                f"An unexpected error occurred during the stream for credential ...{key[-6:]}: {e}"
+                f"An unexpected error occurred during the stream for credential {_format_credential_for_display(key)}: {e}"
             )
             # We still need to raise it so the client knows something went wrong.
             raise
@@ -689,7 +708,7 @@ class RotatingClient:
             # The primary goal is to ensure usage is always logged internally.
             await self.usage_manager.release_key(key, model)
             lib_logger.info(
-                f"STREAM FINISHED and lock released for credential ...{key[-6:]}."
+                f"STREAM FINISHED and lock released for credential {_format_credential_for_display(key)}."
             )
 
             # Only send [DONE] if the stream completed naturally and the client is still there.
@@ -1010,7 +1029,7 @@ class RotatingClient:
                     for attempt in range(self.max_retries):
                         try:
                             lib_logger.info(
-                                f"Attempting call with credential ...{current_cred[-6:]} (Attempt {attempt + 1}/{self.max_retries})"
+                                f"Attempting call with credential {_format_credential_for_display(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                             )
 
                             if pre_request_callback:
@@ -1059,7 +1078,7 @@ class RotatingClient:
                             # Extract a clean error message for the user-facing log
                             error_message = str(e).split("\n")[0]
                             lib_logger.info(
-                                f"Key ...{current_cred[-6:]} hit rate limit for model {model}. Reason: '{error_message}'. Rotating key."
+                                f"Key {_format_credential_for_display(current_cred)} hit rate limit for model {model}. Reason: '{error_message}'. Rotating key."
                             )
 
                             if classified_error.status_code == 429:
@@ -1077,7 +1096,7 @@ class RotatingClient:
                                 current_cred, model, classified_error
                             )
                             lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} encountered a rate limit. Trying next key."
+                                f"Key {_format_credential_for_display(current_cred)} encountered a rate limit. Trying next key."
                             )
                             break  # Move to the next key
 
@@ -1106,7 +1125,7 @@ class RotatingClient:
                             if attempt >= self.max_retries - 1:
                                 error_message = str(e).split("\n")[0]
                                 lib_logger.warning(
-                                    f"Key ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Reason: '{error_message}'. Rotating key."
+                                    f"Key {_format_credential_for_display(current_cred)} failed after max retries for model {model} due to a server error. Reason: '{error_message}'. Rotating key."
                                 )
                                 break  # Move to the next key
 
@@ -1125,7 +1144,7 @@ class RotatingClient:
 
                             error_message = str(e).split("\n")[0]
                             lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                f"Key {_format_credential_for_display(current_cred)} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
                             )
                             await asyncio.sleep(wait_time)
                             continue  # Retry with the same key
@@ -1144,14 +1163,14 @@ class RotatingClient:
 
                             if request and await request.is_disconnected():
                                 lib_logger.warning(
-                                    f"Client disconnected. Aborting retries for credential ...{current_cred[-6:]}."
+                                    f"Client disconnected. Aborting retries for credential {_format_credential_for_display(current_cred)}."
                                 )
                                 raise last_exception
 
                             classified_error = classify_error(e)
                             error_message = str(e).split("\n")[0]
                             lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key."
+                                f"Key {_format_credential_for_display(current_cred)} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key."
                             )
                             if classified_error.status_code == 429:
                                 # Apply cooldown to provider, but this doesn't block the CURRENT rotation
@@ -1436,7 +1455,7 @@ class RotatingClient:
                         for attempt in range(self.max_retries):
                             try:
                                 lib_logger.info(
-                                    f"Attempting stream with credential ...{current_cred[-6:]} (Attempt {attempt + 1}/{self.max_retries})"
+                                    f"Attempting stream with credential {_format_credential_for_display(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                                 )
 
                                 if pre_request_callback:
@@ -1459,7 +1478,7 @@ class RotatingClient:
                                 )
 
                                 lib_logger.info(
-                                    f"Stream connection established for credential ...{current_cred[-6:]}. Processing response."
+                                    f"Stream connection established for credential {_format_credential_for_display(current_cred)}. Processing response."
                                 )
 
                                 key_acquired = False
@@ -1485,7 +1504,7 @@ class RotatingClient:
                                     current_cred, model, classified_error
                                 )
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during custom provider stream. Rotating key."
+                                    f"Credential {_format_credential_for_display(current_cred)} encountered a recoverable error ({classified_error.error_type}) during custom provider stream. Rotating key."
                                 )
                                 break
 
@@ -1513,7 +1532,7 @@ class RotatingClient:
 
                                 if attempt >= self.max_retries - 1:
                                     lib_logger.warning(
-                                        f"Credential ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Rotating key."
+                                        f"Credential {_format_credential_for_display(current_cred)} failed after max retries for model {model} due to a server error. Rotating key."
                                     )
                                     break
 
@@ -1529,7 +1548,7 @@ class RotatingClient:
 
                                 error_message = str(e).split("\n")[0]
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                    f"Credential {_format_credential_for_display(current_cred)} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
                                 )
                                 await asyncio.sleep(wait_time)
                                 continue
@@ -1547,7 +1566,7 @@ class RotatingClient:
                                 )
                                 classified_error = classify_error(e)
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
+                                    f"Credential {_format_credential_for_display(current_cred)} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
                                 )
                                 if classified_error.error_type in [
                                     "invalid_request",
@@ -1619,7 +1638,7 @@ class RotatingClient:
                     for attempt in range(self.max_retries):
                         try:
                             lib_logger.info(
-                                f"Attempting stream with credential ...{current_cred[-6:]} (Attempt {attempt + 1}/{self.max_retries})"
+                                f"Attempting stream with credential {_format_credential_for_display(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                             )
 
                             if pre_request_callback:
@@ -1647,7 +1666,7 @@ class RotatingClient:
                             )
 
                             lib_logger.info(
-                                f"Stream connection established for credential ...{current_cred[-6:]}. Processing response."
+                                f"Stream connection established for credential {_format_credential_for_display(current_cred)}. Processing response."
                             )
 
                             key_acquired = False
@@ -1673,7 +1692,7 @@ class RotatingClient:
                                 # The client logic below this block handles the rotation if 'last_exception' is set.
                                 last_exception = e
                                 lib_logger.warning(
-                                    f"Streaming failed mid-stream for credential ...{current_cred[-6:]} with error: {str(e)}. "
+                                    f"Streaming failed mid-stream for credential {_format_credential_for_display(current_cred)} with error: {str(e)}. "
                                     f"Attempting to rotate and retry if retries are available."
                                 )
                                 
@@ -1730,7 +1749,7 @@ class RotatingClient:
                             ):
                                 consecutive_quota_failures += 1
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} hit a quota limit. This is consecutive failure #{consecutive_quota_failures} for this request."
+                                    f"Credential {_format_credential_for_display(current_cred)} hit a quota limit. This is consecutive failure #{consecutive_quota_failures} for this request."
                                 )
 
                                 quota_value = "N/A"
@@ -1759,7 +1778,7 @@ class RotatingClient:
 
                                 if consecutive_quota_failures >= 3:
                                     console_log_message = (
-                                        f"Terminating stream for credential ...{current_cred[-6:]} due to 3rd consecutive quota error. "
+                                        f"Terminating stream for credential {_format_credential_for_display(current_cred)} due to 3rd consecutive quota error. "
                                         f"This is now considered a fatal input data error. ID: {quota_id}, Limit: {quota_value}."
                                     )
                                     client_error_message = (
@@ -1776,7 +1795,7 @@ class RotatingClient:
                                 else:
                                     # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
                                     lib_logger.warning(
-                                        f"Quota error on credential ...{current_cred[-6:]} (failure {consecutive_quota_failures}/3). Rotating key silently."
+                                        f"Quota error on credential {_format_credential_for_display(current_cred)} (failure {consecutive_quota_failures}/3). Rotating key silently."
                                     )
                                     break
 
@@ -1784,7 +1803,7 @@ class RotatingClient:
                                 consecutive_quota_failures = 0
                                 # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during stream. Rotating key silently."
+                                    f"Credential {_format_credential_for_display(current_cred)} encountered a recoverable error ({classified_error.error_type}) during stream. Rotating key silently."
                                 )
 
                                 if (
@@ -1833,7 +1852,7 @@ class RotatingClient:
 
                             if attempt >= self.max_retries - 1:
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Rotating key silently."
+                                    f"Credential {_format_credential_for_display(current_cred)} failed after max retries for model {model} due to a server error. Rotating key silently."
                                 )
                                 # [MODIFIED] Do not yield to the client here.
                                 break
@@ -1850,7 +1869,7 @@ class RotatingClient:
 
                             error_message = str(e).split("\n")[0]
                             lib_logger.warning(
-                                f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                f"Credential {_format_credential_for_display(current_cred)} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
                             )
                             await asyncio.sleep(wait_time)
                             continue
@@ -1870,7 +1889,7 @@ class RotatingClient:
                             classified_error = classify_error(e)
 
                             lib_logger.warning(
-                                f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
+                                f"Credential {_format_credential_for_display(current_cred)} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
                             )
 
                             if classified_error.status_code == 429:
@@ -2053,13 +2072,9 @@ class RotatingClient:
             for credential in shuffled_credentials:
                 try:
                     # Display last 6 chars for API keys, or the filename for OAuth paths
-                    cred_display = (
-                        credential[-6:]
-                        if not os.path.isfile(credential)
-                        else os.path.basename(credential)
-                    )
+                    cred_display = _format_credential_for_display(credential)
                     lib_logger.debug(
-                        f"Attempting to get models for {provider} with credential ...{cred_display}"
+                        f"Attempting to get models for {provider} with credential {cred_display}"
                     )
                     models = await provider_instance.get_models(
                         credential, self.http_client
@@ -2090,13 +2105,9 @@ class RotatingClient:
                     return final_models
                 except Exception as e:
                     classified_error = classify_error(e)
-                    cred_display = (
-                        credential[-6:]
-                        if not os.path.isfile(credential)
-                        else os.path.basename(credential)
-                    )
+                    cred_display = _format_credential_for_display(credential)
                     lib_logger.debug(
-                        f"Failed to get models for provider {provider} with credential ...{cred_display}: {classified_error.error_type}. Trying next credential."
+                        f"Failed to get models for provider {provider} with credential {cred_display}: {classified_error.error_type}. Trying next credential."
                     )
                     continue  # Try the next credential
 

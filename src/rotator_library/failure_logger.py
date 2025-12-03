@@ -4,6 +4,8 @@ from logging.handlers import RotatingFileHandler
 import os
 from datetime import datetime
 
+from .utils import format_credential_for_display
+
 def setup_failure_logger():
     """Sets up a dedicated JSON logger for writing detailed failure logs to a file."""
     log_dir = "logs"
@@ -56,7 +58,7 @@ def log_failure(api_key: str, model: str, attempt: int, error: Exception, reques
 
     detailed_log_data = {
         "timestamp": datetime.utcnow().isoformat(),
-        "api_key_ending": api_key[-4:],
+        "api_key_display": format_credential_for_display(api_key),
         "model": model,
         "attempt_number": attempt,
         "error_type": type(error).__name__,
@@ -68,7 +70,7 @@ def log_failure(api_key: str, model: str, attempt: int, error: Exception, reques
 
     # 2. Log a concise summary to the main library logger, which will propagate
     summary_message = (
-        f"API call failed for model {model} with key ...{api_key[-4:]}. "
+        f"API call failed for model {model} with key {format_credential_for_display(api_key)}. "
         f"Error: {type(error).__name__}. See failures.log for details."
     )
     main_lib_logger.error(summary_message)

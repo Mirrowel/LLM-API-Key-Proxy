@@ -11,6 +11,7 @@ import litellm
 
 from .error_handler import ClassifiedError, NoAvailableKeysError
 from .providers import PROVIDER_PLUGINS
+from .utils import format_credential_for_display
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
@@ -139,7 +140,7 @@ class UsageManager:
                     last_reset_dt is None
                     or last_reset_dt < reset_threshold_today <= now_utc
                 ):
-                    lib_logger.debug(f"Performing daily reset for key ...{key[-6:]}")
+                    lib_logger.debug(f"Performing daily reset for key {format_credential_for_display(key)}")
                     needs_saving = True
 
                     # Reset cooldowns
@@ -237,7 +238,7 @@ class UsageManager:
         if lib_logger.isEnabledFor(logging.DEBUG):
             total_weight = sum(weights)
             weight_info = ", ".join(
-                f"...{cred[-6:]}: w={w:.1f} ({w/total_weight*100:.1f}%)"
+                f"{format_credential_for_display(cred)}: w={w:.1f} ({w/total_weight*100:.1f}%)"
                 for (cred, _), w in zip(candidates, weights)
             )
             #lib_logger.debug(f"Weighted selection candidates: {weight_info}")
@@ -358,7 +359,7 @@ class UsageManager:
                             if not state["models_in_use"]:
                                 state["models_in_use"][model] = 1
                                 lib_logger.info(
-                                    f"Acquired Priority-{priority_level} Tier-1 key ...{key[-6:]} for model {model} "
+                                    f"Acquired Priority-{priority_level} Tier-1 key {format_credential_for_display(key)} for model {model} "
                                     f"(selection: {selection_method}, usage: {usage})"
                                 )
                                 return key
@@ -371,7 +372,7 @@ class UsageManager:
                             if current_count < max_concurrent:
                                 state["models_in_use"][model] = current_count + 1
                                 lib_logger.info(
-                                    f"Acquired Priority-{priority_level} Tier-2 key ...{key[-6:]} for model {model} "
+                                    f"Acquired Priority-{priority_level} Tier-2 key {format_credential_for_display(key)} for model {model} "
                                     f"(selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
                                 )
                                 return key
@@ -452,7 +453,7 @@ class UsageManager:
                         if not state["models_in_use"]:
                             state["models_in_use"][model] = 1
                             lib_logger.info(
-                                f"Acquired Tier 1 key ...{key[-6:]} for model {model} "
+                                f"Acquired Tier 1 key {format_credential_for_display(key)} for model {model} "
                                 f"(selection: {selection_method}, usage: {usage})"
                             )
                             return key
@@ -465,7 +466,7 @@ class UsageManager:
                         if current_count < max_concurrent:
                             state["models_in_use"][model] = current_count + 1
                             lib_logger.info(
-                                f"Acquired Tier 2 key ...{key[-6:]} for model {model} "
+                                f"Acquired Tier 2 key {format_credential_for_display(key)} for model {model} "
                                 f"(selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
                             )
                             return key
@@ -521,12 +522,12 @@ class UsageManager:
                 if remaining <= 0:
                     del state["models_in_use"][model]  # Clean up when count reaches 0
                 lib_logger.info(
-                    f"Released credential ...{key[-6:]} from model {model} "
+                    f"Released credential {format_credential_for_display(key)} from model {model} "
                     f"(remaining concurrent: {max(0, remaining)})"
                 )
             else:
                 lib_logger.warning(
-                    f"Attempted to release credential ...{key[-6:]} for model {model}, but it was not in use."
+                    f"Attempted to release credential {format_credential_for_display(key)} for model {model}, but it was not in use."
                 )
 
         # Notify all tasks waiting on this key's condition
@@ -589,7 +590,7 @@ class UsageManager:
                     usage, "completion_tokens", 0
                 )  # Not present in embedding responses
                 lib_logger.info(
-                    f"Recorded usage from response object for key ...{key[-6:]}"
+                    f"Recorded usage from response object for key {format_credential_for_display(key)}"
                 )
                 try:
                     provider_name = model.split("/")[0]
@@ -686,21 +687,21 @@ class UsageManager:
                     # Use the original delay from Antigravity for key-level cooldown
                     cooldown_seconds = original_delay
                     lib_logger.info(
-                        f"Rate limit error on key ...{key[-6:]} for model {model}. "
+                        f"Rate limit error on key {format_credential_for_display(key)} for model {model}. "
                         f"Using original retryDelay for key cooldown: {cooldown_seconds}s"
                     )
                 else:
                     # Standard retry_after or increased default for fail-fast strategy
                     cooldown_seconds = classified_error.retry_after or 300
                     lib_logger.info(
-                        f"Rate limit error on key ...{key[-6:]} for model {model}. "
+                        f"Rate limit error on key {format_credential_for_display(key)} for model {model}. "
                         f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
                     )
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
                 key_data["key_cooldown_until"] = time.time() + 300
                 lib_logger.warning(
-                    f"Authentication error on key ...{key[-6:]}. Applying 5-minute key-level lockout."
+                    f"Authentication error on key {format_credential_for_display(key)}. Applying 5-minute key-level lockout."
                 )
                 # Auth errors still use escalating backoff for the specific model
                 cooldown_seconds = 300  # 5 minutes for model cooldown
@@ -719,7 +720,7 @@ class UsageManager:
                     backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
                     cooldown_seconds = backoff_tiers.get(count, 7200)  # Default to 2 hours for "spent" keys
                     lib_logger.warning(
-                        f"Failure #{count} for key ...{key[-6:]} with model {model}. "
+                        f"Failure #{count} for key {format_credential_for_display(key)} with model {model}. "
                         f"Error type: {classified_error.error_type}"
                     )
             else:
@@ -727,7 +728,7 @@ class UsageManager:
                 if cooldown_seconds is None:
                     cooldown_seconds = 30  # 30s cooldown for provider issues
                 lib_logger.info(
-                    f"Provider-level error ({classified_error.error_type}) for key ...{key[-6:]} with model {model}. "
+                    f"Provider-level error ({classified_error.error_type}) for key {format_credential_for_display(key)} with model {model}. "
                     f"NOT incrementing consecutive failures. Applying {cooldown_seconds}s cooldown."
                 )
 
@@ -735,7 +736,7 @@ class UsageManager:
             model_cooldowns = key_data.setdefault("model_cooldowns", {})
             model_cooldowns[model] = time.time() + cooldown_seconds
             lib_logger.warning(
-                f"Cooldown applied for key ...{key[-6:]} with model {model}: {cooldown_seconds}s. "
+                f"Cooldown applied for key {format_credential_for_display(key)} with model {model}: {cooldown_seconds}s. "
                 f"Error type: {classified_error.error_type}"
             )
 
@@ -762,5 +763,5 @@ class UsageManager:
         if long_term_lockout_models >= 3:
             key_data["key_cooldown_until"] = now + 300  # 5-minute key lockout
             lib_logger.error(
-                f"Key ...{key[-6:]} has {long_term_lockout_models} models in long-term lockout. Applying 5-minute key-level lockout."
+                f"Key {format_credential_for_display(key)} has {long_term_lockout_models} models in long-term lockout. Applying 5-minute key-level lockout."
             )
