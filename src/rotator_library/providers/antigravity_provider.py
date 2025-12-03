@@ -2111,14 +2111,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         3. Makes API call with fallback logic
         4. Transforms response to OpenAI format
         """
-        return await self._execute_acompletion(client, **kwargs)
-
-    async def _execute_acompletion(
-        self,
-        client: httpx.AsyncClient,
-        **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
-        """Internal execution method for completions."""
         # Extract parameters
         model = self._strip_provider_prefix(kwargs.get("model", "gemini-2.5-pro"))
         messages = kwargs.get("messages", [])
