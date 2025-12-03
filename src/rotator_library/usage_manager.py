@@ -678,12 +678,24 @@ class UsageManager:
             cooldown_seconds = None
 
             if classified_error.error_type == "rate_limit":
-                # Rate limit errors: use retry_after if available, otherwise default to 60s
-                cooldown_seconds = classified_error.retry_after or 60
-                lib_logger.info(
-                    f"Rate limit error on key ...{key[-6:]} for model {model}. "
-                    f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
-                )
+                # Rate limit errors: Check for original_retry_delay (from Antigravity fail-fast)
+                # This ensures the key gets the FULL cooldown even though retry_after=0 for rotation
+                original_delay = getattr(classified_error.original_exception, 'original_retry_delay', None)
+                
+                if original_delay:
+                    # Use the original delay from Antigravity for key-level cooldown
+                    cooldown_seconds = original_delay
+                    lib_logger.info(
+                        f"Rate limit error on key ...{key[-6:]} for model {model}. "
+                        f"Using original retryDelay for key cooldown: {cooldown_seconds}s"
+                    )
+                else:
+                    # Standard retry_after or increased default for fail-fast strategy
+                    cooldown_seconds = classified_error.retry_after or 300
+                    lib_logger.info(
+                        f"Rate limit error on key ...{key[-6:]} for model {model}. "
+                        f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
+                    )
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
                 key_data["key_cooldown_until"] = time.time() + 300

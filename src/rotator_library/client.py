@@ -53,7 +53,7 @@ class RotatingClient:
         self,
         api_keys: Optional[Dict[str, List[str]]] = None,
         oauth_credentials: Optional[Dict[str, List[str]]] = None,
-        max_retries: int = 2,
+        max_retries: int = 3,
         usage_file_path: str = "key_usage.json",
         configure_logging: bool = True,
         global_timeout: int = 30,
@@ -823,12 +823,12 @@ class RotatingClient:
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
         ):
             if len(tried_creds) > 0 and last_exception:
-                # Exponential backoff for rotation to prevent retry storms
+                # Fail-fast strategy: minimal delay between key rotations
                 retry_count = len(tried_creds)
-                base_delay = 1.0
+                base_delay = 0.0  # Immediate rotation for fail-fast
                 max_delay = 15.0  # Cap at 15 seconds
 
-                # Check for Rate Limit (429) to apply steeper backoff
+                # Check for Rate Limit (429) - fail fast with zero delay
                 is_rate_limit = False
                 if isinstance(last_exception, litellm.RateLimitError):
                     is_rate_limit = True
@@ -842,7 +842,7 @@ class RotatingClient:
                     is_rate_limit = True
 
                 if is_rate_limit:
-                    base_delay = 2.0
+                    base_delay = 0.0  # Fail fast on rate limits - rotate immediately
 
                 delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
                 # Add slight jitter to prevent thundering herd
@@ -1063,12 +1063,14 @@ class RotatingClient:
                             )
 
                             if classified_error.status_code == 429:
+                                # Apply cooldown to provider, but this doesn't block the CURRENT rotation
+                                # The cooldown applies to FUTURE requests, allowing immediate key rotation
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
                                 lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown."
+                                    f"Rate limit detected for {provider}. Applied {cooldown_duration}s cooldown for future requests. Current request continues rotation immediately."
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1152,12 +1154,14 @@ class RotatingClient:
                                 f"Key ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key."
                             )
                             if classified_error.status_code == 429:
+                                # Apply cooldown to provider, but this doesn't block the CURRENT rotation
+                                # The cooldown applies to FUTURE requests, allowing immediate key rotation
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
                                 lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown."
+                                    f"Rate limit detected for {provider}. Applied {cooldown_duration}s cooldown for future requests. Current request continues rotation immediately."
                                 )
 
                             if classified_error.error_type in [
@@ -1303,12 +1307,12 @@ class RotatingClient:
                 and time.time() < deadline
             ):
                 if len(tried_creds) > 0 and last_exception:
-                    # Exponential backoff for rotation to prevent retry storms
+                    # Fail-fast strategy: minimal delay between key rotations
                     retry_count = len(tried_creds)
-                    base_delay = 1.0
+                    base_delay = 0.0  # Immediate rotation for fail-fast
                     max_delay = 15.0  # Cap at 15 seconds
-
-                    # Check for Rate Limit (429) to apply steeper backoff
+    
+                    # Check for Rate Limit (429) - fail fast with zero delay
                     is_rate_limit = False
                     if isinstance(last_exception, litellm.RateLimitError):
                         is_rate_limit = True
@@ -1320,10 +1324,10 @@ class RotatingClient:
                         and last_exception.response.status_code == 429
                     ):
                         is_rate_limit = True
-
+    
                     if is_rate_limit:
-                        base_delay = 2.0
-
+                        base_delay = 0.0  # Fail fast on rate limits - rotate immediately
+    
                     delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
                     # Add slight jitter to prevent thundering herd
                     delay += random.uniform(0, 0.5)
@@ -1787,6 +1791,8 @@ class RotatingClient:
                                     classified_error.error_type == "rate_limit"
                                     and classified_error.status_code == 429
                                 ):
+                                    # Apply cooldown to provider, but this doesn't block the CURRENT rotation
+                                    # The cooldown applies to FUTURE requests, allowing immediate key rotation
                                     cooldown_duration = (
                                         classified_error.retry_after or 60
                                     )
@@ -1794,7 +1800,7 @@ class RotatingClient:
                                         provider, cooldown_duration
                                     )
                                     lib_logger.warning(
-                                        f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown."
+                                        f"Rate limit detected for {provider}. Applied {cooldown_duration}s cooldown for future requests. Current request continues rotation immediately."
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -1868,12 +1874,14 @@ class RotatingClient:
                             )
 
                             if classified_error.status_code == 429:
+                                # Apply cooldown to provider, but this doesn't block the CURRENT rotation
+                                # The cooldown applies to FUTURE requests, allowing immediate key rotation
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
                                 lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown."
+                                    f"Rate limit detected for {provider}. Applied {cooldown_duration}s cooldown for future requests. Current request continues rotation immediately."
                                 )
 
                             if classified_error.error_type in [

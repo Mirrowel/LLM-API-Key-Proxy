@@ -2345,13 +2345,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     lib_logger.warning(
                         f"Antigravity error {e.response.status_code} with retryDelay={retry_delay}s"
                     )
-                    # Create a new RateLimitError with the parsed delay
+                    # Create a new RateLimitError
                     rate_limit_error = litellm.RateLimitError(
                         message=f"Rate limit error: {str(e)}",
                         response=e.response
                     )
-                    # Attach retry_after for classify_error to extract
-                    rate_limit_error.retry_after = int(retry_delay)
+                    
+                    # FAIL-FAST STRATEGY: Set retry_after to 0 for immediate rotation
+                    # The full retry_delay is stored in a custom attribute for usage_manager
+                    # to apply as key-level cooldown, but we don't want the main client
+                    # to sleep on provider-level cooldown during the current rotation
+                    rate_limit_error.retry_after = 0  # Immediate rotation
+                    rate_limit_error.original_retry_delay = int(retry_delay)  # Store for key cooldown
+                    
+                    lib_logger.info(
+                        f"Fail-fast: Setting retry_after=0 for immediate rotation. "
+                        f"Original retryDelay={retry_delay}s stored for key cooldown."
+                    )
                     raise rate_limit_error from e
                 
                 # Re-raise original error if no retry delay or not a rate limit
