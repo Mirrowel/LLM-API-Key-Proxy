@@ -1307,16 +1307,38 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 new_contents.append(content)
         
         # Handle remaining groups (shouldn't happen in well-formed conversations)
+        # Attempt recovery by matching orphans to unsatisfied calls
         for group in pending_groups:
             group_ids = group["ids"]
-            available_ids = [gid for gid in group_ids if gid in collected_responses]
-            if available_ids:
-                group_responses = [collected_responses.pop(gid) for gid in available_ids]
+            group_responses = []
+            
+            for expected_id in group_ids:
+                if expected_id in collected_responses:
+                    group_responses.append(collected_responses.pop(expected_id))
+                elif collected_responses:
+                    # Recovery: Match with an orphan response
+                    # This handles cases where client/proxy mutates IDs (e.g. toolu_ -> call_)
+                    # Get the first available orphan ID to maintain order
+                    orphan_id = next(iter(collected_responses))
+                    orphan_resp = collected_responses.pop(orphan_id)
+                    
+                    # Fix the ID in the response to match the call
+                    orphan_resp["functionResponse"]["id"] = expected_id
+                    
+                    lib_logger.warning(
+                        f"[Grouping] Auto-repaired ID mismatch: mapped response '{orphan_id}' "
+                        f"to call '{expected_id}'"
+                    )
+                    group_responses.append(orphan_resp)
+            
+            if group_responses:
                 new_contents.append({"parts": group_responses, "role": "user"})
-                lib_logger.warning(
-                    f"[Grouping] Partial group satisfaction: expected {len(group_ids)}, "
-                    f"got {len(available_ids)} responses"
-                )
+                
+                if len(group_responses) != len(group_ids):
+                    lib_logger.warning(
+                        f"[Grouping] Partial group satisfaction after repair: "
+                        f"expected {len(group_ids)}, got {len(group_responses)} responses"
+                    )
         
         # Warn about unmatched responses
         if collected_responses:
@@ -2305,6 +2327,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             internal_model = self._alias_to_internal(model)
             
             system_instruction, contents = self._transform_messages(messages, internal_model)
+            contents = self._fix_tool_response_grouping(contents)
             
             gemini_payload = {"contents": contents}
             if system_instruction:
