@@ -1,3 +1,17 @@
+# src/rotator_library/providers/antigravity_provider_v2.py
+"""
+Antigravity Provider - Refactored Implementation
+A clean, well-structured provider for Google's Antigravity API, supporting:
+- Gemini 2.5 (Pro/Flash) with thinkingBudget
+- Gemini 3 (Pro/Image) with thinkingLevel
+- Claude (Sonnet 4.5) via Antigravity proxy
+Key Features:
+- Unified streaming/non-streaming handling
+- Server-side thought signature caching
+- Automatic base URL fallback
+- Gemini 3 tool hallucination prevention
+"""
+
 from __future__ import annotations
 
 import asyncio
