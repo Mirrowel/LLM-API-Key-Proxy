@@ -448,6 +448,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()
+        self.project_id_cache: Dict[str, str] = {}  # Cache project ID per credential path
         
         # Base URL management
         self._base_url_index = 0
@@ -587,6 +588,90 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         return "thinking_" + "_".join(key_parts) if key_parts else None
     
+    # =========================================================================
+    # PROJECT ID DISCOVERY
+    # =========================================================================
+    
+    async def _discover_project_id(self, credential_path: str, litellm_params: Dict[str, Any]) -> str:
+        """
+        Discovers the Google Cloud Project ID for Antigravity API.
+        
+        Priority: cache → env vars → persisted file → API discovery → GCP listing
+        """
+        # Check cache
+        if credential_path in self.project_id_cache:
+            return self.project_id_cache[credential_path]
+        
+        # Check env vars
+        configured_project_id = (
+            litellm_params.get("project_id") or 
+            os.getenv("ANTIGRAVITY_PROJECT_ID") or 
+            os.getenv("GOOGLE_CLOUD_PROJECT")
+        )
+        if configured_project_id:
+            self.project_id_cache[credential_path] = configured_project_id
+            return configured_project_id
+        
+        # Try persisted file
+        try:
+            with open(credential_path, 'r') as f:
+                creds = json.load(f)
+            persisted = creds.get("_proxy_metadata", {}).get("project_id")
+            if persisted:
+                self.project_id_cache[credential_path] = persisted
+                return persisted
+        except:
+            pass
+        
+        # API discovery
+        access_token = await self.get_valid_token(credential_path)
+        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                    headers=headers,
+                    json={"cloudaicompanionProject": None, "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}},
+                    timeout=20
+                )
+                response.raise_for_status()
+                server_project = response.json().get('cloudaicompanionProject')
+                if server_project:
+                    self.project_id_cache[credential_path] = server_project
+                    await self._persist_project_id(credential_path, server_project)
+                    return server_project
+            except:
+                pass
+        
+        # GCP listing fallback
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers, timeout=20)
+                response.raise_for_status()
+                active_projects = [p for p in response.json().get('projects', []) if p.get('lifecycleState') == 'ACTIVE']
+                if active_projects:
+                    project_id = active_projects[0]['projectId']
+                    self.project_id_cache[credential_path] = project_id
+                    await self._persist_project_id(credential_path, project_id)
+                    return project_id
+        except:
+            pass
+        
+        raise ValueError("Could not discover Google Cloud project ID for Antigravity. Set ANTIGRAVITY_PROJECT_ID or GOOGLE_CLOUD_PROJECT environment variable.")
+    
+    async def _persist_project_id(self, credential_path: str, project_id: str):
+        """Persist project ID to credential file."""
+        try:
+            with open(credential_path, 'r') as f:
+                creds = json.load(f)
+            if "_proxy_metadata" not in creds:
+                creds["_proxy_metadata"] = {}
+            creds["_proxy_metadata"]["project_id"] = project_id
+            await self._save_credentials(credential_path, creds)
+        except:
+            pass
+
     # =========================================================================
     # THINKING MODE SANITIZATION
     # =========================================================================
@@ -1588,6 +1673,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self,
         gemini_payload: Dict[str, Any],
         model: str,
+        project_id: str,
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None
@@ -1620,7 +1706,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Wrap in Antigravity envelope
         antigravity_payload = {
-            "project": _generate_project_id(),
+            "project": project_id,  # Will be passed as parameter
             "userAgent": "antigravity",
             "requestId": _generate_request_id(),
             "model": internal_model,
@@ -2158,8 +2244,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     self._claude_description_prompt
                 )
         
-        # Transform to Antigravity format
-        payload = self._transform_to_antigravity_format(gemini_payload, model, max_tokens, reasoning_effort, tool_choice)
+        # Discover real project ID
+        litellm_params = kwargs.get("litellm_params", {}) or {}
+        project_id = await self._discover_project_id(credential_path, litellm_params)
+
+        # Transform to Antigravity format with real project ID
+        payload = self._transform_to_antigravity_format(gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice)
         file_logger.log_request(payload)
         
         # Make API call
