@@ -37,6 +37,18 @@ def _ensure_providers_loaded():
     return _provider_factory, _provider_plugins
 
 
+def clear_screen():
+    """
+    Cross-platform terminal clear that works robustly on both 
+    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    
+    Uses native OS commands instead of ANSI escape sequences:
+    - Windows (conhost & Windows Terminal): cls
+    - Unix-like systems (Linux, Mac): clear
+    """
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
 def _get_credential_number_from_filename(filename: str) -> int:
     """
     Extract credential number from filename like 'provider_oauth_1.json' -> 1
@@ -127,6 +139,9 @@ async def setup_api_key():
     """
     console.print(Panel("[bold cyan]API Key Setup[/bold cyan]", expand=False))
 
+    # Debug toggle: Set to True to see env var names next to each provider
+    SHOW_ENV_VAR_NAMES = True
+
     # Verified list of LiteLLM providers with their friendly names and API key variables
     LITELLM_PROVIDERS = {
         "OpenAI": "OPENAI_API_KEY", "Anthropic": "ANTHROPIC_API_KEY",
@@ -162,26 +177,59 @@ async def setup_api_key():
         "Nscale": "NSCALE_API_KEY", "Recraft": "RECRAFT_API_KEY",
         "v0": "V0_API_KEY", "Vercel": "VERCEL_AI_GATEWAY_API_KEY",
         "Topaz": "TOPAZ_API_KEY", "ElevenLabs": "ELEVENLABS_API_KEY",
-        "Deepgram": "DEEPGRAM_API_KEY", "Custom API": "CUSTOM_API_KEY",
+        "Deepgram": "DEEPGRAM_API_KEY",
         "GitHub Models": "GITHUB_TOKEN", "GitHub Copilot": "GITHUB_COPILOT_API_KEY",
     }
 
     # Discover custom providers and add them to the list
-    # Note: gemini_cli is OAuth-only, but qwen_code and iflow support both OAuth and API keys
+    # Note: gemini_cli and antigravity are OAuth-only
+    # qwen_code API key support is a fallback
+    # iflow API key support is a feature
     _, PROVIDER_PLUGINS = _ensure_providers_loaded()
-    oauth_only_providers = {'gemini_cli', 'antigravity'}
-    discovered_providers = {
-        p.replace('_', ' ').title(): p.upper() + "_API_KEY"
-        for p in PROVIDER_PLUGINS.keys()
-        if p not in oauth_only_providers and p.replace('_', ' ').title() not in LITELLM_PROVIDERS
+    
+    # Build a set of environment variables already in LITELLM_PROVIDERS
+    # to avoid duplicates based on the actual API key names
+    litellm_env_vars = set(LITELLM_PROVIDERS.values())
+    
+    # Providers to exclude from API key list
+    exclude_providers = {
+        'gemini_cli',  # OAuth-only
+        'antigravity',  # OAuth-only  
+        'qwen_code',  # API key is fallback, OAuth is primary - don't advertise
+        'openai_compatible',  # Base class, not a real provider
     }
     
+    discovered_providers = {}
+    for provider_key in PROVIDER_PLUGINS.keys():
+        if provider_key in exclude_providers:
+            continue
+        
+        # Create environment variable name
+        env_var = provider_key.upper() + "_API_KEY"
+        
+        # Check if this env var already exists in LITELLM_PROVIDERS
+        # This catches duplicates like GEMINI_API_KEY, MISTRAL_API_KEY, etc.
+        if env_var in litellm_env_vars:
+            # Already in LITELLM_PROVIDERS with better name, skip this one
+            continue
+        
+        # Create display name for this custom provider
+        display_name = provider_key.replace('_', ' ').title()
+        discovered_providers[display_name] = env_var
+    
+    # LITELLM_PROVIDERS takes precedence (comes first in merge)
     combined_providers = {**LITELLM_PROVIDERS, **discovered_providers}
     provider_display_list = sorted(combined_providers.keys())
 
     provider_text = Text()
     for i, provider_name in enumerate(provider_display_list):
-        provider_text.append(f"  {i + 1}. {provider_name}\n")
+        if SHOW_ENV_VAR_NAMES:
+            # Extract env var prefix (before _API_KEY)
+            env_var = combined_providers[provider_name]
+            prefix = env_var.replace("_API_KEY", "").replace("_", " ")
+            provider_text.append(f"  {i + 1}. {provider_name} ({prefix})\n")
+        else:
+            provider_text.append(f"  {i + 1}. {provider_name}\n")
 
     console.print(Panel(provider_text, title="Available Providers for API Key", style="bold blue"))
 
@@ -1000,7 +1048,7 @@ async def export_credentials_submenu():
     Submenu for credential export options.
     """
     while True:
-        console.clear()
+        clear_screen()
         console.print(Panel("[bold cyan]Export Credentials to .env[/bold cyan]", title="--- API Key Proxy ---", expand=False))
         
         console.print(Panel(
@@ -1111,7 +1159,7 @@ async def main(clear_on_start=True):
     
     while True:
         # Clear screen between menu selections for cleaner UX
-        console.clear()
+        clear_screen()
         console.print(Panel("[bold cyan]Interactive Credential Setup[/bold cyan]", title="--- API Key Proxy ---", expand=False))
         
         console.print(Panel(
@@ -1179,7 +1227,7 @@ async def main(clear_on_start=True):
         elif setup_type == "2":
             await setup_api_key()
             #console.print("\n[dim]Press Enter to return to main menu...[/dim]")
-            input()
+            #input()
 
         elif setup_type == "3":
             await export_credentials_submenu()
@@ -1225,7 +1273,7 @@ def run_credential_tool(from_launcher=False):
     # If from launcher, don't clear screen at start to preserve loading messages
     try:
         asyncio.run(main(clear_on_start=not from_launcher))
-        console.clear()  # Clear terminal when credential tool exits
+        clear_screen()  # Clear terminal when credential tool exits
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Exiting setup.[/bold yellow]")
-        console.clear()  # Clear terminal on keyboard interrupt too
+        clear_screen()  # Clear terminal on keyboard interrupt too
