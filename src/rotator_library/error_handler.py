@@ -112,7 +112,7 @@ def mask_credential(credential: str) -> str:
     - For API keys: shows last 6 characters (e.g., "...xyz123")
     - For OAuth file paths: shows just the filename (e.g., "antigravity_oauth_1.json")
     """
-    if os.path.isfile(credential):
+    if os.path.isfile(credential) or credential.endswith(".json"):
         return os.path.basename(credential)
     elif len(credential) > 6:
         return f"...{credential[-6:]}"
