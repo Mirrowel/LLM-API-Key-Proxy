@@ -391,7 +391,7 @@ A modular, shared caching system for providers to persist conversation state acr
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
-The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini and Claude models.
+The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
 
 #### Architecture
 
@@ -417,6 +417,13 @@ The most sophisticated provider implementation, supporting Google's internal Ant
   - Caching signatures from responses for reuse in follow-up messages
   - Automatic injection into functionCalls for multi-turn conversations
   - Fallback to bypass value if signature unavailable
+
+**Claude Opus 4.5 (NEW!):**
+- Anthropic's most powerful model, now available via Antigravity proxy
+- Uses internal model name `claude-opus-4-5-thinking` when reasoning is enabled
+- Uses `thinkingBudget` parameter for extended thinking control
+- Full support for tool use with schema cleaning
+- Same thinking preservation and sanitization features as Sonnet
 
 **Claude Sonnet 4.5:**
 - Proxied through Antigravity API (uses internal model name `claude-sonnet-4-5-thinking`)

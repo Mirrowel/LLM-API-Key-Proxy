@@ -28,11 +28,13 @@ This project provides a powerful solution for developers building complex applic
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 -   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
 
--   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 2.5, Gemini 3, and Claude Sonnet 4.5 models with advanced features:
+-   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 2.5, Gemini 3, and Claude models with advanced features:
+    - **🚀 NEW: Claude Opus 4.5** - Anthropic's most powerful model, now available via Antigravity!
+    - Claude Sonnet 4.5 with extended thinking support
     - Thought signature caching for multi-turn conversations
     - Tool hallucination prevention via parameter signature injection
     - Automatic thinking block sanitization for Claude models
-    - Note: Claude Sonnet 4.5 thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
+    - Note: Claude thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
 -   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
 -   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.
 -   **🆕 Enhanced Gemini CLI**: Improved project discovery, paid vs free tier detection, and Gemini 3 support with thoughtSignature caching.
@@ -504,12 +506,13 @@ The following advanced settings can be added to your `.env` file (or configured 
     SKIP_OAUTH_INIT_CHECK=true
 
 
-#### **Antigravity (Advanced - Gemini 3 \Claude 4.5 Access)**
+#### **Antigravity (Advanced - Gemini 3 \ Claude Opus 4.5 / Sonnet 4.5 Access)**
 The newest and most sophisticated provider, offering access to cutting-edge models via Google's internal Antigravity API.
 
 **Supported Models:**
 -   Gemini 2.5 (Pro/Flash) with `thinkingBudget` parameter
 -   **Gemini 3 Pro (High/Low)** - Latest preview models
+-   **🆕 Claude Opus 4.5 + Thinking** - Anthropic's most powerful model via Antigravity proxy
 -   **Claude Sonnet 4.5 + Thinking** via Antigravity proxy
 
 **Advanced Features:**

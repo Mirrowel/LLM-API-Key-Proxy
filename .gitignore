@@ -129,4 +129,4 @@ logs/
 cache/
 *.env
 
-oauth_creds
+oauth_creds/
