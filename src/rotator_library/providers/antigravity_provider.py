@@ -6,6 +6,7 @@ A clean, well-structured provider for Google's Antigravity API, supporting:
 - Gemini 2.5 (Pro/Flash) with thinkingBudget
 - Gemini 3 (Pro/Image) with thinkingLevel
 - Claude (Sonnet 4.5) via Antigravity proxy
+- Claude (Opus 4.5) via Antigravity proxy
 
 Key Features:
 - Unified streaming/non-streaming handling
@@ -62,6 +63,7 @@ AVAILABLE_MODELS = [
     #"gemini-3-pro-image-preview",
     #"gemini-2.5-computer-use-preview-10-2025",
     "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
+    "claude-opus-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
@@ -436,6 +438,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     - Gemini 2.5 (Pro/Flash) with thinkingBudget
     - Gemini 3 (Pro/Image) with thinkingLevel  
     - Claude Sonnet 4.5 via Antigravity proxy
+    - Claude Opus 4.5 via Antigravity proxy
     
     Features:
     - Unified streaming/non-streaming handling
@@ -1993,8 +1996,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Map base Claude model to -thinking variant when reasoning_effort is provided
         if self._is_claude(internal_model) and reasoning_effort:
-            if internal_model == "claude-sonnet-4-5" and not internal_model.endswith("-thinking"):
-                internal_model = "claude-sonnet-4-5-thinking"
+            if internal_model in ["claude-sonnet-4-5", "claude-opus-4-5"] and not internal_model.endswith("-thinking"):
+                internal_model = f"{internal_model}-thinking"
         
         # Map gemini-3-pro-preview to -low/-high variant based on thinking config
         if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-preview":
@@ -2070,7 +2073,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             # Subsequent parallel calls: leave as-is (no signature)
         
         # Claude-specific tool schema transformation
-        if internal_model.startswith("claude-sonnet-"):
+        if internal_model.startswith("claude-sonnet-") or internal_model.startswith("claude-opus-"):
             self._apply_claude_tool_transform(antigravity_payload)
         
         return antigravity_payload
