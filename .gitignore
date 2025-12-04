@@ -128,3 +128,5 @@ cache/antigravity/thought_signatures.json
 logs/
 cache/
 *.env
+
+oauth_creds
