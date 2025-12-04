@@ -3,6 +3,7 @@ import json
 from logging.handlers import RotatingFileHandler
 import os
 from datetime import datetime
+from .error_handler import mask_credential
 
 
 def setup_failure_logger():
@@ -133,7 +134,7 @@ def log_failure(
 
     detailed_log_data = {
         "timestamp": datetime.utcnow().isoformat(),
-        "api_key_ending": api_key[-4:] if len(api_key) >= 4 else "****",
+        "api_key_ending": mask_credential(api_key),
         "model": model,
         "attempt_number": attempt,
         "error_type": type(error).__name__,
@@ -148,7 +149,7 @@ def log_failure(
 
     # 2. Log a concise summary to the main library logger, which will propagate
     summary_message = (
-        f"API call failed for model {model} with key ...{api_key[-4:] if len(api_key) >= 4 else '****'}. "
+        f"API call failed for model {model} with key {mask_credential(api_key)}. "
         f"Error: {type(error).__name__}. See failures.log for details."
     )
     main_lib_logger.error(summary_message)
