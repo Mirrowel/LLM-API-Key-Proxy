@@ -33,7 +33,7 @@ COPY src/ ./src/
 
 # Create directories for logs and oauth credentials
 RUN mkdir -p logs oauth_creds
-
+EXPOSE 8000
 # Expose the default port
 EXPOSE 8000
 
