@@ -35,7 +35,7 @@ COPY src/ ./src/
 RUN mkdir -p logs oauth_creds
 
 # Expose the default port
-EXPOSE 8317
+EXPOSE 8000
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
