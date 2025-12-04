@@ -1996,8 +1996,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         
         # Map base Claude model to -thinking variant when reasoning_effort is provided
         if self._is_claude(internal_model) and reasoning_effort:
-            if internal_model == "claude-sonnet-4-5" and not internal_model.endswith("-thinking"):
-            elif internal_model in ["claude-sonnet-4-5", "claude-opus-4-5"] and not internal_model.endswith("-thinking"):
+            if internal_model in ["claude-sonnet-4-5", "claude-opus-4-5"] and not internal_model.endswith("-thinking"):
                 internal_model = f"{internal_model}-thinking"
         
         # Map gemini-3-pro-preview to -low/-high variant based on thinking config
