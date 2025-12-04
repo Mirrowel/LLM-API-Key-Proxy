@@ -6,7 +6,7 @@ services:
     container_name: llm-api-proxy
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8317:8317"
     volumes:
       # Mount .env files for configuration
       - ./.env:/app/.env:ro
@@ -22,7 +22,7 @@ services:
       # Ensure Python output is not buffered
       - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8317/')"]
       interval: 30s
       timeout: 10s
       retries: 3
