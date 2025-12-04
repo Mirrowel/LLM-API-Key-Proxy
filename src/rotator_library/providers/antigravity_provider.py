@@ -2620,7 +2620,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None
     ) -> litellm.ModelResponse:
         """Handle non-streaming completion."""
-        response = await client.post(url, headers=headers, json=payload, timeout=120.0)
+        response = await client.post(url, headers=headers, json=payload, timeout=600.0)
         response.raise_for_status()
         
         data = response.json()
@@ -2652,7 +2652,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "is_complete": False  # Track if we received usageMetadata
         }
         
-        async with client.stream("POST", url, headers=headers, json=payload, timeout=120.0) as response:
+        async with client.stream("POST", url, headers=headers, json=payload, timeout=600.0) as response:
             if response.status_code >= 400:
                 try:
                     error_body = await response.aread()
