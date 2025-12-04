@@ -18,6 +18,6 @@ jobs:
             "/repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
             -f state='pending' \
             -f context='compliance-check' \
-            -f description='Awaiting compliance verification - run /mirrobot-check when ready to merge'
+            -f description='run /mirrobot-check when ready to merge'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

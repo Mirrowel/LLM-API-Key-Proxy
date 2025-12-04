@@ -147,11 +147,7 @@ jobs:
               -f query="$GRAPHQL_QUERY")
 
             echo "$discussion_data" > discussion_data.txt
-
-            # For checkout step
-            echo "repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')" >> $GITHUB_OUTPUT
-            echo "ref_name=$(echo "$pr_json" | jq -r .headRefName)" >> $GITHUB_OUTPUT
-           
+            
             # For prompt context
             echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
             echo "THREAD_AUTHOR=$(echo "$pr_json" | jq -r .author.login)" >> $GITHUB_ENV
@@ -478,15 +474,13 @@ jobs:
           fi
 
       - name: Save secure prompt from base branch
-        if: steps.context.outputs.IS_PR == 'true'
         run: cp .github/prompts/bot-reply.md /tmp/bot-reply.md
 
       - name: Checkout PR head
         if: steps.context.outputs.IS_PR == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.context.outputs.repo_full_name }}
-          ref: ${{ steps.context.outputs.ref_name }}
+          ref: ${{ env.PR_HEAD_SHA }}
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0  # Full history needed for git operations and code analysis
 
