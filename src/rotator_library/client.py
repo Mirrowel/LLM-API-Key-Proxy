@@ -25,6 +25,10 @@ from .error_handler import (
     classify_error,
     AllProviders,
     NoAvailableKeysError,
+    should_rotate_on_error,
+    should_retry_same_key,
+    RequestErrorAccumulator,
+    mask_credential,
 )
 from .providers import PROVIDER_PLUGINS
 from .providers.openai_compatible_provider import OpenAICompatibleProvider
@@ -67,7 +71,7 @@ class RotatingClient:
     ):
         """
         Initialize the RotatingClient with intelligent credential rotation.
-        
+
         Args:
             api_keys: Dictionary mapping provider names to lists of API keys
             oauth_credentials: Dictionary mapping provider names to OAuth credential paths
@@ -136,8 +140,7 @@ class RotatingClient:
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
         self.usage_manager = UsageManager(
-            file_path=usage_file_path,
-            rotation_tolerance=rotation_tolerance
+            file_path=usage_file_path, rotation_tolerance=rotation_tolerance
         )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
@@ -156,7 +159,9 @@ class RotatingClient:
         # Validate all values are >= 1
         for provider, max_val in self.max_concurrent_requests_per_key.items():
             if max_val < 1:
-                lib_logger.warning(f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1.")
+                lib_logger.warning(
+                    f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
+                )
                 self.max_concurrent_requests_per_key[provider] = 1
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
@@ -364,7 +369,9 @@ class RotatingClient:
 
         return kwargs
 
-    def _apply_default_safety_settings(self, litellm_kwargs: Dict[str, Any], provider: str):
+    def _apply_default_safety_settings(
+        self, litellm_kwargs: Dict[str, Any], provider: str
+    ):
         """
         Ensure default Gemini safety settings are present when calling the Gemini provider.
         This will not override any explicit settings provided by the request. It accepts
@@ -393,22 +400,33 @@ class RotatingClient:
         ]
 
         # If generic form is present, ensure missing generic keys are filled in
-        if "safety_settings" in litellm_kwargs and isinstance(litellm_kwargs["safety_settings"], dict):
+        if "safety_settings" in litellm_kwargs and isinstance(
+            litellm_kwargs["safety_settings"], dict
+        ):
             for k, v in default_generic.items():
                 if k not in litellm_kwargs["safety_settings"]:
                     litellm_kwargs["safety_settings"][k] = v
             return
 
         # If Gemini form is present, ensure missing gemini categories are appended
-        if "safetySettings" in litellm_kwargs and isinstance(litellm_kwargs["safetySettings"], list):
-            present = {item.get("category") for item in litellm_kwargs["safetySettings"] if isinstance(item, dict)}
+        if "safetySettings" in litellm_kwargs and isinstance(
+            litellm_kwargs["safetySettings"], list
+        ):
+            present = {
+                item.get("category")
+                for item in litellm_kwargs["safetySettings"]
+                if isinstance(item, dict)
+            }
             for d in default_gemini:
                 if d["category"] not in present:
                     litellm_kwargs["safetySettings"].append(d)
             return
 
         # Neither present: set generic defaults so provider conversion will translate them
-        if "safety_settings" not in litellm_kwargs and "safetySettings" not in litellm_kwargs:
+        if (
+            "safety_settings" not in litellm_kwargs
+            and "safetySettings" not in litellm_kwargs
+        ):
             litellm_kwargs["safety_settings"] = default_generic.copy()
 
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
@@ -426,10 +444,10 @@ class RotatingClient:
         """
         Lazily initializes and returns a provider instance.
         Only initializes providers that have configured credentials.
-        
+
         Args:
             provider_name: The name of the provider to get an instance for.
-        
+
         Returns:
             Provider instance if credentials exist, None otherwise.
         """
@@ -439,7 +457,7 @@ class RotatingClient:
                 f"Skipping provider '{provider_name}' initialization: no credentials configured"
             )
             return None
-        
+
         if provider_name not in self._provider_instances:
             if provider_name in self._provider_plugins:
                 self._provider_instances[provider_name] = self._provider_plugins[
@@ -461,38 +479,39 @@ class RotatingClient:
     def _resolve_model_id(self, model: str, provider: str) -> str:
         """
         Resolves the actual model ID to send to the provider.
-        
+
         For custom models with name/ID mappings, returns the ID.
         Otherwise, returns the model name unchanged.
-        
+
         Args:
             model: Full model string with provider (e.g., "iflow/DS-v3.2")
             provider: Provider name (e.g., "iflow")
-        
+
         Returns:
             Full model string with ID (e.g., "iflow/deepseek-v3.2")
         """
         # Extract model name from "provider/model_name" format
-        model_name = model.split('/')[-1] if '/' in model else model
-        
+        model_name = model.split("/")[-1] if "/" in model else model
+
         # Try to get provider instance to check for model definitions
         provider_plugin = self._get_provider_instance(provider)
-        
+
         # Check if provider has model definitions
-        if provider_plugin and hasattr(provider_plugin, 'model_definitions'):
-            model_id = provider_plugin.model_definitions.get_model_id(provider, model_name)
+        if provider_plugin and hasattr(provider_plugin, "model_definitions"):
+            model_id = provider_plugin.model_definitions.get_model_id(
+                provider, model_name
+            )
             if model_id and model_id != model_name:
                 # Return with provider prefix
                 return f"{provider}/{model_id}"
-        
+
         # Fallback: use client's own model definitions
         model_id = self.model_definitions.get_model_id(provider, model_name)
         if model_id and model_id != model_name:
             return f"{provider}/{model_id}"
-        
+
         # No conversion needed, return original
         return model
-
 
     async def _safe_streaming_wrapper(
         self, stream: Any, key: str, model: str, request: Optional[Any] = None
@@ -500,7 +519,7 @@ class RotatingClient:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
         and distinguishes between content and streamed errors.
-        
+
         FINISH_REASON HANDLING:
         Providers just translate chunks - this wrapper handles ALL finish_reason logic:
         1. Strip finish_reason from intermediate chunks (litellm defaults to "stop")
@@ -537,7 +556,7 @@ class RotatingClient:
                         chunk_dict = chunk.model_dump()
                     else:
                         chunk_dict = chunk
-                    
+
                     # === FINISH_REASON LOGIC ===
                     # Providers send raw chunks without finish_reason logic.
                     # This wrapper determines finish_reason based on accumulated state.
@@ -545,19 +564,19 @@ class RotatingClient:
                         choice = chunk_dict["choices"][0]
                         delta = choice.get("delta", {})
                         usage = chunk_dict.get("usage", {})
-                        
+
                         # Track tool_calls across ALL chunks - if we ever see one, finish_reason must be tool_calls
                         if delta.get("tool_calls"):
                             has_tool_calls = True
                             accumulated_finish_reason = "tool_calls"
-                        
+
                         # Detect final chunk: has usage with completion_tokens > 0
                         has_completion_tokens = (
-                            usage and 
-                            isinstance(usage, dict) and 
-                            usage.get("completion_tokens", 0) > 0
+                            usage
+                            and isinstance(usage, dict)
+                            and usage.get("completion_tokens", 0) > 0
                         )
-                        
+
                         if has_completion_tokens:
                             # FINAL CHUNK: Determine correct finish_reason
                             if has_tool_calls:
@@ -573,7 +592,7 @@ class RotatingClient:
                             # INTERMEDIATE CHUNK: Never emit finish_reason
                             # (litellm.ModelResponse defaults to "stop" which is wrong)
                             choice["finish_reason"] = None
-                    
+
                     yield f"data: {json.dumps(chunk_dict)}\n\n"
 
                     if hasattr(chunk, "usage") and chunk.usage:
@@ -722,12 +741,13 @@ class RotatingClient:
         # multiple keys have the same usage stats.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
-        
+
         # Filter out credentials that are unavailable (queued for re-auth)
         provider_plugin = self._get_provider_instance(provider)
-        if provider_plugin and hasattr(provider_plugin, 'is_credential_available'):
+        if provider_plugin and hasattr(provider_plugin, "is_credential_available"):
             available_creds = [
-                cred for cred in credentials_for_provider
+                cred
+                for cred in credentials_for_provider
                 if provider_plugin.is_credential_available(cred)
             ]
             if available_creds:
@@ -740,7 +760,7 @@ class RotatingClient:
         kwargs = self._convert_model_params(**kwargs)
 
         # The main rotation loop. It continues as long as there are untried credentials and the global deadline has not been exceeded.
-        
+
         # Resolve model ID early, before any credential operations
         # This ensures consistent model ID usage for acquisition, release, and tracking
         resolved_model = self._resolve_model_id(model, provider)
@@ -748,10 +768,10 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
-        
+
         # [NEW] Filter by model tier requirement and build priority map
         credential_priorities = None
-        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+        if provider_plugin and hasattr(provider_plugin, "get_model_tier_requirement"):
             required_tier = provider_plugin.get_model_tier_requirement(model)
             if required_tier is not None:
                 # Filter OUT only credentials we KNOW are too low priority
@@ -759,9 +779,9 @@ class RotatingClient:
                 incompatible_creds = []
                 compatible_creds = []
                 unknown_creds = []
-                
+
                 for cred in credentials_for_provider:
-                    if hasattr(provider_plugin, 'get_credential_priority'):
+                    if hasattr(provider_plugin, "get_credential_priority"):
                         priority = provider_plugin.get_credential_priority(cred)
                         if priority is None:
                             # Unknown priority - keep it, will be discovered on first use
@@ -775,7 +795,7 @@ class RotatingClient:
                     else:
                         # Provider doesn't support priorities - keep all
                         unknown_creds.append(cred)
-                
+
                 # If we have any known-compatible or unknown credentials, use them
                 tier_compatible_creds = compatible_creds + unknown_creds
                 if tier_compatible_creds:
@@ -802,19 +822,24 @@ class RotatingClient:
                         f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
                         f"Request will likely fail."
                     )
-        
+
         # Build priority map for usage_manager
-        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+        if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
-            
+
             if credential_priorities:
                 lib_logger.debug(
-                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c) == p])}' for p in sorted(set(credential_priorities.values())))}"
                 )
+
+        # Initialize error accumulator for tracking errors across credential rotation
+        error_accumulator = RequestErrorAccumulator()
+        error_accumulator.model = model
+        error_accumulator.provider = provider
 
         while (
             len(tried_creds) < len(credentials_for_provider) and time.time() < deadline
@@ -852,9 +877,11 @@ class RotatingClient:
                 )
                 max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
-                    available_keys=creds_to_try, model=model, deadline=deadline,
+                    available_keys=creds_to_try,
+                    model=model,
+                    deadline=deadline,
                     max_concurrent=max_concurrent,
-                    credential_priorities=credential_priorities
+                    credential_priorities=credential_priorities,
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -937,10 +964,14 @@ class RotatingClient:
                     if provider_instance:
                         # Ensure default Gemini safety settings are present (without overriding request)
                         try:
-                            self._apply_default_safety_settings(litellm_kwargs, provider)
+                            self._apply_default_safety_settings(
+                                litellm_kwargs, provider
+                            )
                         except Exception:
                             # If anything goes wrong here, avoid breaking the request flow.
-                            lib_logger.debug("Could not apply default safety settings; continuing.")
+                            lib_logger.debug(
+                                "Could not apply default safety settings; continuing."
+                            )
 
                         if "safety_settings" in litellm_kwargs:
                             converted_settings = (
@@ -1023,8 +1054,14 @@ class RotatingClient:
 
                             # Extract a clean error message for the user-facing log
                             error_message = str(e).split("\n")[0]
+
+                            # Record in accumulator for client reporting
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message
+                            )
+
                             lib_logger.info(
-                                f"Key ...{current_cred[-6:]} hit rate limit for model {model}. Reason: '{error_message}'. Rotating key."
+                                f"Key {mask_credential(current_cred)} hit rate limit for {model}. Rotating key."
                             )
 
                             if classified_error.status_code == 429:
@@ -1032,15 +1069,9 @@ class RotatingClient:
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
-                                lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown."
-                                )
 
                             await self.usage_manager.record_failure(
                                 current_cred, model, classified_error
-                            )
-                            lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} encountered a rate limit. Trying next key."
                             )
                             break  # Move to the next key
 
@@ -1060,38 +1091,114 @@ class RotatingClient:
                                 else {},
                             )
                             classified_error = classify_error(e)
+                            error_message = str(e).split("\n")[0]
+
                             # Provider-level error: don't increment consecutive failures
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error,
-                                increment_consecutive_failures=False
+                                current_cred,
+                                model,
+                                classified_error,
+                                increment_consecutive_failures=False,
                             )
 
                             if attempt >= self.max_retries - 1:
-                                error_message = str(e).split("\n")[0]
+                                # Record in accumulator only on final failure for this key
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
                                 lib_logger.warning(
-                                    f"Key ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Reason: '{error_message}'. Rotating key."
+                                    f"Key {mask_credential(current_cred)} failed after max retries due to server error. Rotating."
                                 )
                                 break  # Move to the next key
 
                             # For temporary errors, wait before retrying with the same key.
                             wait_time = classified_error.retry_after or (
-                                1 * (2**attempt)
+                                2**attempt
                             ) + random.uniform(0, 1)
                             remaining_budget = deadline - time.time()
 
                             # If the required wait time exceeds the budget, don't wait; rotate to the next key immediately.
                             if wait_time > remaining_budget:
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
                                 lib_logger.warning(
-                                    f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early."
+                                    f"Retry wait ({wait_time:.2f}s) exceeds budget ({remaining_budget:.2f}s). Rotating key."
                                 )
                                 break
 
-                            error_message = str(e).split("\n")[0]
                             lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                f"Key {mask_credential(current_cred)} server error. Retrying in {wait_time:.2f}s."
                             )
                             await asyncio.sleep(wait_time)
                             continue  # Retry with the same key
+
+                        except httpx.HTTPStatusError as e:
+                            # Handle HTTP errors from httpx (e.g., from custom providers like Antigravity)
+                            last_exception = e
+                            log_failure(
+                                api_key=current_cred,
+                                model=model,
+                                attempt=attempt + 1,
+                                error=e,
+                                request_headers=dict(request.headers)
+                                if request
+                                else {},
+                            )
+
+                            classified_error = classify_error(e)
+                            error_message = str(e).split("\n")[0]
+
+                            lib_logger.warning(
+                                f"Key {mask_credential(current_cred)} HTTP {e.response.status_code} ({classified_error.error_type})."
+                            )
+
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}). Failing request."
+                                )
+                                raise last_exception
+
+                            # Record in accumulator after confirming it's a rotatable error
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message
+                            )
+
+                            # Handle rate limits with cooldown
+                            if classified_error.error_type in [
+                                "rate_limit",
+                                "quota_exceeded",
+                            ]:
+                                cooldown_duration = classified_error.retry_after or 60
+                                await self.cooldown_manager.start_cooldown(
+                                    provider, cooldown_duration
+                                )
+
+                            # Check if we should retry same key (server errors with retries left)
+                            if (
+                                should_retry_same_key(classified_error)
+                                and attempt < self.max_retries - 1
+                            ):
+                                wait_time = classified_error.retry_after or (
+                                    2**attempt
+                                ) + random.uniform(0, 1)
+                                remaining_budget = deadline - time.time()
+                                if wait_time <= remaining_budget:
+                                    lib_logger.warning(
+                                        f"Server error, retrying same key in {wait_time:.2f}s."
+                                    )
+                                    await asyncio.sleep(wait_time)
+                                    continue
+
+                            # Record failure and rotate to next key
+                            await self.usage_manager.record_failure(
+                                current_cred, model, classified_error
+                            )
+                            lib_logger.info(
+                                f"Rotating to next key after {classified_error.error_type} error."
+                            )
+                            break
 
                         except Exception as e:
                             last_exception = e
@@ -1107,31 +1214,39 @@ class RotatingClient:
 
                             if request and await request.is_disconnected():
                                 lib_logger.warning(
-                                    f"Client disconnected. Aborting retries for credential ...{current_cred[-6:]}."
+                                    f"Client disconnected. Aborting retries for {mask_credential(current_cred)}."
                                 )
                                 raise last_exception
 
                             classified_error = classify_error(e)
                             error_message = str(e).split("\n")[0]
+
                             lib_logger.warning(
-                                f"Key ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message}. Rotating key."
+                                f"Key {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code})."
                             )
-                            if classified_error.status_code == 429:
+
+                            # Handle rate limits with cooldown
+                            if (
+                                classified_error.status_code == 429
+                                or classified_error.error_type
+                                in ["rate_limit", "quota_exceeded"]
+                            ):
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
-                                lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider} from generic exception. Starting a {cooldown_duration}-second global cooldown."
-                                )
 
-                            if classified_error.error_type in [
-                                "invalid_request",
-                                "context_window_exceeded",
-                                "authentication",
-                            ]:
-                                # For these errors, we should not retry with other keys.
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}). Failing request."
+                                )
                                 raise last_exception
+
+                            # Record in accumulator after confirming it's a rotatable error
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message
+                            )
 
                             await self.usage_manager.record_failure(
                                 current_cred, model, classified_error
@@ -1141,14 +1256,22 @@ class RotatingClient:
                 if key_acquired and current_cred:
                     await self.usage_manager.release_key(current_cred, model)
 
-        if last_exception:
-            # Log the final error but do not raise it, as per the new requirement.
-            # The client should not see intermittent failures.
-            lib_logger.error(
-                f"Request failed after trying all keys or exceeding global timeout. Last error: {last_exception}"
-            )
+        # Check if we exhausted all credentials or timed out
+        if time.time() >= deadline:
+            error_accumulator.timeout_occurred = True
 
-        # Return None to indicate failure without propagating a disruptive exception.
+        if error_accumulator.has_errors():
+            # Log concise summary for server logs
+            lib_logger.error(error_accumulator.build_log_message())
+
+            # Return the structured error response for the client
+            return error_accumulator.build_client_error_response()
+
+        # Return None to indicate failure without error details (shouldn't normally happen)
+        lib_logger.warning(
+            "Unexpected state: request failed with no recorded errors. "
+            "This may indicate a logic error in error tracking."
+        )
         return None
 
     async def _streaming_acompletion_with_retry(
@@ -1164,12 +1287,13 @@ class RotatingClient:
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
-        
+
         # Filter out credentials that are unavailable (queued for re-auth)
         provider_plugin = self._get_provider_instance(provider)
-        if provider_plugin and hasattr(provider_plugin, 'is_credential_available'):
+        if provider_plugin and hasattr(provider_plugin, "is_credential_available"):
             available_creds = [
-                cred for cred in credentials_for_provider
+                cred
+                for cred in credentials_for_provider
                 if provider_plugin.is_credential_available(cred)
             ]
             if available_creds:
@@ -1191,10 +1315,10 @@ class RotatingClient:
             lib_logger.info(f"Resolved model '{model}' to '{resolved_model}'")
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
-        
+
         # [NEW] Filter by model tier requirement and build priority map
         credential_priorities = None
-        if provider_plugin and hasattr(provider_plugin, 'get_model_tier_requirement'):
+        if provider_plugin and hasattr(provider_plugin, "get_model_tier_requirement"):
             required_tier = provider_plugin.get_model_tier_requirement(model)
             if required_tier is not None:
                 # Filter OUT only credentials we KNOW are too low priority
@@ -1202,9 +1326,9 @@ class RotatingClient:
                 incompatible_creds = []
                 compatible_creds = []
                 unknown_creds = []
-                
+
                 for cred in credentials_for_provider:
-                    if hasattr(provider_plugin, 'get_credential_priority'):
+                    if hasattr(provider_plugin, "get_credential_priority"):
                         priority = provider_plugin.get_credential_priority(cred)
                         if priority is None:
                             # Unknown priority - keep it, will be discovered on first use
@@ -1218,7 +1342,7 @@ class RotatingClient:
                     else:
                         # Provider doesn't support priorities - keep all
                         unknown_creds.append(cred)
-                
+
                 # If we have any known-compatible or unknown credentials, use them
                 tier_compatible_creds = compatible_creds + unknown_creds
                 if tier_compatible_creds:
@@ -1245,19 +1369,24 @@ class RotatingClient:
                         f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
                         f"Request will likely fail."
                     )
-        
+
         # Build priority map for usage_manager
-        if provider_plugin and hasattr(provider_plugin, 'get_credential_priority'):
+        if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
-            
+
             if credential_priorities:
                 lib_logger.debug(
-                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c)==p])}' for p in sorted(set(credential_priorities.values())))}"
+                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c) == p])}' for p in sorted(set(credential_priorities.values())))}"
                 )
+
+        # Initialize error accumulator for tracking errors across credential rotation
+        error_accumulator = RequestErrorAccumulator()
+        error_accumulator.model = model
+        error_accumulator.provider = provider
 
         try:
             while (
@@ -1294,11 +1423,15 @@ class RotatingClient:
                     lib_logger.info(
                         f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{len(credentials_for_provider)}"
                     )
-                    max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
+                    max_concurrent = self.max_concurrent_requests_per_key.get(
+                        provider, 1
+                    )
                     current_cred = await self.usage_manager.acquire_key(
-                        available_keys=creds_to_try, model=model, deadline=deadline,
+                        available_keys=creds_to_try,
+                        model=model,
+                        deadline=deadline,
                         max_concurrent=max_concurrent,
-                        credential_priorities=credential_priorities
+                        credential_priorities=credential_priorities,
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)
@@ -1402,21 +1535,51 @@ class RotatingClient:
                                 litellm.RateLimitError,
                                 httpx.HTTPStatusError,
                             ) as e:
-                                if (
-                                    isinstance(e, httpx.HTTPStatusError)
-                                    and e.response.status_code != 429
-                                ):
-                                    raise e
-
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
                                 original_exc = getattr(e, "data", e)
                                 classified_error = classify_error(original_exc)
+                                error_message = str(original_exc).split("\n")[0]
+
+                                log_failure(
+                                    api_key=current_cred,
+                                    model=model,
+                                    attempt=attempt + 1,
+                                    error=e,
+                                    request_headers=dict(request.headers)
+                                    if request
+                                    else {},
+                                )
+
+                                # Record in accumulator for client reporting
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
+
+                                # Check if this error should trigger rotation
+                                if not should_rotate_on_error(classified_error):
+                                    lib_logger.error(
+                                        f"Non-recoverable error ({classified_error.error_type}) during custom stream. Failing."
+                                    )
+                                    raise last_exception
+
+                                # Handle rate limits with cooldown
+                                if classified_error.error_type in [
+                                    "rate_limit",
+                                    "quota_exceeded",
+                                ]:
+                                    cooldown_duration = (
+                                        classified_error.retry_after or 60
+                                    )
+                                    await self.cooldown_manager.start_cooldown(
+                                        provider, cooldown_duration
+                                    )
+
                                 await self.usage_manager.record_failure(
                                     current_cred, model, classified_error
                                 )
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during custom provider stream. Rotating key."
+                                    f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code}). Rotating."
                                 )
                                 break
 
@@ -1436,31 +1599,40 @@ class RotatingClient:
                                     else {},
                                 )
                                 classified_error = classify_error(e)
+                                error_message = str(e).split("\n")[0]
+
                                 # Provider-level error: don't increment consecutive failures
                                 await self.usage_manager.record_failure(
-                                    current_cred, model, classified_error,
-                                    increment_consecutive_failures=False
+                                    current_cred,
+                                    model,
+                                    classified_error,
+                                    increment_consecutive_failures=False,
                                 )
 
                                 if attempt >= self.max_retries - 1:
+                                    error_accumulator.record_error(
+                                        current_cred, classified_error, error_message
+                                    )
                                     lib_logger.warning(
-                                        f"Credential ...{current_cred[-6:]} failed after max retries for model {model} due to a server error. Rotating key."
+                                        f"Cred {mask_credential(current_cred)} failed after max retries. Rotating."
                                     )
                                     break
 
                                 wait_time = classified_error.retry_after or (
-                                    1 * (2**attempt)
+                                    2**attempt
                                 ) + random.uniform(0, 1)
                                 remaining_budget = deadline - time.time()
                                 if wait_time > remaining_budget:
+                                    error_accumulator.record_error(
+                                        current_cred, classified_error, error_message
+                                    )
                                     lib_logger.warning(
-                                        f"Required retry wait time ({wait_time:.2f}s) exceeds remaining budget ({remaining_budget:.2f}s). Rotating key early."
+                                        f"Retry wait ({wait_time:.2f}s) exceeds budget. Rotating."
                                     )
                                     break
 
-                                error_message = str(e).split("\n")[0]
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                    f"Cred {mask_credential(current_cred)} server error. Retrying in {wait_time:.2f}s."
                                 )
                                 await asyncio.sleep(wait_time)
                                 continue
@@ -1477,15 +1649,24 @@ class RotatingClient:
                                     else {},
                                 )
                                 classified_error = classify_error(e)
-                                lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
+                                error_message = str(e).split("\n")[0]
+
+                                # Record in accumulator
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
                                 )
-                                if classified_error.error_type in [
-                                    "invalid_request",
-                                    "context_window_exceeded",
-                                    "authentication",
-                                ]:
+
+                                lib_logger.warning(
+                                    f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code})."
+                                )
+
+                                # Check if this error should trigger rotation
+                                if not should_rotate_on_error(classified_error):
+                                    lib_logger.error(
+                                        f"Non-recoverable error ({classified_error.error_type}). Failing."
+                                    )
                                     raise last_exception
+
                                 await self.usage_manager.record_failure(
                                     current_cred, model, classified_error
                                 )
@@ -1507,9 +1688,13 @@ class RotatingClient:
                     if provider_instance:
                         # Ensure default Gemini safety settings are present (without overriding request)
                         try:
-                            self._apply_default_safety_settings(litellm_kwargs, provider)
+                            self._apply_default_safety_settings(
+                                litellm_kwargs, provider
+                            )
                         except Exception:
-                            lib_logger.debug("Could not apply default safety settings for streaming path; continuing.")
+                            lib_logger.debug(
+                                "Could not apply default safety settings for streaming path; continuing."
+                            )
 
                         if "safety_settings" in litellm_kwargs:
                             converted_settings = (
@@ -1590,7 +1775,11 @@ class RotatingClient:
                                 yield chunk
                             return
 
-                        except (StreamedAPIError, litellm.RateLimitError) as e:
+                        except (
+                            StreamedAPIError,
+                            litellm.RateLimitError,
+                            httpx.HTTPStatusError,
+                        ) as e:
                             last_exception = e
 
                             # This is the final, robust handler for streamed errors.
@@ -1600,24 +1789,26 @@ class RotatingClient:
                             original_exc = getattr(e, "data", e)
                             classified_error = classify_error(original_exc)
 
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}) during litellm stream. Failing."
+                                )
+                                raise last_exception
+
                             try:
                                 # The full error JSON is in the string representation of the exception.
                                 json_str_match = re.search(
                                     r"(\{.*\})", str(original_exc), re.DOTALL
                                 )
                                 if json_str_match:
-                                    # The string may contain byte-escaped characters (e.g., \\n).
                                     cleaned_str = codecs.decode(
                                         json_str_match.group(1), "unicode_escape"
                                     )
                                     error_payload = json.loads(cleaned_str)
                             except (json.JSONDecodeError, TypeError):
-                                lib_logger.warning(
-                                    "Could not parse JSON details from streamed error exception."
-                                )
                                 error_payload = {}
 
-                            # Now, log the failure with the extracted raw response.
                             log_failure(
                                 api_key=current_cred,
                                 model=model,
@@ -1631,9 +1822,13 @@ class RotatingClient:
 
                             error_details = error_payload.get("error", {})
                             error_status = error_details.get("status", "")
-                            # Fallback to the full string if parsing fails.
                             error_message_text = error_details.get(
-                                "message", str(original_exc)
+                                "message", str(original_exc).split("\n")[0]
+                            )
+
+                            # Record in accumulator for client reporting
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message_text
                             )
 
                             if (
@@ -1641,9 +1836,6 @@ class RotatingClient:
                                 or "resource_exhausted" in error_status.lower()
                             ):
                                 consecutive_quota_failures += 1
-                                lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} hit a quota limit. This is consecutive failure #{consecutive_quota_failures} for this request."
-                                )
 
                                 quota_value = "N/A"
                                 quota_id = "N/A"
@@ -1670,47 +1862,38 @@ class RotatingClient:
                                 )
 
                                 if consecutive_quota_failures >= 3:
-                                    console_log_message = (
-                                        f"Terminating stream for credential ...{current_cred[-6:]} due to 3rd consecutive quota error. "
-                                        f"This is now considered a fatal input data error. ID: {quota_id}, Limit: {quota_value}."
-                                    )
+                                    # Fatal: likely input data too large
                                     client_error_message = (
-                                        "FATAL: Request failed after 3 consecutive quota errors, "
-                                        "indicating the input data is too large for the model's per-request limit. "
-                                        f"Last Error Message: '{error_message_text}'. Limit: {quota_value} (Quota ID: {quota_id})."
+                                        f"Request failed after 3 consecutive quota errors (input may be too large). "
+                                        f"Limit: {quota_value} (Quota ID: {quota_id})"
                                     )
-                                    lib_logger.error(console_log_message)
-
+                                    lib_logger.error(
+                                        f"Fatal quota error for {mask_credential(current_cred)}. ID: {quota_id}, Limit: {quota_value}"
+                                    )
                                     yield f"data: {json.dumps({'error': {'message': client_error_message, 'type': 'proxy_fatal_quota_error'}})}\n\n"
                                     yield "data: [DONE]\n\n"
                                     return
-
                                 else:
-                                    # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
                                     lib_logger.warning(
-                                        f"Quota error on credential ...{current_cred[-6:]} (failure {consecutive_quota_failures}/3). Rotating key silently."
+                                        f"Cred {mask_credential(current_cred)} quota error ({consecutive_quota_failures}/3). Rotating."
                                     )
                                     break
 
                             else:
                                 consecutive_quota_failures = 0
-                                # [MODIFIED] Do not yield to the client. Just log and break to rotate the key.
                                 lib_logger.warning(
-                                    f"Credential ...{current_cred[-6:]} encountered a recoverable error ({classified_error.error_type}) during stream. Rotating key silently."
+                                    f"Cred {mask_credential(current_cred)} {classified_error.error_type}. Rotating."
                                 )
 
-                                if (
-                                    classified_error.error_type == "rate_limit"
-                                    and classified_error.status_code == 429
-                                ):
+                                if classified_error.error_type in [
+                                    "rate_limit",
+                                    "quota_exceeded",
+                                ]:
                                     cooldown_duration = (
                                         classified_error.retry_after or 60
                                     )
                                     await self.cooldown_manager.start_cooldown(
                                         provider, cooldown_duration
-                                    )
-                                    lib_logger.warning(
-                                        f"IP-based rate limit detected for {provider}. Starting a {cooldown_duration}-second global cooldown."
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -1735,10 +1918,19 @@ class RotatingClient:
                                 else {},
                             )
                             classified_error = classify_error(e)
+                            error_message_text = str(e).split("\n")[0]
+
+                            # Record error in accumulator (server errors are transient, not abnormal)
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message_text
+                            )
+
                             # Provider-level error: don't increment consecutive failures
                             await self.usage_manager.record_failure(
-                                current_cred, model, classified_error,
-                                increment_consecutive_failures=False
+                                current_cred,
+                                model,
+                                classified_error,
+                                increment_consecutive_failures=False,
                             )
 
                             if attempt >= self.max_retries - 1:
@@ -1749,7 +1941,7 @@ class RotatingClient:
                                 break
 
                             wait_time = classified_error.retry_after or (
-                                1 * (2**attempt)
+                                2**attempt
                             ) + random.uniform(0, 1)
                             remaining_budget = deadline - time.time()
                             if wait_time > remaining_budget:
@@ -1758,9 +1950,8 @@ class RotatingClient:
                                 )
                                 break
 
-                            error_message = str(e).split("\n")[0]
                             lib_logger.warning(
-                                f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message}'. Retrying in {wait_time:.2f}s."
+                                f"Credential ...{current_cred[-6:]} encountered a server error for model {model}. Reason: '{error_message_text}'. Retrying in {wait_time:.2f}s."
                             )
                             await asyncio.sleep(wait_time)
                             continue
@@ -1778,30 +1969,45 @@ class RotatingClient:
                                 else {},
                             )
                             classified_error = classify_error(e)
+                            error_message_text = str(e).split("\n")[0]
 
-                            lib_logger.warning(
-                                f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {str(e)}. Rotating key."
+                            # Record error in accumulator
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message_text
                             )
 
-                            if classified_error.status_code == 429:
+                            lib_logger.warning(
+                                f"Credential ...{current_cred[-6:]} failed with {classified_error.error_type} (Status: {classified_error.status_code}). Error: {error_message_text}."
+                            )
+
+                            # Handle rate limits with cooldown
+                            if (
+                                classified_error.status_code == 429
+                                or classified_error.error_type
+                                in ["rate_limit", "quota_exceeded"]
+                            ):
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
                                 )
                                 lib_logger.warning(
-                                    f"IP-based rate limit detected for {provider} from generic stream exception. Starting a {cooldown_duration}-second global cooldown."
+                                    f"Rate limit detected for {provider}. Starting {cooldown_duration}s cooldown."
                                 )
 
-                            if classified_error.error_type in [
-                                "invalid_request",
-                                "context_window_exceeded",
-                                "authentication",
-                            ]:
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                # Non-rotatable errors - fail immediately
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}). Failing request."
+                                )
                                 raise last_exception
 
-                            # [MODIFIED] Do not yield to the client here.
+                            # Record failure and rotate to next key
                             await self.usage_manager.record_failure(
                                 current_cred, model, classified_error
+                            )
+                            lib_logger.info(
+                                f"Rotating to next key after {classified_error.error_type} error."
                             )
                             break
 
@@ -1809,18 +2015,30 @@ class RotatingClient:
                     if key_acquired and current_cred:
                         await self.usage_manager.release_key(current_cred, model)
 
-            final_error_message = "Failed to complete the streaming request: No available API keys after rotation or global timeout exceeded."
-            if last_exception:
-                final_error_message = f"Failed to complete the streaming request. Last error: {str(last_exception)}"
-                lib_logger.error(
-                    f"Streaming request failed after trying all keys. Last error: {last_exception}"
-                )
+            # Build detailed error response using error accumulator
+            error_accumulator.timeout_occurred = time.time() >= deadline
+
+            if error_accumulator.has_errors():
+                # Log concise summary for server logs
+                lib_logger.error(error_accumulator.build_log_message())
+
+                # Build structured error response for client
+                error_response = error_accumulator.build_client_error_response()
+                error_data = error_response
             else:
+                # Fallback if no errors were recorded (shouldn't happen)
+                final_error_message = (
+                    "Request failed: No available API keys after rotation or timeout."
+                )
+                if last_exception:
+                    final_error_message = (
+                        f"Request failed. Last error: {str(last_exception)}"
+                    )
+                error_data = {
+                    "error": {"message": final_error_message, "type": "proxy_error"}
+                }
                 lib_logger.error(final_error_message)
 
-            error_data = {
-                "error": {"message": final_error_message, "type": "proxy_error"}
-            }
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -1868,11 +2086,13 @@ class RotatingClient:
         # Handle iflow provider: remove stream_options to avoid HTTP 406
         model = kwargs.get("model", "")
         provider = model.split("/")[0] if "/" in model else ""
-        
+
         if provider == "iflow" and "stream_options" in kwargs:
-            lib_logger.debug("Removing stream_options for iflow provider to avoid HTTP 406")
+            lib_logger.debug(
+                "Removing stream_options for iflow provider to avoid HTTP 406"
+            )
             kwargs.pop("stream_options", None)
-        
+
         if kwargs.get("stream"):
             # Only add stream_options for providers that support it (excluding iflow)
             if provider != "iflow":
@@ -1880,7 +2100,7 @@ class RotatingClient:
                     kwargs["stream_options"] = {}
                 if "include_usage" not in kwargs["stream_options"]:
                     kwargs["stream_options"]["include_usage"] = True
-            
+
             return self._streaming_acompletion_with_retry(
                 request=request, pre_request_callback=pre_request_callback, **kwargs
             )
