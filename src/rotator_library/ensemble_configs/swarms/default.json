@@ -1,0 +1,38 @@
+{
+  "id": "default",
+  "description": "Standard swarm configuration with balanced settings",
+  "base_models": [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-3-5-sonnet",
+    "claude-3-haiku",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash"
+  ],
+  "omit_id": false,
+  "count": 3,
+  
+  "temperature_jitter": {
+    "enabled": true,
+    "delta": 0.2
+  },
+  
+  "arbiter": {
+    "model": "self",
+    "strategy": "synthesis",
+    "blind": true,
+    "note": "Arbiter should be a decent reasoning model (e.g., GPT-4o, Claude 3+, Gemini 1.5 Pro+)"
+  },
+  
+  "adversarial_config": {
+    "enabled": false,
+    "count": 1,
+    "prompt": "You are a Senior Principal Engineer with 15+ years of experience. Your role is to find edge cases, security vulnerabilities, performance bottlenecks, and incorrect assumptions. Be thorough and critical in your analysis. Focus on:\n- Edge cases that could cause failures\n- Security implications and potential exploits\n- Performance and scalability concerns\n- Maintainability and code quality issues\n- Incorrect assumptions in the solution\n\nProvide constructive criticism to improve the solution."
+  },
+  
+  "recursive_mode": {
+    "enabled": false,
+    "consensus_threshold": 7,
+    "note": "Requires a reasoning-capable arbiter model"
+  }
+}

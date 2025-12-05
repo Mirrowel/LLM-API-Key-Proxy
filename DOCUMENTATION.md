@@ -10,7 +10,10 @@ The project is a monorepo containing two primary components:
     *   **Batch Manager**: Optimizes high-volume embedding requests.
     *   **Detailed Logger**: Provides per-request file logging for debugging.
     *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
-2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
+2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues. It also includes:
+    *   **HiveMind Ensemble Manager**: Orchestrates parallel model execution (Swarm and Fusion modes) with intelligent arbitration.
+    *   **Key Management**: Advanced concurrency control and intelligent key selection.
+    *   **Error Handling**: Escalating cooldowns and automatic recovery.
 
 This architecture cleanly separates the API interface from the resilience logic, making the library a portable and powerful tool for any application needing robust API key management.
 
@@ -312,6 +315,148 @@ The `CooldownManager` handles IP or account-level rate limiting that affects all
 - When a key fails with `RATE_LIMIT` error type, the client checks if it's likely an IP-level limit
 - If so, `CooldownManager.start_cooldown()` is called for the entire provider
 - All subsequent `acquire_key()` calls for that provider will wait until the cooldown expires
+
+---
+
+## 2.10. HiveMind Ensemble (`ensemble/`)
+
+The **HiveMind Ensemble** system enables parallel model execution with intelligent arbitration, supporting two distinct modes:
+
+### 2.10.1. Swarm Mode
+
+**Purpose**: Execute the same model multiple times in parallel to generate diverse responses, then synthesize them into a single high-quality output.
+
+**Key Features**:
+- **Temperature Jitter**: Randomly varies temperature across drones (±delta) to increase response diversity
+- **Adversarial Mode**: Dedicates N drones as critical reviewers with adversarial prompts to stress-test solutions
+- **Blind Switch**: Optionally hides model names from the arbiter to reduce synthesis bias
+- **Self-Arbitration**: Can use the same model as arbiter to save costs
+
+**Configuration** (`ensemble_configs/swarms/*.json`):
+- Folder-based preset system with model-specific overrides
+- Default configuration applies to all swarms unless overridden
+- Preset-based discovery: `{base_model}-{preset_id}[swarm]` format
+
+**Example Usage**:
+```python
+response = await client.acompletion(
+    model="gpt-4o-mini-default[swarm]",
+    messages=[{"role": "user", "content": "Explain AI"}]
+)
+# → 3 parallel calls to gpt-4o-mini with temperature jitter
+# → Arbiter synthesizes responses into final answer
+```
+
+### 2.10.2. Fusion Mode
+
+**Purpose**: Combine responses from multiple specialized models with role-based routing and weighted synthesis.
+
+**Key Features**:
+- **Role Assignment**: Each specialist model receives a custom system prompt defining its expertise
+- **Weight Descriptions**: Guide arbiter on which specialist to trust for specific domains
+- **Role Templates**: Reusable role definitions stored in `ensemble_configs/roles/`
+- **Blind Mode**: Hides model names while preserving role labels
+- **Multi-Provider Support**: Can mix models from different providers in a single fusion
+
+**Configuration** (`ensemble_configs/fusions/*.json`):
+- Each fusion defined in its own JSON file or as an array in a single file
+- Specialists can reference role templates via `role_template` field
+- Supports `weight_description` for arbiter context
+
+**Example Configuration**:
+```json
+{
+  "id": "dev-team",
+  "specialists": [
+    {
+      "model": "gpt-4o",
+      "role": "Architect",
+      "system_prompt": "Focus on scalability and system design.",
+      "weight_description": "Expert in architecture. Trust for design decisions."
+    },
+    {
+      "model": "claude-3-opus",
+      "role": "Security",
+      "role_template": "security-expert"
+    }
+  ],
+  "arbiter": {
+    "model": "gpt-4o",
+    "strategy": "synthesis",
+    "blind": true
+  }
+}
+```
+
+### 2.10.3. Arbitration Strategies
+
+Strategies define how the arbiter synthesizes responses. Stored as plain text files in `ensemble_configs/strategies/*.txt` with `{responses}` placeholder.
+
+**Built-in Strategies**:
+- **synthesis**: Combine best elements from all responses
+- **best_of_n**: Select and refine the strongest response
+- **code_review**: Code-specific evaluation criteria
+
+**Custom Strategies**: Users can add their own `.txt` files with custom synthesis prompts.
+
+### 2.10.4. Recursive Mode
+
+**Purpose**: Enable autonomous arbiter decision-making for low-consensus scenarios.
+
+**Mechanism**:
+- Arbiter assesses consensus (1-10 scale)
+- If consensus < threshold: arbiter performs internal critique reasoning
+- If consensus >= threshold: proceeds directly to synthesis
+- All internal reasoning wrapped in `[INTERNAL]` tags (filtered from user output)
+
+**Markers**:
+- `[CONSENSUS: X/10]`: Logged at WARN level if below threshold
+- `[CONFLICTS: ...]`: Identified disagreement points
+- `[CRITIQUE: ...]`: Internal reasoning about conflicts
+- `[FINAL SYNTHESIS:]`: Start of user-facing output
+
+### 2.10.5. Usage Tracking
+
+HiveMind responses include standard OpenAI-compatible usage fields **plus** supplementary `hivemind_details`:
+
+**Standard Fields** (aggregated totals from all models):
+- `prompt_tokens`: Total prompt tokens (drones/specialists + arbiter)
+- `completion_tokens`: Total completion tokens
+- `total_tokens`: Grand total
+
+**Supplementary Breakdown** (`hivemind_details`):
+```json
+{
+  "mode": "swarm" | "fusion",
+  "drone_count" | "specialist_count": 3,
+  "drone_tokens" | "specialist_tokens": 450,
+  "arbiter_tokens": 200,
+  "total_cost_usd": 0.00123,
+  "latency_ms": 1523.45
+}
+```
+
+**Important**: Consumers should use standard `usage` fields for billing/analytics. The `hivemind_details` provides debugging context.
+
+### 2.10.6. Architecture
+
+**Components**:
+- **EnsembleManager** (`manager.py`): Orchestration engine
+  - Detects ensemble requests (`is_ensemble()`)
+  - Prepares drones/specialists (`_prepare_drones()`, `_prepare_fusion_models()`)
+  - Executes parallel calls (`_execute_parallel()`)
+  - Builds arbiter prompts (`_build_arbiter_prompt()`)
+  - Handles streaming (`_call_arbiter_streaming()`)
+  
+- **ConfigLoader** (`config_loader.py`): Configuration management
+  - Loads swarm presets, fusions, strategies, and role templates
+  - Supports both single-item and array-based file formats
+  - Validates and merges configurations
+
+**Integration**:
+- Initialized in `RotatingClient.__init__()`
+- Intercepts requests in `acompletion()` before normal routing
+- Inherits all retry/resilience logic from RotatingClient
 
 ---
 
