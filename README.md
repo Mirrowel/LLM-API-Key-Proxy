@@ -33,7 +33,8 @@ This project provides a powerful solution for developers building complex applic
     - Claude Sonnet 4.5 with extended thinking support
     - Thought signature caching for multi-turn conversations
     - Tool hallucination prevention via parameter signature injection
-    - Automatic thinking block sanitization for Claude models
+    - Automatic thinking block sanitization for Claude models (with recovery strategies)
+    - Improved function call response pairing with three-tier matching strategy
     - Note: Claude thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
 -   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
 -   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.

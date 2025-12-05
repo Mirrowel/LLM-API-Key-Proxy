@@ -420,10 +420,11 @@ The most sophisticated provider implementation, supporting Google's internal Ant
 
 **Claude Opus 4.5 (NEW!):**
 - Anthropic's most powerful model, now available via Antigravity proxy
-- Uses internal model name `claude-opus-4-5-thinking` when reasoning is enabled
-- Uses `thinkingBudget` parameter for extended thinking control
+- **Always uses thinking variant** - `claude-opus-4-5-thinking` is the only available variant (non-thinking version doesn't exist)
+- Uses `thinkingBudget` parameter for extended thinking control (-1 for auto, 0 to disable, or specific token count)
 - Full support for tool use with schema cleaning
 - Same thinking preservation and sanitization features as Sonnet
+- Increased default max output tokens to 64000 to accommodate thinking output
 
 **Claude Sonnet 4.5:**
 - Proxied through Antigravity API (uses internal model name `claude-sonnet-4-5-thinking`)
@@ -475,7 +476,7 @@ ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
 
 #### Claude Extended Thinking Sanitization
 
-The provider includes automatic sanitization for Claude's extended thinking mode, handling common error scenarios:
+The provider now includes robust automatic sanitization for Claude's extended thinking mode, handling all common error scenarios with conversation history.
 
 **Problem**: Claude's extended thinking API requires strict consistency in thinking blocks:
 - If thinking is enabled, the final assistant turn must start with a thinking block
@@ -491,37 +492,41 @@ The provider includes automatic sanitization for Claude's extended thinking mode
 | Tool loop WITHOUT thinking + thinking enabled | **Inject synthetic closure** to start fresh turn with thinking |
 | Thinking disabled | Strip all thinking blocks |
 | Normal conversation (no tool loop) | Strip old thinking, new response adds thinking naturally |
+| Function call ID mismatch | Three-tier recovery: ID match → name match → fallback |
+| Missing tool responses | Automatic placeholder injection |
+| Compacted/cached conversations | Recover thinking from cache post-transformation |
 
-**Solution**: The `_sanitize_thinking_for_claude()` method:
-- Analyzes conversation state to detect incomplete tool use loops
-- When enabling thinking in a tool loop that started without thinking:
-  - Injects a minimal synthetic assistant message: `"[Tool execution completed. Processing results.]"`
-  - This **closes** the previous turn, allowing Claude to start a **fresh turn with thinking**
-- Strips thinking from old turns (Claude API ignores them anyway)
-- Preserves thinking when the turn was started with thinking enabled
+**Key Implementation Details**:
 
-**Key Insight**: Instead of force-disabling thinking, we close the tool loop with a synthetic message. This allows seamless model switching (e.g., Gemini → Claude with thinking) without losing the ability to think.
+The `_sanitize_thinking_for_claude()` method now:
+- Operates on Gemini-format messages (`parts[]` with `"thought": true` markers)
+- Detects tool results as user messages with `functionResponse` parts
+- Uses `_analyze_turn_state()` to classify conversation state on Gemini format
+- Recovers thinking from cache when client strips reasoning_content
+- When enabling thinking in a tool loop started without thinking:
+  - Injects synthetic assistant message to close the previous turn
+  - Allows Claude to start fresh turn with thinking capability
 
-**Example**:
+**Function Call Response Grouping**:
+
+The enhanced pairing system ensures conversation history integrity:
 ```
-Before sanitization:
-  User: "What's the weather?"
-  Assistant: [tool_use: get_weather]     ← Made by Gemini (no thinking)
-  User: [tool_result: "20C sunny"]
+Problem: Client/proxy may mutate response IDs or lose responses during context processing
 
-After sanitization (thinking enabled):
-  User: "What's the weather?"
-  Assistant: [tool_use: get_weather]
-  User: [tool_result: "20C sunny"]
-  Assistant: "[Tool execution completed. Processing results.]"  ← INJECTED
-  
-  → Claude now starts a NEW turn and CAN think!
+Solution:
+1. Try direct ID match (tool_call_id == response.id)
+2. If no match, try function name match (tool.name == response.name)
+3. If still no match, use order-based fallback (nth tool → nth response)
+4. Repair "unknown_function" responses with correct names
+5. Create placeholders for completely missing responses
 ```
 
 **Configuration**:
 ```env
-ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable/disable auto-correction
+ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable/disable auto-correction (default: true)
 ```
+
+**Note**: These fixes ensure Claude thinking mode works seamlessly with tool use, model switching, context compression, and cached conversations. No manual intervention required.
 
 #### File Logging
 
