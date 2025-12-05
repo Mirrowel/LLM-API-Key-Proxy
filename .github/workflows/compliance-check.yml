@@ -87,7 +87,7 @@ jobs:
       # BASIC CONFIGURATION
       # -----------------------------------------------------------------------
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}
-      BOT_NAMES_JSON: '[\"mirrobot\", \"mirrobot-agent\", \"mirrobot-agent[bot]\"]'
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
       
       # -----------------------------------------------------------------------
       # FEATURE TOGGLES
@@ -179,7 +179,7 @@ jobs:
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
 
-            # ======================================================================
+      # ======================================================================
       # CONDITIONAL WAIT: Wait for PR Review to Complete
       # ======================================================================
       # Only wait when triggered by ready_for_review event
@@ -241,7 +241,10 @@ jobs:
           
           echo "head_sha=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_OUTPUT
           echo "pr_title=$(echo "$pr_json" | jq -r .title)" >> $GITHUB_OUTPUT
-          echo "pr_author=$(echo "$pr_json" | jq -r .author.login)" >> $GITHUB_OUTPUT
+          
+          # Extract author to shell variable first (can't self-reference step outputs)
+          pr_author=$(echo "$pr_json" | jq -r .author.login)
+          echo "pr_author=$pr_author" >> $GITHUB_OUTPUT
           
           pr_body=$(echo "$pr_json" | jq -r '.body // ""')
           echo "pr_body<<EOF" >> $GITHUB_OUTPUT
@@ -262,7 +265,7 @@ jobs:
           
           # Requested reviewers for mentions
           reviewers=$(echo "$pr_json" | jq -r '.reviewRequests[]? | .login' | tr '\n' ' ')
-          mentions="@${{ steps.pr_info.outputs.pr_author }}"
+          mentions="@$pr_author"
           if [ -n "$reviewers" ]; then
             for reviewer in $reviewers; do
               mentions="$mentions @$reviewer"
