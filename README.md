@@ -28,13 +28,14 @@ This project provides a powerful solution for developers building complex applic
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 -   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
 
--   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 2.5, Gemini 3, and Claude models with advanced features:
-    - **🚀 NEW: Claude Opus 4.5** - Anthropic's most powerful model, now available via Antigravity!
-    - Claude Sonnet 4.5 with extended thinking support
+-   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 3 and Claude models with advanced features:
+    - **🚀 Claude Opus 4.5** - Anthropic's most powerful model (thinking mode only)
+    - **Claude Sonnet 4.5** - Supports both thinking and non-thinking modes
+    - **Gemini 3 Pro** - With thinkingLevel support (low/high)
+    - Credential prioritization with automatic paid/free tier detection
     - Thought signature caching for multi-turn conversations
     - Tool hallucination prevention via parameter signature injection
     - Automatic thinking block sanitization for Claude models (with recovery strategies)
-    - Improved function call response pairing with three-tier matching strategy
     - Note: Claude thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
 -   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
 -   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.

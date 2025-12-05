@@ -361,6 +361,13 @@ def get_model_tier_requirement(self, model: str) -> Optional[int]:
     return None  # All other models have no restrictions
 ```
 
+**Provider Support:**
+
+The following providers implement credential prioritization:
+
+- **Gemini CLI**: Paid tier (priority 1), Free tier (priority 2), Legacy/Unknown (priority 10). Gemini 3 models require paid tier.
+- **Antigravity**: Same priority system as Gemini CLI. No model-tier restrictions (all models work on all tiers). Paid tier resets every 5 hours, free tier resets weekly.
+
 **Usage Manager Integration:**
 
 The `acquire_key()` method has been enhanced to:
@@ -391,22 +398,18 @@ A modular, shared caching system for providers to persist conversation state acr
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
-The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
+The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
 
 #### Architecture
 
 - **Unified Streaming/Non-Streaming**: Single code path handles both response types with optimal transformations
 - **Thought Signature Caching**: Server-side caching of encrypted signatures for multi-turn Gemini 3 conversations
-- **Model-Specific Logic**: Automatic configuration based on model type (Gemini 2.5, Gemini 3, Claude)
+- **Model-Specific Logic**: Automatic configuration based on model type (Gemini 3, Claude Sonnet, Claude Opus)
+- **Credential Prioritization**: Automatic tier detection with paid credentials prioritized over free (paid tier resets every 5 hours, free tier resets weekly)
 
 #### Model Support
 
-**Gemini 2.5 (Pro/Flash):**
-- Uses `thinkingBudget` parameter (integer tokens: -1 for auto, 0 to disable, or specific value)
-- Standard safety settings and toolConfig
-- Stream processing with thinking content separation
-
-**Gemini 3 (Pro/Image):**
+**Gemini 3 Pro:**
 - Uses `thinkingLevel` parameter (string: "low" or "high")
 - **Tool Hallucination Prevention**:
   - Automatic system instruction injection explaining custom tool schema rules
@@ -427,8 +430,10 @@ The most sophisticated provider implementation, supporting Google's internal Ant
 - Increased default max output tokens to 64000 to accommodate thinking output
 
 **Claude Sonnet 4.5:**
-- Proxied through Antigravity API (uses internal model name `claude-sonnet-4-5-thinking`)
-- Uses `thinkingBudget` parameter like Gemini 2.5
+- Proxied through Antigravity API
+- **Supports both thinking and non-thinking modes**:
+  - With `reasoning_effort`: Uses `claude-sonnet-4-5-thinking` variant with `thinkingBudget`
+  - Without `reasoning_effort`: Uses standard `claude-sonnet-4-5` variant
 - **Thinking Preservation**: Caches thinking content using composite keys (tool_call_id + text_hash)
 - **Schema Cleaning**: Removes unsupported properties (`$schema`, `additionalProperties`, `const` → `enum`)
 
