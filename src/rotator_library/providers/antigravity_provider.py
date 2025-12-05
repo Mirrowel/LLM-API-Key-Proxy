@@ -2160,9 +2160,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         to grouped format (model with calls, user with all responses).
 
         IMPORTANT: Preserves ID-based pairing to prevent mismatches.
+        When IDs don't match, attempts recovery by:
+        1. Matching by function name first
+        2. Matching by order if names don't match
+        3. Inserting placeholder responses if responses are missing
+        4. Inserting responses at the CORRECT position (after their corresponding call)
         """
         new_contents = []
-        pending_groups = []  # List of {"ids": [id1, id2, ...], "call_indices": [...]}
+        # Each pending group tracks:
+        # - ids: expected response IDs
+        # - func_names: expected function names (for orphan matching)
+        # - insert_after_idx: position in new_contents where model message was added
+        pending_groups = []
         collected_responses = {}  # Dict mapping ID -> response_part
 
         for content in contents:
@@ -2182,7 +2191,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                                 f"Ignoring duplicate - this may indicate malformed conversation history."
                             )
                             continue
-                        # lib_logger.debug(f"[Grouping] Collected response for ID: {resp_id}")
+                        lib_logger.debug(
+                            f"[Grouping] Collected response for ID: {resp_id}"
+                        )
                         collected_responses[resp_id] = resp
 
                 # Try to satisfy pending groups (newest first)
@@ -2197,10 +2208,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             collected_responses.pop(gid) for gid in group_ids
                         ]
                         new_contents.append({"parts": group_responses, "role": "user"})
-                        # lib_logger.debug(
-                        #    f"[Grouping] Satisfied group with {len(group_responses)} responses: "
-                        #    f"ids={group_ids}"
-                        # )
+                        lib_logger.debug(
+                            f"[Grouping] Satisfied group with {len(group_responses)} responses: "
+                            f"ids={group_ids}"
+                        )
                         pending_groups.pop(i)
                         break
                 continue
@@ -2213,14 +2224,22 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         fc.get("functionCall", {}).get("id", "") for fc in func_calls
                     ]
                     call_ids = [cid for cid in call_ids if cid]  # Filter empty IDs
+
+                    # Also extract function names for orphan matching
+                    func_names = [
+                        fc.get("functionCall", {}).get("name", "") for fc in func_calls
+                    ]
+
                     if call_ids:
                         lib_logger.debug(
-                            f"[Grouping] Created pending group expecting {len(call_ids)} responses: ids={call_ids}"
+                            f"[Grouping] Created pending group expecting {len(call_ids)} responses: "
+                            f"ids={call_ids}, names={func_names}"
                         )
                         pending_groups.append(
                             {
                                 "ids": call_ids,
-                                "call_indices": list(range(len(func_calls))),
+                                "func_names": func_names,
+                                "insert_after_idx": len(new_contents) - 1,
                             }
                         )
             else:
@@ -2228,37 +2247,120 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         # Handle remaining groups (shouldn't happen in well-formed conversations)
         # Attempt recovery by matching orphans to unsatisfied calls
+        # Process in REVERSE order of insert_after_idx so insertions don't shift indices
+        pending_groups.sort(key=lambda g: g["insert_after_idx"], reverse=True)
+
         for group in pending_groups:
             group_ids = group["ids"]
+            group_func_names = group.get("func_names", [])
+            insert_idx = group["insert_after_idx"] + 1
             group_responses = []
 
-            for expected_id in group_ids:
+            lib_logger.debug(
+                f"[Grouping Recovery] Processing unsatisfied group: "
+                f"ids={group_ids}, names={group_func_names}, insert_at={insert_idx}"
+            )
+
+            for i, expected_id in enumerate(group_ids):
+                expected_name = group_func_names[i] if i < len(group_func_names) else ""
+
                 if expected_id in collected_responses:
+                    # Direct ID match
                     group_responses.append(collected_responses.pop(expected_id))
-                elif collected_responses:
-                    # Recovery: Match with an orphan response
-                    # This handles cases where client/proxy mutates IDs (e.g. toolu_ -> call_)
-                    # Get the first available orphan ID to maintain order
-                    orphan_id = next(iter(collected_responses))
-                    orphan_resp = collected_responses.pop(orphan_id)
-
-                    # Fix the ID in the response to match the call
-                    orphan_resp["functionResponse"]["id"] = expected_id
-
-                    lib_logger.warning(
-                        f"[Grouping] Auto-repaired ID mismatch: mapped response '{orphan_id}' "
-                        f"to call '{expected_id}'"
+                    lib_logger.debug(
+                        f"[Grouping Recovery] Direct ID match for '{expected_id}'"
                     )
-                    group_responses.append(orphan_resp)
+                elif collected_responses:
+                    # Try to find orphan with matching function name first
+                    matched_orphan_id = None
+
+                    # First pass: match by function name
+                    for orphan_id, orphan_resp in collected_responses.items():
+                        orphan_name = orphan_resp.get("functionResponse", {}).get(
+                            "name", ""
+                        )
+                        # Match if names are equal, or if orphan has "unknown_function" (can be fixed)
+                        if orphan_name == expected_name:
+                            matched_orphan_id = orphan_id
+                            lib_logger.debug(
+                                f"[Grouping Recovery] Matched orphan '{orphan_id}' by name '{orphan_name}'"
+                            )
+                            break
+
+                    # Second pass: if no name match, try "unknown_function" orphans
+                    if not matched_orphan_id:
+                        for orphan_id, orphan_resp in collected_responses.items():
+                            orphan_name = orphan_resp.get("functionResponse", {}).get(
+                                "name", ""
+                            )
+                            if orphan_name == "unknown_function":
+                                matched_orphan_id = orphan_id
+                                lib_logger.debug(
+                                    f"[Grouping Recovery] Matched unknown_function orphan '{orphan_id}' "
+                                    f"to expected '{expected_name}'"
+                                )
+                                break
+
+                    # Third pass: if still no match, take first available (order-based)
+                    if not matched_orphan_id:
+                        matched_orphan_id = next(iter(collected_responses))
+                        lib_logger.debug(
+                            f"[Grouping Recovery] No name match, using first available orphan '{matched_orphan_id}'"
+                        )
+
+                    if matched_orphan_id:
+                        orphan_resp = collected_responses.pop(matched_orphan_id)
+
+                        # Fix the ID in the response to match the call
+                        old_id = orphan_resp["functionResponse"].get("id", "")
+                        orphan_resp["functionResponse"]["id"] = expected_id
+
+                        # Fix the name if it was "unknown_function"
+                        if (
+                            orphan_resp["functionResponse"].get("name")
+                            == "unknown_function"
+                            and expected_name
+                        ):
+                            orphan_resp["functionResponse"]["name"] = expected_name
+                            lib_logger.info(
+                                f"[Grouping Recovery] Fixed function name from 'unknown_function' to '{expected_name}'"
+                            )
+
+                        lib_logger.warning(
+                            f"[Grouping] Auto-repaired ID mismatch: mapped response '{old_id}' "
+                            f"to call '{expected_id}' (function: {expected_name})"
+                        )
+                        group_responses.append(orphan_resp)
+                else:
+                    # No responses available - create placeholder
+                    placeholder_resp = {
+                        "functionResponse": {
+                            "name": expected_name or "unknown_function",
+                            "response": {
+                                "result": {
+                                    "error": "Tool response was lost during context processing. "
+                                    "This is a recovered placeholder.",
+                                    "recovered": True,
+                                }
+                            },
+                            "id": expected_id,
+                        }
+                    }
+                    lib_logger.warning(
+                        f"[Grouping Recovery] Created placeholder response for missing tool: "
+                        f"id='{expected_id}', name='{expected_name}'"
+                    )
+                    group_responses.append(placeholder_resp)
 
             if group_responses:
-                new_contents.append({"parts": group_responses, "role": "user"})
-
-                if len(group_responses) != len(group_ids):
-                    lib_logger.warning(
-                        f"[Grouping] Partial group satisfaction after repair: "
-                        f"expected {len(group_ids)}, got {len(group_responses)} responses"
-                    )
+                # Insert at the correct position (right after the model message with the calls)
+                new_contents.insert(
+                    insert_idx, {"parts": group_responses, "role": "user"}
+                )
+                lib_logger.info(
+                    f"[Grouping Recovery] Inserted {len(group_responses)} responses at position {insert_idx} "
+                    f"(expected {len(group_ids)})"
+                )
 
         # Warn about unmatched responses
         if collected_responses:
