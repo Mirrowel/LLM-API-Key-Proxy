@@ -54,7 +54,6 @@ coverage.xml
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -124,4 +123,10 @@ test_proxy.py
 start_proxy.bat
 key_usage.json
 staged_changes.txt
+launcher_config.json
+cache/antigravity/thought_signatures.json
 logs/
+cache/
+*.env
+
+oauth_creds/

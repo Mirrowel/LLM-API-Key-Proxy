@@ -1,5 +1,6 @@
 import re
 import json
+import os
 from typing import Optional, Dict, Any
 import httpx
 
@@ -17,6 +18,42 @@ from litellm.exceptions import (
 )
 
 
+def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
+    """
+    Extract the retry-after time from an API error response body.
+
+    Handles various error formats including:
+    - Gemini CLI: "Your quota will reset after 39s."
+    - Generic: "quota will reset after 120s", "retry after 60s"
+
+    Args:
+        error_body: The raw error response body
+
+    Returns:
+        The retry time in seconds, or None if not found
+    """
+    if not error_body:
+        return None
+
+    # Pattern to match various "reset after Xs" or "retry after Xs" formats
+    patterns = [
+        r"quota will reset after\s*(\d+)s",
+        r"reset after\s*(\d+)s",
+        r"retry after\s*(\d+)s",
+        r"try again in\s*(\d+)\s*seconds?",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, error_body, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except (ValueError, IndexError):
+                continue
+
+    return None
+
+
 class NoAvailableKeysError(Exception):
     """Raised when no API keys are available for a request after waiting."""
 
@@ -27,6 +64,227 @@ class PreRequestCallbackError(Exception):
     """Raised when a pre-request callback fails."""
 
     pass
+
+
+# =============================================================================
+# ERROR TRACKING FOR CLIENT REPORTING
+# =============================================================================
+
+# Abnormal errors that require attention and should always be reported to client
+ABNORMAL_ERROR_TYPES = frozenset(
+    {
+        "forbidden",  # 403 - credential access issue
+        "authentication",  # 401 - credential invalid/revoked
+        "pre_request_callback_error",  # Internal proxy error
+    }
+)
+
+# Normal/expected errors during operation - only report if ALL credentials fail
+NORMAL_ERROR_TYPES = frozenset(
+    {
+        "rate_limit",  # 429 - expected during high load
+        "quota_exceeded",  # Expected when quota runs out
+        "server_error",  # 5xx - transient provider issues
+        "api_connection",  # Network issues - transient
+    }
+)
+
+
+def is_abnormal_error(classified_error: "ClassifiedError") -> bool:
+    """
+    Check if an error is abnormal and should be reported to the client.
+
+    Abnormal errors indicate credential issues that need attention:
+    - 403 Forbidden: Credential doesn't have access
+    - 401 Unauthorized: Credential is invalid/revoked
+
+    Normal errors are expected during operation:
+    - 429 Rate limit: Expected during high load
+    - 5xx Server errors: Transient provider issues
+    """
+    return classified_error.error_type in ABNORMAL_ERROR_TYPES
+
+
+def mask_credential(credential: str) -> str:
+    """
+    Mask a credential for safe display in logs and error messages.
+
+    - For API keys: shows last 6 characters (e.g., "...xyz123")
+    - For OAuth file paths: shows just the filename (e.g., "antigravity_oauth_1.json")
+    """
+    if os.path.isfile(credential) or credential.endswith(".json"):
+        return os.path.basename(credential)
+    elif len(credential) > 6:
+        return f"...{credential[-6:]}"
+    else:
+        return "***"
+
+
+class RequestErrorAccumulator:
+    """
+    Tracks errors encountered during a request's credential rotation cycle.
+
+    Used to build informative error messages for clients when all credentials
+    are exhausted. Distinguishes between abnormal errors (that need attention)
+    and normal errors (expected during operation).
+    """
+
+    def __init__(self):
+        self.abnormal_errors: list = []  # 403, 401 - always report details
+        self.normal_errors: list = []  # 429, 5xx - summarize only
+        self._tried_credentials: set = set()  # Track unique credentials
+        self.timeout_occurred: bool = False
+        self.model: str = ""
+        self.provider: str = ""
+
+    def record_error(
+        self, credential: str, classified_error: "ClassifiedError", error_message: str
+    ):
+        """Record an error for a credential."""
+        self._tried_credentials.add(credential)
+        masked_cred = mask_credential(credential)
+
+        error_record = {
+            "credential": masked_cred,
+            "error_type": classified_error.error_type,
+            "status_code": classified_error.status_code,
+            "message": self._truncate_message(error_message, 150),
+        }
+
+        if is_abnormal_error(classified_error):
+            self.abnormal_errors.append(error_record)
+        else:
+            self.normal_errors.append(error_record)
+
+    @property
+    def total_credentials_tried(self) -> int:
+        """Return the number of unique credentials tried."""
+        return len(self._tried_credentials)
+
+    def _truncate_message(self, message: str, max_length: int = 150) -> str:
+        """Truncate error message for readability."""
+        # Take first line and truncate
+        first_line = message.split("\n")[0]
+        if len(first_line) > max_length:
+            return first_line[:max_length] + "..."
+        return first_line
+
+    def has_errors(self) -> bool:
+        """Check if any errors were recorded."""
+        return bool(self.abnormal_errors or self.normal_errors)
+
+    def has_abnormal_errors(self) -> bool:
+        """Check if any abnormal errors were recorded."""
+        return bool(self.abnormal_errors)
+
+    def get_normal_error_summary(self) -> str:
+        """Get a summary of normal errors (not individual details)."""
+        if not self.normal_errors:
+            return ""
+
+        # Count by type
+        counts = {}
+        for err in self.normal_errors:
+            err_type = err["error_type"]
+            counts[err_type] = counts.get(err_type, 0) + 1
+
+        # Build summary like "3 rate_limit, 1 server_error"
+        parts = [f"{count} {err_type}" for err_type, count in counts.items()]
+        return ", ".join(parts)
+
+    def build_client_error_response(self) -> dict:
+        """
+        Build a structured error response for the client.
+
+        Returns a dict suitable for JSON serialization in the error response.
+        """
+        # Determine the primary failure reason
+        if self.timeout_occurred:
+            error_type = "proxy_timeout"
+            base_message = f"Request timed out after trying {self.total_credentials_tried} credential(s)"
+        else:
+            error_type = "proxy_all_credentials_exhausted"
+            base_message = f"All {self.total_credentials_tried} credential(s) exhausted for {self.provider}"
+
+        # Build human-readable message
+        message_parts = [base_message]
+
+        if self.abnormal_errors:
+            message_parts.append("\n\nCredential issues (require attention):")
+            for err in self.abnormal_errors:
+                status = (
+                    f"HTTP {err['status_code']}"
+                    if err["status_code"] is not None
+                    else err["error_type"]
+                )
+                message_parts.append(
+                    f"\n  • {err['credential']}: {status} - {err['message']}"
+                )
+
+        normal_summary = self.get_normal_error_summary()
+        if normal_summary:
+            if self.abnormal_errors:
+                message_parts.append(
+                    f"\n\nAdditionally: {normal_summary} (expected during normal operation)"
+                )
+            else:
+                message_parts.append(f"\n\nAll failures were: {normal_summary}")
+                message_parts.append(
+                    "\nThis is normal during high load - retry later or add more credentials."
+                )
+
+        response = {
+            "error": {
+                "message": "".join(message_parts),
+                "type": error_type,
+                "details": {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "credentials_tried": self.total_credentials_tried,
+                    "timeout": self.timeout_occurred,
+                },
+            }
+        }
+
+        # Only include abnormal errors in details (they need attention)
+        if self.abnormal_errors:
+            response["error"]["details"]["abnormal_errors"] = self.abnormal_errors
+
+        # Include summary of normal errors
+        if normal_summary:
+            response["error"]["details"]["normal_error_summary"] = normal_summary
+
+        return response
+
+    def build_log_message(self) -> str:
+        """
+        Build a concise log message for server-side logging.
+
+        Shorter than client message, suitable for terminal display.
+        """
+        parts = []
+
+        if self.timeout_occurred:
+            parts.append(
+                f"TIMEOUT: {self.total_credentials_tried} creds tried for {self.model}"
+            )
+        else:
+            parts.append(
+                f"ALL CREDS EXHAUSTED: {self.total_credentials_tried} tried for {self.model}"
+            )
+
+        if self.abnormal_errors:
+            abnormal_summary = ", ".join(
+                f"{e['credential']}={e['status_code'] or e['error_type']}"
+                for e in self.abnormal_errors
+            )
+            parts.append(f"ISSUES: {abnormal_summary}")
+
+        normal_summary = self.get_normal_error_summary()
+        if normal_summary:
+            parts.append(f"Normal: {normal_summary}")
+
+        return " | ".join(parts)
 
 
 class ClassifiedError:
@@ -58,7 +316,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
     if isinstance(error, httpx.HTTPStatusError):
         headers = error.response.headers
         # Check standard Retry-After header (case-insensitive)
-        retry_header = headers.get('retry-after') or headers.get('Retry-After')
+        retry_header = headers.get("retry-after") or headers.get("Retry-After")
         if retry_header:
             try:
                 return int(retry_header)  # Assumes seconds format
@@ -66,10 +324,13 @@ def get_retry_after(error: Exception) -> Optional[int]:
                 pass  # Might be HTTP date format, skip for now
 
         # Check X-RateLimit-Reset header (Unix timestamp)
-        reset_header = headers.get('x-ratelimit-reset') or headers.get('X-RateLimit-Reset')
+        reset_header = headers.get("x-ratelimit-reset") or headers.get(
+            "X-RateLimit-Reset"
+        )
         if reset_header:
             try:
                 import time
+
                 reset_timestamp = int(reset_header)
                 current_time = int(time.time())
                 wait_seconds = reset_timestamp - current_time
@@ -106,6 +367,8 @@ def get_retry_after(error: Exception) -> Optional[int]:
         r"wait for\s*(\d+)\s*seconds?",
         r'"retryDelay":\s*"(\d+)s"',
         r"x-ratelimit-reset:?\s*(\d+)",
+        r"quota will reset after\s*(\d+)s",  # Gemini CLI rate limit format
+        r"reset after\s*(\d+)s",  # Generic reset after format
     ]
 
     for pattern in patterns:
@@ -117,16 +380,16 @@ def get_retry_after(error: Exception) -> Optional[int]:
                 continue
 
     # 3. Handle duration formats like "60s", "2m", "1h"
-    duration_match = re.search(r'(\d+)\s*([smh])', error_str)
+    duration_match = re.search(r"(\d+)\s*([smh])", error_str)
     if duration_match:
         try:
             value = int(duration_match.group(1))
             unit = duration_match.group(2)
-            if unit == 's':
+            if unit == "s":
                 return value
-            elif unit == 'm':
+            elif unit == "m":
                 return value * 60
-            elif unit == 'h':
+            elif unit == "h":
                 return value * 3600
         except (ValueError, IndexError):
             pass
@@ -141,15 +404,15 @@ def get_retry_after(error: Exception) -> Optional[int]:
             if value.isdigit():
                 return int(value)
             # Handle "60s", "2m" format in attribute
-            duration_match = re.search(r'(\d+)\s*([smh])', value.lower())
+            duration_match = re.search(r"(\d+)\s*([smh])", value.lower())
             if duration_match:
                 val = int(duration_match.group(1))
                 unit = duration_match.group(2)
-                if unit == 's':
+                if unit == "s":
                     return val
-                elif unit == 'm':
+                elif unit == "m":
                     return val * 60
-                elif unit == 'h':
+                elif unit == "h":
                     return val * 3600
 
     return None
@@ -159,25 +422,89 @@ def classify_error(e: Exception) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
     Now handles both litellm and httpx exceptions.
+
+    Error types and their typical handling:
+    - rate_limit (429): Rotate key, may retry with backoff
+    - server_error (5xx): Retry with backoff, then rotate
+    - forbidden (403): Rotate key immediately (access denied for this credential)
+    - authentication (401): Rotate key, trigger re-auth if OAuth
+    - quota_exceeded: Rotate key (credential quota exhausted)
+    - invalid_request (400): Don't retry - client error in request
+    - context_window_exceeded: Don't retry - request too large
+    - api_connection: Retry with backoff, then rotate
+    - unknown: Rotate key (safer to try another)
     """
     status_code = getattr(e, "status_code", None)
+
     if isinstance(e, httpx.HTTPStatusError):  # [NEW] Handle httpx errors first
         status_code = e.response.status_code
+
+        # Try to get error body for better classification
+        try:
+            error_body = e.response.text.lower() if hasattr(e.response, "text") else ""
+        except Exception:
+            error_body = ""
+
         if status_code == 401:
             return ClassifiedError(
                 error_type="authentication",
                 original_exception=e,
                 status_code=status_code,
             )
+        if status_code == 403:
+            # 403 Forbidden - credential doesn't have access, should rotate
+            # Could be: IP restriction, account disabled, permission denied, etc.
+            return ClassifiedError(
+                error_type="forbidden",
+                original_exception=e,
+                status_code=status_code,
+            )
         if status_code == 429:
             retry_after = get_retry_after(e)
+            # Check if this is a quota error vs rate limit
+            if "quota" in error_body or "resource_exhausted" in error_body:
+                return ClassifiedError(
+                    error_type="quota_exceeded",
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                )
             return ClassifiedError(
                 error_type="rate_limit",
                 original_exception=e,
                 status_code=status_code,
                 retry_after=retry_after,
             )
+        if status_code == 400:
+            # Check for context window / token limit errors with more specific patterns
+            if any(
+                pattern in error_body
+                for pattern in [
+                    "context_length",
+                    "max_tokens",
+                    "token limit",
+                    "context window",
+                    "too many tokens",
+                    "too long",
+                ]
+            ):
+                return ClassifiedError(
+                    error_type="context_window_exceeded",
+                    original_exception=e,
+                    status_code=status_code,
+                )
+            return ClassifiedError(
+                error_type="invalid_request",
+                original_exception=e,
+                status_code=status_code,
+            )
+            return ClassifiedError(
+                error_type="invalid_request",
+                original_exception=e,
+                status_code=status_code,
+            )
         if 400 <= status_code < 500:
+            # Other 4xx errors - generally client errors
             return ClassifiedError(
                 error_type="invalid_request",
                 original_exception=e,
@@ -204,6 +531,15 @@ def classify_error(e: Exception) -> ClassifiedError:
 
     if isinstance(e, RateLimitError):
         retry_after = get_retry_after(e)
+        # Check if this is a quota error vs rate limit
+        error_msg = str(e).lower()
+        if "quota" in error_msg or "resource_exhausted" in error_msg:
+            return ClassifiedError(
+                error_type="quota_exceeded",
+                original_exception=e,
+                status_code=status_code or 429,
+                retry_after=retry_after,
+            )
         return ClassifiedError(
             error_type="rate_limit",
             original_exception=e,
@@ -273,6 +609,52 @@ def is_unrecoverable_error(e: Exception) -> bool:
     These are errors that will not resolve on their own.
     """
     return isinstance(e, (InvalidRequestError, AuthenticationError, BadRequestError))
+
+
+def should_rotate_on_error(classified_error: ClassifiedError) -> bool:
+    """
+    Determines if an error should trigger key rotation.
+
+    Errors that SHOULD rotate (try another key):
+    - rate_limit: Current key is throttled
+    - quota_exceeded: Current key/account exhausted
+    - forbidden: Current credential denied access
+    - authentication: Current credential invalid
+    - server_error: Provider having issues (might work with different endpoint/key)
+    - api_connection: Network issues (might be transient)
+    - unknown: Safer to try another key
+
+    Errors that should NOT rotate (fail immediately):
+    - invalid_request: Client error in request payload (won't help to retry)
+    - context_window_exceeded: Request too large (won't help to retry)
+    - pre_request_callback_error: Internal proxy error
+
+    Returns:
+        True if should rotate to next key, False if should fail immediately
+    """
+    non_rotatable_errors = {
+        "invalid_request",
+        "context_window_exceeded",
+        "pre_request_callback_error",
+    }
+    return classified_error.error_type not in non_rotatable_errors
+
+
+def should_retry_same_key(classified_error: ClassifiedError) -> bool:
+    """
+    Determines if an error should retry with the same key (with backoff).
+
+    Only server errors and connection issues should retry the same key,
+    as these are often transient.
+
+    Returns:
+        True if should retry same key, False if should rotate immediately
+    """
+    retryable_errors = {
+        "server_error",
+        "api_connection",
+    }
+    return classified_error.error_type in retryable_errors
 
 
 class AllProviders:

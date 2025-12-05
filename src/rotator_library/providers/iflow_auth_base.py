@@ -21,9 +21,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
+from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 
-lib_logger = logging.getLogger('rotator_library')
+lib_logger = logging.getLogger("rotator_library")
 
 IFLOW_OAUTH_AUTHORIZE_ENDPOINT = "https://iflow.cn/oauth"
 IFLOW_OAUTH_TOKEN_ENDPOINT = "https://iflow.cn/oauth/token"
@@ -61,7 +62,7 @@ class OAuthCallbackServer:
         """Checks if the callback port is available."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(('', self.port))
+            sock.bind(("", self.port))
             sock.close()
             return True
         except OSError:
@@ -76,12 +77,12 @@ class OAuthCallbackServer:
         self.result_future = asyncio.Future()
 
         # Setup route
-        self.app.router.add_get('/oauth2callback', self._handle_callback)
+        self.app.router.add_get("/oauth2callback", self._handle_callback)
 
         # Start server
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        self.site = web.TCPSite(self.runner, 'localhost', self.port)
+        self.site = web.TCPSite(self.runner, "localhost", self.port)
         await self.site.start()
 
         lib_logger.debug(f"iFlow OAuth callback server started on port {self.port}")
@@ -99,34 +100,46 @@ class OAuthCallbackServer:
         query = request.query
 
         # Check for error parameter
-        if 'error' in query:
-            error = query.get('error', 'unknown_error')
+        if "error" in query:
+            error = query.get("error", "unknown_error")
             lib_logger.error(f"iFlow OAuth callback received error: {error}")
             if not self.result_future.done():
                 self.result_future.set_exception(ValueError(f"OAuth error: {error}"))
-            return web.Response(status=302, headers={'Location': IFLOW_ERROR_REDIRECT_URL})
+            return web.Response(
+                status=302, headers={"Location": IFLOW_ERROR_REDIRECT_URL}
+            )
 
         # Check for authorization code
-        code = query.get('code')
+        code = query.get("code")
         if not code:
             lib_logger.error("iFlow OAuth callback missing authorization code")
             if not self.result_future.done():
-                self.result_future.set_exception(ValueError("Missing authorization code"))
-            return web.Response(status=302, headers={'Location': IFLOW_ERROR_REDIRECT_URL})
+                self.result_future.set_exception(
+                    ValueError("Missing authorization code")
+                )
+            return web.Response(
+                status=302, headers={"Location": IFLOW_ERROR_REDIRECT_URL}
+            )
 
         # Validate state parameter
-        state = query.get('state', '')
+        state = query.get("state", "")
         if state != self.expected_state:
-            lib_logger.error(f"iFlow OAuth state mismatch. Expected: {self.expected_state}, Got: {state}")
+            lib_logger.error(
+                f"iFlow OAuth state mismatch. Expected: {self.expected_state}, Got: {state}"
+            )
             if not self.result_future.done():
                 self.result_future.set_exception(ValueError("State parameter mismatch"))
-            return web.Response(status=302, headers={'Location': IFLOW_ERROR_REDIRECT_URL})
+            return web.Response(
+                status=302, headers={"Location": IFLOW_ERROR_REDIRECT_URL}
+            )
 
         # Success - set result and redirect to success page
         if not self.result_future.done():
             self.result_future.set_result(code)
 
-        return web.Response(status=302, headers={'Location': IFLOW_SUCCESS_REDIRECT_URL})
+        return web.Response(
+            status=302, headers={"Location": IFLOW_SUCCESS_REDIRECT_URL}
+        )
 
     async def wait_for_callback(self, timeout: float = 300.0) -> str:
         """Waits for the OAuth callback and returns the authorization code."""
@@ -146,60 +159,106 @@ class IFlowAuthBase:
     def __init__(self):
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # Protects the locks dict from race conditions
+        self._locks_lock = (
+            asyncio.Lock()
+        )  # Protects the locks dict from race conditions
         # [BACKOFF TRACKING] Track consecutive failures per credential
-        self._refresh_failures: Dict[str, int] = {}  # Track consecutive failures per credential
-        self._next_refresh_after: Dict[str, float] = {}  # Track backoff timers (Unix timestamp)
-        
+        self._refresh_failures: Dict[
+            str, int
+        ] = {}  # Track consecutive failures per credential
+        self._next_refresh_after: Dict[
+            str, float
+        ] = {}  # Track backoff timers (Unix timestamp)
+
         # [QUEUE SYSTEM] Sequential refresh processing
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queued_credentials: set = set()  # Track credentials already in queue
-        self._unavailable_credentials: set = set()  # Mark credentials unavailable during re-auth
+        self._unavailable_credentials: set = (
+            set()
+        )  # Mark credentials unavailable during re-auth
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
-        self._queue_processor_task: Optional[asyncio.Task] = None  # Background worker task
+        self._queue_processor_task: Optional[asyncio.Task] = (
+            None  # Background worker task
+        )
 
-    def _load_from_env(self) -> Optional[Dict[str, Any]]:
+    def _parse_env_credential_path(self, path: str) -> Optional[str]:
+        """
+        Parse a virtual env:// path and return the credential index.
+
+        Supported formats:
+        - "env://provider/0" - Legacy single credential (no index in env var names)
+        - "env://provider/1" - First numbered credential (IFLOW_1_ACCESS_TOKEN)
+
+        Returns:
+            The credential index as string, or None if path is not an env:// path
+        """
+        if not path.startswith("env://"):
+            return None
+
+        parts = path[6:].split("/")
+        if len(parts) >= 2:
+            return parts[1]
+        return "0"
+
+    def _load_from_env(
+        self, credential_index: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Load OAuth credentials from environment variables for stateless deployments.
 
-        Expected environment variables:
-        - IFLOW_ACCESS_TOKEN (required)
-        - IFLOW_REFRESH_TOKEN (required)
-        - IFLOW_API_KEY (required - critical for iFlow!)
-        - IFLOW_EXPIRY_DATE (optional, defaults to empty string)
-        - IFLOW_EMAIL (optional, defaults to "env-user")
-        - IFLOW_TOKEN_TYPE (optional, defaults to "Bearer")
-        - IFLOW_SCOPE (optional, defaults to "read write")
+        Supports two formats:
+        1. Legacy (credential_index="0" or None): IFLOW_ACCESS_TOKEN
+        2. Numbered (credential_index="1", "2", etc.): IFLOW_1_ACCESS_TOKEN, etc.
+
+        Expected environment variables (for numbered format with index N):
+        - IFLOW_{N}_ACCESS_TOKEN (required)
+        - IFLOW_{N}_REFRESH_TOKEN (required)
+        - IFLOW_{N}_API_KEY (required - critical for iFlow!)
+        - IFLOW_{N}_EXPIRY_DATE (optional, defaults to empty string)
+        - IFLOW_{N}_EMAIL (optional, defaults to "env-user-{N}")
+        - IFLOW_{N}_TOKEN_TYPE (optional, defaults to "Bearer")
+        - IFLOW_{N}_SCOPE (optional, defaults to "read write")
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
         """
-        access_token = os.getenv("IFLOW_ACCESS_TOKEN")
-        refresh_token = os.getenv("IFLOW_REFRESH_TOKEN")
-        api_key = os.getenv("IFLOW_API_KEY")
+        # Determine the env var prefix based on credential index
+        if credential_index and credential_index != "0":
+            prefix = f"IFLOW_{credential_index}"
+            default_email = f"env-user-{credential_index}"
+        else:
+            prefix = "IFLOW"
+            default_email = "env-user"
+
+        access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
+        refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
+        api_key = os.getenv(f"{prefix}_API_KEY")
 
         # All three are required for iFlow
         if not (access_token and refresh_token and api_key):
             return None
 
-        lib_logger.debug("Loading iFlow credentials from environment variables")
+        lib_logger.debug(
+            f"Loading iFlow credentials from environment variables (prefix: {prefix})"
+        )
 
         # Parse expiry_date as string (ISO 8601 format)
-        expiry_str = os.getenv("IFLOW_EXPIRY_DATE", "")
+        expiry_str = os.getenv(f"{prefix}_EXPIRY_DATE", "")
 
         creds = {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "api_key": api_key,  # Critical for iFlow!
             "expiry_date": expiry_str,
-            "email": os.getenv("IFLOW_EMAIL", "env-user"),
-            "token_type": os.getenv("IFLOW_TOKEN_TYPE", "Bearer"),
-            "scope": os.getenv("IFLOW_SCOPE", "read write"),
+            "email": os.getenv(f"{prefix}_EMAIL", default_email),
+            "token_type": os.getenv(f"{prefix}_TOKEN_TYPE", "Bearer"),
+            "scope": os.getenv(f"{prefix}_SCOPE", "read write"),
             "_proxy_metadata": {
-                "email": os.getenv("IFLOW_EMAIL", "env-user"),
+                "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
-                "loaded_from_env": True  # Flag to indicate env-based credentials
-            }
+                "loaded_from_env": True,
+                "env_credential_index": credential_index or "0",
+            },
         }
 
         return creds
@@ -208,7 +267,7 @@ class IFlowAuthBase:
         """Reads credentials from file and populates the cache. No locking."""
         try:
             lib_logger.debug(f"Reading iFlow credentials from file: {path}")
-            with open(path, 'r') as f:
+            with open(path, "r") as f:
                 creds = json.load(f)
             self._credentials_cache[path] = creds
             return creds
@@ -227,11 +286,25 @@ class IFlowAuthBase:
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
 
-            # First, try loading from environment variables
+            # Check if this is a virtual env:// path
+            credential_index = self._parse_env_credential_path(path)
+            if credential_index is not None:
+                env_creds = self._load_from_env(credential_index)
+                if env_creds:
+                    lib_logger.info(
+                        f"Using iFlow credentials from environment variables (index: {credential_index})"
+                    )
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
+                else:
+                    raise IOError(
+                        f"Environment variables for iFlow credential index {credential_index} not found"
+                    )
+
+            # For file paths, try loading from legacy env vars first
             env_creds = self._load_from_env()
             if env_creds:
                 lib_logger.info("Using iFlow credentials from environment variables")
-                # Cache env-based credentials using the path as key
                 self._credentials_cache[path] = env_creds
                 return env_creds
 
@@ -256,10 +329,12 @@ class IFlowAuthBase:
         tmp_path = None
         try:
             # Create temp file in same directory as target (ensures same filesystem)
-            tmp_fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix='.tmp_', suffix='.json', text=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
+            )
 
             # Write JSON to temp file
-            with os.fdopen(tmp_fd, 'w') as f:
+            with os.fdopen(tmp_fd, "w") as f:
                 json.dump(creds, f, indent=2)
                 tmp_fd = None  # fdopen closes the fd
 
@@ -276,10 +351,14 @@ class IFlowAuthBase:
 
             # Update cache AFTER successful file write
             self._credentials_cache[path] = creds
-            lib_logger.debug(f"Saved updated iFlow OAuth credentials to '{path}' (atomic write).")
+            lib_logger.debug(
+                f"Saved updated iFlow OAuth credentials to '{path}' (atomic write)."
+            )
 
         except Exception as e:
-            lib_logger.error(f"Failed to save updated iFlow OAuth credentials to '{path}': {e}")
+            lib_logger.error(
+                f"Failed to save updated iFlow OAuth credentials to '{path}': {e}"
+            )
             # Clean up temp file if it still exists
             if tmp_fd is not None:
                 try:
@@ -303,7 +382,8 @@ class IFlowAuthBase:
         try:
             # Parse ISO 8601 format (e.g., "2025-01-17T12:00:00Z")
             from datetime import datetime
-            expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+
+            expiry_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
             expiry_timestamp = expiry_dt.timestamp()
         except (ValueError, AttributeError):
             # Fallback: treat as numeric timestamp
@@ -347,7 +427,9 @@ class IFlowAuthBase:
 
         return {"api_key": api_key, "email": email}
 
-    async def _exchange_code_for_tokens(self, code: str, redirect_uri: str) -> Dict[str, Any]:
+    async def _exchange_code_for_tokens(
+        self, code: str, redirect_uri: str
+    ) -> Dict[str, Any]:
         """
         Exchanges authorization code for access and refresh tokens.
         Uses Basic Auth with client credentials.
@@ -359,7 +441,7 @@ class IFlowAuthBase:
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "Authorization": f"Basic {basic_auth}"
+            "Authorization": f"Basic {basic_auth}",
         }
 
         data = {
@@ -367,16 +449,22 @@ class IFlowAuthBase:
             "code": code,
             "redirect_uri": redirect_uri,
             "client_id": IFLOW_CLIENT_ID,
-            "client_secret": IFLOW_CLIENT_SECRET
+            "client_secret": IFLOW_CLIENT_SECRET,
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data)
+            response = await client.post(
+                IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data
+            )
 
             if response.status_code != 200:
                 error_text = response.text
-                lib_logger.error(f"iFlow token exchange failed: {response.status_code} {error_text}")
-                raise ValueError(f"Token exchange failed: {response.status_code} {error_text}")
+                lib_logger.error(
+                    f"iFlow token exchange failed: {response.status_code} {error_text}"
+                )
+                raise ValueError(
+                    f"Token exchange failed: {response.status_code} {error_text}"
+                )
 
             token_data = response.json()
 
@@ -394,7 +482,10 @@ class IFlowAuthBase:
 
         # Calculate expiry date
         from datetime import datetime, timedelta
-        expiry_date = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat() + 'Z'
+
+        expiry_date = (
+            datetime.utcnow() + timedelta(seconds=expires_in)
+        ).isoformat() + "Z"
 
         return {
             "access_token": access_token,
@@ -403,7 +494,7 @@ class IFlowAuthBase:
             "email": user_info["email"],
             "expiry_date": expiry_date,
             "token_type": token_type,
-            "scope": scope
+            "scope": scope,
         }
 
     async def _refresh_token(self, path: str, force: bool = False) -> Dict[str, Any]:
@@ -440,20 +531,22 @@ class IFlowAuthBase:
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
-                "Authorization": f"Basic {basic_auth}"
+                "Authorization": f"Basic {basic_auth}",
             }
 
             data = {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "client_id": IFLOW_CLIENT_ID,
-                "client_secret": IFLOW_CLIENT_SECRET
+                "client_secret": IFLOW_CLIENT_SECRET,
             }
 
             async with httpx.AsyncClient(timeout=30.0) as client:
                 for attempt in range(max_retries):
                     try:
-                        response = await client.post(IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data)
+                        response = await client.post(
+                            IFLOW_OAUTH_TOKEN_ENDPOINT, headers=headers, data=data
+                        )
                         response.raise_for_status()
                         new_token_data = response.json()
                         break  # Success
@@ -463,7 +556,9 @@ class IFlowAuthBase:
                         status_code = e.response.status_code
                         error_body = e.response.text
 
-                        lib_logger.error(f"[REFRESH HTTP ERROR] HTTP {status_code} for '{Path(path).name}': {error_body}")
+                        lib_logger.error(
+                            f"[REFRESH HTTP ERROR] HTTP {status_code} for '{Path(path).name}': {error_body}"
+                        )
 
                         # [STATUS CODE HANDLING]
                         # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
@@ -477,7 +572,9 @@ class IFlowAuthBase:
 
                         elif status_code == 429:
                             retry_after = int(e.response.headers.get("Retry-After", 60))
-                            lib_logger.warning(f"Rate limited (HTTP 429), retry after {retry_after}s")
+                            lib_logger.warning(
+                                f"Rate limited (HTTP 429), retry after {retry_after}s"
+                            )
                             if attempt < max_retries - 1:
                                 await asyncio.sleep(retry_after)
                                 continue
@@ -485,8 +582,10 @@ class IFlowAuthBase:
 
                         elif 500 <= status_code < 600:
                             if attempt < max_retries - 1:
-                                wait_time = 2 ** attempt
-                                lib_logger.warning(f"Server error (HTTP {status_code}), retry {attempt + 1}/{max_retries} in {wait_time}s")
+                                wait_time = 2**attempt
+                                lib_logger.warning(
+                                    f"Server error (HTTP {status_code}), retry {attempt + 1}/{max_retries} in {wait_time}s"
+                                )
                                 await asyncio.sleep(wait_time)
                                 continue
                             raise
@@ -497,24 +596,55 @@ class IFlowAuthBase:
                     except (httpx.RequestError, httpx.TimeoutException) as e:
                         last_error = e
                         if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            lib_logger.warning(f"Network error during refresh: {e}, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                            wait_time = 2**attempt
+                            lib_logger.warning(
+                                f"Network error during refresh: {e}, retry {attempt + 1}/{max_retries} in {wait_time}s"
+                            )
                             await asyncio.sleep(wait_time)
                             continue
                         raise
 
             # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
             if needs_reauth:
-                lib_logger.info(f"Starting re-authentication for '{Path(path).name}'...")
+                lib_logger.info(
+                    f"Starting re-authentication for '{Path(path).name}'..."
+                )
                 try:
                     # Call initialize_token to trigger OAuth flow
                     new_creds = await self.initialize_token(path)
+                    # Clear backoff on successful re-auth
+                    self._refresh_failures.pop(path, None)
+                    self._next_refresh_after.pop(path, None)
                     return new_creds
                 except Exception as reauth_error:
-                    lib_logger.error(f"Re-authentication failed for '{Path(path).name}': {reauth_error}")
-                    raise ValueError(f"Refresh token invalid and re-authentication failed: {reauth_error}")
+                    lib_logger.error(
+                        f"Re-authentication failed for '{Path(path).name}': {reauth_error}"
+                    )
+                    # [BACKOFF TRACKING] Increment failure count and set backoff timer
+                    self._refresh_failures[path] = (
+                        self._refresh_failures.get(path, 0) + 1
+                    )
+                    backoff_seconds = min(
+                        300, 30 * (2 ** self._refresh_failures[path])
+                    )  # Max 5 min backoff
+                    self._next_refresh_after[path] = time.time() + backoff_seconds
+                    lib_logger.debug(
+                        f"Setting backoff for '{Path(path).name}': {backoff_seconds}s"
+                    )
+                    raise ValueError(
+                        f"Refresh token invalid and re-authentication failed: {reauth_error}"
+                    )
 
             if new_token_data is None:
+                # [BACKOFF TRACKING] Increment failure count and set backoff timer
+                self._refresh_failures[path] = self._refresh_failures.get(path, 0) + 1
+                backoff_seconds = min(
+                    300, 30 * (2 ** self._refresh_failures[path])
+                )  # Max 5 min backoff
+                self._next_refresh_after[path] = time.time() + backoff_seconds
+                lib_logger.debug(
+                    f"Setting backoff for '{Path(path).name}': {backoff_seconds}s"
+                )
                 raise last_error or Exception("Token refresh failed after all retries")
 
             # Update tokens
@@ -523,14 +653,23 @@ class IFlowAuthBase:
                 raise ValueError("Missing access_token in refresh response")
 
             creds_from_file["access_token"] = access_token
-            creds_from_file["refresh_token"] = new_token_data.get("refresh_token", creds_from_file["refresh_token"])
+            creds_from_file["refresh_token"] = new_token_data.get(
+                "refresh_token", creds_from_file["refresh_token"]
+            )
 
             expires_in = new_token_data.get("expires_in", 3600)
             from datetime import datetime, timedelta
-            creds_from_file["expiry_date"] = (datetime.utcnow() + timedelta(seconds=expires_in)).isoformat() + 'Z'
 
-            creds_from_file["token_type"] = new_token_data.get("token_type", creds_from_file.get("token_type", "Bearer"))
-            creds_from_file["scope"] = new_token_data.get("scope", creds_from_file.get("scope", ""))
+            creds_from_file["expiry_date"] = (
+                datetime.utcnow() + timedelta(seconds=expires_in)
+            ).isoformat() + "Z"
+
+            creds_from_file["token_type"] = new_token_data.get(
+                "token_type", creds_from_file.get("token_type", "Bearer")
+            )
+            creds_from_file["scope"] = new_token_data.get(
+                "scope", creds_from_file.get("scope", "")
+            )
 
             # CRITICAL: Re-fetch user info to get potentially updated API key
             try:
@@ -540,15 +679,33 @@ class IFlowAuthBase:
                 if user_info.get("email"):
                     creds_from_file["email"] = user_info["email"]
             except Exception as e:
-                lib_logger.warning(f"Failed to update API key during token refresh: {e}")
+                lib_logger.warning(
+                    f"Failed to update API key during token refresh: {e}"
+                )
 
             # Ensure _proxy_metadata exists and update timestamp
             if "_proxy_metadata" not in creds_from_file:
                 creds_from_file["_proxy_metadata"] = {}
             creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
 
+            # [VALIDATION] Verify required fields exist after refresh
+            required_fields = ["access_token", "refresh_token", "api_key"]
+            missing_fields = [
+                field for field in required_fields if not creds_from_file.get(field)
+            ]
+            if missing_fields:
+                raise ValueError(
+                    f"Refreshed credentials missing required fields: {missing_fields}"
+                )
+
+            # [BACKOFF TRACKING] Clear failure count on successful refresh
+            self._refresh_failures.pop(path, None)
+            self._next_refresh_after.pop(path, None)
+
             await self._save_credentials(path, creds_from_file)
-            lib_logger.debug(f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'.")
+            lib_logger.debug(
+                f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'."
+            )
             return creds_from_file
 
     async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
@@ -563,7 +720,9 @@ class IFlowAuthBase:
         # Detect credential type
         if os.path.isfile(credential_identifier):
             # OAuth credential: file path to JSON
-            lib_logger.debug(f"Using OAuth credentials from file: {credential_identifier}")
+            lib_logger.debug(
+                f"Using OAuth credentials from file: {credential_identifier}"
+            )
             creds = await self._load_credentials(credential_identifier)
 
             # Check if token needs refresh
@@ -584,16 +743,21 @@ class IFlowAuthBase:
     async def proactively_refresh(self, credential_identifier: str):
         """
         Proactively refreshes tokens if they're close to expiry.
-        Only applies to OAuth credentials (file paths). Direct API keys are skipped.
+        Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
         """
-        # Only refresh if it's an OAuth credential (file path)
-        if not os.path.isfile(credential_identifier):
+        # Check if it's an env:// virtual path (OAuth credentials from environment)
+        is_env_path = credential_identifier.startswith("env://")
+
+        # Only refresh if it's an OAuth credential (file path or env:// path)
+        if not is_env_path and not os.path.isfile(credential_identifier):
             return  # Direct API key, no refresh needed
 
         creds = await self._load_credentials(credential_identifier)
         if self._is_token_expired(creds):
             # Queue for refresh with needs_reauth=False (automated refresh)
-            await self._queue_refresh(credential_identifier, force=False, needs_reauth=False)
+            await self._queue_refresh(
+                credential_identifier, force=False, needs_reauth=False
+            )
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
         """Gets or creates a lock for the given credential path."""
@@ -610,11 +774,15 @@ class IFlowAuthBase:
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
         if self._queue_processor_task is None or self._queue_processor_task.done():
-            self._queue_processor_task = asyncio.create_task(self._process_refresh_queue())
+            self._queue_processor_task = asyncio.create_task(
+                self._process_refresh_queue()
+            )
 
-    async def _queue_refresh(self, path: str, force: bool = False, needs_reauth: bool = False):
+    async def _queue_refresh(
+        self, path: str, force: bool = False, needs_reauth: bool = False
+    ):
         """Add a credential to the refresh queue if not already queued.
-        
+
         Args:
             path: Credential file path
             force: Force refresh even if not expired
@@ -629,9 +797,11 @@ class IFlowAuthBase:
                 if now < backoff_until:
                     # Credential is in backoff for automated refresh, do not queue
                     remaining = int(backoff_until - now)
-                    lib_logger.debug(f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)")
+                    lib_logger.debug(
+                        f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
+                    )
                     return
-        
+
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
@@ -647,14 +817,13 @@ class IFlowAuthBase:
                 # Wait for an item with timeout to allow graceful shutdown
                 try:
                     path, force, needs_reauth = await asyncio.wait_for(
-                        self._refresh_queue.get(), 
-                        timeout=60.0
+                        self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
                     # No items for 60s, exit to save resources
                     self._queue_processor_task = None
                     return
-                
+
                 try:
                     # Perform the actual refresh (still using per-credential lock)
                     async with await self._get_lock(path):
@@ -665,16 +834,16 @@ class IFlowAuthBase:
                             async with self._queue_tracking_lock:
                                 self._unavailable_credentials.discard(path)
                             continue
-                        
+
                         # Perform refresh
                         if not creds:
                             creds = await self._load_credentials(path)
                         await self._refresh_token(path, force=force)
-                        
+
                         # SUCCESS: Mark as available again
                         async with self._queue_tracking_lock:
                             self._unavailable_credentials.discard(path)
-                        
+
                 finally:
                     # Remove from queued set
                     async with self._queue_tracking_lock:
@@ -689,7 +858,9 @@ class IFlowAuthBase:
                     async with self._queue_tracking_lock:
                         self._unavailable_credentials.discard(path)
 
-    async def initialize_token(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+    async def initialize_token(
+        self, creds_or_path: Union[Dict[str, Any], str]
+    ) -> Dict[str, Any]:
         """
         Initiates OAuth authorization code flow if tokens are missing or invalid.
         Uses local callback server to receive authorization code.
@@ -698,14 +869,18 @@ class IFlowAuthBase:
 
         # Get display name from metadata if available, otherwise derive from path
         if isinstance(creds_or_path, dict):
-            display_name = creds_or_path.get("_proxy_metadata", {}).get("display_name", "in-memory object")
+            display_name = creds_or_path.get("_proxy_metadata", {}).get(
+                "display_name", "in-memory object"
+            )
         else:
             display_name = Path(path).name if path else "in-memory object"
 
         lib_logger.debug(f"Initializing iFlow token for '{display_name}'...")
 
         try:
-            creds = await self._load_credentials(creds_or_path) if path else creds_or_path
+            creds = (
+                await self._load_credentials(creds_or_path) if path else creds_or_path
+            )
 
             reason = ""
             if not creds.get("refresh_token"):
@@ -719,11 +894,15 @@ class IFlowAuthBase:
                     try:
                         return await self._refresh_token(path)
                     except Exception as e:
-                        lib_logger.warning(f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login.")
+                        lib_logger.warning(
+                            f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login."
+                        )
 
                 # Interactive OAuth flow
-                lib_logger.warning(f"iFlow OAuth token for '{display_name}' needs setup: {reason}.")
-                
+                lib_logger.warning(
+                    f"iFlow OAuth token for '{display_name}' needs setup: {reason}."
+                )
+
                 # [HEADLESS DETECTION] Check if running in headless environment
                 is_headless = is_headless_environment()
 
@@ -737,7 +916,7 @@ class IFlowAuthBase:
                     "type": "phone",
                     "redirect": redirect_uri,
                     "state": state,
-                    "client_id": IFLOW_CLIENT_ID
+                    "client_id": IFLOW_CLIENT_ID,
                 }
                 auth_url = f"{IFLOW_OAUTH_AUTHORIZE_ENDPOINT}?{urlencode(auth_params)}"
 
@@ -761,49 +940,86 @@ class IFlowAuthBase:
                             "2. [bold]Authorize the application[/bold] to access your account.\n"
                             "3. You will be automatically redirected after authorization."
                         )
-                    
-                    console.print(Panel(auth_panel_text, title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]", style="bold blue"))
-                    console.print(f"[bold]URL:[/bold] [link={auth_url}]{auth_url}[/link]\n")
+
+                    console.print(
+                        Panel(
+                            auth_panel_text,
+                            title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                            style="bold blue",
+                        )
+                    )
+                    # [URL DISPLAY] Print URL with proper escaping to prevent Rich markup issues.
+                    # IMPORTANT: OAuth URLs contain special characters (=, &, etc.) that Rich might
+                    # interpret as markup in some terminal configurations. We escape the URL to
+                    # ensure it displays correctly.
+                    #
+                    # KNOWN ISSUE: If Rich rendering fails entirely (e.g., terminal doesn't support
+                    # ANSI codes, or output is piped), the escaped URL should still be valid.
+                    # However, if the terminal strips or mangles the output, users should copy
+                    # the URL directly from logs or use --verbose to see the raw URL.
+                    #
+                    # The [link=...] markup creates a clickable hyperlink in supported terminals
+                    # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
+                    # which can be safely copied even if the hyperlink doesn't work.
+                    escaped_url = rich_escape(auth_url)
+                    console.print(
+                        f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n"
+                    )
 
                     # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
                     if not is_headless:
                         try:
                             webbrowser.open(auth_url)
-                            lib_logger.info("Browser opened successfully for iFlow OAuth flow")
+                            lib_logger.info(
+                                "Browser opened successfully for iFlow OAuth flow"
+                            )
                         except Exception as e:
-                            lib_logger.warning(f"Failed to open browser automatically: {e}. Please open the URL manually.")
+                            lib_logger.warning(
+                                f"Failed to open browser automatically: {e}. Please open the URL manually."
+                            )
 
                     # Wait for callback
-                    with console.status("[bold green]Waiting for authorization in the browser...[/bold green]", spinner="dots"):
+                    with console.status(
+                        "[bold green]Waiting for authorization in the browser...[/bold green]",
+                        spinner="dots",
+                    ):
                         code = await callback_server.wait_for_callback(timeout=300.0)
 
-                    lib_logger.info("Received authorization code, exchanging for tokens...")
+                    lib_logger.info(
+                        "Received authorization code, exchanging for tokens..."
+                    )
 
                     # Exchange code for tokens and API key
-                    token_data = await self._exchange_code_for_tokens(code, redirect_uri)
+                    token_data = await self._exchange_code_for_tokens(
+                        code, redirect_uri
+                    )
 
                     # Update credentials
-                    creds.update({
-                        "access_token": token_data["access_token"],
-                        "refresh_token": token_data["refresh_token"],
-                        "api_key": token_data["api_key"],
-                        "email": token_data["email"],
-                        "expiry_date": token_data["expiry_date"],
-                        "token_type": token_data["token_type"],
-                        "scope": token_data["scope"]
-                    })
+                    creds.update(
+                        {
+                            "access_token": token_data["access_token"],
+                            "refresh_token": token_data["refresh_token"],
+                            "api_key": token_data["api_key"],
+                            "email": token_data["email"],
+                            "expiry_date": token_data["expiry_date"],
+                            "token_type": token_data["token_type"],
+                            "scope": token_data["scope"],
+                        }
+                    )
 
                     # Create metadata object
                     if not creds.get("_proxy_metadata"):
                         creds["_proxy_metadata"] = {
                             "email": token_data["email"],
-                            "last_check_timestamp": time.time()
+                            "last_check_timestamp": time.time(),
                         }
 
                     if path:
                         await self._save_credentials(path, creds)
 
-                    lib_logger.info(f"iFlow OAuth initialized successfully for '{display_name}'.")
+                    lib_logger.info(
+                        f"iFlow OAuth initialized successfully for '{display_name}'."
+                    )
                     return creds
 
                 finally:
@@ -830,11 +1046,15 @@ class IFlowAuthBase:
 
         return {"Authorization": f"Bearer {api_key}"}
 
-    async def get_user_info(self, creds_or_path: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+    async def get_user_info(
+        self, creds_or_path: Union[Dict[str, Any], str]
+    ) -> Dict[str, Any]:
         """Retrieves user info from the _proxy_metadata in the credential file."""
         try:
             path = creds_or_path if isinstance(creds_or_path, str) else None
-            creds = await self._load_credentials(creds_or_path) if path else creds_or_path
+            creds = (
+                await self._load_credentials(creds_or_path) if path else creds_or_path
+            )
 
             # Ensure the token is valid
             if path:
@@ -844,7 +1064,9 @@ class IFlowAuthBase:
             email = creds.get("email") or creds.get("_proxy_metadata", {}).get("email")
 
             if not email:
-                lib_logger.warning(f"No email found in iFlow credentials for '{path or 'in-memory object'}'.")
+                lib_logger.warning(
+                    f"No email found in iFlow credentials for '{path or 'in-memory object'}'."
+                )
 
             # Update timestamp on check
             if path and "_proxy_metadata" in creds:

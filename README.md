@@ -27,6 +27,23 @@ This project provides a powerful solution for developers building complex applic
 -   **Provider Agnostic**: Compatible with any provider supported by `litellm`.
 -   **OpenAI-Compatible Proxy**: Offers a familiar API interface with additional endpoints for model and provider discovery.
 -   **Advanced Model Filtering**: Supports both blacklists and whitelists to give you fine-grained control over which models are available through the proxy.
+
+-   **🆕 Antigravity Provider**: Full support for Google's internal Antigravity API, providing access to Gemini 3 and Claude models with advanced features:
+    - **🚀 Claude Opus 4.5** - Anthropic's most powerful model (thinking mode only)
+    - **Claude Sonnet 4.5** - Supports both thinking and non-thinking modes
+    - **Gemini 3 Pro** - With thinkingLevel support (low/high)
+    - Credential prioritization with automatic paid/free tier detection
+    - Thought signature caching for multi-turn conversations
+    - Tool hallucination prevention via parameter signature injection
+    - Automatic thinking block sanitization for Claude models (with recovery strategies)
+    - Note: Claude thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
+-   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
+-   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.
+-   **🆕 Enhanced Gemini CLI**: Improved project discovery, paid vs free tier detection, and Gemini 3 support with thoughtSignature caching.
+-   **🆕 Temperature Override**: Global temperature=0 override option to prevent tool hallucination issues with low-temperature settings.
+-   **🆕 Provider Cache System**: Modular caching system for preserving conversation state (thought signatures, thinking content) across requests.
+-   **🆕 Refactored OAuth Base**: Shared [`GoogleOAuthBase`](src/rotator_library/providers/google_oauth_base.py) class eliminates code duplication across OAuth providers.
+
 -   **🆕 Interactive Launcher TUI**: Beautiful, cross-platform TUI for configuration and management with an integrated settings tool for advanced configuration.
 
 
@@ -234,11 +251,12 @@ python src/proxy_app/main.py
 
 **Main Menu Features:**
 
-1. **Add OAuth Credential** - Interactive OAuth flow for Gemini CLI, Qwen Code, and iFlow
+1. **Add OAuth Credential** - Interactive OAuth flow for Gemini CLI, Antigravity, Qwen Code, and iFlow
    - Automatically opens your browser for authentication
    - Handles the entire OAuth flow including callbacks
    - Saves credentials to the local `oauth_creds/` directory
    - For Gemini CLI: Automatically discovers or creates a Google Cloud project
+   - For Antigravity: Similar to Gemini CLI with Antigravity-specific scopes
    - For Qwen Code: Uses Device Code flow (you'll enter a code in your browser)
    - For iFlow: Starts a local callback server on port 11451
 
@@ -488,6 +506,43 @@ The following advanced settings can be added to your `.env` file (or configured 
 -   **`SKIP_OAUTH_INIT_CHECK`**: Set to `true` to skip the interactive OAuth setup/validation check on startup. Essential for non-interactive environments like Docker containers or CI/CD pipelines.
     ```env
     SKIP_OAUTH_INIT_CHECK=true
+
+
+#### **Antigravity (Advanced - Gemini 3 \ Claude Opus 4.5 / Sonnet 4.5 Access)**
+The newest and most sophisticated provider, offering access to cutting-edge models via Google's internal Antigravity API.
+
+**Supported Models:**
+-   Gemini 2.5 (Pro/Flash) with `thinkingBudget` parameter
+-   **Gemini 3 Pro (High/Low)** - Latest preview models
+-   **🆕 Claude Opus 4.5 + Thinking** - Anthropic's most powerful model via Antigravity proxy
+-   **Claude Sonnet 4.5 + Thinking** via Antigravity proxy
+
+**Advanced Features:**
+-   **Thought Signature Caching**: Preserves encrypted signatures for multi-turn Gemini 3 conversations
+-   **Tool Hallucination Prevention**: Automatic system instruction and parameter signature injection for Gemini 3 to prevent tools from being called with incorrect parameters
+-   **Thinking Preservation**: Caches Claude thinking content for consistency across conversation turns
+-   **Automatic Fallback**: Tries sandbox endpoints before falling back to production
+-   **Schema Cleaning**: Handles Claude-specific tool schema requirements
+
+**Configuration:**
+-   **OAuth Setup**: Uses Google OAuth similar to Gemini CLI (separate scopes)
+-   **Stateless Deployment**: Full environment variable support
+-   **Paid Tier Recommended**: Gemini 3 models require a paid Google Cloud project
+
+**Environment Variables:**
+```env
+# Stateless deployment
+ANTIGRAVITY_ACCESS_TOKEN="..."
+ANTIGRAVITY_REFRESH_TOKEN="..."
+ANTIGRAVITY_EXPIRY_DATE="..."
+ANTIGRAVITY_EMAIL="user@gmail.com"
+
+# Feature toggles
+ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true  # Multi-turn conversation support
+ANTIGRAVITY_GEMINI3_TOOL_FIX=true  # Prevent tool hallucination
+```
+
+
     ```
 
 #### Concurrency Control
@@ -516,6 +571,71 @@ For providers that support custom model definitions (Qwen Code, iFlow), you can 
 #### Provider-Specific Settings
 
 -   **`GEMINI_CLI_PROJECT_ID`**: Manually specify a Google Cloud Project ID for Gemini CLI OAuth. Only needed if automatic discovery fails.
+
+
+#### Antigravity Provider
+
+-   **`ANTIGRAVITY_OAUTH_1`**: Path to Antigravity OAuth credential file (auto-discovered from `~/.antigravity/` or use the credential tool).
+    ```env
+    ANTIGRAVITY_OAUTH_1="/path/to/your/antigravity_creds.json"
+    ```
+
+-   **Stateless Deployment** (Environment Variables):
+    ```env
+    ANTIGRAVITY_ACCESS_TOKEN="ya29.your-access-token"
+
+
+#### Credential Rotation Strategy
+
+-   **`ROTATION_TOLERANCE`**: Controls how credentials are selected for requests. Set via environment variable or programmatically.
+    - `0.0`: **Deterministic** - Always selects the least-used credential for perfect load balance
+    - `3.0` (default, recommended): **Weighted Random** - Randomly selects with bias toward less-used credentials. Provides unpredictability (harder to fingerprint/detect) while maintaining good balance
+    - `5.0+`: **High Randomness** - Maximum unpredictability, even heavily-used credentials can be selected
+    
+    ```env
+    # For maximum security/unpredictability (recommended for production)
+    ROTATION_TOLERANCE=3.0
+    
+    # For perfect load balancing (default)
+    ROTATION_TOLERANCE=0.0
+    ```
+    
+    **Why use weighted random?**
+    - Makes traffic patterns less predictable
+    - Still maintains good load distribution across keys
+    - Recommended for production environments with multiple credentials
+
+
+    ANTIGRAVITY_REFRESH_TOKEN="1//your-refresh-token"
+    ANTIGRAVITY_EXPIRY_DATE="1234567890000"
+    ANTIGRAVITY_EMAIL="your-email@gmail.com"
+    ```
+
+-   **`ANTIGRAVITY_ENABLE_SIGNATURE_CACHE`**: Enable/disable thought signature caching for Gemini 3 multi-turn conversations. Default: `true`.
+    ```env
+    ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
+    ```
+
+-   **`ANTIGRAVITY_GEMINI3_TOOL_FIX`**: Enable/disable tool hallucination prevention for Gemini 3 models. Default: `true`.
+    ```env
+    ANTIGRAVITY_GEMINI3_TOOL_FIX=true
+    ```
+
+#### Temperature Override (Global)
+
+-   **`OVERRIDE_TEMPERATURE_ZERO`**: Prevents tool hallucination caused by temperature=0 settings. Modes:
+    - `"remove"`: Deletes temperature=0 from requests (lets provider use default)
+    - `"set"`: Changes temperature=0 to temperature=1.0
+    - `"false"` or unset: Disabled (default)
+
+#### Credential Prioritization
+
+-   **`GEMINI_CLI_PROJECT_ID`**: Manually specify a Google Cloud Project ID for Gemini CLI OAuth. Auto-discovered unless unexpected failure occurs.
+    ```env
+    GEMINI_CLI_PROJECT_ID="your-gcp-project-id"
+    ```
+
+
     ```env
     GEMINI_CLI_PROJECT_ID="your-gcp-project-id"
     ```

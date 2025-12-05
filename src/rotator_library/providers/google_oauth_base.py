@@ -1,23 +1,20 @@
-# src/rotator_library/providers/qwen_auth_base.py
+# src/rotator_library/providers/google_oauth_base.py
 
-import secrets
-import hashlib
-import base64
+import os
+import webbrowser
+from typing import Union, Optional
 import json
 import time
 import asyncio
 import logging
-import webbrowser
-import os
 from pathlib import Path
-from typing import Dict, Any, Tuple, Union, Optional
+from typing import Dict, Any
 import tempfile
 import shutil
 
 import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.text import Text
 from rich.markup import escape as rich_escape
 
@@ -25,18 +22,53 @@ from ..utils.headless_detection import is_headless_environment
 
 lib_logger = logging.getLogger("rotator_library")
 
-CLIENT_ID = (
-    "f0304373b74a44d2b584a3fb70ca9e56"  # https://api.kilocode.ai/extension-config.json
-)
-SCOPE = "openid profile email model.completion"
-TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token"
-REFRESH_EXPIRY_BUFFER_SECONDS = 3 * 60 * 60  # 3 hours buffer before expiry
-
 console = Console()
 
 
-class QwenAuthBase:
+class GoogleOAuthBase:
+    """
+    Base class for Google OAuth2 authentication providers.
+
+    Subclasses must override:
+        - CLIENT_ID: OAuth client ID
+        - CLIENT_SECRET: OAuth client secret
+        - OAUTH_SCOPES: List of OAuth scopes
+        - ENV_PREFIX: Prefix for environment variables (e.g., "GEMINI_CLI", "ANTIGRAVITY")
+
+    Subclasses may optionally override:
+        - CALLBACK_PORT: Local OAuth callback server port (default: 8085)
+        - CALLBACK_PATH: OAuth callback path (default: "/oauth2callback")
+        - REFRESH_EXPIRY_BUFFER_SECONDS: Time buffer before token expiry (default: 30 minutes)
+    """
+
+    # Subclasses MUST override these
+    CLIENT_ID: str = None
+    CLIENT_SECRET: str = None
+    OAUTH_SCOPES: list = None
+    ENV_PREFIX: str = None
+
+    # Subclasses MAY override these
+    TOKEN_URI: str = "https://oauth2.googleapis.com/token"
+    USER_INFO_URI: str = "https://www.googleapis.com/oauth2/v1/userinfo"
+    CALLBACK_PORT: int = 8085
+    CALLBACK_PATH: str = "/oauth2callback"
+    REFRESH_EXPIRY_BUFFER_SECONDS: int = 30 * 60  # 30 minutes
+
     def __init__(self):
+        # Validate that subclass has set required attributes
+        if self.CLIENT_ID is None:
+            raise NotImplementedError(f"{self.__class__.__name__} must set CLIENT_ID")
+        if self.CLIENT_SECRET is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} must set CLIENT_SECRET"
+            )
+        if self.OAUTH_SCOPES is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} must set OAUTH_SCOPES"
+            )
+        if self.ENV_PREFIX is None:
+            raise NotImplementedError(f"{self.__class__.__name__} must set ENV_PREFIX")
+
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
         self._refresh_locks: Dict[str, asyncio.Lock] = {}
         self._locks_lock = (
@@ -67,18 +99,21 @@ class QwenAuthBase:
 
         Supported formats:
         - "env://provider/0" - Legacy single credential (no index in env var names)
-        - "env://provider/1" - First numbered credential (QWEN_CODE_1_ACCESS_TOKEN)
+        - "env://provider/1" - First numbered credential (PROVIDER_1_ACCESS_TOKEN)
+        - "env://provider/2" - Second numbered credential, etc.
 
         Returns:
-            The credential index as string, or None if path is not an env:// path
+            The credential index as string ("0" for legacy, "1", "2", etc. for numbered)
+            or None if path is not an env:// path
         """
         if not path.startswith("env://"):
             return None
 
-        parts = path[6:].split("/")
+        # Parse: env://provider/index
+        parts = path[6:].split("/")  # Remove "env://" prefix
         if len(parts) >= 2:
-            return parts[1]
-        return "0"
+            return parts[1]  # Return the index
+        return "0"  # Default to legacy format
 
     def _load_from_env(
         self, credential_index: Optional[str] = None
@@ -87,25 +122,34 @@ class QwenAuthBase:
         Load OAuth credentials from environment variables for stateless deployments.
 
         Supports two formats:
-        1. Legacy (credential_index="0" or None): QWEN_CODE_ACCESS_TOKEN
-        2. Numbered (credential_index="1", "2", etc.): QWEN_CODE_1_ACCESS_TOKEN, etc.
+        1. Legacy (credential_index="0" or None): PROVIDER_ACCESS_TOKEN
+        2. Numbered (credential_index="1", "2", etc.): PROVIDER_1_ACCESS_TOKEN, PROVIDER_2_ACCESS_TOKEN
 
         Expected environment variables (for numbered format with index N):
-        - QWEN_CODE_{N}_ACCESS_TOKEN (required)
-        - QWEN_CODE_{N}_REFRESH_TOKEN (required)
-        - QWEN_CODE_{N}_EXPIRY_DATE (optional, defaults to 0)
-        - QWEN_CODE_{N}_RESOURCE_URL (optional, defaults to https://portal.qwen.ai/v1)
-        - QWEN_CODE_{N}_EMAIL (optional, defaults to "env-user-{N}")
+        - {ENV_PREFIX}_{N}_ACCESS_TOKEN (required)
+        - {ENV_PREFIX}_{N}_REFRESH_TOKEN (required)
+        - {ENV_PREFIX}_{N}_EXPIRY_DATE (optional, defaults to 0)
+        - {ENV_PREFIX}_{N}_CLIENT_ID (optional, uses default)
+        - {ENV_PREFIX}_{N}_CLIENT_SECRET (optional, uses default)
+        - {ENV_PREFIX}_{N}_TOKEN_URI (optional, uses default)
+        - {ENV_PREFIX}_{N}_UNIVERSE_DOMAIN (optional, defaults to googleapis.com)
+        - {ENV_PREFIX}_{N}_EMAIL (optional, defaults to "env-user-{N}")
+        - {ENV_PREFIX}_{N}_PROJECT_ID (optional)
+        - {ENV_PREFIX}_{N}_TIER (optional)
+
+        For legacy format (index="0" or None), omit the _{N}_ part.
 
         Returns:
             Dict with credential structure if env vars present, None otherwise
         """
         # Determine the env var prefix based on credential index
         if credential_index and credential_index != "0":
-            prefix = f"QWEN_CODE_{credential_index}"
+            # Numbered format: PROVIDER_N_ACCESS_TOKEN
+            prefix = f"{self.ENV_PREFIX}_{credential_index}"
             default_email = f"env-user-{credential_index}"
         else:
-            prefix = "QWEN_CODE"
+            # Legacy format: PROVIDER_ACCESS_TOKEN
+            prefix = self.ENV_PREFIX
             default_email = "env-user"
 
         access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
@@ -115,9 +159,7 @@ class QwenAuthBase:
         if not (access_token and refresh_token):
             return None
 
-        lib_logger.debug(
-            f"Loading Qwen Code credentials from environment variables (prefix: {prefix})"
-        )
+        lib_logger.debug(f"Loading {prefix} credentials from environment variables")
 
         # Parse expiry_date as float, default to 0 if not present
         expiry_str = os.getenv(f"{prefix}_EXPIRY_DATE", "0")
@@ -133,68 +175,89 @@ class QwenAuthBase:
             "access_token": access_token,
             "refresh_token": refresh_token,
             "expiry_date": expiry_date,
-            "resource_url": os.getenv(
-                f"{prefix}_RESOURCE_URL", "https://portal.qwen.ai/v1"
-            ),
+            "client_id": os.getenv(f"{prefix}_CLIENT_ID", self.CLIENT_ID),
+            "client_secret": os.getenv(f"{prefix}_CLIENT_SECRET", self.CLIENT_SECRET),
+            "token_uri": os.getenv(f"{prefix}_TOKEN_URI", self.TOKEN_URI),
+            "universe_domain": os.getenv(f"{prefix}_UNIVERSE_DOMAIN", "googleapis.com"),
             "_proxy_metadata": {
                 "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
-                "loaded_from_env": True,
-                "env_credential_index": credential_index or "0",
+                "loaded_from_env": True,  # Flag to indicate env-based credentials
+                "env_credential_index": credential_index
+                or "0",  # Track which env credential this is
             },
         }
 
+        # Add project_id if provided
+        project_id = os.getenv(f"{prefix}_PROJECT_ID")
+        if project_id:
+            creds["_proxy_metadata"]["project_id"] = project_id
+
+        # Add tier if provided
+        tier = os.getenv(f"{prefix}_TIER")
+        if tier:
+            creds["_proxy_metadata"]["tier"] = tier
+
         return creds
 
-    async def _read_creds_from_file(self, path: str) -> Dict[str, Any]:
-        """Reads credentials from file and populates the cache. No locking."""
-        try:
-            lib_logger.debug(f"Reading Qwen credentials from file: {path}")
-            with open(path, "r") as f:
-                creds = json.load(f)
-            self._credentials_cache[path] = creds
-            return creds
-        except FileNotFoundError:
-            raise IOError(f"Qwen OAuth credential file not found at '{path}'")
-        except Exception as e:
-            raise IOError(f"Failed to load Qwen OAuth credentials from '{path}': {e}")
-
     async def _load_credentials(self, path: str) -> Dict[str, Any]:
-        """Loads credentials from cache, environment variables, or file."""
         if path in self._credentials_cache:
             return self._credentials_cache[path]
 
         async with await self._get_lock(path):
-            # Re-check cache after acquiring lock
             if path in self._credentials_cache:
                 return self._credentials_cache[path]
 
             # Check if this is a virtual env:// path
             credential_index = self._parse_env_credential_path(path)
             if credential_index is not None:
+                # Load from environment variables with specific index
                 env_creds = self._load_from_env(credential_index)
                 if env_creds:
                     lib_logger.info(
-                        f"Using Qwen Code credentials from environment variables (index: {credential_index})"
+                        f"Using {self.ENV_PREFIX} credentials from environment variables (index: {credential_index})"
                     )
                     self._credentials_cache[path] = env_creds
                     return env_creds
                 else:
                     raise IOError(
-                        f"Environment variables for Qwen Code credential index {credential_index} not found"
+                        f"Environment variables for {self.ENV_PREFIX} credential index {credential_index} not found"
                     )
 
-            # For file paths, try loading from legacy env vars first
+            # For file paths, first try loading from legacy env vars (for backwards compatibility)
             env_creds = self._load_from_env()
             if env_creds:
                 lib_logger.info(
-                    "Using Qwen Code credentials from environment variables"
+                    f"Using {self.ENV_PREFIX} credentials from environment variables"
                 )
+                # Cache env-based credentials using the path as key
                 self._credentials_cache[path] = env_creds
                 return env_creds
 
             # Fall back to file-based loading
-            return await self._read_creds_from_file(path)
+            try:
+                lib_logger.debug(
+                    f"Loading {self.ENV_PREFIX} credentials from file: {path}"
+                )
+                with open(path, "r") as f:
+                    creds = json.load(f)
+                # Handle gcloud-style creds file which nest tokens under "credential"
+                if "credential" in creds:
+                    creds = creds["credential"]
+                self._credentials_cache[path] = creds
+                return creds
+            except FileNotFoundError:
+                raise IOError(
+                    f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'"
+                )
+            except Exception as e:
+                raise IOError(
+                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
+                )
+            except Exception as e:
+                raise IOError(
+                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
+                )
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
         # Don't save to file if credentials were loaded from environment
@@ -205,6 +268,7 @@ class QwenAuthBase:
             return
 
         # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
+        # This prevents credential corruption if the process is interrupted during write
         parent_dir = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent_dir, exist_ok=True)
 
@@ -232,15 +296,15 @@ class QwenAuthBase:
             shutil.move(tmp_path, path)
             tmp_path = None  # Successfully moved
 
-            # Update cache AFTER successful file write
+            # Update cache AFTER successful file write (prevents cache/file inconsistency)
             self._credentials_cache[path] = creds
             lib_logger.debug(
-                f"Saved updated Qwen OAuth credentials to '{path}' (atomic write)."
+                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}' (atomic write)."
             )
 
         except Exception as e:
             lib_logger.error(
-                f"Failed to save updated Qwen OAuth credentials to '{path}': {e}"
+                f"Failed to save updated {self.ENV_PREFIX} OAuth credentials to '{path}': {e}"
             )
             # Clean up temp file if it still exists
             if tmp_fd is not None:
@@ -256,26 +320,29 @@ class QwenAuthBase:
             raise
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
-        expiry_timestamp = creds.get("expiry_date", 0) / 1000
-        return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
+        expiry = creds.get("token_expiry")  # gcloud format
+        if not expiry:  # gemini-cli format
+            expiry_timestamp = creds.get("expiry_date", 0) / 1000
+        else:
+            expiry_timestamp = time.mktime(time.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ"))
+        return expiry_timestamp < time.time() + self.REFRESH_EXPIRY_BUFFER_SECONDS
 
-    async def _refresh_token(self, path: str, force: bool = False) -> Dict[str, Any]:
+    async def _refresh_token(
+        self, path: str, creds: Dict[str, Any], force: bool = False
+    ) -> Dict[str, Any]:
         async with await self._get_lock(path):
-            cached_creds = self._credentials_cache.get(path)
-            if not force and cached_creds and not self._is_token_expired(cached_creds):
-                return cached_creds
+            # Skip the expiry check if a refresh is being forced
+            if not force and not self._is_token_expired(
+                self._credentials_cache.get(path, creds)
+            ):
+                return self._credentials_cache.get(path, creds)
 
-            # If cache is empty, read from file. This is safe because we hold the lock.
-            if path not in self._credentials_cache:
-                await self._read_creds_from_file(path)
-
-            creds_from_file = self._credentials_cache[path]
-
-            lib_logger.debug(f"Refreshing Qwen OAuth token for '{Path(path).name}'...")
-            refresh_token = creds_from_file.get("refresh_token")
+            lib_logger.debug(
+                f"Refreshing {self.ENV_PREFIX} OAuth token for '{Path(path).name}' (forced: {force})..."
+            )
+            refresh_token = creds.get("refresh_token")
             if not refresh_token:
-                lib_logger.error(f"No refresh_token found in '{Path(path).name}'")
-                raise ValueError("No refresh_token found in Qwen credentials file.")
+                raise ValueError("No refresh_token found in credentials file.")
 
             # [RETRY LOGIC] Implement exponential backoff for transient errors
             max_retries = 3
@@ -283,39 +350,31 @@ class QwenAuthBase:
             last_error = None
             needs_reauth = False
 
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            }
-
             async with httpx.AsyncClient() as client:
                 for attempt in range(max_retries):
                     try:
                         response = await client.post(
-                            TOKEN_ENDPOINT,
-                            headers=headers,
+                            self.TOKEN_URI,
                             data={
-                                "grant_type": "refresh_token",
+                                "client_id": creds.get("client_id", self.CLIENT_ID),
+                                "client_secret": creds.get(
+                                    "client_secret", self.CLIENT_SECRET
+                                ),
                                 "refresh_token": refresh_token,
-                                "client_id": CLIENT_ID,
+                                "grant_type": "refresh_token",
                             },
                             timeout=30.0,
                         )
                         response.raise_for_status()
                         new_token_data = response.json()
-                        break  # Success
+                        break  # Success, exit retry loop
 
                     except httpx.HTTPStatusError as e:
                         last_error = e
                         status_code = e.response.status_code
-                        error_body = e.response.text
-                        lib_logger.error(
-                            f"HTTP {status_code} for '{Path(path).name}': {error_body}"
-                        )
 
                         # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
-                        if status_code in (401, 403):
+                        if status_code == 401 or status_code == 403:
                             lib_logger.warning(
                                 f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
                                 f"Token may have been revoked or expired. Starting re-authentication..."
@@ -324,6 +383,7 @@ class QwenAuthBase:
                             break  # Exit retry loop to trigger re-auth
 
                         elif status_code == 429:
+                            # Rate limit - honor Retry-After header if present
                             retry_after = int(e.response.headers.get("Retry-After", 60))
                             lib_logger.warning(
                                 f"Rate limited (HTTP 429), retry after {retry_after}s"
@@ -333,20 +393,23 @@ class QwenAuthBase:
                                 continue
                             raise
 
-                        elif 500 <= status_code < 600:
+                        elif status_code >= 500 and status_code < 600:
+                            # Server error - retry with exponential backoff
                             if attempt < max_retries - 1:
-                                wait_time = 2**attempt
+                                wait_time = 2**attempt  # 1s, 2s, 4s
                                 lib_logger.warning(
                                     f"Server error (HTTP {status_code}), retry {attempt + 1}/{max_retries} in {wait_time}s"
                                 )
                                 await asyncio.sleep(wait_time)
                                 continue
-                            raise
+                            raise  # Final attempt failed
 
                         else:
+                            # Other errors - don't retry
                             raise
 
                     except (httpx.RequestError, httpx.TimeoutException) as e:
+                        # Network errors - retry with backoff
                         last_error = e
                         if attempt < max_retries - 1:
                             wait_time = 2**attempt
@@ -365,129 +428,98 @@ class QwenAuthBase:
                 try:
                     # Call initialize_token to trigger OAuth flow
                     new_creds = await self.initialize_token(path)
-                    # Clear backoff on successful re-auth
-                    self._refresh_failures.pop(path, None)
-                    self._next_refresh_after.pop(path, None)
                     return new_creds
                 except Exception as reauth_error:
                     lib_logger.error(
                         f"Re-authentication failed for '{Path(path).name}': {reauth_error}"
                     )
-                    # [BACKOFF TRACKING] Increment failure count and set backoff timer
-                    self._refresh_failures[path] = (
-                        self._refresh_failures.get(path, 0) + 1
-                    )
-                    backoff_seconds = min(
-                        300, 30 * (2 ** self._refresh_failures[path])
-                    )  # Max 5 min backoff
-                    self._next_refresh_after[path] = time.time() + backoff_seconds
-                    lib_logger.debug(
-                        f"Setting backoff for '{Path(path).name}': {backoff_seconds}s"
-                    )
                     raise ValueError(
                         f"Refresh token invalid and re-authentication failed: {reauth_error}"
                     )
 
+            # If we exhausted retries without success
             if new_token_data is None:
-                # [BACKOFF TRACKING] Increment failure count and set backoff timer
-                self._refresh_failures[path] = self._refresh_failures.get(path, 0) + 1
-                backoff_seconds = min(
-                    300, 30 * (2 ** self._refresh_failures[path])
-                )  # Max 5 min backoff
-                self._next_refresh_after[path] = time.time() + backoff_seconds
-                lib_logger.debug(
-                    f"Setting backoff for '{Path(path).name}': {backoff_seconds}s"
-                )
                 raise last_error or Exception("Token refresh failed after all retries")
 
-            creds_from_file["access_token"] = new_token_data["access_token"]
-            creds_from_file["refresh_token"] = new_token_data.get(
-                "refresh_token", creds_from_file["refresh_token"]
-            )
-            creds_from_file["expiry_date"] = (
-                time.time() + new_token_data["expires_in"]
-            ) * 1000
-            creds_from_file["resource_url"] = new_token_data.get(
-                "resource_url", creds_from_file.get("resource_url")
-            )
+            # [FIX 1] Update OAuth token fields from response
+            creds["access_token"] = new_token_data["access_token"]
+            expiry_timestamp = time.time() + new_token_data["expires_in"]
+            creds["expiry_date"] = expiry_timestamp * 1000  # gemini-cli format
 
-            # Ensure _proxy_metadata exists and update timestamp
-            if "_proxy_metadata" not in creds_from_file:
-                creds_from_file["_proxy_metadata"] = {}
-            creds_from_file["_proxy_metadata"]["last_check_timestamp"] = time.time()
+            # [FIX 2] Update refresh_token if server provided a new one (rare but possible with Google OAuth)
+            if "refresh_token" in new_token_data:
+                creds["refresh_token"] = new_token_data["refresh_token"]
 
-            # [VALIDATION] Verify required fields exist after refresh
-            required_fields = ["access_token", "refresh_token"]
+            # [FIX 3] Ensure all required OAuth client fields are present (restore if missing)
+            if "client_id" not in creds or not creds["client_id"]:
+                creds["client_id"] = self.CLIENT_ID
+            if "client_secret" not in creds or not creds["client_secret"]:
+                creds["client_secret"] = self.CLIENT_SECRET
+            if "token_uri" not in creds or not creds["token_uri"]:
+                creds["token_uri"] = self.TOKEN_URI
+            if "universe_domain" not in creds or not creds["universe_domain"]:
+                creds["universe_domain"] = "googleapis.com"
+
+            # [FIX 4] Add scopes array if missing
+            if "scopes" not in creds:
+                creds["scopes"] = self.OAUTH_SCOPES
+
+            # [FIX 5] Ensure _proxy_metadata exists and update timestamp
+            if "_proxy_metadata" not in creds:
+                creds["_proxy_metadata"] = {}
+            creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
+            # [VALIDATION] Verify refreshed credentials have all required fields
+            required_fields = [
+                "access_token",
+                "refresh_token",
+                "client_id",
+                "client_secret",
+                "token_uri",
+            ]
             missing_fields = [
-                field for field in required_fields if not creds_from_file.get(field)
+                field for field in required_fields if not creds.get(field)
             ]
             if missing_fields:
                 raise ValueError(
                     f"Refreshed credentials missing required fields: {missing_fields}"
                 )
 
-            # [BACKOFF TRACKING] Clear failure count on successful refresh
-            self._refresh_failures.pop(path, None)
-            self._next_refresh_after.pop(path, None)
+            # [VALIDATION] Optional: Test that the refreshed token is actually usable
+            try:
+                async with httpx.AsyncClient() as client:
+                    test_response = await client.get(
+                        self.USER_INFO_URI,
+                        headers={"Authorization": f"Bearer {creds['access_token']}"},
+                        timeout=5.0,
+                    )
+                    test_response.raise_for_status()
+                    lib_logger.debug(
+                        f"Token validation successful for '{Path(path).name}'"
+                    )
+            except Exception as e:
+                lib_logger.warning(
+                    f"Refreshed token validation failed for '{Path(path).name}': {e}"
+                )
+                # Don't fail the refresh - the token might still work for other endpoints
+                # But log it for debugging purposes
 
-            await self._save_credentials(path, creds_from_file)
+            await self._save_credentials(path, creds)
             lib_logger.debug(
-                f"Successfully refreshed Qwen OAuth token for '{Path(path).name}'."
+                f"Successfully refreshed {self.ENV_PREFIX} OAuth token for '{Path(path).name}'."
             )
-            return creds_from_file
+            return creds
 
-    async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
-        """
-        Returns the API base URL and access token.
-
-        Supports both credential types:
-        - OAuth: credential_identifier is a file path to JSON credentials
-        - API Key: credential_identifier is the API key string itself
-        """
-        # Detect credential type
-        if os.path.isfile(credential_identifier):
-            # OAuth credential: file path to JSON
-            lib_logger.debug(
-                f"Using OAuth credentials from file: {credential_identifier}"
-            )
-            creds = await self._load_credentials(credential_identifier)
-
-            if self._is_token_expired(creds):
-                creds = await self._refresh_token(credential_identifier)
-
-            base_url = creds.get("resource_url", "https://portal.qwen.ai/v1")
-            if not base_url.startswith("http"):
-                base_url = f"https://{base_url}"
-            access_token = creds["access_token"]
-        else:
-            # Direct API key: use as-is
-            lib_logger.debug("Using direct API key for Qwen Code")
-            base_url = "https://portal.qwen.ai/v1"
-            access_token = credential_identifier
-
-        return base_url, access_token
-
-    async def proactively_refresh(self, credential_identifier: str):
-        """
-        Proactively refreshes tokens if they're close to expiry.
-        Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
-        """
-        # Check if it's an env:// virtual path (OAuth credentials from environment)
-        is_env_path = credential_identifier.startswith("env://")
-
-        # Only refresh if it's an OAuth credential (file path or env:// path)
-        if not is_env_path and not os.path.isfile(credential_identifier):
-            return  # Direct API key, no refresh needed
-
-        creds = await self._load_credentials(credential_identifier)
+    async def proactively_refresh(self, credential_path: str):
+        """Proactively refresh a credential by queueing it for refresh."""
+        creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
             # Queue for refresh with needs_reauth=False (automated refresh)
-            await self._queue_refresh(
-                credential_identifier, force=False, needs_reauth=False
-            )
+            await self._queue_refresh(credential_path, force=False, needs_reauth=False)
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
         # [FIX RACE CONDITION] Protect lock creation with a master lock
+        # This prevents TOCTOU bug where multiple coroutines check and create simultaneously
         async with self._locks_lock:
             if path not in self._refresh_locks:
                 self._refresh_locks[path] = asyncio.Lock()
@@ -564,7 +596,7 @@ class QwenAuthBase:
                         # Perform refresh
                         if not creds:
                             creds = await self._load_credentials(path)
-                        await self._refresh_token(path, force=force)
+                        await self._refresh_token(path, creds, force=force)
 
                         # SUCCESS: Mark as available again
                         async with self._queue_tracking_lock:
@@ -587,7 +619,6 @@ class QwenAuthBase:
     async def initialize_token(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
-        """Initiates device flow if tokens are missing or invalid."""
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
         # Get display name from metadata if available, otherwise derive from path
@@ -598,12 +629,13 @@ class QwenAuthBase:
         else:
             display_name = Path(path).name if path else "in-memory object"
 
-        lib_logger.debug(f"Initializing Qwen token for '{display_name}'...")
+        lib_logger.debug(
+            f"Initializing {self.ENV_PREFIX} token for '{display_name}'..."
+        )
         try:
             creds = (
                 await self._load_credentials(creds_or_path) if path else creds_or_path
             )
-
             reason = ""
             if not creds.get("refresh_token"):
                 reason = "refresh token is missing"
@@ -613,80 +645,95 @@ class QwenAuthBase:
             if reason:
                 if reason == "token is expired" and creds.get("refresh_token"):
                     try:
-                        return await self._refresh_token(path)
+                        return await self._refresh_token(path, creds)
                     except Exception as e:
                         lib_logger.warning(
                             f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login."
                         )
 
                 lib_logger.warning(
-                    f"Qwen OAuth token for '{display_name}' needs setup: {reason}."
+                    f"{self.ENV_PREFIX} OAuth token for '{display_name}' needs setup: {reason}."
                 )
 
                 # [HEADLESS DETECTION] Check if running in headless environment
                 is_headless = is_headless_environment()
 
-                code_verifier = (
-                    base64.urlsafe_b64encode(secrets.token_bytes(32))
-                    .decode("utf-8")
-                    .rstrip("=")
-                )
-                code_challenge = (
-                    base64.urlsafe_b64encode(
-                        hashlib.sha256(code_verifier.encode("utf-8")).digest()
-                    )
-                    .decode("utf-8")
-                    .rstrip("=")
-                )
+                auth_code_future = asyncio.get_event_loop().create_future()
+                server = None
 
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                }
-                async with httpx.AsyncClient() as client:
-                    request_data = {
-                        "client_id": CLIENT_ID,
-                        "scope": SCOPE,
-                        "code_challenge": code_challenge,
-                        "code_challenge_method": "S256",
-                    }
-                    lib_logger.debug(f"Qwen device code request data: {request_data}")
+                async def handle_callback(reader, writer):
                     try:
-                        dev_response = await client.post(
-                            "https://chat.qwen.ai/api/v1/oauth2/device/code",
-                            headers=headers,
-                            data=request_data,
+                        request_line_bytes = await reader.readline()
+                        if not request_line_bytes:
+                            return
+                        path_str = (
+                            request_line_bytes.decode("utf-8").strip().split(" ")[1]
                         )
-                        dev_response.raise_for_status()
-                        dev_data = dev_response.json()
-                        lib_logger.debug(f"Qwen device auth response: {dev_data}")
-                    except httpx.HTTPStatusError as e:
-                        lib_logger.error(
-                            f"Qwen device code request failed with status {e.response.status_code}: {e.response.text}"
+                        while await reader.readline() != b"\r\n":
+                            pass
+                        from urllib.parse import urlparse, parse_qs
+
+                        query_params = parse_qs(urlparse(path_str).query)
+                        writer.write(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
                         )
-                        raise e
+                        if "code" in query_params:
+                            if not auth_code_future.done():
+                                auth_code_future.set_result(query_params["code"][0])
+                            writer.write(
+                                b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>"
+                            )
+                        else:
+                            error = query_params.get("error", ["Unknown error"])[0]
+                            if not auth_code_future.done():
+                                auth_code_future.set_exception(
+                                    Exception(f"OAuth failed: {error}")
+                                )
+                            writer.write(
+                                f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode()
+                            )
+                        await writer.drain()
+                    except Exception as e:
+                        lib_logger.error(f"Error in OAuth callback handler: {e}")
+                    finally:
+                        writer.close()
+
+                try:
+                    server = await asyncio.start_server(
+                        handle_callback, "127.0.0.1", self.CALLBACK_PORT
+                    )
+                    from urllib.parse import urlencode
+
+                    auth_url = (
+                        "https://accounts.google.com/o/oauth2/v2/auth?"
+                        + urlencode(
+                            {
+                                "client_id": self.CLIENT_ID,
+                                "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                                "scope": " ".join(self.OAUTH_SCOPES),
+                                "access_type": "offline",
+                                "response_type": "code",
+                                "prompt": "consent",
+                            }
+                        )
+                    )
 
                     # [HEADLESS SUPPORT] Display appropriate instructions
                     if is_headless:
                         auth_panel_text = Text.from_markup(
                             "Running in headless environment (no GUI detected).\n"
                             "Please open the URL below in a browser on another machine to authorize:\n"
-                            "1. Visit the URL below to sign in.\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
-                            "3. You will be prompted to enter your identifier after authorization."
                         )
                     else:
                         auth_panel_text = Text.from_markup(
-                            "1. Visit the URL below to sign in.\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
-                            "3. You will be prompted to enter your identifier after authorization."
+                            "1. Your browser will now open to log in and authorize the application.\n"
+                            "2. If it doesn't open automatically, please open the URL below manually."
                         )
 
                     console.print(
                         Panel(
                             auth_panel_text,
-                            title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                            title=f"{self.ENV_PREFIX} OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
                             style="bold blue",
                         )
                     )
@@ -703,154 +750,130 @@ class QwenAuthBase:
                     # The [link=...] markup creates a clickable hyperlink in supported terminals
                     # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
                     # which can be safely copied even if the hyperlink doesn't work.
-                    verification_url = dev_data["verification_uri_complete"]
-                    escaped_url = rich_escape(verification_url)
+                    escaped_url = rich_escape(auth_url)
                     console.print(
-                        f"[bold]URL:[/bold] [link={verification_url}]{escaped_url}[/link]\n"
+                        f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n"
                     )
 
                     # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
                     if not is_headless:
                         try:
-                            webbrowser.open(dev_data["verification_uri_complete"])
+                            webbrowser.open(auth_url)
                             lib_logger.info(
-                                "Browser opened successfully for Qwen OAuth flow"
+                                "Browser opened successfully for OAuth flow"
                             )
                         except Exception as e:
                             lib_logger.warning(
                                 f"Failed to open browser automatically: {e}. Please open the URL manually."
                             )
 
-                    token_data = None
-                    start_time = time.time()
-                    interval = dev_data.get("interval", 5)
-
                     with console.status(
-                        "[bold green]Polling for token, please complete authentication in the browser...[/bold green]",
+                        f"[bold green]Waiting for you to complete authentication in the browser...[/bold green]",
                         spinner="dots",
-                    ) as status:
-                        while time.time() - start_time < dev_data["expires_in"]:
-                            poll_response = await client.post(
-                                TOKEN_ENDPOINT,
-                                headers=headers,
-                                data={
-                                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                                    "device_code": dev_data["device_code"],
-                                    "client_id": CLIENT_ID,
-                                    "code_verifier": code_verifier,
-                                },
-                            )
-                            if poll_response.status_code == 200:
-                                token_data = poll_response.json()
-                                lib_logger.info("Successfully received token.")
-                                break
-                            elif poll_response.status_code == 400:
-                                poll_data = poll_response.json()
-                                error_type = poll_data.get("error")
-                                if error_type == "authorization_pending":
-                                    lib_logger.debug(
-                                        f"Polling status: {error_type}, waiting {interval}s"
-                                    )
-                                elif error_type == "slow_down":
-                                    interval = int(interval * 1.5)
-                                    if interval > 10:
-                                        interval = 10
-                                    lib_logger.debug(
-                                        f"Polling status: {error_type}, waiting {interval}s"
-                                    )
-                                else:
-                                    raise ValueError(
-                                        f"Token polling failed: {poll_data.get('error_description', error_type)}"
-                                    )
-                            else:
-                                poll_response.raise_for_status()
+                    ):
+                        auth_code = await asyncio.wait_for(
+                            auth_code_future, timeout=300
+                        )
+                except asyncio.TimeoutError:
+                    raise Exception("OAuth flow timed out. Please try again.")
+                finally:
+                    if server:
+                        server.close()
+                        await server.wait_closed()
 
-                            await asyncio.sleep(interval)
-
-                    if not token_data:
-                        raise TimeoutError("Qwen device flow timed out.")
-
-                    creds.update(
-                        {
-                            "access_token": token_data["access_token"],
-                            "refresh_token": token_data.get("refresh_token"),
-                            "expiry_date": (time.time() + token_data["expires_in"])
-                            * 1000,
-                            "resource_url": token_data.get("resource_url"),
-                        }
+                lib_logger.info(
+                    f"Attempting to exchange authorization code for tokens..."
+                )
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        self.TOKEN_URI,
+                        data={
+                            "code": auth_code.strip(),
+                            "client_id": self.CLIENT_ID,
+                            "client_secret": self.CLIENT_SECRET,
+                            "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                            "grant_type": "authorization_code",
+                        },
                     )
+                    response.raise_for_status()
+                    token_data = response.json()
+                    # Start with the full token data from the exchange
+                    creds = token_data.copy()
 
-                    # Prompt for user identifier and create metadata object if needed
-                    if not creds.get("_proxy_metadata", {}).get("email"):
-                        try:
-                            prompt_text = Text.from_markup(
-                                f"\\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]"
-                            )
-                            email = Prompt.ask(prompt_text)
-                            creds["_proxy_metadata"] = {
-                                "email": email.strip(),
-                                "last_check_timestamp": time.time(),
-                            }
-                        except (EOFError, KeyboardInterrupt):
-                            console.print(
-                                "\\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]"
-                            )
-                            creds["_proxy_metadata"] = {
-                                "email": None,
-                                "last_check_timestamp": time.time(),
-                            }
+                    # Convert 'expires_in' to 'expiry_date' in milliseconds
+                    creds["expiry_date"] = (
+                        time.time() + creds.pop("expires_in")
+                    ) * 1000
+
+                    # Ensure client_id and client_secret are present
+                    creds["client_id"] = self.CLIENT_ID
+                    creds["client_secret"] = self.CLIENT_SECRET
+
+                    creds["token_uri"] = self.TOKEN_URI
+                    creds["universe_domain"] = "googleapis.com"
+
+                    # Fetch user info and add metadata
+                    user_info_response = await client.get(
+                        self.USER_INFO_URI,
+                        headers={"Authorization": f"Bearer {creds['access_token']}"},
+                    )
+                    user_info_response.raise_for_status()
+                    user_info = user_info_response.json()
+                    creds["_proxy_metadata"] = {
+                        "email": user_info.get("email"),
+                        "last_check_timestamp": time.time(),
+                    }
 
                     if path:
                         await self._save_credentials(path, creds)
                     lib_logger.info(
-                        f"Qwen OAuth initialized successfully for '{display_name}'."
+                        f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
                     )
                 return creds
 
-            lib_logger.info(f"Qwen OAuth token at '{display_name}' is valid.")
+            lib_logger.info(
+                f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid."
+            )
             return creds
         except Exception as e:
-            raise ValueError(f"Failed to initialize Qwen OAuth for '{path}': {e}")
+            raise ValueError(
+                f"Failed to initialize {self.ENV_PREFIX} OAuth for '{path}': {e}"
+            )
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path)
+            creds = await self._refresh_token(credential_path, creds)
         return {"Authorization": f"Bearer {creds['access_token']}"}
 
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
-        """
-        Retrieves user info from the _proxy_metadata in the credential file.
-        """
-        try:
-            path = creds_or_path if isinstance(creds_or_path, str) else None
-            creds = (
-                await self._load_credentials(creds_or_path) if path else creds_or_path
-            )
+        path = creds_or_path if isinstance(creds_or_path, str) else None
+        creds = await self._load_credentials(creds_or_path) if path else creds_or_path
 
-            # This will ensure the token is valid and metadata exists if the flow was just run
+        if path and self._is_token_expired(creds):
+            creds = await self._refresh_token(path, creds)
+
+        # Prefer locally stored metadata
+        if creds.get("_proxy_metadata", {}).get("email"):
             if path:
-                await self.initialize_token(path)
-                creds = await self._load_credentials(
-                    path
-                )  # Re-load after potential init
-
-            metadata = creds.get("_proxy_metadata", {"email": None})
-            email = metadata.get("email")
-
-            if not email:
-                lib_logger.warning(
-                    f"No email found in _proxy_metadata for '{path or 'in-memory object'}'."
-                )
-
-            # Update timestamp on check and save if it's a file-based credential
-            if path and "_proxy_metadata" in creds:
                 creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
                 await self._save_credentials(path, creds)
+            return {"email": creds["_proxy_metadata"]["email"]}
 
-            return {"email": email}
-        except Exception as e:
-            lib_logger.error(f"Failed to get Qwen user info from credentials: {e}")
-            return {"email": None}
+        # Fallback to API call if metadata is missing
+        headers = {"Authorization": f"Bearer {creds['access_token']}"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(self.USER_INFO_URI, headers=headers)
+            response.raise_for_status()
+            user_info = response.json()
+
+            # Save the retrieved info for future use
+            creds["_proxy_metadata"] = {
+                "email": user_info.get("email"),
+                "last_check_timestamp": time.time(),
+            }
+            if path:
+                await self._save_credentials(path, creds)
+            return {"email": user_info.get("email")}

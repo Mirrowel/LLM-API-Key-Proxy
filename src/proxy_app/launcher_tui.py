@@ -111,7 +111,8 @@ class SettingsDetector:
             "custom_bases": SettingsDetector.detect_custom_api_bases(),
             "model_definitions": SettingsDetector.detect_model_definitions(),
             "concurrency_limits": SettingsDetector.detect_concurrency_limits(),
-            "model_filters": SettingsDetector.detect_model_filters()
+            "model_filters": SettingsDetector.detect_model_filters(),
+            "provider_settings": SettingsDetector.detect_provider_settings()
         }
     
     @staticmethod
@@ -209,6 +210,45 @@ class SettingsDetector:
                 else:
                     filters[provider]["has_whitelist"] = True
         return filters
+    
+    @staticmethod
+    def detect_provider_settings() -> dict:
+        """Detect provider-specific settings (Antigravity, Gemini CLI)"""
+        try:
+            from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
+        except ImportError:
+            # Fallback for direct execution or testing
+            from .settings_tool import PROVIDER_SETTINGS_MAP
+        
+        provider_settings = {}
+        env_vars = SettingsDetector._load_local_env()
+        
+        for provider, definitions in PROVIDER_SETTINGS_MAP.items():
+            modified_count = 0
+            for key, definition in definitions.items():
+                env_value = env_vars.get(key)
+                if env_value is not None:
+                    # Check if value differs from default
+                    default = definition.get("default")
+                    setting_type = definition.get("type", "str")
+                    
+                    try:
+                        if setting_type == "bool":
+                            current = env_value.lower() in ("true", "1", "yes")
+                        elif setting_type == "int":
+                            current = int(env_value)
+                        else:
+                            current = env_value
+                        
+                        if current != default:
+                            modified_count += 1
+                    except (ValueError, AttributeError):
+                        pass
+            
+            if modified_count > 0:
+                provider_settings[provider] = modified_count
+        
+        return provider_settings
 
 
 class LauncherTUI:
@@ -311,7 +351,8 @@ class LauncherTUI:
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
-        has_advanced = bool(settings["model_definitions"] or settings["concurrency_limits"] or settings["model_filters"])
+        provider_settings = settings.get("provider_settings", {})
+        has_advanced = bool(settings["model_definitions"] or settings["concurrency_limits"] or settings["model_filters"] or provider_settings)
         
         self.console.print(f"   Providers:           {provider_count} configured")
         self.console.print(f"   Custom Providers:    {custom_count} configured")
@@ -433,6 +474,7 @@ class LauncherTUI:
         model_defs = settings["model_definitions"]
         concurrency = settings["concurrency_limits"]
         filters = settings["model_filters"]
+        provider_settings = settings.get("provider_settings", {})
         
         self.console.print(Panel.fit(
             "[bold cyan]📊 Provider & Advanced Settings[/bold cyan]",
@@ -498,6 +540,22 @@ class LauncherTUI:
                     status_parts.append("Ignore list")
                 status = " + ".join(status_parts) if status_parts else "None"
                 self.console.print(f"   • {provider:15} ✅ {status}")
+        
+        # Provider-Specific Settings
+        self.console.print()
+        self.console.print("[bold]🔬 Provider-Specific Settings[/bold]")
+        self.console.print("━" * 70)
+        try:
+            from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
+        except ImportError:
+            from .settings_tool import PROVIDER_SETTINGS_MAP
+        for provider in PROVIDER_SETTINGS_MAP.keys():
+            display_name = provider.replace("_", " ").title()
+            modified = provider_settings.get(provider, 0)
+            if modified > 0:
+                self.console.print(f"   • {display_name:20} [yellow]{modified} setting{'s' if modified > 1 else ''} modified[/yellow]")
+            else:
+                self.console.print(f"   • {display_name:20} [dim]using defaults[/dim]")
         
         # Actions
         self.console.print()

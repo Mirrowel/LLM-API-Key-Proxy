@@ -1,5 +1,6 @@
 # src/rotator_library/providers/gemini_cli_provider.py
 
+import copy
 import json
 import httpx
 import logging
@@ -8,10 +9,11 @@ import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
+from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 import litellm
 from litellm.exceptions import RateLimitError
-from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
+from ..error_handler import extract_retry_after_from_body
 import os
 from pathlib import Path
 import uuid
@@ -81,8 +83,88 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 HARDCODED_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro-preview"
 ]
+
+# Cache directory for Gemini CLI
+CACHE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "cache" / "gemini_cli"
+GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
+
+# Gemini 3 tool fix system instruction (prevents hallucination)
+DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
+You are operating in a CUSTOM ENVIRONMENT where tool definitions COMPLETELY DIFFER from your training data.
+VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
+
+## ABSOLUTE RULES - NO EXCEPTIONS
+
+1. **SCHEMA IS LAW**: The JSON schema in each tool definition is the ONLY source of truth.
+   - Your pre-trained knowledge about tools like 'read_file', 'apply_diff', 'write_to_file', 'bash', etc. is INVALID here.
+   - Every tool has been REDEFINED with different parameters than what you learned during training.
+
+2. **PARAMETER NAMES ARE EXACT**: Use ONLY the parameter names from the schema.
+   - WRONG: 'suggested_answers', 'file_path', 'files_to_read', 'command_to_run'
+   - RIGHT: Check the 'properties' field in the schema for the exact names
+   - The schema's 'required' array tells you which parameters are mandatory
+
+3. **ARRAY PARAMETERS**: When a parameter has "type": "array", check the 'items' field:
+   - If items.type is "object", you MUST provide an array of objects with the EXACT properties listed
+   - If items.type is "string", you MUST provide an array of strings
+   - NEVER provide a single object when an array is expected
+   - NEVER provide an array when a single value is expected
+
+4. **NESTED OBJECTS**: When items.type is "object":
+   - Check items.properties for the EXACT field names required
+   - Check items.required for which nested fields are mandatory
+   - Include ALL required nested fields in EVERY array element
+
+5. **STRICT PARAMETERS HINT**: Tool descriptions contain "STRICT PARAMETERS: ..." which lists:
+   - Parameter name, type, and whether REQUIRED
+   - For arrays of objects: the nested structure in brackets like [field: type REQUIRED, ...]
+   - USE THIS as your quick reference, but the JSON schema is authoritative
+
+6. **BEFORE EVERY TOOL CALL**:
+   a. Read the tool's 'parametersJsonSchema' or 'parameters' field completely
+   b. Identify ALL required parameters
+   c. Verify your parameter names match EXACTLY (case-sensitive)
+   d. For arrays, verify you're providing the correct item structure
+   e. Do NOT add parameters that don't exist in the schema
+
+## COMMON FAILURE PATTERNS TO AVOID
+
+- Using 'path' when schema says 'filePath' (or vice versa)
+- Using 'content' when schema says 'text' (or vice versa)  
+- Providing {"file": "..."} when schema wants [{"path": "...", "line_ranges": [...]}]
+- Omitting required nested fields in array items
+- Adding 'additionalProperties' that the schema doesn't define
+- Guessing parameter names from similar tools you know from training
+
+## REMEMBER
+Your training data about function calling is OUTDATED for this environment.
+The tool names may look familiar, but the schemas are DIFFERENT.
+When in doubt, RE-READ THE SCHEMA before making the call.
+</CRITICAL_TOOL_USAGE_INSTRUCTIONS>
+"""
+
+# Gemini finish reason mapping
+FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "OTHER": "stop",
+}
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Get boolean from environment variable."""
+    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
+
+
+def _env_int(key: str, default: int) -> int:
+    """Get integer from environment variable."""
+    return int(os.getenv(key, str(default)))
+
 
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
@@ -92,9 +174,125 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         self.model_definitions = ModelDefinitions()
         self.project_id_cache: Dict[str, str] = {} # Cache project ID per credential path
         self.project_tier_cache: Dict[str, str] = {} # Cache project tier per credential path
+        
+        # Gemini 3 configuration from environment
+        memory_ttl = _env_int("GEMINI_CLI_SIGNATURE_CACHE_TTL", 3600)
+        disk_ttl = _env_int("GEMINI_CLI_SIGNATURE_DISK_TTL", 86400)
+        
+        # Initialize signature cache for Gemini 3 thoughtSignatures
+        self._signature_cache = ProviderCache(
+            GEMINI3_SIGNATURE_CACHE_FILE, memory_ttl, disk_ttl,
+            env_prefix="GEMINI_CLI_SIGNATURE"
+        )
+        
+        # Gemini 3 feature flags
+        self._preserve_signatures_in_client = _env_bool("GEMINI_CLI_PRESERVE_THOUGHT_SIGNATURES", True)
+        self._enable_signature_cache = _env_bool("GEMINI_CLI_ENABLE_SIGNATURE_CACHE", True)
+        self._enable_gemini3_tool_fix = _env_bool("GEMINI_CLI_GEMINI3_TOOL_FIX", True)
+        self._gemini3_enforce_strict_schema = _env_bool("GEMINI_CLI_GEMINI3_STRICT_SCHEMA", True)
+        
+        # Gemini 3 tool fix configuration
+        self._gemini3_tool_prefix = os.getenv("GEMINI_CLI_GEMINI3_TOOL_PREFIX", "gemini3_")
+        self._gemini3_description_prompt = os.getenv(
+            "GEMINI_CLI_GEMINI3_DESCRIPTION_PROMPT",
+            "\n\n⚠️ STRICT PARAMETERS (use EXACTLY as shown): {params}. Do NOT use parameters from your training data - use ONLY these parameter names."
+        )
+        self._gemini3_system_instruction = os.getenv(
+            "GEMINI_CLI_GEMINI3_SYSTEM_INSTRUCTION",
+            DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
+        )
+        
+        lib_logger.debug(
+            f"GeminiCli config: signatures_in_client={self._preserve_signatures_in_client}, "
+            f"cache={self._enable_signature_cache}, gemini3_fix={self._enable_gemini3_tool_fix}, "
+            f"gemini3_strict_schema={self._gemini3_enforce_strict_schema}"
+        )
+
+    # =========================================================================
+    # CREDENTIAL PRIORITIZATION
+    # =========================================================================
+    
+    def get_credential_priority(self, credential: str) -> Optional[int]:
+        """
+        Returns priority based on Gemini tier.
+        Paid tiers: priority 1 (highest)
+        Free/Legacy tiers: priority 2
+        Unknown: priority 10 (lowest)
+        
+        Args:
+            credential: The credential path
+        
+        Returns:
+            Priority level (1-10) or None if tier not yet discovered
+        """
+        tier = self.project_tier_cache.get(credential)
+        if not tier:
+            return None  # Not yet discovered
+        
+        # Paid tiers get highest priority
+        if tier not in ['free-tier', 'legacy-tier', 'unknown']:
+            return 1
+        
+        # Free tier gets lower priority
+        if tier == 'free-tier':
+            return 2
+        
+        # Legacy and unknown get even lower
+        return 10
+    
+    def get_model_tier_requirement(self, model: str) -> Optional[int]:
+        """
+        Returns the minimum priority tier required for a model.
+        Gemini 3 requires paid tier (priority 1).
+        
+        Args:
+            model: The model name (with or without provider prefix)
+        
+        Returns:
+            Minimum required priority level or None if no restrictions
+        """
+        model_name = model.split('/')[-1].replace(':thinking', '')
+        
+        # Gemini 3 requires paid tier
+        if model_name.startswith("gemini-3-"):
+            return 1  # Only priority 1 (paid) credentials
+        
+        return None  # All other models have no restrictions
+
+
+
+    # =========================================================================
+    # MODEL UTILITIES
+    # =========================================================================
+    
+    def _is_gemini_3(self, model: str) -> bool:
+        """Check if model is Gemini 3 (requires special handling)."""
+        model_name = model.split('/')[-1].replace(':thinking', '')
+        return model_name.startswith("gemini-3-")
+    
+    def _strip_gemini3_prefix(self, name: str) -> str:
+        """Strip the Gemini 3 namespace prefix from a tool name."""
+        if name and name.startswith(self._gemini3_tool_prefix):
+            return name[len(self._gemini3_tool_prefix):]
+        return name
 
     async def _discover_project_id(self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]) -> str:
-        """Discovers the Google Cloud Project ID, with caching and onboarding for new accounts."""
+        """
+        Discovers the Google Cloud Project ID, with caching and onboarding for new accounts.
+        
+        This follows the official Gemini CLI discovery flow:
+        1. Check in-memory cache
+        2. Check configured project_id override (litellm_params or env var)
+        3. Check persisted project_id in credential file
+        4. Call loadCodeAssist to check if user is already known (has currentTier)
+           - If currentTier exists AND cloudaicompanionProject returned: use server's project
+           - If currentTier exists but NO cloudaicompanionProject: use configured project_id (paid tier requires this)
+           - If no currentTier: user needs onboarding
+        5. Onboard user based on tier:
+           - FREE tier: pass cloudaicompanionProject=None (server-managed)
+           - PAID tier: pass cloudaicompanionProject=configured_project_id
+        6. Fallback to GCP Resource Manager project listing
+        """
         lib_logger.debug(f"Starting project discovery for credential: {credential_path}")
 
         # Check in-memory cache first
@@ -103,34 +301,37 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             lib_logger.debug(f"Using cached project ID: {cached_project}")
             return cached_project
 
-        # Check for configured project ID override
-        if litellm_params.get("project_id"):
-            project_id = litellm_params["project_id"]
-            lib_logger.info(f"Using configured Gemini CLI project ID: {project_id}")
-            self.project_id_cache[credential_path] = project_id
-            return project_id
+        # Check for configured project ID override (from litellm_params or env var)
+        # This is REQUIRED for paid tier users per the official CLI behavior
+        configured_project_id = litellm_params.get("project_id")
+        if configured_project_id:
+            lib_logger.debug(f"Found configured project_id override: {configured_project_id}")
 
-        # [NEW] Load credentials from file to check for persisted project_id and tier
-        try:
-            with open(credential_path, 'r') as f:
-                creds = json.load(f)
-            
-            metadata = creds.get("_proxy_metadata", {})
-            persisted_project_id = metadata.get("project_id")
-            persisted_tier = metadata.get("tier")
-            
-            if persisted_project_id:
-                lib_logger.info(f"Loaded persisted project ID from credential file: {persisted_project_id}")
-                self.project_id_cache[credential_path] = persisted_project_id
+        # Load credentials from file to check for persisted project_id and tier
+        # Skip for env:// paths (environment-based credentials don't persist to files)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is None:
+            # Only try to load from file if it's not an env:// path
+            try:
+                with open(credential_path, 'r') as f:
+                    creds = json.load(f)
                 
-                # Also load tier if available
-                if persisted_tier:
-                    self.project_tier_cache[credential_path] = persisted_tier
-                    lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+                metadata = creds.get("_proxy_metadata", {})
+                persisted_project_id = metadata.get("project_id")
+                persisted_tier = metadata.get("tier")
                 
-                return persisted_project_id
-        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-            lib_logger.debug(f"Could not load persisted project ID from file: {e}")
+                if persisted_project_id:
+                    lib_logger.info(f"Loaded persisted project ID from credential file: {persisted_project_id}")
+                    self.project_id_cache[credential_path] = persisted_project_id
+                    
+                    # Also load tier if available
+                    if persisted_tier:
+                        self.project_tier_cache[credential_path] = persisted_tier
+                        lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+                    
+                    return persisted_project_id
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                lib_logger.debug(f"Could not load persisted project ID from file: {e}")
 
         lib_logger.debug("No cached or configured project ID found, initiating discovery...")
         headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
@@ -139,64 +340,168 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         discovered_tier = None
 
         async with httpx.AsyncClient() as client:
-            # 1. Try discovery endpoint with onboarding logic
+            # 1. Try discovery endpoint with loadCodeAssist
             lib_logger.debug("Attempting project discovery via Code Assist loadCodeAssist endpoint...")
             try:
-                initial_project_id = "default"
-                client_metadata = {
-                    "ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI", "duetProject": initial_project_id,
+                # Build metadata - include duetProject only if we have a configured project
+                core_client_metadata = {
+                    "ideType": "IDE_UNSPECIFIED",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI",
                 }
-                load_request = {"cloudaicompanionProject": initial_project_id, "metadata": client_metadata}
+                if configured_project_id:
+                    core_client_metadata["duetProject"] = configured_project_id
                 
+                # Build load request - pass configured_project_id if available, otherwise None
+                load_request = {
+                    "cloudaicompanionProject": configured_project_id,  # Can be None
+                    "metadata": core_client_metadata,
+                }
+                
+                lib_logger.debug(f"Sending loadCodeAssist request with cloudaicompanionProject={configured_project_id}")
                 response = await client.post(f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist", headers=headers, json=load_request, timeout=20)
                 response.raise_for_status()
                 data = response.json()
 
-                # Extract tier information for paid project detection
-                selected_tier_id = None
-                allowed_tiers = data.get('allowedTiers', [])
-                lib_logger.debug(f"Available tiers from loadCodeAssist response: {[t.get('id') for t in allowed_tiers]}")
+                # Log full response for debugging
+                lib_logger.debug(f"loadCodeAssist full response keys: {list(data.keys())}")
 
+                # Extract and log ALL tier information for debugging
+                allowed_tiers = data.get('allowedTiers', [])
+                current_tier = data.get('currentTier')
+                
+                lib_logger.debug(f"=== Tier Information ===")
+                lib_logger.debug(f"currentTier: {current_tier}")
+                lib_logger.debug(f"allowedTiers count: {len(allowed_tiers)}")
+                for i, tier in enumerate(allowed_tiers):
+                    tier_id = tier.get('id', 'unknown')
+                    is_default = tier.get('isDefault', False)
+                    user_defined = tier.get('userDefinedCloudaicompanionProject', False)
+                    lib_logger.debug(f"  Tier {i+1}: id={tier_id}, isDefault={is_default}, userDefinedProject={user_defined}")
+                lib_logger.debug(f"========================")
+
+                # Determine the current tier ID
+                current_tier_id = None
+                if current_tier:
+                    current_tier_id = current_tier.get('id')
+                    lib_logger.debug(f"User has currentTier: {current_tier_id}")
+
+                # Check if user is already known to server (has currentTier)
+                if current_tier_id:
+                    # User is already onboarded - check for project from server
+                    server_project = data.get('cloudaicompanionProject')
+                    
+                    # Check if this tier requires user-defined project (paid tiers)
+                    requires_user_project = any(
+                        t.get('id') == current_tier_id and t.get('userDefinedCloudaicompanionProject', False)
+                        for t in allowed_tiers
+                    )
+                    is_free_tier = current_tier_id == 'free-tier'
+                    
+                    if server_project:
+                        # Server returned a project - use it (server wins)
+                        # This is the normal case for FREE tier users
+                        project_id = server_project
+                        lib_logger.debug(f"Server returned project: {project_id}")
+                    elif configured_project_id:
+                        # No server project but we have configured one - use it
+                        # This is the PAID TIER case where server doesn't return a project
+                        project_id = configured_project_id
+                        lib_logger.debug(f"No server project, using configured: {project_id}")
+                    elif is_free_tier:
+                        # Free tier user without server project - this shouldn't happen normally
+                        # but let's not fail, just proceed to onboarding
+                        lib_logger.debug("Free tier user with currentTier but no project - will try onboarding")
+                        project_id = None
+                    elif requires_user_project:
+                        # Paid tier requires a project ID to be set
+                        raise ValueError(
+                            f"Paid tier '{current_tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
+                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
+                        )
+                    else:
+                        # Unknown tier without project - proceed carefully
+                        lib_logger.warning(f"Tier '{current_tier_id}' has no project and none configured - will try onboarding")
+                        project_id = None
+
+                    if project_id:
+                        # Cache tier info
+                        self.project_tier_cache[credential_path] = current_tier_id
+                        discovered_tier = current_tier_id
+
+                        # Log appropriately based on tier
+                        is_paid = current_tier_id and current_tier_id not in ['free-tier', 'legacy-tier', 'unknown']
+                        if is_paid:
+                            lib_logger.info(f"Using Gemini paid tier '{current_tier_id}' with project: {project_id}")
+                        else:
+                            lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
+
+                        self.project_id_cache[credential_path] = project_id
+                        discovered_project_id = project_id
+                        
+                        # Persist to credential file
+                        await self._persist_project_metadata(credential_path, project_id, discovered_tier)
+                        
+                        return project_id
+                
+                # 2. User needs onboarding - no currentTier
+                lib_logger.info("No existing Gemini session found (no currentTier), attempting to onboard user...")
+                
+                # Determine which tier to onboard with
+                onboard_tier = None
                 for tier in allowed_tiers:
                     if tier.get('isDefault'):
-                        selected_tier_id = tier.get('id', 'unknown')
-                        lib_logger.debug(f"Selected default tier: {selected_tier_id}")
+                        onboard_tier = tier
                         break
-                if not selected_tier_id and allowed_tiers:
-                    selected_tier_id = allowed_tiers[0].get('id', 'unknown')
-                    lib_logger.debug(f"No default tier found, using first available: {selected_tier_id}")
-
-                if data.get('cloudaicompanionProject'):
-                    project_id = data['cloudaicompanionProject']
-                    lib_logger.debug(f"Existing project found in loadCodeAssist response: {project_id}")
-
-                    # Cache tier info
-                    if selected_tier_id:
-                        self.project_tier_cache[credential_path] = selected_tier_id
-                        discovered_tier = selected_tier_id
-                        lib_logger.debug(f"Cached tier information: {selected_tier_id}")
-
-                    # Log concise message for paid projects
-                    is_paid = selected_tier_id and selected_tier_id not in ['free-tier', 'legacy-tier', 'unknown']
-                    if is_paid:
-                        lib_logger.info(f"Using Gemini paid project: {project_id}")
-                    else:
-                        lib_logger.info(f"Discovered Gemini project ID via loadCodeAssist: {project_id}")
-
-                    self.project_id_cache[credential_path] = project_id
-                    discovered_project_id = project_id
-                    
-                    # [NEW] Persist to credential file
-                    await self._persist_project_metadata(credential_path, project_id, discovered_tier)
-                    
-                    return project_id
                 
-                # 2. If no project ID, trigger onboarding
-                lib_logger.info("No existing Gemini project found, attempting to onboard user...")
-                tier_id = next((t.get('id', 'free-tier') for t in data.get('allowedTiers', []) if t.get('isDefault')), 'free-tier')
-                lib_logger.debug(f"Onboarding with tier: {tier_id}")
-                onboard_request = {"tierId": tier_id, "cloudaicompanionProject": initial_project_id, "metadata": client_metadata}
+                # Fallback to LEGACY tier if no default (requires user project)
+                if not onboard_tier and allowed_tiers:
+                    # Look for legacy-tier as fallback
+                    for tier in allowed_tiers:
+                        if tier.get('id') == 'legacy-tier':
+                            onboard_tier = tier
+                            break
+                    # If still no tier, use first available
+                    if not onboard_tier:
+                        onboard_tier = allowed_tiers[0]
+                
+                if not onboard_tier:
+                    raise ValueError("No onboarding tiers available from server")
+                
+                tier_id = onboard_tier.get('id', 'free-tier')
+                requires_user_project = onboard_tier.get('userDefinedCloudaicompanionProject', False)
+                
+                lib_logger.debug(f"Onboarding with tier: {tier_id}, requiresUserProject: {requires_user_project}")
+                
+                # Build onboard request based on tier type (following official CLI logic)
+                # FREE tier: cloudaicompanionProject = None (server-managed)
+                # PAID tier: cloudaicompanionProject = configured_project_id (user must provide)
+                is_free_tier = tier_id == 'free-tier'
+                
+                if is_free_tier:
+                    # Free tier uses server-managed project
+                    onboard_request = {
+                        "tierId": tier_id,
+                        "cloudaicompanionProject": None,  # Server will create/manage
+                        "metadata": core_client_metadata,
+                    }
+                    lib_logger.debug("Free tier onboarding: using server-managed project")
+                else:
+                    # Paid/legacy tier requires user-provided project
+                    if not configured_project_id and requires_user_project:
+                        raise ValueError(
+                            f"Tier '{tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
+                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
+                        )
+                    onboard_request = {
+                        "tierId": tier_id,
+                        "cloudaicompanionProject": configured_project_id,
+                        "metadata": {
+                            **core_client_metadata,
+                            "duetProject": configured_project_id,
+                        } if configured_project_id else core_client_metadata,
+                    }
+                    lib_logger.debug(f"Paid tier onboarding: using project {configured_project_id}")
 
                 lib_logger.debug("Initiating onboardUser request...")
                 lro_response = await client.post(f"{CODE_ASSIST_ENDPOINT}:onboardUser", headers=headers, json=onboard_request, timeout=30)
@@ -204,7 +509,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 lro_data = lro_response.json()
                 lib_logger.debug(f"Initial onboarding response: done={lro_data.get('done')}")
 
-                for i in range(150): # Poll for up to 5 minutes (150 × 2s)
+                for i in range(150):  # Poll for up to 5 minutes (150 × 2s)
                     if lro_data.get('done'):
                         lib_logger.debug(f"Onboarding completed after {i} polling attempts")
                         break
@@ -220,41 +525,62 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     lib_logger.error("Onboarding process timed out after 5 minutes")
                     raise ValueError("Onboarding process timed out after 5 minutes. Please try again or contact support.")
 
-                project_id = lro_data.get('response', {}).get('cloudaicompanionProject', {}).get('id')
+                # Extract project ID from LRO response
+                # Note: onboardUser returns response.cloudaicompanionProject as an object with .id
+                lro_response_data = lro_data.get('response', {})
+                lro_project_obj = lro_response_data.get('cloudaicompanionProject', {})
+                project_id = lro_project_obj.get('id') if isinstance(lro_project_obj, dict) else None
+                
+                # Fallback to configured project if LRO didn't return one
+                if not project_id and configured_project_id:
+                    project_id = configured_project_id
+                    lib_logger.debug(f"LRO didn't return project, using configured: {project_id}")
+                
                 if not project_id:
-                    lib_logger.error("Onboarding completed but no project ID in response")
-                    raise ValueError("Onboarding completed, but no project ID was returned.")
+                    lib_logger.error("Onboarding completed but no project ID in response and none configured")
+                    raise ValueError(
+                        "Onboarding completed, but no project ID was returned. "
+                        "For paid tiers, set GEMINI_CLI_PROJECT_ID environment variable."
+                    )
 
                 lib_logger.debug(f"Successfully extracted project ID from onboarding response: {project_id}")
 
                 # Cache tier info
-                if tier_id:
-                    self.project_tier_cache[credential_path] = tier_id
-                    discovered_tier = tier_id
-                    lib_logger.debug(f"Cached tier information: {tier_id}")
+                self.project_tier_cache[credential_path] = tier_id
+                discovered_tier = tier_id
+                lib_logger.debug(f"Cached tier information: {tier_id}")
 
                 # Log concise message for paid projects
                 is_paid = tier_id and tier_id not in ['free-tier', 'legacy-tier']
                 if is_paid:
-                    lib_logger.info(f"Using Gemini paid project: {project_id}")
+                    lib_logger.info(f"Using Gemini paid tier '{tier_id}' with project: {project_id}")
                 else:
                     lib_logger.info(f"Successfully onboarded user and discovered project ID: {project_id}")
 
                 self.project_id_cache[credential_path] = project_id
                 discovered_project_id = project_id
                 
-                # [NEW] Persist to credential file
+                # Persist to credential file
                 await self._persist_project_metadata(credential_path, project_id, discovered_tier)
                 
                 return project_id
 
             except httpx.HTTPStatusError as e:
+                error_body = ""
+                try:
+                    error_body = e.response.text
+                except Exception:
+                    pass
                 if e.response.status_code == 403:
-                    lib_logger.error(f"Gemini Code Assist API access denied (403). The cloudaicompanion.googleapis.com API may not be enabled for your account. Please enable it in Google Cloud Console.")
+                    lib_logger.error(f"Gemini Code Assist API access denied (403). Response: {error_body}")
+                    lib_logger.error("Possible causes: 1) cloudaicompanion.googleapis.com API not enabled, 2) Wrong project ID for paid tier, 3) Account lacks permissions")
                 elif e.response.status_code == 404:
                     lib_logger.warning(f"Gemini Code Assist endpoint not found (404). Falling back to project listing.")
+                elif e.response.status_code == 412:
+                    # Precondition Failed - often means wrong project for free tier onboarding
+                    lib_logger.error(f"Precondition failed (412): {error_body}. This may mean the project ID is incompatible with the selected tier.")
                 else:
-                    lib_logger.warning(f"Gemini onboarding/discovery failed with status {e.response.status_code}: {e}. Falling back to project listing.")
+                    lib_logger.warning(f"Gemini onboarding/discovery failed with status {e.response.status_code}: {error_body}. Falling back to project listing.")
             except httpx.RequestError as e:
                 lib_logger.warning(f"Gemini onboarding/discovery network error: {e}. Falling back to project listing.")
 
@@ -303,6 +629,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     
     async def _persist_project_metadata(self, credential_path: str, project_id: str, tier: Optional[str]):
         """Persists project ID and tier to the credential file for faster future startups."""
+        # Skip persistence for env:// paths (environment-based credentials)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is not None:
+            lib_logger.debug(f"Skipping project metadata persistence for env:// credential path: {credential_path}")
+            return
+        
         try:
             # Load current credentials
             with open(credential_path, 'r') as f:
@@ -311,13 +643,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             # Update metadata
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}
-            
+
             creds["_proxy_metadata"]["project_id"] = project_id
             if tier:
                 creds["_proxy_metadata"]["tier"] = tier
             
             # Save back using the existing save method (handles atomic writes and permissions)
-            self._save_credentials(credential_path, creds)
+            await self._save_credentials(credential_path, creds)
             
             lib_logger.debug(f"Persisted project_id and tier to credential file: {credential_path}")
         except Exception as e:
@@ -374,9 +706,20 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         # Return fallback chain if available, otherwise just return the original model
         return fallback_chains.get(model_name, [model_name])
 
-    def _transform_messages(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _transform_messages(self, messages: List[Dict[str, Any]], model: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Transform OpenAI messages to Gemini CLI format.
+        
+        Handles:
+        - System instruction extraction
+        - Multi-part content (text, images)
+        - Tool calls and responses
+        - Gemini 3 thoughtSignature preservation
+        """
+        messages = copy.deepcopy(messages)  # Don't mutate original
         system_instruction = None
         gemini_contents = []
+        is_gemini_3 = self._is_gemini_3(model)
         
         # Separate system prompt from other messages
         if messages and messages[0].get('role') == 'system':
@@ -394,11 +737,21 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     if tool_call.get("type") == "function":
                         tool_call_id_to_name[tool_call["id"]] = tool_call["function"]["name"]
 
+        # Process messages and consolidate consecutive tool responses
+        # Per Gemini docs: parallel function responses must be in a single user message,
+        # not interleaved as separate messages
+        pending_tool_parts = []  # Accumulate tool responses
+        
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
             parts = []
-            gemini_role = "model" if role == "assistant" else "tool" if role == "tool" else "user"
+            gemini_role = "model" if role == "assistant" else "user"  # tool -> user in Gemini
+
+            # If we have pending tool parts and hit a non-tool message, flush them first
+            if pending_tool_parts and role != "tool":
+                gemini_contents.append({"role": "user", "parts": pending_tool_parts})
+                pending_tool_parts = []
 
             if role == "user":
                 if isinstance(content, str):
@@ -435,24 +788,78 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if isinstance(content, str):
                     parts.append({"text": content})
                 if msg.get("tool_calls"):
+                    # Track if we've seen the first function call in this message
+                    # Per Gemini docs: Only the FIRST parallel function call gets a signature
+                    first_func_in_msg = True
                     for tool_call in msg["tool_calls"]:
                         if tool_call.get("type") == "function":
                             try:
                                 args_dict = json.loads(tool_call["function"]["arguments"])
                             except (json.JSONDecodeError, TypeError):
                                 args_dict = {}
-                            parts.append({"functionCall": {"name": tool_call["function"]["name"], "args": args_dict}})
+                            
+                            tool_id = tool_call.get("id", "")
+                            func_name = tool_call["function"]["name"]
+                            
+                            # Add prefix for Gemini 3
+                            if is_gemini_3 and self._enable_gemini3_tool_fix:
+                                func_name = f"{self._gemini3_tool_prefix}{func_name}"
+                            
+                            func_part = {
+                                "functionCall": {
+                                    "name": func_name,
+                                    "args": args_dict,
+                                    "id": tool_id
+                                }
+                            }
+                            
+                            # Add thoughtSignature for Gemini 3
+                            # Per Gemini docs: Only the FIRST parallel function call gets a signature.
+                            # Subsequent parallel calls should NOT have a thoughtSignature field.
+                            if is_gemini_3:
+                                sig = tool_call.get("thought_signature")
+                                if not sig and tool_id and self._enable_signature_cache:
+                                    sig = self._signature_cache.retrieve(tool_id)
+                                
+                                if sig:
+                                    func_part["thoughtSignature"] = sig
+                                elif first_func_in_msg:
+                                    # Only add bypass to the first function call if no sig available
+                                    func_part["thoughtSignature"] = "skip_thought_signature_validator"
+                                    lib_logger.warning(f"Missing thoughtSignature for first func call {tool_id}, using bypass")
+                                # Subsequent parallel calls: no signature field at all
+                                
+                                first_func_in_msg = False
+                            
+                            parts.append(func_part)
 
             elif role == "tool":
                 tool_call_id = msg.get("tool_call_id")
                 function_name = tool_call_id_to_name.get(tool_call_id)
                 if function_name:
+                    # Add prefix for Gemini 3
+                    if is_gemini_3 and self._enable_gemini3_tool_fix:
+                        function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                    
                     # Wrap the tool response in a 'result' object
                     response_content = {"result": content}
-                    parts.append({"functionResponse": {"name": function_name, "response": response_content}})
+                    # Accumulate tool responses - they'll be combined into one user message
+                    pending_tool_parts.append({
+                        "functionResponse": {
+                            "name": function_name,
+                            "response": response_content,
+                            "id": tool_call_id
+                        }
+                    })
+                # Don't add parts here - tool responses are handled via pending_tool_parts
+                continue
 
             if parts:
                 gemini_contents.append({"role": gemini_role, "parts": parts})
+
+        # Flush any remaining tool parts at end of messages
+        if pending_tool_parts:
+            gemini_contents.append({"role": "user", "parts": pending_tool_parts})
 
         if not gemini_contents or gemini_contents[0]['role'] != 'user':
             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
@@ -460,19 +867,42 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         return system_instruction, gemini_contents
 
     def _handle_reasoning_parameters(self, payload: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+        """
+        Map reasoning_effort to thinking configuration.
+        
+        - Gemini 2.5: thinkingBudget (integer tokens)
+        - Gemini 3: thinkingLevel (string: "low"/"high")
+        """
         custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
         reasoning_effort = payload.get("reasoning_effort")
 
         if "thinkingConfig" in payload.get("generationConfig", {}):
             return None
 
-        # Only apply reasoning logic to the gemini-2.5 model family
-        if "gemini-2.5" not in model:
+        is_gemini_25 = "gemini-2.5" in model
+        is_gemini_3 = self._is_gemini_3(model)
+
+        # Only apply reasoning logic to supported models
+        if not (is_gemini_25 or is_gemini_3):
             payload.pop("reasoning_effort", None)
             payload.pop("custom_reasoning_budget", None)
             return None
+        
+        # Gemini 3: String-based thinkingLevel
+        if is_gemini_3:
+            # Clean up the original payload
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
+            
+            if reasoning_effort == "low":
+                return {"thinkingLevel": "low", "include_thoughts": True}
+            return {"thinkingLevel": "high", "include_thoughts": True}
 
+        # Gemini 2.5: Integer thinkingBudget
         if not reasoning_effort:
+            # Clean up the original payload
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
             return {"thinkingBudget": -1, "include_thoughts": True}
 
         # If reasoning_effort is provided, calculate the budget
@@ -498,8 +928,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return {"thinkingBudget": budget, "include_thoughts": True}
 
-    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
-        lib_logger.debug(f"Converting Gemini chunk: {json.dumps(chunk)}")
+    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str, accumulator: Optional[Dict[str, Any]] = None):
+        """
+        Convert Gemini response chunk to OpenAI streaming format.
+        
+        Args:
+            chunk: Gemini API response chunk
+            model_id: Model name
+            accumulator: Optional dict to accumulate data for post-processing (signatures, etc.)
+        """
         response_data = chunk.get('response', chunk)
         candidates = response_data.get('candidates', [])
         if not candidates:
@@ -507,29 +944,65 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         candidate = candidates[0]
         parts = candidate.get('content', {}).get('parts', [])
+        is_gemini_3 = self._is_gemini_3(model_id)
 
         for part in parts:
             delta = {}
-            finish_reason = None
+            
+            has_func = 'functionCall' in part
+            has_text = 'text' in part
+            has_sig = bool(part.get('thoughtSignature'))
+            is_thought = part.get('thought') is True or (isinstance(part.get('thought'), str) and str(part.get('thought')).lower() == 'true')
+            
+            # Skip standalone signature parts (no function, no meaningful text)
+            if has_sig and not has_func and (not has_text or not part.get('text')):
+                continue
 
-            if 'functionCall' in part:
+            if has_func:
                 function_call = part['functionCall']
                 function_name = function_call.get('name', 'unknown')
-                # Generate unique ID with nanosecond precision
-                tool_call_id = f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
-                delta['tool_calls'] = [{
-                    "index": 0,
+                
+                # Strip Gemini 3 prefix from tool name
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = self._strip_gemini3_prefix(function_name)
+                
+                # Use provided ID or generate unique one with nanosecond precision
+                tool_call_id = function_call.get('id') or f"call_{function_name}_{int(time.time() * 1_000_000_000)}"
+                
+                # Get current tool index from accumulator (default 0) and increment
+                current_tool_idx = accumulator.get('tool_idx', 0) if accumulator else 0
+                
+                tool_call = {
+                    "index": current_tool_idx,
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
                         "name": function_name,
                         "arguments": json.dumps(function_call.get('args', {}))
                     }
-                }]
-            elif 'text' in part:
+                }
+                
+                # Handle thoughtSignature for Gemini 3
+                # Store signature for each tool call (needed for parallel tool calls)
+                if is_gemini_3 and has_sig:
+                    sig = part['thoughtSignature']
+                    
+                    if self._enable_signature_cache:
+                        self._signature_cache.store(tool_call_id, sig)
+                        lib_logger.debug(f"Stored signature for {tool_call_id}")
+                    
+                    if self._preserve_signatures_in_client:
+                        tool_call["thought_signature"] = sig
+                
+                delta['tool_calls'] = [tool_call]
+                # Mark that we've sent tool calls and increment tool_idx
+                if accumulator is not None:
+                    accumulator['has_tool_calls'] = True
+                    accumulator['tool_idx'] = current_tool_idx + 1
+                
+            elif has_text:
                 # Use an explicit check for the 'thought' flag, as its type can be inconsistent
-                thought = part.get('thought')
-                if thought is True or (isinstance(thought, str) and thought.lower() == 'true'):
+                if is_thought:
                     delta['reasoning_content'] = part['text']
                 else:
                     delta['content'] = part['text']
@@ -537,16 +1010,20 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if not delta:
                 continue
 
-            raw_finish_reason = candidate.get('finishReason')
-            if raw_finish_reason:
-                mapping = {'STOP': 'stop', 'MAX_TOKENS': 'length', 'SAFETY': 'content_filter'}
-                finish_reason = mapping.get(raw_finish_reason, 'stop')
+            # Mark that we have tool calls for accumulator tracking
+            # finish_reason determination is handled by the client
+            
+            # Mark stream complete if we have usageMetadata
+            is_final_chunk = 'usageMetadata' in response_data
+            if is_final_chunk and accumulator is not None:
+                accumulator['is_complete'] = True
 
-            choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            # Build choice - don't include finish_reason, let client handle it
+            choice = {"index": 0, "delta": delta}
             
             openai_chunk = {
                 "choices": [choice], "model": model_id, "object": "chat.completion.chunk",
-                "id": f"chatcmpl-geminicli-{time.time()}", "created": int(time.time())
+                "id": chunk.get("responseId", f"chatcmpl-geminicli-{time.time()}"), "created": int(time.time())
             }
 
             if 'usageMetadata' in response_data:
@@ -572,7 +1049,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
-        This replaces the non-existent litellm.utils.stream_to_completion_response function.
+        
+        Key improvements:
+        - Determines finish_reason based on accumulated state
+        - Priority: tool_calls > chunk's finish_reason (length, content_filter, etc.) > stop
+        - Properly initializes tool_calls with type field
         """
         if not chunks:
             raise ValueError("No chunks provided for reassembly")
@@ -581,7 +1062,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         final_message = {"role": "assistant"}
         aggregated_tool_calls = {}
         usage_data = None
-        finish_reason = None
+        chunk_finish_reason = None  # Track finish_reason from chunks
 
         # Get the first chunk for basic response metadata
         first_chunk = chunks[0]
@@ -609,11 +1090,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             # Aggregate tool calls
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
-                    index = tc_chunk["index"]
+                    index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                    if "type" in tc_chunk:
+                        aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
                         if "name" in tc_chunk["function"] and tc_chunk["function"]["name"] is not None:
                             aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
@@ -629,9 +1112,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
                     final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
 
-            # Get finish reason from the last chunk that has it
+            # Track finish_reason from chunks (respects length, content_filter, etc.)
             if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+                chunk_finish_reason = choice["finish_reason"]
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -648,6 +1131,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if field not in final_message:
                 final_message[field] = None
 
+        # Determine finish_reason based on accumulated state
+        # Priority: tool_calls wins if present, then chunk's finish_reason (length, content_filter, etc.), then default to "stop"
+        if aggregated_tool_calls:
+            finish_reason = "tool_calls"
+        elif chunk_finish_reason:
+            finish_reason = chunk_finish_reason
+        else:
+            finish_reason = "stop"
+        
         # Construct the final response
         final_choice = {
             "index": 0,
@@ -704,12 +1196,44 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         
         return schema
 
-    def _transform_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _enforce_strict_schema(self, schema: Any) -> Any:
+        """
+        Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
+        
+        Adds 'additionalProperties: false' recursively to all object schemas,
+        which tells the model it CANNOT add properties not in the schema.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        
+        result = {}
+        for key, value in schema.items():
+            if isinstance(value, dict):
+                result[key] = self._enforce_strict_schema(value)
+            elif isinstance(value, list):
+                result[key] = [self._enforce_strict_schema(item) if isinstance(item, dict) else item for item in value]
+            else:
+                result[key] = value
+        
+        # Add additionalProperties: false to object schemas
+        if result.get("type") == "object" and "properties" in result:
+            result["additionalProperties"] = False
+        
+        return result
+
+    def _transform_tool_schemas(self, tools: List[Dict[str, Any]], model: str = "") -> List[Dict[str, Any]]:
         """
         Transforms a list of OpenAI-style tool schemas into the format required by the Gemini CLI API.
         This uses a custom schema transformer instead of litellm's generic one.
+        
+        For Gemini 3 models, also applies:
+        - Namespace prefix to tool names
+        - Parameter signature injection into descriptions
+        - Strict schema enforcement (additionalProperties: false)
         """
         transformed_declarations = []
+        is_gemini_3 = self._is_gemini_3(model)
+        
         for tool in tools:
             if tool.get("type") == "function" and "function" in tool:
                 new_function = json.loads(json.dumps(tool["function"]))
@@ -726,19 +1250,139 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     # Set default empty schema if neither exists
                     new_function["parametersJsonSchema"] = {"type": "object", "properties": {}}
 
+                # Gemini 3 specific transformations
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    # Add namespace prefix to tool names
+                    name = new_function.get("name", "")
+                    if name:
+                        new_function["name"] = f"{self._gemini3_tool_prefix}{name}"
+                    
+                    # Enforce strict schema (additionalProperties: false)
+                    if self._gemini3_enforce_strict_schema and "parametersJsonSchema" in new_function:
+                        new_function["parametersJsonSchema"] = self._enforce_strict_schema(new_function["parametersJsonSchema"])
+                    
+                    # Inject parameter signature into description
+                    new_function = self._inject_signature_into_description(new_function)
+
                 transformed_declarations.append(new_function)
         
         return transformed_declarations
 
-    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _inject_signature_into_description(self, func_decl: Dict[str, Any]) -> Dict[str, Any]:
+        """Inject parameter signatures into tool description for Gemini 3."""
+        schema = func_decl.get("parametersJsonSchema", {})
+        if not schema:
+            return func_decl
+        
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+        
+        if not properties:
+            return func_decl
+        
+        param_list = []
+        for prop_name, prop_data in properties.items():
+            if not isinstance(prop_data, dict):
+                continue
+            
+            type_hint = self._format_type_hint(prop_data)
+            is_required = prop_name in required
+            param_list.append(
+                f"{prop_name} ({type_hint}{', REQUIRED' if is_required else ''})"
+            )
+        
+        if param_list:
+            sig_str = self._gemini3_description_prompt.replace(
+                "{params}", ", ".join(param_list)
+            )
+            func_decl["description"] = func_decl.get("description", "") + sig_str
+        
+        return func_decl
+
+    def _format_type_hint(self, prop_data: Dict[str, Any], depth: int = 0) -> str:
+        """Format a detailed type hint for a property schema."""
+        type_hint = prop_data.get("type", "unknown")
+        
+        # Handle enum values - show allowed options
+        if "enum" in prop_data:
+            enum_vals = prop_data["enum"]
+            if len(enum_vals) <= 5:
+                return f"string ENUM[{', '.join(repr(v) for v in enum_vals)}]"
+            return f"string ENUM[{len(enum_vals)} options]"
+        
+        # Handle const values
+        if "const" in prop_data:
+            return f"string CONST={repr(prop_data['const'])}"
+        
+        if type_hint == "array":
+            items = prop_data.get("items", {})
+            if isinstance(items, dict):
+                item_type = items.get("type", "unknown")
+                if item_type == "object":
+                    nested_props = items.get("properties", {})
+                    nested_req = items.get("required", [])
+                    if nested_props:
+                        nested_list = []
+                        for n, d in nested_props.items():
+                            if isinstance(d, dict):
+                                # Recursively format nested types (limit depth)
+                                if depth < 1:
+                                    t = self._format_type_hint(d, depth + 1)
+                                else:
+                                    t = d.get("type", "unknown")
+                                req = " REQUIRED" if n in nested_req else ""
+                                nested_list.append(f"{n}: {t}{req}")
+                        return f"ARRAY_OF_OBJECTS[{', '.join(nested_list)}]"
+                    return "ARRAY_OF_OBJECTS"
+                return f"ARRAY_OF_{item_type.upper()}"
+            return "ARRAY"
+        
+        if type_hint == "object":
+            nested_props = prop_data.get("properties", {})
+            nested_req = prop_data.get("required", [])
+            if nested_props and depth < 1:
+                nested_list = []
+                for n, d in nested_props.items():
+                    if isinstance(d, dict):
+                        t = d.get("type", "unknown")
+                        req = " REQUIRED" if n in nested_req else ""
+                        nested_list.append(f"{n}: {t}{req}")
+                return f"object{{{', '.join(nested_list)}}}"
+        
+        return type_hint
+
+    def _inject_gemini3_system_instruction(self, request_payload: Dict[str, Any]) -> None:
+        """Inject Gemini 3 tool fix system instruction if tools are present."""
+        if not request_payload.get("request", {}).get("tools"):
+            return
+        
+        existing_system = request_payload.get("request", {}).get("systemInstruction")
+        
+        if existing_system:
+            # Prepend to existing system instruction
+            existing_parts = existing_system.get("parts", [])
+            if existing_parts and existing_parts[0].get("text"):
+                existing_parts[0]["text"] = self._gemini3_system_instruction + "\n\n" + existing_parts[0]["text"]
+            else:
+                existing_parts.insert(0, {"text": self._gemini3_system_instruction})
+        else:
+            # Create new system instruction
+            request_payload["request"]["systemInstruction"] = {
+                "role": "user",
+                "parts": [{"text": self._gemini3_system_instruction}]
+            }
+
+    def _translate_tool_choice(self, tool_choice: Union[str, Dict[str, Any]], model: str = "") -> Optional[Dict[str, Any]]:
         """
         Translates OpenAI's `tool_choice` to Gemini's `toolConfig`.
+        Handles Gemini 3 namespace prefixes for specific tool selection.
         """
         if not tool_choice:
             return None
 
         config = {}
         mode = "AUTO"  # Default to auto
+        is_gemini_3 = self._is_gemini_3(model)
 
         if isinstance(tool_choice, str):
             if tool_choice == "auto":
@@ -750,6 +1394,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             function_name = tool_choice.get("function", {}).get("name")
             if function_name:
+                # Add Gemini 3 prefix if needed
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
+                
                 mode = "ANY" # Force a call, but only to this function
                 config["functionCallingConfig"] = {
                     "mode": mode,
@@ -778,6 +1426,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 access_token = auth_header['Authorization'].split(' ')[1]
                 project_id = await self._discover_project_id(credential_path, access_token, kwargs.get("litellm_params", {}))
 
+            # Log paid tier usage visibly on each request
+            credential_tier = self.project_tier_cache.get(credential_path)
+            if credential_tier and credential_tier not in ['free-tier', 'legacy-tier', 'unknown']:
+                lib_logger.info(f"[PAID TIER] Using Gemini '{credential_tier}' subscription for this request")
+
             # Handle :thinking suffix
             model_name = attempt_model.split('/')[-1].replace(':thinking', '')
 
@@ -786,6 +1439,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 model_name=model_name,
                 enabled=enable_request_logging
             )
+            
+            is_gemini_3 = self._is_gemini_3(model_name)
 
             gen_config = {
                 "maxOutputTokens": kwargs.get("max_tokens", 64000), # Increased default
@@ -801,7 +1456,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             if thinking_config:
                 gen_config["thinkingConfig"] = thinking_config
 
-            system_instruction, contents = self._transform_messages(kwargs.get("messages", []))
+            system_instruction, contents = self._transform_messages(kwargs.get("messages", []), model_name)
             request_payload = {
                 "model": model_name,
                 "project": project_id,
@@ -815,15 +1470,19 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 request_payload["request"]["systemInstruction"] = system_instruction
 
             if "tools" in kwargs and kwargs["tools"]:
-                function_declarations = self._transform_tool_schemas(kwargs["tools"])
+                function_declarations = self._transform_tool_schemas(kwargs["tools"], model_name)
                 if function_declarations:
                     request_payload["request"]["tools"] = [{"functionDeclarations": function_declarations}]
 
             # [NEW] Handle tool_choice translation
             if "tool_choice" in kwargs and kwargs["tool_choice"]:
-                tool_config = self._translate_tool_choice(kwargs["tool_choice"])
+                tool_config = self._translate_tool_choice(kwargs["tool_choice"], model_name)
                 if tool_config:
                     request_payload["request"]["toolConfig"] = tool_config
+            
+            # Inject Gemini 3 system instruction if using tools
+            if is_gemini_3 and self._enable_gemini3_tool_fix:
+                self._inject_gemini3_system_instruction(request_payload)
 
             # Add default safety settings to prevent content filtering
             if "safetySettings" not in request_payload["request"]:
@@ -842,6 +1501,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
 
             async def stream_handler():
+                # Track state across chunks for tool indexing
+                accumulator = {"has_tool_calls": False, "tool_idx": 0, "is_complete": False}
+                
                 final_headers = auth_header.copy()
                 final_headers.update({
                     "User-Agent": "google-api-nodejs-client/9.15.1",
@@ -851,6 +1513,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 })
                 try:
                     async with client.stream("POST", url, headers=final_headers, json=request_payload, params={"alt": "sse"}, timeout=600) as response:
+                        # Read and log error body before raise_for_status for better debugging
+                        if response.status_code >= 400:
+                            try:
+                                error_body = await response.aread()
+                                lib_logger.error(f"Gemini CLI API error {response.status_code}: {error_body.decode()}")
+                                file_logger.log_error(f"API error {response.status_code}: {error_body.decode()}")
+                            except Exception:
+                                pass
+                        
                         # This will raise an HTTPStatusError for 4xx/5xx responses
                         response.raise_for_status()
 
@@ -861,10 +1532,24 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                 if data_str == "[DONE]": break
                                 try:
                                     chunk = json.loads(data_str)
-                                    for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                    for openai_chunk in self._convert_chunk_to_openai(chunk, model, accumulator):
                                         yield litellm.ModelResponse(**openai_chunk)
                                 except json.JSONDecodeError:
                                     lib_logger.warning(f"Could not decode JSON from Gemini CLI: {line}")
+                        
+                        # Emit final chunk if stream ended without usageMetadata
+                        # Client will determine the correct finish_reason
+                        if not accumulator.get("is_complete"):
+                            final_chunk = {
+                                "id": f"chatcmpl-geminicli-{time.time()}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                                # Include minimal usage to signal this is the final chunk
+                                "usage": {"prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1}
+                            }
+                            yield litellm.ModelResponse(**final_chunk)
 
                 except httpx.HTTPStatusError as e:
                     error_body = None
@@ -873,16 +1558,24 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                             error_body = e.response.text
                         except Exception:
                             pass
-                    log_line = f"Stream handler HTTPStatusError: {str(e)}"
+                    
+                    # Only log to file logger (for detailed logging)
                     if error_body:
-                        log_line = f"{log_line} | response_body={error_body}"
-                    file_logger.log_error(log_line)
+                        file_logger.log_error(f"HTTPStatusError {e.response.status_code}: {error_body}")
+                    else:
+                        file_logger.log_error(f"HTTPStatusError {e.response.status_code}: {str(e)}")
+                    
                     if e.response.status_code == 429:
-                        # Pass the raw response object to the exception. Do not read the
-                        # response body here as it will close the stream and cause a
-                        # 'StreamClosed' error in the client's stream reader.
+                        # Extract retry-after time from the error body
+                        retry_after = extract_retry_after_from_body(error_body)
+                        retry_info = f" (retry after {retry_after}s)" if retry_after else ""
+                        error_msg = f"Gemini CLI rate limit exceeded{retry_info}"
+                        if error_body:
+                            error_msg = f"{error_msg} | {error_body}"
+                        # Only log at debug level - rotation happens silently
+                        lib_logger.debug(f"Gemini CLI 429 rate limit: retry_after={retry_after}s")
                         raise RateLimitError(
-                            message=f"Gemini CLI rate limit exceeded: {e.request.url}",
+                            message=error_msg,
                             llm_provider="gemini_cli",
                             model=model,
                             response=e.response
@@ -919,7 +1612,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         for idx, attempt_model in enumerate(fallback_models):
             is_fallback = idx > 0
             if is_fallback:
-                lib_logger.info(f"Gemini CLI rate limited, retrying with fallback model: {attempt_model}")
+                # Silent rotation - only log at debug level
+                lib_logger.debug(f"Rate limited on previous model, trying fallback: {attempt_model}")
             elif has_fallbacks:
                 lib_logger.debug(f"Attempting primary model: {attempt_model} (with {len(fallback_models)-1} fallback(s) available)")
             else:
@@ -941,8 +1635,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 if idx + 1 < len(fallback_models):
                     lib_logger.debug(f"Rate limit hit on {attempt_model}, trying next fallback...")
                     continue
-                # If this was the last fallback option, raise the error
-                lib_logger.error(f"Rate limit hit on all fallback models (tried {len(fallback_models)} models)")
+                # If this was the last fallback option, log error and raise
+                lib_logger.warning(f"Rate limit exhausted on all fallback models (tried {len(fallback_models)} models)")
                 raise
 
         # Should not reach here, but raise last error if we do
@@ -990,8 +1684,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Build request payload
         request_payload = {
-            "model": model_name,
-            "project": project_id,
             "request": {
                 "contents": contents,
             },
