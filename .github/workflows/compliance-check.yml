@@ -115,7 +115,7 @@ jobs:
             "description": "When code changes affect the build or CI process, verify build.yml is updated with new steps, jobs, or release configurations. Check that code changes are reflected in build matrix, deploy steps, and CI/CD pipeline.",
             "files": [
               ".github/workflows/build.yml",
-              ".github/workflows/cleanup.yml",
+              ".github/workflows/cleanup.yml"
             ]
           },
           {
