@@ -1919,15 +1919,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         system_instruction = None
         gemini_contents = []
 
-        # Extract system prompt
-        if messages and messages[0].get("role") == "system":
+        # Extract system prompts (handle multiple consecutive system messages)
+        system_parts = []
+        while messages and messages[0].get("role") == "system":
             system_content = messages.pop(0).get("content", "")
             if system_content:
-                system_parts = self._parse_content_parts(
+                new_parts = self._parse_content_parts(
                     system_content, _strip_cache_control=True
                 )
-                if system_parts:
-                    system_instruction = {"role": "user", "parts": system_parts}
+                system_parts.extend(new_parts)
+
+        if system_parts:
+            system_instruction = {"role": "user", "parts": system_parts}
 
         # Build tool_call_id → name mapping
         tool_id_to_name = {}
