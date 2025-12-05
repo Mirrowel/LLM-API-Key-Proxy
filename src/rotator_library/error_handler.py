@@ -18,12 +18,60 @@ from litellm.exceptions import (
 )
 
 
+def _parse_duration_string(duration_str: str) -> Optional[int]:
+    """
+    Parse duration strings in various formats to total seconds.
+
+    Handles:
+    - Compound durations: '156h14m36.752463453s', '2h30m', '45m30s'
+    - Simple durations: '562476.752463453s', '3600s', '60m', '2h'
+    - Plain seconds (no unit): '562476'
+
+    Args:
+        duration_str: Duration string to parse
+
+    Returns:
+        Total seconds as integer, or None if parsing fails
+    """
+    if not duration_str:
+        return None
+
+    total_seconds = 0
+    remaining = duration_str.strip().lower()
+
+    # Try parsing as plain number first (no units)
+    try:
+        return int(float(remaining))
+    except ValueError:
+        pass
+
+    # Parse hours component
+    hour_match = re.match(r"(\d+)h", remaining)
+    if hour_match:
+        total_seconds += int(hour_match.group(1)) * 3600
+        remaining = remaining[hour_match.end() :]
+
+    # Parse minutes component
+    min_match = re.match(r"(\d+)m", remaining)
+    if min_match:
+        total_seconds += int(min_match.group(1)) * 60
+        remaining = remaining[min_match.end() :]
+
+    # Parse seconds component (including decimals like 36.752463453s)
+    sec_match = re.match(r"([\d.]+)s", remaining)
+    if sec_match:
+        total_seconds += int(float(sec_match.group(1)))
+
+    return total_seconds if total_seconds > 0 else None
+
+
 def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
     """
     Extract the retry-after time from an API error response body.
 
     Handles various error formats including:
     - Gemini CLI: "Your quota will reset after 39s."
+    - Antigravity: "quota will reset after 156h14m36s"
     - Generic: "quota will reset after 120s", "retry after 60s"
 
     Args:
@@ -35,21 +83,21 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
     if not error_body:
         return None
 
-    # Pattern to match various "reset after Xs" or "retry after Xs" formats
+    # Pattern to match various "reset after" formats - capture the full duration string
     patterns = [
-        r"quota will reset after\s*(\d+)s",
-        r"reset after\s*(\d+)s",
-        r"retry after\s*(\d+)s",
+        r"quota will reset after\s*([\dhmso.]+)",  # Matches compound: 156h14m36s or 120s
+        r"reset after\s*([\dhmso.]+)",
+        r"retry after\s*([\dhmso.]+)",
         r"try again in\s*(\d+)\s*seconds?",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, error_body, re.IGNORECASE)
         if match:
-            try:
-                return int(match.group(1))
-            except (ValueError, IndexError):
-                continue
+            duration_str = match.group(1)
+            result = _parse_duration_string(duration_str)
+            if result is not None:
+                return result
 
     return None
 
@@ -311,6 +359,11 @@ def get_retry_after(error: Exception) -> Optional[int]:
     Extracts the 'retry-after' duration in seconds from an exception message.
     Handles both integer and string representations of the duration, as well as JSON bodies.
     Also checks HTTP response headers for httpx.HTTPStatusError instances.
+
+    Supports Antigravity/Google API error formats:
+    - RetryInfo with retryDelay: "562476.752463453s"
+    - ErrorInfo metadata with quotaResetDelay: "156h14m36.752463453s"
+    - Human-readable message: "quota will reset after 156h14m36s"
     """
     # 0. For httpx errors, check response headers first (most reliable)
     if isinstance(error, httpx.HTTPStatusError):
@@ -341,79 +394,81 @@ def get_retry_after(error: Exception) -> Optional[int]:
 
     error_str = str(error).lower()
 
-    # 1. Try to parse JSON from the error string to find 'retryDelay'
+    # 1. Try to parse JSON from the error string to find retry info
+    # Antigravity errors have details array with RetryInfo and/or ErrorInfo
     try:
         # It's common for the actual JSON to be embedded in the string representation
         json_match = re.search(r"(\{.*\})", error_str, re.DOTALL)
         if json_match:
             error_json = json.loads(json_match.group(1))
-            retry_info = error_json.get("error", {}).get("details", [{}])[0]
-            if retry_info.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                delay_str = retry_info.get("retryDelay", {}).get("seconds")
-                if delay_str:
-                    return int(delay_str)
-                # Fallback for the other format
-                delay_str = retry_info.get("retryDelay")
-                if isinstance(delay_str, str) and delay_str.endswith("s"):
-                    return int(delay_str[:-1])
+            details = error_json.get("error", {}).get("details", [])
+
+            # Iterate through ALL details items (not just index 0)
+            for detail in details:
+                detail_type = detail.get("@type", "")
+
+                # Check RetryInfo for retryDelay (most authoritative)
+                if detail_type == "type.googleapis.com/google.rpc.retryinfo":
+                    delay_str = detail.get("retrydelay")
+                    if delay_str:
+                        # Handle both {"seconds": "123"} format and "123.456s" string format
+                        if isinstance(delay_str, dict):
+                            seconds = delay_str.get("seconds")
+                            if seconds:
+                                return int(float(seconds))
+                        elif isinstance(delay_str, str):
+                            result = _parse_duration_string(delay_str)
+                            if result is not None:
+                                return result
+
+                # Check ErrorInfo metadata for quotaResetDelay (Antigravity-specific)
+                if detail_type == "type.googleapis.com/google.rpc.errorinfo":
+                    metadata = detail.get("metadata", {})
+                    quota_reset_delay = metadata.get("quotaresetdelay")
+                    if quota_reset_delay:
+                        result = _parse_duration_string(quota_reset_delay)
+                        if result is not None:
+                            return result
 
     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
         pass  # If JSON parsing fails, proceed to regex and attribute checks
 
-    # 2. Common regex patterns for 'retry-after' (with duration format support)
+    # 2. Common regex patterns for 'retry-after' (with compound duration support)
     patterns = [
         r"retry[-_\s]after:?\s*(\d+)",  # Matches: retry-after, retry_after, retry after
         r"retry in\s*(\d+)\s*seconds?",
         r"wait for\s*(\d+)\s*seconds?",
-        r'"retryDelay":\s*"(\d+)s"',
+        r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON
         r"x-ratelimit-reset:?\s*(\d+)",
-        r"quota will reset after\s*(\d+)s",  # Gemini CLI rate limit format
-        r"reset after\s*(\d+)s",  # Generic reset after format
+        # Compound duration patterns (Antigravity format)
+        r"quota will reset after\s*([\dhms.]+)",  # e.g., "156h14m36s" or "120s"
+        r"reset after\s*([\dhms.]+)",
+        r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON
     ]
 
     for pattern in patterns:
         match = re.search(pattern, error_str)
         if match:
+            duration_str = match.group(1)
+            # Try parsing as compound duration first
+            result = _parse_duration_string(duration_str)
+            if result is not None:
+                return result
+            # Fallback to simple integer
             try:
-                return int(match.group(1))
+                return int(duration_str)
             except (ValueError, IndexError):
                 continue
 
-    # 3. Handle duration formats like "60s", "2m", "1h"
-    duration_match = re.search(r"(\d+)\s*([smh])", error_str)
-    if duration_match:
-        try:
-            value = int(duration_match.group(1))
-            unit = duration_match.group(2)
-            if unit == "s":
-                return value
-            elif unit == "m":
-                return value * 60
-            elif unit == "h":
-                return value * 3600
-        except (ValueError, IndexError):
-            pass
-
-    # 4. Handle cases where the error object itself has the attribute
+    # 3. Handle cases where the error object itself has the attribute
     if hasattr(error, "retry_after"):
         value = getattr(error, "retry_after")
         if isinstance(value, int):
             return value
         if isinstance(value, str):
-            # Try to parse string formats
-            if value.isdigit():
-                return int(value)
-            # Handle "60s", "2m" format in attribute
-            duration_match = re.search(r"(\d+)\s*([smh])", value.lower())
-            if duration_match:
-                val = int(duration_match.group(1))
-                unit = duration_match.group(2)
-                if unit == "s":
-                    return val
-                elif unit == "m":
-                    return val * 60
-                elif unit == "h":
-                    return val * 3600
+            result = _parse_duration_string(value)
+            if result is not None:
+                return result
 
     return None
 
