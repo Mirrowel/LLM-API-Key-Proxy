@@ -391,7 +391,7 @@ jobs:
           echo "" >> /tmp/file_groups.txt
           
           # Parse JSON and format for prompt
-          echo '${{ env.FILE_GROUPS_JSON }}' | jq -r '.[] | 
+          echo "$FILE_GROUPS_JSON" | jq -r '.[] |
             "Group: \(.name)\n" +
             "Description: \(.description)\n" +
             "Files:\n" +
