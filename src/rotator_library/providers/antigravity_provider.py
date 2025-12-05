@@ -1178,20 +1178,27 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Returns:
             {
                 "in_tool_loop": bool - True if we're in an incomplete tool use loop
-                "turn_start_idx": int - Index of first assistant message in current turn
+                "turn_start_idx": int - Index of first model message in current turn
                 "turn_has_thinking": bool - Whether the TURN started with thinking
-                "last_assistant_idx": int - Index of last assistant message
-                "last_assistant_has_thinking": bool - Whether last assistant msg has thinking
-                "last_assistant_has_tool_calls": bool - Whether last assistant msg has tool calls
-                "pending_tool_results": bool - Whether there are tool results after last assistant
+                "last_model_idx": int - Index of last model message
+                "last_model_has_thinking": bool - Whether last model msg has thinking
+                "last_model_has_tool_calls": bool - Whether last model msg has tool calls
+                "pending_tool_results": bool - Whether there are tool results after last model
                 "thinking_block_indices": List[int] - Indices of messages with thinking/reasoning
             }
+
+        NOTE: This now operates on Gemini-format messages (after transformation):
+        - Role "model" instead of "assistant"
+        - Role "user" for both user messages AND tool results (with functionResponse)
+        - "parts" array with "thought": true for thinking
+        - "parts" array with "functionCall" for tool calls
+        - "parts" array with "functionResponse" for tool results
         """
         state = {
             "in_tool_loop": False,
             "turn_start_idx": -1,
             "turn_has_thinking": False,
-            "last_assistant_idx": -1,
+            "last_assistant_idx": -1,  # Keep name for compatibility
             "last_assistant_has_thinking": False,
             "last_assistant_has_tool_calls": False,
             "pending_tool_results": False,
@@ -1199,25 +1206,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         }
 
         # First pass: Find the last "real" user message (not a tool result)
-        # A real user message is one that doesn't immediately follow an assistant with tool_calls
+        # In Gemini format, tool results are "user" role with functionResponse parts
         last_real_user_idx = -1
         for i, msg in enumerate(messages):
             role = msg.get("role")
             if role == "user":
-                # Check if this is a real user message or just follows tool results
-                # Tool messages have role="tool", so if this is role="user" and
-                # it's not just a tool_result container, it's a real user message.
-                # However, we need to be careful: the client might format tool results
-                # as user messages with tool_result content. Check the content.
-                content = msg.get("content")
-
-                # If content is a list with tool_result items, it's a tool response
-                is_tool_result_msg = False
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "tool_result":
-                            is_tool_result_msg = True
-                            break
+                # Check if this is a real user message or a tool result container
+                parts = msg.get("parts", [])
+                is_tool_result_msg = any(
+                    isinstance(p, dict) and "functionResponse" in p for p in parts
+                )
 
                 if not is_tool_result_msg:
                     last_real_user_idx = i
@@ -1226,9 +1224,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         for i, msg in enumerate(messages):
             role = msg.get("role")
 
-            if role == "assistant":
-                # Check for thinking/reasoning content
+            if role == "model":
+                # Check for thinking/reasoning content (Gemini format)
                 has_thinking = self._message_has_thinking(msg)
+
+                # Check for tool calls (functionCall in parts)
+                parts = msg.get("parts", [])
+                has_tool_calls = any(
+                    isinstance(p, dict) and "functionCall" in p for p in parts
+                )
 
                 # Track if this is the turn start
                 if i > last_real_user_idx and state["turn_start_idx"] == -1:
@@ -1236,41 +1240,54 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     state["turn_has_thinking"] = has_thinking
 
                 state["last_assistant_idx"] = i
-                state["last_assistant_has_tool_calls"] = bool(msg.get("tool_calls"))
+                state["last_assistant_has_tool_calls"] = has_tool_calls
                 state["last_assistant_has_thinking"] = has_thinking
 
                 if has_thinking:
                     state["thinking_block_indices"].append(i)
 
-            elif role == "tool":
-                # Tool result after an assistant message with tool calls = in tool loop
-                if state["last_assistant_has_tool_calls"]:
+            elif role == "user":
+                # Check if this is a tool result (functionResponse in parts)
+                parts = msg.get("parts", [])
+                is_tool_result = any(
+                    isinstance(p, dict) and "functionResponse" in p for p in parts
+                )
+
+                if is_tool_result and state["last_assistant_has_tool_calls"]:
                     state["pending_tool_results"] = True
 
         # We're in a tool loop if:
         # 1. There are pending tool results
-        # 2. The conversation ends with tool results (last message is "tool" role)
+        # 2. The conversation ends with tool results (last message is user with functionResponse)
         if state["pending_tool_results"] and messages:
             last_msg = messages[-1]
-            if last_msg.get("role") == "tool":
-                state["in_tool_loop"] = True
+            if last_msg.get("role") == "user":
+                parts = last_msg.get("parts", [])
+                ends_with_tool_result = any(
+                    isinstance(p, dict) and "functionResponse" in p for p in parts
+                )
+                if ends_with_tool_result:
+                    state["in_tool_loop"] = True
 
         return state
 
     def _message_has_thinking(self, msg: Dict[str, Any]) -> bool:
-        """Check if an assistant message contains thinking/reasoning content."""
-        # Check reasoning_content field (OpenAI format)
-        if msg.get("reasoning_content"):
-            return True
+        """
+        Check if a message contains thinking/reasoning content.
 
-        # Check for thinking in content array (some formats)
-        content = msg.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "thinking":
-                    return True
-
+        Handles GEMINI format (after transformation):
+        - "parts" array with items having "thought": true
+        """
+        parts = msg.get("parts", [])
+        for part in parts:
+            if isinstance(part, dict) and part.get("thought") is True:
+                return True
         return False
+
+    def _message_has_tool_calls(self, msg: Dict[str, Any]) -> bool:
+        """Check if a message contains tool calls (Gemini format)."""
+        parts = msg.get("parts", [])
+        return any(isinstance(p, dict) and "functionCall" in p for p in parts)
 
     def _sanitize_thinking_for_claude(
         self, messages: List[Dict[str, Any]], thinking_enabled: bool
@@ -1403,7 +1420,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     state["last_assistant_has_tool_calls"]
                     and not state["turn_has_thinking"]
                 ):
-                    # The turn has tool_calls but no thinking at turn start.
+                    # The turn has functionCall but no thinking at turn start.
                     # This could be:
                     # 1. Compaction removed the thinking block
                     # 2. The original call was made without thinking
@@ -1412,7 +1429,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     # For case 2, we let the model respond naturally.
                     #
                     # We can detect case 1 if there's evidence thinking was expected:
-                    # - The turn_start message has tool_calls (typical thinking-enabled flow)
+                    # - The turn_start message has functionCall (typical thinking-enabled flow)
                     # - The content structure suggests a thinking block was stripped
 
                     # Check if turn_start has the hallmarks of a compacted thinking response
@@ -1436,18 +1453,21 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                                 messages, state["turn_start_idx"]
                             ), False
                         else:
-                            # Can't recover - add synthetic user to start fresh turn
+                            # Can't recover - add synthetic user to start fresh turn (Gemini format)
                             lib_logger.info(
                                 "[Thinking Sanitization] Detected compacted turn missing thinking block. "
                                 "Adding synthetic user message to start fresh thinking turn."
                             )
                             # Add synthetic user message to trigger new turn with thinking
-                            synthetic_user = {"role": "user", "content": "[Continue]"}
+                            synthetic_user = {
+                                "role": "user",
+                                "parts": [{"text": "[Continue]"}],
+                            }
                             messages.append(synthetic_user)
                             return self._strip_all_thinking_blocks(messages), False
                     else:
                         lib_logger.debug(
-                            "[Thinking Sanitization] Last assistant has tool_calls but no thinking. "
+                            "[Thinking Sanitization] Last model has functionCall but no thinking. "
                             "This is likely from context compression or non-thinking model. "
                             "New response will include thinking naturally."
                         )
@@ -1460,75 +1480,80 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _strip_all_thinking_blocks(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Remove all thinking/reasoning content from messages."""
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                # Remove reasoning_content field
-                msg.pop("reasoning_content", None)
+        """
+        Remove all thinking/reasoning content from messages.
 
-                # Remove thinking blocks from content array
-                content = msg.get("content")
-                if isinstance(content, list):
+        Handles GEMINI format (after transformation):
+        - Role "model" instead of "assistant"
+        - "parts" array with "thought": true for thinking
+        """
+        for msg in messages:
+            if msg.get("role") == "model":
+                parts = msg.get("parts", [])
+                if parts:
+                    # Filter out thinking parts (those with "thought": true)
                     filtered = [
-                        item
-                        for item in content
-                        if not (
-                            isinstance(item, dict) and item.get("type") == "thinking"
-                        )
+                        p
+                        for p in parts
+                        if not (isinstance(p, dict) and p.get("thought") is True)
                     ]
-                    # If filtering leaves empty list, we need to preserve message structure
-                    # to maintain user/assistant alternation. Use empty string as placeholder
-                    # (will result in empty "text" part which is valid).
+
+                    # Check if there are still functionCalls remaining
+                    has_function_calls = any(
+                        isinstance(p, dict) and "functionCall" in p for p in filtered
+                    )
+
                     if not filtered:
-                        # Only if there are no tool_calls either - otherwise message is valid
-                        if not msg.get("tool_calls"):
-                            msg["content"] = ""
+                        # All parts were thinking - need placeholder for valid structure
+                        if not has_function_calls:
+                            msg["parts"] = [{"text": ""}]
                         else:
-                            msg["content"] = (
-                                None  # tool_calls exist, content not needed
-                            )
+                            msg["parts"] = []  # Will be invalid, but shouldn't happen
                     else:
-                        msg["content"] = filtered
+                        msg["parts"] = filtered
         return messages
 
     def _strip_old_turn_thinking(
-        self, messages: List[Dict[str, Any]], last_assistant_idx: int
+        self, messages: List[Dict[str, Any]], last_model_idx: int
     ) -> List[Dict[str, Any]]:
         """
-        Strip thinking from old turns but preserve for the last assistant turn.
+        Strip thinking from old turns but preserve for the last model turn.
 
         Per Claude docs: "thinking blocks from previous turns are removed from context"
         This mimics the API behavior and prevents issues.
+
+        Handles GEMINI format: role "model", "parts" with "thought": true
         """
         for i, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and i < last_assistant_idx:
-                # Old turn - strip thinking
-                msg.pop("reasoning_content", None)
-                content = msg.get("content")
-                if isinstance(content, list):
+            if msg.get("role") == "model" and i < last_model_idx:
+                # Old turn - strip thinking parts
+                parts = msg.get("parts", [])
+                if parts:
                     filtered = [
-                        item
-                        for item in content
-                        if not (
-                            isinstance(item, dict) and item.get("type") == "thinking"
-                        )
+                        p
+                        for p in parts
+                        if not (isinstance(p, dict) and p.get("thought") is True)
                     ]
-                    # Preserve message structure with empty string if needed
+
+                    has_function_calls = any(
+                        isinstance(p, dict) and "functionCall" in p for p in filtered
+                    )
+
                     if not filtered:
-                        msg["content"] = "" if not msg.get("tool_calls") else None
+                        msg["parts"] = [{"text": ""}] if not has_function_calls else []
                     else:
-                        msg["content"] = filtered
+                        msg["parts"] = filtered
         return messages
 
     def _preserve_current_turn_thinking(
-        self, messages: List[Dict[str, Any]], last_assistant_idx: int
+        self, messages: List[Dict[str, Any]], last_model_idx: int
     ) -> List[Dict[str, Any]]:
         """
-        Preserve thinking only for the current (last) assistant turn.
+        Preserve thinking only for the current (last) model turn.
         Strip from all previous turns.
         """
         # Same as strip_old_turn_thinking - we keep the last turn intact
-        return self._strip_old_turn_thinking(messages, last_assistant_idx)
+        return self._strip_old_turn_thinking(messages, last_model_idx)
 
     def _preserve_turn_start_thinking(
         self, messages: List[Dict[str, Any]], turn_start_idx: int
@@ -1536,65 +1561,66 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         Preserve thinking at the turn start message.
 
-        In multi-message tool loops, the thinking block is at the FIRST assistant
+        In multi-message tool loops, the thinking block is at the FIRST model
         message of the turn (turn_start_idx), not the last one. We need to preserve
         thinking from the turn start, and strip it from all older turns.
+
+        Handles GEMINI format: role "model", "parts" with "thought": true
         """
         for i, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and i < turn_start_idx:
-                # Old turn - strip thinking
-                msg.pop("reasoning_content", None)
-                content = msg.get("content")
-                if isinstance(content, list):
+            if msg.get("role") == "model" and i < turn_start_idx:
+                # Old turn - strip thinking parts
+                parts = msg.get("parts", [])
+                if parts:
                     filtered = [
-                        item
-                        for item in content
-                        if not (
-                            isinstance(item, dict) and item.get("type") == "thinking"
-                        )
+                        p
+                        for p in parts
+                        if not (isinstance(p, dict) and p.get("thought") is True)
                     ]
+
+                    has_function_calls = any(
+                        isinstance(p, dict) and "functionCall" in p for p in filtered
+                    )
+
                     if not filtered:
-                        msg["content"] = "" if not msg.get("tool_calls") else None
+                        msg["parts"] = [{"text": ""}] if not has_function_calls else []
                     else:
-                        msg["content"] = filtered
+                        msg["parts"] = filtered
         return messages
 
     def _looks_like_compacted_thinking_turn(self, msg: Dict[str, Any]) -> bool:
         """
         Detect if a message looks like it was compacted from a thinking-enabled turn.
 
-        Heuristics:
-        1. Has tool_calls (typical thinking flow produces tool calls)
-        2. Content structure suggests stripped thinking (e.g., starts with tool_use directly)
-        3. No text content before tool_use (thinking responses usually have text)
+        Heuristics (GEMINI format):
+        1. Has functionCall parts (typical thinking flow produces tool calls)
+        2. No thinking parts (thought: true)
+        3. No text content before functionCall (thinking responses usually have text)
 
         This is imperfect but helps catch common compaction scenarios.
         """
-        if not msg.get("tool_calls"):
+        parts = msg.get("parts", [])
+        if not parts:
             return False
 
-        content = msg.get("content")
+        has_function_call = any(
+            isinstance(p, dict) and "functionCall" in p for p in parts
+        )
 
-        # If content is just tool_use blocks with no text, it might be compacted
-        if isinstance(content, list):
-            has_text = any(
-                isinstance(item, dict)
-                and item.get("type") == "text"
-                and item.get("text", "").strip()
-                for item in content
-            )
-            has_tool_use = any(
-                isinstance(item, dict) and item.get("type") == "tool_use"
-                for item in content
-            )
+        if not has_function_call:
+            return False
 
-            # Typical compacted thinking: tool_use without preceding text
-            # Normal non-thinking response would have explanatory text
-            if has_tool_use and not has_text:
-                return True
+        # Check for text content (not thinking)
+        has_text = any(
+            isinstance(p, dict)
+            and "text" in p
+            and p.get("text", "").strip()
+            and not p.get("thought")  # Exclude thinking text
+            for p in parts
+        )
 
-        # If content is empty/None but has tool_calls, likely compacted
-        if not content and msg.get("tool_calls"):
+        # If we have functionCall but no non-thinking text, likely compacted
+        if not has_text:
             return True
 
         return False
@@ -1605,17 +1631,38 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         Try to recover thinking content from cache for a compacted turn.
 
+        Handles GEMINI format: extracts functionCall for cache key lookup,
+        injects thinking as a part with thought: true.
+
         Returns True if thinking was successfully recovered and injected, False otherwise.
         """
         if turn_start_idx < 0 or turn_start_idx >= len(messages):
             return False
 
         msg = messages[turn_start_idx]
+        parts = msg.get("parts", [])
 
-        # Extract tool_calls for cache key lookup
-        tool_calls = msg.get("tool_calls", [])
-        content = msg.get("content", "")
-        text_content = content if isinstance(content, str) else ""
+        # Extract text content and build tool_calls structure for cache key lookup
+        text_content = ""
+        tool_calls = []
+
+        for part in parts:
+            if isinstance(part, dict):
+                if "text" in part and not part.get("thought"):
+                    text_content = part["text"]
+                elif "functionCall" in part:
+                    fc = part["functionCall"]
+                    # Convert to OpenAI tool_calls format for cache key compatibility
+                    tool_calls.append(
+                        {
+                            "id": fc.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": fc.get("name", ""),
+                                "arguments": json.dumps(fc.get("args", {})),
+                            },
+                        }
+                    )
 
         # Generate cache key and try to retrieve
         cache_key = self._generate_thinking_cache_key(text_content, tool_calls)
@@ -1640,19 +1687,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 )
                 return False
 
-            # Inject the recovered thinking block
-            thinking_block = {
-                "type": "thinking",
-                "thinking": thinking_text,
-                "signature": signature,
+            # Inject the recovered thinking part at the beginning (Gemini format)
+            thinking_part = {
+                "text": thinking_text,
+                "thought": True,
+                "thoughtSignature": signature,
             }
 
-            if isinstance(content, list):
-                msg["content"] = [thinking_block] + content
-            elif isinstance(content, str):
-                msg["content"] = [thinking_block, {"type": "text", "text": content}]
-            else:
-                msg["content"] = [thinking_block]
+            msg["parts"] = [thinking_part] + parts
 
             lib_logger.debug(
                 f"[Thinking Sanitization] Recovered thinking from cache: {len(thinking_text)} chars"
@@ -1672,7 +1714,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Close an incomplete tool loop by injecting synthetic messages to start a new turn.
 
         This is used when:
-        - We're in a tool loop (conversation ends with tool_result)
+        - We're in a tool loop (conversation ends with functionResponse)
         - The tool call was made WITHOUT thinking (e.g., by Gemini, non-thinking Claude, or compaction stripped it)
         - We NOW want to enable thinking
 
@@ -1681,8 +1723,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         - "To toggle thinking, you must complete the assistant turn first"
         - A non-tool-result user message ends the turn and allows a fresh start
 
-        Solution:
-        1. Add synthetic ASSISTANT message to complete the non-thinking turn
+        Solution (GEMINI format):
+        1. Add synthetic MODEL message to complete the non-thinking turn
         2. Add synthetic USER message to start a NEW turn
         3. Claude will generate thinking for its response to the new turn
 
@@ -1692,47 +1734,61 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Strip any old thinking first
         messages = self._strip_all_thinking_blocks(messages)
 
-        # Collect tool results from the end of the conversation
-        tool_results = []
+        # Count tool results from the end of the conversation (Gemini format)
+        tool_result_count = 0
         for msg in reversed(messages):
-            if msg.get("role") == "tool":
-                tool_results.append(msg)
-            elif msg.get("role") == "assistant":
-                break  # Stop at the assistant that made the tool calls
-
-        tool_results.reverse()  # Put back in order
+            if msg.get("role") == "user":
+                parts = msg.get("parts", [])
+                has_function_response = any(
+                    isinstance(p, dict) and "functionResponse" in p for p in parts
+                )
+                if has_function_response:
+                    tool_result_count += len(
+                        [
+                            p
+                            for p in parts
+                            if isinstance(p, dict) and "functionResponse" in p
+                        ]
+                    )
+                else:
+                    break  # Real user message, stop counting
+            elif msg.get("role") == "model":
+                break  # Stop at the model that made the tool calls
 
         # Safety check: if no tool results found, this shouldn't have been called
         # But handle gracefully with a generic message
-        if not tool_results:
+        if tool_result_count == 0:
             lib_logger.warning(
                 "[Thinking Sanitization] _close_tool_loop_for_thinking called but no tool results found. "
                 "This may indicate malformed conversation history."
             )
-            synthetic_assistant_content = "[Processing previous context.]"
-        elif len(tool_results) == 1:
-            synthetic_assistant_content = "[Tool execution completed.]"
+            synthetic_model_content = "[Processing previous context.]"
+        elif tool_result_count == 1:
+            synthetic_model_content = "[Tool execution completed.]"
         else:
-            synthetic_assistant_content = (
-                f"[{len(tool_results)} tool executions completed.]"
+            synthetic_model_content = (
+                f"[{tool_result_count} tool executions completed.]"
             )
 
-        # Step 1: Inject synthetic ASSISTANT message to complete the non-thinking turn
-        synthetic_assistant = {
-            "role": "assistant",
-            "content": synthetic_assistant_content,
+        # Step 1: Inject synthetic MODEL message to complete the non-thinking turn (Gemini format)
+        synthetic_model = {
+            "role": "model",
+            "parts": [{"text": synthetic_model_content}],
         }
-        messages.append(synthetic_assistant)
+        messages.append(synthetic_model)
 
-        # Step 2: Inject synthetic USER message to start a NEW turn
+        # Step 2: Inject synthetic USER message to start a NEW turn (Gemini format)
         # This allows Claude to generate thinking for its response
         # The message is minimal and unobtrusive - just triggers a new turn
-        synthetic_user = {"role": "user", "content": "[Continue]"}
+        synthetic_user = {
+            "role": "user",
+            "parts": [{"text": "[Continue]"}],
+        }
         messages.append(synthetic_user)
 
         lib_logger.info(
             f"[Thinking Sanitization] Closed tool loop with synthetic messages. "
-            f"Assistant: '{synthetic_assistant_content}', User: '[Continue]'. "
+            f"Model: '{synthetic_model_content}', User: '[Continue]'. "
             f"Claude will now start a fresh turn with thinking enabled."
         )
 
@@ -2981,13 +3037,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 reasoning_effort is not None and reasoning_effort != "disable"
             )
 
-        # Sanitize thinking blocks for Claude to prevent 400 errors
+        # Transform messages to Gemini format FIRST
+        # This restores thinking from cache if reasoning_content was stripped by client
+        system_instruction, gemini_contents = self._transform_messages(messages, model)
+        gemini_contents = self._fix_tool_response_grouping(gemini_contents)
+
+        # Sanitize thinking blocks for Claude AFTER transformation
+        # Now we can see the full picture including cached thinking that was restored
         # This handles: context compression, model switching, mid-turn thinking toggle
-        # Returns (sanitized_messages, force_disable_thinking)
         force_disable_thinking = False
         if self._is_claude(model) and self._enable_thinking_sanitization:
-            messages, force_disable_thinking = self._sanitize_thinking_for_claude(
-                messages, thinking_enabled
+            gemini_contents, force_disable_thinking = (
+                self._sanitize_thinking_for_claude(gemini_contents, thinking_enabled)
             )
 
             # If we're in a mid-turn thinking toggle situation, we MUST disable thinking
@@ -2995,10 +3056,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             if force_disable_thinking:
                 thinking_enabled = False
                 reasoning_effort = "disable"  # Force disable for this request
-
-        # Transform messages
-        system_instruction, gemini_contents = self._transform_messages(messages, model)
-        gemini_contents = self._fix_tool_response_grouping(gemini_contents)
 
         # Build payload
         gemini_payload = {"contents": gemini_contents}
