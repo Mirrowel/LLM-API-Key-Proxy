@@ -215,13 +215,14 @@ Use this tool to:
 
 ### Antigravity
 -   **Auth**: Uses OAuth 2.0 flow similar to Gemini CLI, with Antigravity-specific credentials and scopes.
--   **Models**: Supports Gemini 2.5 (Pro/Flash), Gemini 3 (Pro/Image), and Claude Sonnet 4.5 via Google's internal Antigravity API.
+-   **Credential Prioritization**: Automatic detection and prioritization of paid vs free tier credentials (paid tier resets every 5 hours, free tier resets weekly).
+-   **Models**: Supports Gemini 3 Pro, Claude Sonnet 4.5 (with/without thinking), and Claude Opus 4.5 (thinking only) via Google's internal Antigravity API.
 -   **Thought Signature Caching**: Server-side caching of `thoughtSignature` data for multi-turn conversations with Gemini 3 models.
--   **Tool Hallucination Prevention**: Automatic injection of system instructions and parameter signatures for Gemini 3 to prevent tool parameter hallucination.
+-   **Tool Hallucination Prevention**: Automatic injection of system instructions and parameter signatures for Gemini 3 and Claude to prevent tool parameter hallucination.
 -   **Thinking Support**:
-    - Gemini 2.5: Uses `thinkingBudget` (integer tokens)
     - Gemini 3: Uses `thinkingLevel` (string: "low"/"high")
-    - Claude: Uses `thinkingBudget` via Antigravity proxy
+    - Claude Sonnet 4.5: Uses `thinkingBudget` (optional - supports both thinking and non-thinking modes)
+    - Claude Opus 4.5: Uses `thinkingBudget` (always uses thinking variant)
 -   **Base URL Fallback**: Automatic fallback between sandbox and production endpoints.
 
 ## Error Handling and Cooldowns
