@@ -1,0 +1,23 @@
+name: Initialize Compliance Status Check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  init-status:
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Set compliance check to pending
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state='pending' \
+            -f context='compliance-check' \
+            -f description='run /mirrobot-check when ready to merge'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

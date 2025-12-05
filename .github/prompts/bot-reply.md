@@ -162,7 +162,7 @@ When reviewing code, your priority is value, not volume.
 
 Strict rules to reduce noise:
 - Post inline comments only for issues, risks, regressions, missing tests, unclear logic, or concrete improvement opportunities.
-- Do not post praise-only or generic “LGTM” inline comments, except when explicitly confirming the resolution of previously raised issues or regressions; in that case, limit to at most 0–2 such inline comments per review and reference the prior feedback.
+- Do not post praise-only or generic "LGTM" inline comments, except when explicitly confirming the resolution of previously raised issues or regressions; in that case, limit to at most 0–2 such inline comments per review and reference the prior feedback.
 - If only positive observations remain after curation, submit 0 inline comments and provide a concise summary instead.
 - Keep general positive feedback in the summary and keep it concise; reserve inline praise only when verifying fixes as described above.
 
@@ -242,19 +242,32 @@ EOF
 ```
 
 **Step 2: Collect All Potential Findings (Internal)**
-Analyze the changed files from the diff file at `${DIFF_FILE_PATH}`. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external "scratchpad"; do not filter or curate at this stage.
+Analyze the changed files. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external "scratchpad"; do not filter or curate at this stage.
 
-#### Read the Diff File (Provided by Workflow)
-- The workflow already generated the appropriate diff and exposed it at `${DIFF_FILE_PATH}`.
-- Read this file first; it may be a full diff (first review) or an incremental diff (follow-up), depending on `${IS_FIRST_REVIEW}`.
-- Do not regenerate diffs, scrape SHAs, or attempt to infer prior reviews. Use the provided inputs only. Unless something is missing, which will be noted in the file.
+#### Available Diff Files (Read Only If Needed)
+The workflow has pre-generated diff files for your convenience, but you should **only read them if you need them**:
+- **Full diff** (entire PR against base branch): `${FULL_DIFF_PATH}`
+- **Incremental diff** (changes since last review): `${INCREMENTAL_DIFF_PATH}`
+  - Available only if `${LAST_REVIEWED_SHA}` is not empty (i.e., this is a follow-up review)
+  - The diff compares `${LAST_REVIEWED_SHA}` to `${PR_HEAD_SHA}`
+
+**Strategic Reading Recommendations:**
+- For **initial reviews** or when you need full context: Read `${FULL_DIFF_PATH}`
+- For **follow-up reviews** where you only want to see what changed: Read `${INCREMENTAL_DIFF_PATH}` (if available)
+- For **simple requests** (e.g., "what's the status?"): You may not need to read either diff
+- You can also use `git diff` commands directly if you need custom diffs or specific file comparisons
+
+**Important Notes:**
+- Do not regenerate these diffs - they are pre-generated and ready for you
+- If a diff file contains error messages (starting with `"("`), it means the diff generation failed; use the changed files list from context or generate diffs manually with `git`
+- Files may be large (truncated at 500KB), so read strategically
 
 #### Head SHA Rules (Critical)
 - Always use the provided environment variable `$PR_HEAD_SHA` for both:
   - The `commit_id` field in the final review submission payload.
   - The marker `<!-- last_reviewed_sha:${PR_HEAD_SHA} -->` embedded in your review summary body.
 - Never attempt to derive, scrape, or copy the head SHA from comments, reviews, or other text. Do not reuse `LAST_REVIEWED_SHA` as `commit_id`.
-- The only purpose of `LAST_REVIEWED_SHA` is to determine the base for an incremental diff. It must not replace `$PR_HEAD_SHA` anywhere.
+- The only purpose of `LAST_REVIEWED_SHA` is to indicate which SHA was reviewed last (for context only). It must not replace `$PR_HEAD_SHA` anywhere in your review submission.
 - If `$PR_HEAD_SHA` is empty or unavailable, do not guess it from comments. Prefer `git rev-parse HEAD` strictly as a fallback and include a warning in your final summary.
 
 #### **Using Line Ranges Correctly**
@@ -266,7 +279,7 @@ Line ranges pinpoint the exact code you're discussing. Use them precisely:
 -   **Constructive Tone:** Your feedback should be helpful and guiding, not critical.
 -   **Code Suggestions:** For proposed code fixes, you **must** wrap your code in a ```suggestion``` block. This makes it a one-click suggestion in the GitHub UI.
 -   **Be Specific:** Clearly explain *why* a change is needed, not just *what* should change.
--   **No Praise-Only Inline Comments (with one exception):** Do not add generic affirmations as line comments. You may add up to 0–2 inline “fix verified” notes when they directly confirm resolution of issues you or others previously raised—reference the prior comment/issue. Keep broader praise in a concise summary.
+-   **No Praise-Only Inline Comments (with one exception):** Do not add generic affirmations as line comments. You may add up to 0–2 inline "fix verified" notes when they directly confirm resolution of issues you or others previously raised—reference the prior comment/issue. Keep broader praise in a concise summary.
 
 For each file with findings, batch them into a single command:
 ```bash
