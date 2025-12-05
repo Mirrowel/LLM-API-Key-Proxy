@@ -253,16 +253,27 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
     elif isinstance(obj, str):
         stripped = obj.strip()
 
-        # Check if string contains common escape sequences that need unescaping
-        # This handles cases where diff content or other text has literal \n instead of newlines
-        if "\\n" in obj or "\\t" in obj or '\\"' in obj or "\\\\" in obj:
+        # Check if string contains control character escape sequences that need unescaping
+        # This handles cases where diff content has literal \n or \t instead of actual newlines/tabs
+        #
+        # IMPORTANT: We intentionally do NOT unescape strings containing \" or \\
+        # because these are typically intentional escapes in code/config content
+        # (e.g., JSON embedded in YAML: BOT_NAMES_JSON: '["mirrobot", ...]')
+        # Unescaping these would corrupt the content and cause issues like
+        # oldString and newString becoming identical when they should differ.
+        has_control_char_escapes = "\\n" in obj or "\\t" in obj
+        has_intentional_escapes = '\\"' in obj or "\\\\" in obj
+
+        if has_control_char_escapes and not has_intentional_escapes:
             try:
                 # Use json.loads with quotes to properly unescape the string
-                # This converts \n -> newline, \t -> tab, \" -> quote, etc.
+                # This converts \n -> newline, \t -> tab
                 unescaped = json.loads(f'"{obj}"')
+                # Log the fix with a snippet for debugging
+                snippet = obj[:80] + "..." if len(obj) > 80 else obj
                 lib_logger.debug(
-                    f"[Antigravity] Unescaped string content: "
-                    f"{len(obj) - len(unescaped)} chars changed"
+                    f"[Antigravity] Unescaped control chars in string: "
+                    f"{len(obj) - len(unescaped)} chars changed. Snippet: {snippet!r}"
                 )
                 return unescaped
             except (json.JSONDecodeError, ValueError):
