@@ -578,6 +578,51 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         )
 
     # =========================================================================
+    # CREDENTIAL PRIORITIZATION
+    # =========================================================================
+
+    def get_credential_priority(self, credential: str) -> Optional[int]:
+        """
+        Returns priority based on Antigravity tier.
+        Paid tiers: priority 1 (highest)
+        Free tier: priority 2
+        Legacy/Unknown: priority 10 (lowest)
+
+        Args:
+            credential: The credential path
+
+        Returns:
+            Priority level (1-10) or None if tier not yet discovered
+        """
+        tier = self.project_tier_cache.get(credential)
+        if not tier:
+            return None  # Not yet discovered
+
+        # Paid tiers get highest priority
+        if tier not in ["free-tier", "legacy-tier", "unknown"]:
+            return 1
+
+        # Free tier gets lower priority
+        if tier == "free-tier":
+            return 2
+
+        # Legacy and unknown get even lower
+        return 10
+
+    def get_model_tier_requirement(self, model: str) -> Optional[int]:
+        """
+        Returns the minimum priority tier required for a model.
+        Antigravity has no model-tier restrictions - all models work on all tiers.
+
+        Args:
+            model: The model name (with or without provider prefix)
+
+        Returns:
+            None - no restrictions for any model
+        """
+        return None
+
+    # =========================================================================
     # MODEL UTILITIES
     # =========================================================================
 
