@@ -531,6 +531,15 @@ def classify_error(e: Exception) -> ClassifiedError:
 
     if isinstance(e, RateLimitError):
         retry_after = get_retry_after(e)
+        # Check if this is a quota error vs rate limit
+        error_msg = str(e).lower()
+        if "quota" in error_msg or "resource_exhausted" in error_msg:
+            return ClassifiedError(
+                error_type="quota_exceeded",
+                original_exception=e,
+                status_code=status_code or 429,
+                retry_after=retry_after,
+            )
         return ClassifiedError(
             error_type="rate_limit",
             original_exception=e,
