@@ -620,8 +620,9 @@ class RotatingClient:
                     litellm.ServiceUnavailableError,
                     litellm.InternalServerError,
                     APIConnectionError,
+                    httpx.HTTPStatusError,
                 ) as e:
-                    # This is a critical, typed error from litellm that signals a key failure.
+                    # This is a critical, typed error from litellm or httpx that signals a key failure.
                     # We do not try to parse it here. We wrap it and raise it immediately
                     # for the outer retry loop to handle.
                     lib_logger.warning(
@@ -1065,7 +1066,10 @@ class RotatingClient:
                             )
 
                             # Only trigger provider-wide cooldown for rate limits, not quota issues
-                            if classified_error.status_code == 429 and classified_error.error_type != "quota_exceeded":
+                            if (
+                                classified_error.status_code == 429
+                                and classified_error.error_type != "quota_exceeded"
+                            ):
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
@@ -1225,9 +1229,9 @@ class RotatingClient:
 
                             # Handle rate limits with cooldown (exclude quota_exceeded from provider-wide cooldown)
                             if (
-                                (classified_error.status_code == 429 and classified_error.error_type != "quota_exceeded")
-                                or classified_error.error_type == "rate_limit"
-                            ):
+                                classified_error.status_code == 429
+                                and classified_error.error_type != "quota_exceeded"
+                            ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
@@ -1494,7 +1498,7 @@ class RotatingClient:
                                 lib_logger.info(
                                     f"Attempting stream with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                                 )
-    
+
                                 if pre_request_callback:
                                     try:
                                         await pre_request_callback(
@@ -1973,9 +1977,9 @@ class RotatingClient:
 
                             # Handle rate limits with cooldown (exclude quota_exceeded)
                             if (
-                                (classified_error.status_code == 429 and classified_error.error_type != "quota_exceeded")
-                                or classified_error.error_type == "rate_limit"
-                            ):
+                                classified_error.status_code == 429
+                                and classified_error.error_type != "quota_exceeded"
+                            ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
                                     provider, cooldown_duration
