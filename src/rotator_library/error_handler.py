@@ -354,6 +354,66 @@ class ClassifiedError:
         return f"ClassifiedError(type={self.error_type}, status={self.status_code}, retry_after={self.retry_after}, original_exc={self.original_exception})"
 
 
+def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
+    """
+    Extract retry delay from a JSON error response body.
+
+    Handles Antigravity/Google API error formats with details array containing:
+    - RetryInfo with retryDelay: "562476.752463453s"
+    - ErrorInfo metadata with quotaResetDelay: "156h14m36.752463453s"
+
+    Args:
+        json_text: JSON string (original case, not lowercased)
+
+    Returns:
+        Retry delay in seconds, or None if not found
+    """
+    try:
+        # Find JSON object in the text
+        json_match = re.search(r"(\{.*\})", json_text, re.DOTALL)
+        if not json_match:
+            return None
+
+        error_json = json.loads(json_match.group(1))
+        details = error_json.get("error", {}).get("details", [])
+
+        # Iterate through ALL details items (not just index 0)
+        for detail in details:
+            detail_type = detail.get("@type", "")
+
+            # Check RetryInfo for retryDelay (most authoritative)
+            # Note: Case-sensitive key names as returned by API
+            if "google.rpc.RetryInfo" in detail_type:
+                delay_str = detail.get("retryDelay")
+                if delay_str:
+                    # Handle both {"seconds": "123"} format and "123.456s" string format
+                    if isinstance(delay_str, dict):
+                        seconds = delay_str.get("seconds")
+                        if seconds:
+                            return int(float(seconds))
+                    elif isinstance(delay_str, str):
+                        result = _parse_duration_string(delay_str)
+                        if result is not None:
+                            return result
+
+            # Check ErrorInfo metadata for quotaResetDelay (Antigravity-specific)
+            if "google.rpc.ErrorInfo" in detail_type:
+                metadata = detail.get("metadata", {})
+                # Try both camelCase and lowercase variants
+                quota_reset_delay = metadata.get("quotaResetDelay") or metadata.get(
+                    "quotaresetdelay"
+                )
+                if quota_reset_delay:
+                    result = _parse_duration_string(quota_reset_delay)
+                    if result is not None:
+                        return result
+
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        pass
+
+    return None
+
+
 def get_retry_after(error: Exception) -> Optional[int]:
     """
     Extracts the 'retry-after' duration in seconds from an exception message.
@@ -365,8 +425,20 @@ def get_retry_after(error: Exception) -> Optional[int]:
     - ErrorInfo metadata with quotaResetDelay: "156h14m36.752463453s"
     - Human-readable message: "quota will reset after 156h14m36s"
     """
-    # 0. For httpx errors, check response headers first (most reliable)
+    # 0. For httpx errors, check response body and headers
     if isinstance(error, httpx.HTTPStatusError):
+        # First, try to parse the response body JSON (contains retryDelay/quotaResetDelay)
+        # This is where Antigravity puts the retry information
+        try:
+            response_text = error.response.text
+            if response_text:
+                result = _extract_retry_from_json_body(response_text)
+                if result is not None:
+                    return result
+        except Exception:
+            pass  # Response body may not be available
+
+        # Fallback to HTTP headers
         headers = error.response.headers
         # Check standard Retry-After header (case-insensitive)
         retry_header = headers.get("retry-after") or headers.get("Retry-After")
@@ -392,62 +464,30 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, TypeError):
                 pass
 
-    error_str = str(error).lower()
-
-    # 1. Try to parse JSON from the error string to find retry info
-    # Antigravity errors have details array with RetryInfo and/or ErrorInfo
-    try:
-        # It's common for the actual JSON to be embedded in the string representation
-        json_match = re.search(r"(\{.*\})", error_str, re.DOTALL)
-        if json_match:
-            error_json = json.loads(json_match.group(1))
-            details = error_json.get("error", {}).get("details", [])
-
-            # Iterate through ALL details items (not just index 0)
-            for detail in details:
-                detail_type = detail.get("@type", "")
-
-                # Check RetryInfo for retryDelay (most authoritative)
-                if detail_type == "type.googleapis.com/google.rpc.retryinfo":
-                    delay_str = detail.get("retrydelay")
-                    if delay_str:
-                        # Handle both {"seconds": "123"} format and "123.456s" string format
-                        if isinstance(delay_str, dict):
-                            seconds = delay_str.get("seconds")
-                            if seconds:
-                                return int(float(seconds))
-                        elif isinstance(delay_str, str):
-                            result = _parse_duration_string(delay_str)
-                            if result is not None:
-                                return result
-
-                # Check ErrorInfo metadata for quotaResetDelay (Antigravity-specific)
-                if detail_type == "type.googleapis.com/google.rpc.errorinfo":
-                    metadata = detail.get("metadata", {})
-                    quota_reset_delay = metadata.get("quotaresetdelay")
-                    if quota_reset_delay:
-                        result = _parse_duration_string(quota_reset_delay)
-                        if result is not None:
-                            return result
-
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
-        pass  # If JSON parsing fails, proceed to regex and attribute checks
+    # 1. Try to parse JSON from the error string representation
+    # Some exceptions embed JSON in their string representation
+    error_str = str(error)
+    result = _extract_retry_from_json_body(error_str)
+    if result is not None:
+        return result
 
     # 2. Common regex patterns for 'retry-after' (with compound duration support)
+    # Use lowercase for pattern matching
+    error_str_lower = error_str.lower()
     patterns = [
         r"retry[-_\s]after:?\s*(\d+)",  # Matches: retry-after, retry_after, retry after
         r"retry in\s*(\d+)\s*seconds?",
         r"wait for\s*(\d+)\s*seconds?",
-        r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON
+        r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON (lowercased)
         r"x-ratelimit-reset:?\s*(\d+)",
         # Compound duration patterns (Antigravity format)
         r"quota will reset after\s*([\dhms.]+)",  # e.g., "156h14m36s" or "120s"
         r"reset after\s*([\dhms.]+)",
-        r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON
+        r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON (lowercased)
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, error_str)
+        match = re.search(pattern, error_str_lower)
         if match:
             duration_str = match.group(1)
             # Try parsing as compound duration first
