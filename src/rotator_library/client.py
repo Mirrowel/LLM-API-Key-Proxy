@@ -140,6 +140,10 @@ class RotatingClient:
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
 
+        # Initialize provider plugins early so they can be used for rotation mode detection
+        self._provider_plugins = PROVIDER_PLUGINS
+        self._provider_instances = {}
+
         # Build provider rotation modes map
         # Each provider can specify its preferred rotation mode ("balanced" or "sequential")
         provider_rotation_modes = {}
@@ -164,8 +168,6 @@ class RotatingClient:
             provider_plugins=PROVIDER_PLUGINS,
         )
         self._model_list_cache = {}
-        self._provider_plugins = PROVIDER_PLUGINS
-        self._provider_instances = {}
         self.http_client = httpx.AsyncClient()
         self.all_providers = AllProviders()
         self.cooldown_manager = CooldownManager()
