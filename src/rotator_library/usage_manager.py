@@ -162,6 +162,69 @@ class UsageManager:
 
         return None
 
+    def _get_reset_mode(self, credential: str) -> str:
+        """
+        Get the reset mode for a credential: 'credential' or 'per_model'.
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            "per_model" or "credential" (default)
+        """
+        config = self._get_usage_reset_config(credential)
+        return config.get("mode", "credential") if config else "credential"
+
+    def _get_model_quota_group(self, credential: str, model: str) -> Optional[str]:
+        """
+        Get the quota group for a model, if the provider defines one.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Group name (e.g., "claude") or None if not grouped
+        """
+        provider = self._get_provider_from_credential(credential)
+        if not provider:
+            return None
+
+        plugin = self.provider_plugins.get(provider)
+        if not plugin:
+            return None
+
+        if hasattr(plugin, "get_model_quota_group"):
+            return plugin.get_model_quota_group(model)
+
+        return None
+
+    def _get_grouped_models(self, credential: str, group: str) -> List[str]:
+        """
+        Get all model names in a quota group (with provider prefix).
+
+        Args:
+            credential: The credential identifier
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of full model names (e.g., ["antigravity/claude-opus-4-5", ...])
+        """
+        provider = self._get_provider_from_credential(credential)
+        if not provider:
+            return []
+
+        plugin = self.provider_plugins.get(provider)
+        if not plugin:
+            return []
+
+        if hasattr(plugin, "get_models_in_quota_group"):
+            models = plugin.get_models_in_quota_group(group)
+            # Add provider prefix
+            return [f"{provider}/{m}" for m in models]
+
+        return []
+
     def _get_usage_field_name(self, credential: str) -> str:
         """
         Get the usage tracking field name for a credential.
@@ -190,27 +253,36 @@ class UsageManager:
 
     def _get_usage_count(self, key: str, model: str) -> int:
         """
-        Get the current usage count for a model from the appropriate usage field.
+        Get the current usage count for a model from the appropriate usage structure.
+
+        Supports both:
+        - New per-model structure: {"models": {"model_name": {"success_count": N, ...}}}
+        - Legacy structure: {"daily": {"models": {"model_name": {"success_count": N, ...}}}}
 
         Args:
             key: Credential identifier
             model: Model name
 
         Returns:
-            Usage count (success_count) for the model in the current window/daily period
+            Usage count (success_count) for the model in the current window/period
         """
         if self._usage_data is None:
             return 0
 
         key_data = self._usage_data.get(key, {})
-        usage_field = self._get_usage_field_name(key)
+        reset_mode = self._get_reset_mode(key)
 
-        return (
-            key_data.get(usage_field, {})
-            .get("models", {})
-            .get(model, {})
-            .get("success_count", 0)
-        )
+        if reset_mode == "per_model":
+            # New per-model structure: key_data["models"][model]["success_count"]
+            return key_data.get("models", {}).get(model, {}).get("success_count", 0)
+        else:
+            # Legacy structure: key_data["daily"]["models"][model]["success_count"]
+            return (
+                key_data.get("daily", {})
+                .get("models", {})
+                .get(model, {})
+                .get("success_count", 0)
+            )
 
     def _select_sequential(
         self,
@@ -299,9 +371,10 @@ class UsageManager:
         """
         Checks if usage stats need to be reset for any key.
 
-        Supports two reset modes:
-        1. Provider-specific rolling windows (e.g., 5h for Antigravity paid, 7d for free)
-        2. Legacy daily reset at daily_reset_time_utc for providers without custom config
+        Supports three reset modes:
+        1. per_model: Each model has its own window, resets based on quota_reset_ts or fallback window
+        2. credential: One window per credential (legacy with custom window duration)
+        3. daily: Legacy daily reset at daily_reset_time_utc
         """
         if self._usage_data is None:
             return
@@ -312,22 +385,193 @@ class UsageManager:
         needs_saving = False
 
         for key, data in self._usage_data.items():
-            # Check for provider-specific reset configuration
             reset_config = self._get_usage_reset_config(key)
 
             if reset_config:
-                # Provider-specific rolling window reset
-                needs_saving |= await self._check_window_reset(
-                    key, data, reset_config, now_ts
-                )
+                reset_mode = reset_config.get("mode", "credential")
+
+                if reset_mode == "per_model":
+                    # Per-model window reset
+                    needs_saving |= await self._check_per_model_resets(
+                        key, data, reset_config, now_ts
+                    )
+                else:
+                    # Credential-level window reset (legacy)
+                    needs_saving |= await self._check_window_reset(
+                        key, data, reset_config, now_ts
+                    )
             elif self.daily_reset_time_utc:
-                # Legacy daily reset for providers without custom config
+                # Legacy daily reset
                 needs_saving |= await self._check_daily_reset(
                     key, data, now_utc, today_str, now_ts
                 )
 
         if needs_saving:
             await self._save_usage()
+
+    async def _check_per_model_resets(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        reset_config: Dict[str, Any],
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform per-model resets for a credential.
+
+        Each model resets independently based on:
+        1. quota_reset_ts (authoritative, from quota exhausted error) if set
+        2. window_start_ts + window_seconds (fallback) otherwise
+
+        Grouped models reset together - all models in a group must be ready.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            reset_config: Provider's reset configuration
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        window_seconds = reset_config.get("window_seconds", 86400)
+        models_data = data.get("models", {})
+
+        if not models_data:
+            return False
+
+        modified = False
+        processed_groups = set()
+
+        for model, model_data in list(models_data.items()):
+            # Check if this model is in a quota group
+            group = self._get_model_quota_group(key, model)
+
+            if group:
+                if group in processed_groups:
+                    continue  # Already handled this group
+
+                # Check if entire group should reset
+                if self._should_group_reset(
+                    key, group, models_data, window_seconds, now_ts
+                ):
+                    # Archive and reset all models in group
+                    grouped_models = self._get_grouped_models(key, group)
+                    archived_count = 0
+
+                    for grouped_model in grouped_models:
+                        if grouped_model in models_data:
+                            gm_data = models_data[grouped_model]
+                            self._archive_model_to_global(data, grouped_model, gm_data)
+                            self._reset_model_data(gm_data)
+                            archived_count += 1
+
+                    if archived_count > 0:
+                        lib_logger.info(
+                            f"Reset model group '{group}' ({archived_count} models) for {mask_credential(key)}"
+                        )
+                        modified = True
+
+                processed_groups.add(group)
+
+            else:
+                # Ungrouped model - check individually
+                if self._should_model_reset(model_data, window_seconds, now_ts):
+                    self._archive_model_to_global(data, model, model_data)
+                    self._reset_model_data(model_data)
+                    lib_logger.info(f"Reset model {model} for {mask_credential(key)}")
+                    modified = True
+
+        # Preserve unexpired cooldowns
+        if modified:
+            self._preserve_unexpired_cooldowns(key, data, now_ts)
+            if "failures" in data:
+                data["failures"] = {}
+
+        return modified
+
+    def _should_model_reset(
+        self, model_data: Dict[str, Any], window_seconds: int, now_ts: float
+    ) -> bool:
+        """
+        Check if a single model should reset.
+
+        Returns True if:
+        - quota_reset_ts is set AND now >= quota_reset_ts, OR
+        - quota_reset_ts is NOT set AND now >= window_start_ts + window_seconds
+        """
+        quota_reset = model_data.get("quota_reset_ts")
+        window_start = model_data.get("window_start_ts")
+
+        if quota_reset:
+            return now_ts >= quota_reset
+        elif window_start:
+            return now_ts >= window_start + window_seconds
+        return False
+
+    def _should_group_reset(
+        self,
+        key: str,
+        group: str,
+        models_data: Dict[str, Dict],
+        window_seconds: int,
+        now_ts: float,
+    ) -> bool:
+        """
+        Check if all models in a group should reset.
+
+        All models in the group must be ready to reset.
+        If any model has an active cooldown/window, the whole group waits.
+        """
+        grouped_models = self._get_grouped_models(key, group)
+
+        # Track if any model in group has data
+        any_has_data = False
+
+        for grouped_model in grouped_models:
+            model_data = models_data.get(grouped_model, {})
+
+            if not model_data or (
+                model_data.get("window_start_ts") is None
+                and model_data.get("success_count", 0) == 0
+            ):
+                continue  # No stats for this model yet
+
+            any_has_data = True
+
+            if not self._should_model_reset(model_data, window_seconds, now_ts):
+                return False  # At least one model not ready
+
+        return any_has_data
+
+    def _archive_model_to_global(
+        self, data: Dict[str, Any], model: str, model_data: Dict[str, Any]
+    ) -> None:
+        """Archive a single model's stats to global."""
+        global_data = data.setdefault("global", {"models": {}})
+        global_model = global_data["models"].setdefault(
+            model,
+            {
+                "success_count": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "approx_cost": 0.0,
+            },
+        )
+
+        global_model["success_count"] += model_data.get("success_count", 0)
+        global_model["prompt_tokens"] += model_data.get("prompt_tokens", 0)
+        global_model["completion_tokens"] += model_data.get("completion_tokens", 0)
+        global_model["approx_cost"] += model_data.get("approx_cost", 0.0)
+
+    def _reset_model_data(self, model_data: Dict[str, Any]) -> None:
+        """Reset a model's window and stats."""
+        model_data["window_start_ts"] = None
+        model_data["quota_reset_ts"] = None
+        model_data["success_count"] = 0
+        model_data["prompt_tokens"] = 0
+        model_data["completion_tokens"] = 0
+        model_data["approx_cost"] = 0.0
 
     async def _check_window_reset(
         self,
@@ -948,36 +1192,67 @@ class UsageManager:
         Records a successful API call, resetting failure counters.
         It safely handles cases where token usage data is not available.
 
-        Uses provider-specific field names for usage tracking (e.g., "5h_window", "weekly")
-        and sets window start timestamp on first request.
+        Supports two modes based on provider configuration:
+        - per_model: Each model has its own window_start_ts and stats in key_data["models"]
+        - credential: Legacy mode with key_data["daily"]["models"]
         """
         await self._lazy_init()
         async with self._data_lock:
             now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
 
-            # Determine the usage field name for this credential
-            usage_field = self._get_usage_field_name(key)
             reset_config = self._get_usage_reset_config(key)
-            uses_window = reset_config is not None
+            reset_mode = (
+                reset_config.get("mode", "credential") if reset_config else "credential"
+            )
 
-            # Initialize key data with appropriate structure
-            if uses_window:
-                # Provider-specific rolling window
+            if reset_mode == "per_model":
+                # New per-model structure
                 key_data = self._usage_data.setdefault(
                     key,
                     {
-                        usage_field: {"start_ts": None, "models": {}},
+                        "models": {},
                         "global": {"models": {}},
                         "model_cooldowns": {},
                         "failures": {},
                     },
                 )
-                # Ensure the usage field exists (for migration from old format)
-                if usage_field not in key_data:
-                    key_data[usage_field] = {"start_ts": None, "models": {}}
+
+                # Ensure models dict exists
+                if "models" not in key_data:
+                    key_data["models"] = {}
+
+                # Get or create per-model data with window tracking
+                model_data = key_data["models"].setdefault(
+                    model,
+                    {
+                        "window_start_ts": None,
+                        "quota_reset_ts": None,
+                        "success_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "approx_cost": 0.0,
+                    },
+                )
+
+                # Start window on first request for this model
+                if model_data.get("window_start_ts") is None:
+                    model_data["window_start_ts"] = now_ts
+                    window_hours = (
+                        reset_config.get("window_seconds", 0) / 3600
+                        if reset_config
+                        else 0
+                    )
+                    lib_logger.info(
+                        f"Started {window_hours:.1f}h window for model {model} on {mask_credential(key)}"
+                    )
+
+                # Record stats
+                model_data["success_count"] += 1
+                usage_data_ref = model_data  # For token/cost recording below
+
             else:
-                # Legacy daily reset
+                # Legacy credential-level structure
                 key_data = self._usage_data.setdefault(
                     key,
                     {
@@ -987,57 +1262,41 @@ class UsageManager:
                         "failures": {},
                     },
                 )
-                usage_field = "daily"
 
-            # If the key is new, ensure its reset date is initialized to prevent an immediate reset.
-            if not uses_window and "last_daily_reset" not in key_data:
-                key_data["last_daily_reset"] = today_utc_str
+                if "last_daily_reset" not in key_data:
+                    key_data["last_daily_reset"] = today_utc_str
 
-            # Always record a success and reset failures
+                # Get or create model data in daily structure
+                usage_data_ref = key_data["daily"]["models"].setdefault(
+                    model,
+                    {
+                        "success_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "approx_cost": 0.0,
+                    },
+                )
+                usage_data_ref["success_count"] += 1
+
+            # Reset failures for this model
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
             model_failures["consecutive_failures"] = 0
+
+            # Clear transient cooldown on success (but NOT quota_reset_ts)
             if model in key_data.get("model_cooldowns", {}):
                 del key_data["model_cooldowns"][model]
 
-            # Get or create the usage field data
-            usage_data = key_data.setdefault(usage_field, {"models": {}})
-
-            # For window-based tracking, set start_ts on first request
-            if uses_window:
-                if usage_data.get("start_ts") is None:
-                    usage_data["start_ts"] = now_ts
-                    window_hours = reset_config.get("window_seconds", 0) / 3600
-                    description = reset_config.get("description", "rolling window")
-                    lib_logger.info(
-                        f"Starting new {window_hours:.1f}h window for {mask_credential(key)} - {description}"
-                    )
-
-            # Ensure models dict exists
-            if "models" not in usage_data:
-                usage_data["models"] = {}
-
-            model_data = usage_data["models"].setdefault(
-                model,
-                {
-                    "success_count": 0,
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "approx_cost": 0.0,
-                },
-            )
-            model_data["success_count"] += 1
-
-            # Safely attempt to record token and cost usage
+            # Record token and cost usage
             if (
                 completion_response
                 and hasattr(completion_response, "usage")
                 and completion_response.usage
             ):
                 usage = completion_response.usage
-                model_data["prompt_tokens"] += usage.prompt_tokens
-                model_data["completion_tokens"] += getattr(
+                usage_data_ref["prompt_tokens"] += usage.prompt_tokens
+                usage_data_ref["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
-                )  # Not present in embedding responses
+                )
                 lib_logger.info(
                     f"Recorded usage from response object for key {mask_credential(key)}"
                 )
@@ -1045,7 +1304,6 @@ class UsageManager:
                     provider_name = model.split("/")[0]
                     provider_plugin = self.provider_plugins.get(provider_name)
 
-                    # Check class attribute directly - no need to instantiate
                     if provider_plugin and getattr(
                         provider_plugin, "skip_cost_calculation", False
                     ):
@@ -1053,9 +1311,7 @@ class UsageManager:
                             f"Skipping cost calculation for provider '{provider_name}' (custom provider)."
                         )
                     else:
-                        # Differentiate cost calculation based on response type
                         if isinstance(completion_response, litellm.EmbeddingResponse):
-                            # Manually calculate cost for embeddings
                             model_info = litellm.get_model_info(model)
                             input_cost = model_info.get("input_cost_per_token")
                             if input_cost:
@@ -1070,7 +1326,7 @@ class UsageManager:
                             )
 
                         if cost is not None:
-                            model_data["approx_cost"] += cost
+                            usage_data_ref["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(
                         f"Could not calculate cost for model {model}: {e}"
@@ -1078,8 +1334,7 @@ class UsageManager:
             elif isinstance(completion_response, asyncio.Future) or hasattr(
                 completion_response, "__aiter__"
             ):
-                # This is an unconsumed stream object. Do not log a warning, as usage will be recorded from the chunks.
-                pass
+                pass  # Stream - usage recorded from chunks
             else:
                 lib_logger.warning(
                     f"No usage data found in completion response for model {model}. Recording success without token count."
@@ -1096,7 +1351,13 @@ class UsageManager:
         classified_error: ClassifiedError,
         increment_consecutive_failures: bool = True,
     ):
-        """Records a failure and applies cooldowns based on an escalating backoff strategy.
+        """Records a failure and applies cooldowns based on error type.
+
+        Distinguishes between:
+        - quota_exceeded: Long cooldown with exact reset time (from quota_reset_timestamp)
+          Sets quota_reset_ts on model (and group) - this becomes authoritative stats reset time
+        - rate_limit: Short transient cooldown (just wait and retry)
+          Only sets model_cooldowns - does NOT affect stats reset timing
 
         Args:
             key: The API key or credential identifier
@@ -1107,19 +1368,20 @@ class UsageManager:
         """
         await self._lazy_init()
         async with self._data_lock:
+            now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
 
-            # Determine the usage field name for this credential
-            usage_field = self._get_usage_field_name(key)
             reset_config = self._get_usage_reset_config(key)
-            uses_window = reset_config is not None
+            reset_mode = (
+                reset_config.get("mode", "credential") if reset_config else "credential"
+            )
 
             # Initialize key data with appropriate structure
-            if uses_window:
+            if reset_mode == "per_model":
                 key_data = self._usage_data.setdefault(
                     key,
                     {
-                        usage_field: {"start_ts": None, "models": {}},
+                        "models": {},
                         "global": {"models": {}},
                         "model_cooldowns": {},
                         "failures": {},
@@ -1147,36 +1409,94 @@ class UsageManager:
 
             # Calculate cooldown duration based on error type
             cooldown_seconds = None
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
 
-            if classified_error.error_type in ["rate_limit", "quota_exceeded"]:
-                # Rate limit / Quota errors: use retry_after if available, otherwise default to 60s
+            if classified_error.error_type == "quota_exceeded":
+                # Quota exhausted - use authoritative reset timestamp if available
+                quota_reset_ts = classified_error.quota_reset_timestamp
                 cooldown_seconds = classified_error.retry_after or 60
-                if classified_error.retry_after:
-                    # Log with human-readable duration for provider-parsed cooldowns
-                    hours = cooldown_seconds / 3600
-                    if hours >= 1:
+
+                if quota_reset_ts and reset_mode == "per_model":
+                    # Set quota_reset_ts on model - this becomes authoritative stats reset time
+                    models_data = key_data.setdefault("models", {})
+                    model_data = models_data.setdefault(
+                        model,
+                        {
+                            "window_start_ts": None,
+                            "quota_reset_ts": None,
+                            "success_count": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "approx_cost": 0.0,
+                        },
+                    )
+                    model_data["quota_reset_ts"] = quota_reset_ts
+
+                    # Apply to all models in the same quota group
+                    group = self._get_model_quota_group(key, model)
+                    if group:
+                        grouped_models = self._get_grouped_models(key, group)
+                        for grouped_model in grouped_models:
+                            group_model_data = models_data.setdefault(
+                                grouped_model,
+                                {
+                                    "window_start_ts": None,
+                                    "quota_reset_ts": None,
+                                    "success_count": 0,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "approx_cost": 0.0,
+                                },
+                            )
+                            group_model_data["quota_reset_ts"] = quota_reset_ts
+                            # Also set transient cooldown for selection logic
+                            model_cooldowns[grouped_model] = quota_reset_ts
+
+                        reset_dt = datetime.fromtimestamp(
+                            quota_reset_ts, tz=timezone.utc
+                        )
                         lib_logger.info(
-                            f"Quota/rate limit on key {mask_credential(key)} for model {model}. "
-                            f"Applying provider-specified cooldown: {cooldown_seconds}s ({hours:.1f}h)"
+                            f"Quota exhausted for group '{group}' ({len(grouped_models)} models) "
+                            f"on {mask_credential(key)}. Resets at {reset_dt.isoformat()}"
                         )
                     else:
-                        lib_logger.info(
-                            f"Rate limit on key {mask_credential(key)} for model {model}. "
-                            f"Applying provider-specified cooldown: {cooldown_seconds}s"
+                        reset_dt = datetime.fromtimestamp(
+                            quota_reset_ts, tz=timezone.utc
                         )
+                        hours = (quota_reset_ts - now_ts) / 3600
+                        lib_logger.info(
+                            f"Quota exhausted for model {model} on {mask_credential(key)}. "
+                            f"Resets at {reset_dt.isoformat()} ({hours:.1f}h)"
+                        )
+
+                    # Set transient cooldown for selection logic
+                    model_cooldowns[model] = quota_reset_ts
                 else:
+                    # No authoritative timestamp or legacy mode - just use retry_after
+                    model_cooldowns[model] = now_ts + cooldown_seconds
+                    hours = cooldown_seconds / 3600
                     lib_logger.info(
-                        f"Rate limit on key {mask_credential(key)} for model {model}. "
-                        f"Using default cooldown: {cooldown_seconds}s"
+                        f"Quota exhausted on {mask_credential(key)} for model {model}. "
+                        f"Cooldown: {cooldown_seconds}s ({hours:.1f}h)"
                     )
+
+            elif classified_error.error_type == "rate_limit":
+                # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
+                cooldown_seconds = classified_error.retry_after or 60
+                model_cooldowns[model] = now_ts + cooldown_seconds
+                lib_logger.info(
+                    f"Rate limit on {mask_credential(key)} for model {model}. "
+                    f"Transient cooldown: {cooldown_seconds}s"
+                )
+
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
-                key_data["key_cooldown_until"] = time.time() + 300
+                key_data["key_cooldown_until"] = now_ts + 300
+                cooldown_seconds = 300
+                model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.warning(
                     f"Authentication error on key {mask_credential(key)}. Applying 5-minute key-level lockout."
                 )
-                # Auth errors still use escalating backoff for the specific model
-                cooldown_seconds = 300  # 5 minutes for model cooldown
 
             # If we should increment failures, calculate escalating backoff
             if should_increment:
@@ -1190,35 +1510,27 @@ class UsageManager:
                 # If cooldown wasn't set by specific error type, use escalating backoff
                 if cooldown_seconds is None:
                     backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
-                    cooldown_seconds = backoff_tiers.get(
-                        count, 7200
-                    )  # Default to 2 hours for "spent" keys
+                    cooldown_seconds = backoff_tiers.get(count, 7200)
+                    model_cooldowns[model] = now_ts + cooldown_seconds
                     lib_logger.warning(
                         f"Failure #{count} for key {mask_credential(key)} with model {model}. "
-                        f"Error type: {classified_error.error_type}"
+                        f"Error type: {classified_error.error_type}, cooldown: {cooldown_seconds}s"
                     )
             else:
                 # Provider-level errors: apply short cooldown but don't count against key
                 if cooldown_seconds is None:
-                    cooldown_seconds = 30  # 30s cooldown for provider issues
+                    cooldown_seconds = 30
+                    model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
-                    f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} with model {model}. "
-                    f"NOT incrementing consecutive failures. Applying {cooldown_seconds}s cooldown."
+                    f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} "
+                    f"with model {model}. NOT incrementing failures. Cooldown: {cooldown_seconds}s"
                 )
-
-            # Apply the cooldown
-            model_cooldowns = key_data.setdefault("model_cooldowns", {})
-            model_cooldowns[model] = time.time() + cooldown_seconds
-            lib_logger.warning(
-                f"Cooldown applied for key {mask_credential(key)} with model {model}: {cooldown_seconds}s. "
-                f"Error type: {classified_error.error_type}"
-            )
 
             # Check for key-level lockout condition
             await self._check_key_lockout(key, key_data)
 
             key_data["last_failure"] = {
-                "timestamp": time.time(),
+                "timestamp": now_ts,
                 "model": model,
                 "error": str(classified_error.original_exception),
             }

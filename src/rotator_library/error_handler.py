@@ -347,14 +347,26 @@ class ClassifiedError:
         original_exception: Exception,
         status_code: Optional[int] = None,
         retry_after: Optional[int] = None,
+        quota_reset_timestamp: Optional[float] = None,
     ):
         self.error_type = error_type
         self.original_exception = original_exception
         self.status_code = status_code
         self.retry_after = retry_after
+        # Unix timestamp when quota resets (from quota_exhausted errors)
+        # This is the authoritative reset time parsed from provider's error response
+        self.quota_reset_timestamp = quota_reset_timestamp
 
     def __str__(self):
-        return f"ClassifiedError(type={self.error_type}, status={self.status_code}, retry_after={self.retry_after}, original_exc={self.original_exception})"
+        parts = [
+            f"type={self.error_type}",
+            f"status={self.status_code}",
+            f"retry_after={self.retry_after}",
+        ]
+        if self.quota_reset_timestamp:
+            parts.append(f"quota_reset_ts={self.quota_reset_timestamp}")
+        parts.append(f"original_exc={self.original_exception}")
+        return f"ClassifiedError({', '.join(parts)})"
 
 
 def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
@@ -567,6 +579,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     retry_after = quota_info["retry_after"]
                     reason = quota_info.get("reason", "QUOTA_EXHAUSTED")
                     reset_ts = quota_info.get("reset_timestamp")
+                    quota_reset_timestamp = quota_info.get("quota_reset_timestamp")
 
                     # Log the parsed result with human-readable duration
                     hours = retry_after / 3600
@@ -581,6 +594,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                         original_exception=e,
                         status_code=429,
                         retry_after=retry_after,
+                        quota_reset_timestamp=quota_reset_timestamp,
                     )
         except Exception as parse_error:
             lib_logger.debug(

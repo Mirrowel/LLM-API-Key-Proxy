@@ -600,6 +600,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "retry_after": None,
             "reason": None,
             "reset_timestamp": None,
+            "quota_reset_timestamp": None,  # Unix timestamp for quota reset
         }
 
         for detail in details:
@@ -626,8 +627,22 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         if parsed:
                             result["retry_after"] = parsed
 
-                # Capture reset timestamp for logging
-                result["reset_timestamp"] = metadata.get("quotaResetTimeStamp")
+                # Capture reset timestamp for logging and authoritative reset time
+                reset_ts_str = metadata.get("quotaResetTimeStamp")
+                result["reset_timestamp"] = reset_ts_str
+
+                # Parse ISO timestamp to Unix timestamp for usage tracking
+                if reset_ts_str:
+                    try:
+                        # Handle ISO format: "2025-12-11T22:53:16Z"
+                        reset_dt = datetime.fromisoformat(
+                            reset_ts_str.replace("Z", "+00:00")
+                        )
+                        result["quota_reset_timestamp"] = reset_dt.timestamp()
+                    except (ValueError, AttributeError) as e:
+                        lib_logger.warning(
+                            f"Failed to parse quota reset timestamp '{reset_ts_str}': {e}"
+                        )
 
         # Return None if we couldn't extract retry_after
         if not result["retry_after"]:
@@ -826,45 +841,48 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         Get Antigravity-specific usage tracking configuration based on credential tier.
 
-        Antigravity has different quota reset windows by tier:
-        - Paid tiers (priority 1): 5-hour rolling window
-        - Free tier (priority 2): 7-day rolling window
-        - Unknown/legacy: 7-day rolling window (conservative default)
+        Antigravity uses per-model windows with different durations by tier:
+        - Paid tiers (priority 1): 5-hour per-model window
+        - Free tier (priority 2): 7-day per-model window
+        - Unknown/legacy: 7-day per-model window (conservative default)
+
+        When a model hits a quota_exhausted 429 error with exact reset timestamp,
+        that timestamp becomes the authoritative reset time for the model (and its group).
 
         Args:
             credential: The credential path
 
         Returns:
-            Usage reset configuration dict
+            Usage reset configuration dict with mode="per_model"
         """
         tier = self.project_tier_cache.get(credential)
         if not tier:
             tier = self._load_tier_from_file(credential)
 
-        # Paid tiers: 5-hour window
+        # Paid tiers: 5-hour per-model window
         if tier and tier not in ["free-tier", "legacy-tier", "unknown"]:
             return {
                 "window_seconds": 5 * 60 * 60,  # 18000 seconds = 5 hours
-                "field_name": "5h_window",
+                "mode": "per_model",
                 "priority": 1,
-                "description": "5-hour rolling window (paid tier)",
+                "description": "5-hour per-model window (paid tier)",
             }
 
-        # Free tier: 7-day window
+        # Free tier: 7-day per-model window
         if tier == "free-tier":
             return {
                 "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
-                "field_name": "weekly",
+                "mode": "per_model",
                 "priority": 2,
-                "description": "7-day rolling window (free tier)",
+                "description": "7-day per-model window (free tier)",
             }
 
-        # Unknown/legacy: use 7-day window as conservative default
+        # Unknown/legacy: use 7-day per-model window as conservative default
         return {
             "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
-            "field_name": "weekly",
+            "mode": "per_model",
             "priority": 10,
-            "description": "7-day rolling window (unknown tier - conservative default)",
+            "description": "7-day per-model window (unknown tier - conservative default)",
         }
 
     def get_default_usage_field_name(self) -> str:
@@ -872,9 +890,51 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Get the default usage tracking field name for Antigravity.
 
         Returns:
-            "weekly" as the conservative default for unknown credentials
+            "models" for per-model tracking
         """
-        return "weekly"
+        return "models"
+
+    # =========================================================================
+    # Model Quota Grouping
+    # =========================================================================
+
+    # Models that share quota timing - when one hits quota, all get same reset time
+    QUOTA_GROUPS = {
+        # Future: add claude/gemini groups if they share quota
+    }
+
+    def get_model_quota_group(self, model: str) -> Optional[str]:
+        """
+        Returns the quota group name for a model.
+
+        Claude models (sonnet and opus) share quota on Antigravity.
+        When one hits quota exhausted, all models in the group get the same reset time.
+
+        Args:
+            model: Model name (with or without "antigravity/" prefix)
+
+        Returns:
+            Group name ("claude") or None if not grouped
+        """
+        # Remove provider prefix if present
+        clean_model = model.replace("antigravity/", "")
+
+        for group_name, models in self.QUOTA_GROUPS.items():
+            if clean_model in models:
+                return group_name
+        return None
+
+    def get_models_in_quota_group(self, group: str) -> List[str]:
+        """
+        Returns all model names in a quota group.
+
+        Args:
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of model names (without provider prefix)
+        """
+        return self.QUOTA_GROUPS.get(group, [])
 
     async def initialize_credentials(self, credential_paths: List[str]) -> None:
         """

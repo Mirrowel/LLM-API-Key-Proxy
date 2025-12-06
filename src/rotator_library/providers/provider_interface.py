@@ -202,6 +202,7 @@ class ProviderInterface(ABC):
                 "retry_after": int,  # seconds until quota resets
                 "reason": str,       # e.g., "QUOTA_EXHAUSTED", "RATE_LIMITED"
                 "reset_timestamp": str | None,  # ISO timestamp if available
+                "quota_reset_timestamp": float | None,  # Unix timestamp for quota reset
             }
         """
         return None  # Default: no provider-specific parsing
@@ -218,9 +219,9 @@ class ProviderInterface(ABC):
         credential tier (e.g., paid vs free accounts with different quota periods).
 
         The UsageManager will use this configuration to:
-        1. Track usage in a custom-named field (instead of default "daily")
-        2. Reset usage based on a rolling window from first request
-        3. Archive stats to "global" when the window expires
+        1. Track usage per-model or per-credential based on mode
+        2. Reset usage based on a rolling window OR quota exhausted timestamp
+        3. Archive stats to "global" when the window/quota expires
 
         Args:
             credential: The credential identifier (API key or path)
@@ -229,32 +230,35 @@ class ProviderInterface(ABC):
             None to use default daily reset, otherwise a dict with:
             {
                 "window_seconds": int,     # Duration in seconds (e.g., 18000 for 5h)
-                "field_name": str,         # Custom field name (e.g., "5h_window", "weekly")
-                "priority": int,           # Priority level this config applies to (for docs)
+                "mode": str,               # "credential" or "per_model"
+                "priority": int,           # Priority level this config applies to
                 "description": str,        # Human-readable description (for logging)
             }
 
+        Modes:
+            - "credential": One window per credential. Window starts from first
+              request of ANY model. All models reset together when window expires.
+            - "per_model": Separate window per model (or model group). Window starts
+              from first request of THAT model. Models reset independently unless
+              grouped. If a quota_exhausted error provides exact reset time, that
+              becomes the authoritative reset time for the model.
+
         Examples:
-            Antigravity paid tier:
+            Antigravity paid tier (per-model):
             {
                 "window_seconds": 18000,   # 5 hours
-                "field_name": "5h_window",
+                "mode": "per_model",
                 "priority": 1,
-                "description": "5-hour rolling window (paid tier)"
+                "description": "5-hour per-model window (paid tier)"
             }
 
-            Antigravity free tier:
+            Default provider (credential-level):
             {
-                "window_seconds": 604800,  # 7 days
-                "field_name": "weekly",
-                "priority": 2,
-                "description": "7-day rolling window (free tier)"
+                "window_seconds": 86400,   # 24 hours
+                "mode": "credential",
+                "priority": 1,
+                "description": "24-hour credential window"
             }
-
-        Note:
-            - window_seconds: Time from first request until stats reset
-            - When window expires, stats move to "global" (same as daily reset)
-            - First request after window expiry starts a new window
         """
         return None  # Default: use daily reset at daily_reset_time_utc
 
@@ -269,3 +273,39 @@ class ProviderInterface(ABC):
             Field name string (default: "daily")
         """
         return "daily"
+
+    # =========================================================================
+    # Model Quota Grouping
+    # =========================================================================
+
+    def get_model_quota_group(self, model: str) -> Optional[str]:
+        """
+        Returns the quota group name for a model, or None if not grouped.
+
+        Models in the same quota group share cooldown timing - when one model
+        hits a quota exhausted error, all models in the group get the same
+        reset timestamp. They also reset (archive stats) together.
+
+        This is useful for providers where multiple model variants share the
+        same underlying quota (e.g., Claude Sonnet and Opus on Antigravity).
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Group name string (e.g., "claude") or None if model is not grouped
+        """
+        return None
+
+    def get_models_in_quota_group(self, group: str) -> List[str]:
+        """
+        Returns all model names that belong to a quota group.
+
+        Args:
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of model names (WITHOUT provider prefix) in the group.
+            Empty list if group doesn't exist.
+        """
+        return []
