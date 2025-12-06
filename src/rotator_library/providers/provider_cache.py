@@ -104,7 +104,10 @@ class ProviderCache:
         self._running = False
         
         # Statistics
-        self._stats = {"memory_hits": 0, "disk_hits": 0, "misses": 0, "writes": 0}
+        self._stats = {"memory_hits": 0, "disk_hits": 0, "misses": 0, "writes": 0, "disk_errors": 0}
+        
+        # [RUNTIME RESILIENCE] Track disk health for monitoring
+        self._disk_available = True
         
         # Metadata about this cache instance
         self._cache_name = cache_file.stem if cache_file else "unnamed"
@@ -171,13 +174,27 @@ class ProviderCache:
     # =========================================================================
     
     async def _save_to_disk(self) -> None:
-        """Persist cache to disk using atomic write."""
+        """Persist cache to disk using atomic write with health tracking.
+        
+        [RUNTIME RESILIENCE] Tracks disk health and records errors. If disk
+        operations fail, the memory cache continues to work. Health status
+        is available via get_stats() for monitoring.
+        """
         if not self._enable_disk:
             return
         
         try:
             async with self._disk_lock:
-                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+                # [DIRECTORY AUTO-RECREATION] Attempt to create directory
+                try:
+                    self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+                except (OSError, PermissionError) as e:
+                    self._stats["disk_errors"] += 1
+                    self._disk_available = False
+                    lib_logger.warning(
+                        f"ProviderCache[{self._cache_name}]: Cannot create cache directory: {e}"
+                    )
+                    return
                 
                 cache_data = {
                     "version": "1.0",
@@ -210,6 +227,8 @@ class ProviderCache:
                     
                     shutil.move(tmp_path, self._cache_file)
                     self._stats["writes"] += 1
+                    # [RUNTIME RESILIENCE] Mark disk as healthy on success
+                    self._disk_available = True
                     lib_logger.debug(
                         f"ProviderCache[{self._cache_name}]: Saved {len(self._cache)} entries"
                     )
@@ -218,6 +237,9 @@ class ProviderCache:
                         os.unlink(tmp_path)
                     raise
         except Exception as e:
+            # [RUNTIME RESILIENCE] Track disk errors for monitoring
+            self._stats["disk_errors"] += 1
+            self._disk_available = False
             lib_logger.error(f"ProviderCache[{self._cache_name}]: Disk save failed: {e}")
     
     # =========================================================================
@@ -416,12 +438,17 @@ class ProviderCache:
         return False
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
+        """Get cache statistics including disk health.
+        
+        [RUNTIME RESILIENCE] Includes disk_available flag for monitoring
+        the health of disk persistence.
+        """
         return {
             **self._stats,
             "memory_entries": len(self._cache),
             "dirty": self._dirty,
-            "disk_enabled": self._enable_disk
+            "disk_enabled": self._enable_disk,
+            "disk_available": self._disk_available  # [RUNTIME RESILIENCE] Health indicator
         }
     
     async def clear(self) -> None:

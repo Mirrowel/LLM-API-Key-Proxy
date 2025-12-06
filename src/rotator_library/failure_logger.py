@@ -5,39 +5,74 @@ import os
 from datetime import datetime
 from .error_handler import mask_credential
 
+# Module-level state for resilience
+_file_handler = None
+_fallback_mode = False
+
+
+# Custom JSON formatter for structured logs (defined at module level for reuse)
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        # The message is already a dict, so we just format it as a JSON string
+        return json.dumps(record.msg)
+
+
+def _create_file_handler():
+    """Create file handler with directory auto-recreation."""
+    global _file_handler, _fallback_mode
+    log_dir = "logs"
+    
+    try:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        
+        handler = RotatingFileHandler(
+            os.path.join(log_dir, "failures.log"),
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=2,
+        )
+        
+        handler.setFormatter(JsonFormatter())
+        _file_handler = handler
+        _fallback_mode = False
+        return handler
+    except (OSError, PermissionError, IOError) as e:
+        logging.warning(f"Cannot create failure log file handler: {e}")
+        _fallback_mode = True
+        return None
+
 
 def setup_failure_logger():
-    """Sets up a dedicated JSON logger for writing detailed failure logs to a file."""
-    log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-
-    # Create a logger specifically for failures.
-    # This logger will NOT propagate to the root logger.
+    """Sets up a dedicated JSON logger for writing detailed failure logs."""
     logger = logging.getLogger("failure_logger")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-
-    # Use a rotating file handler
-    handler = RotatingFileHandler(
-        os.path.join(log_dir, "failures.log"),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=2,
-    )
-
-    # Custom JSON formatter for structured logs
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            # The message is already a dict, so we just format it as a JSON string
-            return json.dumps(record.msg)
-
-    handler.setFormatter(JsonFormatter())
-
-    # Add handler only if it hasn't been added before
-    if not logger.handlers:
+    
+    # Remove existing handlers to prevent duplicates
+    logger.handlers.clear()
+    
+    # Try to add file handler
+    handler = _create_file_handler()
+    if handler:
         logger.addHandler(handler)
-
+    
+    # Always add a NullHandler as fallback to prevent "no handlers" warning
+    if not logger.handlers:
+        logger.addHandler(logging.NullHandler())
+    
     return logger
+
+
+def _ensure_handler_valid():
+    """Check if file handler is still valid, recreate if needed."""
+    global _file_handler, _fallback_mode
+    
+    if _file_handler is None or _fallback_mode:
+        handler = _create_file_handler()
+        if handler:
+            failure_logger = logging.getLogger("failure_logger")
+            failure_logger.handlers.clear()
+            failure_logger.addHandler(handler)
 
 
 # Initialize the dedicated logger for detailed failure logs
@@ -145,11 +180,23 @@ def log_failure(
         "request_headers": request_headers,
         "error_chain": error_chain if len(error_chain) > 1 else None,
     }
-    failure_logger.error(detailed_log_data)
-
+    
     # 2. Log a concise summary to the main library logger, which will propagate
     summary_message = (
         f"API call failed for model {model} with key {mask_credential(api_key)}. "
         f"Error: {type(error).__name__}. See failures.log for details."
     )
+    
+    # Attempt to ensure handler is valid before logging
+    _ensure_handler_valid()
+    
+    # Wrap the actual log call with resilience
+    try:
+        failure_logger.error(detailed_log_data)
+    except (OSError, IOError) as e:
+        # File logging failed - log to console instead
+        logging.error(f"Failed to write to failures.log: {e}")
+        logging.error(f"Failure summary: {summary_message}")
+    
+    # Console log always succeeds
     main_lib_logger.error(summary_message)

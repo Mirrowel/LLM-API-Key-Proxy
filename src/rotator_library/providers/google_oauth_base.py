@@ -260,64 +260,76 @@ class GoogleOAuthBase:
                 )
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
+        """Save credentials with in-memory fallback if disk unavailable.
+        
+        [RUNTIME RESILIENCE] Always updates the in-memory cache first (memory is reliable),
+        then attempts disk persistence. If disk write fails, logs a warning but does NOT
+        raise an exception - the in-memory state continues to work.
+        """
+        # [IN-MEMORY FIRST] Always update cache first (reliable)
+        self._credentials_cache[path] = creds
+
         # Don't save to file if credentials were loaded from environment
         if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
             lib_logger.debug("Credentials loaded from env, skipping file save")
-            # Still update cache for in-memory consistency
-            self._credentials_cache[path] = creds
             return
 
-        # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
-        # This prevents credential corruption if the process is interrupted during write
-        parent_dir = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent_dir, exist_ok=True)
-
-        tmp_fd = None
-        tmp_path = None
         try:
-            # Create temp file in same directory as target (ensures same filesystem)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
-            )
+            # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
+            # This prevents credential corruption if the process is interrupted during write
+            parent_dir = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent_dir, exist_ok=True)
 
-            # Write JSON to temp file
-            with os.fdopen(tmp_fd, "w") as f:
-                json.dump(creds, f, indent=2)
-                tmp_fd = None  # fdopen closes the fd
-
-            # Set secure permissions (0600 = owner read/write only)
+            tmp_fd = None
+            tmp_path = None
             try:
-                os.chmod(tmp_path, 0o600)
-            except (OSError, AttributeError):
-                # Windows may not support chmod, ignore
-                pass
+                # Create temp file in same directory as target (ensures same filesystem)
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
+                )
 
-            # Atomic move (overwrites target if it exists)
-            shutil.move(tmp_path, path)
-            tmp_path = None  # Successfully moved
+                # Write JSON to temp file
+                with os.fdopen(tmp_fd, "w") as f:
+                    json.dump(creds, f, indent=2)
+                    tmp_fd = None  # fdopen closes the fd
 
-            # Update cache AFTER successful file write (prevents cache/file inconsistency)
-            self._credentials_cache[path] = creds
-            lib_logger.debug(
-                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}' (atomic write)."
-            )
-
-        except Exception as e:
-            lib_logger.error(
-                f"Failed to save updated {self.ENV_PREFIX} OAuth credentials to '{path}': {e}"
-            )
-            # Clean up temp file if it still exists
-            if tmp_fd is not None:
+                # Set secure permissions (0600 = owner read/write only)
                 try:
-                    os.close(tmp_fd)
-                except:
+                    os.chmod(tmp_path, 0o600)
+                except (OSError, AttributeError):
+                    # Windows may not support chmod, ignore
                     pass
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-            raise
+
+                # Atomic move (overwrites target if it exists)
+                shutil.move(tmp_path, path)
+                tmp_path = None  # Successfully moved
+
+                lib_logger.debug(
+                    f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}' (atomic write)."
+                )
+
+            except Exception as e:
+                # Clean up temp file if it still exists
+                if tmp_fd is not None:
+                    try:
+                        os.close(tmp_fd)
+                    except:
+                        pass
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+                raise
+
+        except (OSError, PermissionError, IOError) as e:
+            # [FAIL SILENTLY, LOG LOUDLY] Log the error but don't crash
+            # The in-memory cache was already updated, so we can continue operating
+            lib_logger.warning(
+                f"Failed to save credentials to {path}: {e}. "
+                "Credentials cached in memory only (will be lost on restart)."
+            )
+            # Don't raise - we already updated the memory cache
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         expiry = creds.get("token_expiry")  # gcloud format
@@ -841,10 +853,39 @@ class GoogleOAuthBase:
             )
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path, creds)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
+        """Get auth header with graceful degradation if refresh fails.
+        
+        [RUNTIME RESILIENCE] If credential file is deleted or refresh fails,
+        attempts to use cached credentials. This allows the proxy to continue
+        operating with potentially stale tokens rather than crashing.
+        """
+        try:
+            creds = await self._load_credentials(credential_path)
+            if self._is_token_expired(creds):
+                try:
+                    creds = await self._refresh_token(credential_path, creds)
+                except Exception as e:
+                    # [CACHED TOKEN FALLBACK] Check if we have a cached token that might still work
+                    cached = self._credentials_cache.get(credential_path)
+                    if cached and cached.get("access_token"):
+                        lib_logger.warning(
+                            f"Token refresh failed for {Path(credential_path).name}: {e}. "
+                            "Using cached token (may be expired)."
+                        )
+                        creds = cached
+                    else:
+                        raise
+            return {"Authorization": f"Bearer {creds['access_token']}"}
+        except Exception as e:
+            # [FINAL FALLBACK] Check if any cached credential exists as last resort
+            cached = self._credentials_cache.get(credential_path)
+            if cached and cached.get("access_token"):
+                lib_logger.error(
+                    f"Credential load failed for {credential_path}: {e}. "
+                    "Using stale cached token as last resort."
+                )
+                return {"Authorization": f"Bearer {cached['access_token']}"}
+            raise
 
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
