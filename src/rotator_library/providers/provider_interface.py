@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union
+import os
 import httpx
 import litellm
 
@@ -11,6 +12,11 @@ class ProviderInterface(ABC):
     """
 
     skip_cost_calculation: bool = False
+
+    # Default rotation mode for this provider ("balanced" or "sequential")
+    # - "balanced": Rotate credentials to distribute load evenly
+    # - "sequential": Use one credential until exhausted, then switch to next
+    default_rotation_mode: str = "balanced"
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -153,3 +159,153 @@ class ProviderInterface(ABC):
             Tier name string (e.g., "free-tier", "paid-tier") or None if unknown
         """
         return None
+
+    # =========================================================================
+    # Sequential Rotation Support
+    # =========================================================================
+
+    @classmethod
+    def get_rotation_mode(cls, provider_name: str) -> str:
+        """
+        Get the rotation mode for this provider.
+
+        Checks ROTATION_MODE_{PROVIDER} environment variable first,
+        then falls back to the class's default_rotation_mode.
+
+        Args:
+            provider_name: The provider name (e.g., "antigravity", "gemini_cli")
+
+        Returns:
+            "balanced" or "sequential"
+        """
+        env_key = f"ROTATION_MODE_{provider_name.upper()}"
+        return os.getenv(env_key, cls.default_rotation_mode)
+
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse a quota/rate-limit error and extract structured information.
+
+        Providers should override this method to handle their specific error formats.
+        This allows the error_handler to use provider-specific parsing when available,
+        falling back to generic parsing otherwise.
+
+        Args:
+            error: The caught exception
+            error_body: Optional raw response body string
+
+        Returns:
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,  # seconds until quota resets
+                "reason": str,       # e.g., "QUOTA_EXHAUSTED", "RATE_LIMITED"
+                "reset_timestamp": str | None,  # ISO timestamp if available
+                "quota_reset_timestamp": float | None,  # Unix timestamp for quota reset
+            }
+        """
+        return None  # Default: no provider-specific parsing
+
+    # =========================================================================
+    # Per-Provider Usage Tracking Configuration
+    # =========================================================================
+
+    def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Get provider-specific usage tracking configuration for a credential.
+
+        This allows providers to define custom usage reset windows based on
+        credential tier (e.g., paid vs free accounts with different quota periods).
+
+        The UsageManager will use this configuration to:
+        1. Track usage per-model or per-credential based on mode
+        2. Reset usage based on a rolling window OR quota exhausted timestamp
+        3. Archive stats to "global" when the window/quota expires
+
+        Args:
+            credential: The credential identifier (API key or path)
+
+        Returns:
+            None to use default daily reset, otherwise a dict with:
+            {
+                "window_seconds": int,     # Duration in seconds (e.g., 18000 for 5h)
+                "mode": str,               # "credential" or "per_model"
+                "priority": int,           # Priority level this config applies to
+                "description": str,        # Human-readable description (for logging)
+            }
+
+        Modes:
+            - "credential": One window per credential. Window starts from first
+              request of ANY model. All models reset together when window expires.
+            - "per_model": Separate window per model (or model group). Window starts
+              from first request of THAT model. Models reset independently unless
+              grouped. If a quota_exhausted error provides exact reset time, that
+              becomes the authoritative reset time for the model.
+
+        Examples:
+            Antigravity paid tier (per-model):
+            {
+                "window_seconds": 18000,   # 5 hours
+                "mode": "per_model",
+                "priority": 1,
+                "description": "5-hour per-model window (paid tier)"
+            }
+
+            Default provider (credential-level):
+            {
+                "window_seconds": 86400,   # 24 hours
+                "mode": "credential",
+                "priority": 1,
+                "description": "24-hour credential window"
+            }
+        """
+        return None  # Default: use daily reset at daily_reset_time_utc
+
+    def get_default_usage_field_name(self) -> str:
+        """
+        Get the default usage tracking field name for this provider.
+
+        Providers can override this to use a custom field name for usage tracking
+        when no credential-specific config is available.
+
+        Returns:
+            Field name string (default: "daily")
+        """
+        return "daily"
+
+    # =========================================================================
+    # Model Quota Grouping
+    # =========================================================================
+
+    def get_model_quota_group(self, model: str) -> Optional[str]:
+        """
+        Returns the quota group name for a model, or None if not grouped.
+
+        Models in the same quota group share cooldown timing - when one model
+        hits a quota exhausted error, all models in the group get the same
+        reset timestamp. They also reset (archive stats) together.
+
+        This is useful for providers where multiple model variants share the
+        same underlying quota (e.g., Claude Sonnet and Opus on Antigravity).
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Group name string (e.g., "claude") or None if model is not grouped
+        """
+        return None
+
+    def get_models_in_quota_group(self, group: str) -> List[str]:
+        """
+        Returns all model names that belong to a quota group.
+
+        Args:
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of model names (WITHOUT provider prefix) in the group.
+            Empty list if group doesn't exist.
+        """
+        return []

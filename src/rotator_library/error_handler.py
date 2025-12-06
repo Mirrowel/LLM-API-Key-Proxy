@@ -1,6 +1,7 @@
 import re
 import json
 import os
+import logging
 from typing import Optional, Dict, Any
 import httpx
 
@@ -16,6 +17,8 @@ from litellm.exceptions import (
     Timeout,
     ContextWindowExceededError,
 )
+
+lib_logger = logging.getLogger("rotator_library")
 
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
@@ -344,14 +347,26 @@ class ClassifiedError:
         original_exception: Exception,
         status_code: Optional[int] = None,
         retry_after: Optional[int] = None,
+        quota_reset_timestamp: Optional[float] = None,
     ):
         self.error_type = error_type
         self.original_exception = original_exception
         self.status_code = status_code
         self.retry_after = retry_after
+        # Unix timestamp when quota resets (from quota_exhausted errors)
+        # This is the authoritative reset time parsed from provider's error response
+        self.quota_reset_timestamp = quota_reset_timestamp
 
     def __str__(self):
-        return f"ClassifiedError(type={self.error_type}, status={self.status_code}, retry_after={self.retry_after}, original_exc={self.original_exception})"
+        parts = [
+            f"type={self.error_type}",
+            f"status={self.status_code}",
+            f"retry_after={self.retry_after}",
+        ]
+        if self.quota_reset_timestamp:
+            parts.append(f"quota_reset_ts={self.quota_reset_timestamp}")
+        parts.append(f"original_exc={self.original_exception}")
+        return f"ClassifiedError({', '.join(parts)})"
 
 
 def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
@@ -513,10 +528,14 @@ def get_retry_after(error: Exception) -> Optional[int]:
     return None
 
 
-def classify_error(e: Exception) -> ClassifiedError:
+def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
     Now handles both litellm and httpx exceptions.
+
+    If provider is specified and has a parse_quota_error() method,
+    attempts provider-specific error parsing first before falling back
+    to generic classification.
 
     Error types and their typical handling:
     - rate_limit (429): Rotate key, may retry with backoff
@@ -528,7 +547,62 @@ def classify_error(e: Exception) -> ClassifiedError:
     - context_window_exceeded: Don't retry - request too large
     - api_connection: Retry with backoff, then rotate
     - unknown: Rotate key (safer to try another)
+
+    Args:
+        e: The exception to classify
+        provider: Optional provider name for provider-specific error parsing
+
+    Returns:
+        ClassifiedError with error_type, status_code, retry_after, etc.
     """
+    # Try provider-specific parsing first for 429/rate limit errors
+    if provider:
+        try:
+            from .providers import PROVIDER_PLUGINS
+
+            provider_class = PROVIDER_PLUGINS.get(provider)
+
+            if provider_class and hasattr(provider_class, "parse_quota_error"):
+                # Get error body if available
+                error_body = None
+                if hasattr(e, "response") and hasattr(e.response, "text"):
+                    try:
+                        error_body = e.response.text
+                    except Exception:
+                        pass
+                elif hasattr(e, "body"):
+                    error_body = str(e.body)
+
+                quota_info = provider_class.parse_quota_error(e, error_body)
+
+                if quota_info and quota_info.get("retry_after"):
+                    retry_after = quota_info["retry_after"]
+                    reason = quota_info.get("reason", "QUOTA_EXHAUSTED")
+                    reset_ts = quota_info.get("reset_timestamp")
+                    quota_reset_timestamp = quota_info.get("quota_reset_timestamp")
+
+                    # Log the parsed result with human-readable duration
+                    hours = retry_after / 3600
+                    lib_logger.info(
+                        f"Provider '{provider}' parsed quota error: "
+                        f"retry_after={retry_after}s ({hours:.1f}h), reason={reason}"
+                        + (f", resets at {reset_ts}" if reset_ts else "")
+                    )
+
+                    return ClassifiedError(
+                        error_type="quota_exceeded",
+                        original_exception=e,
+                        status_code=429,
+                        retry_after=retry_after,
+                        quota_reset_timestamp=quota_reset_timestamp,
+                    )
+        except Exception as parse_error:
+            lib_logger.debug(
+                f"Provider-specific error parsing failed for '{provider}': {parse_error}"
+            )
+            # Fall through to generic classification
+
+    # Generic classification logic
     status_code = getattr(e, "status_code", None)
 
     if isinstance(e, httpx.HTTPStatusError):  # [NEW] Handle httpx errors first
