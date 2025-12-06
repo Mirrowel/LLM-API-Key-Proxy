@@ -13,6 +13,10 @@ class DetailedLogger:
     """
     Logs comprehensive details of each API transaction to a unique, timestamped directory.
     """
+    # Class-level fallback flags for resilience
+    _disk_available = True
+    _console_fallback_warned = False
+    
     def __init__(self):
         """
         Initializes the logger for a single request, creating a unique directory to store all related log files.
@@ -21,16 +25,33 @@ class DetailedLogger:
         self.request_id = str(uuid.uuid4())
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = DETAILED_LOGS_DIR / f"{timestamp}_{self.request_id}"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
         self.streaming = False
+        self._in_memory_logs = []  # Fallback storage
+        
+        # Attempt directory creation with resilience
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            DetailedLogger._disk_available = True
+        except (OSError, PermissionError) as e:
+            DetailedLogger._disk_available = False
+            if not DetailedLogger._console_fallback_warned:
+                logging.warning(f"Detailed logging disabled - cannot create log directory: {e}")
+                DetailedLogger._console_fallback_warned = True
 
     def _write_json(self, filename: str, data: Dict[str, Any]):
         """Helper to write data to a JSON file in the log directory."""
+        if not DetailedLogger._disk_available:
+            self._in_memory_logs.append({"file": filename, "data": data})
+            return
+        
         try:
+            # Attempt directory recreation if needed
+            self.log_dir.mkdir(parents=True, exist_ok=True)
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
+        except (OSError, PermissionError, IOError) as e:
             logging.error(f"[{self.request_id}] Failed to write to {filename}: {e}")
+            self._in_memory_logs.append({"file": filename, "data": data})
 
     def log_request(self, headers: Dict[str, Any], body: Dict[str, Any]):
         """Logs the initial request details."""
@@ -45,14 +66,18 @@ class DetailedLogger:
 
     def log_stream_chunk(self, chunk: Dict[str, Any]):
         """Logs an individual chunk from a streaming response to a JSON Lines file."""
+        if not DetailedLogger._disk_available:
+            return  # Skip chunk logging when disk unavailable
+        
         try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
             log_entry = {
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "chunk": chunk
             }
             with open(self.log_dir / "streaming_chunks.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        except Exception as e:
+        except (OSError, PermissionError, IOError) as e:
             logging.error(f"[{self.request_id}] Failed to write stream chunk: {e}")
 
     def log_final_response(self, status_code: int, headers: Optional[Dict[str, Any]], body: Dict[str, Any]):

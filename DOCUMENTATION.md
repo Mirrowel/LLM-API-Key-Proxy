@@ -697,4 +697,35 @@ To facilitate robust debugging, the proxy includes a comprehensive transaction l
 
 This level of detail allows developers to trace exactly why a request failed or why a specific key was rotated.
 
+---
+
+## 5. Runtime Resilience
+
+The proxy is engineered to maintain high availability even in the face of runtime filesystem disruptions. This "Runtime Resilience" capability ensures that the service continues to process API requests even if core data directories (like `logs/`, `oauth_creds/`) or files are accidentally deleted or become unwritable while the application is running.
+
+### 5.1. Resilience Hierarchy
+
+The system follows a strict hierarchy of survival:
+
+1.  **Core API Handling (Level 1)**: The Python runtime keeps all necessary code in memory (`sys.modules`). Deleting source code files while the proxy is running will **not** crash active requests.
+2.  **Credential Management (Level 2)**: OAuth tokens are aggressively cached in memory. If credential files are deleted, the proxy continues using the cached tokens. If a token needs refresh and the file cannot be written, the new token is updated in memory only.
+3.  **Usage Tracking (Level 3)**: Usage statistics (`key_usage.json`) are maintained in memory. If the file is deleted, the system tracks usage internally. It attempts to recreate the file/directory on the next save interval. If save fails, data is effectively "memory-only" until the next successful write.
+4.  **Logging (Level 4)**: Logging is treated as non-critical. If the `logs/` directory is removed, the system attempts to recreate it. If creation fails (e.g., permission error), logging degrades gracefully (stops or falls back to console) without interrupting the request flow.
+
+### 5.2. "Develop While Running"
+
+This architecture supports a robust development workflow:
+
+*   **Log Cleanup**: You can safely run `rm -rf logs/` while the proxy is serving traffic. The system will simply recreate the directory structure on the next request.
+*   **Config Reset**: Deleting `key_usage.json` resets the persistence layer, but the running instance preserves its current in-memory counts to ensure load balancing consistency.
+*   **File Recovery**: If you delete a critical file, the system attempts **Directory Auto-Recreation** before every write operation.
+
+### 5.3. Graceful Degradation & Data Loss
+
+While functionality is preserved, persistence may be compromised during filesystem failures:
+
+*   **Logs**: If disk writes fail, detailed request logs may be lost (unless console fallback is active).
+*   **Usage Stats**: If `key_usage.json` cannot be written, usage data since the last successful save will be lost upon application restart.
+*   **Credentials**: Refreshed tokens held only in memory will require re-authentication after a restart if they cannot be persisted to disk.
+
 
