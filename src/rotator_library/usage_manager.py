@@ -54,6 +54,7 @@ class UsageManager:
         daily_reset_time_utc: Optional[str] = "03:00",
         rotation_tolerance: float = 0.0,
         provider_rotation_modes: Optional[Dict[str, str]] = None,
+        provider_plugins: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -68,10 +69,13 @@ class UsageManager:
             provider_rotation_modes: Dict mapping provider names to rotation modes.
                 - "balanced": Rotate credentials to distribute load evenly (default)
                 - "sequential": Use one credential until exhausted (preserves caching)
+            provider_plugins: Dict mapping provider names to provider plugin instances.
+                Used for per-provider usage reset configuration (window durations, field names).
         """
         self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
         self.provider_rotation_modes = provider_rotation_modes or {}
+        self.provider_plugins = provider_plugins or PROVIDER_PLUGINS
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
         self._data_lock = asyncio.Lock()
@@ -101,6 +105,112 @@ class UsageManager:
             "balanced" or "sequential"
         """
         return self.provider_rotation_modes.get(provider, "balanced")
+
+    def _get_provider_from_credential(self, credential: str) -> Optional[str]:
+        """
+        Extract provider name from credential path or identifier.
+
+        Supports multiple credential formats:
+        - OAuth: "oauth_creds/antigravity_oauth_15.json" -> "antigravity"
+        - OAuth: "C:\\...\\oauth_creds\\gemini_cli_oauth_1.json" -> "gemini_cli"
+        - API key style: stored with provider prefix metadata
+
+        Args:
+            credential: The credential identifier (path or key)
+
+        Returns:
+            Provider name string or None if cannot be determined
+        """
+        import re
+
+        # Normalize path separators
+        normalized = credential.replace("\\", "/")
+
+        # Pattern: {provider}_oauth_{number}.json
+        match = re.search(r"/([a-z_]+)_oauth_\d+\.json$", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
+        # Pattern: oauth_creds/{provider}_...
+        match = re.search(r"oauth_creds/([a-z_]+)_", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
+        return None
+
+    def _get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the usage reset configuration for a credential from its provider plugin.
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            Configuration dict with window_seconds, field_name, etc.
+            or None to use default daily reset.
+        """
+        provider = self._get_provider_from_credential(credential)
+        if not provider:
+            return None
+
+        plugin = self.provider_plugins.get(provider)
+        if not plugin:
+            return None
+
+        if hasattr(plugin, "get_usage_reset_config"):
+            return plugin.get_usage_reset_config(credential)
+
+        return None
+
+    def _get_usage_field_name(self, credential: str) -> str:
+        """
+        Get the usage tracking field name for a credential.
+
+        Returns the provider-specific field name if configured,
+        otherwise falls back to "daily".
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            Field name string (e.g., "5h_window", "weekly", "daily")
+        """
+        config = self._get_usage_reset_config(credential)
+        if config and "field_name" in config:
+            return config["field_name"]
+
+        # Check provider default
+        provider = self._get_provider_from_credential(credential)
+        if provider:
+            plugin = self.provider_plugins.get(provider)
+            if plugin and hasattr(plugin, "get_default_usage_field_name"):
+                return plugin.get_default_usage_field_name()
+
+        return "daily"
+
+    def _get_usage_count(self, key: str, model: str) -> int:
+        """
+        Get the current usage count for a model from the appropriate usage field.
+
+        Args:
+            key: Credential identifier
+            model: Model name
+
+        Returns:
+            Usage count (success_count) for the model in the current window/daily period
+        """
+        if self._usage_data is None:
+            return 0
+
+        key_data = self._usage_data.get(key, {})
+        usage_field = self._get_usage_field_name(key)
+
+        return (
+            key_data.get(usage_field, {})
+            .get("models", {})
+            .get(model, {})
+            .get("success_count", 0)
+        )
 
     def _select_sequential(
         self,
@@ -186,129 +296,233 @@ class UsageManager:
                 await f.write(json.dumps(self._usage_data, indent=2))
 
     async def _reset_daily_stats_if_needed(self):
-        """Checks if daily stats need to be reset for any key."""
-        if self._usage_data is None or not self.daily_reset_time_utc:
+        """
+        Checks if usage stats need to be reset for any key.
+
+        Supports two reset modes:
+        1. Provider-specific rolling windows (e.g., 5h for Antigravity paid, 7d for free)
+        2. Legacy daily reset at daily_reset_time_utc for providers without custom config
+        """
+        if self._usage_data is None:
             return
 
         now_utc = datetime.now(timezone.utc)
+        now_ts = time.time()
         today_str = now_utc.date().isoformat()
         needs_saving = False
 
         for key, data in self._usage_data.items():
-            last_reset_str = data.get("last_daily_reset", "")
+            # Check for provider-specific reset configuration
+            reset_config = self._get_usage_reset_config(key)
 
-            if last_reset_str != today_str:
-                last_reset_dt = None
-                if last_reset_str:
-                    # Ensure the parsed datetime is timezone-aware (UTC)
-                    last_reset_dt = datetime.fromisoformat(last_reset_str).replace(
-                        tzinfo=timezone.utc
-                    )
-
-                # Determine the reset threshold for today
-                reset_threshold_today = datetime.combine(
-                    now_utc.date(), self.daily_reset_time_utc
+            if reset_config:
+                # Provider-specific rolling window reset
+                needs_saving |= await self._check_window_reset(
+                    key, data, reset_config, now_ts
                 )
-
-                if (
-                    last_reset_dt is None
-                    or last_reset_dt < reset_threshold_today <= now_utc
-                ):
-                    lib_logger.debug(
-                        f"Performing daily reset for key {mask_credential(key)}"
-                    )
-                    needs_saving = True
-
-                    # Reset cooldowns - BUT preserve unexpired long-term cooldowns
-                    # This is important for quota errors with long cooldowns (e.g., 143 hours)
-                    now_ts = time.time()
-                    if "model_cooldowns" in data:
-                        active_cooldowns = {
-                            model: end_time
-                            for model, end_time in data["model_cooldowns"].items()
-                            if end_time > now_ts
-                        }
-                        if active_cooldowns:
-                            # Calculate how long the longest cooldown has remaining
-                            max_remaining = max(
-                                end_time - now_ts
-                                for end_time in active_cooldowns.values()
-                            )
-                            hours_remaining = max_remaining / 3600
-                            lib_logger.info(
-                                f"Preserving {len(active_cooldowns)} active cooldown(s) "
-                                f"for key {mask_credential(key)} during daily reset "
-                                f"(longest: {hours_remaining:.1f}h remaining)"
-                            )
-                        data["model_cooldowns"] = active_cooldowns
-                    else:
-                        data["model_cooldowns"] = {}
-
-                    # Clear key-level cooldown only if expired
-                    if data.get("key_cooldown_until"):
-                        if data["key_cooldown_until"] <= now_ts:
-                            data["key_cooldown_until"] = None
-                        else:
-                            hours_remaining = (
-                                data["key_cooldown_until"] - now_ts
-                            ) / 3600
-                            lib_logger.info(
-                                f"Preserving key-level cooldown for {mask_credential(key)} "
-                                f"during daily reset ({hours_remaining:.1f}h remaining)"
-                            )
-                    else:
-                        data["key_cooldown_until"] = None
-
-                    # Reset consecutive failures
-                    if "failures" in data:
-                        data["failures"] = {}
-
-                    # TODO: Implement provider-specific reset schedules
-                    # Different providers have different quota reset periods:
-                    # - Most providers: Daily reset at daily_reset_time_utc
-                    # - Antigravity free tier: Weekly reset
-                    # - Antigravity paid tier: 5-hour rolling window
-                    #
-                    # Future implementation should:
-                    # 1. Group credentials by provider (extracted from key path or metadata)
-                    # 2. Check each provider's get_quota_reset_behavior()
-                    # 3. Apply provider-specific reset logic instead of universal daily reset
-                    #
-                    # For now, we preserve unexpired cooldowns which handles long cooldowns correctly.
-
-                    # Archive global stats from the previous day's 'daily'
-                    daily_data = data.get("daily", {})
-                    if daily_data:
-                        global_data = data.setdefault("global", {"models": {}})
-                        for model, stats in daily_data.get("models", {}).items():
-                            global_model_stats = global_data["models"].setdefault(
-                                model,
-                                {
-                                    "success_count": 0,
-                                    "prompt_tokens": 0,
-                                    "completion_tokens": 0,
-                                    "approx_cost": 0.0,
-                                },
-                            )
-                            global_model_stats["success_count"] += stats.get(
-                                "success_count", 0
-                            )
-                            global_model_stats["prompt_tokens"] += stats.get(
-                                "prompt_tokens", 0
-                            )
-                            global_model_stats["completion_tokens"] += stats.get(
-                                "completion_tokens", 0
-                            )
-                            global_model_stats["approx_cost"] += stats.get(
-                                "approx_cost", 0.0
-                            )
-
-                    # Reset daily stats
-                    data["daily"] = {"date": today_str, "models": {}}
-                    data["last_daily_reset"] = today_str
+            elif self.daily_reset_time_utc:
+                # Legacy daily reset for providers without custom config
+                needs_saving |= await self._check_daily_reset(
+                    key, data, now_utc, today_str, now_ts
+                )
 
         if needs_saving:
             await self._save_usage()
+
+    async def _check_window_reset(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        reset_config: Dict[str, Any],
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform rolling window reset for a credential.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            reset_config: Provider's reset configuration
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        window_seconds = reset_config.get("window_seconds", 86400)  # Default 24h
+        field_name = reset_config.get("field_name", "window")
+        description = reset_config.get("description", "rolling window")
+
+        # Get current window data
+        window_data = data.get(field_name, {})
+        window_start = window_data.get("start_ts")
+
+        # No window started yet - nothing to reset
+        if window_start is None:
+            return False
+
+        # Check if window has expired
+        window_end = window_start + window_seconds
+        if now_ts < window_end:
+            # Window still active
+            return False
+
+        # Window expired - perform reset
+        hours_elapsed = (now_ts - window_start) / 3600
+        lib_logger.info(
+            f"Resetting {field_name} for {mask_credential(key)} - "
+            f"{description} expired after {hours_elapsed:.1f}h"
+        )
+
+        # Archive to global
+        self._archive_to_global(data, window_data)
+
+        # Preserve unexpired cooldowns
+        self._preserve_unexpired_cooldowns(key, data, now_ts)
+
+        # Reset window stats (but don't start new window until first request)
+        data[field_name] = {"start_ts": None, "models": {}}
+
+        # Reset consecutive failures
+        if "failures" in data:
+            data["failures"] = {}
+
+        return True
+
+    async def _check_daily_reset(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        now_utc: datetime,
+        today_str: str,
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform legacy daily reset for a credential.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            now_utc: Current datetime in UTC
+            today_str: Today's date as ISO string
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        last_reset_str = data.get("last_daily_reset", "")
+
+        if last_reset_str == today_str:
+            return False
+
+        last_reset_dt = None
+        if last_reset_str:
+            try:
+                last_reset_dt = datetime.fromisoformat(last_reset_str).replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                pass
+
+        # Determine the reset threshold for today
+        reset_threshold_today = datetime.combine(
+            now_utc.date(), self.daily_reset_time_utc
+        )
+
+        if not (
+            last_reset_dt is None or last_reset_dt < reset_threshold_today <= now_utc
+        ):
+            return False
+
+        lib_logger.debug(f"Performing daily reset for key {mask_credential(key)}")
+
+        # Preserve unexpired cooldowns
+        self._preserve_unexpired_cooldowns(key, data, now_ts)
+
+        # Reset consecutive failures
+        if "failures" in data:
+            data["failures"] = {}
+
+        # Archive daily stats to global
+        daily_data = data.get("daily", {})
+        if daily_data:
+            self._archive_to_global(data, daily_data)
+
+        # Reset daily stats
+        data["daily"] = {"date": today_str, "models": {}}
+        data["last_daily_reset"] = today_str
+
+        return True
+
+    def _archive_to_global(
+        self, data: Dict[str, Any], source_data: Dict[str, Any]
+    ) -> None:
+        """
+        Archive usage stats from a source field (daily/window) to global.
+
+        Args:
+            data: The credential's usage data
+            source_data: The source field data to archive (has "models" key)
+        """
+        global_data = data.setdefault("global", {"models": {}})
+        for model, stats in source_data.get("models", {}).items():
+            global_model_stats = global_data["models"].setdefault(
+                model,
+                {
+                    "success_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "approx_cost": 0.0,
+                },
+            )
+            global_model_stats["success_count"] += stats.get("success_count", 0)
+            global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+            global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
+            global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
+
+    def _preserve_unexpired_cooldowns(
+        self, key: str, data: Dict[str, Any], now_ts: float
+    ) -> None:
+        """
+        Preserve unexpired cooldowns during reset (important for long quota cooldowns).
+
+        Args:
+            key: Credential identifier (for logging)
+            data: The credential's usage data
+            now_ts: Current timestamp
+        """
+        # Preserve unexpired model cooldowns
+        if "model_cooldowns" in data:
+            active_cooldowns = {
+                model: end_time
+                for model, end_time in data["model_cooldowns"].items()
+                if end_time > now_ts
+            }
+            if active_cooldowns:
+                max_remaining = max(
+                    end_time - now_ts for end_time in active_cooldowns.values()
+                )
+                hours_remaining = max_remaining / 3600
+                lib_logger.info(
+                    f"Preserving {len(active_cooldowns)} active cooldown(s) "
+                    f"for key {mask_credential(key)} during reset "
+                    f"(longest: {hours_remaining:.1f}h remaining)"
+                )
+            data["model_cooldowns"] = active_cooldowns
+        else:
+            data["model_cooldowns"] = {}
+
+        # Preserve unexpired key-level cooldown
+        if data.get("key_cooldown_until"):
+            if data["key_cooldown_until"] <= now_ts:
+                data["key_cooldown_until"] = None
+            else:
+                hours_remaining = (data["key_cooldown_until"] - now_ts) / 3600
+                lib_logger.info(
+                    f"Preserving key-level cooldown for {mask_credential(key)} "
+                    f"during reset ({hours_remaining:.1f}h remaining)"
+                )
+        else:
+            data["key_cooldown_until"] = None
 
     def _initialize_key_states(self, keys: List[str]):
         """Initializes state tracking for all provided keys if not already present."""
@@ -430,12 +644,7 @@ class UsageManager:
                         priority = credential_priorities.get(key, 999)
 
                         # Get usage count for load balancing within priority groups
-                        usage_count = (
-                            key_data.get("daily", {})
-                            .get("models", {})
-                            .get(model, {})
-                            .get("success_count", 0)
-                        )
+                        usage_count = self._get_usage_count(key, model)
 
                         # Group by priority
                         if priority not in priority_groups:
@@ -577,12 +786,7 @@ class UsageManager:
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
-                        usage_count = (
-                            key_data.get("daily", {})
-                            .get("models", {})
-                            .get(model, {})
-                            .get("success_count", 0)
-                        )
+                        usage_count = self._get_usage_count(key, model)
                         key_state = self.key_states[key]
 
                         # Tier 1: Completely idle keys (preferred).
@@ -743,22 +947,50 @@ class UsageManager:
         """
         Records a successful API call, resetting failure counters.
         It safely handles cases where token usage data is not available.
+
+        Uses provider-specific field names for usage tracking (e.g., "5h_window", "weekly")
+        and sets window start timestamp on first request.
         """
         await self._lazy_init()
         async with self._data_lock:
+            now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
-            key_data = self._usage_data.setdefault(
-                key,
-                {
-                    "daily": {"date": today_utc_str, "models": {}},
-                    "global": {"models": {}},
-                    "model_cooldowns": {},
-                    "failures": {},
-                },
-            )
+
+            # Determine the usage field name for this credential
+            usage_field = self._get_usage_field_name(key)
+            reset_config = self._get_usage_reset_config(key)
+            uses_window = reset_config is not None
+
+            # Initialize key data with appropriate structure
+            if uses_window:
+                # Provider-specific rolling window
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        usage_field: {"start_ts": None, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
+                # Ensure the usage field exists (for migration from old format)
+                if usage_field not in key_data:
+                    key_data[usage_field] = {"start_ts": None, "models": {}}
+            else:
+                # Legacy daily reset
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "daily": {"date": today_utc_str, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
+                usage_field = "daily"
 
             # If the key is new, ensure its reset date is initialized to prevent an immediate reset.
-            if "last_daily_reset" not in key_data:
+            if not uses_window and "last_daily_reset" not in key_data:
                 key_data["last_daily_reset"] = today_utc_str
 
             # Always record a success and reset failures
@@ -767,7 +999,24 @@ class UsageManager:
             if model in key_data.get("model_cooldowns", {}):
                 del key_data["model_cooldowns"][model]
 
-            daily_model_data = key_data["daily"]["models"].setdefault(
+            # Get or create the usage field data
+            usage_data = key_data.setdefault(usage_field, {"models": {}})
+
+            # For window-based tracking, set start_ts on first request
+            if uses_window:
+                if usage_data.get("start_ts") is None:
+                    usage_data["start_ts"] = now_ts
+                    window_hours = reset_config.get("window_seconds", 0) / 3600
+                    description = reset_config.get("description", "rolling window")
+                    lib_logger.info(
+                        f"Starting new {window_hours:.1f}h window for {mask_credential(key)} - {description}"
+                    )
+
+            # Ensure models dict exists
+            if "models" not in usage_data:
+                usage_data["models"] = {}
+
+            model_data = usage_data["models"].setdefault(
                 model,
                 {
                     "success_count": 0,
@@ -776,7 +1025,7 @@ class UsageManager:
                     "approx_cost": 0.0,
                 },
             )
-            daily_model_data["success_count"] += 1
+            model_data["success_count"] += 1
 
             # Safely attempt to record token and cost usage
             if (
@@ -785,8 +1034,8 @@ class UsageManager:
                 and completion_response.usage
             ):
                 usage = completion_response.usage
-                daily_model_data["prompt_tokens"] += usage.prompt_tokens
-                daily_model_data["completion_tokens"] += getattr(
+                model_data["prompt_tokens"] += usage.prompt_tokens
+                model_data["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
                 )  # Not present in embedding responses
                 lib_logger.info(
@@ -794,7 +1043,7 @@ class UsageManager:
                 )
                 try:
                     provider_name = model.split("/")[0]
-                    provider_plugin = PROVIDER_PLUGINS.get(provider_name)
+                    provider_plugin = self.provider_plugins.get(provider_name)
 
                     # Check class attribute directly - no need to instantiate
                     if provider_plugin and getattr(
@@ -821,7 +1070,7 @@ class UsageManager:
                             )
 
                         if cost is not None:
-                            daily_model_data["approx_cost"] += cost
+                            model_data["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(
                         f"Could not calculate cost for model {model}: {e}"
@@ -836,7 +1085,7 @@ class UsageManager:
                     f"No usage data found in completion response for model {model}. Recording success without token count."
                 )
 
-            key_data["last_used_ts"] = time.time()
+            key_data["last_used_ts"] = now_ts
 
         await self._save_usage()
 
@@ -859,15 +1108,33 @@ class UsageManager:
         await self._lazy_init()
         async with self._data_lock:
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
-            key_data = self._usage_data.setdefault(
-                key,
-                {
-                    "daily": {"date": today_utc_str, "models": {}},
-                    "global": {"models": {}},
-                    "model_cooldowns": {},
-                    "failures": {},
-                },
-            )
+
+            # Determine the usage field name for this credential
+            usage_field = self._get_usage_field_name(key)
+            reset_config = self._get_usage_reset_config(key)
+            uses_window = reset_config is not None
+
+            # Initialize key data with appropriate structure
+            if uses_window:
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        usage_field: {"start_ts": None, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
+            else:
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "daily": {"date": today_utc_str, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
 
             # Provider-level errors (transient issues) should not count against the key
             provider_level_errors = {"server_error", "api_connection"}

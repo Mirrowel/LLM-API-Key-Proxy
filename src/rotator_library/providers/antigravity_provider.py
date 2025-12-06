@@ -822,6 +822,60 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         return None
 
+    def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Get Antigravity-specific usage tracking configuration based on credential tier.
+
+        Antigravity has different quota reset windows by tier:
+        - Paid tiers (priority 1): 5-hour rolling window
+        - Free tier (priority 2): 7-day rolling window
+        - Unknown/legacy: 7-day rolling window (conservative default)
+
+        Args:
+            credential: The credential path
+
+        Returns:
+            Usage reset configuration dict
+        """
+        tier = self.project_tier_cache.get(credential)
+        if not tier:
+            tier = self._load_tier_from_file(credential)
+
+        # Paid tiers: 5-hour window
+        if tier and tier not in ["free-tier", "legacy-tier", "unknown"]:
+            return {
+                "window_seconds": 5 * 60 * 60,  # 18000 seconds = 5 hours
+                "field_name": "5h_window",
+                "priority": 1,
+                "description": "5-hour rolling window (paid tier)",
+            }
+
+        # Free tier: 7-day window
+        if tier == "free-tier":
+            return {
+                "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
+                "field_name": "weekly",
+                "priority": 2,
+                "description": "7-day rolling window (free tier)",
+            }
+
+        # Unknown/legacy: use 7-day window as conservative default
+        return {
+            "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
+            "field_name": "weekly",
+            "priority": 10,
+            "description": "7-day rolling window (unknown tier - conservative default)",
+        }
+
+    def get_default_usage_field_name(self) -> str:
+        """
+        Get the default usage tracking field name for Antigravity.
+
+        Returns:
+            "weekly" as the conservative default for unknown credentials
+        """
+        return "weekly"
+
     async def initialize_credentials(self, credential_paths: List[str]) -> None:
         """
         Load persisted tier information from credential files at startup.

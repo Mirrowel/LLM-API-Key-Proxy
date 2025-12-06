@@ -206,22 +206,66 @@ class ProviderInterface(ABC):
         """
         return None  # Default: no provider-specific parsing
 
-    # TODO: Implement provider-specific quota reset schedules
-    # Different providers have different quota reset periods:
-    # - Most providers: Daily reset at a specific time
-    # - Antigravity free tier: Weekly reset
-    # - Antigravity paid tier: 5-hour rolling window
-    #
-    # Future implementation should add:
-    # @classmethod
-    # def get_quota_reset_behavior(cls) -> Dict[str, Any]:
-    #     """
-    #     Get provider-specific quota reset behavior.
-    #     Returns:
-    #         {
-    #             "type": "daily" | "weekly" | "rolling",
-    #             "reset_time_utc": "03:00",  # For daily/weekly
-    #             "rolling_hours": 5,          # For rolling
-    #         }
-    #     """
-    #     return {"type": "daily", "reset_time_utc": "03:00"}
+    # =========================================================================
+    # Per-Provider Usage Tracking Configuration
+    # =========================================================================
+
+    def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Get provider-specific usage tracking configuration for a credential.
+
+        This allows providers to define custom usage reset windows based on
+        credential tier (e.g., paid vs free accounts with different quota periods).
+
+        The UsageManager will use this configuration to:
+        1. Track usage in a custom-named field (instead of default "daily")
+        2. Reset usage based on a rolling window from first request
+        3. Archive stats to "global" when the window expires
+
+        Args:
+            credential: The credential identifier (API key or path)
+
+        Returns:
+            None to use default daily reset, otherwise a dict with:
+            {
+                "window_seconds": int,     # Duration in seconds (e.g., 18000 for 5h)
+                "field_name": str,         # Custom field name (e.g., "5h_window", "weekly")
+                "priority": int,           # Priority level this config applies to (for docs)
+                "description": str,        # Human-readable description (for logging)
+            }
+
+        Examples:
+            Antigravity paid tier:
+            {
+                "window_seconds": 18000,   # 5 hours
+                "field_name": "5h_window",
+                "priority": 1,
+                "description": "5-hour rolling window (paid tier)"
+            }
+
+            Antigravity free tier:
+            {
+                "window_seconds": 604800,  # 7 days
+                "field_name": "weekly",
+                "priority": 2,
+                "description": "7-day rolling window (free tier)"
+            }
+
+        Note:
+            - window_seconds: Time from first request until stats reset
+            - When window expires, stats move to "global" (same as daily reset)
+            - First request after window expiry starts a new window
+        """
+        return None  # Default: use daily reset at daily_reset_time_utc
+
+    def get_default_usage_field_name(self) -> str:
+        """
+        Get the default usage tracking field name for this provider.
+
+        Providers can override this to use a custom field name for usage tracking
+        when no credential-specific config is available.
+
+        Returns:
+            Field name string (default: "daily")
+        """
+        return "daily"

@@ -161,6 +161,7 @@ class RotatingClient:
             file_path=usage_file_path,
             rotation_tolerance=rotation_tolerance,
             provider_rotation_modes=provider_rotation_modes,
+            provider_plugins=PROVIDER_PLUGINS,
         )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
