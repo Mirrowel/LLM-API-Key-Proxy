@@ -5,7 +5,7 @@ import logging
 import asyncio
 import random
 from datetime import date, datetime, timezone, time as dt_time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 import aiofiles
 import litellm
 
@@ -42,6 +42,10 @@ class UsageManager:
 
     This ensures lower-usage credentials are preferred while tolerance controls how much
     randomness is introduced into the selection process.
+
+    Additionally, providers can specify a rotation mode:
+    - "balanced" (default): Rotate credentials to distribute load evenly
+    - "sequential": Use one credential until exhausted (preserves caching)
     """
 
     def __init__(
@@ -49,6 +53,7 @@ class UsageManager:
         file_path: str = "key_usage.json",
         daily_reset_time_utc: Optional[str] = "03:00",
         rotation_tolerance: float = 0.0,
+        provider_rotation_modes: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -60,9 +65,13 @@ class UsageManager:
                 - 0.0: Deterministic, least-used credential always selected
                 - tolerance = 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
                 - 5.0+: High randomness, more unpredictable selection patterns
+            provider_rotation_modes: Dict mapping provider names to rotation modes.
+                - "balanced": Rotate credentials to distribute load evenly (default)
+                - "sequential": Use one credential until exhausted (preserves caching)
         """
         self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
+        self.provider_rotation_modes = provider_rotation_modes or {}
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
         self._data_lock = asyncio.Lock()
@@ -80,6 +89,72 @@ class UsageManager:
             )
         else:
             self.daily_reset_time_utc = None
+
+    def _get_rotation_mode(self, provider: str) -> str:
+        """
+        Get the rotation mode for a provider.
+
+        Args:
+            provider: Provider name (e.g., "antigravity", "gemini_cli")
+
+        Returns:
+            "balanced" or "sequential"
+        """
+        return self.provider_rotation_modes.get(provider, "balanced")
+
+    def _select_sequential(
+        self,
+        candidates: List[Tuple[str, int]],
+        credential_priorities: Optional[Dict[str, int]] = None,
+    ) -> str:
+        """
+        Select credential in strict sequential order for cache-preserving rotation.
+
+        This method ensures the same credential is reused until it hits a cooldown,
+        which preserves provider-side caching (e.g., thinking signature caches).
+
+        Selection logic:
+        1. Sort by priority (lowest number = highest priority)
+        2. Within same priority, sort by last_used_ts (most recent first = sticky)
+        3. Return the first candidate
+
+        Args:
+            candidates: List of (credential_id, usage_count) tuples
+            credential_priorities: Optional dict mapping credentials to priority levels
+
+        Returns:
+            Selected credential ID
+        """
+        if not candidates:
+            raise ValueError("Cannot select from empty candidate list")
+
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        def sort_key(item: Tuple[str, int]) -> Tuple[int, float]:
+            cred, _ = item
+            # Priority: lower is better (1 = highest priority)
+            priority = (
+                credential_priorities.get(cred, 999) if credential_priorities else 999
+            )
+            # Last used: higher (more recent) is better for stickiness
+            last_used = (
+                self._usage_data.get(cred, {}).get("last_used_ts", 0)
+                if self._usage_data
+                else 0
+            )
+            # Negative last_used so most recent sorts first
+            return (priority, -last_used)
+
+        sorted_candidates = sorted(candidates, key=sort_key)
+        selected = sorted_candidates[0][0]
+
+        lib_logger.debug(
+            f"Sequential selection: chose {mask_credential(selected)} "
+            f"(priority={credential_priorities.get(selected, 999) if credential_priorities else 'N/A'})"
+        )
+
+        return selected
 
     async def _lazy_init(self):
         """Initializes the usage data by loading it from the file asynchronously."""
@@ -144,13 +219,62 @@ class UsageManager:
                     )
                     needs_saving = True
 
-                    # Reset cooldowns
-                    data["model_cooldowns"] = {}
-                    data["key_cooldown_until"] = None
+                    # Reset cooldowns - BUT preserve unexpired long-term cooldowns
+                    # This is important for quota errors with long cooldowns (e.g., 143 hours)
+                    now_ts = time.time()
+                    if "model_cooldowns" in data:
+                        active_cooldowns = {
+                            model: end_time
+                            for model, end_time in data["model_cooldowns"].items()
+                            if end_time > now_ts
+                        }
+                        if active_cooldowns:
+                            # Calculate how long the longest cooldown has remaining
+                            max_remaining = max(
+                                end_time - now_ts
+                                for end_time in active_cooldowns.values()
+                            )
+                            hours_remaining = max_remaining / 3600
+                            lib_logger.info(
+                                f"Preserving {len(active_cooldowns)} active cooldown(s) "
+                                f"for key {mask_credential(key)} during daily reset "
+                                f"(longest: {hours_remaining:.1f}h remaining)"
+                            )
+                        data["model_cooldowns"] = active_cooldowns
+                    else:
+                        data["model_cooldowns"] = {}
+
+                    # Clear key-level cooldown only if expired
+                    if data.get("key_cooldown_until"):
+                        if data["key_cooldown_until"] <= now_ts:
+                            data["key_cooldown_until"] = None
+                        else:
+                            hours_remaining = (
+                                data["key_cooldown_until"] - now_ts
+                            ) / 3600
+                            lib_logger.info(
+                                f"Preserving key-level cooldown for {mask_credential(key)} "
+                                f"during daily reset ({hours_remaining:.1f}h remaining)"
+                            )
+                    else:
+                        data["key_cooldown_until"] = None
 
                     # Reset consecutive failures
                     if "failures" in data:
                         data["failures"] = {}
+
+                    # TODO: Implement provider-specific reset schedules
+                    # Different providers have different quota reset periods:
+                    # - Most providers: Daily reset at daily_reset_time_utc
+                    # - Antigravity free tier: Weekly reset
+                    # - Antigravity paid tier: 5-hour rolling window
+                    #
+                    # Future implementation should:
+                    # 1. Group credentials by provider (extracted from key path or metadata)
+                    # 2. Check each provider's get_quota_reset_behavior()
+                    # 3. Apply provider-specific reset logic instead of universal daily reset
+                    #
+                    # For now, we preserve unexpired cooldowns which handles long cooldowns correctly.
 
                     # Archive global stats from the previous day's 'daily'
                     daily_data = data.get("daily", {})
@@ -336,15 +460,30 @@ class UsageManager:
                         elif key_state["models_in_use"].get(model, 0) < max_concurrent:
                             tier2_keys.append((key, usage_count))
 
-                    # Apply weighted random selection or deterministic sorting
-                    selection_method = (
-                        "weighted-random"
-                        if self.rotation_tolerance > 0
-                        else "least-used"
-                    )
+                    # Determine selection method based on provider's rotation mode
+                    provider = model.split("/")[0] if "/" in model else ""
+                    rotation_mode = self._get_rotation_mode(provider)
 
-                    if self.rotation_tolerance > 0:
-                        # Weighted random selection within each tier
+                    if rotation_mode == "sequential":
+                        # Sequential mode: stick with same credential until exhausted
+                        selection_method = "sequential"
+                        if tier1_keys:
+                            selected_key = self._select_sequential(
+                                tier1_keys, credential_priorities
+                            )
+                            tier1_keys = [
+                                (k, u) for k, u in tier1_keys if k == selected_key
+                            ]
+                        if tier2_keys:
+                            selected_key = self._select_sequential(
+                                tier2_keys, credential_priorities
+                            )
+                            tier2_keys = [
+                                (k, u) for k, u in tier2_keys if k == selected_key
+                            ]
+                    elif self.rotation_tolerance > 0:
+                        # Balanced mode with weighted randomness
+                        selection_method = "weighted-random"
                         if tier1_keys:
                             selected_key = self._select_weighted_random(
                                 tier1_keys, self.rotation_tolerance
@@ -361,6 +500,7 @@ class UsageManager:
                             ]
                     else:
                         # Deterministic: sort by usage within each tier
+                        selection_method = "least-used"
                         tier1_keys.sort(key=lambda x: x[1])
                         tier2_keys.sort(key=lambda x: x[1])
 
@@ -452,13 +592,30 @@ class UsageManager:
                         elif key_state["models_in_use"].get(model, 0) < max_concurrent:
                             tier2_keys.append((key, usage_count))
 
-                # Apply weighted random selection or deterministic sorting
-                selection_method = (
-                    "weighted-random" if self.rotation_tolerance > 0 else "least-used"
-                )
+                # Determine selection method based on provider's rotation mode
+                provider = model.split("/")[0] if "/" in model else ""
+                rotation_mode = self._get_rotation_mode(provider)
 
-                if self.rotation_tolerance > 0:
-                    # Weighted random selection within each tier
+                if rotation_mode == "sequential":
+                    # Sequential mode: stick with same credential until exhausted
+                    selection_method = "sequential"
+                    if tier1_keys:
+                        selected_key = self._select_sequential(
+                            tier1_keys, credential_priorities
+                        )
+                        tier1_keys = [
+                            (k, u) for k, u in tier1_keys if k == selected_key
+                        ]
+                    if tier2_keys:
+                        selected_key = self._select_sequential(
+                            tier2_keys, credential_priorities
+                        )
+                        tier2_keys = [
+                            (k, u) for k, u in tier2_keys if k == selected_key
+                        ]
+                elif self.rotation_tolerance > 0:
+                    # Balanced mode with weighted randomness
+                    selection_method = "weighted-random"
                     if tier1_keys:
                         selected_key = self._select_weighted_random(
                             tier1_keys, self.rotation_tolerance
@@ -475,6 +632,7 @@ class UsageManager:
                         ]
                 else:
                     # Deterministic: sort by usage within each tier
+                    selection_method = "least-used"
                     tier1_keys.sort(key=lambda x: x[1])
                     tier2_keys.sort(key=lambda x: x[1])
 
@@ -726,10 +884,24 @@ class UsageManager:
             if classified_error.error_type in ["rate_limit", "quota_exceeded"]:
                 # Rate limit / Quota errors: use retry_after if available, otherwise default to 60s
                 cooldown_seconds = classified_error.retry_after or 60
-                lib_logger.info(
-                    f"Rate limit error on key {mask_credential(key)} for model {model}. "
-                    f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
-                )
+                if classified_error.retry_after:
+                    # Log with human-readable duration for provider-parsed cooldowns
+                    hours = cooldown_seconds / 3600
+                    if hours >= 1:
+                        lib_logger.info(
+                            f"Quota/rate limit on key {mask_credential(key)} for model {model}. "
+                            f"Applying provider-specified cooldown: {cooldown_seconds}s ({hours:.1f}h)"
+                        )
+                    else:
+                        lib_logger.info(
+                            f"Rate limit on key {mask_credential(key)} for model {model}. "
+                            f"Applying provider-specified cooldown: {cooldown_seconds}s"
+                        )
+                else:
+                    lib_logger.info(
+                        f"Rate limit on key {mask_credential(key)} for model {model}. "
+                        f"Using default cooldown: {cooldown_seconds}s"
+                    )
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
                 key_data["key_cooldown_until"] = time.time() + 300

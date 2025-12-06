@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union
+import os
 import httpx
 import litellm
 
@@ -11,6 +12,11 @@ class ProviderInterface(ABC):
     """
 
     skip_cost_calculation: bool = False
+
+    # Default rotation mode for this provider ("balanced" or "sequential")
+    # - "balanced": Rotate credentials to distribute load evenly
+    # - "sequential": Use one credential until exhausted, then switch to next
+    default_rotation_mode: str = "balanced"
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -153,3 +159,69 @@ class ProviderInterface(ABC):
             Tier name string (e.g., "free-tier", "paid-tier") or None if unknown
         """
         return None
+
+    # =========================================================================
+    # Sequential Rotation Support
+    # =========================================================================
+
+    @classmethod
+    def get_rotation_mode(cls, provider_name: str) -> str:
+        """
+        Get the rotation mode for this provider.
+
+        Checks ROTATION_MODE_{PROVIDER} environment variable first,
+        then falls back to the class's default_rotation_mode.
+
+        Args:
+            provider_name: The provider name (e.g., "antigravity", "gemini_cli")
+
+        Returns:
+            "balanced" or "sequential"
+        """
+        env_key = f"ROTATION_MODE_{provider_name.upper()}"
+        return os.getenv(env_key, cls.default_rotation_mode)
+
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse a quota/rate-limit error and extract structured information.
+
+        Providers should override this method to handle their specific error formats.
+        This allows the error_handler to use provider-specific parsing when available,
+        falling back to generic parsing otherwise.
+
+        Args:
+            error: The caught exception
+            error_body: Optional raw response body string
+
+        Returns:
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,  # seconds until quota resets
+                "reason": str,       # e.g., "QUOTA_EXHAUSTED", "RATE_LIMITED"
+                "reset_timestamp": str | None,  # ISO timestamp if available
+            }
+        """
+        return None  # Default: no provider-specific parsing
+
+    # TODO: Implement provider-specific quota reset schedules
+    # Different providers have different quota reset periods:
+    # - Most providers: Daily reset at a specific time
+    # - Antigravity free tier: Weekly reset
+    # - Antigravity paid tier: 5-hour rolling window
+    #
+    # Future implementation should add:
+    # @classmethod
+    # def get_quota_reset_behavior(cls) -> Dict[str, Any]:
+    #     """
+    #     Get provider-specific quota reset behavior.
+    #     Returns:
+    #         {
+    #             "type": "daily" | "weekly" | "rolling",
+    #             "reset_time_utc": "03:00",  # For daily/weekly
+    #             "rolling_hours": 5,          # For rolling
+    #         }
+    #     """
+    #     return {"type": "daily", "reset_time_utc": "03:00"}

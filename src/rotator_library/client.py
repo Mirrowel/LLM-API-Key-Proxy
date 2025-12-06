@@ -139,8 +139,28 @@ class RotatingClient:
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
+
+        # Build provider rotation modes map
+        # Each provider can specify its preferred rotation mode ("balanced" or "sequential")
+        provider_rotation_modes = {}
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+            if provider_class and hasattr(provider_class, "get_rotation_mode"):
+                # Use class method to get rotation mode (checks env var + class default)
+                mode = provider_class.get_rotation_mode(provider)
+            else:
+                # Fallback: check environment variable directly
+                env_key = f"ROTATION_MODE_{provider.upper()}"
+                mode = os.getenv(env_key, "balanced")
+
+            provider_rotation_modes[provider] = mode
+            if mode != "balanced":
+                lib_logger.info(f"Provider '{provider}' using rotation mode: {mode}")
+
         self.usage_manager = UsageManager(
-            file_path=usage_file_path, rotation_tolerance=rotation_tolerance
+            file_path=usage_file_path,
+            rotation_tolerance=rotation_tolerance,
+            provider_rotation_modes=provider_rotation_modes,
         )
         self._model_list_cache = {}
         self._provider_plugins = PROVIDER_PLUGINS
@@ -1070,7 +1090,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
 
                             # Extract a clean error message for the user-facing log
                             error_message = str(e).split("\n")[0]
@@ -1114,7 +1134,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             # Provider-level error: don't increment consecutive failures
@@ -1170,7 +1190,7 @@ class RotatingClient:
                                 else {},
                             )
 
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             lib_logger.warning(
@@ -1239,7 +1259,7 @@ class RotatingClient:
                                 )
                                 raise last_exception
 
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
 
                             lib_logger.warning(
@@ -1566,7 +1586,9 @@ class RotatingClient:
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
                                 original_exc = getattr(e, "data", e)
-                                classified_error = classify_error(original_exc)
+                                classified_error = classify_error(
+                                    original_exc, provider=provider
+                                )
                                 error_message = str(original_exc).split("\n")[0]
 
                                 log_failure(
@@ -1623,7 +1645,7 @@ class RotatingClient:
                                     if request
                                     else {},
                                 )
-                                classified_error = classify_error(e)
+                                classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
 
                                 # Provider-level error: don't increment consecutive failures
@@ -1673,7 +1695,7 @@ class RotatingClient:
                                     if request
                                     else {},
                                 )
-                                classified_error = classify_error(e)
+                                classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
 
                                 # Record in accumulator
@@ -1812,7 +1834,9 @@ class RotatingClient:
                             cleaned_str = None
                             # The actual exception might be wrapped in our StreamedAPIError.
                             original_exc = getattr(e, "data", e)
-                            classified_error = classify_error(original_exc)
+                            classified_error = classify_error(
+                                original_exc, provider=provider
+                            )
 
                             # Check if this error should trigger rotation
                             if not should_rotate_on_error(classified_error):
@@ -1939,7 +1963,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
 
                             # Record error in accumulator (server errors are transient, not abnormal)
@@ -1990,7 +2014,7 @@ class RotatingClient:
                                 if request
                                 else {},
                             )
-                            classified_error = classify_error(e)
+                            classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
 
                             # Record error in accumulator
@@ -2232,7 +2256,7 @@ class RotatingClient:
                     self._model_list_cache[provider] = final_models
                     return final_models
                 except Exception as e:
-                    classified_error = classify_error(e)
+                    classified_error = classify_error(e, provider=provider)
                     cred_display = mask_credential(credential)
                     lib_logger.debug(
                         f"Failed to get models for provider {provider} with credential {cred_display}: {classified_error.error_type}. Trying next credential."

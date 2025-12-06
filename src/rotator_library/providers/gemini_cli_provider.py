@@ -186,6 +186,31 @@ def _env_int(key: str, default: int) -> int:
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
 
+    # Balanced by default - Gemini CLI has short cooldowns (seconds, not hours)
+    default_rotation_mode: str = "balanced"
+
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse Gemini CLI quota errors.
+
+        Uses the same Google RPC format as Antigravity but typically has
+        much shorter cooldown durations (seconds to minutes, not hours).
+
+        Args:
+            error: The caught exception
+            error_body: Optional raw response body string
+
+        Returns:
+            Same format as AntigravityProvider.parse_quota_error()
+        """
+        # Reuse the same parsing logic as Antigravity since both use Google RPC format
+        from .antigravity_provider import AntigravityProvider
+
+        return AntigravityProvider.parse_quota_error(error, error_body)
+
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()

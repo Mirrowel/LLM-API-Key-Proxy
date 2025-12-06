@@ -494,6 +494,147 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     skip_cost_calculation = True
 
+    # Sequential mode by default - preserves thinking signature caches between requests
+    default_rotation_mode: str = "sequential"
+
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse Antigravity/Google RPC quota errors.
+
+        Handles the Google Cloud API error format with ErrorInfo and RetryInfo details.
+
+        Example error format:
+        {
+          "error": {
+            "code": 429,
+            "details": [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "QUOTA_EXHAUSTED",
+                "metadata": {
+                  "quotaResetDelay": "143h4m52.730699158s",
+                  "quotaResetTimeStamp": "2025-12-11T22:53:16Z"
+                }
+              },
+              {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "515092.730699158s"
+              }
+            ]
+          }
+        }
+
+        Args:
+            error: The caught exception
+            error_body: Optional raw response body string
+
+        Returns:
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,
+                "reason": str,
+                "reset_timestamp": str | None,
+            }
+        """
+        import re as regex_module
+
+        def parse_duration(duration_str: str) -> Optional[int]:
+            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds."""
+            if not duration_str:
+                return None
+
+            # Handle pure seconds format: "515092.730699158s"
+            pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
+            if pure_seconds_match:
+                return int(float(pure_seconds_match.group(1)))
+
+            # Handle compound format: "143h4m52.730699158s"
+            total_seconds = 0
+            patterns = [
+                (r"(\d+)h", 3600),  # hours
+                (r"(\d+)m", 60),  # minutes
+                (r"([\d.]+)s", 1),  # seconds
+            ]
+            for pattern, multiplier in patterns:
+                match = regex_module.search(pattern, duration_str)
+                if match:
+                    total_seconds += float(match.group(1)) * multiplier
+
+            return int(total_seconds) if total_seconds > 0 else None
+
+        # Get error body from exception if not provided
+        body = error_body
+        if not body:
+            # Try to extract from various exception attributes
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                body = error.response.text
+            elif hasattr(error, "body"):
+                body = str(error.body)
+            elif hasattr(error, "message"):
+                body = str(error.message)
+            else:
+                body = str(error)
+
+        # Try to find JSON in the body
+        try:
+            # Handle cases where JSON is embedded in a larger string
+            json_match = regex_module.search(r"\{[\s\S]*\}", body)
+            if not json_match:
+                return None
+
+            data = json.loads(json_match.group(0))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return None
+
+        # Navigate to error.details
+        error_obj = data.get("error", data)
+        details = error_obj.get("details", [])
+
+        if not details:
+            return None
+
+        result = {
+            "retry_after": None,
+            "reason": None,
+            "reset_timestamp": None,
+        }
+
+        for detail in details:
+            detail_type = detail.get("@type", "")
+
+            # Parse RetryInfo - most authoritative source for retry delay
+            if "RetryInfo" in detail_type:
+                retry_delay = detail.get("retryDelay")
+                if retry_delay:
+                    parsed = parse_duration(retry_delay)
+                    if parsed:
+                        result["retry_after"] = parsed
+
+            # Parse ErrorInfo - contains reason and quota reset metadata
+            elif "ErrorInfo" in detail_type:
+                result["reason"] = detail.get("reason")
+                metadata = detail.get("metadata", {})
+
+                # Get quotaResetDelay as fallback if RetryInfo not present
+                if not result["retry_after"]:
+                    quota_delay = metadata.get("quotaResetDelay")
+                    if quota_delay:
+                        parsed = parse_duration(quota_delay)
+                        if parsed:
+                            result["retry_after"] = parsed
+
+                # Capture reset timestamp for logging
+                result["reset_timestamp"] = metadata.get("quotaResetTimeStamp")
+
+        # Return None if we couldn't extract retry_after
+        if not result["retry_after"]:
+            return None
+
+        return result
+
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()
