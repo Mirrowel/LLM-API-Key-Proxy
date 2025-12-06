@@ -76,6 +76,7 @@ class UsageManager:
         self.rotation_tolerance = rotation_tolerance
         self.provider_rotation_modes = provider_rotation_modes or {}
         self.provider_plugins = provider_plugins or PROVIDER_PLUGINS
+        self._provider_instances: Dict[str, Any] = {}  # Cache for provider instances
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
         self._data_lock = asyncio.Lock()
@@ -138,6 +139,33 @@ class UsageManager:
 
         return None
 
+    def _get_provider_instance(self, provider: str) -> Optional[Any]:
+        """
+        Get or create a provider plugin instance.
+
+        Args:
+            provider: The provider name
+
+        Returns:
+            Provider plugin instance or None
+        """
+        if not provider:
+            return None
+
+        plugin_class = self.provider_plugins.get(provider)
+        if not plugin_class:
+            return None
+
+        # Get or create provider instance from cache
+        if provider not in self._provider_instances:
+            # Instantiate the plugin if it's a class, or use it directly if already an instance
+            if isinstance(plugin_class, type):
+                self._provider_instances[provider] = plugin_class()
+            else:
+                self._provider_instances[provider] = plugin_class
+
+        return self._provider_instances[provider]
+
     def _get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
         """
         Get the usage reset configuration for a credential from its provider plugin.
@@ -150,15 +178,10 @@ class UsageManager:
             or None to use default daily reset.
         """
         provider = self._get_provider_from_credential(credential)
-        if not provider:
-            return None
+        plugin_instance = self._get_provider_instance(provider)
 
-        plugin = self.provider_plugins.get(provider)
-        if not plugin:
-            return None
-
-        if hasattr(plugin, "get_usage_reset_config"):
-            return plugin.get_usage_reset_config(credential)
+        if plugin_instance and hasattr(plugin_instance, "get_usage_reset_config"):
+            return plugin_instance.get_usage_reset_config(credential)
 
         return None
 
@@ -187,15 +210,10 @@ class UsageManager:
             Group name (e.g., "claude") or None if not grouped
         """
         provider = self._get_provider_from_credential(credential)
-        if not provider:
-            return None
+        plugin_instance = self._get_provider_instance(provider)
 
-        plugin = self.provider_plugins.get(provider)
-        if not plugin:
-            return None
-
-        if hasattr(plugin, "get_model_quota_group"):
-            return plugin.get_model_quota_group(model)
+        if plugin_instance and hasattr(plugin_instance, "get_model_quota_group"):
+            return plugin_instance.get_model_quota_group(model)
 
         return None
 
@@ -211,15 +229,10 @@ class UsageManager:
             List of full model names (e.g., ["antigravity/claude-opus-4-5", ...])
         """
         provider = self._get_provider_from_credential(credential)
-        if not provider:
-            return []
+        plugin_instance = self._get_provider_instance(provider)
 
-        plugin = self.provider_plugins.get(provider)
-        if not plugin:
-            return []
-
-        if hasattr(plugin, "get_models_in_quota_group"):
-            models = plugin.get_models_in_quota_group(group)
+        if plugin_instance and hasattr(plugin_instance, "get_models_in_quota_group"):
+            models = plugin_instance.get_models_in_quota_group(group)
             # Add provider prefix
             return [f"{provider}/{m}" for m in models]
 
@@ -244,10 +257,10 @@ class UsageManager:
 
         # Check provider default
         provider = self._get_provider_from_credential(credential)
-        if provider:
-            plugin = self.provider_plugins.get(provider)
-            if plugin and hasattr(plugin, "get_default_usage_field_name"):
-                return plugin.get_default_usage_field_name()
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_default_usage_field_name"):
+            return plugin_instance.get_default_usage_field_name()
 
         return "daily"
 
@@ -1302,10 +1315,10 @@ class UsageManager:
                 )
                 try:
                     provider_name = model.split("/")[0]
-                    provider_plugin = self.provider_plugins.get(provider_name)
+                    provider_instance = self._get_provider_instance(provider_name)
 
-                    if provider_plugin and getattr(
-                        provider_plugin, "skip_cost_calculation", False
+                    if provider_instance and getattr(
+                        provider_instance, "skip_cost_calculation", False
                     ):
                         lib_logger.debug(
                             f"Skipping cost calculation for provider '{provider_name}' (custom provider)."
