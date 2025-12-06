@@ -177,11 +177,6 @@ jobs:
           echo "$pr_json" > pr_json.txt
           echo "$discussion_data" > discussion_data.txt
           
-          # For checkout step
-          repo_full_name=$(echo "$pr_json" | jq -r '.headRepository.nameWithOwner // "${{ github.repository }}"')
-          echo "repo_full_name=$repo_full_name" >> $GITHUB_OUTPUT
-          echo "ref_name=$(echo "$pr_json" | jq -r .headRefName)" >> $GITHUB_OUTPUT
-
           # Prepare metadata
           author=$(echo "$pr_json" | jq -r .author.login)
           created_at=$(echo "$pr_json" | jq -r .createdAt)
@@ -474,8 +469,7 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.pr_meta.outputs.repo_full_name }}
-          ref: ${{ steps.pr_meta.outputs.ref_name }}
+          ref: ${{ env.PR_HEAD_SHA }}
           token: ${{ steps.setup.outputs.token }}
           fetch-depth: 0  # Full history needed for diff generation
 

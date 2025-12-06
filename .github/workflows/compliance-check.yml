@@ -1,0 +1,589 @@
+# ============================================================================
+# COMPLIANCE CHECK WORKFLOW
+# ============================================================================
+# Purpose: AI-powered compliance agent that verifies PRs are ready for merge
+#          by checking file group consistency, documentation updates, and
+#          enforcing project-specific merge requirements.
+#
+# Triggers:
+#   - AUTOMATICALLY after PR Review completes (for events that trigger both)
+#   - PR labeled with 'ready-for-merge'
+#   - PR marked ready for review
+#   - Comment with '/mirrobot-check' or '/mirrobot_check'
+#   - Manual workflow dispatch
+#
+# Workflow Dependency:
+#   - When triggered by ready_for_review, waits for PR Review to complete
+#   - When triggered independently (labels, comments), runs immediately
+#   - Ensures sequential execution only when both workflows trigger together
+#
+# Security Model:
+#   - Uses pull_request_target to run from base branch (trusted code)
+#   - Saves prompt from base branch BEFORE checking out PR code
+#   - Prevents prompt injection attacks from malicious PRs
+#
+# AI Behavior:
+#   - Multiple-turn analysis (one file/issue per turn)
+#   - Detailed issue descriptions for future self-analysis
+#   - Posts findings as PR comment and updates status checks
+# ============================================================================
+
+name: Compliance Check
+
+# Prevent concurrent runs for the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}
+  cancel-in-progress: false
+
+on:
+  # AUTOMATIC: Run after PR Review workflow completes
+  # This handles cases where both workflows would trigger together
+  # (e.g., ready_for_review, opened, synchronize)
+  workflow_run:
+    workflows: ["PR Review"]
+    types: [completed]
+  
+  # SECURITY: Use pull_request_target (not pull_request) to run workflow from base branch
+  # This prevents malicious PRs from modifying the workflow or prompt files
+  # Note: ready_for_review removed - handled by workflow_run to ensure sequential execution
+  pull_request_target:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check'
+        required: true
+        type: string
+
+jobs:
+  compliance-check:
+    # Run when:
+    # 1. Manual trigger via workflow_dispatch
+    # 2. PR marked ready for review or labeled 'ready-for-merge'
+    # 3. Comment contains '/mirrobot-check' or '/mirrobot_check'
+    # Note: ready_for_review will wait for PR Review to complete (see step below)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && 
+       (github.event.action == 'ready_for_review' ||
+        (github.event.action == 'labeled' && contains(github.event.label.name, 'ready-for-merge')))) ||
+      (github.event_name == 'issue_comment' && 
+       github.event.issue.pull_request && 
+       (contains(github.event.comment.body, '/mirrobot-check') || 
+        contains(github.event.comment.body, '/mirrobot_check')))
+    runs-on: ubuntu-latest
+    
+    # Minimal permissions following principle of least privilege
+    permissions:
+      contents: read          # Read repository files
+      pull-requests: write    # Post comments and reviews
+      statuses: write         # Update commit status checks
+      issues: write           # Post issue comments
+
+    env:
+      # -----------------------------------------------------------------------
+      # BASIC CONFIGURATION
+      # -----------------------------------------------------------------------
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      
+      # -----------------------------------------------------------------------
+      # FEATURE TOGGLES
+      # -----------------------------------------------------------------------
+      # ENABLE_REVIEWER_MENTIONS: Prepend @mentions to compliance report
+      # Set to 'true' to notify reviewers, 'false' to disable
+      ENABLE_REVIEWER_MENTIONS: 'false'
+      
+      # -----------------------------------------------------------------------
+      # FILE GROUPS CONFIGURATION
+      # -----------------------------------------------------------------------
+      # Define file groups that the AI should check for consistency.
+      # Each group has:
+      #   - name: Display name for the group
+      #   - description: What to verify when files in this group change
+      #   - files: List of file patterns (supports globs like docs/**/*.md)
+      #
+      # To add a new group, append to the JSON array below.
+      # The AI will check if changes to one file in a group require updates
+      # to other files in the same group (e.g., code + tests, manifest + lockfile)
+      FILE_GROUPS_JSON: |
+        [
+          {
+            "name": "GitHub Workflows",
+            "description": "When code changes affect the build or CI process, verify build.yml is updated with new steps, jobs, or release configurations. Check that code changes are reflected in build matrix, deploy steps, and CI/CD pipeline.",
+            "files": [
+              ".github/workflows/build.yml",
+              ".github/workflows/cleanup.yml"
+            ]
+          },
+          {
+            "name": "Documentation",
+            "description": "Ensure README.md and DOCUMENTATION.md reflect code changes. For new features (providers, configuration options, CLI changes), verify feature documentation exists in both files. For API endpoint changes, check that DOCUMENTATION.md is updated. The 'Deployment guide.md' should be updated for deployment-related changes.",
+            "files": [
+              "README.md",
+              "DOCUMENTATION.md",
+              "Deployment guide.md",
+              "src/rotator_library/README.md"
+            ]
+          },
+          {
+            "name": "Python Dependencies",
+            "description": "When requirements.txt changes, ensure all new dependencies are properly listed. When pyproject.toml in src/rotator_library changes, verify it's consistent with requirements.txt. No lockfile is required for this project, but verify dependency versions are compatible.",
+            "files": [
+              "requirements.txt",
+              "src/rotator_library/pyproject.toml"
+            ]
+          },
+          {
+            "name": "Provider Configuration",
+            "description": "When adding or modifying LLM providers in src/rotator_library/providers/, ensure the provider is documented in DOCUMENTATION.md and README.md. New providers should have corresponding model definitions in model_definitions.py if needed.",
+            "files": [
+              "src/rotator_library/providers/**/*.py",
+              "src/rotator_library/model_definitions.py",
+              "src/rotator_library/provider_factory.py"
+            ]
+          },
+          {
+            "name": "Proxy Application",
+            "description": "Changes to proxy_app endpoints, TUI launcher, or settings should be reflected in documentation. New CLI arguments should be documented in README.md Quick Start section.",
+            "files": [
+              "src/proxy_app/main.py",
+              "src/proxy_app/launcher_tui.py",
+              "src/proxy_app/settings_tool.py",
+              "src/proxy_app/batch_manager.py",
+              "src/proxy_app/detailed_logger.py"
+            ]
+          }
+        ]
+
+    steps:
+      # ======================================================================
+      # PHASE 1: SECURE SETUP
+      # ======================================================================
+      # SECURITY: Checkout base branch first to access trusted prompt file.
+      # This prevents malicious PRs from injecting code into the AI prompt.
+      - name: Checkout base branch (for trusted prompt)
+        uses: actions/checkout@v4
+
+      # Initialize bot credentials and OpenCode API access
+      - name: Bot Setup
+        id: setup
+        uses: ./.github/actions/bot-setup
+        with:
+          bot-app-id: ${{ secrets.BOT_APP_ID }}
+          bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          opencode-model: ${{ secrets.OPENCODE_MODEL }}
+          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
+          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+      # ======================================================================
+      # CONDITIONAL WAIT: Wait for PR Review to Complete
+      # ======================================================================
+      # Only wait when triggered by ready_for_review event
+      # This ensures sequential execution: PR Review → Compliance Check
+      # For other triggers (labels, comments), skip and proceed immediately
+      - name: Wait for PR Review Workflow (if triggered by ready_for_review)
+        if: github.event.action == 'ready_for_review'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          echo "Triggered by ready_for_review - waiting for PR Review to complete..."
+          
+          # Wait up to 30 minutes (180 checks * 10 seconds)
+          MAX_ATTEMPTS=180
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            # Get latest PR Review workflow run for this PR
+            REVIEW_STATUS=$(gh run list \
+              --repo ${{ github.repository }} \
+              --workflow "PR Review" \
+              --json status,conclusion,headSha \
+              --jq "[.[] | select(.headSha == \"${{ github.event.pull_request.head.sha }}\")][0] | {status, conclusion}")
+            
+            STATUS=$(echo "$REVIEW_STATUS" | jq -r '.status // "not_found"')
+            CONCLUSION=$(echo "$REVIEW_STATUS" | jq -r '.conclusion // ""')
+            
+            echo "Attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS: PR Review status=$STATUS, conclusion=$CONCLUSION"
+            
+            if [ "$STATUS" == "completed" ]; then
+              echo "✅ PR Review completed with conclusion: $CONCLUSION"
+              break
+            elif [ "$STATUS" == "not_found" ]; then
+              echo "⚠️  No PR Review workflow run found yet, waiting..."
+            else
+              echo "⏳ PR Review still running ($STATUS), waiting..."
+            fi
+            
+            sleep 10
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "::warning::Timed out waiting for PR Review workflow (waited 30 minutes)"
+            echo "Proceeding with compliance check anyway..."
+          fi
+
+
+      # ======================================================================
+      # PHASE 2: GATHER PR CONTEXT
+      # ======================================================================
+      # Fetch PR metadata: title, author, files changed, labels, reviewers
+      - name: Get PR Metadata
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json author,title,body,headRefOid,files,labels,reviewRequests)
+          
+          echo "head_sha=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_OUTPUT
+          echo "pr_title=$(echo "$pr_json" | jq -r .title)" >> $GITHUB_OUTPUT
+          
+          # Extract author to shell variable first (can't self-reference step outputs)
+          pr_author=$(echo "$pr_json" | jq -r .author.login)
+          echo "pr_author=$pr_author" >> $GITHUB_OUTPUT
+          
+          pr_body=$(echo "$pr_json" | jq -r '.body // ""')
+          echo "pr_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$pr_body" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Changed files as space-separated list
+          changed_files=$(echo "$pr_json" | jq -r '.files[] | .path' | tr '\n' ' ')
+          echo "changed_files=$changed_files" >> $GITHUB_OUTPUT
+          
+          # Changed files as JSON array
+          files_json=$(echo "$pr_json" | jq -c '[.files[] | .path]')
+          echo "files_json=$files_json" >> $GITHUB_OUTPUT
+          
+          # Labels as JSON array
+          labels_json=$(echo "$pr_json" | jq -c '[.labels[] | .name]')
+          echo "labels_json=$labels_json" >> $GITHUB_OUTPUT
+          
+          # Requested reviewers for mentions
+          reviewers=$(echo "$pr_json" | jq -r '.reviewRequests[]? | .login' | tr '\n' ' ')
+          mentions="@$pr_author"
+          if [ -n "$reviewers" ]; then
+            for reviewer in $reviewers; do
+              mentions="$mentions @$reviewer"
+            done
+          fi
+          echo "reviewer_mentions=$reviewers" >> $GITHUB_OUTPUT
+          echo "all_mentions=$mentions" >> $GITHUB_OUTPUT
+
+      # Retrieve previous compliance check results for this PR
+      # This allows the AI to track previously identified issues
+      - name: Fetch Previous Compliance Reviews
+        id: prev_reviews
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+        run: |
+          # Find previous compliance review comments by this bot
+          reviews=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(
+                (.user.login as $u | $bots | index($u)) and
+                (.body | contains("<!-- compliance-check-id:"))
+              ))
+              | map(
+                  # Extract commit SHA from marker
+                  (.body | capture("<!-- compliance-check-id: [0-9]+-(?<sha>[a-f0-9]+) -->") | .sha) as $commit_sha |
+                  "## Previous Compliance Review\n" +
+                  "**Date**: " + .created_at + "\n" +
+                  "**Commit**: " + $commit_sha + "\n\n" +
+                  .body
+                )
+              | join("\n\n---\n\n")
+            ')
+          
+          if [ -n "$reviews" ]; then
+            echo "PREVIOUS_REVIEWS<<EOF" >> $GITHUB_OUTPUT
+            echo "$reviews" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "PREVIOUS_REVIEWS=" >> $GITHUB_OUTPUT
+          fi
+
+      # ======================================================================
+      # PHASE 3: SECURITY CHECKPOINT
+      # ======================================================================
+      # CRITICAL: Save the trusted prompt from base branch to /tmp BEFORE
+      # checking out PR code. This prevents prompt injection attacks.
+      - name: Save secure prompt from base branch
+        run: cp .github/prompts/compliance-check.md /tmp/compliance-check.md
+
+      # NOW it's safe to checkout the PR code (untrusted)
+      # The prompt is already secured in /tmp
+      - name: Checkout PR Head for Diff Generation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr_info.outputs.head_sha }}
+          fetch-depth: 0  # Full history needed for diff
+
+      # Generate a unified diff of all PR changes for the AI to analyze
+      # The diff is saved to a file for efficient context usage
+      - name: Generate PR Diff
+        id: diff
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
+          
+          # Get base branch from PR
+          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json baseRefName)
+          BASE_BRANCH=$(echo "$pr_json" | jq -r .baseRefName)
+          CURRENT_SHA="${{ steps.pr_info.outputs.head_sha }}"
+          
+          echo "Generating PR diff against base branch: $BASE_BRANCH"
+          
+          # Fetch base branch
+          if git fetch origin "$BASE_BRANCH":refs/remotes/origin/"$BASE_BRANCH" 2>/dev/null; then
+            echo "Successfully fetched base branch $BASE_BRANCH"
+            
+            # Find merge base
+            if MERGE_BASE=$(git merge-base origin/"$BASE_BRANCH" "$CURRENT_SHA" 2>/dev/null); then
+              echo "Found merge base: $MERGE_BASE"
+              
+              # Generate diff
+              if DIFF_CONTENT=$(git diff --patch "$MERGE_BASE".."$CURRENT_SHA" 2>/dev/null); then
+                DIFF_SIZE=${#DIFF_CONTENT}
+                DIFF_LINES=$(echo "$DIFF_CONTENT" | wc -l)
+                echo "Generated PR diff: $DIFF_LINES lines, $DIFF_SIZE characters"
+                
+                # Truncate if too large (500KB limit)
+                if [ $DIFF_SIZE -gt 500000 ]; then
+                  echo "::warning::PR diff is very large ($DIFF_SIZE chars). Truncating to 500KB."
+                  TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - PR is very large. Showing first 500KB only.]'
+                  DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
+                fi
+                
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+              else
+                echo "::warning::Could not generate diff. Using changed files list only."
+                echo "(Diff generation failed. Please refer to the changed files list.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "::warning::Could not find merge base."
+              echo "(No common ancestor found.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+              echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::warning::Could not fetch base branch."
+            echo "(Base branch not available for diff.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+            echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+
+      # ======================================================================
+      # PHASE 4: PREPARE AI CONTEXT
+      # ======================================================================
+      # Convert FILE_GROUPS_JSON to human-readable format for AI prompt
+      - name: Format File Groups for Prompt
+        id: file_groups
+        run: |
+          # Convert JSON config to human-readable format for the AI
+          echo "FILE GROUPS FOR COMPLIANCE CHECKING:" > /tmp/file_groups.txt
+          echo "" >> /tmp/file_groups.txt
+          
+          # Parse JSON and format for prompt
+          echo "$FILE_GROUPS_JSON" | jq -r '.[] |
+            "Group: \(.name)\n" +
+            "Description: \(.description)\n" +
+            "Files:\n" +
+            (.files | map("  - \(.)") | join("\n")) +
+            "\n"
+          ' >> /tmp/file_groups.txt
+          
+          echo "FILE_GROUPS_PATH=/tmp/file_groups.txt" >> $GITHUB_OUTPUT
+
+      # Create template structure for the compliance report
+      # AI will fill in the analysis sections
+      - name: Generate Report Template
+        id: template
+        run: |
+          cat > /tmp/report_template.md <<'TEMPLATE'
+          ## 🔍 Compliance Check Results
+
+          ### Status: [TO_BE_DETERMINED]
+
+          **PR**: #${{ env.PR_NUMBER }} - ${{ steps.pr_info.outputs.pr_title }}
+          **Author**: @${{ steps.pr_info.outputs.pr_author }}
+          **Commit**: ${{ steps.pr_info.outputs.head_sha }}
+          **Checked**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          ---
+
+          ### 📊 Summary
+          [AI to complete: Brief overview of analysis]
+
+          ---
+
+          ### 📁 File Groups Analyzed
+          [AI to complete: Fill in analysis for each affected group]
+
+          ---
+
+          ### 🎯 Overall Assessment
+          [AI to complete: Holistic compliance state]
+
+          ### 📝 Next Steps  
+          [AI to complete: Actionable guidance]
+
+          ---
+          _Compliance verification by AI agent • Re-run with `/mirrobot-check`_
+          <!-- compliance-check-id: ${{ env.PR_NUMBER }}-${{ steps.pr_info.outputs.head_sha }} -->
+          TEMPLATE
+
+          echo "TEMPLATE_PATH=/tmp/report_template.md" >> $GITHUB_OUTPUT
+
+      # ======================================================================
+      # PHASE 5: AI ANALYSIS
+      # ======================================================================
+      # Substitute environment variables into the prompt template
+      # Uses the TRUSTED prompt from /tmp (not from PR code)
+      - name: Assemble Compliance Prompt
+        env:
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
+          PR_BODY: ${{ steps.pr_info.outputs.pr_body }}
+          PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+          CHANGED_FILES: ${{ steps.pr_info.outputs.changed_files }}
+          CHANGED_FILES_JSON: ${{ steps.pr_info.outputs.files_json }}
+          PR_LABELS: ${{ steps.pr_info.outputs.labels_json }}
+          PREVIOUS_REVIEWS: ${{ steps.prev_reviews.outputs.PREVIOUS_REVIEWS }}
+          FILE_GROUPS: ${{ steps.file_groups.outputs.FILE_GROUPS_PATH }}
+          REPORT_TEMPLATE: ${{ steps.template.outputs.TEMPLATE_PATH }}
+          DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}'
+          envsubst "$VARS" < /tmp/compliance-check.md > "$TMP_DIR/assembled_prompt.txt"
+
+      # Execute the AI compliance check
+      # The AI will analyze the PR using multiple turns (5-20+ expected)
+      # and post its findings as a comment + status check
+      - name: Run Compliance Check with OpenCode
+        env:
+          GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
+          OPENCODE_PERMISSION: |
+            {
+              "bash": {
+                "gh*": "allow",
+                "git*": "allow",
+                "jq*": "allow",
+                "cat*": "allow"
+              },
+              "external_directory": "allow",
+              "webfetch": "deny"
+            }
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
+
+      # ======================================================================
+      # PHASE 6: POST-PROCESSING (OPTIONAL)
+      # ======================================================================
+      # If enabled, prepend @reviewer mentions to the compliance report
+      # This is controlled by ENABLE_REVIEWER_MENTIONS at the top
+      - name: Prepend Reviewer Mentions to Posted Comment
+        if: always() && env.ENABLE_REVIEWER_MENTIONS == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+          REVIEWER_MENTIONS: ${{ steps.pr_info.outputs.reviewer_mentions }}
+          PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
+        run: |
+          sleep 3  # Wait for comment to be posted
+          
+          # Find the compliance comment just posted by the bot
+          latest_comment=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(.user.login as $u | $bots | index($u)))
+              | sort_by(.created_at)
+              | last
+              | {id: .id, body: .body}
+            ')
+          
+          comment_id=$(echo "$latest_comment" | jq -r .id)
+          current_body=$(echo "$latest_comment" | jq -r .body)
+          
+          # Build reviewer mentions (excluding author since already in template)
+          reviewer_mentions=""
+          if [ -n "$REVIEWER_MENTIONS" ]; then
+            for reviewer in $REVIEWER_MENTIONS; do
+              if [ "$reviewer" != "$PR_AUTHOR" ]; then
+                reviewer_mentions="$reviewer_mentions @$reviewer"
+              fi
+            done
+          fi
+          
+          # Prepend reviewer mentions if any exist
+          if [ -n "$reviewer_mentions" ]; then
+            new_body="$reviewer_mentions
+
+          $current_body"
+            gh api --method PATCH "/repos/${{ github.repository }}/issues/comments/$comment_id" \
+              -f body="$new_body"
+            echo "✓ Prepended reviewer mentions: $reviewer_mentions"
+          else
+            echo "No additional reviewers to mention"
+          fi
+
+      - name: Verify Compliance Review Footers
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+        run: |
+          set -e
+          sleep 5  # Wait for API consistency
+          
+          echo "Verifying latest compliance review for required footers..."
+          
+          # Find latest bot comment with compliance marker
+          latest_comment=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(.user.login as $u | $bots | index($u)))
+              | sort_by(.created_at)
+              | last
+              | {id: .id, body: .body}
+            ')
+          
+          comment_id=$(echo "$latest_comment" | jq -r .id)
+          current_body=$(echo "$latest_comment" | jq -r .body)
+          
+          EXPECTED_SIGNATURE="_Compliance verification by AI agent"
+          EXPECTED_MARKER="<!-- compliance-check-id: ${{ env.PR_NUMBER }}-${{ steps.pr_info.outputs.head_sha }} -->"
+          
+          needs_fix=false
+          
+          if [[ "$current_body" != *"$EXPECTED_SIGNATURE"* ]]; then
+            echo "::warning::Missing compliance signature footer."
+            needs_fix=true
+          fi
+          
+          if [[ "$current_body" != *"compliance-check-id:"* ]]; then
+            echo "::warning::Missing compliance-check-id marker."
+            needs_fix=true
+          fi
+          
+          if [ "$needs_fix" = true ]; then
+            echo "::error::Compliance review missing required footers."
+            exit 1
+          else
+            echo "✓ Verification passed!"
+          fi

@@ -677,8 +677,8 @@ class UsageManager:
             # Calculate cooldown duration based on error type
             cooldown_seconds = None
 
-            if classified_error.error_type == "rate_limit":
-                # Rate limit errors: use retry_after if available, otherwise default to 60s
+            if classified_error.error_type in ["rate_limit", "quota_exceeded"]:
+                # Rate limit / Quota errors: use retry_after if available, otherwise default to 60s
                 cooldown_seconds = classified_error.retry_after or 60
                 lib_logger.info(
                     f"Rate limit error on key {mask_credential(key)} for model {model}. "
