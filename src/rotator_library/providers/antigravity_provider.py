@@ -540,7 +540,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     model_quota_groups: QuotaGroupMap = {
-        # "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+        # "claude": ["claude-sonnet-4-5", "claude-opus-4-5"], - commented out for later use if needed
     }
 
     @staticmethod

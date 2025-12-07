@@ -202,10 +202,10 @@ class RotationModeManager:
         # Import here to avoid circular imports
         try:
             from rotator_library.providers.provider_interface import (
-                LLMProviderInterface,
+                ProviderInterface,
             )
 
-            return LLMProviderInterface.get_rotation_mode(provider)
+            return ProviderInterface.get_rotation_mode(provider)
         except ImportError:
             # Fallback defaults if import fails
             if provider.lower() == "antigravity":
