@@ -297,6 +297,69 @@ class UsageManager:
                 .get("success_count", 0)
             )
 
+    # =========================================================================
+    # TIMESTAMP FORMATTING HELPERS
+    # =========================================================================
+
+    def _format_timestamp_local(self, ts: Optional[float]) -> Optional[str]:
+        """
+        Format Unix timestamp as local time string with timezone offset.
+
+        Args:
+            ts: Unix timestamp or None
+
+        Returns:
+            Formatted string like "2025-12-07 14:30:17 +0100" or None
+        """
+        if ts is None:
+            return None
+        try:
+            dt = datetime.fromtimestamp(ts).astimezone()  # Local timezone
+            # Use UTC offset for conciseness (works on all platforms)
+            return dt.strftime("%Y-%m-%d %H:%M:%S %z")
+        except (OSError, ValueError, OverflowError):
+            return None
+
+    def _add_readable_timestamps(self, data: Dict) -> Dict:
+        """
+        Add human-readable timestamp fields to usage data before saving.
+
+        Adds 'window_started' and 'quota_resets' fields derived from
+        Unix timestamps for easier debugging and monitoring.
+
+        Args:
+            data: The usage data dict to enhance
+
+        Returns:
+            The same dict with readable timestamp fields added
+        """
+        for key, key_data in data.items():
+            # Handle per-model structure
+            models = key_data.get("models", {})
+            for model_name, model_stats in models.items():
+                if not isinstance(model_stats, dict):
+                    continue
+
+                # Add readable window start time
+                window_start = model_stats.get("window_start_ts")
+                if window_start:
+                    model_stats["window_started"] = self._format_timestamp_local(
+                        window_start
+                    )
+                elif "window_started" in model_stats:
+                    del model_stats["window_started"]
+
+                # Add readable reset time
+                quota_reset = model_stats.get("quota_reset_ts")
+                if quota_reset:
+                    model_stats["quota_resets"] = self._format_timestamp_local(
+                        quota_reset
+                    )
+                elif "quota_resets" in model_stats:
+                    del model_stats["quota_resets"]
+
+        return data
+
     def _select_sequential(
         self,
         candidates: List[Tuple[str, int]],
@@ -377,6 +440,8 @@ class UsageManager:
         if self._usage_data is None:
             return
         async with self._data_lock:
+            # Add human-readable timestamp fields before saving
+            self._add_readable_timestamps(self._usage_data)
             async with aiofiles.open(self.file_path, "w") as f:
                 await f.write(json.dumps(self._usage_data, indent=2))
 
@@ -1251,11 +1316,15 @@ class UsageManager:
                 # Start window on first request for this model
                 if model_data.get("window_start_ts") is None:
                     model_data["window_start_ts"] = now_ts
-                    window_hours = (
-                        reset_config.get("window_seconds", 0) / 3600
-                        if reset_config
-                        else 0
+
+                    # Set expected quota reset time from provider config
+                    window_seconds = (
+                        reset_config.get("window_seconds", 0) if reset_config else 0
                     )
+                    if window_seconds > 0:
+                        model_data["quota_reset_ts"] = now_ts + window_seconds
+
+                    window_hours = window_seconds / 3600 if window_seconds else 0
                     lib_logger.info(
                         f"Started {window_hours:.1f}h window for model {model} on {mask_credential(key)}"
                     )
