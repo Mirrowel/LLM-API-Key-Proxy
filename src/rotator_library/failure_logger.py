@@ -194,6 +194,8 @@ def log_failure(
     try:
         failure_logger.error(detailed_log_data)
     except (OSError, IOError) as e:
+        global _fallback_mode
+        _fallback_mode = True
         # File logging failed - log to console instead
         logging.error(f"Failed to write to failures.log: {e}")
         logging.error(f"Failure summary: {summary_message}")

@@ -72,6 +72,9 @@ class UsageManager:
 
         self._timeout_lock = asyncio.Lock()
         self._claimed_on_timeout: Set[str] = set()
+        
+        # Circuit breaker for disk write failures
+        self._disk_available = True
 
         if daily_reset_time_utc:
             hour, minute = map(int, daily_reset_time_utc.split(":"))
@@ -113,6 +116,9 @@ class UsageManager:
             except (OSError, PermissionError, IOError) as e:
                 lib_logger.warning(f"Cannot read usage file {self.file_path}: {e}. Using empty state.")
                 self._usage_data = {}
+            else:
+                # [CIRCUIT BREAKER RESET] Successfully loaded, re-enable disk writes
+                self._disk_available = True
 
     async def _save_usage(self):
         """Saves the current usage data to the JSON file asynchronously with resilience.
@@ -123,6 +129,9 @@ class UsageManager:
         """
         if self._usage_data is None:
             return
+        
+        if not self._disk_available:
+            return  # Skip disk write when unavailable
 
         try:
             async with self._data_lock:
@@ -134,6 +143,8 @@ class UsageManager:
                 async with aiofiles.open(self.file_path, "w") as f:
                     await f.write(json.dumps(self._usage_data, indent=2))
         except (OSError, PermissionError, IOError) as e:
+            # [CIRCUIT BREAKER] Disable disk writes to prevent repeated failures
+            self._disk_available = False
             # [FAIL SILENTLY, LOG LOUDLY] Log the error but don't crash
             # In-memory state is preserved and will continue to work
             lib_logger.warning(
