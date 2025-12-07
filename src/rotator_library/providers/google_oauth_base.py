@@ -85,9 +85,12 @@ class GoogleOAuthBase:
         # [QUEUE SYSTEM] Sequential refresh processing
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queued_credentials: set = set()  # Track credentials already in queue
-        self._unavailable_credentials: set = (
-            set()
-        )  # Mark credentials unavailable during re-auth
+        # [FIX 4] Changed from set to dict mapping credential path to timestamp
+        # This enables TTL-based stale entry cleanup as defense in depth
+        self._unavailable_credentials: Dict[str, float] = (
+            {}
+        )  # Maps credential path -> timestamp when marked unavailable
+        self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = (
             None  # Background worker task
@@ -526,8 +529,33 @@ class GoogleOAuthBase:
             return self._refresh_locks[path]
 
     def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not queued/refreshing)."""
-        return path not in self._unavailable_credentials
+        """Check if a credential is available for rotation (not queued/refreshing).
+        
+        [FIX 4] Now includes TTL-based stale entry cleanup as defense in depth.
+        If a credential has been unavailable for longer than _unavailable_ttl_seconds,
+        it is automatically cleaned up and considered available.
+        """
+        if path not in self._unavailable_credentials:
+            return True
+        
+        # [FIX 4] Check if the entry is stale (TTL expired)
+        marked_time = self._unavailable_credentials.get(path)
+        if marked_time is not None:
+            now = time.time()
+            if now - marked_time > self._unavailable_ttl_seconds:
+                # Entry is stale - clean it up and return available
+                lib_logger.warning(
+                    f"Credential '{Path(path).name}' was stuck in unavailable state for "
+                    f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
+                    f"Auto-cleaning stale entry."
+                )
+                # Note: This is a sync method, so we can't use async lock here.
+                # However, discard from dict is thread-safe for single operations.
+                # The _queue_tracking_lock protects concurrent modifications in async context.
+                self._unavailable_credentials.pop(path, None)
+                return True
+        
+        return False
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -563,7 +591,12 @@ class GoogleOAuthBase:
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                self._unavailable_credentials.add(path)  # Mark as unavailable
+                # [FIX 4] Store timestamp when marking unavailable (for TTL cleanup)
+                self._unavailable_credentials[path] = time.time()
+                lib_logger.debug(
+                    f"Marked '{Path(path).name}' as unavailable. "
+                    f"Total unavailable: {len(self._unavailable_credentials)}"
+                )
                 await self._refresh_queue.put((path, force, needs_reauth))
                 await self._ensure_queue_processor_running()
 
@@ -578,7 +611,16 @@ class GoogleOAuthBase:
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # No items for 60s, exit to save resources
+                    # [FIX 2] Clean up any stale unavailable entries before exiting
+                    # If we're idle for 60s, no refreshes are in progress
+                    async with self._queue_tracking_lock:
+                        if self._unavailable_credentials:
+                            stale_count = len(self._unavailable_credentials)
+                            lib_logger.warning(
+                                f"Queue processor idle timeout. Cleaning {stale_count} "
+                                f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
+                            )
+                            self._unavailable_credentials.clear()
                     self._queue_processor_task = None
                     return
 
@@ -590,7 +632,11 @@ class GoogleOAuthBase:
                         if creds and not self._is_token_expired(creds):
                             # No longer expired, mark as available
                             async with self._queue_tracking_lock:
-                                self._unavailable_credentials.discard(path)
+                                self._unavailable_credentials.pop(path, None)
+                                lib_logger.debug(
+                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
+                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                                )
                             continue
 
                         # Perform refresh
@@ -600,21 +646,44 @@ class GoogleOAuthBase:
 
                         # SUCCESS: Mark as available again
                         async with self._queue_tracking_lock:
-                            self._unavailable_credentials.discard(path)
+                            self._unavailable_credentials.pop(path, None)
+                            lib_logger.debug(
+                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                            )
 
                 finally:
-                    # Remove from queued set
+                    # [FIX 1] Remove from BOTH queued set AND unavailable credentials
+                    # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
+                        # [FIX 1] Always clean up unavailable credentials in finally block
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Finally cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                     self._refresh_queue.task_done()
             except asyncio.CancelledError:
+                # [FIX 3] Clean up the current credential before breaking
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"CancelledError cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                 break
             except Exception as e:
                 lib_logger.error(f"Error in queue processor: {e}")
                 # Even on error, mark as available (backoff will prevent immediate retry)
                 if path:
                     async with self._queue_tracking_lock:
-                        self._unavailable_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Error cleanup for '{Path(path).name}': {e}. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
 
     async def initialize_token(
         self, creds_or_path: Union[Dict[str, Any], str]
