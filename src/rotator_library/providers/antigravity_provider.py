@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
@@ -497,6 +497,52 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     # Sequential mode by default - preserves thinking signature caches between requests
     default_rotation_mode: str = "sequential"
 
+    # =========================================================================
+    # TIER & USAGE CONFIGURATION
+    # =========================================================================
+
+    # Provider name for env var lookups (QUOTA_GROUPS_ANTIGRAVITY_*)
+    provider_env_name: str = "antigravity"
+
+    # Tier name -> priority mapping (Single Source of Truth)
+    # Lower numbers = higher priority
+    tier_priorities = {
+        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
+        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
+        # Priority 2: Standard paid tier
+        "standard-tier": 2,
+        # Priority 3: Free tier
+        "free-tier": 3,
+        # Priority 10: Legacy/Unknown (lowest)
+        "legacy-tier": 10,
+        "unknown": 10,
+    }
+
+    # Default priority for tiers not in the mapping
+    default_tier_priority: int = 10
+
+    # Usage reset configs keyed by priority sets
+    # Priorities 1-2 (paid tiers) get 5h window, others get 7d window
+    usage_reset_configs = {
+        frozenset({1, 2}): UsageResetConfigDef(
+            window_seconds=5 * 60 * 60,  # 5 hours
+            mode="per_model",
+            description="5-hour per-model window (paid tier)",
+            field_name="models",
+        ),
+        "default": UsageResetConfigDef(
+            window_seconds=7 * 24 * 60 * 60,  # 7 days
+            mode="per_model",
+            description="7-day per-model window (free/unknown tier)",
+            field_name="models",
+        ),
+    }
+
+    # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
+    model_quota_groups: QuotaGroupMap = {
+        # "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+    }
+
     @staticmethod
     def parse_quota_error(
         error: Exception, error_body: Optional[str] = None
@@ -733,43 +779,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
         )
 
-    # =========================================================================
-    # CREDENTIAL PRIORITIZATION
-    # =========================================================================
-
-    def get_credential_priority(self, credential: str) -> Optional[int]:
-        """
-        Returns priority based on Antigravity tier.
-        Paid tiers: priority 1 (highest)
-        Free tier: priority 2
-        Legacy/Unknown: priority 10 (lowest)
-
-        Args:
-            credential: The credential path
-
-        Returns:
-            Priority level (1-10) or None if tier not yet discovered
-        """
-        tier = self.project_tier_cache.get(credential)
-
-        # Lazy load from file if not in cache
-        if not tier:
-            tier = self._load_tier_from_file(credential)
-
-        if not tier:
-            return None  # Not yet discovered
-
-        # Paid tiers get highest priority
-        if tier not in ["free-tier", "legacy-tier", "unknown"]:
-            return 1
-
-        # Free tier gets lower priority
-        if tier == "free-tier":
-            return 2
-
-        # Legacy and unknown get even lower
-        return 10
-
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
         """
         Load tier from credential file's _proxy_metadata and cache it.
@@ -836,105 +845,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             None - no restrictions for any model
         """
         return None
-
-    def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
-        """
-        Get Antigravity-specific usage tracking configuration based on credential tier.
-
-        Antigravity uses per-model windows with different durations by tier:
-        - Paid tiers (priority 1): 5-hour per-model window
-        - Free tier (priority 2): 7-day per-model window
-        - Unknown/legacy: 7-day per-model window (conservative default)
-
-        When a model hits a quota_exhausted 429 error with exact reset timestamp,
-        that timestamp becomes the authoritative reset time for the model (and its group).
-
-        Args:
-            credential: The credential path
-
-        Returns:
-            Usage reset configuration dict with mode="per_model"
-        """
-        tier = self.project_tier_cache.get(credential)
-        if not tier:
-            tier = self._load_tier_from_file(credential)
-
-        # Paid tiers: 5-hour per-model window
-        if tier and tier not in ["free-tier", "legacy-tier", "unknown"]:
-            return {
-                "window_seconds": 5 * 60 * 60,  # 18000 seconds = 5 hours
-                "mode": "per_model",
-                "priority": 1,
-                "description": "5-hour per-model window (paid tier)",
-            }
-
-        # Free tier: 7-day per-model window
-        if tier == "free-tier":
-            return {
-                "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
-                "mode": "per_model",
-                "priority": 2,
-                "description": "7-day per-model window (free tier)",
-            }
-
-        # Unknown/legacy: use 7-day per-model window as conservative default
-        return {
-            "window_seconds": 7 * 24 * 60 * 60,  # 604800 seconds = 7 days
-            "mode": "per_model",
-            "priority": 10,
-            "description": "7-day per-model window (unknown tier - conservative default)",
-        }
-
-    def get_default_usage_field_name(self) -> str:
-        """
-        Get the default usage tracking field name for Antigravity.
-
-        Returns:
-            "models" for per-model tracking
-        """
-        return "models"
-
-    # =========================================================================
-    # Model Quota Grouping
-    # =========================================================================
-
-    # Models that share quota timing - when one hits quota, all get same reset time
-    QUOTA_GROUPS = {
-        # Future: add claude/gemini groups if they share quota
-    }
-
-    def get_model_quota_group(self, model: str) -> Optional[str]:
-        """
-        Returns the quota group name for a model.
-
-        Claude models (sonnet and opus) share quota on Antigravity.
-        When one hits quota exhausted, all models in the group get the same reset time.
-
-        Args:
-            model: Model name (with or without "antigravity/" prefix)
-
-        Returns:
-            Group name ("claude") or None if not grouped
-        """
-        # Remove provider prefix if present
-        clean_model = model.replace("antigravity/", "")
-
-        for group_name, models in self.QUOTA_GROUPS.items():
-            if clean_model in models:
-                return group_name
-        return None
-
-    def get_models_in_quota_group(self, group: str) -> List[str]:
-        """
-        Returns all model names in a quota group.
-
-        Args:
-            group: Group name (e.g., "claude")
-
-        Returns:
-            List of model names (without provider prefix)
-        """
-        return self.QUOTA_GROUPS.get(group, [])
 
     async def initialize_credentials(self, credential_paths: List[str]) -> None:
         """

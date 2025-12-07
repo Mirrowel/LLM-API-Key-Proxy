@@ -1,8 +1,44 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, AsyncGenerator, Union
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, AsyncGenerator, Union, FrozenSet
 import os
 import httpx
 import litellm
+
+
+# =============================================================================
+# TIER & USAGE CONFIGURATION TYPES
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class UsageResetConfigDef:
+    """
+    Definition for usage reset configuration per tier type.
+
+    Providers define these as class attributes to specify how usage stats
+    should reset based on credential tier (paid vs free).
+
+    Attributes:
+        window_seconds: Duration of the usage tracking window in seconds.
+        mode: Either "credential" (one window per credential) or "per_model"
+              (separate window per model or model group).
+        description: Human-readable description for logging.
+        field_name: The key used in usage data JSON structure.
+                    Typically "models" for per_model mode, "daily" for credential mode.
+    """
+
+    window_seconds: int
+    mode: str  # "credential" or "per_model"
+    description: str
+    field_name: str = "daily"  # Default for backwards compatibility
+
+
+# Type aliases for provider configuration
+TierPriorityMap = Dict[str, int]  # tier_name -> priority
+UsageConfigKey = Union[FrozenSet[int], str]  # frozenset of priorities OR "default"
+UsageConfigMap = Dict[UsageConfigKey, UsageResetConfigDef]  # priority_set -> config
+QuotaGroupMap = Dict[str, List[str]]  # group_name -> [models]
 
 
 class ProviderInterface(ABC):
@@ -17,6 +53,40 @@ class ProviderInterface(ABC):
     # - "balanced": Rotate credentials to distribute load evenly
     # - "sequential": Use one credential until exhausted, then switch to next
     default_rotation_mode: str = "balanced"
+
+    # =========================================================================
+    # TIER CONFIGURATION - Override in subclass
+    # =========================================================================
+
+    # Provider name for env var lookups (e.g., "antigravity", "gemini_cli")
+    # Used for: QUOTA_GROUPS_{provider_env_name}_{GROUP}
+    provider_env_name: str = ""
+
+    # Tier name -> priority mapping (Single Source of Truth)
+    # Lower numbers = higher priority (1 is highest)
+    # Multiple tiers can map to the same priority
+    # Unknown tiers fall back to default_tier_priority
+    tier_priorities: TierPriorityMap = {}
+
+    # Default priority for tiers not in tier_priorities mapping
+    default_tier_priority: int = 10
+
+    # =========================================================================
+    # USAGE RESET CONFIGURATION - Override in subclass
+    # =========================================================================
+
+    # Usage reset configurations keyed by priority sets
+    # Keys: frozenset of priority values (e.g., frozenset({1, 2})) OR "default"
+    # The "default" key is used for any priority not matched by a frozenset
+    usage_reset_configs: UsageConfigMap = {}
+
+    # =========================================================================
+    # MODEL QUOTA GROUPS - Override in subclass
+    # =========================================================================
+
+    # Models that share quota/cooldown timing
+    # Can be overridden via env: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
+    model_quota_groups: QuotaGroupMap = {}
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -87,28 +157,50 @@ class ProviderInterface(ABC):
         pass
 
     # [NEW] Credential Prioritization System
+
+    # =========================================================================
+    # TIER RESOLUTION LOGIC (Centralized)
+    # =========================================================================
+
+    def _resolve_tier_priority(self, tier_name: Optional[str]) -> int:
+        """
+        Resolve priority for a tier name using provider's tier_priorities mapping.
+
+        Args:
+            tier_name: The tier name string (e.g., "free-tier", "standard-tier")
+
+        Returns:
+            Priority level from tier_priorities, or default_tier_priority if
+            tier_name is None or not found in the mapping.
+        """
+        if tier_name is None:
+            return self.default_tier_priority
+        return self.tier_priorities.get(tier_name, self.default_tier_priority)
+
     def get_credential_priority(self, credential: str) -> Optional[int]:
         """
         Returns the priority level for a credential.
         Lower numbers = higher priority (1 is highest).
-        Returns None if provider doesn't use priorities.
+        Returns None if tier not yet discovered.
 
-        This allows providers to auto-detect credential tiers (e.g., paid vs free)
-        and ensure higher-tier credentials are always tried first.
+        Uses the provider's tier_priorities mapping to resolve priority from
+        tier name. Unknown tiers fall back to default_tier_priority.
+
+        Subclasses should:
+        1. Define tier_priorities dict with all known tier names
+        2. Override get_credential_tier_name() for tier lookup
+        Do NOT override this method.
 
         Args:
             credential: The credential identifier (API key or path)
 
         Returns:
-            Priority level (1-10) or None if no priority system
-
-        Example:
-            For Gemini CLI:
-            - Paid tier credentials: priority 1 (highest)
-            - Free tier credentials: priority 2
-            - Unknown tier: priority 10 (lowest)
+            Priority level (1-10) or None if tier not yet discovered
         """
-        return None
+        tier = self.get_credential_tier_name(credential)
+        if tier is None:
+            return None  # Tier not yet discovered
+        return self._resolve_tier_priority(tier)
 
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """
@@ -211,12 +303,76 @@ class ProviderInterface(ABC):
     # Per-Provider Usage Tracking Configuration
     # =========================================================================
 
+    # =========================================================================
+    # USAGE RESET CONFIG LOGIC (Centralized)
+    # =========================================================================
+
+    def _find_usage_config_for_priority(
+        self, priority: int
+    ) -> Optional[UsageResetConfigDef]:
+        """
+        Find usage config that applies to a priority value.
+
+        Checks frozenset keys first (priority must be in the set),
+        then falls back to "default" key if no match found.
+
+        Args:
+            priority: The credential priority level
+
+        Returns:
+            UsageResetConfigDef if found, None otherwise
+        """
+        # First, check frozenset keys for explicit priority match
+        for key, config in self.usage_reset_configs.items():
+            if isinstance(key, frozenset) and priority in key:
+                return config
+
+        # Fall back to "default" key
+        return self.usage_reset_configs.get("default")
+
+    def _build_usage_reset_config(
+        self, tier_name: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build usage reset configuration dict for a tier.
+
+        Resolves tier to priority, then finds matching usage config.
+        Returns None if provider doesn't define usage_reset_configs.
+
+        Args:
+            tier_name: The tier name string
+
+        Returns:
+            Usage config dict with window_seconds, mode, priority, description,
+            field_name, or None if no config applies
+        """
+        if not self.usage_reset_configs:
+            return None
+
+        priority = self._resolve_tier_priority(tier_name)
+        config = self._find_usage_config_for_priority(priority)
+
+        if config is None:
+            return None
+
+        return {
+            "window_seconds": config.window_seconds,
+            "mode": config.mode,
+            "priority": priority,
+            "description": config.description,
+            "field_name": config.field_name,
+        }
+
     def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
         """
         Get provider-specific usage tracking configuration for a credential.
 
-        This allows providers to define custom usage reset windows based on
-        credential tier (e.g., paid vs free accounts with different quota periods).
+        Uses the provider's usage_reset_configs class attribute to build
+        the configuration dict. Priority is auto-derived from tier.
+
+        Subclasses should define usage_reset_configs as a class attribute
+        instead of overriding this method. Only override get_credential_tier_name()
+        to provide the tier lookup mechanism.
 
         The UsageManager will use this configuration to:
         1. Track usage per-model or per-credential based on mode
@@ -231,7 +387,7 @@ class ProviderInterface(ABC):
             {
                 "window_seconds": int,     # Duration in seconds (e.g., 18000 for 5h)
                 "mode": str,               # "credential" or "per_model"
-                "priority": int,           # Priority level this config applies to
+                "priority": int,           # Priority level (auto-derived from tier)
                 "description": str,        # Human-readable description (for logging)
             }
 
@@ -242,25 +398,9 @@ class ProviderInterface(ABC):
               from first request of THAT model. Models reset independently unless
               grouped. If a quota_exhausted error provides exact reset time, that
               becomes the authoritative reset time for the model.
-
-        Examples:
-            Antigravity paid tier (per-model):
-            {
-                "window_seconds": 18000,   # 5 hours
-                "mode": "per_model",
-                "priority": 1,
-                "description": "5-hour per-model window (paid tier)"
-            }
-
-            Default provider (credential-level):
-            {
-                "window_seconds": 86400,   # 24 hours
-                "mode": "credential",
-                "priority": 1,
-                "description": "24-hour credential window"
-            }
         """
-        return None  # Default: use daily reset at daily_reset_time_utc
+        tier = self.get_credential_tier_name(credential)
+        return self._build_usage_reset_config(tier)
 
     def get_default_usage_field_name(self) -> str:
         """
@@ -278,16 +418,68 @@ class ProviderInterface(ABC):
     # Model Quota Grouping
     # =========================================================================
 
+    # =========================================================================
+    # QUOTA GROUPS LOGIC (Centralized)
+    # =========================================================================
+
+    def _get_effective_quota_groups(self) -> QuotaGroupMap:
+        """
+        Get quota groups with .env overrides applied.
+
+        Env format: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
+        Set empty string to disable a default group.
+        """
+        if not self.provider_env_name or not self.model_quota_groups:
+            return self.model_quota_groups
+
+        result: QuotaGroupMap = {}
+
+        for group_name, default_models in self.model_quota_groups.items():
+            env_key = (
+                f"QUOTA_GROUPS_{self.provider_env_name.upper()}_{group_name.upper()}"
+            )
+            env_value = os.getenv(env_key)
+
+            if env_value is not None:
+                # Env override present
+                if env_value.strip():
+                    # Parse comma-separated models
+                    result[group_name] = [
+                        m.strip() for m in env_value.split(",") if m.strip()
+                    ]
+                # Empty string = group disabled, don't add to result
+            else:
+                # Use default
+                result[group_name] = list(default_models)
+
+        return result
+
+    def _find_model_quota_group(self, model: str) -> Optional[str]:
+        """Find which quota group a model belongs to."""
+        groups = self._get_effective_quota_groups()
+        for group_name, models in groups.items():
+            if model in models:
+                return group_name
+        return None
+
+    def _get_quota_group_models(self, group: str) -> List[str]:
+        """Get all models in a quota group."""
+        groups = self._get_effective_quota_groups()
+        return groups.get(group, [])
+
     def get_model_quota_group(self, model: str) -> Optional[str]:
         """
         Returns the quota group name for a model, or None if not grouped.
+
+        Uses the provider's model_quota_groups class attribute with .env overrides
+        via QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2".
 
         Models in the same quota group share cooldown timing - when one model
         hits a quota exhausted error, all models in the group get the same
         reset timestamp. They also reset (archive stats) together.
 
-        This is useful for providers where multiple model variants share the
-        same underlying quota (e.g., Claude Sonnet and Opus on Antigravity).
+        Subclasses should define model_quota_groups as a class attribute
+        instead of overriding this method.
 
         Args:
             model: Model name (with or without provider prefix)
@@ -295,11 +487,15 @@ class ProviderInterface(ABC):
         Returns:
             Group name string (e.g., "claude") or None if model is not grouped
         """
-        return None
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+        return self._find_model_quota_group(clean_model)
 
     def get_models_in_quota_group(self, group: str) -> List[str]:
         """
         Returns all model names that belong to a quota group.
+
+        Uses the provider's model_quota_groups class attribute with .env overrides.
 
         Args:
             group: Group name (e.g., "claude")
@@ -308,4 +504,4 @@ class ProviderInterface(ABC):
             List of model names (WITHOUT provider prefix) in the group.
             Empty list if group doesn't exist.
         """
-        return []
+        return self._get_quota_group_models(group)

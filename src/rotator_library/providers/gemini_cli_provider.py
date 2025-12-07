@@ -189,6 +189,36 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     # Balanced by default - Gemini CLI has short cooldowns (seconds, not hours)
     default_rotation_mode: str = "balanced"
 
+    # =========================================================================
+    # TIER CONFIGURATION
+    # =========================================================================
+
+    # Provider name for env var lookups (QUOTA_GROUPS_GEMINI_CLI_*)
+    provider_env_name: str = "gemini_cli"
+
+    # Tier name -> priority mapping (Single Source of Truth)
+    # Same tier names as Antigravity (coincidentally), but defined separately
+    tier_priorities = {
+        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
+        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
+        # Priority 2: Standard paid tier
+        "standard-tier": 2,
+        # Priority 3: Free tier
+        "free-tier": 3,
+        # Priority 10: Legacy/Unknown (lowest)
+        "legacy-tier": 10,
+        "unknown": 10,
+    }
+
+    # Default priority for tiers not in the mapping
+    default_tier_priority: int = 10
+
+    # Gemini CLI uses default daily reset - no custom usage_reset_configs
+    # (Empty dict means inherited get_usage_reset_config returns None)
+
+    # No quota groups defined for Gemini CLI
+    # (Models don't share quotas)
+
     @staticmethod
     def parse_quota_error(
         error: Exception, error_body: Optional[str] = None
@@ -264,41 +294,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         )
 
     # =========================================================================
-    # CREDENTIAL PRIORITIZATION
+    # CREDENTIAL TIER LOOKUP (Provider-specific - uses cache)
     # =========================================================================
-
-    def get_credential_priority(self, credential: str) -> Optional[int]:
-        """
-        Returns priority based on Gemini tier.
-        Paid tiers: priority 1 (highest)
-        Free/Legacy tiers: priority 2
-        Unknown: priority 10 (lowest)
-
-        Args:
-            credential: The credential path
-
-        Returns:
-            Priority level (1-10) or None if tier not yet discovered
-        """
-        tier = self.project_tier_cache.get(credential)
-
-        # Lazy load from file if not in cache
-        if not tier:
-            tier = self._load_tier_from_file(credential)
-
-        if not tier:
-            return None  # Not yet discovered
-
-        # Paid tiers get highest priority
-        if tier not in ["free-tier", "legacy-tier", "unknown"]:
-            return 1
-
-        # Free tier gets lower priority
-        if tier == "free-tier":
-            return 2
-
-        # Legacy and unknown get even lower
-        return 10
+    #
+    # NOTE: get_credential_priority() is now inherited from ProviderInterface.
+    # It uses get_credential_tier_name() to get the tier and resolve priority
+    # from the tier_priorities class attribute.
+    # =========================================================================
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
         """
