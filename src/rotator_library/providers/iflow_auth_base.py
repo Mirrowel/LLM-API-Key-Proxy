@@ -23,6 +23,7 @@ from rich.prompt import Prompt
 from rich.text import Text
 from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
+from ..utils.reauth_coordinator import get_reauth_coordinator
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -173,9 +174,12 @@ class IFlowAuthBase:
         # [QUEUE SYSTEM] Sequential refresh processing
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queued_credentials: set = set()  # Track credentials already in queue
-        self._unavailable_credentials: set = (
-            set()
-        )  # Mark credentials unavailable during re-auth
+        # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
+        # This enables TTL-based stale entry cleanup as defense in depth
+        self._unavailable_credentials: Dict[
+            str, float
+        ] = {}  # Maps credential path -> timestamp when marked unavailable
+        self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = (
             None  # Background worker task
@@ -745,15 +749,28 @@ class IFlowAuthBase:
         Proactively refreshes tokens if they're close to expiry.
         Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
         """
-        # Check if it's an env:// virtual path (OAuth credentials from environment)
-        is_env_path = credential_identifier.startswith("env://")
+        lib_logger.debug(f"proactively_refresh called for: {credential_identifier}")
 
-        # Only refresh if it's an OAuth credential (file path or env:// path)
-        if not is_env_path and not os.path.isfile(credential_identifier):
-            return  # Direct API key, no refresh needed
+        # Try to load credentials - this will fail for direct API keys
+        # and succeed for OAuth credentials (file paths or env:// paths)
+        try:
+            creds = await self._load_credentials(credential_identifier)
+        except IOError as e:
+            # Not a valid credential path (likely a direct API key string)
+            lib_logger.debug(
+                f"Skipping refresh for '{credential_identifier}' - not an OAuth credential: {e}"
+            )
+            return
 
-        creds = await self._load_credentials(credential_identifier)
-        if self._is_token_expired(creds):
+        is_expired = self._is_token_expired(creds)
+        lib_logger.debug(
+            f"Token expired check for '{Path(credential_identifier).name}': {is_expired}"
+        )
+
+        if is_expired:
+            lib_logger.debug(
+                f"Queueing refresh for '{Path(credential_identifier).name}'"
+            )
             # Queue for refresh with needs_reauth=False (automated refresh)
             await self._queue_refresh(
                 credential_identifier, force=False, needs_reauth=False
@@ -768,8 +785,30 @@ class IFlowAuthBase:
             return self._refresh_locks[path]
 
     def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not queued/refreshing)."""
-        return path not in self._unavailable_credentials
+        """Check if a credential is available for rotation (not queued/refreshing).
+
+        [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
+        If a credential has been unavailable for longer than _unavailable_ttl_seconds,
+        it is automatically cleaned up and considered available.
+        """
+        if path not in self._unavailable_credentials:
+            return True
+
+        # [FIX PR#34] Check if the entry is stale (TTL expired)
+        marked_time = self._unavailable_credentials.get(path)
+        if marked_time is not None:
+            now = time.time()
+            if now - marked_time > self._unavailable_ttl_seconds:
+                # Entry is stale - clean it up and return available
+                lib_logger.warning(
+                    f"Credential '{Path(path).name}' was stuck in unavailable state for "
+                    f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
+                    f"Auto-cleaning stale entry."
+                )
+                self._unavailable_credentials.pop(path, None)
+                return True
+
+        return False
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -805,7 +844,12 @@ class IFlowAuthBase:
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                self._unavailable_credentials.add(path)  # Mark as unavailable
+                # [FIX PR#34] Store timestamp when marking unavailable (for TTL cleanup)
+                self._unavailable_credentials[path] = time.time()
+                lib_logger.debug(
+                    f"Marked '{Path(path).name}' as unavailable. "
+                    f"Total unavailable: {len(self._unavailable_credentials)}"
+                )
                 await self._refresh_queue.put((path, force, needs_reauth))
                 await self._ensure_queue_processor_running()
 
@@ -820,7 +864,22 @@ class IFlowAuthBase:
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # No items for 60s, exit to save resources
+                    # [FIX PR#34] Clean up any stale unavailable entries before exiting
+                    # If we're idle for 60s, no refreshes are in progress
+                    async with self._queue_tracking_lock:
+                        if self._unavailable_credentials:
+                            stale_count = len(self._unavailable_credentials)
+                            lib_logger.warning(
+                                f"Queue processor idle timeout. Cleaning {stale_count} "
+                                f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
+                            )
+                            self._unavailable_credentials.clear()
+                        # [FIX BUG#6] Also clear queued credentials to prevent stuck state
+                        if self._queued_credentials:
+                            lib_logger.debug(
+                                f"Clearing {len(self._queued_credentials)} queued credentials on timeout"
+                            )
+                            self._queued_credentials.clear()
                     self._queue_processor_task = None
                     return
 
@@ -832,7 +891,11 @@ class IFlowAuthBase:
                         if creds and not self._is_token_expired(creds):
                             # No longer expired, mark as available
                             async with self._queue_tracking_lock:
-                                self._unavailable_credentials.discard(path)
+                                self._unavailable_credentials.pop(path, None)
+                                lib_logger.debug(
+                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
+                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                                )
                             continue
 
                         # Perform refresh
@@ -842,28 +905,174 @@ class IFlowAuthBase:
 
                         # SUCCESS: Mark as available again
                         async with self._queue_tracking_lock:
-                            self._unavailable_credentials.discard(path)
+                            self._unavailable_credentials.pop(path, None)
+                            lib_logger.debug(
+                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                            )
 
                 finally:
-                    # Remove from queued set
+                    # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
+                    # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
+                        # [FIX PR#34] Always clean up unavailable credentials in finally block
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Finally cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                     self._refresh_queue.task_done()
             except asyncio.CancelledError:
+                # [FIX PR#34] Clean up the current credential before breaking
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"CancelledError cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                 break
             except Exception as e:
                 lib_logger.error(f"Error in queue processor: {e}")
                 # Even on error, mark as available (backoff will prevent immediate retry)
                 if path:
                     async with self._queue_tracking_lock:
-                        self._unavailable_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Error cleanup for '{Path(path).name}': {e}. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
+
+    async def _perform_interactive_oauth(
+        self, path: str, creds: Dict[str, Any], display_name: str
+    ) -> Dict[str, Any]:
+        """
+        Perform interactive OAuth authorization code flow (browser-based authentication).
+
+        This method is called via the global ReauthCoordinator to ensure
+        only one interactive OAuth flow runs at a time across all providers.
+
+        Args:
+            path: Credential file path
+            creds: Current credentials dict (will be updated)
+            display_name: Display name for logging/UI
+
+        Returns:
+            Updated credentials dict with new tokens
+        """
+        # [HEADLESS DETECTION] Check if running in headless environment
+        is_headless = is_headless_environment()
+
+        # Generate random state for CSRF protection
+        state = secrets.token_urlsafe(32)
+
+        # Build authorization URL
+        redirect_uri = f"http://localhost:{CALLBACK_PORT}/oauth2callback"
+        auth_params = {
+            "loginMethod": "phone",
+            "type": "phone",
+            "redirect": redirect_uri,
+            "state": state,
+            "client_id": IFLOW_CLIENT_ID,
+        }
+        auth_url = f"{IFLOW_OAUTH_AUTHORIZE_ENDPOINT}?{urlencode(auth_params)}"
+
+        # Start OAuth callback server
+        callback_server = OAuthCallbackServer(port=CALLBACK_PORT)
+        try:
+            await callback_server.start(expected_state=state)
+
+            # [HEADLESS SUPPORT] Display appropriate instructions
+            if is_headless:
+                auth_panel_text = Text.from_markup(
+                    "Running in headless environment (no GUI detected).\n"
+                    "Please open the URL below in a browser on another machine to authorize:\n"
+                    "1. Visit the URL below to sign in with your phone number.\n"
+                    "2. [bold]Authorize the application[/bold] to access your account.\n"
+                    "3. You will be automatically redirected after authorization."
+                )
+            else:
+                auth_panel_text = Text.from_markup(
+                    "1. Visit the URL below to sign in with your phone number.\n"
+                    "2. [bold]Authorize the application[/bold] to access your account.\n"
+                    "3. You will be automatically redirected after authorization."
+                )
+
+            console.print(
+                Panel(
+                    auth_panel_text,
+                    title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                    style="bold blue",
+                )
+            )
+            escaped_url = rich_escape(auth_url)
+            console.print(f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n")
+
+            # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+            if not is_headless:
+                try:
+                    webbrowser.open(auth_url)
+                    lib_logger.info("Browser opened successfully for iFlow OAuth flow")
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Failed to open browser automatically: {e}. Please open the URL manually."
+                    )
+
+            # Wait for callback
+            with console.status(
+                "[bold green]Waiting for authorization in the browser...[/bold green]",
+                spinner="dots",
+            ):
+                # Note: The 300s timeout here is handled by the ReauthCoordinator
+                # We use a slightly longer internal timeout to let the coordinator handle it
+                code = await callback_server.wait_for_callback(timeout=310.0)
+
+            lib_logger.info("Received authorization code, exchanging for tokens...")
+
+            # Exchange code for tokens and API key
+            token_data = await self._exchange_code_for_tokens(code, redirect_uri)
+
+            # Update credentials
+            creds.update(
+                {
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data["refresh_token"],
+                    "api_key": token_data["api_key"],
+                    "email": token_data["email"],
+                    "expiry_date": token_data["expiry_date"],
+                    "token_type": token_data["token_type"],
+                    "scope": token_data["scope"],
+                }
+            )
+
+            # Create metadata object
+            if not creds.get("_proxy_metadata"):
+                creds["_proxy_metadata"] = {
+                    "email": token_data["email"],
+                    "last_check_timestamp": time.time(),
+                }
+
+            if path:
+                await self._save_credentials(path, creds)
+
+            lib_logger.info(
+                f"iFlow OAuth initialized successfully for '{display_name}'."
+            )
+            return creds
+
+        finally:
+            await callback_server.stop()
 
     async def initialize_token(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
         """
-        Initiates OAuth authorization code flow if tokens are missing or invalid.
-        Uses local callback server to receive authorization code.
+        Initialize OAuth token, triggering interactive authorization flow if needed.
+
+        If interactive OAuth is required (expired refresh token, missing credentials, etc.),
+        the flow is coordinated globally via ReauthCoordinator to ensure only one
+        interactive OAuth flow runs at a time across all providers.
         """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
@@ -903,127 +1112,23 @@ class IFlowAuthBase:
                     f"iFlow OAuth token for '{display_name}' needs setup: {reason}."
                 )
 
-                # [HEADLESS DETECTION] Check if running in headless environment
-                is_headless = is_headless_environment()
+                # [GLOBAL REAUTH COORDINATION] Use the global coordinator to ensure
+                # only one interactive OAuth flow runs at a time across all providers
+                coordinator = get_reauth_coordinator()
 
-                # Generate random state for CSRF protection
-                state = secrets.token_urlsafe(32)
-
-                # Build authorization URL
-                redirect_uri = f"http://localhost:{CALLBACK_PORT}/oauth2callback"
-                auth_params = {
-                    "loginMethod": "phone",
-                    "type": "phone",
-                    "redirect": redirect_uri,
-                    "state": state,
-                    "client_id": IFLOW_CLIENT_ID,
-                }
-                auth_url = f"{IFLOW_OAUTH_AUTHORIZE_ENDPOINT}?{urlencode(auth_params)}"
-
-                # Start OAuth callback server
-                callback_server = OAuthCallbackServer(port=CALLBACK_PORT)
-                try:
-                    await callback_server.start(expected_state=state)
-
-                    # [HEADLESS SUPPORT] Display appropriate instructions
-                    if is_headless:
-                        auth_panel_text = Text.from_markup(
-                            "Running in headless environment (no GUI detected).\n"
-                            "Please open the URL below in a browser on another machine to authorize:\n"
-                            "1. Visit the URL below to sign in with your phone number.\n"
-                            "2. [bold]Authorize the application[/bold] to access your account.\n"
-                            "3. You will be automatically redirected after authorization."
-                        )
-                    else:
-                        auth_panel_text = Text.from_markup(
-                            "1. Visit the URL below to sign in with your phone number.\n"
-                            "2. [bold]Authorize the application[/bold] to access your account.\n"
-                            "3. You will be automatically redirected after authorization."
-                        )
-
-                    console.print(
-                        Panel(
-                            auth_panel_text,
-                            title=f"iFlow OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
-                            style="bold blue",
-                        )
-                    )
-                    # [URL DISPLAY] Print URL with proper escaping to prevent Rich markup issues.
-                    # IMPORTANT: OAuth URLs contain special characters (=, &, etc.) that Rich might
-                    # interpret as markup in some terminal configurations. We escape the URL to
-                    # ensure it displays correctly.
-                    #
-                    # KNOWN ISSUE: If Rich rendering fails entirely (e.g., terminal doesn't support
-                    # ANSI codes, or output is piped), the escaped URL should still be valid.
-                    # However, if the terminal strips or mangles the output, users should copy
-                    # the URL directly from logs or use --verbose to see the raw URL.
-                    #
-                    # The [link=...] markup creates a clickable hyperlink in supported terminals
-                    # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
-                    # which can be safely copied even if the hyperlink doesn't work.
-                    escaped_url = rich_escape(auth_url)
-                    console.print(
-                        f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n"
+                # Define the interactive OAuth function to be executed by coordinator
+                async def _do_interactive_oauth():
+                    return await self._perform_interactive_oauth(
+                        path, creds, display_name
                     )
 
-                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
-                    if not is_headless:
-                        try:
-                            webbrowser.open(auth_url)
-                            lib_logger.info(
-                                "Browser opened successfully for iFlow OAuth flow"
-                            )
-                        except Exception as e:
-                            lib_logger.warning(
-                                f"Failed to open browser automatically: {e}. Please open the URL manually."
-                            )
-
-                    # Wait for callback
-                    with console.status(
-                        "[bold green]Waiting for authorization in the browser...[/bold green]",
-                        spinner="dots",
-                    ):
-                        code = await callback_server.wait_for_callback(timeout=300.0)
-
-                    lib_logger.info(
-                        "Received authorization code, exchanging for tokens..."
-                    )
-
-                    # Exchange code for tokens and API key
-                    token_data = await self._exchange_code_for_tokens(
-                        code, redirect_uri
-                    )
-
-                    # Update credentials
-                    creds.update(
-                        {
-                            "access_token": token_data["access_token"],
-                            "refresh_token": token_data["refresh_token"],
-                            "api_key": token_data["api_key"],
-                            "email": token_data["email"],
-                            "expiry_date": token_data["expiry_date"],
-                            "token_type": token_data["token_type"],
-                            "scope": token_data["scope"],
-                        }
-                    )
-
-                    # Create metadata object
-                    if not creds.get("_proxy_metadata"):
-                        creds["_proxy_metadata"] = {
-                            "email": token_data["email"],
-                            "last_check_timestamp": time.time(),
-                        }
-
-                    if path:
-                        await self._save_credentials(path, creds)
-
-                    lib_logger.info(
-                        f"iFlow OAuth initialized successfully for '{display_name}'."
-                    )
-                    return creds
-
-                finally:
-                    await callback_server.stop()
+                # Execute via global coordinator (ensures only one at a time)
+                return await coordinator.execute_reauth(
+                    credential_path=path or display_name,
+                    provider_name="IFLOW",
+                    reauth_func=_do_interactive_oauth,
+                    timeout=300.0,  # 5 minute timeout for user to complete OAuth
+                )
 
             lib_logger.info(f"iFlow OAuth token at '{display_name}' is valid.")
             return creds

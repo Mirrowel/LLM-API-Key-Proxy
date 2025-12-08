@@ -570,23 +570,11 @@ async def lifespan(app: FastAPI):
     )
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
-    _api_summary = (
-        ", ".join([f"{p}:{len(c)}" for p, c in api_keys.items()])
-        if api_keys
-        else "none"
-    )
-    _oauth_summary = (
-        ", ".join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()])
-        if oauth_credentials
-        else "none"
-    )
-    _total_summary = ", ".join(
-        [f"{p}:{len(c)}" for p, c in client.all_credentials.items()]
-    )
-    print(
-        f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})"
-    )
-    client.background_refresher.start()  # Start the background task
+    #_api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
+    #_oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
+    #_total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
+    #print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
+    client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
 
     # Warn if no provider credentials are configured
