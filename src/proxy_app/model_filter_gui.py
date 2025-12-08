@@ -149,6 +149,7 @@ class FilterEngine:
 
     Handles pattern matching, rule storage, and status calculation.
     Tracks changes for save/discard functionality.
+    Uses caching for performance with large model lists.
     """
 
     def __init__(self):
@@ -160,6 +161,17 @@ class FilterEngine:
         self._original_whitelist_patterns: Set[str] = set()
         self._current_provider: Optional[str] = None
 
+        # Caching for performance
+        self._status_cache: Dict[str, ModelStatus] = {}
+        self._available_count_cache: Optional[Tuple[int, int]] = None
+        self._cache_valid: bool = False
+
+    def _invalidate_cache(self):
+        """Mark cache as stale (call when rules change)."""
+        self._status_cache.clear()
+        self._available_count_cache = None
+        self._cache_valid = False
+
     def reset(self):
         """Clear all rules and reset state."""
         self.ignore_rules.clear()
@@ -168,6 +180,7 @@ class FilterEngine:
         self._whitelist_color_index = 0
         self._original_ignore_patterns.clear()
         self._original_whitelist_patterns.clear()
+        self._invalidate_cache()
 
     def _get_next_ignore_color(self) -> str:
         """Get next color for ignore rules (cycles through palette)."""
@@ -196,6 +209,7 @@ class FilterEngine:
             pattern=pattern, color=self._get_next_ignore_color(), rule_type="ignore"
         )
         self.ignore_rules.append(rule)
+        self._invalidate_cache()
         return rule
 
     def add_whitelist_rule(self, pattern: str) -> Optional[FilterRule]:
@@ -215,6 +229,7 @@ class FilterEngine:
             rule_type="whitelist",
         )
         self.whitelist_rules.append(rule)
+        self._invalidate_cache()
         return rule
 
     def remove_ignore_rule(self, pattern: str) -> bool:
@@ -222,6 +237,7 @@ class FilterEngine:
         for i, rule in enumerate(self.ignore_rules):
             if rule.pattern == pattern:
                 self.ignore_rules.pop(i)
+                self._invalidate_cache()
                 return True
         return False
 
@@ -230,6 +246,7 @@ class FilterEngine:
         for i, rule in enumerate(self.whitelist_rules):
             if rule.pattern == pattern:
                 self.whitelist_rules.pop(i)
+                self._invalidate_cache()
                 return True
         return False
 
@@ -257,9 +274,9 @@ class FilterEngine:
             # Exact match against full ID or provider model name
             return model_id == pattern or provider_model_name == pattern
 
-    def get_model_status(self, model_id: str) -> ModelStatus:
+    def _compute_status(self, model_id: str) -> ModelStatus:
         """
-        Determine the status of a model based on current rules.
+        Compute the status of a model based on current rules (no caching).
 
         Priority: Whitelist > Ignore > Normal
         """
@@ -288,32 +305,53 @@ class FilterEngine:
             model_id=model_id, status="normal", color=NORMAL_COLOR, affecting_rule=None
         )
 
-    def get_all_statuses(self, models: List[str]) -> List[ModelStatus]:
-        """Get status for all models."""
-        return [self.get_model_status(m) for m in models]
+    def get_model_status(self, model_id: str) -> ModelStatus:
+        """Get status for a model (uses cache if available)."""
+        if model_id in self._status_cache:
+            return self._status_cache[model_id]
+        return self._compute_status(model_id)
 
-    def update_affected_counts(self, models: List[str]):
-        """Update the affected_count and affected_models for all rules."""
-        # Reset counts
+    def _rebuild_cache(self, models: List[str]):
+        """Rebuild the entire status cache in one efficient pass."""
+        self._status_cache.clear()
+
+        # Reset rule counts
         for rule in self.ignore_rules + self.whitelist_rules:
             rule.affected_count = 0
             rule.affected_models = []
 
-        # Count affected models
+        available = 0
         for model_id in models:
-            status = self.get_model_status(model_id)
+            status = self._compute_status(model_id)
+            self._status_cache[model_id] = status
+
             if status.affecting_rule:
                 status.affecting_rule.affected_count += 1
                 status.affecting_rule.affected_models.append(model_id)
 
-    def get_available_count(self, models: List[str]) -> Tuple[int, int]:
-        """Returns (available_count, total_count)."""
-        available = 0
-        for model_id in models:
-            status = self.get_model_status(model_id)
             if status.status != "ignored":
                 available += 1
-        return available, len(models)
+
+        self._available_count_cache = (available, len(models))
+        self._cache_valid = True
+
+    def get_all_statuses(self, models: List[str]) -> List[ModelStatus]:
+        """Get status for all models (rebuilds cache if invalid)."""
+        if not self._cache_valid:
+            self._rebuild_cache(models)
+        return [self._status_cache.get(m, self._compute_status(m)) for m in models]
+
+    def update_affected_counts(self, models: List[str]):
+        """Update the affected_count and affected_models for all rules."""
+        # This now just ensures cache is valid - counts are updated in _rebuild_cache
+        if not self._cache_valid:
+            self._rebuild_cache(models)
+
+    def get_available_count(self, models: List[str]) -> Tuple[int, int]:
+        """Returns (available_count, total_count) from cache."""
+        if not self._cache_valid:
+            self._rebuild_cache(models)
+        return self._available_count_cache or (0, 0)
 
     def preview_pattern(
         self, pattern: str, rule_type: str, models: List[str]
@@ -1002,6 +1040,576 @@ class ToolTip:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# VIRTUAL MODEL LIST (Canvas-based for performance)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Constants for virtual list
+ITEM_HEIGHT = 24  # Height of each row in pixels
+INDICATOR_WIDTH = 18  # Width of status indicator
+
+
+class VirtualModelList:
+    """
+    High-performance virtual list that only renders visible items.
+
+    Uses a raw tkinter Canvas to draw text directly rather than
+    creating individual widgets per row. This reduces widget count
+    from O(n) to O(visible_rows).
+    """
+
+    def __init__(
+        self,
+        parent,
+        show_status_indicator: bool = False,
+        on_click: Optional[Callable[[str], None]] = None,
+        on_right_click: Optional[Callable[[str, any], None]] = None,
+    ):
+        self.parent = parent
+        self.show_status_indicator = show_status_indicator
+        self.on_click = on_click
+        self.on_right_click = on_right_click
+
+        # Data
+        self.models: List[str] = []
+        self.statuses: Dict[str, ModelStatus] = {}
+        self.filtered_models: List[str] = []  # Models after search filter
+        self.search_query: str = ""
+        self.highlighted_models: Set[str] = set()
+
+        # UI state
+        self._hover_index: Optional[int] = None
+        self._scroll_position: float = 0.0
+
+        # Create container frame
+        self.frame = ctk.CTkFrame(parent, fg_color=BG_TERTIARY, corner_radius=6)
+
+        # Create canvas (use raw tk.Canvas for performance)
+        import tkinter as tk
+
+        self.canvas = tk.Canvas(
+            self.frame,
+            bg=BG_TERTIARY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Scrollbar
+        self.scrollbar = ctk.CTkScrollbar(self.frame, command=self._on_scroll)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Link canvas to scrollbar
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
+
+        # Bind events
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-1>", self._on_left_click)
+        self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<Motion>", self._on_mouse_motion)
+        self.canvas.bind("<Leave>", self._on_mouse_leave)
+
+    def grid(self, **kwargs):
+        """Grid the container frame."""
+        self.frame.grid(**kwargs)
+
+    def grid_forget(self):
+        """Hide the container frame."""
+        self.frame.grid_forget()
+
+    def pack(self, **kwargs):
+        """Pack the container frame."""
+        self.frame.pack(**kwargs)
+
+    def pack_forget(self):
+        """Hide the container frame."""
+        self.frame.pack_forget()
+
+    def set_models(self, models: List[str], statuses: Dict[str, ModelStatus]):
+        """Set the model list and statuses."""
+        self.models = models
+        self.statuses = statuses
+        self._apply_filter()
+        self._update_scroll_region()
+        self._render()
+
+    def update_statuses(self, statuses: Dict[str, ModelStatus]):
+        """Update just the statuses (no model list change)."""
+        self.statuses = statuses
+        self._render()
+
+    def filter_by_search(self, query: str):
+        """Filter models by search query."""
+        self.search_query = query.lower().strip()
+        self._apply_filter()
+        self._update_scroll_region()
+        self._render()
+
+    def _apply_filter(self):
+        """Apply current search filter to models."""
+        if not self.search_query:
+            self.filtered_models = list(self.models)
+        else:
+            self.filtered_models = [
+                m for m in self.models if self.search_query in m.lower()
+            ]
+
+    def highlight_models(self, model_ids: Set[str]):
+        """Set which models should be highlighted."""
+        self.highlighted_models = model_ids
+        self._render()
+
+    def clear_highlights(self):
+        """Clear all highlights."""
+        self.highlighted_models.clear()
+        self._render()
+
+    def scroll_to_model(self, model_id: str):
+        """Scroll to make a model visible."""
+        if model_id not in self.filtered_models:
+            return
+
+        index = self.filtered_models.index(model_id)
+        total_height = len(self.filtered_models) * ITEM_HEIGHT
+        canvas_height = self.canvas.winfo_height()
+
+        if total_height <= canvas_height:
+            return
+
+        # Calculate position to center the item
+        item_y = index * ITEM_HEIGHT
+        target_scroll = (item_y - canvas_height / 2 + ITEM_HEIGHT / 2) / total_height
+        target_scroll = max(0, min(1, target_scroll))
+
+        self.canvas.yview_moveto(target_scroll)
+
+    def _update_scroll_region(self):
+        """Update the scrollable region based on item count."""
+        total_height = max(len(self.filtered_models) * ITEM_HEIGHT, 1)
+        self.canvas.configure(scrollregion=(0, 0, 100, total_height))
+
+    def _on_scroll(self, *args):
+        """Handle scrollbar command."""
+        self.canvas.yview(*args)
+        self._render()
+
+    def _on_canvas_scroll(self, first: float, last: float):
+        """Handle canvas scroll update."""
+        self.scrollbar.set(first, last)
+        self._scroll_position = float(first)
+
+    def _on_configure(self, event=None):
+        """Handle canvas resize."""
+        self._update_scroll_region()
+        self._render()
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling."""
+        delta = -1 * (event.delta // 120)
+        self.canvas.yview_scroll(delta, "units")
+        self._render()
+        return "break"
+
+    def _get_index_at_y(self, y: int) -> Optional[int]:
+        """Get the model index at a y coordinate."""
+        # Adjust for scroll position
+        canvas_height = self.canvas.winfo_height()
+        total_height = len(self.filtered_models) * ITEM_HEIGHT
+
+        if total_height == 0:
+            return None
+
+        # Get scroll offset in pixels
+        scroll_offset = self._scroll_position * total_height
+
+        # Calculate actual y in the virtual list
+        actual_y = scroll_offset + y
+
+        index = int(actual_y // ITEM_HEIGHT)
+
+        if 0 <= index < len(self.filtered_models):
+            return index
+        return None
+
+    def _on_left_click(self, event):
+        """Handle left click."""
+        index = self._get_index_at_y(event.y)
+        if index is not None and self.on_click:
+            model_id = self.filtered_models[index]
+            self.on_click(model_id)
+
+    def _on_right_click(self, event):
+        """Handle right click."""
+        index = self._get_index_at_y(event.y)
+        if index is not None and self.on_right_click:
+            model_id = self.filtered_models[index]
+            self.on_right_click(model_id, event)
+
+    def _on_mouse_motion(self, event):
+        """Handle mouse motion for hover effect."""
+        new_hover = self._get_index_at_y(event.y)
+        if new_hover != self._hover_index:
+            self._hover_index = new_hover
+            self._render()
+
+    def _on_mouse_leave(self, event):
+        """Handle mouse leaving canvas."""
+        if self._hover_index is not None:
+            self._hover_index = None
+            self._render()
+
+    def _render(self):
+        """Render only the visible items."""
+        self.canvas.delete("all")
+
+        if not self.filtered_models:
+            # Show empty state
+            canvas_height = self.canvas.winfo_height()
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2,
+                canvas_height // 2,
+                text="No models",
+                fill=TEXT_MUTED,
+                font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            )
+            return
+
+        canvas_height = self.canvas.winfo_height()
+        canvas_width = self.canvas.winfo_width()
+        total_height = len(self.filtered_models) * ITEM_HEIGHT
+
+        # Calculate visible range
+        scroll_offset = self._scroll_position * total_height
+        first_visible = int(scroll_offset // ITEM_HEIGHT)
+        visible_count = int(canvas_height // ITEM_HEIGHT) + 2  # +2 for partial rows
+
+        # Clamp to valid range
+        first_visible = max(0, first_visible)
+        last_visible = min(len(self.filtered_models), first_visible + visible_count)
+
+        # Draw visible items
+        for i in range(first_visible, last_visible):
+            model_id = self.filtered_models[i]
+            status = self.statuses.get(
+                model_id,
+                ModelStatus(model_id=model_id, status="normal", color=NORMAL_COLOR),
+            )
+
+            # Calculate y position relative to canvas
+            y = (i * ITEM_HEIGHT) - scroll_offset
+            y_center = y + ITEM_HEIGHT // 2
+
+            # Background for hover/highlight
+            is_highlighted = model_id in self.highlighted_models
+            is_hovered = i == self._hover_index
+
+            if is_highlighted:
+                self.canvas.create_rectangle(
+                    0, y, canvas_width, y + ITEM_HEIGHT, fill=HIGHLIGHT_BG, outline=""
+                )
+            elif is_hovered:
+                self.canvas.create_rectangle(
+                    0, y, canvas_width, y + ITEM_HEIGHT, fill=BG_HOVER, outline=""
+                )
+
+            # Status indicator (for right list)
+            x_offset = 8
+            if self.show_status_indicator:
+                indicator_text = {
+                    "normal": "●",
+                    "ignored": "✗",
+                    "whitelisted": "★",
+                }.get(status.status, "●")
+                self.canvas.create_text(
+                    x_offset + INDICATOR_WIDTH // 2,
+                    y_center,
+                    text=indicator_text,
+                    fill=status.color,
+                    font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                )
+                x_offset += INDICATOR_WIDTH
+
+            # Model name
+            text_color = status.color if self.show_status_indicator else TEXT_PRIMARY
+            display_name = status.display_name
+
+            self.canvas.create_text(
+                x_offset,
+                y_center,
+                text=display_name,
+                fill=text_color,
+                font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+                anchor="w",
+            )
+
+    def get_scroll_position(self) -> float:
+        """Get current scroll position (0-1)."""
+        return self._scroll_position
+
+    def set_scroll_position(self, pos: float):
+        """Set scroll position (0-1) without triggering render (for sync)."""
+        self.canvas.yview_moveto(pos)
+
+
+class VirtualSyncModelLists(ctk.CTkFrame):
+    """
+    Container with two synchronized virtual model lists.
+
+    Left list: All fetched models (plain display)
+    Right list: Same models with colored status indicators
+
+    Both lists scroll together.
+    """
+
+    def __init__(
+        self,
+        master,
+        on_model_click: Callable[[str], None],
+        on_model_right_click: Callable[[str, any], None],
+    ):
+        super().__init__(master, fg_color="transparent")
+
+        self.on_model_click = on_model_click
+        self.on_model_right_click = on_model_right_click
+
+        self.models: List[str] = []
+        self.statuses: Dict[str, ModelStatus] = {}
+        self._syncing_scroll = False
+
+        self._create_content()
+
+    def _create_content(self):
+        """Build the dual list layout."""
+        # Configure grid
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Left header
+        left_header = ctk.CTkLabel(
+            self,
+            text="All Fetched Models",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            text_color=TEXT_PRIMARY,
+        )
+        left_header.grid(row=0, column=0, sticky="w", padx=8, pady=(0, 5))
+
+        self.left_count_label = ctk.CTkLabel(
+            self, text="(0)", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
+        )
+        self.left_count_label.grid(row=0, column=0, sticky="e", padx=8, pady=(0, 5))
+
+        # Right header
+        right_header = ctk.CTkLabel(
+            self,
+            text="Filtered Status",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            text_color=TEXT_PRIMARY,
+        )
+        right_header.grid(row=0, column=1, sticky="w", padx=8, pady=(0, 5))
+
+        self.right_count_label = ctk.CTkLabel(
+            self, text="", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
+        )
+        self.right_count_label.grid(row=0, column=1, sticky="e", padx=8, pady=(0, 5))
+
+        # Create virtual lists
+        self.left_list = VirtualModelList(
+            self,
+            show_status_indicator=False,
+            on_click=self.on_model_click,
+            on_right_click=self.on_model_right_click,
+        )
+        self.left_list.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+
+        self.right_list = VirtualModelList(
+            self,
+            show_status_indicator=True,
+            on_click=self.on_model_click,
+            on_right_click=self.on_model_right_click,
+        )
+        self.right_list.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+
+        # Synchronize scrolling
+        self._setup_scroll_sync()
+
+        # Loading state
+        self.loading_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
+        self.loading_label = ctk.CTkLabel(
+            self.loading_frame,
+            text="Loading...",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            text_color=TEXT_MUTED,
+        )
+        self.loading_label.pack(expand=True)
+
+        # Error state
+        self.error_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
+        self.error_label = ctk.CTkLabel(
+            self.error_frame,
+            text="",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            text_color=ACCENT_RED,
+        )
+        self.error_label.pack(expand=True, pady=20)
+
+        self.retry_btn = ctk.CTkButton(
+            self.error_frame,
+            text="Retry",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8aee",
+            width=100,
+        )
+        self.retry_btn.pack()
+
+    def _setup_scroll_sync(self):
+        """Setup synchronized scrolling between both lists."""
+        # Override the scroll handlers to sync both lists
+        original_left_scroll = self.left_list._on_scroll
+        original_right_scroll = self.right_list._on_scroll
+        original_left_wheel = self.left_list._on_mousewheel
+        original_right_wheel = self.right_list._on_mousewheel
+
+        def sync_scroll_left(*args):
+            if self._syncing_scroll:
+                return
+            self._syncing_scroll = True
+            original_left_scroll(*args)
+            # Sync to right
+            pos = self.left_list.get_scroll_position()
+            self.right_list.set_scroll_position(pos)
+            self.right_list._render()
+            self._syncing_scroll = False
+
+        def sync_scroll_right(*args):
+            if self._syncing_scroll:
+                return
+            self._syncing_scroll = True
+            original_right_scroll(*args)
+            # Sync to left
+            pos = self.right_list.get_scroll_position()
+            self.left_list.set_scroll_position(pos)
+            self.left_list._render()
+            self._syncing_scroll = False
+
+        def sync_wheel_left(event):
+            if self._syncing_scroll:
+                return "break"
+            self._syncing_scroll = True
+            original_left_wheel(event)
+            # Sync to right
+            pos = self.left_list.get_scroll_position()
+            self.right_list.set_scroll_position(pos)
+            self.right_list._render()
+            self._syncing_scroll = False
+            return "break"
+
+        def sync_wheel_right(event):
+            if self._syncing_scroll:
+                return "break"
+            self._syncing_scroll = True
+            original_right_wheel(event)
+            # Sync to left
+            pos = self.right_list.get_scroll_position()
+            self.left_list.set_scroll_position(pos)
+            self.left_list._render()
+            self._syncing_scroll = False
+            return "break"
+
+        self.left_list._on_scroll = sync_scroll_left
+        self.right_list._on_scroll = sync_scroll_right
+        self.left_list.canvas.bind("<MouseWheel>", sync_wheel_left)
+        self.right_list.canvas.bind("<MouseWheel>", sync_wheel_right)
+
+    def show_loading(self, provider: str):
+        """Show loading state."""
+        self.loading_label.configure(text=f"Fetching models from {provider}...")
+        self.loading_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.error_frame.grid_forget()
+
+    def show_error(self, message: str, on_retry: Callable):
+        """Show error state."""
+        self.error_label.configure(text=f"❌ {message}")
+        self.retry_btn.configure(command=on_retry)
+        self.error_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self.loading_frame.grid_forget()
+
+    def hide_overlays(self):
+        """Hide loading and error overlays."""
+        self.loading_frame.grid_forget()
+        self.error_frame.grid_forget()
+
+    def set_models(self, models: List[str], statuses: List[ModelStatus]):
+        """Set the models to display."""
+        self.models = models
+        self.statuses = {s.model_id: s for s in statuses}
+
+        self.left_list.set_models(models, self.statuses)
+        self.right_list.set_models(models, self.statuses)
+
+        self._update_counts()
+        self.hide_overlays()
+
+    def update_statuses(self, statuses: List[ModelStatus]):
+        """Update status display for all models."""
+        self.statuses = {s.model_id: s for s in statuses}
+        self.left_list.update_statuses(self.statuses)
+        self.right_list.update_statuses(self.statuses)
+        self._update_counts()
+
+    def _update_counts(self):
+        """Update the count labels."""
+        total = len(self.models)
+        available = sum(1 for s in self.statuses.values() if s.status != "ignored")
+
+        self.left_count_label.configure(text=f"({total})")
+        self.right_count_label.configure(text=f"{available} available")
+
+    def filter_by_search(self, query: str):
+        """Filter models by search query."""
+        self.left_list.filter_by_search(query)
+        self.right_list.filter_by_search(query)
+
+    def highlight_models_by_rule(self, rule: FilterRule):
+        """Highlight all models affected by a rule."""
+        model_set = set(rule.affected_models)
+        self.left_list.highlight_models(model_set)
+        self.right_list.highlight_models(model_set)
+
+        # Scroll to first match
+        if rule.affected_models:
+            self.left_list.scroll_to_model(rule.affected_models[0])
+            # Sync right list scroll
+            pos = self.left_list.get_scroll_position()
+            self.right_list.set_scroll_position(pos)
+            self.right_list._render()
+
+    def highlight_model(self, model_id: str):
+        """Highlight a specific model."""
+        model_set = {model_id}
+        self.left_list.highlight_models(model_set)
+        self.right_list.highlight_models(model_set)
+
+    def clear_highlights(self):
+        """Clear all model highlights."""
+        self.left_list.clear_highlights()
+        self.right_list.clear_highlights()
+
+    def scroll_to_affected(self, affected_models: List[str]):
+        """Scroll to first affected model."""
+        if affected_models:
+            self.left_list.scroll_to_model(affected_models[0])
+            pos = self.left_list.get_scroll_position()
+            self.right_list.set_scroll_position(pos)
+            self.right_list._render()
+
+    def get_model_at_position(self, model_id: str) -> Optional[ModelStatus]:
+        """Get the status of a model."""
+        return self.statuses.get(model_id)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # RULE CHIP COMPONENT
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1312,493 +1920,6 @@ class RulePanel(ctk.CTkFrame):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MODEL LIST ITEM
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-class ModelListItem(ctk.CTkFrame):
-    """
-    Single model row in the list.
-
-    Shows model name with appropriate coloring based on status.
-    """
-
-    def __init__(
-        self,
-        master,
-        status: ModelStatus,
-        show_status_indicator: bool = False,
-        on_click: Optional[Callable[[str], None]] = None,
-        on_right_click: Optional[Callable[[str, any], None]] = None,
-    ):
-        super().__init__(master, fg_color="transparent", height=28)
-
-        self.status = status
-        self.on_click = on_click
-        self.on_right_click = on_right_click
-        self._is_highlighted = False
-        self._show_status_indicator = show_status_indicator
-
-        self._create_content()
-
-    def _create_content(self):
-        """Build item content."""
-        self.pack_propagate(False)
-
-        # Container
-        self.container = ctk.CTkFrame(self, fg_color="transparent")
-        self.container.pack(fill="both", expand=True, padx=4, pady=1)
-
-        # Status indicator (for filtered list)
-        if self._show_status_indicator:
-            indicator_text = {"normal": "●", "ignored": "✗", "whitelisted": "★"}.get(
-                self.status.status, "●"
-            )
-
-            self.indicator = ctk.CTkLabel(
-                self.container,
-                text=indicator_text,
-                font=(FONT_FAMILY, FONT_SIZE_SMALL),
-                text_color=self.status.color,
-                width=18,
-            )
-            self.indicator.pack(side="left")
-            self.indicator.bind("<Button-1>", self._handle_click)
-            self.indicator.bind("<Button-3>", self._handle_right_click)
-
-        # Model name
-        self.name_label = ctk.CTkLabel(
-            self.container,
-            text=self.status.display_name,
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            text_color=self.status.color
-            if self._show_status_indicator
-            else TEXT_PRIMARY,
-            anchor="w",
-        )
-        self.name_label.pack(side="left", fill="x", expand=True)
-        self.name_label.bind("<Button-1>", self._handle_click)
-        self.name_label.bind("<Button-3>", self._handle_right_click)
-
-        # Bindings for the frame itself
-        self.bind("<Button-1>", self._handle_click)
-        self.bind("<Button-3>", self._handle_right_click)
-        self.container.bind("<Button-1>", self._handle_click)
-        self.container.bind("<Button-3>", self._handle_right_click)
-
-        # Hover effect
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.container.bind("<Enter>", self._on_enter)
-        self.container.bind("<Leave>", self._on_leave)
-
-    def _handle_click(self, event=None):
-        """Handle left click."""
-        if self.on_click:
-            self.on_click(self.status.model_id)
-
-    def _handle_right_click(self, event):
-        """Handle right click."""
-        if self.on_right_click:
-            self.on_right_click(self.status.model_id, event)
-
-    def _on_enter(self, event=None):
-        """Mouse enter - show hover state."""
-        if not self._is_highlighted:
-            self.container.configure(fg_color=BG_HOVER)
-
-    def _on_leave(self, event=None):
-        """Mouse leave - hide hover state."""
-        if not self._is_highlighted:
-            self.container.configure(fg_color="transparent")
-
-    def update_status(self, status: ModelStatus):
-        """Update the model's status and appearance."""
-        self.status = status
-
-        if self._show_status_indicator:
-            indicator_text = {"normal": "●", "ignored": "✗", "whitelisted": "★"}.get(
-                status.status, "●"
-            )
-            self.indicator.configure(text=indicator_text, text_color=status.color)
-            self.name_label.configure(text_color=status.color)
-        else:
-            self.name_label.configure(text_color=TEXT_PRIMARY)
-
-    def set_highlighted(self, highlighted: bool):
-        """Set highlighted state."""
-        self._is_highlighted = highlighted
-        if highlighted:
-            self.container.configure(fg_color=HIGHLIGHT_BG)
-        else:
-            self.container.configure(fg_color="transparent")
-
-    def matches_search(self, query: str) -> bool:
-        """Check if this item matches a search query."""
-        if not query:
-            return True
-        return query.lower() in self.status.model_id.lower()
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SYNCHRONIZED MODEL LIST PANEL
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-class SyncModelListPanel(ctk.CTkFrame):
-    """
-    Two synchronized scrollable model lists side by side.
-
-    Left list: All fetched models (plain display)
-    Right list: Same models with colored status indicators
-
-    Both lists scroll together and filter together.
-    """
-
-    def __init__(
-        self,
-        master,
-        on_model_click: Callable[[str], None],
-        on_model_right_click: Callable[[str, any], None],
-    ):
-        super().__init__(master, fg_color="transparent")
-
-        self.on_model_click = on_model_click
-        self.on_model_right_click = on_model_right_click
-
-        self.models: List[str] = []
-        self.statuses: Dict[str, ModelStatus] = {}
-        self.left_items: Dict[str, ModelListItem] = {}
-        self.right_items: Dict[str, ModelListItem] = {}
-        self.search_query: str = ""
-
-        self._create_content()
-
-    def _create_content(self):
-        """Build the dual list layout."""
-        # Configure grid
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        # Left header
-        left_header = ctk.CTkLabel(
-            self,
-            text="All Fetched Models",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
-            text_color=TEXT_PRIMARY,
-        )
-        left_header.grid(row=0, column=0, sticky="w", padx=8, pady=(0, 5))
-
-        self.left_count_label = ctk.CTkLabel(
-            self, text="(0)", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
-        )
-        self.left_count_label.grid(row=0, column=0, sticky="e", padx=8, pady=(0, 5))
-
-        # Right header
-        right_header = ctk.CTkLabel(
-            self,
-            text="Filtered Status",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
-            text_color=TEXT_PRIMARY,
-        )
-        right_header.grid(row=0, column=1, sticky="w", padx=8, pady=(0, 5))
-
-        self.right_count_label = ctk.CTkLabel(
-            self, text="", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
-        )
-        self.right_count_label.grid(row=0, column=1, sticky="e", padx=8, pady=(0, 5))
-
-        # Left list container
-        left_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
-        left_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-
-        self.left_canvas = ctk.CTkCanvas(
-            left_frame,
-            bg=self._apply_appearance_mode(BG_TERTIARY),
-            highlightthickness=0,
-        )
-        self.left_scrollbar = ctk.CTkScrollbar(left_frame, command=self._sync_scroll)
-        self.left_inner = ctk.CTkFrame(self.left_canvas, fg_color="transparent")
-
-        self.left_canvas.pack(side="left", fill="both", expand=True)
-        self.left_scrollbar.pack(side="right", fill="y")
-
-        self.left_canvas_window = self.left_canvas.create_window(
-            (0, 0), window=self.left_inner, anchor="nw"
-        )
-
-        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
-
-        # Right list container
-        right_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
-        right_frame.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-
-        self.right_canvas = ctk.CTkCanvas(
-            right_frame,
-            bg=self._apply_appearance_mode(BG_TERTIARY),
-            highlightthickness=0,
-        )
-        self.right_scrollbar = ctk.CTkScrollbar(right_frame, command=self._sync_scroll)
-        self.right_inner = ctk.CTkFrame(self.right_canvas, fg_color="transparent")
-
-        self.right_canvas.pack(side="left", fill="both", expand=True)
-        self.right_scrollbar.pack(side="right", fill="y")
-
-        self.right_canvas_window = self.right_canvas.create_window(
-            (0, 0), window=self.right_inner, anchor="nw"
-        )
-
-        self.right_canvas.configure(yscrollcommand=self.right_scrollbar.set)
-
-        # Bind scroll events
-        self.left_canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.right_canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.left_inner.bind("<MouseWheel>", self._on_mousewheel)
-        self.right_inner.bind("<MouseWheel>", self._on_mousewheel)
-
-        # Bind resize
-        self.left_inner.bind("<Configure>", self._on_inner_configure)
-        self.left_canvas.bind("<Configure>", self._on_canvas_configure)
-
-        # Loading state
-        self.loading_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
-        self.loading_label = ctk.CTkLabel(
-            self.loading_frame,
-            text="Loading...",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            text_color=TEXT_MUTED,
-        )
-        self.loading_label.pack(expand=True)
-
-        # Error state
-        self.error_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
-        self.error_label = ctk.CTkLabel(
-            self.error_frame,
-            text="",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            text_color=ACCENT_RED,
-        )
-        self.error_label.pack(expand=True, pady=20)
-
-        self.retry_btn = ctk.CTkButton(
-            self.error_frame,
-            text="Retry",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            fg_color=ACCENT_BLUE,
-            hover_color="#3a8aee",
-            width=100,
-        )
-        self.retry_btn.pack()
-
-    def _apply_appearance_mode(self, color):
-        """Apply appearance mode to color."""
-        return color
-
-    def _sync_scroll(self, *args):
-        """Synchronized scroll handler."""
-        self.left_canvas.yview(*args)
-        self.right_canvas.yview(*args)
-
-    def _on_mousewheel(self, event):
-        """Handle mouse wheel scrolling."""
-        delta = -1 * (event.delta // 120)
-        self.left_canvas.yview_scroll(delta, "units")
-        self.right_canvas.yview_scroll(delta, "units")
-        return "break"
-
-    def _on_inner_configure(self, event=None):
-        """Update scroll region when inner frame changes."""
-        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
-        self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event=None):
-        """Update inner frame width when canvas resizes."""
-        width = self.left_canvas.winfo_width()
-        self.left_canvas.itemconfig(self.left_canvas_window, width=width)
-        self.right_canvas.itemconfig(self.right_canvas_window, width=width)
-
-    def show_loading(self, provider: str):
-        """Show loading state."""
-        self.loading_label.configure(text=f"Fetching models from {provider}...")
-        self.loading_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        self.error_frame.grid_forget()
-
-    def show_error(self, message: str, on_retry: Callable):
-        """Show error state."""
-        self.error_label.configure(text=f"❌ {message}")
-        self.retry_btn.configure(command=on_retry)
-        self.error_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        self.loading_frame.grid_forget()
-
-    def hide_overlays(self):
-        """Hide loading and error overlays."""
-        self.loading_frame.grid_forget()
-        self.error_frame.grid_forget()
-
-    def set_models(self, models: List[str], statuses: List[ModelStatus]):
-        """Set the models to display."""
-        self.models = models
-        self.statuses = {s.model_id: s for s in statuses}
-
-        self._rebuild_lists()
-        self._update_counts()
-        self.hide_overlays()
-
-    def _rebuild_lists(self):
-        """Rebuild both model lists."""
-        # Clear existing items
-        for item in self.left_items.values():
-            item.destroy()
-        for item in self.right_items.values():
-            item.destroy()
-        self.left_items.clear()
-        self.right_items.clear()
-
-        # Create new items
-        for model_id in self.models:
-            status = self.statuses.get(
-                model_id,
-                ModelStatus(model_id=model_id, status="normal", color=NORMAL_COLOR),
-            )
-
-            # Left item (plain)
-            left_item = ModelListItem(
-                self.left_inner,
-                status,
-                show_status_indicator=False,
-                on_click=self.on_model_click,
-                on_right_click=self.on_model_right_click,
-            )
-            left_item.pack(fill="x")
-            self.left_items[model_id] = left_item
-
-            # Right item (with status colors)
-            right_item = ModelListItem(
-                self.right_inner,
-                status,
-                show_status_indicator=True,
-                on_click=self.on_model_click,
-                on_right_click=self.on_model_right_click,
-            )
-            right_item.pack(fill="x")
-            self.right_items[model_id] = right_item
-
-        # Apply current search filter
-        self._apply_search_filter()
-
-    def update_statuses(self, statuses: List[ModelStatus]):
-        """Update status display for all models."""
-        self.statuses = {s.model_id: s for s in statuses}
-
-        for model_id, status in self.statuses.items():
-            if model_id in self.right_items:
-                self.right_items[model_id].update_status(status)
-
-        self._update_counts()
-
-    def _update_counts(self):
-        """Update the count labels."""
-        visible_count = sum(
-            1
-            for item in self.left_items.values()
-            if item.winfo_viewable() or item.matches_search(self.search_query)
-        )
-        total = len(self.models)
-
-        # Count available (not ignored)
-        available = sum(1 for s in self.statuses.values() if s.status != "ignored")
-
-        self.left_count_label.configure(text=f"({total})")
-        self.right_count_label.configure(text=f"{available} available")
-
-    def filter_by_search(self, query: str):
-        """Filter models by search query."""
-        self.search_query = query
-        self._apply_search_filter()
-
-    def _apply_search_filter(self):
-        """Apply the current search filter to items."""
-        for model_id in self.models:
-            left_item = self.left_items.get(model_id)
-            right_item = self.right_items.get(model_id)
-
-            if left_item and right_item:
-                matches = left_item.matches_search(self.search_query)
-                if matches:
-                    left_item.pack(fill="x")
-                    right_item.pack(fill="x")
-                else:
-                    left_item.pack_forget()
-                    right_item.pack_forget()
-
-    def highlight_models_by_rule(self, rule: FilterRule):
-        """Highlight all models affected by a rule."""
-        self.clear_highlights()
-
-        first_match = None
-        for model_id in rule.affected_models:
-            if model_id in self.left_items:
-                self.left_items[model_id].set_highlighted(True)
-                if first_match is None:
-                    first_match = model_id
-            if model_id in self.right_items:
-                self.right_items[model_id].set_highlighted(True)
-
-        # Scroll to first match
-        if first_match:
-            self._scroll_to_model(first_match)
-
-    def highlight_model(self, model_id: str):
-        """Highlight a specific model."""
-        self.clear_highlights()
-
-        if model_id in self.left_items:
-            self.left_items[model_id].set_highlighted(True)
-        if model_id in self.right_items:
-            self.right_items[model_id].set_highlighted(True)
-
-    def clear_highlights(self):
-        """Clear all model highlights."""
-        for item in self.left_items.values():
-            item.set_highlighted(False)
-        for item in self.right_items.values():
-            item.set_highlighted(False)
-
-    def _scroll_to_model(self, model_id: str):
-        """Scroll to make a model visible."""
-        if model_id not in self.left_items:
-            return
-
-        item = self.left_items[model_id]
-
-        # Calculate position
-        self.update_idletasks()
-        item_y = item.winfo_y()
-        inner_height = self.left_inner.winfo_height()
-        canvas_height = self.left_canvas.winfo_height()
-
-        if inner_height > canvas_height:
-            # Calculate scroll fraction
-            scroll_pos = item_y / inner_height
-            scroll_pos = max(0, min(scroll_pos, 1))
-
-            self.left_canvas.yview_moveto(scroll_pos)
-            self.right_canvas.yview_moveto(scroll_pos)
-
-    def scroll_to_affected(self, affected_models: List[str]):
-        """Scroll to first affected model in the list."""
-        for model_id in self.models:
-            if model_id in affected_models:
-                self._scroll_to_model(model_id)
-                break
-
-    def get_model_at_position(self, model_id: str) -> Optional[ModelStatus]:
-        """Get the status of a model."""
-        return self.statuses.get(model_id)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION WINDOW
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1982,7 +2103,8 @@ class ModelFilterGUI(ctk.CTk):
 
     def _create_model_lists(self):
         """Create the synchronized model list panel."""
-        self.model_list_panel = SyncModelListPanel(
+        # Use the virtual list implementation for performance
+        self.model_list_panel = VirtualSyncModelLists(
             self,
             on_model_click=self._on_model_clicked,
             on_model_right_click=self._on_model_right_clicked,
@@ -2378,12 +2500,11 @@ class ModelFilterGUI(ctk.CTk):
                 self.filter_engine.preview_pattern(pattern, rule_type, self.models)
             )
 
-        # Highlight affected models
+        # Highlight affected models using new virtual list API
         if affected:
-            # Create temporary statuses for preview
-            for model_id in affected:
-                if model_id in self.model_list_panel.right_items:
-                    self.model_list_panel.right_items[model_id].set_highlighted(True)
+            affected_set = set(affected)
+            self.model_list_panel.left_list.highlight_models(affected_set)
+            self.model_list_panel.right_list.highlight_models(affected_set)
 
             # Scroll to first affected
             self.model_list_panel.scroll_to_affected(affected)
