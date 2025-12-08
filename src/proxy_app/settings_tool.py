@@ -199,13 +199,13 @@ class RotationModeManager:
 
     def get_default_mode(self, provider: str) -> str:
         """Get the default rotation mode for a provider"""
-        # Import here to avoid circular imports
         try:
-            from rotator_library.providers.provider_interface import (
-                ProviderInterface,
-            )
+            from rotator_library.providers import PROVIDER_PLUGINS
 
-            return ProviderInterface.get_rotation_mode(provider)
+            provider_class = PROVIDER_PLUGINS.get(provider.lower())
+            if provider_class and hasattr(provider_class, "default_rotation_mode"):
+                return provider_class.default_rotation_mode
+            return "balanced"
         except ImportError:
             # Fallback defaults if import fails
             if provider.lower() == "antigravity":
@@ -527,6 +527,9 @@ class SettingsTool:
                 with open(env_file, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
+                        # Skip comments and empty lines
+                        if not line or line.startswith("#"):
+                            continue
                         if (
                             "_API_KEY" in line
                             and "PROXY_API_KEY" not in line
@@ -538,7 +541,7 @@ class SettingsTool:
                 pass
 
         # Also check for OAuth providers from files
-        oauth_dir = Path("oauth_credentials")
+        oauth_dir = Path("oauth_creds")
         if oauth_dir.exists():
             for file in oauth_dir.glob("*_oauth_*.json"):
                 provider = file.name.split("_oauth_")[0]
