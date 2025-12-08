@@ -2424,7 +2424,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 elif first_func_in_msg:
                     # Only add bypass to the first function call if no sig available
                     func_part["thoughtSignature"] = "skip_thought_signature_validator"
-                    lib_logger.warning(
+                    lib_logger.debug(
                         f"Missing thoughtSignature for first func call {tool_id}, using bypass"
                     )
                 # Subsequent parallel calls: no signature field at all
@@ -3405,7 +3405,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         }
 
         self._thinking_cache.store(cache_key, json.dumps(data))
-        lib_logger.info(f"Cached thinking: {cache_key[:50]}...")
+        lib_logger.debug(f"Cached thinking: {cache_key[:50]}...")
 
     # =========================================================================
     # PROVIDER INTERFACE IMPLEMENTATION

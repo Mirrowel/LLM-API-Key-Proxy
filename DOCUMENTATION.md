@@ -935,4 +935,177 @@ To facilitate robust debugging, the proxy includes a comprehensive transaction l
 
 This level of detail allows developers to trace exactly why a request failed or why a specific key was rotated.
 
+---
+
+## 5. Runtime Resilience
+
+The proxy is engineered to maintain high availability even in the face of runtime filesystem disruptions. This "Runtime Resilience" capability ensures that the service continues to process API requests even if data files or directories are deleted while the application is running.
+
+### 5.1. Centralized Resilient I/O (`resilient_io.py`)
+
+All file operations are centralized in a single utility module that provides consistent error handling, graceful degradation, and automatic retry with shutdown flush:
+
+#### `BufferedWriteRegistry` (Singleton)
+
+Global registry for buffered writes with periodic retry and shutdown flush. Ensures critical data is saved even if disk writes fail temporarily:
+
+- **Per-file buffering**: Each file path has its own pending write (latest data always wins)
+- **Periodic retries**: Background thread retries failed writes every 30 seconds
+- **Shutdown flush**: `atexit` hook ensures final write attempt on app exit (Ctrl+C)
+- **Thread-safe**: Safe for concurrent access from multiple threads
+
+```python
+# Get the singleton instance
+registry = BufferedWriteRegistry.get_instance()
+
+# Check pending writes (for monitoring)
+pending_count = registry.get_pending_count()
+pending_files = registry.get_pending_paths()
+
+# Manual flush (optional - atexit handles this automatically)
+results = registry.flush_all()  # Returns {path: success_bool}
+
+# Manual shutdown (if needed before atexit)
+results = registry.shutdown()
+```
+
+#### `ResilientStateWriter`
+
+For stateful files that must persist (usage stats):
+- **Memory-first**: Always updates in-memory state before attempting disk write
+- **Atomic writes**: Uses tempfile + move pattern to prevent corruption
+- **Automatic retry with backoff**: If disk fails, waits `retry_interval` seconds before trying again
+- **Shutdown integration**: Registers with `BufferedWriteRegistry` on failure for final flush
+- **Health monitoring**: Exposes `is_healthy` property for monitoring
+
+```python
+writer = ResilientStateWriter("data.json", logger, retry_interval=30.0)
+writer.write({"key": "value"})  # Always succeeds (memory update)
+if not writer.is_healthy:
+    logger.warning("Disk writes failing, data in memory only")
+# On next write() call after retry_interval, disk write is attempted again
+# On app exit (Ctrl+C), BufferedWriteRegistry attempts final save
+```
+
+#### `safe_write_json()`
+
+For JSON writes with configurable options (credentials, cache):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | required | File path to write to |
+| `data` | required | JSON-serializable data |
+| `logger` | required | Logger for warnings |
+| `atomic` | `True` | Use atomic write pattern (tempfile + move) |
+| `indent` | `2` | JSON indentation level |
+| `ensure_ascii` | `True` | Escape non-ASCII characters |
+| `secure_permissions` | `False` | Set file permissions to 0o600 |
+| `buffer_on_failure` | `False` | Register with BufferedWriteRegistry on failure |
+
+When `buffer_on_failure=True`:
+- Failed writes are registered with `BufferedWriteRegistry`
+- Data is retried every 30 seconds in background
+- On app exit, final write attempt is made automatically
+- Success unregisters the pending write
+
+```python
+# For critical data (auth tokens) - use buffer_on_failure
+safe_write_json(path, creds, logger, secure_permissions=True, buffer_on_failure=True)
+
+# For non-critical data (logs) - no buffering needed
+safe_write_json(path, data, logger)
+```
+
+#### `safe_log_write()`
+
+For log files where occasional loss is acceptable:
+- Fire-and-forget pattern
+- Creates parent directories if needed
+- Returns `True`/`False`, never raises
+- **No buffering** - logs are dropped on failure
+
+#### `safe_mkdir()`
+
+For directory creation with error handling.
+
+### 5.2. Resilience Hierarchy
+
+The system follows a strict hierarchy of survival:
+
+1. **Core API Handling (Level 1)**: The Python runtime keeps all necessary code in memory. Deleting source code files while the proxy is running will **not** crash active requests.
+
+2. **Credential Management (Level 2)**: OAuth tokens are cached in memory first. If credential files are deleted, the proxy continues using cached tokens. If a token refresh succeeds but the file cannot be written, the new token is buffered for retry and saved on shutdown.
+
+3. **Usage Tracking (Level 3)**: Usage statistics (`key_usage.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
+
+4. **Provider Cache (Level 4)**: The provider cache tracks disk health and continues operating in memory-only mode if disk writes fail. Has its own shutdown mechanism.
+
+5. **Logging (Level 5)**: Logging is treated as non-critical. If the `logs/` directory is removed, the system attempts to recreate it. If creation fails, logging degrades gracefully without interrupting the request flow. **No buffering or retry**.
+
+### 5.3. Component Integration
+
+| Component | Utility Used | Behavior on Disk Failure | Shutdown Flush |
+|-----------|--------------|--------------------------|----------------|
+| `UsageManager` | `ResilientStateWriter` | Continues in memory, retries after 30s | Yes (via registry) |
+| `GoogleOAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `QwenAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `IFlowAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `ProviderCache` | `safe_write_json` + own shutdown | Retries via own background loop | Yes (own mechanism) |
+| `DetailedLogger` | `safe_write_json` | Logs dropped, no crash | No |
+| `failure_logger` | Python `logging.RotatingFileHandler` | Falls back to NullHandler | No |
+
+### 5.4. Shutdown Behavior
+
+When the application exits (including Ctrl+C):
+
+1. **atexit handler fires**: `BufferedWriteRegistry._atexit_handler()` is called
+2. **Pending writes counted**: Registry checks how many files have pending writes
+3. **Flush attempted**: Each pending file gets a final write attempt
+4. **Results logged**:
+   - Success: `"Shutdown flush: all N write(s) succeeded"`
+   - Partial: `"Shutdown flush: X succeeded, Y failed"` with failed file names
+
+**Console output example:**
+```
+INFO:rotator_library.resilient_io:Flushing 2 pending write(s) on shutdown...
+INFO:rotator_library.resilient_io:Shutdown flush: all 2 write(s) succeeded
+```
+
+### 5.5. "Develop While Running"
+
+This architecture supports a robust development workflow:
+
+- **Log Cleanup**: You can safely run `rm -rf logs/` while the proxy is serving traffic. The system will recreate the directory structure on the next request.
+- **Config Reset**: Deleting `key_usage.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
+- **File Recovery**: If you delete a critical file, the system attempts directory auto-recreation before every write operation.
+- **Safe Exit**: Ctrl+C triggers graceful shutdown with final data flush attempt.
+
+### 5.6. Graceful Degradation & Data Loss
+
+While functionality is preserved, persistence may be compromised during filesystem failures:
+
+- **Logs**: If disk writes fail, detailed request logs may be lost (no buffering).
+- **Usage Stats**: Buffered in memory and flushed on shutdown. Data loss only if shutdown flush also fails.
+- **Credentials**: Buffered in memory and flushed on shutdown. Re-authentication only needed if shutdown flush fails.
+- **Cache**: Provider cache entries may need to be regenerated after restart if its own shutdown mechanism fails.
+
+### 5.7. Monitoring Disk Health
+
+Components expose health information for monitoring:
+
+```python
+# BufferedWriteRegistry
+registry = BufferedWriteRegistry.get_instance()
+pending = registry.get_pending_count()  # Number of files with pending writes
+files = registry.get_pending_paths()    # List of pending file names
+
+# UsageManager
+writer = usage_manager._state_writer
+health = writer.get_health_info()
+# Returns: {"healthy": True, "failure_count": 0, "last_success": 1234567890.0, ...}
+
+# ProviderCache
+stats = cache.get_stats()
+# Includes: {"disk_available": True, "disk_errors": 0, ...}
+```
 

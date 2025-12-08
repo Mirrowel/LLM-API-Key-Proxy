@@ -6,36 +6,39 @@ from datetime import datetime
 from .error_handler import mask_credential
 
 
+class JsonFormatter(logging.Formatter):
+    """Custom JSON formatter for structured logs."""
+
+    def format(self, record):
+        # The message is already a dict, so we just format it as a JSON string
+        return json.dumps(record.msg)
+
+
 def setup_failure_logger():
     """Sets up a dedicated JSON logger for writing detailed failure logs to a file."""
     log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-
-    # Create a logger specifically for failures.
-    # This logger will NOT propagate to the root logger.
     logger = logging.getLogger("failure_logger")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Use a rotating file handler
-    handler = RotatingFileHandler(
-        os.path.join(log_dir, "failures.log"),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=2,
-    )
+    # Clear existing handlers to prevent duplicates on re-setup
+    logger.handlers.clear()
 
-    # Custom JSON formatter for structured logs
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            # The message is already a dict, so we just format it as a JSON string
-            return json.dumps(record.msg)
+    try:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
 
-    handler.setFormatter(JsonFormatter())
-
-    # Add handler only if it hasn't been added before
-    if not logger.handlers:
+        handler = RotatingFileHandler(
+            os.path.join(log_dir, "failures.log"),
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=2,
+        )
+        handler.setFormatter(JsonFormatter())
         logger.addHandler(handler)
+    except (OSError, PermissionError, IOError) as e:
+        logging.warning(f"Cannot create failure log file handler: {e}")
+        # Add NullHandler to prevent "no handlers" warning
+        logger.addHandler(logging.NullHandler())
 
     return logger
 
@@ -145,11 +148,19 @@ def log_failure(
         "request_headers": request_headers,
         "error_chain": error_chain if len(error_chain) > 1 else None,
     }
-    failure_logger.error(detailed_log_data)
 
     # 2. Log a concise summary to the main library logger, which will propagate
     summary_message = (
         f"API call failed for model {model} with key {mask_credential(api_key)}. "
         f"Error: {type(error).__name__}. See failures.log for details."
     )
+
+    # Log to failure logger with resilience - if it fails, just continue
+    try:
+        failure_logger.error(detailed_log_data)
+    except (OSError, IOError) as e:
+        # Log file write failed - log to console instead
+        logging.warning(f"Failed to write to failures.log: {e}")
+
+    # Console log always succeeds
     main_lib_logger.error(summary_message)

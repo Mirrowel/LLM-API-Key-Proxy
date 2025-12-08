@@ -9,8 +9,6 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Dict, Any
-import tempfile
-import shutil
 
 import httpx
 from rich.console import Console
@@ -20,6 +18,7 @@ from rich.markup import escape as rich_escape
 
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
+from ..utils.resilient_io import safe_write_json
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -228,17 +227,7 @@ class GoogleOAuthBase:
                         f"Environment variables for {self.ENV_PREFIX} credential index {credential_index} not found"
                     )
 
-            # For file paths, first try loading from legacy env vars (for backwards compatibility)
-            env_creds = self._load_from_env()
-            if env_creds:
-                lib_logger.info(
-                    f"Using {self.ENV_PREFIX} credentials from environment variables"
-                )
-                # Cache env-based credentials using the path as key
-                self._credentials_cache[path] = env_creds
-                return env_creds
-
-            # Fall back to file-based loading
+            # Try file-based loading first (preferred for explicit file paths)
             try:
                 lib_logger.debug(
                     f"Loading {self.ENV_PREFIX} credentials from file: {path}"
@@ -251,6 +240,15 @@ class GoogleOAuthBase:
                 self._credentials_cache[path] = creds
                 return creds
             except FileNotFoundError:
+                # File not found - fall back to legacy env vars for backwards compatibility
+                # This handles the case where only env vars are set and file paths are placeholders
+                env_creds = self._load_from_env()
+                if env_creds:
+                    lib_logger.info(
+                        f"File '{path}' not found, using {self.ENV_PREFIX} credentials from environment variables"
+                    )
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
                 raise IOError(
                     f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'"
                 )
@@ -258,70 +256,29 @@ class GoogleOAuthBase:
                 raise IOError(
                     f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
                 )
-            except Exception as e:
-                raise IOError(
-                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
-                )
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
+        """Save credentials with in-memory fallback if disk unavailable."""
+        # Always update cache first (memory is reliable)
+        self._credentials_cache[path] = creds
+
         # Don't save to file if credentials were loaded from environment
         if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
             lib_logger.debug("Credentials loaded from env, skipping file save")
-            # Still update cache for in-memory consistency
-            self._credentials_cache[path] = creds
             return
 
-        # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
-        # This prevents credential corruption if the process is interrupted during write
-        parent_dir = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent_dir, exist_ok=True)
-
-        tmp_fd = None
-        tmp_path = None
-        try:
-            # Create temp file in same directory as target (ensures same filesystem)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
-            )
-
-            # Write JSON to temp file
-            with os.fdopen(tmp_fd, "w") as f:
-                json.dump(creds, f, indent=2)
-                tmp_fd = None  # fdopen closes the fd
-
-            # Set secure permissions (0600 = owner read/write only)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except (OSError, AttributeError):
-                # Windows may not support chmod, ignore
-                pass
-
-            # Atomic move (overwrites target if it exists)
-            shutil.move(tmp_path, path)
-            tmp_path = None  # Successfully moved
-
-            # Update cache AFTER successful file write (prevents cache/file inconsistency)
-            self._credentials_cache[path] = creds
+        # Attempt disk write - if it fails, we still have the cache
+        # buffer_on_failure ensures data is retried periodically and saved on shutdown
+        if safe_write_json(
+            path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
+        ):
             lib_logger.debug(
-                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}' (atomic write)."
+                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'."
             )
-
-        except Exception as e:
-            lib_logger.error(
-                f"Failed to save updated {self.ENV_PREFIX} OAuth credentials to '{path}': {e}"
+        else:
+            lib_logger.warning(
+                f"Credentials for {self.ENV_PREFIX} cached in memory only (buffered for retry)."
             )
-            # Clean up temp file if it still exists
-            if tmp_fd is not None:
-                try:
-                    os.close(tmp_fd)
-                except:
-                    pass
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-            raise
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         expiry = creds.get("token_expiry")  # gcloud format
@@ -626,32 +583,32 @@ class GoogleOAuthBase:
                     return
 
                 try:
-                    # Perform the actual refresh (still using per-credential lock)
-                    async with await self._get_lock(path):
-                        # Re-check if still expired (may have changed since queueing)
-                        creds = self._credentials_cache.get(path)
-                        if creds and not self._is_token_expired(creds):
-                            # No longer expired, mark as available
-                            async with self._queue_tracking_lock:
-                                self._unavailable_credentials.pop(path, None)
-                                lib_logger.debug(
-                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
-                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                                )
-                            continue
-
-                        # Perform refresh
-                        if not creds:
-                            creds = await self._load_credentials(path)
-                        await self._refresh_token(path, creds, force=force)
-
-                        # SUCCESS: Mark as available again
+                    # Quick check if still expired (optimization to avoid unnecessary refresh)
+                    # Note: _refresh_token() will do its own locking and expiry check
+                    creds = self._credentials_cache.get(path)
+                    if creds and not self._is_token_expired(creds):
+                        # No longer expired, mark as available
                         async with self._queue_tracking_lock:
                             self._unavailable_credentials.pop(path, None)
                             lib_logger.debug(
-                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Credential '{Path(path).name}' no longer expired, marked available. "
                                 f"Remaining unavailable: {len(self._unavailable_credentials)}"
                             )
+                        continue
+
+                    # Perform refresh - _refresh_token handles its own locking
+                    # DO NOT acquire lock here as _refresh_token also acquires it (would deadlock)
+                    if not creds:
+                        creds = await self._load_credentials(path)
+                    await self._refresh_token(path, creds, force=force)
+
+                    # SUCCESS: Mark as available again
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
 
                 finally:
                     # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
@@ -940,10 +897,34 @@ class GoogleOAuthBase:
             )
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path, creds)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
+        """Get auth header with graceful degradation if refresh fails."""
+        try:
+            creds = await self._load_credentials(credential_path)
+            if self._is_token_expired(creds):
+                try:
+                    creds = await self._refresh_token(credential_path, creds)
+                except Exception as e:
+                    # Check if we have a cached token that might still work
+                    cached = self._credentials_cache.get(credential_path)
+                    if cached and cached.get("access_token"):
+                        lib_logger.warning(
+                            f"Token refresh failed for {Path(credential_path).name}: {e}. "
+                            "Using cached token (may be expired)."
+                        )
+                        creds = cached
+                    else:
+                        raise
+            return {"Authorization": f"Bearer {creds['access_token']}"}
+        except Exception as e:
+            # Check if any cached credential exists as last resort
+            cached = self._credentials_cache.get(credential_path)
+            if cached and cached.get("access_token"):
+                lib_logger.error(
+                    f"Credential load failed for {credential_path}: {e}. "
+                    "Using stale cached token as last resort."
+                )
+                return {"Authorization": f"Bearer {cached['access_token']}"}
+            raise
 
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
