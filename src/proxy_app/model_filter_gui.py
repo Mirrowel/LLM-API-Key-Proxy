@@ -1078,7 +1078,6 @@ class VirtualModelList:
 
         # UI state
         self._hover_index: Optional[int] = None
-        self._scroll_position: float = 0.0
 
         # Create container frame
         self.frame = ctk.CTkFrame(parent, fg_color=BG_TERTIARY, corner_radius=6)
@@ -1182,6 +1181,7 @@ class VirtualModelList:
         target_scroll = max(0, min(1, target_scroll))
 
         self.canvas.yview_moveto(target_scroll)
+        self._render()
 
     def _update_scroll_region(self):
         """Update the scrollable region based on item count."""
@@ -1194,9 +1194,8 @@ class VirtualModelList:
         self._render()
 
     def _on_canvas_scroll(self, first: float, last: float):
-        """Handle canvas scroll update."""
+        """Handle canvas scroll update - just update scrollbar."""
         self.scrollbar.set(first, last)
-        self._scroll_position = float(first)
 
     def _on_configure(self, event=None):
         """Handle canvas resize."""
@@ -1212,20 +1211,14 @@ class VirtualModelList:
 
     def _get_index_at_y(self, y: int) -> Optional[int]:
         """Get the model index at a y coordinate."""
-        # Adjust for scroll position
-        canvas_height = self.canvas.winfo_height()
-        total_height = len(self.filtered_models) * ITEM_HEIGHT
-
-        if total_height == 0:
+        if not self.filtered_models:
             return None
 
-        # Get scroll offset in pixels
-        scroll_offset = self._scroll_position * total_height
+        # Convert window y coordinate to canvas (scrollregion) coordinate
+        canvas_y = self.canvas.canvasy(y)
 
-        # Calculate actual y in the virtual list
-        actual_y = scroll_offset + y
-
-        index = int(actual_y // ITEM_HEIGHT)
+        # Calculate index from absolute position
+        index = int(canvas_y // ITEM_HEIGHT)
 
         if 0 <= index < len(self.filtered_models):
             return index
@@ -1278,8 +1271,9 @@ class VirtualModelList:
         canvas_width = self.canvas.winfo_width()
         total_height = len(self.filtered_models) * ITEM_HEIGHT
 
-        # Calculate visible range
-        scroll_offset = self._scroll_position * total_height
+        # Calculate visible range based on scroll position
+        scroll_position = self.canvas.yview()[0]
+        scroll_offset = scroll_position * total_height
         first_visible = int(scroll_offset // ITEM_HEIGHT)
         visible_count = int(canvas_height // ITEM_HEIGHT) + 2  # +2 for partial rows
 
@@ -1287,7 +1281,8 @@ class VirtualModelList:
         first_visible = max(0, first_visible)
         last_visible = min(len(self.filtered_models), first_visible + visible_count)
 
-        # Draw visible items
+        # Draw visible items at ABSOLUTE positions
+        # The canvas scrollregion + yview handles showing the correct portion
         for i in range(first_visible, last_visible):
             model_id = self.filtered_models[i]
             status = self.statuses.get(
@@ -1295,8 +1290,8 @@ class VirtualModelList:
                 ModelStatus(model_id=model_id, status="normal", color=NORMAL_COLOR),
             )
 
-            # Calculate y position relative to canvas
-            y = (i * ITEM_HEIGHT) - scroll_offset
+            # Absolute y position in the virtual list
+            y = i * ITEM_HEIGHT
             y_center = y + ITEM_HEIGHT // 2
 
             # Background for hover/highlight
@@ -1343,12 +1338,14 @@ class VirtualModelList:
             )
 
     def get_scroll_position(self) -> float:
-        """Get current scroll position (0-1)."""
-        return self._scroll_position
+        """Get current scroll position (0-1) directly from canvas."""
+        return self.canvas.yview()[0]
 
-    def set_scroll_position(self, pos: float):
-        """Set scroll position (0-1) without triggering render (for sync)."""
+    def set_scroll_position(self, pos: float, render: bool = True):
+        """Set scroll position (0-1) and optionally render."""
         self.canvas.yview_moveto(pos)
+        if render:
+            self._render()
 
 
 class VirtualSyncModelLists(ctk.CTkFrame):
@@ -1476,10 +1473,9 @@ class VirtualSyncModelLists(ctk.CTkFrame):
                 return
             self._syncing_scroll = True
             original_left_scroll(*args)
-            # Sync to right
+            # Sync to right - get position after scroll completed
             pos = self.left_list.get_scroll_position()
             self.right_list.set_scroll_position(pos)
-            self.right_list._render()
             self._syncing_scroll = False
 
         def sync_scroll_right(*args):
@@ -1487,10 +1483,9 @@ class VirtualSyncModelLists(ctk.CTkFrame):
                 return
             self._syncing_scroll = True
             original_right_scroll(*args)
-            # Sync to left
+            # Sync to left - get position after scroll completed
             pos = self.right_list.get_scroll_position()
             self.left_list.set_scroll_position(pos)
-            self.left_list._render()
             self._syncing_scroll = False
 
         def sync_wheel_left(event):
@@ -1498,10 +1493,9 @@ class VirtualSyncModelLists(ctk.CTkFrame):
                 return "break"
             self._syncing_scroll = True
             original_left_wheel(event)
-            # Sync to right
+            # Sync to right - get position after scroll completed
             pos = self.left_list.get_scroll_position()
             self.right_list.set_scroll_position(pos)
-            self.right_list._render()
             self._syncing_scroll = False
             return "break"
 
@@ -1510,15 +1504,22 @@ class VirtualSyncModelLists(ctk.CTkFrame):
                 return "break"
             self._syncing_scroll = True
             original_right_wheel(event)
-            # Sync to left
+            # Sync to left - get position after scroll completed
             pos = self.right_list.get_scroll_position()
             self.left_list.set_scroll_position(pos)
-            self.left_list._render()
             self._syncing_scroll = False
             return "break"
 
+        # Override the method references
         self.left_list._on_scroll = sync_scroll_left
         self.right_list._on_scroll = sync_scroll_right
+
+        # IMPORTANT: Reconfigure scrollbars to use the new sync handlers
+        # The scrollbars were created with command=_on_scroll before we overrode it
+        self.left_list.scrollbar.configure(command=sync_scroll_left)
+        self.right_list.scrollbar.configure(command=sync_scroll_right)
+
+        # Rebind mouse wheel events
         self.left_list.canvas.bind("<MouseWheel>", sync_wheel_left)
         self.right_list.canvas.bind("<MouseWheel>", sync_wheel_right)
 
@@ -1583,7 +1584,6 @@ class VirtualSyncModelLists(ctk.CTkFrame):
             # Sync right list scroll
             pos = self.left_list.get_scroll_position()
             self.right_list.set_scroll_position(pos)
-            self.right_list._render()
 
     def highlight_model(self, model_id: str):
         """Highlight a specific model."""
@@ -1602,7 +1602,6 @@ class VirtualSyncModelLists(ctk.CTkFrame):
             self.left_list.scroll_to_model(affected_models[0])
             pos = self.left_list.get_scroll_position()
             self.right_list.set_scroll_position(pos)
-            self.right_list._render()
 
     def get_model_at_position(self, model_id: str) -> Optional[ModelStatus]:
         """Get the status of a model."""
