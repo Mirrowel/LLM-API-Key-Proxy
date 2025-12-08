@@ -1609,6 +1609,415 @@ class VirtualSyncModelLists(ctk.CTkFrame):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# VIRTUAL RULE LIST (Canvas-based for performance)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Constants for virtual rule list
+RULE_ITEM_HEIGHT = 32  # Height of each rule row
+RULE_DELETE_WIDTH = 24  # Width of delete button area
+RULE_COUNT_WIDTH = 40  # Width of count area
+RULE_PADDING = 8  # Horizontal padding
+
+
+class VirtualRuleList:
+    """
+    High-performance virtual list for filter rules.
+
+    Uses a raw tkinter Canvas to draw rules directly rather than
+    creating individual widgets per row.
+    """
+
+    def __init__(
+        self,
+        parent,
+        rule_type: str,  # 'ignore' or 'whitelist'
+        on_rule_click: Callable[[FilterRule], None],
+        on_rule_delete: Callable[[str], None],
+    ):
+        self.parent = parent
+        self.rule_type = rule_type
+        self.on_rule_click = on_rule_click
+        self.on_rule_delete = on_rule_delete
+
+        # Data
+        self.rules: List[FilterRule] = []
+        self.highlighted_pattern: Optional[str] = None
+
+        # UI state
+        self._hover_index: Optional[int] = None
+        self._hover_delete: bool = False  # True if hovering over delete button
+
+        # Tooltip state
+        self._tooltip_window = None
+        self._tooltip_after_id = None
+        self._tooltip_rule_index: Optional[int] = None
+
+        # Create container frame
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+        # Create canvas
+        import tkinter as tk
+
+        self.canvas = tk.Canvas(
+            self.frame,
+            bg=BG_SECONDARY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Scrollbar
+        self.scrollbar = ctk.CTkScrollbar(self.frame, command=self._on_scroll)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Link canvas to scrollbar
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
+
+        # Bind events
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-1>", self._on_left_click)
+        self.canvas.bind("<Motion>", self._on_mouse_motion)
+        self.canvas.bind("<Leave>", self._on_mouse_leave)
+
+    def pack(self, **kwargs):
+        """Pack the container frame."""
+        self.frame.pack(**kwargs)
+
+    def set_rules(self, rules: List[FilterRule]):
+        """Set the rules to display."""
+        self.rules = rules
+        self._update_scroll_region()
+        self._render()
+
+    def add_rule(self, rule: FilterRule):
+        """Add a rule to the list."""
+        # Check for duplicates
+        if any(r.pattern == rule.pattern for r in self.rules):
+            return
+        self.rules.append(rule)
+        self._update_scroll_region()
+        self._render()
+
+    def remove_rule(self, pattern: str):
+        """Remove a rule by pattern."""
+        self.rules = [r for r in self.rules if r.pattern != pattern]
+        self._update_scroll_region()
+        self._render()
+
+    def update_rule_counts(self, rules: List[FilterRule]):
+        """Update affected counts from new rule data."""
+        rule_map = {r.pattern: r for r in rules}
+        for rule in self.rules:
+            if rule.pattern in rule_map:
+                rule.affected_count = rule_map[rule.pattern].affected_count
+                rule.affected_models = rule_map[rule.pattern].affected_models
+        self._render()
+
+    def highlight_rule(self, pattern: Optional[str]):
+        """Highlight a specific rule."""
+        self.highlighted_pattern = pattern
+        if pattern:
+            self._scroll_to_rule(pattern)
+        self._render()
+
+    def clear_highlights(self):
+        """Clear all highlights."""
+        self.highlighted_pattern = None
+        self._render()
+
+    def clear_all(self):
+        """Remove all rules."""
+        self.rules = []
+        self._update_scroll_region()
+        self._render()
+
+    def _scroll_to_rule(self, pattern: str):
+        """Scroll to make a rule visible."""
+        for i, rule in enumerate(self.rules):
+            if rule.pattern == pattern:
+                total_height = len(self.rules) * RULE_ITEM_HEIGHT
+                canvas_height = self.canvas.winfo_height()
+
+                if total_height <= canvas_height:
+                    return
+
+                item_y = i * RULE_ITEM_HEIGHT
+                target_scroll = (
+                    item_y - canvas_height / 2 + RULE_ITEM_HEIGHT / 2
+                ) / total_height
+                target_scroll = max(0, min(1, target_scroll))
+
+                self.canvas.yview_moveto(target_scroll)
+                self._render()
+                return
+
+    def _update_scroll_region(self):
+        """Update the scrollable region."""
+        total_height = max(len(self.rules) * RULE_ITEM_HEIGHT, 1)
+        self.canvas.configure(scrollregion=(0, 0, 100, total_height))
+
+    def _on_scroll(self, *args):
+        """Handle scrollbar command."""
+        self.canvas.yview(*args)
+        self._render()
+
+    def _on_canvas_scroll(self, first: float, last: float):
+        """Handle canvas scroll update."""
+        self.scrollbar.set(first, last)
+
+    def _on_configure(self, event=None):
+        """Handle canvas resize."""
+        self._update_scroll_region()
+        self._render()
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling."""
+        delta = -1 * (event.delta // 120)
+        self.canvas.yview_scroll(delta, "units")
+        self._render()
+        return "break"
+
+    def _get_index_at_y(self, y: int) -> Optional[int]:
+        """Get the rule index at a y coordinate."""
+        if not self.rules:
+            return None
+
+        canvas_y = self.canvas.canvasy(y)
+        index = int(canvas_y // RULE_ITEM_HEIGHT)
+
+        if 0 <= index < len(self.rules):
+            return index
+        return None
+
+    def _is_over_delete(self, x: int) -> bool:
+        """Check if x coordinate is over the delete button."""
+        canvas_width = self.canvas.winfo_width()
+        delete_start = canvas_width - RULE_DELETE_WIDTH - RULE_PADDING
+        return x >= delete_start
+
+    def _on_left_click(self, event):
+        """Handle left click."""
+        index = self._get_index_at_y(event.y)
+        if index is None:
+            return
+
+        rule = self.rules[index]
+
+        if self._is_over_delete(event.x):
+            # Click on delete button
+            self.on_rule_delete(rule.pattern)
+        else:
+            # Click on rule
+            self.on_rule_click(rule)
+
+    def _on_mouse_motion(self, event):
+        """Handle mouse motion for hover effect."""
+        new_hover = self._get_index_at_y(event.y)
+        new_hover_delete = (
+            self._is_over_delete(event.x) if new_hover is not None else False
+        )
+
+        if new_hover != self._hover_index or new_hover_delete != self._hover_delete:
+            self._hover_index = new_hover
+            self._hover_delete = new_hover_delete
+            self._render()
+
+        # Handle tooltip
+        if new_hover != self._tooltip_rule_index:
+            self._hide_tooltip()
+            if new_hover is not None and not new_hover_delete:
+                self._schedule_tooltip(new_hover)
+
+    def _on_mouse_leave(self, event):
+        """Handle mouse leaving canvas."""
+        if self._hover_index is not None:
+            self._hover_index = None
+            self._hover_delete = False
+            self._render()
+        self._hide_tooltip()
+
+    def _schedule_tooltip(self, index: int):
+        """Schedule tooltip to appear."""
+        self._tooltip_rule_index = index
+        self._tooltip_after_id = self.canvas.after(
+            500, lambda: self._show_tooltip(index)
+        )
+
+    def _show_tooltip(self, index: int):
+        """Show tooltip for a rule."""
+        if index != self._tooltip_rule_index or index >= len(self.rules):
+            return
+
+        rule = self.rules[index]
+
+        # Build tooltip text
+        if rule.affected_models:
+            if len(rule.affected_models) <= 5:
+                models_text = "\n".join(rule.affected_models)
+            else:
+                models_text = "\n".join(rule.affected_models[:5])
+                models_text += f"\n... and {len(rule.affected_models) - 5} more"
+            text = f"Matches:\n{models_text}"
+        else:
+            text = "No models match this pattern"
+
+        # Position tooltip
+        x = self.canvas.winfo_rootx() + 20
+        y = (
+            self.canvas.winfo_rooty()
+            + int(self.canvas.canvasy(0))
+            + (index + 1) * RULE_ITEM_HEIGHT
+        )
+
+        # Create tooltip window
+        self._tooltip_window = tw = ctk.CTkToplevel(self.canvas)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.configure(fg_color=BG_SECONDARY)
+
+        frame = ctk.CTkFrame(
+            tw,
+            fg_color=BG_SECONDARY,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            corner_radius=6,
+        )
+        frame.pack(fill="both", expand=True)
+
+        label = ctk.CTkLabel(
+            frame,
+            text=text,
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            text_color=TEXT_SECONDARY,
+            padx=10,
+            pady=5,
+        )
+        label.pack()
+        tw.lift()
+
+    def _hide_tooltip(self):
+        """Hide the tooltip."""
+        if self._tooltip_after_id:
+            self.canvas.after_cancel(self._tooltip_after_id)
+            self._tooltip_after_id = None
+        if self._tooltip_window:
+            self._tooltip_window.destroy()
+            self._tooltip_window = None
+        self._tooltip_rule_index = None
+
+    def _render(self):
+        """Render only the visible rules."""
+        self.canvas.delete("all")
+
+        if not self.rules:
+            # Show empty state
+            canvas_height = self.canvas.winfo_height()
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2,
+                canvas_height // 2,
+                text="No rules configured\nAdd patterns below",
+                fill=TEXT_MUTED,
+                font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                justify="center",
+            )
+            return
+
+        canvas_height = self.canvas.winfo_height()
+        canvas_width = self.canvas.winfo_width()
+        total_height = len(self.rules) * RULE_ITEM_HEIGHT
+
+        # Calculate visible range
+        scroll_position = self.canvas.yview()[0]
+        scroll_offset = scroll_position * total_height
+        first_visible = int(scroll_offset // RULE_ITEM_HEIGHT)
+        visible_count = int(canvas_height // RULE_ITEM_HEIGHT) + 2
+
+        first_visible = max(0, first_visible)
+        last_visible = min(len(self.rules), first_visible + visible_count)
+
+        # Draw visible rules
+        for i in range(first_visible, last_visible):
+            rule = self.rules[i]
+
+            # Absolute y position
+            y = i * RULE_ITEM_HEIGHT
+            y_center = y + RULE_ITEM_HEIGHT // 2
+
+            # Background
+            is_highlighted = rule.pattern == self.highlighted_pattern
+            is_hovered = i == self._hover_index
+
+            if is_highlighted:
+                # Highlighted - use rule color for border effect
+                self.canvas.create_rectangle(
+                    2,
+                    y + 2,
+                    canvas_width - 2,
+                    y + RULE_ITEM_HEIGHT - 2,
+                    fill=BG_TERTIARY,
+                    outline=rule.color,
+                    width=2,
+                )
+            elif is_hovered:
+                self.canvas.create_rectangle(
+                    2,
+                    y + 2,
+                    canvas_width - 2,
+                    y + RULE_ITEM_HEIGHT - 2,
+                    fill=BG_HOVER,
+                    outline=BORDER_COLOR,
+                    width=1,
+                )
+            else:
+                self.canvas.create_rectangle(
+                    2,
+                    y + 2,
+                    canvas_width - 2,
+                    y + RULE_ITEM_HEIGHT - 2,
+                    fill=BG_TERTIARY,
+                    outline=BORDER_COLOR,
+                    width=1,
+                )
+
+            # Pattern text (colored)
+            self.canvas.create_text(
+                RULE_PADDING + 4,
+                y_center,
+                text=rule.pattern,
+                fill=rule.color,
+                font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+                anchor="w",
+            )
+
+            # Count text
+            count_x = canvas_width - RULE_DELETE_WIDTH - RULE_COUNT_WIDTH - RULE_PADDING
+            self.canvas.create_text(
+                count_x,
+                y_center,
+                text=f"({rule.affected_count})",
+                fill=TEXT_MUTED,
+                font=(FONT_FAMILY, FONT_SIZE_SMALL),
+                anchor="w",
+            )
+
+            # Delete button
+            delete_x = (
+                canvas_width - RULE_DELETE_WIDTH - RULE_PADDING + RULE_DELETE_WIDTH // 2
+            )
+            delete_color = (
+                ACCENT_RED if (is_hovered and self._hover_delete) else TEXT_MUTED
+            )
+            self.canvas.create_text(
+                delete_x,
+                y_center,
+                text="×",
+                fill=delete_color,
+                font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # RULE CHIP COMPONENT
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1639,6 +2048,7 @@ class RuleChip(ctk.CTkFrame):
         self.on_delete = on_delete
         self.on_click = on_click
         self._is_highlighted = False
+        self._tooltip = None  # Store tooltip reference to avoid duplicates
 
         self._create_content()
 
@@ -1648,12 +2058,12 @@ class RuleChip(ctk.CTkFrame):
     def _create_content(self):
         """Build chip content."""
         # Container for horizontal layout
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(fill="x", padx=8, pady=6)
+        self.content = ctk.CTkFrame(self, fg_color="transparent")
+        self.content.pack(fill="x", padx=8, pady=6)
 
         # Pattern text (colored)
         self.pattern_label = ctk.CTkLabel(
-            content,
+            self.content,
             text=self.rule.pattern,
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             text_color=self.rule.color,
@@ -1664,7 +2074,7 @@ class RuleChip(ctk.CTkFrame):
 
         # Affected count
         self.count_label = ctk.CTkLabel(
-            content,
+            self.content,
             text=f"({self.rule.affected_count})",
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_MUTED,
@@ -1675,7 +2085,7 @@ class RuleChip(ctk.CTkFrame):
 
         # Delete button
         delete_btn = ctk.CTkButton(
-            content,
+            self.content,
             text="×",
             font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
             fg_color="transparent",
@@ -1688,8 +2098,23 @@ class RuleChip(ctk.CTkFrame):
         )
         delete_btn.pack(side="right")
 
-        # Tooltip showing affected models
+        # Tooltip showing affected models - create once, update later
         self._update_tooltip()
+
+        # Bind tooltip events to child widgets (not delete button)
+        for widget in [self.content, self.pattern_label, self.count_label]:
+            widget.bind("<Enter>", self._on_tooltip_enter)
+            widget.bind("<Leave>", self._on_tooltip_leave)
+
+    def _on_tooltip_enter(self, event=None):
+        """Forward enter event to tooltip."""
+        if self._tooltip:
+            self._tooltip._schedule_show(event)
+
+    def _on_tooltip_leave(self, event=None):
+        """Forward leave event to tooltip."""
+        if self._tooltip:
+            self._tooltip._hide(event)
 
     def _handle_click(self, event=None):
         """Handle click on rule chip."""
@@ -1714,9 +2139,15 @@ class RuleChip(ctk.CTkFrame):
             else:
                 models_text = "\n".join(self.rule.affected_models[:5])
                 models_text += f"\n... and {len(self.rule.affected_models) - 5} more"
-            ToolTip(self, f"Matches:\n{models_text}")
+            text = f"Matches:\n{models_text}"
         else:
-            ToolTip(self, "No models match this pattern")
+            text = "No models match this pattern"
+
+        # Reuse existing tooltip or create new one
+        if self._tooltip is None:
+            self._tooltip = ToolTip(self, text)
+        else:
+            self._tooltip.update_text(text)
 
     def set_highlighted(self, highlighted: bool):
         """Set highlighted state."""
@@ -1736,7 +2167,7 @@ class RulePanel(ctk.CTkFrame):
     """
     Panel containing rule chips, input field, and add button.
 
-    Handles adding and removing rules, with callbacks for changes.
+    Uses VirtualRuleList for high-performance rendering of rules.
     """
 
     def __init__(
@@ -1755,7 +2186,6 @@ class RulePanel(ctk.CTkFrame):
         self.on_rules_changed = on_rules_changed
         self.on_rule_clicked = on_rule_clicked
         self.on_input_changed = on_input_changed
-        self.rule_chips: Dict[str, RuleChip] = {}
 
         self._create_content()
 
@@ -1770,25 +2200,14 @@ class RulePanel(ctk.CTkFrame):
         )
         title_label.pack(anchor="w", padx=12, pady=(12, 8))
 
-        # Rules container (scrollable)
-        self.rules_frame = ctk.CTkScrollableFrame(
+        # Virtual rule list (replaces CTkScrollableFrame + RuleChips)
+        self.rule_list = VirtualRuleList(
             self,
-            fg_color="transparent",
-            height=120,
-            scrollbar_fg_color=BG_TERTIARY,
-            scrollbar_button_color=BORDER_COLOR,
+            rule_type=self.rule_type,
+            on_rule_click=self.on_rule_clicked,
+            on_rule_delete=self._on_rule_delete,
         )
-        self.rules_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-        # Empty state label
-        self.empty_label = ctk.CTkLabel(
-            self.rules_frame,
-            text="No rules configured\nAdd patterns below",
-            font=(FONT_FAMILY, FONT_SIZE_SMALL),
-            text_color=TEXT_MUTED,
-            justify="center",
-        )
-        self.empty_label.pack(expand=True, pady=20)
+        self.rule_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         # Input frame
         input_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -1840,7 +2259,6 @@ class RulePanel(ctk.CTkFrame):
 
     def _emit_add_pattern(self, pattern: str):
         """Emit request to add a pattern (handled by parent)."""
-        # This will be connected to the main window's add method
         if hasattr(self, "_add_pattern_callback"):
             self._add_pattern_callback(pattern)
 
@@ -1849,31 +2267,12 @@ class RulePanel(ctk.CTkFrame):
         self._add_pattern_callback = callback
 
     def add_rule_chip(self, rule: FilterRule):
-        """Add a rule chip to the panel."""
-        if rule.pattern in self.rule_chips:
-            return
-
-        # Hide empty label
-        self.empty_label.pack_forget()
-
-        chip = RuleChip(
-            self.rules_frame,
-            rule,
-            on_delete=self._on_rule_delete,
-            on_click=self.on_rule_clicked,
-        )
-        chip.pack(fill="x", pady=2)
-        self.rule_chips[rule.pattern] = chip
+        """Add a rule to the panel."""
+        self.rule_list.add_rule(rule)
 
     def remove_rule_chip(self, pattern: str):
-        """Remove a rule chip from the panel."""
-        if pattern in self.rule_chips:
-            self.rule_chips[pattern].destroy()
-            del self.rule_chips[pattern]
-
-        # Show empty label if no rules
-        if not self.rule_chips:
-            self.empty_label.pack(expand=True, pady=20)
+        """Remove a rule from the panel."""
+        self.rule_list.remove_rule(pattern)
 
     def _on_rule_delete(self, pattern: str):
         """Handle rule deletion."""
@@ -1885,29 +2284,20 @@ class RulePanel(ctk.CTkFrame):
         self._delete_pattern_callback = callback
 
     def update_rule_counts(self, rules: List[FilterRule], models: List[str]):
-        """Update affected counts for all rule chips."""
-        for rule in rules:
-            if rule.pattern in self.rule_chips:
-                self.rule_chips[rule.pattern].update_count(
-                    rule.affected_count, rule.affected_models
-                )
+        """Update affected counts for all rules."""
+        self.rule_list.update_rule_counts(rules)
 
     def highlight_rule(self, pattern: str):
-        """Highlight a specific rule chip."""
-        for p, chip in self.rule_chips.items():
-            chip.set_highlighted(p == pattern)
+        """Highlight a specific rule and scroll to it."""
+        self.rule_list.highlight_rule(pattern)
 
     def clear_highlights(self):
         """Clear all rule highlights."""
-        for chip in self.rule_chips.values():
-            chip.set_highlighted(False)
+        self.rule_list.clear_highlights()
 
     def clear_all(self):
-        """Remove all rule chips."""
-        for chip in list(self.rule_chips.values()):
-            chip.destroy()
-        self.rule_chips.clear()
-        self.empty_label.pack(expand=True, pady=20)
+        """Remove all rules."""
+        self.rule_list.clear_all()
 
     def get_input_text(self) -> str:
         """Get current input text."""
@@ -2356,7 +2746,8 @@ class ModelFilterGUI(ctk.CTk):
 
     def _on_models_loaded(self, models: List[str]):
         """Handle successful model fetch."""
-        self.models = sorted(models)
+        # Deduplicate while preserving order, then sort
+        self.models = sorted(list(dict.fromkeys(models)))
 
         # Update filter engine counts
         self.filter_engine.update_affected_counts(self.models)
