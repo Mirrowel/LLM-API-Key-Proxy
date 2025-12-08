@@ -9,8 +9,11 @@ import asyncio
 import logging
 import webbrowser
 import os
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Tuple, Union, Optional
+from glob import glob
+from typing import Dict, Any, Tuple, Union, Optional, List
 
 import httpx
 from rich.console import Console
@@ -33,6 +36,20 @@ TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token"
 REFRESH_EXPIRY_BUFFER_SECONDS = 3 * 60 * 60  # 3 hours buffer before expiry
 
 console = Console()
+
+
+@dataclass
+class QwenCredentialSetupResult:
+    """
+    Standardized result structure for Qwen credential setup operations.
+    """
+
+    success: bool
+    file_path: Optional[str] = None
+    email: Optional[str] = None
+    is_update: bool = False
+    error: Optional[str] = None
+    credentials: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
 
 class QwenAuthBase:
@@ -928,3 +945,251 @@ class QwenAuthBase:
         except Exception as e:
             lib_logger.error(f"Failed to get Qwen user info from credentials: {e}")
             return {"email": None}
+
+    # =========================================================================
+    # CREDENTIAL MANAGEMENT METHODS
+    # =========================================================================
+
+    def _get_provider_file_prefix(self) -> str:
+        """Return the file prefix for Qwen credentials."""
+        return "qwen_code"
+
+    def _get_oauth_base_dir(self) -> Path:
+        """Get the base directory for OAuth credential files."""
+        return Path.cwd() / "oauth_creds"
+
+    def _find_existing_credential_by_email(
+        self, email: str, base_dir: Optional[Path] = None
+    ) -> Optional[Path]:
+        """Find an existing credential file for the given email."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        for cred_file in glob(pattern):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+                existing_email = creds.get("_proxy_metadata", {}).get("email")
+                if existing_email == email:
+                    return Path(cred_file)
+            except (json.JSONDecodeError, IOError) as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return None
+
+    def _get_next_credential_number(self, base_dir: Optional[Path] = None) -> int:
+        """Get the next available credential number."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        existing_numbers = []
+        for cred_file in glob(pattern):
+            match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+            if match:
+                existing_numbers.append(int(match.group(1)))
+
+        if not existing_numbers:
+            return 1
+        return max(existing_numbers) + 1
+
+    def _build_credential_path(
+        self, base_dir: Optional[Path] = None, number: Optional[int] = None
+    ) -> Path:
+        """Build a path for a new credential file."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        if number is None:
+            number = self._get_next_credential_number(base_dir)
+
+        prefix = self._get_provider_file_prefix()
+        filename = f"{prefix}_oauth_{number}.json"
+        return base_dir / filename
+
+    async def setup_credential(
+        self, base_dir: Optional[Path] = None
+    ) -> QwenCredentialSetupResult:
+        """
+        Complete credential setup flow: OAuth -> save.
+
+        This is the main entry point for setting up new credentials.
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        # Ensure directory exists
+        base_dir.mkdir(exist_ok=True)
+
+        try:
+            # Step 1: Perform OAuth authentication
+            temp_creds = {
+                "_proxy_metadata": {"display_name": "new Qwen Code credential"}
+            }
+            new_creds = await self.initialize_token(temp_creds)
+
+            # Step 2: Get user info for deduplication
+            email = new_creds.get("_proxy_metadata", {}).get("email")
+
+            if not email:
+                return QwenCredentialSetupResult(
+                    success=False, error="Could not retrieve email from OAuth response"
+                )
+
+            # Step 3: Check for existing credential with same email
+            existing_path = self._find_existing_credential_by_email(email, base_dir)
+            is_update = existing_path is not None
+
+            if is_update:
+                file_path = existing_path
+                lib_logger.info(
+                    f"Found existing credential for {email}, updating {file_path.name}"
+                )
+            else:
+                file_path = self._build_credential_path(base_dir)
+                lib_logger.info(
+                    f"Creating new credential for {email} at {file_path.name}"
+                )
+
+            # Step 4: Save credentials to file
+            await self._save_credentials(str(file_path), new_creds)
+
+            return QwenCredentialSetupResult(
+                success=True,
+                file_path=str(file_path),
+                email=email,
+                is_update=is_update,
+                credentials=new_creds,
+            )
+
+        except Exception as e:
+            lib_logger.error(f"Credential setup failed: {e}")
+            return QwenCredentialSetupResult(success=False, error=str(e))
+
+    def build_env_lines(self, creds: Dict[str, Any], cred_number: int) -> List[str]:
+        """Generate .env file lines for a Qwen credential."""
+        email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+        prefix = f"QWEN_CODE_{cred_number}"
+
+        lines = [
+            f"# QWEN_CODE Credential #{cred_number} for: {email}",
+            f"# Exported from: qwen_code_oauth_{cred_number}.json",
+            f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "#",
+            "# To combine multiple credentials into one .env file, copy these lines",
+            "# and ensure each credential has a unique number (1, 2, 3, etc.)",
+            "",
+            f"{prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+            f"{prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+            f"{prefix}_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+            f"{prefix}_RESOURCE_URL={creds.get('resource_url', 'https://portal.qwen.ai/v1')}",
+            f"{prefix}_EMAIL={email}",
+        ]
+
+        return lines
+
+    def export_credential_to_env(
+        self, credential_path: str, output_dir: Optional[Path] = None
+    ) -> Optional[str]:
+        """Export a credential file to .env format."""
+        try:
+            cred_path = Path(credential_path)
+
+            # Load credential
+            with open(cred_path, "r") as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Get credential number from filename
+            match = re.search(r"_oauth_(\d+)\.json$", cred_path.name)
+            cred_number = int(match.group(1)) if match else 1
+
+            # Build output path
+            if output_dir is None:
+                output_dir = cred_path.parent
+
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            env_filename = f"qwen_code_{cred_number}_{safe_email}.env"
+            env_path = output_dir / env_filename
+
+            # Build and write content
+            env_lines = self.build_env_lines(creds, cred_number)
+            with open(env_path, "w") as f:
+                f.write("\n".join(env_lines))
+
+            lib_logger.info(f"Exported credential to {env_path}")
+            return str(env_path)
+
+        except Exception as e:
+            lib_logger.error(f"Failed to export credential: {e}")
+            return None
+
+    def list_credentials(self, base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """List all Qwen credential files."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        credentials = []
+        for cred_file in sorted(glob(pattern)):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+
+                metadata = creds.get("_proxy_metadata", {})
+
+                # Extract number from filename
+                match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+                number = int(match.group(1)) if match else 0
+
+                credentials.append(
+                    {
+                        "file_path": cred_file,
+                        "email": metadata.get("email", "unknown"),
+                        "number": number,
+                    }
+                )
+            except Exception as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return credentials
+
+    def delete_credential(self, credential_path: str) -> bool:
+        """Delete a credential file."""
+        try:
+            cred_path = Path(credential_path)
+
+            # Validate that it's one of our credential files
+            prefix = self._get_provider_file_prefix()
+            if not cred_path.name.startswith(f"{prefix}_oauth_"):
+                lib_logger.error(
+                    f"File {cred_path.name} does not appear to be a Qwen Code credential"
+                )
+                return False
+
+            if not cred_path.exists():
+                lib_logger.warning(f"Credential file does not exist: {credential_path}")
+                return False
+
+            # Remove from cache if present
+            self._credentials_cache.pop(credential_path, None)
+
+            # Delete the file
+            cred_path.unlink()
+            lib_logger.info(f"Deleted credential file: {credential_path}")
+            return True
+
+        except Exception as e:
+            lib_logger.error(f"Failed to delete credential: {e}")
+            return False

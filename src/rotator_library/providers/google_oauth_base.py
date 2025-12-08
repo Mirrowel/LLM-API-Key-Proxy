@@ -1,14 +1,17 @@
 # src/rotator_library/providers/google_oauth_base.py
 
 import os
+import re
 import webbrowser
-from typing import Union, Optional
+from dataclasses import dataclass, field
+from typing import Union, Optional, List
 import json
 import time
 import asyncio
 import logging
 from pathlib import Path
 from typing import Dict, Any
+from glob import glob
 
 import httpx
 from rich.console import Console
@@ -23,6 +26,24 @@ from ..utils.resilient_io import safe_write_json
 lib_logger = logging.getLogger("rotator_library")
 
 console = Console()
+
+
+@dataclass
+class CredentialSetupResult:
+    """
+    Standardized result structure for credential setup operations.
+
+    Used by all auth classes to return consistent setup results to the credential tool.
+    """
+
+    success: bool
+    file_path: Optional[str] = None
+    email: Optional[str] = None
+    tier: Optional[str] = None
+    project_id: Optional[str] = None
+    is_update: bool = False
+    error: Optional[str] = None
+    credentials: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
 
 class GoogleOAuthBase:
@@ -840,6 +861,18 @@ class GoogleOAuthBase:
             lib_logger.info(
                 f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
             )
+
+            # Perform post-auth discovery (tier, project, etc.) while we have a fresh token
+            if path:
+                try:
+                    await self._post_auth_discovery(path, new_creds["access_token"])
+                except Exception as e:
+                    # Don't fail auth if discovery fails - it can be retried on first request
+                    lib_logger.warning(
+                        f"Post-auth discovery failed for '{display_name}': {e}. "
+                        "Tier/project will be discovered on first request."
+                    )
+
         return new_creds
 
     async def initialize_token(
@@ -945,6 +978,23 @@ class GoogleOAuthBase:
                 return {"Authorization": f"Bearer {cached['access_token']}"}
             raise
 
+    async def _post_auth_discovery(
+        self, credential_path: str, access_token: str
+    ) -> None:
+        """
+        Hook for subclasses to perform post-authentication discovery.
+
+        Called after successful OAuth authentication (both initial and re-auth).
+        Subclasses can override this to discover and cache tier/project information
+        during the authentication flow rather than waiting for the first API request.
+
+        Args:
+            credential_path: Path to the credential file
+            access_token: The newly obtained access token
+        """
+        # Default implementation does nothing - subclasses can override
+        pass
+
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
@@ -976,3 +1026,372 @@ class GoogleOAuthBase:
             if path:
                 await self._save_credentials(path, creds)
             return {"email": user_info.get("email")}
+
+    # =========================================================================
+    # CREDENTIAL MANAGEMENT METHODS
+    # =========================================================================
+
+    def _get_provider_file_prefix(self) -> str:
+        """
+        Get the file name prefix for this provider's credential files.
+
+        Override in subclasses if the prefix differs from ENV_PREFIX.
+        Default: lowercase ENV_PREFIX with underscores (e.g., "gemini_cli")
+        """
+        return self.ENV_PREFIX.lower()
+
+    def _get_oauth_base_dir(self) -> Path:
+        """
+        Get the base directory for OAuth credential files.
+
+        Can be overridden to customize credential storage location.
+        """
+        return Path.cwd() / "oauth_creds"
+
+    def _find_existing_credential_by_email(
+        self, email: str, base_dir: Optional[Path] = None
+    ) -> Optional[Path]:
+        """
+        Find an existing credential file for the given email.
+
+        Args:
+            email: Email address to search for
+            base_dir: Directory to search in (defaults to oauth_creds)
+
+        Returns:
+            Path to existing credential file, or None if not found
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        for cred_file in glob(pattern):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+                existing_email = creds.get("_proxy_metadata", {}).get("email")
+                if existing_email == email:
+                    return Path(cred_file)
+            except (json.JSONDecodeError, IOError) as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return None
+
+    def _get_next_credential_number(self, base_dir: Optional[Path] = None) -> int:
+        """
+        Get the next available credential number for new credential files.
+
+        Args:
+            base_dir: Directory to scan (defaults to oauth_creds)
+
+        Returns:
+            Next available credential number (1, 2, 3, etc.)
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        existing_numbers = []
+        for cred_file in glob(pattern):
+            match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+            if match:
+                existing_numbers.append(int(match.group(1)))
+
+        if not existing_numbers:
+            return 1
+        return max(existing_numbers) + 1
+
+    def _build_credential_path(
+        self, base_dir: Optional[Path] = None, number: Optional[int] = None
+    ) -> Path:
+        """
+        Build a path for a new credential file.
+
+        Args:
+            base_dir: Directory for credential files (defaults to oauth_creds)
+            number: Credential number (auto-determined if None)
+
+        Returns:
+            Path for the new credential file
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        if number is None:
+            number = self._get_next_credential_number(base_dir)
+
+        prefix = self._get_provider_file_prefix()
+        filename = f"{prefix}_oauth_{number}.json"
+        return base_dir / filename
+
+    async def setup_credential(
+        self, base_dir: Optional[Path] = None
+    ) -> CredentialSetupResult:
+        """
+        Complete credential setup flow: OAuth -> save -> discovery.
+
+        This is the main entry point for setting up new credentials.
+        Handles the entire lifecycle:
+        1. Perform OAuth authentication
+        2. Get user info (email) for deduplication
+        3. Find existing credential or create new file path
+        4. Save credentials to file
+        5. Perform post-auth discovery (tier/project for Google OAuth)
+
+        Args:
+            base_dir: Directory for credential files (defaults to oauth_creds)
+
+        Returns:
+            CredentialSetupResult with status and details
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        # Ensure directory exists
+        base_dir.mkdir(exist_ok=True)
+
+        try:
+            # Step 1: Perform OAuth authentication (returns credentials dict)
+            temp_creds = {
+                "_proxy_metadata": {"display_name": f"new {self.ENV_PREFIX} credential"}
+            }
+            new_creds = await self.initialize_token(temp_creds)
+
+            # Step 2: Get user info for deduplication
+            user_info = await self.get_user_info(new_creds)
+            email = user_info.get("email")
+
+            if not email:
+                return CredentialSetupResult(
+                    success=False, error="Could not retrieve email from OAuth response"
+                )
+
+            # Step 3: Check for existing credential with same email
+            existing_path = self._find_existing_credential_by_email(email, base_dir)
+            is_update = existing_path is not None
+
+            if is_update:
+                file_path = existing_path
+                lib_logger.info(
+                    f"Found existing credential for {email}, updating {file_path.name}"
+                )
+            else:
+                file_path = self._build_credential_path(base_dir)
+                lib_logger.info(
+                    f"Creating new credential for {email} at {file_path.name}"
+                )
+
+            # Step 4: Save credentials to file
+            await self._save_credentials(str(file_path), new_creds)
+
+            # Step 5: Perform post-auth discovery (tier, project_id)
+            # This is already called in _perform_interactive_oauth, but we call it again
+            # in case credentials were loaded from existing token
+            tier = None
+            project_id = None
+            try:
+                await self._post_auth_discovery(
+                    str(file_path), new_creds["access_token"]
+                )
+                # Reload credentials to get discovered metadata
+                with open(file_path, "r") as f:
+                    updated_creds = json.load(f)
+                tier = updated_creds.get("_proxy_metadata", {}).get("tier")
+                project_id = updated_creds.get("_proxy_metadata", {}).get("project_id")
+                new_creds = updated_creds
+            except Exception as e:
+                lib_logger.warning(
+                    f"Post-auth discovery failed: {e}. Tier/project will be discovered on first request."
+                )
+
+            return CredentialSetupResult(
+                success=True,
+                file_path=str(file_path),
+                email=email,
+                tier=tier,
+                project_id=project_id,
+                is_update=is_update,
+                credentials=new_creds,
+            )
+
+        except Exception as e:
+            lib_logger.error(f"Credential setup failed: {e}")
+            return CredentialSetupResult(success=False, error=str(e))
+
+    def build_env_lines(self, creds: Dict[str, Any], cred_number: int) -> List[str]:
+        """
+        Generate .env file lines for a credential.
+
+        Subclasses should override to include provider-specific fields
+        (e.g., tier, project_id for Google OAuth providers).
+
+        Args:
+            creds: Credential dictionary loaded from JSON
+            cred_number: Credential number (1, 2, 3, etc.)
+
+        Returns:
+            List of .env file lines
+        """
+        email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+        prefix = f"{self.ENV_PREFIX}_{cred_number}"
+
+        lines = [
+            f"# {self.ENV_PREFIX} Credential #{cred_number} for: {email}",
+            f"# Exported from: {self._get_provider_file_prefix()}_oauth_{cred_number}.json",
+            f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "#",
+            "# To combine multiple credentials into one .env file, copy these lines",
+            "# and ensure each credential has a unique number (1, 2, 3, etc.)",
+            "",
+            f"{prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+            f"{prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+            f"{prefix}_SCOPE={creds.get('scope', '')}",
+            f"{prefix}_TOKEN_TYPE={creds.get('token_type', 'Bearer')}",
+            f"{prefix}_ID_TOKEN={creds.get('id_token', '')}",
+            f"{prefix}_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+            f"{prefix}_CLIENT_ID={creds.get('client_id', '')}",
+            f"{prefix}_CLIENT_SECRET={creds.get('client_secret', '')}",
+            f"{prefix}_TOKEN_URI={creds.get('token_uri', 'https://oauth2.googleapis.com/token')}",
+            f"{prefix}_UNIVERSE_DOMAIN={creds.get('universe_domain', 'googleapis.com')}",
+            f"{prefix}_EMAIL={email}",
+        ]
+
+        return lines
+
+    def export_credential_to_env(
+        self, credential_path: str, output_dir: Optional[Path] = None
+    ) -> Optional[str]:
+        """
+        Export a credential file to .env format.
+
+        Args:
+            credential_path: Path to the credential JSON file
+            output_dir: Directory for output .env file (defaults to same as credential)
+
+        Returns:
+            Path to the exported .env file, or None on error
+        """
+        try:
+            cred_path = Path(credential_path)
+
+            # Load credential
+            with open(cred_path, "r") as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Get credential number from filename
+            match = re.search(r"_oauth_(\d+)\.json$", cred_path.name)
+            cred_number = int(match.group(1)) if match else 1
+
+            # Build output path
+            if output_dir is None:
+                output_dir = cred_path.parent
+
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            prefix = self._get_provider_file_prefix()
+            env_filename = f"{prefix}_{cred_number}_{safe_email}.env"
+            env_path = output_dir / env_filename
+
+            # Build and write content
+            env_lines = self.build_env_lines(creds, cred_number)
+            with open(env_path, "w") as f:
+                f.write("\n".join(env_lines))
+
+            lib_logger.info(f"Exported credential to {env_path}")
+            return str(env_path)
+
+        except Exception as e:
+            lib_logger.error(f"Failed to export credential: {e}")
+            return None
+
+    def list_credentials(self, base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """
+        List all credential files for this provider.
+
+        Args:
+            base_dir: Directory to search (defaults to oauth_creds)
+
+        Returns:
+            List of dicts with credential info:
+            - file_path: Path to credential file
+            - email: User email
+            - tier: Tier info (if available)
+            - project_id: Project ID (if available)
+            - number: Credential number
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        credentials = []
+        for cred_file in sorted(glob(pattern)):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+
+                metadata = creds.get("_proxy_metadata", {})
+
+                # Extract number from filename
+                match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+                number = int(match.group(1)) if match else 0
+
+                credentials.append(
+                    {
+                        "file_path": cred_file,
+                        "email": metadata.get("email", "unknown"),
+                        "tier": metadata.get("tier"),
+                        "project_id": metadata.get("project_id"),
+                        "number": number,
+                    }
+                )
+            except Exception as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return credentials
+
+    def delete_credential(self, credential_path: str) -> bool:
+        """
+        Delete a credential file.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            cred_path = Path(credential_path)
+
+            # Validate that it's one of our credential files
+            prefix = self._get_provider_file_prefix()
+            if not cred_path.name.startswith(f"{prefix}_oauth_"):
+                lib_logger.error(
+                    f"File {cred_path.name} does not appear to be a {self.ENV_PREFIX} credential"
+                )
+                return False
+
+            if not cred_path.exists():
+                lib_logger.warning(f"Credential file does not exist: {credential_path}")
+                return False
+
+            # Remove from cache if present
+            self._credentials_cache.pop(credential_path, None)
+
+            # Delete the file
+            cred_path.unlink()
+            lib_logger.info(f"Deleted credential file: {credential_path}")
+            return True
+
+        except Exception as e:
+            lib_logger.error(f"Failed to delete credential: {e}")
+            return False
