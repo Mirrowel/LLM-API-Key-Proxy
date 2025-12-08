@@ -2191,14 +2191,14 @@ class RulePanel(ctk.CTkFrame):
 
     def _create_content(self):
         """Build panel content."""
-        # Title
+        # Title (compact)
         title_label = ctk.CTkLabel(
             self,
             text=self.title,
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
             text_color=TEXT_PRIMARY,
         )
-        title_label.pack(anchor="w", padx=12, pady=(12, 8))
+        title_label.pack(anchor="w", padx=10, pady=(6, 3))
 
         # Virtual rule list (replaces CTkScrollableFrame + RuleChips)
         self.rule_list = VirtualRuleList(
@@ -2207,24 +2207,28 @@ class RulePanel(ctk.CTkFrame):
             on_rule_click=self.on_rule_clicked,
             on_rule_delete=self._on_rule_delete,
         )
-        self.rule_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.rule_list.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
-        # Input frame
-        input_frame = ctk.CTkFrame(self, fg_color="transparent")
-        input_frame.pack(fill="x", padx=8, pady=(0, 8))
+        # Set minimum height for rule list to ensure it's visible
+        self.rule_list.frame.configure(height=70)
+
+        # Input frame with fixed height (won't squish on resize)
+        input_frame = ctk.CTkFrame(self, fg_color="transparent", height=32)
+        input_frame.pack(fill="x", padx=6, pady=(0, 5))
+        input_frame.pack_propagate(False)  # Prevent children from changing frame height
 
         # Pattern input
         self.input_entry = ctk.CTkEntry(
             input_frame,
             placeholder_text="pattern1, pattern2*, ...",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_TERTIARY,
             border_color=BORDER_COLOR,
             text_color=TEXT_PRIMARY,
             placeholder_text_color=TEXT_MUTED,
-            height=36,
+            height=28,
         )
-        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.input_entry.bind("<Return>", self._on_add_clicked)
         self.input_entry.bind("<KeyRelease>", self._on_input_key)
 
@@ -2232,11 +2236,11 @@ class RulePanel(ctk.CTkFrame):
         add_btn = ctk.CTkButton(
             input_frame,
             text="+ Add",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
-            width=70,
-            height=36,
+            width=55,
+            height=28,
             command=self._on_add_clicked,
         )
         add_btn.pack(side="right")
@@ -2342,13 +2346,8 @@ class ModelFilterGUI(ctk.CTk):
         self._fetch_in_progress: bool = False
         self._preview_after_id: Optional[str] = None
 
-        # Build UI
-        self._create_header()
-        self._create_search_bar()
-        self._create_model_lists()
-        self._create_rule_panels()
-        self._create_status_bar()
-        self._create_action_buttons()
+        # Build UI with grid layout for responsive sizing
+        self._create_main_layout()
 
         # Context menu
         self._create_context_menu()
@@ -2365,6 +2364,30 @@ class ModelFilterGUI(ctk.CTk):
         # Focus and raise window after it's fully loaded
         self.after(100, self._activate_window)
 
+    def _create_main_layout(self):
+        """Create the main layout with grid for responsive sizing."""
+        # Main content frame using grid layout
+        # This allows proportional sizing between model lists and rule panels
+        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_frame.pack(fill="both", expand=True, padx=20, pady=(8, 10))
+
+        # Configure grid weights for responsive layout
+        # Using 3:1 ratio so models get significantly more space than rules
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_rowconfigure(0, weight=0)  # Header - fixed
+        self.content_frame.grid_rowconfigure(1, weight=0)  # Search - fixed
+        self.content_frame.grid_rowconfigure(2, weight=3)  # Model lists - expands most
+        self.content_frame.grid_rowconfigure(3, weight=1)  # Rule panels - expands less
+        self.content_frame.grid_rowconfigure(4, weight=0)  # Status bar - fixed
+
+        # Create all sections
+        self._create_header()
+        self._create_search_bar()
+        self._create_model_lists()
+        self._create_rule_panels()
+        self._create_status_bar()
+        self._create_action_buttons()
+
     def _activate_window(self):
         """Activate and focus the window."""
         self.lift()
@@ -2373,69 +2396,69 @@ class ModelFilterGUI(ctk.CTk):
         self.after(200, lambda: self.attributes("-topmost", False))
 
     def _create_header(self):
-        """Create the header with provider selector and buttons."""
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(15, 10))
+        """Create the header with provider selector and buttons (compact)."""
+        header = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
-        # Title
+        # Title (smaller font)
         title = ctk.CTkLabel(
             header,
             text="🎯 Model Filter Configuration",
-            font=(FONT_FAMILY, FONT_SIZE_HEADER, "bold"),
+            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
             text_color=TEXT_PRIMARY,
         )
         title.pack(side="left")
 
-        # Help button
+        # Help button (smaller)
         help_btn = ctk.CTkButton(
             header,
             text="?",
-            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
             border_width=1,
             border_color=BORDER_COLOR,
-            width=36,
-            height=36,
-            corner_radius=18,
+            width=26,
+            height=26,
+            corner_radius=13,
             command=self._show_help,
         )
-        help_btn.pack(side="right", padx=(10, 0))
+        help_btn.pack(side="right", padx=(8, 0))
         ToolTip(help_btn, "Help (F1)")
 
-        # Refresh button
+        # Refresh button (smaller)
         refresh_btn = ctk.CTkButton(
             header,
             text="🔄 Refresh",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
             border_width=1,
             border_color=BORDER_COLOR,
-            width=100,
-            height=36,
+            width=80,
+            height=26,
             command=self._refresh_models,
         )
-        refresh_btn.pack(side="right", padx=(10, 0))
+        refresh_btn.pack(side="right", padx=(8, 0))
         ToolTip(refresh_btn, "Refresh models (Ctrl+R)")
 
-        # Provider selector
+        # Provider selector (compact)
         provider_frame = ctk.CTkFrame(header, fg_color="transparent")
         provider_frame.pack(side="right")
 
         provider_label = ctk.CTkLabel(
             provider_frame,
             text="Provider:",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_SECONDARY,
         )
-        provider_label.pack(side="left", padx=(0, 8))
+        provider_label.pack(side="left", padx=(0, 6))
 
         self.provider_dropdown = ctk.CTkComboBox(
             provider_frame,
             values=["Loading..."],
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            dropdown_font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            dropdown_font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             border_color=BORDER_COLOR,
             button_color=BORDER_COLOR,
@@ -2443,25 +2466,25 @@ class ModelFilterGUI(ctk.CTk):
             dropdown_fg_color=BG_SECONDARY,
             dropdown_hover_color=BG_HOVER,
             text_color=TEXT_PRIMARY,
-            width=180,
-            height=36,
+            width=160,
+            height=26,
             state="readonly",
             command=self._on_provider_changed,
         )
         self.provider_dropdown.pack(side="left")
 
     def _create_search_bar(self):
-        """Create the search bar."""
-        search_frame = ctk.CTkFrame(self, fg_color="transparent")
-        search_frame.pack(fill="x", padx=20, pady=(0, 10))
+        """Create the search bar (compact version)."""
+        search_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        search_frame.grid(row=1, column=0, sticky="ew", pady=(0, 5))
 
         search_icon = ctk.CTkLabel(
             search_frame,
             text="🔍",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_MUTED,
         )
-        search_icon.pack(side="left", padx=(0, 8))
+        search_icon.pack(side="left", padx=(0, 6))
 
         self.search_entry = ctk.CTkEntry(
             search_frame,
@@ -2471,7 +2494,7 @@ class ModelFilterGUI(ctk.CTk):
             border_color=BORDER_COLOR,
             text_color=TEXT_PRIMARY,
             placeholder_text_color=TEXT_MUTED,
-            height=36,
+            height=28,
         )
         self.search_entry.pack(side="left", fill="x", expand=True)
         self.search_entry.bind("<KeyRelease>", self._on_search_changed)
@@ -2480,12 +2503,12 @@ class ModelFilterGUI(ctk.CTk):
         clear_btn = ctk.CTkButton(
             search_frame,
             text="×",
-            font=(FONT_FAMILY, FONT_SIZE_LARGE),
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color="transparent",
             hover_color=BG_HOVER,
             text_color=TEXT_MUTED,
-            width=36,
-            height=36,
+            width=28,
+            height=28,
             command=self._clear_search,
         )
         clear_btn.pack(side="left")
@@ -2494,22 +2517,23 @@ class ModelFilterGUI(ctk.CTk):
         """Create the synchronized model list panel."""
         # Use the virtual list implementation for performance
         self.model_list_panel = VirtualSyncModelLists(
-            self,
+            self.content_frame,
             on_model_click=self._on_model_clicked,
             on_model_right_click=self._on_model_right_clicked,
         )
-        self.model_list_panel.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.model_list_panel.grid(row=2, column=0, sticky="nsew", pady=(0, 5))
 
     def _create_rule_panels(self):
         """Create the ignore and whitelist rule panels."""
-        rules_frame = ctk.CTkFrame(self, fg_color="transparent")
-        rules_frame.pack(fill="x", padx=20, pady=(0, 10))
-        rules_frame.grid_columnconfigure(0, weight=1)
-        rules_frame.grid_columnconfigure(1, weight=1)
+        self.rules_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        self.rules_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 5))
+        self.rules_frame.grid_columnconfigure(0, weight=1)
+        self.rules_frame.grid_columnconfigure(1, weight=1)
+        self.rules_frame.grid_rowconfigure(0, weight=1)
 
         # Ignore panel
         self.ignore_panel = RulePanel(
-            rules_frame,
+            self.rules_frame,
             title="🚫 Ignore Rules",
             rule_type="ignore",
             on_rules_changed=self._on_rules_changed,
@@ -2522,7 +2546,7 @@ class ModelFilterGUI(ctk.CTk):
 
         # Whitelist panel
         self.whitelist_panel = RulePanel(
-            rules_frame,
+            self.rules_frame,
             title="✓ Whitelist Rules",
             rule_type="whitelist",
             on_rules_changed=self._on_rules_changed,
@@ -2534,16 +2558,16 @@ class ModelFilterGUI(ctk.CTk):
         self.whitelist_panel.set_delete_callback(self._remove_whitelist_pattern)
 
     def _create_status_bar(self):
-        """Create the status bar showing available count and action buttons."""
+        """Create the status bar showing available count and action buttons (compact)."""
         # Combined status bar and action buttons in one row
-        self.status_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.status_frame.pack(fill="x", padx=20, pady=(5, 15))
+        self.status_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        self.status_frame.grid(row=4, column=0, sticky="ew", pady=(3, 3))
 
-        # Status label (left side)
+        # Status label (left side, smaller font)
         self.status_label = ctk.CTkLabel(
             self.status_frame,
             text="Select a provider to begin",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_SECONDARY,
         )
         self.status_label.pack(side="left")
@@ -2555,33 +2579,33 @@ class ModelFilterGUI(ctk.CTk):
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=ACCENT_YELLOW,
         )
-        self.unsaved_label.pack(side="left", padx=(15, 0))
+        self.unsaved_label.pack(side="left", padx=(10, 0))
 
-        # Buttons (right side)
+        # Buttons (right side, smaller)
         # Discard button
         discard_btn = ctk.CTkButton(
             self.status_frame,
             text="↩️ Discard",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
             border_width=1,
             border_color=BORDER_COLOR,
-            width=110,
-            height=36,
+            width=85,
+            height=26,
             command=self._discard_changes,
         )
-        discard_btn.pack(side="right", padx=(10, 0))
+        discard_btn.pack(side="right", padx=(8, 0))
 
         # Save button
         save_btn = ctk.CTkButton(
             self.status_frame,
             text="💾 Save",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
             fg_color=ACCENT_GREEN,
             hover_color="#27ae60",
-            width=110,
-            height=36,
+            width=75,
+            height=26,
             command=self._save_changes,
         )
         save_btn.pack(side="right")
