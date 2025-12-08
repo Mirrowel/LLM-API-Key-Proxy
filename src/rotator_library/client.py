@@ -161,11 +161,95 @@ class RotatingClient:
             if mode != "balanced":
                 lib_logger.info(f"Provider '{provider}' using rotation mode: {mode}")
 
+        # Build priority-based concurrency multiplier maps
+        # These are universal multipliers based on credential tier/priority
+        priority_multipliers: Dict[str, Dict[int, int]] = {}
+        priority_multipliers_by_mode: Dict[str, Dict[str, Dict[int, int]]] = {}
+        sequential_fallback_multipliers: Dict[str, int] = {}
+
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+
+            # Start with provider class defaults
+            if provider_class:
+                # Get default priority multipliers from provider class
+                if hasattr(provider_class, "default_priority_multipliers"):
+                    default_multipliers = provider_class.default_priority_multipliers
+                    if default_multipliers:
+                        priority_multipliers[provider] = dict(default_multipliers)
+
+                # Get sequential fallback from provider class
+                if hasattr(provider_class, "default_sequential_fallback_multiplier"):
+                    fallback = provider_class.default_sequential_fallback_multiplier
+                    if fallback != 1:  # Only store if different from global default
+                        sequential_fallback_multipliers[provider] = fallback
+
+            # Override with environment variables
+            # Format: CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>=<multiplier>
+            # Format: CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>_<MODE>=<multiplier>
+            for key, value in os.environ.items():
+                prefix = f"CONCURRENCY_MULTIPLIER_{provider.upper()}_PRIORITY_"
+                if key.startswith(prefix):
+                    remainder = key[len(prefix) :]
+                    try:
+                        multiplier = int(value)
+                        if multiplier < 1:
+                            lib_logger.warning(f"Invalid {key}: {value}. Must be >= 1.")
+                            continue
+
+                        # Check if mode-specific (e.g., _PRIORITY_1_SEQUENTIAL)
+                        if "_" in remainder:
+                            parts = remainder.rsplit("_", 1)
+                            priority = int(parts[0])
+                            mode = parts[1].lower()
+                            if mode in ("sequential", "balanced"):
+                                # Mode-specific override
+                                if provider not in priority_multipliers_by_mode:
+                                    priority_multipliers_by_mode[provider] = {}
+                                if mode not in priority_multipliers_by_mode[provider]:
+                                    priority_multipliers_by_mode[provider][mode] = {}
+                                priority_multipliers_by_mode[provider][mode][
+                                    priority
+                                ] = multiplier
+                                lib_logger.info(
+                                    f"Provider '{provider}' priority {priority} ({mode} mode) multiplier: {multiplier}x"
+                                )
+                            else:
+                                # Assume it's part of the priority number (unlikely but handle gracefully)
+                                lib_logger.warning(f"Unknown mode in {key}: {mode}")
+                        else:
+                            # Universal priority multiplier
+                            priority = int(remainder)
+                            if provider not in priority_multipliers:
+                                priority_multipliers[provider] = {}
+                            priority_multipliers[provider][priority] = multiplier
+                            lib_logger.info(
+                                f"Provider '{provider}' priority {priority} multiplier: {multiplier}x"
+                            )
+                    except ValueError:
+                        lib_logger.warning(
+                            f"Invalid {key}: {value}. Could not parse priority or multiplier."
+                        )
+
+        # Log configured multipliers
+        for provider, multipliers in priority_multipliers.items():
+            if multipliers:
+                lib_logger.info(
+                    f"Provider '{provider}' priority multipliers: {multipliers}"
+                )
+        for provider, fallback in sequential_fallback_multipliers.items():
+            lib_logger.info(
+                f"Provider '{provider}' sequential fallback multiplier: {fallback}x"
+            )
+
         self.usage_manager = UsageManager(
             file_path=usage_file_path,
             rotation_tolerance=rotation_tolerance,
             provider_rotation_modes=provider_rotation_modes,
             provider_plugins=PROVIDER_PLUGINS,
+            priority_multipliers=priority_multipliers,
+            priority_multipliers_by_mode=priority_multipliers_by_mode,
+            sequential_fallback_multipliers=sequential_fallback_multipliers,
         )
         self._model_list_cache = {}
         self.http_client = httpx.AsyncClient()

@@ -88,6 +88,30 @@ class ProviderInterface(ABC):
     # Can be overridden via env: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
     model_quota_groups: QuotaGroupMap = {}
 
+    # Model usage weights for grouped usage calculation
+    # When calculating combined usage for quota groups, each model's usage
+    # is multiplied by its weight. This accounts for models that consume
+    # more quota per request (e.g., Opus uses more than Sonnet).
+    # Models not in the map default to weight 1.
+    # Example: {"claude-opus-4-5": 2} means Opus usage counts 2x
+    model_usage_weights: Dict[str, int] = {}
+
+    # =========================================================================
+    # PRIORITY CONCURRENCY MULTIPLIERS - Override in subclass
+    # =========================================================================
+
+    # Priority-based concurrency multipliers (universal, applies to all modes)
+    # Maps priority level -> multiplier
+    # Higher priority credentials (lower number) can have higher multipliers
+    # to allow more concurrent requests
+    # Example: {1: 5, 2: 3} means Priority 1 gets 5x, Priority 2 gets 3x
+    default_priority_multipliers: Dict[int, int] = {}
+
+    # Fallback multiplier for sequential mode when priority not in default_priority_multipliers
+    # This is used for lower-priority tiers in sequential mode to maintain some stickiness
+    # Default: 1 (no multiplier effect)
+    default_sequential_fallback_multiplier: int = 1
+
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -505,3 +529,20 @@ class ProviderInterface(ABC):
             Empty list if group doesn't exist.
         """
         return self._get_quota_group_models(group)
+
+    def get_model_usage_weight(self, model: str) -> int:
+        """
+        Returns the usage weight for a model when calculating grouped usage.
+
+        Models with higher weights contribute more to the combined group usage.
+        This accounts for models that consume more quota per request.
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Weight multiplier (default 1 if not configured)
+        """
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+        return self.model_usage_weights.get(clean_model, 1)

@@ -55,6 +55,11 @@ class UsageManager:
         rotation_tolerance: float = 0.0,
         provider_rotation_modes: Optional[Dict[str, str]] = None,
         provider_plugins: Optional[Dict[str, Any]] = None,
+        priority_multipliers: Optional[Dict[str, Dict[int, int]]] = None,
+        priority_multipliers_by_mode: Optional[
+            Dict[str, Dict[str, Dict[int, int]]]
+        ] = None,
+        sequential_fallback_multipliers: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -71,11 +76,22 @@ class UsageManager:
                 - "sequential": Use one credential until exhausted (preserves caching)
             provider_plugins: Dict mapping provider names to provider plugin instances.
                 Used for per-provider usage reset configuration (window durations, field names).
+            priority_multipliers: Dict mapping provider -> priority -> multiplier.
+                Universal multipliers that apply regardless of rotation mode.
+                Example: {"antigravity": {1: 5, 2: 3}}
+            priority_multipliers_by_mode: Dict mapping provider -> mode -> priority -> multiplier.
+                Mode-specific overrides. Example: {"antigravity": {"balanced": {3: 1}}}
+            sequential_fallback_multipliers: Dict mapping provider -> fallback multiplier.
+                Used in sequential mode when priority not in priority_multipliers.
+                Example: {"antigravity": 2}
         """
         self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
         self.provider_rotation_modes = provider_rotation_modes or {}
         self.provider_plugins = provider_plugins or PROVIDER_PLUGINS
+        self.priority_multipliers = priority_multipliers or {}
+        self.priority_multipliers_by_mode = priority_multipliers_by_mode or {}
+        self.sequential_fallback_multipliers = sequential_fallback_multipliers or {}
         self._provider_instances: Dict[str, Any] = {}  # Cache for provider instances
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
@@ -106,6 +122,48 @@ class UsageManager:
             "balanced" or "sequential"
         """
         return self.provider_rotation_modes.get(provider, "balanced")
+
+    def _get_priority_multiplier(
+        self, provider: str, priority: int, rotation_mode: str
+    ) -> int:
+        """
+        Get the concurrency multiplier for a provider/priority/mode combination.
+
+        Lookup order:
+        1. Mode-specific tier override: priority_multipliers_by_mode[provider][mode][priority]
+        2. Universal tier multiplier: priority_multipliers[provider][priority]
+        3. Sequential fallback (if mode is sequential): sequential_fallback_multipliers[provider]
+        4. Global default: 1 (no multiplier effect)
+
+        Args:
+            provider: Provider name (e.g., "antigravity")
+            priority: Priority level (1 = highest priority)
+            rotation_mode: Current rotation mode ("sequential" or "balanced")
+
+        Returns:
+            Multiplier value
+        """
+        provider_lower = provider.lower()
+
+        # 1. Check mode-specific override
+        if provider_lower in self.priority_multipliers_by_mode:
+            mode_multipliers = self.priority_multipliers_by_mode[provider_lower]
+            if rotation_mode in mode_multipliers:
+                if priority in mode_multipliers[rotation_mode]:
+                    return mode_multipliers[rotation_mode][priority]
+
+        # 2. Check universal tier multiplier
+        if provider_lower in self.priority_multipliers:
+            if priority in self.priority_multipliers[provider_lower]:
+                return self.priority_multipliers[provider_lower][priority]
+
+        # 3. Sequential fallback (only for sequential mode)
+        if rotation_mode == "sequential":
+            if provider_lower in self.sequential_fallback_multipliers:
+                return self.sequential_fallback_multipliers[provider_lower]
+
+        # 4. Global default
+        return 1
 
     def _get_provider_from_credential(self, credential: str) -> Optional[str]:
         """
@@ -238,6 +296,60 @@ class UsageManager:
 
         return []
 
+    def _get_model_usage_weight(self, credential: str, model: str) -> int:
+        """
+        Get the usage weight for a model when calculating grouped usage.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Weight multiplier (default 1 if not configured)
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_model_usage_weight"):
+            return plugin_instance.get_model_usage_weight(model)
+
+        return 1
+
+    def _get_grouped_usage_count(self, key: str, model: str) -> int:
+        """
+        Get usage count for credential selection, considering quota groups.
+
+        If the model belongs to a quota group, returns the weighted combined usage
+        across all models in the group. Otherwise returns individual model usage.
+
+        Weights are applied per-model to account for models that consume more quota
+        per request (e.g., Opus might count 2x compared to Sonnet).
+
+        Args:
+            key: Credential identifier
+            model: Model name (with provider prefix, e.g., "antigravity/claude-sonnet-4-5")
+
+        Returns:
+            Weighted combined usage if grouped, otherwise individual model usage
+        """
+        # Check if model is in a quota group
+        group = self._get_model_quota_group(key, model)
+
+        if group:
+            # Get all models in the group
+            grouped_models = self._get_grouped_models(key, group)
+
+            # Sum weighted usage across all models in the group
+            total_weighted_usage = 0
+            for grouped_model in grouped_models:
+                usage = self._get_usage_count(key, grouped_model)
+                weight = self._get_model_usage_weight(key, grouped_model)
+                total_weighted_usage += usage * weight
+            return total_weighted_usage
+
+        # Not grouped - return individual model usage (no weight applied)
+        return self._get_usage_count(key, model)
+
     def _get_usage_field_name(self, credential: str) -> str:
         """
         Get the usage tracking field name for a credential.
@@ -360,59 +472,64 @@ class UsageManager:
 
         return data
 
-    def _select_sequential(
+    def _sort_sequential(
         self,
         candidates: List[Tuple[str, int]],
         credential_priorities: Optional[Dict[str, int]] = None,
-    ) -> str:
+    ) -> List[Tuple[str, int]]:
         """
-        Select credential in strict sequential order for cache-preserving rotation.
+        Sort credentials for sequential mode with position retention.
 
-        This method ensures the same credential is reused until it hits a cooldown,
-        which preserves provider-side caching (e.g., thinking signature caches).
+        Credentials maintain their position based on established usage patterns,
+        ensuring that actively-used credentials remain primary until exhausted.
 
-        Selection logic:
-        1. Sort by priority (lowest number = highest priority)
-        2. Within same priority, sort by last_used_ts (most recent first = sticky)
-        3. Return the first candidate
+        Sorting order (within each sort key, lower value = higher priority):
+        1. Priority tier (lower number = higher priority)
+        2. Usage count (higher = more established in rotation, maintains position)
+        3. Last used timestamp (higher = more recent, tiebreaker for stickiness)
+        4. Credential ID (alphabetical, stable ordering)
 
         Args:
             candidates: List of (credential_id, usage_count) tuples
             credential_priorities: Optional dict mapping credentials to priority levels
 
         Returns:
-            Selected credential ID
+            Sorted list of candidates (same format as input)
         """
         if not candidates:
-            raise ValueError("Cannot select from empty candidate list")
+            return []
 
         if len(candidates) == 1:
-            return candidates[0][0]
+            return candidates
 
-        def sort_key(item: Tuple[str, int]) -> Tuple[int, float]:
-            cred, _ = item
-            # Priority: lower is better (1 = highest priority)
+        def sort_key(item: Tuple[str, int]) -> Tuple[int, int, float, str]:
+            cred, usage_count = item
             priority = (
                 credential_priorities.get(cred, 999) if credential_priorities else 999
             )
-            # Last used: higher (more recent) is better for stickiness
             last_used = (
                 self._usage_data.get(cred, {}).get("last_used_ts", 0)
                 if self._usage_data
                 else 0
             )
-            # Negative last_used so most recent sorts first
-            return (priority, -last_used)
+            return (
+                priority,  # ASC: lower priority number = higher priority
+                -usage_count,  # DESC: higher usage = more established
+                -last_used,  # DESC: more recent = preferred for ties
+                cred,  # ASC: stable alphabetical ordering
+            )
 
         sorted_candidates = sorted(candidates, key=sort_key)
-        selected = sorted_candidates[0][0]
 
-        lib_logger.debug(
-            f"Sequential selection: chose {mask_credential(selected)} "
-            f"(priority={credential_priorities.get(selected, 999) if credential_priorities else 'N/A'})"
-        )
+        # Debug logging - show top 3 credentials in ordering
+        if lib_logger.isEnabledFor(logging.DEBUG):
+            order_info = [
+                f"{mask_credential(c)}(p={credential_priorities.get(c, 999) if credential_priorities else 'N/A'}, u={u})"
+                for c, u in sorted_candidates[:3]
+            ]
+            lib_logger.debug(f"Sequential ordering: {' → '.join(order_info)}")
 
-        return selected
+        return sorted_candidates
 
     async def _lazy_init(self):
         """Initializes the usage data by loading it from the file asynchronously."""
@@ -966,7 +1083,8 @@ class UsageManager:
                         priority = credential_priorities.get(key, 999)
 
                         # Get usage count for load balancing within priority groups
-                        usage_count = self._get_usage_count(key, model)
+                        # Uses grouped usage if model is in a quota group
+                        usage_count = self._get_grouped_usage_count(key, model)
 
                         # Group by priority
                         if priority not in priority_groups:
@@ -979,6 +1097,16 @@ class UsageManager:
                 for priority_level in sorted_priorities:
                     keys_in_priority = priority_groups[priority_level]
 
+                    # Determine selection method based on provider's rotation mode
+                    provider = model.split("/")[0] if "/" in model else ""
+                    rotation_mode = self._get_rotation_mode(provider)
+
+                    # Calculate effective concurrency based on priority tier
+                    multiplier = self._get_priority_multiplier(
+                        provider, priority_level, rotation_mode
+                    )
+                    effective_max_concurrent = max_concurrent * multiplier
+
                     # Within each priority group, use existing tier1/tier2 logic
                     tier1_keys, tier2_keys = [], []
                     for key, usage_count in keys_in_priority:
@@ -988,30 +1116,24 @@ class UsageManager:
                         if not key_state["models_in_use"]:
                             tier1_keys.append((key, usage_count))
                         # Tier 2: Keys that can accept more concurrent requests
-                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                        elif (
+                            key_state["models_in_use"].get(model, 0)
+                            < effective_max_concurrent
+                        ):
                             tier2_keys.append((key, usage_count))
 
-                    # Determine selection method based on provider's rotation mode
-                    provider = model.split("/")[0] if "/" in model else ""
-                    rotation_mode = self._get_rotation_mode(provider)
-
                     if rotation_mode == "sequential":
-                        # Sequential mode: stick with same credential until exhausted
+                        # Sequential mode: sort credentials by priority, usage, recency
+                        # Keep all candidates in sorted order (no filtering to single key)
                         selection_method = "sequential"
                         if tier1_keys:
-                            selected_key = self._select_sequential(
+                            tier1_keys = self._sort_sequential(
                                 tier1_keys, credential_priorities
                             )
-                            tier1_keys = [
-                                (k, u) for k, u in tier1_keys if k == selected_key
-                            ]
                         if tier2_keys:
-                            selected_key = self._select_sequential(
+                            tier2_keys = self._sort_sequential(
                                 tier2_keys, credential_priorities
                             )
-                            tier2_keys = [
-                                (k, u) for k, u in tier2_keys if k == selected_key
-                            ]
                     elif self.rotation_tolerance > 0:
                         # Balanced mode with weighted randomness
                         selection_method = "weighted-random"
@@ -1057,7 +1179,7 @@ class UsageManager:
                         state = self.key_states[key]
                         async with state["lock"]:
                             current_count = state["models_in_use"].get(model, 0)
-                            if current_count < max_concurrent:
+                            if current_count < effective_max_concurrent:
                                 state["models_in_use"][model] = current_count + 1
                                 tier_name = (
                                     credential_tier_names.get(key, "unknown")
@@ -1066,7 +1188,7 @@ class UsageManager:
                                 )
                                 lib_logger.info(
                                     f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
                                 )
                                 return key
 
@@ -1095,6 +1217,19 @@ class UsageManager:
 
             else:
                 # Original logic when no priorities specified
+
+                # Determine selection method based on provider's rotation mode
+                provider = model.split("/")[0] if "/" in model else ""
+                rotation_mode = self._get_rotation_mode(provider)
+
+                # Calculate effective concurrency for default priority (999)
+                # When no priorities are specified, all credentials get default priority
+                default_priority = 999
+                multiplier = self._get_priority_multiplier(
+                    provider, default_priority, rotation_mode
+                )
+                effective_max_concurrent = max_concurrent * multiplier
+
                 tier1_keys, tier2_keys = [], []
 
                 # First, filter the list of available keys to exclude any on cooldown.
@@ -1108,37 +1243,32 @@ class UsageManager:
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
-                        usage_count = self._get_usage_count(key, model)
+                        # Uses grouped usage if model is in a quota group
+                        usage_count = self._get_grouped_usage_count(key, model)
                         key_state = self.key_states[key]
 
                         # Tier 1: Completely idle keys (preferred).
                         if not key_state["models_in_use"]:
                             tier1_keys.append((key, usage_count))
                         # Tier 2: Keys that can accept more concurrent requests for this model.
-                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                        elif (
+                            key_state["models_in_use"].get(model, 0)
+                            < effective_max_concurrent
+                        ):
                             tier2_keys.append((key, usage_count))
 
-                # Determine selection method based on provider's rotation mode
-                provider = model.split("/")[0] if "/" in model else ""
-                rotation_mode = self._get_rotation_mode(provider)
-
                 if rotation_mode == "sequential":
-                    # Sequential mode: stick with same credential until exhausted
+                    # Sequential mode: sort credentials by priority, usage, recency
+                    # Keep all candidates in sorted order (no filtering to single key)
                     selection_method = "sequential"
                     if tier1_keys:
-                        selected_key = self._select_sequential(
+                        tier1_keys = self._sort_sequential(
                             tier1_keys, credential_priorities
                         )
-                        tier1_keys = [
-                            (k, u) for k, u in tier1_keys if k == selected_key
-                        ]
                     if tier2_keys:
-                        selected_key = self._select_sequential(
+                        tier2_keys = self._sort_sequential(
                             tier2_keys, credential_priorities
                         )
-                        tier2_keys = [
-                            (k, u) for k, u in tier2_keys if k == selected_key
-                        ]
                 elif self.rotation_tolerance > 0:
                     # Balanced mode with weighted randomness
                     selection_method = "weighted-random"
@@ -1185,7 +1315,7 @@ class UsageManager:
                     state = self.key_states[key]
                     async with state["lock"]:
                         current_count = state["models_in_use"].get(model, 0)
-                        if current_count < max_concurrent:
+                        if current_count < effective_max_concurrent:
                             state["models_in_use"][model] = current_count + 1
                             tier_name = (
                                 credential_tier_names.get(key)
@@ -1195,7 +1325,7 @@ class UsageManager:
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
                             lib_logger.info(
                                 f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
                             )
                             return key
 

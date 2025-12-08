@@ -219,6 +219,16 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     # No quota groups defined for Gemini CLI
     # (Models don't share quotas)
 
+    # Priority-based concurrency multipliers
+    # Same structure as Antigravity (by coincidence, tiers share naming)
+    # Priority 1 (paid ultra): 5x concurrent requests
+    # Priority 2 (standard paid): 3x concurrent requests
+    # Others: 1x (no sequential fallback, uses global default)
+    default_priority_multipliers = {1: 5, 2: 3}
+
+    # No sequential fallback for Gemini CLI (uses balanced mode default)
+    # default_sequential_fallback_multiplier = 1  (inherited from ProviderInterface)
+
     @staticmethod
     def parse_quota_error(
         error: Exception, error_body: Optional[str] = None

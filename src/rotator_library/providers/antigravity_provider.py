@@ -539,9 +539,28 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     }
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
+    # Models in the same group share quota - when one is exhausted, all are
     model_quota_groups: QuotaGroupMap = {
-        # "claude": ["claude-sonnet-4-5", "claude-opus-4-5"], - commented out for later use if needed
+        #"claude": ["claude-sonnet-4-5", "claude-opus-4-5"], - commented out for later use if needed
     }
+
+    # Model usage weights for grouped usage calculation
+    # Opus consumes more quota per request, so its usage counts 2x when
+    # comparing credentials for selection
+    model_usage_weights = {
+        "claude-opus-4-5": 2,
+    }
+
+    # Priority-based concurrency multipliers
+    # Higher priority credentials (lower number) get higher multipliers
+    # Priority 1 (paid ultra): 5x concurrent requests
+    # Priority 2 (standard paid): 3x concurrent requests
+    # Others: Use sequential fallback (2x) or balanced default (1x)
+    default_priority_multipliers = {1: 5, 2: 3}
+
+    # For sequential mode, lower priority tiers still get 2x to maintain stickiness
+    # For balanced mode, this doesn't apply (falls back to 1x)
+    default_sequential_fallback_multiplier = 2
 
     @staticmethod
     def parse_quota_error(

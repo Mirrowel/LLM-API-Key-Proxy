@@ -234,6 +234,94 @@ class RotationModeManager:
         self.settings.remove(key)
 
 
+class PriorityMultiplierManager:
+    """Manages CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N> settings"""
+
+    def __init__(self, settings: AdvancedSettings):
+        self.settings = settings
+
+    def get_provider_defaults(self, provider: str) -> Dict[int, int]:
+        """Get default priority multipliers from provider class"""
+        try:
+            from rotator_library.providers import PROVIDER_PLUGINS
+
+            provider_class = PROVIDER_PLUGINS.get(provider.lower())
+            if provider_class and hasattr(
+                provider_class, "default_priority_multipliers"
+            ):
+                return dict(provider_class.default_priority_multipliers)
+        except ImportError:
+            pass
+        return {}
+
+    def get_sequential_fallback(self, provider: str) -> int:
+        """Get sequential fallback multiplier from provider class"""
+        try:
+            from rotator_library.providers import PROVIDER_PLUGINS
+
+            provider_class = PROVIDER_PLUGINS.get(provider.lower())
+            if provider_class and hasattr(
+                provider_class, "default_sequential_fallback_multiplier"
+            ):
+                return provider_class.default_sequential_fallback_multiplier
+        except ImportError:
+            pass
+        return 1
+
+    def get_current_multipliers(self) -> Dict[str, Dict[int, int]]:
+        """Get currently configured priority multipliers from env vars"""
+        multipliers: Dict[str, Dict[int, int]] = {}
+        for key, value in os.environ.items():
+            if key.startswith("CONCURRENCY_MULTIPLIER_") and "_PRIORITY_" in key:
+                try:
+                    # Parse: CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>
+                    parts = key.split("_PRIORITY_")
+                    provider = parts[0].replace("CONCURRENCY_MULTIPLIER_", "").lower()
+                    remainder = parts[1]
+
+                    # Check if mode-specific (has _SEQUENTIAL or _BALANCED suffix)
+                    if "_" in remainder:
+                        continue  # Skip mode-specific for now (show in separate view)
+
+                    priority = int(remainder)
+                    multiplier = int(value)
+
+                    if provider not in multipliers:
+                        multipliers[provider] = {}
+                    multipliers[provider][priority] = multiplier
+                except (ValueError, IndexError):
+                    pass
+        return multipliers
+
+    def get_effective_multiplier(self, provider: str, priority: int) -> int:
+        """Get effective multiplier (configured, provider default, or 1)"""
+        # Check env var override
+        current = self.get_current_multipliers()
+        if provider.lower() in current:
+            if priority in current[provider.lower()]:
+                return current[provider.lower()][priority]
+
+        # Check provider defaults
+        defaults = self.get_provider_defaults(provider)
+        if priority in defaults:
+            return defaults[priority]
+
+        # Return 1 (no multiplier)
+        return 1
+
+    def set_multiplier(self, provider: str, priority: int, multiplier: int):
+        """Set priority multiplier for a provider"""
+        if multiplier < 1:
+            raise ValueError("Multiplier must be >= 1")
+        key = f"CONCURRENCY_MULTIPLIER_{provider.upper()}_PRIORITY_{priority}"
+        self.settings.set(key, str(multiplier))
+
+    def remove_multiplier(self, provider: str, priority: int):
+        """Remove multiplier (reset to provider default)"""
+        key = f"CONCURRENCY_MULTIPLIER_{provider.upper()}_PRIORITY_{priority}"
+        self.settings.remove(key)
+
+
 # =============================================================================
 # PROVIDER-SPECIFIC SETTINGS DEFINITIONS
 # =============================================================================
@@ -424,6 +512,7 @@ class SettingsTool:
         self.model_mgr = ModelDefinitionManager(self.settings)
         self.concurrency_mgr = ConcurrencyManager(self.settings)
         self.rotation_mgr = RotationModeManager(self.settings)
+        self.priority_multiplier_mgr = PriorityMultiplierManager(self.settings)
         self.provider_settings_mgr = ProviderSettingsManager(self.settings)
         self.running = True
 
@@ -1268,14 +1357,15 @@ class SettingsTool:
             self.console.print()
             self.console.print("   1. ➕ Set Rotation Mode for Provider")
             self.console.print("   2. 🗑️  Reset to Provider Default")
-            self.console.print("   3. ↩️  Back to Settings Menu")
+            self.console.print("   3. ⚡ Configure Priority Concurrency Multipliers")
+            self.console.print("   4. ↩️  Back to Settings Menu")
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
 
             choice = Prompt.ask(
-                "Select option", choices=["1", "2", "3"], show_choices=False
+                "Select option", choices=["1", "2", "3", "4"], show_choices=False
             )
 
             if choice == "1":
@@ -1368,7 +1458,169 @@ class SettingsTool:
                     input("\nPress Enter to continue...")
 
             elif choice == "3":
+                self.manage_priority_multipliers()
+
+            elif choice == "4":
                 break
+
+    def manage_priority_multipliers(self):
+        """Manage priority-based concurrency multipliers per provider"""
+        clear_screen()
+
+        current_multipliers = self.priority_multiplier_mgr.get_current_multipliers()
+        available_providers = self.get_available_providers()
+
+        self.console.print(
+            Panel.fit(
+                "[bold cyan]⚡ Priority Concurrency Multipliers[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+        self.console.print()
+        self.console.print("[bold]📋 Current Priority Multiplier Settings[/bold]")
+        self.console.print("━" * 70)
+
+        # Show all providers with their priority multipliers
+        has_settings = False
+        for provider in available_providers:
+            defaults = self.priority_multiplier_mgr.get_provider_defaults(provider)
+            overrides = current_multipliers.get(provider, {})
+            seq_fallback = self.priority_multiplier_mgr.get_sequential_fallback(
+                provider
+            )
+            rotation_mode = self.rotation_mgr.get_effective_mode(provider)
+
+            if defaults or overrides or seq_fallback != 1:
+                has_settings = True
+                self.console.print(
+                    f"\n   [bold]{provider}[/bold] ({rotation_mode} mode)"
+                )
+
+                # Combine and display priorities
+                all_priorities = set(defaults.keys()) | set(overrides.keys())
+                for priority in sorted(all_priorities):
+                    default_val = defaults.get(priority, 1)
+                    override_val = overrides.get(priority)
+
+                    if override_val is not None:
+                        self.console.print(
+                            f"      Priority {priority}: [cyan]{override_val}x[/cyan] (override, default: {default_val}x)"
+                        )
+                    else:
+                        self.console.print(
+                            f"      Priority {priority}: {default_val}x [dim](default)[/dim]"
+                        )
+
+                # Show sequential fallback if applicable
+                if rotation_mode == "sequential" and seq_fallback != 1:
+                    self.console.print(
+                        f"      Others (seq): {seq_fallback}x [dim](fallback)[/dim]"
+                    )
+
+        if not has_settings:
+            self.console.print("   [dim]No priority multipliers configured[/dim]")
+
+        self.console.print()
+        self.console.print("[bold]ℹ️  About Priority Multipliers:[/bold]")
+        self.console.print(
+            "   Higher priority tiers (lower numbers) can have higher multipliers."
+        )
+        self.console.print("   Example: Priority 1 = 5x, Priority 2 = 3x, Others = 1x")
+        self.console.print()
+        self.console.print("━" * 70)
+        self.console.print()
+        self.console.print("   1. ✏️  Set Priority Multiplier")
+        self.console.print("   2. 🔄 Reset to Provider Default")
+        self.console.print("   3. ↩️  Back")
+
+        choice = Prompt.ask(
+            "Select option", choices=["1", "2", "3"], show_choices=False
+        )
+
+        if choice == "1":
+            if not available_providers:
+                self.console.print("\n[yellow]No providers available[/yellow]")
+                input("\nPress Enter to continue...")
+                return
+
+            # Select provider
+            self.console.print("\n[bold]Select provider:[/bold]")
+            for idx, prov in enumerate(available_providers, 1):
+                self.console.print(f"   {idx}. {prov}")
+
+            prov_idx = IntPrompt.ask(
+                "Provider",
+                choices=[str(i) for i in range(1, len(available_providers) + 1)],
+            )
+            provider = available_providers[prov_idx - 1]
+
+            # Get priority level
+            priority = IntPrompt.ask("Priority level (e.g., 1, 2, 3)")
+
+            # Get current value
+            current = self.priority_multiplier_mgr.get_effective_multiplier(
+                provider, priority
+            )
+            self.console.print(
+                f"\nCurrent multiplier for priority {priority}: {current}x"
+            )
+
+            multiplier = IntPrompt.ask("New multiplier (1-10)", default=current)
+            if 1 <= multiplier <= 10:
+                self.priority_multiplier_mgr.set_multiplier(
+                    provider, priority, multiplier
+                )
+                self.console.print(
+                    f"\n[green]✅ Priority {priority} multiplier for '{provider}' set to {multiplier}x[/green]"
+                )
+            else:
+                self.console.print(
+                    "\n[yellow]Multiplier must be between 1 and 10[/yellow]"
+                )
+            input("\nPress Enter to continue...")
+
+        elif choice == "2":
+            # Find providers with overrides
+            providers_with_overrides = [
+                p for p in available_providers if p in current_multipliers
+            ]
+            if not providers_with_overrides:
+                self.console.print("\n[yellow]No custom multipliers to reset[/yellow]")
+                input("\nPress Enter to continue...")
+                return
+
+            self.console.print("\n[bold]Select provider to reset:[/bold]")
+            for idx, prov in enumerate(providers_with_overrides, 1):
+                self.console.print(f"   {idx}. {prov}")
+
+            prov_idx = IntPrompt.ask(
+                "Provider",
+                choices=[str(i) for i in range(1, len(providers_with_overrides) + 1)],
+            )
+            provider = providers_with_overrides[prov_idx - 1]
+
+            # Get priority to reset
+            overrides = current_multipliers.get(provider, {})
+            if len(overrides) == 1:
+                priority = list(overrides.keys())[0]
+            else:
+                self.console.print(f"\nOverrides for {provider}: {overrides}")
+                priority = IntPrompt.ask("Priority level to reset")
+
+            if priority in overrides:
+                self.priority_multiplier_mgr.remove_multiplier(provider, priority)
+                default = self.priority_multiplier_mgr.get_effective_multiplier(
+                    provider, priority
+                )
+                self.console.print(
+                    f"\n[green]✅ Reset priority {priority} for '{provider}' to default ({default}x)[/green]"
+                )
+            else:
+                self.console.print(
+                    f"\n[yellow]No override for priority {priority}[/yellow]"
+                )
+            input("\nPress Enter to continue...")
 
     def manage_concurrency_limits(self):
         """Manage concurrency limits"""
