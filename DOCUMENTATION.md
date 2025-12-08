@@ -96,22 +96,30 @@ The `_safe_streaming_wrapper` is a critical component for stability. It:
 
 ### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management
 
-This class is the stateful core of the library, managing concurrency, usage tracking, and cooldowns.
+This class is the stateful core of the library, managing concurrency, usage tracking, cooldowns, and quota resets.
 
 #### Key Concepts
 
 *   **Async-Native & Lazy-Loaded**: Fully asynchronous, using `aiofiles` for non-blocking file I/O. Usage data is loaded only when needed.
 *   **Fine-Grained Locking**: Each API key has its own `asyncio.Lock` and `asyncio.Condition`. This allows for highly granular control.
+*   **Multiple Reset Modes**: Supports three reset strategies:
+    - **per_model**: Each model has independent usage window with authoritative `quota_reset_ts` (from provider errors)
+    - **credential**: One window per credential with custom duration (e.g., 5 hours, 7 days)
+    - **daily**: Legacy daily reset at `daily_reset_time_utc`
+*   **Model Quota Groups**: Models can be grouped to share quota limits. When one model in a group hits quota, all receive the same reset timestamp.
 
 #### Tiered Key Acquisition Strategy
 
 The `acquire_key` method uses a sophisticated strategy to balance load:
 
 1.  **Filtering**: Keys currently on cooldown (global or model-specific) are excluded.
-2.  **Tiering**: Valid keys are split into two tiers:
+2.  **Rotation Mode**: Determines credential selection strategy:
+    *   **Balanced Mode** (default): Credentials sorted by usage count - least-used first for even distribution
+    *   **Sequential Mode**: Credentials sorted by usage count descending - most-used first to maintain sticky behavior until exhausted
+3.  **Tiering**: Valid keys are split into two tiers:
     *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
     *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
-3.  **Selection Strategy** (configurable via `rotation_tolerance`):
+4.  **Selection Strategy** (configurable via `rotation_tolerance`):
     *   **Deterministic (tolerance=0.0)**: Within each tier, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
     *   **Weighted Random (tolerance>0, default)**: Keys are selected randomly with weights biased toward less-used ones:
         - Formula: `weight = (max_usage - credential_usage) + tolerance + 1`
@@ -119,14 +127,19 @@ The `acquire_key` method uses a sophisticated strategy to balance load:
         - `tolerance=5.0+`: High randomness - even heavily-used credentials have significant probability
         - **Security Benefit**: Unpredictable selection patterns make rate limit detection and fingerprinting harder
         - **Load Balance**: Lower-usage credentials still preferred, maintaining reasonable distribution
-4.  **Concurrency Limits**: Checks against `max_concurrent` limits to prevent overloading a single key.
-5.  **Priority Groups**: When credential prioritization is enabled, higher-tier credentials (lower priority numbers) are tried first before moving to lower tiers.
+5.  **Concurrency Limits**: Checks against `max_concurrent` limits (with priority multipliers applied) to prevent overloading a single key.
+6.  **Priority Groups**: When credential prioritization is enabled, higher-tier credentials (lower priority numbers) are tried first before moving to lower tiers.
 
 #### Failure Handling & Cooldowns
 
 *   **Escalating Backoff**: When a failure occurs, the key gets a temporary cooldown for that specific model. Consecutive failures increase this time (10s -> 30s -> 60s -> 120s).
 *   **Key-Level Lockouts**: If a key accumulates failures across multiple distinct models (3+), it is assumed to be dead/revoked and placed on a global 5-minute lockout.
 *   **Authentication Errors**: Immediate 5-minute global lockout.
+*   **Quota Exhausted Errors**: When a provider returns a quota exhausted error with an authoritative reset timestamp:
+    - The `quota_reset_ts` is extracted from the error response (via provider's `parse_quota_error()` method)
+    - Applied to the affected model (and all models in its quota group if defined)
+    - Cooldown preserved even during daily/window resets until the actual quota reset time
+    - Logs show the exact reset time in local timezone with ISO format
 
 ### 2.3. `batch_manager.py` - Efficient Request Aggregation
 
@@ -406,6 +419,10 @@ The most sophisticated provider implementation, supporting Google's internal Ant
 - **Thought Signature Caching**: Server-side caching of encrypted signatures for multi-turn Gemini 3 conversations
 - **Model-Specific Logic**: Automatic configuration based on model type (Gemini 3, Claude Sonnet, Claude Opus)
 - **Credential Prioritization**: Automatic tier detection with paid credentials prioritized over free (paid tier resets every 5 hours, free tier resets weekly)
+- **Sequential Rotation Mode**: Default rotation mode is sequential (use credentials until exhausted) to maximize thought signature cache hits
+- **Per-Model Quota Tracking**: Each model tracks independent usage windows with authoritative reset timestamps from quota errors
+- **Quota Groups**: Claude models (Sonnet 4.5 + Opus 4.5) can be grouped to share quota limits (disabled by default, configurable via `QUOTA_GROUPS_ANTIGRAVITY_CLAUDE`)
+- **Priority Multipliers**: Paid tier credentials get higher concurrency limits (Priority 1: 5x, Priority 2: 3x, Priority 3+: 2x in sequential mode)
 
 #### Model Support
 
@@ -585,6 +602,221 @@ cache/
 
 ---
 
+### 2.13. Sequential Rotation & Per-Model Quota Tracking
+
+A comprehensive credential rotation and quota management system introduced in PR #31.
+
+#### Rotation Modes
+
+Two rotation strategies are available per provider:
+
+**Balanced Mode (Default)**:
+- Distributes load evenly across all credentials
+- Least-used credentials selected first
+- Best for providers with per-minute rate limits
+- Prevents any single credential from being overused
+
+**Sequential Mode**:
+- Uses one credential until it's exhausted (429 quota error)
+- Switches to next credential only after current one fails
+- Most-used credentials selected first (sticky behavior)
+- Best for providers with daily/weekly quotas
+- Maximizes cache hit rates (e.g., Antigravity thought signatures)
+- Default for Antigravity provider
+
+**Configuration**:
+```env
+# Set per provider
+ROTATION_MODE_GEMINI=sequential
+ROTATION_MODE_OPENAI=balanced
+ROTATION_MODE_ANTIGRAVITY=balanced  # Override default
+```
+
+#### Per-Model Quota Tracking
+
+Instead of tracking usage at the credential level, the system now supports granular per-model tracking:
+
+**Data Structure** (when `mode="per_model"`):
+```json
+{
+  "credential_id": {
+    "models": {
+      "gemini-2.5-pro": {
+        "window_start_ts": 1733678400.0,
+        "quota_reset_ts": 1733696400.0,
+        "success_count": 15,
+        "prompt_tokens": 5000,
+        "completion_tokens": 1000,
+        "approx_cost": 0.05,
+        "window_started": "2025-12-08 14:00:00 +0100",
+        "quota_resets": "2025-12-08 19:00:00 +0100"
+      }
+    },
+    "global": {...},
+    "model_cooldowns": {...}
+  }
+}
+```
+
+**Key Features**:
+- Each model tracks its own usage window independently
+- `window_start_ts`: When the current quota period started
+- `quota_reset_ts`: Authoritative reset time from provider error response
+- Human-readable timestamps added for debugging
+- Supports custom window durations (5h, 7d, etc.)
+
+#### Provider-Specific Quota Parsing
+
+Providers can implement `parse_quota_error()` to extract precise reset times from error responses:
+
+```python
+@staticmethod
+def parse_quota_error(error, error_body) -> Optional[Dict]:
+    """Extract quota reset timestamp from provider error.
+    
+    Returns:
+        {
+            'quota_reset_timestamp': 1733696400.0,  # Unix timestamp
+            'retry_after': 18000  # Seconds until reset
+        }
+    """
+```
+
+**Google RPC Format** (Antigravity, Gemini CLI):
+- Parses `RetryInfo` and `ErrorInfo` from error details
+- Handles duration strings: `"143h4m52.73s"` or `"515092.73s"`
+- Extracts `quotaResetTimeStamp` and converts to Unix timestamp
+- Falls back to `quotaResetDelay` if timestamp not available
+
+**Example Error Response**:
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "Quota exceeded",
+    "details": [{
+      "@type": "type.googleapis.com/google.rpc.RetryInfo",
+      "retryDelay": "143h4m52.73s"
+    }, {
+      "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+      "metadata": {
+        "quotaResetTimeStamp": "2025-12-08T19:00:00Z"
+      }
+    }]
+  }
+}
+```
+
+#### Model Quota Groups
+
+Models that share the same quota limits can be grouped:
+
+**Configuration**:
+```env
+# Models in a group share quota/cooldown timing
+QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+
+# To disable a default group:
+QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
+```
+
+**Behavior**:
+- When one model hits quota, all models in the group receive the same `quota_reset_ts`
+- Combined weighted usage for credential selection (e.g., Opus counts 2x vs Sonnet)
+- Group resets only when ALL models' quotas have reset
+- Preserves unexpired cooldowns during other resets
+
+**Provider Implementation**:
+```python
+class AntigravityProvider(ProviderInterface):
+    model_quota_groups = {
+        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"]
+    }
+    
+    model_usage_weights = {
+        "claude-opus-4-5": 2  # Opus counts 2x vs Sonnet
+    }
+```
+
+#### Priority-Based Concurrency Multipliers
+
+Credentials can be assigned to priority tiers with configurable concurrency limits:
+
+**Configuration**:
+```env
+# Universal multipliers (all modes)
+CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_1=10
+CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
+
+# Mode-specific overrides
+CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2_BALANCED=1  # Lower in balanced mode
+```
+
+**How it works**:
+```python
+effective_concurrent_limit = MAX_CONCURRENT_REQUESTS_PER_KEY * tier_multiplier
+```
+
+**Provider Defaults** (Antigravity):
+- Priority 1 (paid ultra): 5x multiplier
+- Priority 2 (standard paid): 3x multiplier  
+- Priority 3+ (free): 2x (sequential mode) or 1x (balanced mode)
+
+**Benefits**:
+- Paid credentials handle more load without manual configuration
+- Different concurrency for different rotation modes
+- Automatic tier detection based on credential properties
+
+#### Reset Window Configuration
+
+Providers can specify custom reset windows per priority tier:
+
+```python
+class AntigravityProvider(ProviderInterface):
+    usage_reset_configs = {
+        frozenset([1, 2]): UsageResetConfigDef(
+            mode="per_model",
+            window_hours=5,  # 5-hour rolling window for paid tiers
+            field_name="5h_window"
+        ),
+        frozenset([3, 4, 5]): UsageResetConfigDef(
+            mode="per_model",
+            window_hours=168,  # 7-day window for free tier
+            field_name="7d_window"
+        )
+    }
+```
+
+**Supported Modes**:
+- `per_model`: Independent window per model with authoritative reset times
+- `credential`: Single window per credential (legacy)
+- `daily`: Daily reset at configured UTC hour (legacy)
+
+#### Usage Flow
+
+1. **Request arrives** for model X with credential Y
+2. **Check rotation mode**: Sequential or balanced?
+3. **Select credential**:
+   - Filter by priority tier requirements
+   - Apply concurrency multiplier for effective limit
+   - Sort by rotation mode strategy
+4. **Check quota**:
+   - Load model's usage data
+   - Check if within window (window_start_ts to quota_reset_ts)
+   - Check model quota groups for combined usage
+5. **Execute request**
+6. **On success**: Increment model usage count
+7. **On quota error**:
+   - Parse error for `quota_reset_ts`
+   - Apply to model (and quota group)
+   - Credential remains on cooldown until reset time
+8. **On window expiration**:
+   - Archive model data to global stats
+   - Start fresh window with new `window_start_ts`
+   - Preserve unexpired quota cooldowns
+
+---
+
 ### 2.12. Google OAuth Base (`providers/google_oauth_base.py`)
 
 A refactored, reusable OAuth2 base class that eliminates code duplication across Google-based providers.
@@ -636,6 +868,12 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 ### 3.1. Gemini CLI (`gemini_cli_provider.py`)
 
 The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
+
+**New in PR #31**:
+- **Quota Parsing**: Implements `parse_quota_error()` using Google RPC format parser
+- **Tier Configuration**: Defines `tier_priorities` and `usage_reset_configs` for automatic priority resolution
+- **Balanced Rotation**: Defaults to balanced mode (unlike Antigravity which uses sequential)
+- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 1x)
 
 #### Authentication (`gemini_auth_base.py`)
 
