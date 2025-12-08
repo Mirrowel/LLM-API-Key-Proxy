@@ -107,7 +107,7 @@ class SettingsDetector:
 
     @staticmethod
     def get_all_settings() -> dict:
-        """Returns comprehensive settings overview"""
+        """Returns comprehensive settings overview (includes provider_settings which triggers heavy imports)"""
         return {
             "credentials": SettingsDetector.detect_credentials(),
             "custom_bases": SettingsDetector.detect_custom_api_bases(),
@@ -115,6 +115,17 @@ class SettingsDetector:
             "concurrency_limits": SettingsDetector.detect_concurrency_limits(),
             "model_filters": SettingsDetector.detect_model_filters(),
             "provider_settings": SettingsDetector.detect_provider_settings(),
+        }
+
+    @staticmethod
+    def get_basic_settings() -> dict:
+        """Returns basic settings overview without provider_settings (avoids heavy imports)"""
+        return {
+            "credentials": SettingsDetector.detect_credentials(),
+            "custom_bases": SettingsDetector.detect_custom_api_bases(),
+            "model_definitions": SettingsDetector.detect_model_definitions(),
+            "concurrency_limits": SettingsDetector.detect_concurrency_limits(),
+            "model_filters": SettingsDetector.detect_model_filters(),
         }
 
     @staticmethod
@@ -277,8 +288,8 @@ class LauncherTUI:
         """Display main menu and handle selection"""
         clear_screen()
 
-        # Detect all settings
-        settings = SettingsDetector.get_all_settings()
+        # Detect basic settings (excludes provider_settings to avoid heavy imports)
+        settings = SettingsDetector.get_basic_settings()
         credentials = settings["credentials"]
         custom_bases = settings["custom_bases"]
 
@@ -363,18 +374,17 @@ class LauncherTUI:
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
-        provider_settings = settings.get("provider_settings", {})
+
+        self.console.print(f"   Providers:           {provider_count} configured")
+        self.console.print(f"   Custom Providers:    {custom_count} configured")
+        # Note: provider_settings detection is deferred to avoid heavy imports on startup
         has_advanced = bool(
             settings["model_definitions"]
             or settings["concurrency_limits"]
             or settings["model_filters"]
-            or provider_settings
         )
-
-        self.console.print(f"   Providers:           {provider_count} configured")
-        self.console.print(f"   Custom Providers:    {custom_count} configured")
         self.console.print(
-            f"   Advanced Settings:   {'Active (view in menu 4)' if has_advanced else 'None'}"
+            f"   Advanced Settings:   {'Active (view in menu 4)' if has_advanced else 'None (view menu 4 for details)'}"
         )
 
         # Show menu
@@ -659,13 +669,14 @@ class LauncherTUI:
         """Display provider/advanced settings (read-only + launch tool)"""
         clear_screen()
 
-        settings = SettingsDetector.get_all_settings()
+        # Use basic settings to avoid heavy imports - provider_settings deferred to Settings Tool
+        settings = SettingsDetector.get_basic_settings()
+
         credentials = settings["credentials"]
         custom_bases = settings["custom_bases"]
         model_defs = settings["model_definitions"]
         concurrency = settings["concurrency_limits"]
         filters = settings["model_filters"]
-        provider_settings = settings.get("provider_settings", {})
 
         self.console.print(
             Panel.fit(
@@ -740,23 +751,13 @@ class LauncherTUI:
                 status = " + ".join(status_parts) if status_parts else "None"
                 self.console.print(f"   • {provider:15} ✅ {status}")
 
-        # Provider-Specific Settings
+        # Provider-Specific Settings (deferred to Settings Tool to avoid heavy imports)
         self.console.print()
         self.console.print("[bold]🔬 Provider-Specific Settings[/bold]")
         self.console.print("━" * 70)
-        try:
-            from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
-        except ImportError:
-            from .settings_tool import PROVIDER_SETTINGS_MAP
-        for provider in PROVIDER_SETTINGS_MAP.keys():
-            display_name = provider.replace("_", " ").title()
-            modified = provider_settings.get(provider, 0)
-            if modified > 0:
-                self.console.print(
-                    f"   • {display_name:20} [yellow]{modified} setting{'s' if modified > 1 else ''} modified[/yellow]"
-                )
-            else:
-                self.console.print(f"   • {display_name:20} [dim]using defaults[/dim]")
+        self.console.print(
+            "   [dim]Launch Settings Tool to view/configure provider-specific settings[/dim]"
+        )
 
         # Actions
         self.console.print()
@@ -827,7 +828,23 @@ class LauncherTUI:
 
     def launch_settings_tool(self):
         """Launch settings configuration tool"""
-        from proxy_app.settings_tool import run_settings_tool
+        import time
+
+        clear_screen()
+
+        self.console.print("━" * 70)
+        self.console.print("Advanced Settings Configuration Tool")
+        self.console.print("━" * 70)
+
+        _start_time = time.time()
+
+        with self.console.status("Initializing settings tool...", spinner="dots"):
+            from proxy_app.settings_tool import run_settings_tool
+
+        _elapsed = time.time() - _start_time
+        self.console.print(f"✓ Settings tool ready in {_elapsed:.2f}s")
+
+        time.sleep(0.3)
 
         run_settings_tool()
         # Reload environment after settings tool

@@ -14,6 +14,29 @@ from dotenv import set_key, unset_key
 
 console = Console()
 
+# Import default OAuth port values from provider modules
+# These serve as the source of truth for default port values
+try:
+    from rotator_library.providers.gemini_auth_base import GeminiAuthBase
+
+    GEMINI_CLI_DEFAULT_OAUTH_PORT = GeminiAuthBase.CALLBACK_PORT
+except ImportError:
+    GEMINI_CLI_DEFAULT_OAUTH_PORT = 8085
+
+try:
+    from rotator_library.providers.antigravity_auth_base import AntigravityAuthBase
+
+    ANTIGRAVITY_DEFAULT_OAUTH_PORT = AntigravityAuthBase.CALLBACK_PORT
+except ImportError:
+    ANTIGRAVITY_DEFAULT_OAUTH_PORT = 51121
+
+try:
+    from rotator_library.providers.iflow_auth_base import (
+        CALLBACK_PORT as IFLOW_DEFAULT_OAUTH_PORT,
+    )
+except ImportError:
+    IFLOW_DEFAULT_OAUTH_PORT = 11451
+
 
 def clear_screen():
     """
@@ -383,6 +406,11 @@ ANTIGRAVITY_SETTINGS = {
         "default": "\n\nSTRICT PARAMETERS: {params}.",
         "description": "Template for Claude strict parameter hints in tool descriptions",
     },
+    "ANTIGRAVITY_OAUTH_PORT": {
+        "type": "int",
+        "default": ANTIGRAVITY_DEFAULT_OAUTH_PORT,
+        "description": "Local port for OAuth callback server during authentication",
+    },
 }
 
 # Gemini CLI provider environment variables
@@ -427,12 +455,27 @@ GEMINI_CLI_SETTINGS = {
         "default": "",
         "description": "GCP Project ID for paid tier users (required for paid tiers)",
     },
+    "GEMINI_CLI_OAUTH_PORT": {
+        "type": "int",
+        "default": GEMINI_CLI_DEFAULT_OAUTH_PORT,
+        "description": "Local port for OAuth callback server during authentication",
+    },
+}
+
+# iFlow provider environment variables
+IFLOW_SETTINGS = {
+    "IFLOW_OAUTH_PORT": {
+        "type": "int",
+        "default": IFLOW_DEFAULT_OAUTH_PORT,
+        "description": "Local port for OAuth callback server during authentication",
+    },
 }
 
 # Map provider names to their settings definitions
 PROVIDER_SETTINGS_MAP = {
     "antigravity": ANTIGRAVITY_SETTINGS,
     "gemini_cli": GEMINI_CLI_SETTINGS,
+    "iflow": IFLOW_SETTINGS,
 }
 
 

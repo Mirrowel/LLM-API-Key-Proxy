@@ -54,6 +54,25 @@ class GoogleOAuthBase:
     CALLBACK_PATH: str = "/oauth2callback"
     REFRESH_EXPIRY_BUFFER_SECONDS: int = 30 * 60  # 30 minutes
 
+    @property
+    def callback_port(self) -> int:
+        """
+        Get the OAuth callback port, checking environment variable first.
+
+        Reads from {ENV_PREFIX}_OAUTH_PORT environment variable, falling back
+        to the class's CALLBACK_PORT default if not set.
+        """
+        env_var = f"{self.ENV_PREFIX}_OAUTH_PORT"
+        env_value = os.getenv(env_var)
+        if env_value:
+            try:
+                return int(env_value)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid {env_var} value: {env_value}, using default {self.CALLBACK_PORT}"
+                )
+        return self.CALLBACK_PORT
+
     def __init__(self):
         # Validate that subclass has set required attributes
         if self.CLIENT_ID is None:
@@ -701,14 +720,14 @@ class GoogleOAuthBase:
 
         try:
             server = await asyncio.start_server(
-                handle_callback, "127.0.0.1", self.CALLBACK_PORT
+                handle_callback, "127.0.0.1", self.callback_port
             )
             from urllib.parse import urlencode
 
             auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
                 {
                     "client_id": self.CLIENT_ID,
-                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "redirect_uri": f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}",
                     "scope": " ".join(self.OAUTH_SCOPES),
                     "access_type": "offline",
                     "response_type": "code",
@@ -783,7 +802,7 @@ class GoogleOAuthBase:
                     "code": auth_code.strip(),
                     "client_id": self.CLIENT_ID,
                     "client_secret": self.CLIENT_SECRET,
-                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "redirect_uri": f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}",
                     "grant_type": "authorization_code",
                 },
             )

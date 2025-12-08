@@ -39,6 +39,25 @@ IFLOW_CLIENT_SECRET = "4Z3YjXycVsQvyGF1etiNlIBB4RsqSDtW"
 # Local callback server port
 CALLBACK_PORT = 11451
 
+
+def get_callback_port() -> int:
+    """
+    Get the OAuth callback port, checking environment variable first.
+
+    Reads from IFLOW_OAUTH_PORT environment variable, falling back
+    to the default CALLBACK_PORT if not set.
+    """
+    env_value = os.getenv("IFLOW_OAUTH_PORT")
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            logging.getLogger("rotator_library").warning(
+                f"Invalid IFLOW_OAUTH_PORT value: {env_value}, using default {CALLBACK_PORT}"
+            )
+    return CALLBACK_PORT
+
+
 # Refresh tokens 24 hours before expiry
 REFRESH_EXPIRY_BUFFER_SECONDS = 24 * 60 * 60
 
@@ -931,7 +950,8 @@ class IFlowAuthBase:
         state = secrets.token_urlsafe(32)
 
         # Build authorization URL
-        redirect_uri = f"http://localhost:{CALLBACK_PORT}/oauth2callback"
+        callback_port = get_callback_port()
+        redirect_uri = f"http://localhost:{callback_port}/oauth2callback"
         auth_params = {
             "loginMethod": "phone",
             "type": "phone",
@@ -942,7 +962,7 @@ class IFlowAuthBase:
         auth_url = f"{IFLOW_OAUTH_AUTHORIZE_ENDPOINT}?{urlencode(auth_params)}"
 
         # Start OAuth callback server
-        callback_server = OAuthCallbackServer(port=CALLBACK_PORT)
+        callback_server = OAuthCallbackServer(port=callback_port)
         try:
             await callback_server.start(expected_state=state)
 

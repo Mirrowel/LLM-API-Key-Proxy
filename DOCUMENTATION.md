@@ -856,6 +856,42 @@ class AntigravityAuthBase(GoogleOAuthBase):
 - Headless environment detection
 - Sequential refresh queue processing
 
+#### OAuth Callback Port Configuration
+
+Each OAuth provider uses a local callback server during authentication. The callback port can be customized via environment variables to avoid conflicts with other services.
+
+**Default Ports:**
+
+| Provider | Default Port | Environment Variable |
+|----------|-------------|---------------------|
+| Gemini CLI | 8085 | `GEMINI_CLI_OAUTH_PORT` |
+| Antigravity | 51121 | `ANTIGRAVITY_OAUTH_PORT` |
+| iFlow | 11451 | `IFLOW_OAUTH_PORT` |
+
+**Configuration Methods:**
+
+1. **Via TUI Settings Menu:**
+   - Main Menu → `4. View Provider & Advanced Settings` → `1. Launch Settings Tool`
+   - Select the provider (Gemini CLI, Antigravity, or iFlow)
+   - Modify the `*_OAUTH_PORT` setting
+   - Use "Reset to Default" to restore the original port
+
+2. **Via `.env` file:**
+   ```env
+   # Custom OAuth callback ports (optional)
+   GEMINI_CLI_OAUTH_PORT=8085
+   ANTIGRAVITY_OAUTH_PORT=51121
+   IFLOW_OAUTH_PORT=11451
+   ```
+
+**When to Change Ports:**
+
+- If the default port conflicts with another service on your system
+- If running multiple proxy instances on the same machine
+- If firewall rules require specific port ranges
+
+**Note:** Port changes take effect on the next OAuth authentication attempt. Existing tokens are not affected.
+
 ---
 
 
@@ -877,8 +913,8 @@ The `GeminiCliProvider` is the most complex implementation, mimicking the Google
 
 #### Authentication (`gemini_auth_base.py`)
 
- *   **Device Flow**: Uses a standard OAuth 2.0 flow. The `credential_tool` spins up a local web server (`localhost:8085`) to capture the callback from Google's auth page.
-*   **Token Lifecycle**:
+ *   **Device Flow**: Uses a standard OAuth 2.0 flow. The `credential_tool` spins up a local web server (default: `localhost:8085`, configurable via `GEMINI_CLI_OAUTH_PORT`) to capture the callback from Google's auth page.
+ *   **Token Lifecycle**:
     *   **Proactive Refresh**: Tokens are refreshed 5 minutes before expiry.
     *   **Atomic Writes**: Credential files are updated using a temp-file-and-move strategy to prevent corruption during writes.
     *   **Revocation Handling**: If a `400` or `401` occurs during refresh, the token is marked as revoked, preventing infinite retry loops.
@@ -907,7 +943,7 @@ The provider employs a sophisticated, cached discovery mechanism to find a valid
 ### 3.3. iFlow (`iflow_provider.py`)
 
 *   **Hybrid Auth**: Uses a custom OAuth flow (Authorization Code) to obtain an `access_token`. However, the *actual* API calls use a separate `apiKey` that is retrieved from the user's profile (`/api/oauth/getUserInfo`) using the access token.
-*   **Callback Server**: The auth flow spins up a local server on port `11451` to capture the redirect.
+*   **Callback Server**: The auth flow spins up a local server (default: port `11451`, configurable via `IFLOW_OAUTH_PORT`) to capture the redirect.
 *   **Token Management**: Automatically refreshes the OAuth token and re-fetches the API key if needed.
 *   **Schema Cleaning**: Similar to Qwen, it aggressively sanitizes tool schemas to prevent 400 errors.
 *   **Dedicated Logging**: Implements `_IFlowFileLogger` to capture raw chunks for debugging proprietary API behaviors.
