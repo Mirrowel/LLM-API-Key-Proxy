@@ -10,6 +10,7 @@ The project is a monorepo containing two primary components:
     *   **Batch Manager**: Optimizes high-volume embedding requests.
     *   **Detailed Logger**: Provides per-request file logging for debugging.
     *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
+    *   **Model Filter GUI**: Visual interface for configuring model ignore/whitelist rules per provider (see Section 6).
 2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
 
 This architecture cleanly separates the API interface from the resilience logic, making the library a portable and powerful tool for any application needing robust API key management.
@@ -1144,4 +1145,84 @@ health = writer.get_health_info()
 stats = cache.get_stats()
 # Includes: {"disk_available": True, "disk_errors": 0, ...}
 ```
+
+---
+
+## 6. Model Filter GUI
+
+The Model Filter GUI (`model_filter_gui.py`) provides a visual interface for configuring model ignore and whitelist rules per provider. It replaces the need to manually edit `IGNORE_MODELS_*` and `WHITELIST_MODELS_*` environment variables.
+
+### 6.1. Overview
+
+**Purpose**: Visually manage which models are exposed via the `/v1/models` endpoint for each provider.
+
+**Launch**: 
+```bash
+python -c "from src.proxy_app.model_filter_gui import run_model_filter_gui; run_model_filter_gui()"
+```
+
+Or via the launcher TUI if integrated.
+
+### 6.2. Features
+
+#### Core Functionality
+
+- **Provider Selection**: Dropdown to switch between available providers with automatic model fetching
+- **Ignore Rules**: Pattern-based rules (supports wildcards like `*-preview`, `gpt-4*`) to exclude models
+- **Whitelist Rules**: Pattern-based rules to explicitly include models, overriding ignore rules
+- **Real-time Preview**: Typing in rule input fields highlights affected models before committing
+- **Rule-Model Linking**: Click a model to highlight the affecting rule; click a rule to highlight all affected models
+- **Persistence**: Rules saved to `.env` file in standard `IGNORE_MODELS_<PROVIDER>` and `WHITELIST_MODELS_<PROVIDER>` format
+
+#### Dual-Pane Model View
+
+The interface displays two synchronized lists:
+
+| Left Pane | Right Pane |
+|-----------|------------|
+| All fetched models (plain text) | Same models with color-coded status |
+| Shows total count | Shows available/ignored count |
+| Scrolls in sync with right pane | Color indicates affecting rule |
+
+**Color Coding**:
+- **Green**: Model is available (no rule affects it, or whitelisted)
+- **Red/Orange tones**: Model is ignored (color matches the specific ignore rule)
+- **Blue/Teal tones**: Model is explicitly whitelisted (color matches the whitelist rule)
+
+#### Rule Management
+
+- **Comma-separated input**: Add multiple rules at once (e.g., `*-preview, *-beta, gpt-3.5*`)
+- **Wildcard support**: `*` matches any characters (e.g., `gemini-*-preview`)
+- **Affected count**: Each rule shows how many models it affects
+- **Tooltips**: Hover over a rule to see the list of affected models
+- **Instant delete**: Click the × button to remove a rule immediately
+
+### 6.3. Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+S` | Save changes to `.env` |
+| `Ctrl+R` | Refresh models from provider |
+| `Ctrl+F` | Focus search field |
+| `F1` | Show help dialog |
+| `Escape` | Clear search / Clear highlights |
+
+### 6.4. Context Menu
+
+Right-click on any model to access:
+
+- **Add to Ignore List**: Creates an ignore rule for the exact model name
+- **Add to Whitelist**: Creates a whitelist rule for the exact model name
+- **View Affecting Rule**: Highlights the rule that affects this model
+- **Copy Model Name**: Copies the full model ID to clipboard
+
+### 6.5. Integration with Proxy
+
+The GUI modifies the same environment variables that the `RotatingClient` reads:
+
+1. **GUI saves rules** → Updates `.env` file
+2. **Proxy reads on startup** → Loads `IGNORE_MODELS_*` and `WHITELIST_MODELS_*`
+3. **Proxy applies rules** → `get_available_models()` filters based on rules
+
+**Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
 
