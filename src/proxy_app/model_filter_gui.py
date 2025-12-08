@@ -32,8 +32,8 @@ from dotenv import load_dotenv, set_key, unset_key
 # Window settings
 WINDOW_TITLE = "Model Filter Configuration"
 WINDOW_DEFAULT_SIZE = "1000x750"
-WINDOW_MIN_WIDTH = 850
-WINDOW_MIN_HEIGHT = 600
+WINDOW_MIN_WIDTH = 600
+WINDOW_MIN_HEIGHT = 400
 
 # Color scheme (dark mode)
 BG_PRIMARY = "#1a1a2e"  # Main background
@@ -1377,6 +1377,9 @@ class VirtualSyncModelLists(ctk.CTkFrame):
 
     def _create_content(self):
         """Build the dual list layout."""
+        # Don't let content dictate size - let parent grid control height
+        self.grid_propagate(False)
+
         # Configure grid
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -2018,147 +2021,6 @@ class VirtualRuleList:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# RULE CHIP COMPONENT
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-class RuleChip(ctk.CTkFrame):
-    """
-    Individual rule display showing pattern, affected count, and delete button.
-
-    The pattern text is colored with the rule's assigned color.
-    """
-
-    def __init__(
-        self,
-        master,
-        rule: FilterRule,
-        on_delete: Callable[[str], None],
-        on_click: Callable[[FilterRule], None],
-    ):
-        super().__init__(
-            master,
-            fg_color=BG_TERTIARY,
-            corner_radius=6,
-            border_width=1,
-            border_color=BORDER_COLOR,
-        )
-
-        self.rule = rule
-        self.on_delete = on_delete
-        self.on_click = on_click
-        self._is_highlighted = False
-        self._tooltip = None  # Store tooltip reference to avoid duplicates
-
-        self._create_content()
-
-        # Click binding
-        self.bind("<Button-1>", self._handle_click)
-
-    def _create_content(self):
-        """Build chip content."""
-        # Container for horizontal layout
-        self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.pack(fill="x", padx=8, pady=6)
-
-        # Pattern text (colored)
-        self.pattern_label = ctk.CTkLabel(
-            self.content,
-            text=self.rule.pattern,
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            text_color=self.rule.color,
-            anchor="w",
-        )
-        self.pattern_label.pack(side="left", fill="x", expand=True)
-        self.pattern_label.bind("<Button-1>", self._handle_click)
-
-        # Affected count
-        self.count_label = ctk.CTkLabel(
-            self.content,
-            text=f"({self.rule.affected_count})",
-            font=(FONT_FAMILY, FONT_SIZE_SMALL),
-            text_color=TEXT_MUTED,
-            width=35,
-        )
-        self.count_label.pack(side="left", padx=(5, 5))
-        self.count_label.bind("<Button-1>", self._handle_click)
-
-        # Delete button
-        delete_btn = ctk.CTkButton(
-            self.content,
-            text="×",
-            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
-            fg_color="transparent",
-            hover_color=ACCENT_RED,
-            text_color=TEXT_MUTED,
-            width=24,
-            height=24,
-            corner_radius=4,
-            command=self._handle_delete,
-        )
-        delete_btn.pack(side="right")
-
-        # Tooltip showing affected models - create once, update later
-        self._update_tooltip()
-
-        # Bind tooltip events to child widgets (not delete button)
-        for widget in [self.content, self.pattern_label, self.count_label]:
-            widget.bind("<Enter>", self._on_tooltip_enter)
-            widget.bind("<Leave>", self._on_tooltip_leave)
-
-    def _on_tooltip_enter(self, event=None):
-        """Forward enter event to tooltip."""
-        if self._tooltip:
-            self._tooltip._schedule_show(event)
-
-    def _on_tooltip_leave(self, event=None):
-        """Forward leave event to tooltip."""
-        if self._tooltip:
-            self._tooltip._hide(event)
-
-    def _handle_click(self, event=None):
-        """Handle click on rule chip."""
-        self.on_click(self.rule)
-
-    def _handle_delete(self):
-        """Handle delete button click."""
-        self.on_delete(self.rule.pattern)
-
-    def update_count(self, count: int, affected_models: List[str]):
-        """Update the affected count and tooltip."""
-        self.rule.affected_count = count
-        self.rule.affected_models = affected_models
-        self.count_label.configure(text=f"({count})")
-        self._update_tooltip()
-
-    def _update_tooltip(self):
-        """Update tooltip with affected models."""
-        if self.rule.affected_models:
-            if len(self.rule.affected_models) <= 5:
-                models_text = "\n".join(self.rule.affected_models)
-            else:
-                models_text = "\n".join(self.rule.affected_models[:5])
-                models_text += f"\n... and {len(self.rule.affected_models) - 5} more"
-            text = f"Matches:\n{models_text}"
-        else:
-            text = "No models match this pattern"
-
-        # Reuse existing tooltip or create new one
-        if self._tooltip is None:
-            self._tooltip = ToolTip(self, text)
-        else:
-            self._tooltip.update_text(text)
-
-    def set_highlighted(self, highlighted: bool):
-        """Set highlighted state."""
-        self._is_highlighted = highlighted
-        if highlighted:
-            self.configure(border_color=self.rule.color, border_width=2)
-        else:
-            self.configure(border_color=BORDER_COLOR, border_width=1)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # RULE PANEL COMPONENT
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -2191,30 +2053,18 @@ class RulePanel(ctk.CTkFrame):
 
     def _create_content(self):
         """Build panel content."""
-        # Title (compact)
+        # Title at top (compact)
         title_label = ctk.CTkLabel(
             self,
             text=self.title,
             font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
             text_color=TEXT_PRIMARY,
         )
-        title_label.pack(anchor="w", padx=10, pady=(6, 3))
+        title_label.pack(side="top", anchor="w", padx=10, pady=(4, 2))
 
-        # Virtual rule list (replaces CTkScrollableFrame + RuleChips)
-        self.rule_list = VirtualRuleList(
-            self,
-            rule_type=self.rule_type,
-            on_rule_click=self.on_rule_clicked,
-            on_rule_delete=self._on_rule_delete,
-        )
-        self.rule_list.pack(fill="both", expand=True, padx=6, pady=(0, 3))
-
-        # Set minimum height for rule list to ensure it's visible
-        self.rule_list.frame.configure(height=70)
-
-        # Input frame with fixed height (won't squish on resize)
+        # Input frame at BOTTOM - pack BEFORE rule_list to reserve space
         input_frame = ctk.CTkFrame(self, fg_color="transparent", height=32)
-        input_frame.pack(fill="x", padx=6, pady=(0, 5))
+        input_frame.pack(side="bottom", fill="x", padx=6, pady=(2, 4))
         input_frame.pack_propagate(False)  # Prevent children from changing frame height
 
         # Pattern input
@@ -2228,7 +2078,7 @@ class RulePanel(ctk.CTkFrame):
             placeholder_text_color=TEXT_MUTED,
             height=28,
         )
-        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.input_entry.pack(side="left", fill="both", expand=True, padx=(0, 6))
         self.input_entry.bind("<Return>", self._on_add_clicked)
         self.input_entry.bind("<KeyRelease>", self._on_input_key)
 
@@ -2244,6 +2094,15 @@ class RulePanel(ctk.CTkFrame):
             command=self._on_add_clicked,
         )
         add_btn.pack(side="right")
+
+        # Virtual rule list fills REMAINING middle space - pack LAST
+        self.rule_list = VirtualRuleList(
+            self,
+            rule_type=self.rule_type,
+            on_rule_click=self.on_rule_clicked,
+            on_rule_delete=self._on_rule_delete,
+        )
+        self.rule_list.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 2))
 
     def _on_input_key(self, event=None):
         """Handle key release in input field - for real-time preview."""
@@ -2365,20 +2224,24 @@ class ModelFilterGUI(ctk.CTk):
         self.after(100, self._activate_window)
 
     def _create_main_layout(self):
-        """Create the main layout with grid for responsive sizing."""
-        # Main content frame using grid layout
-        # This allows proportional sizing between model lists and rule panels
+        """Create the main layout with grid weights for 3:1 ratio."""
+        # Main content frame - regular frame with grid layout
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.content_frame.pack(fill="both", expand=True, padx=20, pady=(8, 10))
+        self.content_frame.pack(fill="both", expand=True, padx=15, pady=(5, 8))
 
-        # Configure grid weights for responsive layout
-        # Using 3:1 ratio so models get significantly more space than rules
+        # Configure grid with proper weights for 3:1 ratio
         self.content_frame.grid_columnconfigure(0, weight=1)
-        self.content_frame.grid_rowconfigure(0, weight=0)  # Header - fixed
-        self.content_frame.grid_rowconfigure(1, weight=0)  # Search - fixed
-        self.content_frame.grid_rowconfigure(2, weight=3)  # Model lists - expands most
-        self.content_frame.grid_rowconfigure(3, weight=1)  # Rule panels - expands less
-        self.content_frame.grid_rowconfigure(4, weight=0)  # Status bar - fixed
+
+        # Row 0: Header - fixed height
+        self.content_frame.grid_rowconfigure(0, weight=0)
+        # Row 1: Search - fixed height
+        self.content_frame.grid_rowconfigure(1, weight=0)
+        # Row 2: Model lists - weight=3 for 3:1 ratio, minimum 100px
+        self.content_frame.grid_rowconfigure(2, weight=3, minsize=200)
+        # Row 3: Rule panels - weight=1 for 3:1 ratio, minimum 55px
+        self.content_frame.grid_rowconfigure(3, weight=1, minsize=55)
+        # Row 4: Status bar - fixed height
+        self.content_frame.grid_rowconfigure(4, weight=0)
 
         # Create all sections
         self._create_header()
@@ -2527,6 +2390,8 @@ class ModelFilterGUI(ctk.CTk):
         """Create the ignore and whitelist rule panels."""
         self.rules_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
         self.rules_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 5))
+        # Don't let content dictate size - let parent grid control height
+        self.rules_frame.grid_propagate(False)
         self.rules_frame.grid_columnconfigure(0, weight=1)
         self.rules_frame.grid_columnconfigure(1, weight=1)
         self.rules_frame.grid_rowconfigure(0, weight=1)
