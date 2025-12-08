@@ -304,15 +304,19 @@ class IFlowAuthBase:
                         f"Environment variables for iFlow credential index {credential_index} not found"
                     )
 
-            # For file paths, try loading from legacy env vars first
-            env_creds = self._load_from_env()
-            if env_creds:
-                lib_logger.info("Using iFlow credentials from environment variables")
-                self._credentials_cache[path] = env_creds
-                return env_creds
-
-            # Fall back to file-based loading
-            return await self._read_creds_from_file(path)
+            # Try file-based loading first (preferred for explicit file paths)
+            try:
+                return await self._read_creds_from_file(path)
+            except IOError:
+                # File not found - fall back to legacy env vars for backwards compatibility
+                env_creds = self._load_from_env()
+                if env_creds:
+                    lib_logger.info(
+                        f"File '{path}' not found, using iFlow credentials from environment variables"
+                    )
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
+                raise  # Re-raise the original file not found error
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
         """Save credentials with in-memory fallback if disk unavailable."""
@@ -843,32 +847,32 @@ class IFlowAuthBase:
                     return
 
                 try:
-                    # Perform the actual refresh (still using per-credential lock)
-                    async with await self._get_lock(path):
-                        # Re-check if still expired (may have changed since queueing)
-                        creds = self._credentials_cache.get(path)
-                        if creds and not self._is_token_expired(creds):
-                            # No longer expired, mark as available
-                            async with self._queue_tracking_lock:
-                                self._unavailable_credentials.pop(path, None)
-                                lib_logger.debug(
-                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
-                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                                )
-                            continue
-
-                        # Perform refresh
-                        if not creds:
-                            creds = await self._load_credentials(path)
-                        await self._refresh_token(path, force=force)
-
-                        # SUCCESS: Mark as available again
+                    # Quick check if still expired (optimization to avoid unnecessary refresh)
+                    # Note: _refresh_token() will do its own locking and expiry check
+                    creds = self._credentials_cache.get(path)
+                    if creds and not self._is_token_expired(creds):
+                        # No longer expired, mark as available
                         async with self._queue_tracking_lock:
                             self._unavailable_credentials.pop(path, None)
                             lib_logger.debug(
-                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Credential '{Path(path).name}' no longer expired, marked available. "
                                 f"Remaining unavailable: {len(self._unavailable_credentials)}"
                             )
+                        continue
+
+                    # Perform refresh - _refresh_token handles its own locking
+                    # DO NOT acquire lock here as _refresh_token also acquires it (would deadlock)
+                    if not creds:
+                        creds = await self._load_credentials(path)
+                    await self._refresh_token(path, force=force)
+
+                    # SUCCESS: Mark as available again
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
 
                 finally:
                     # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials

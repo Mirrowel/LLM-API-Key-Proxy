@@ -227,17 +227,7 @@ class GoogleOAuthBase:
                         f"Environment variables for {self.ENV_PREFIX} credential index {credential_index} not found"
                     )
 
-            # For file paths, first try loading from legacy env vars (for backwards compatibility)
-            env_creds = self._load_from_env()
-            if env_creds:
-                lib_logger.info(
-                    f"Using {self.ENV_PREFIX} credentials from environment variables"
-                )
-                # Cache env-based credentials using the path as key
-                self._credentials_cache[path] = env_creds
-                return env_creds
-
-            # Fall back to file-based loading
+            # Try file-based loading first (preferred for explicit file paths)
             try:
                 lib_logger.debug(
                     f"Loading {self.ENV_PREFIX} credentials from file: {path}"
@@ -250,12 +240,17 @@ class GoogleOAuthBase:
                 self._credentials_cache[path] = creds
                 return creds
             except FileNotFoundError:
+                # File not found - fall back to legacy env vars for backwards compatibility
+                # This handles the case where only env vars are set and file paths are placeholders
+                env_creds = self._load_from_env()
+                if env_creds:
+                    lib_logger.info(
+                        f"File '{path}' not found, using {self.ENV_PREFIX} credentials from environment variables"
+                    )
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
                 raise IOError(
                     f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'"
-                )
-            except Exception as e:
-                raise IOError(
-                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
                 )
             except Exception as e:
                 raise IOError(
@@ -588,32 +583,32 @@ class GoogleOAuthBase:
                     return
 
                 try:
-                    # Perform the actual refresh (still using per-credential lock)
-                    async with await self._get_lock(path):
-                        # Re-check if still expired (may have changed since queueing)
-                        creds = self._credentials_cache.get(path)
-                        if creds and not self._is_token_expired(creds):
-                            # No longer expired, mark as available
-                            async with self._queue_tracking_lock:
-                                self._unavailable_credentials.pop(path, None)
-                                lib_logger.debug(
-                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
-                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                                )
-                            continue
-
-                        # Perform refresh
-                        if not creds:
-                            creds = await self._load_credentials(path)
-                        await self._refresh_token(path, creds, force=force)
-
-                        # SUCCESS: Mark as available again
+                    # Quick check if still expired (optimization to avoid unnecessary refresh)
+                    # Note: _refresh_token() will do its own locking and expiry check
+                    creds = self._credentials_cache.get(path)
+                    if creds and not self._is_token_expired(creds):
+                        # No longer expired, mark as available
                         async with self._queue_tracking_lock:
                             self._unavailable_credentials.pop(path, None)
                             lib_logger.debug(
-                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Credential '{Path(path).name}' no longer expired, marked available. "
                                 f"Remaining unavailable: {len(self._unavailable_credentials)}"
                             )
+                        continue
+
+                    # Perform refresh - _refresh_token handles its own locking
+                    # DO NOT acquire lock here as _refresh_token also acquires it (would deadlock)
+                    if not creds:
+                        creds = await self._load_credentials(path)
+                    await self._refresh_token(path, creds, force=force)
+
+                    # SUCCESS: Mark as available again
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
 
                 finally:
                     # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
