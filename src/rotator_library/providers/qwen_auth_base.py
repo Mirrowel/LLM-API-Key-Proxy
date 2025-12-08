@@ -22,6 +22,7 @@ from rich.text import Text
 from rich.markup import escape as rich_escape
 
 from ..utils.headless_detection import is_headless_environment
+from ..utils.reauth_coordinator import get_reauth_coordinator
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -53,9 +54,12 @@ class QwenAuthBase:
         # [QUEUE SYSTEM] Sequential refresh processing
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queued_credentials: set = set()  # Track credentials already in queue
-        self._unavailable_credentials: set = (
-            set()
-        )  # Mark credentials unavailable during re-auth
+        # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
+        # This enables TTL-based stale entry cleanup as defense in depth
+        self._unavailable_credentials: Dict[
+            str, float
+        ] = {}  # Maps credential path -> timestamp when marked unavailable
+        self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = (
             None  # Background worker task
@@ -494,8 +498,30 @@ class QwenAuthBase:
             return self._refresh_locks[path]
 
     def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not queued/refreshing)."""
-        return path not in self._unavailable_credentials
+        """Check if a credential is available for rotation (not queued/refreshing).
+
+        [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
+        If a credential has been unavailable for longer than _unavailable_ttl_seconds,
+        it is automatically cleaned up and considered available.
+        """
+        if path not in self._unavailable_credentials:
+            return True
+
+        # [FIX PR#34] Check if the entry is stale (TTL expired)
+        marked_time = self._unavailable_credentials.get(path)
+        if marked_time is not None:
+            now = time.time()
+            if now - marked_time > self._unavailable_ttl_seconds:
+                # Entry is stale - clean it up and return available
+                lib_logger.warning(
+                    f"Credential '{Path(path).name}' was stuck in unavailable state for "
+                    f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
+                    f"Auto-cleaning stale entry."
+                )
+                self._unavailable_credentials.pop(path, None)
+                return True
+
+        return False
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -531,7 +557,12 @@ class QwenAuthBase:
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                self._unavailable_credentials.add(path)  # Mark as unavailable
+                # [FIX PR#34] Store timestamp when marking unavailable (for TTL cleanup)
+                self._unavailable_credentials[path] = time.time()
+                lib_logger.debug(
+                    f"Marked '{Path(path).name}' as unavailable. "
+                    f"Total unavailable: {len(self._unavailable_credentials)}"
+                )
                 await self._refresh_queue.put((path, force, needs_reauth))
                 await self._ensure_queue_processor_running()
 
@@ -546,7 +577,16 @@ class QwenAuthBase:
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # No items for 60s, exit to save resources
+                    # [FIX PR#34] Clean up any stale unavailable entries before exiting
+                    # If we're idle for 60s, no refreshes are in progress
+                    async with self._queue_tracking_lock:
+                        if self._unavailable_credentials:
+                            stale_count = len(self._unavailable_credentials)
+                            lib_logger.warning(
+                                f"Queue processor idle timeout. Cleaning {stale_count} "
+                                f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
+                            )
+                            self._unavailable_credentials.clear()
                     self._queue_processor_task = None
                     return
 
@@ -558,7 +598,11 @@ class QwenAuthBase:
                         if creds and not self._is_token_expired(creds):
                             # No longer expired, mark as available
                             async with self._queue_tracking_lock:
-                                self._unavailable_credentials.discard(path)
+                                self._unavailable_credentials.pop(path, None)
+                                lib_logger.debug(
+                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
+                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                                )
                             continue
 
                         # Perform refresh
@@ -568,26 +612,240 @@ class QwenAuthBase:
 
                         # SUCCESS: Mark as available again
                         async with self._queue_tracking_lock:
-                            self._unavailable_credentials.discard(path)
+                            self._unavailable_credentials.pop(path, None)
+                            lib_logger.debug(
+                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
+                                f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                            )
 
                 finally:
-                    # Remove from queued set
+                    # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
+                    # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
+                        # [FIX PR#34] Always clean up unavailable credentials in finally block
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Finally cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                     self._refresh_queue.task_done()
             except asyncio.CancelledError:
+                # [FIX PR#34] Clean up the current credential before breaking
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"CancelledError cleanup for '{Path(path).name}'. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
                 break
             except Exception as e:
                 lib_logger.error(f"Error in queue processor: {e}")
                 # Even on error, mark as available (backoff will prevent immediate retry)
                 if path:
                     async with self._queue_tracking_lock:
-                        self._unavailable_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
+                        lib_logger.debug(
+                            f"Error cleanup for '{Path(path).name}': {e}. "
+                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        )
+
+    async def _perform_interactive_oauth(
+        self, path: str, creds: Dict[str, Any], display_name: str
+    ) -> Dict[str, Any]:
+        """
+        Perform interactive OAuth device flow (browser-based authentication).
+
+        This method is called via the global ReauthCoordinator to ensure
+        only one interactive OAuth flow runs at a time across all providers.
+
+        Args:
+            path: Credential file path
+            creds: Current credentials dict (will be updated)
+            display_name: Display name for logging/UI
+
+        Returns:
+            Updated credentials dict with new tokens
+        """
+        # [HEADLESS DETECTION] Check if running in headless environment
+        is_headless = is_headless_environment()
+
+        code_verifier = (
+            base64.urlsafe_b64encode(secrets.token_bytes(32))
+            .decode("utf-8")
+            .rstrip("=")
+        )
+        code_challenge = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(code_verifier.encode("utf-8")).digest()
+            )
+            .decode("utf-8")
+            .rstrip("=")
+        )
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient() as client:
+            request_data = {
+                "client_id": CLIENT_ID,
+                "scope": SCOPE,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+            }
+            lib_logger.debug(f"Qwen device code request data: {request_data}")
+            try:
+                dev_response = await client.post(
+                    "https://chat.qwen.ai/api/v1/oauth2/device/code",
+                    headers=headers,
+                    data=request_data,
+                )
+                dev_response.raise_for_status()
+                dev_data = dev_response.json()
+                lib_logger.debug(f"Qwen device auth response: {dev_data}")
+            except httpx.HTTPStatusError as e:
+                lib_logger.error(
+                    f"Qwen device code request failed with status {e.response.status_code}: {e.response.text}"
+                )
+                raise e
+
+            # [HEADLESS SUPPORT] Display appropriate instructions
+            if is_headless:
+                auth_panel_text = Text.from_markup(
+                    "Running in headless environment (no GUI detected).\n"
+                    "Please open the URL below in a browser on another machine to authorize:\n"
+                    "1. Visit the URL below to sign in.\n"
+                    "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
+                    "3. You will be prompted to enter your identifier after authorization."
+                )
+            else:
+                auth_panel_text = Text.from_markup(
+                    "1. Visit the URL below to sign in.\n"
+                    "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
+                    "3. You will be prompted to enter your identifier after authorization."
+                )
+
+            console.print(
+                Panel(
+                    auth_panel_text,
+                    title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                    style="bold blue",
+                )
+            )
+            verification_url = dev_data["verification_uri_complete"]
+            escaped_url = rich_escape(verification_url)
+            console.print(
+                f"[bold]URL:[/bold] [link={verification_url}]{escaped_url}[/link]\n"
+            )
+
+            # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+            if not is_headless:
+                try:
+                    webbrowser.open(dev_data["verification_uri_complete"])
+                    lib_logger.info("Browser opened successfully for Qwen OAuth flow")
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Failed to open browser automatically: {e}. Please open the URL manually."
+                    )
+
+            token_data = None
+            start_time = time.time()
+            interval = dev_data.get("interval", 5)
+
+            with console.status(
+                "[bold green]Polling for token, please complete authentication in the browser...[/bold green]",
+                spinner="dots",
+            ) as status:
+                while time.time() - start_time < dev_data["expires_in"]:
+                    poll_response = await client.post(
+                        TOKEN_ENDPOINT,
+                        headers=headers,
+                        data={
+                            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                            "device_code": dev_data["device_code"],
+                            "client_id": CLIENT_ID,
+                            "code_verifier": code_verifier,
+                        },
+                    )
+                    if poll_response.status_code == 200:
+                        token_data = poll_response.json()
+                        lib_logger.info("Successfully received token.")
+                        break
+                    elif poll_response.status_code == 400:
+                        poll_data = poll_response.json()
+                        error_type = poll_data.get("error")
+                        if error_type == "authorization_pending":
+                            lib_logger.debug(
+                                f"Polling status: {error_type}, waiting {interval}s"
+                            )
+                        elif error_type == "slow_down":
+                            interval = int(interval * 1.5)
+                            if interval > 10:
+                                interval = 10
+                            lib_logger.debug(
+                                f"Polling status: {error_type}, waiting {interval}s"
+                            )
+                        else:
+                            raise ValueError(
+                                f"Token polling failed: {poll_data.get('error_description', error_type)}"
+                            )
+                    else:
+                        poll_response.raise_for_status()
+
+                    await asyncio.sleep(interval)
+
+            if not token_data:
+                raise TimeoutError("Qwen device flow timed out.")
+
+            creds.update(
+                {
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data.get("refresh_token"),
+                    "expiry_date": (time.time() + token_data["expires_in"]) * 1000,
+                    "resource_url": token_data.get("resource_url"),
+                }
+            )
+
+            # Prompt for user identifier and create metadata object if needed
+            if not creds.get("_proxy_metadata", {}).get("email"):
+                try:
+                    prompt_text = Text.from_markup(
+                        f"\\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]"
+                    )
+                    email = Prompt.ask(prompt_text)
+                    creds["_proxy_metadata"] = {
+                        "email": email.strip(),
+                        "last_check_timestamp": time.time(),
+                    }
+                except (EOFError, KeyboardInterrupt):
+                    console.print(
+                        "\\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]"
+                    )
+                    creds["_proxy_metadata"] = {
+                        "email": None,
+                        "last_check_timestamp": time.time(),
+                    }
+
+            if path:
+                await self._save_credentials(path, creds)
+            lib_logger.info(
+                f"Qwen OAuth initialized successfully for '{display_name}'."
+            )
+        return creds
 
     async def initialize_token(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
-        """Initiates device flow if tokens are missing or invalid."""
+        """
+        Initialize OAuth token, triggering interactive device flow if needed.
+
+        If interactive OAuth is required (expired refresh token, missing credentials, etc.),
+        the flow is coordinated globally via ReauthCoordinator to ensure only one
+        interactive OAuth flow runs at a time across all providers.
+        """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
         # Get display name from metadata if available, otherwise derive from path
@@ -623,189 +881,23 @@ class QwenAuthBase:
                     f"Qwen OAuth token for '{display_name}' needs setup: {reason}."
                 )
 
-                # [HEADLESS DETECTION] Check if running in headless environment
-                is_headless = is_headless_environment()
+                # [GLOBAL REAUTH COORDINATION] Use the global coordinator to ensure
+                # only one interactive OAuth flow runs at a time across all providers
+                coordinator = get_reauth_coordinator()
 
-                code_verifier = (
-                    base64.urlsafe_b64encode(secrets.token_bytes(32))
-                    .decode("utf-8")
-                    .rstrip("=")
+                # Define the interactive OAuth function to be executed by coordinator
+                async def _do_interactive_oauth():
+                    return await self._perform_interactive_oauth(
+                        path, creds, display_name
+                    )
+
+                # Execute via global coordinator (ensures only one at a time)
+                return await coordinator.execute_reauth(
+                    credential_path=path or display_name,
+                    provider_name="QWEN_CODE",
+                    reauth_func=_do_interactive_oauth,
+                    timeout=300.0,  # 5 minute timeout for user to complete OAuth
                 )
-                code_challenge = (
-                    base64.urlsafe_b64encode(
-                        hashlib.sha256(code_verifier.encode("utf-8")).digest()
-                    )
-                    .decode("utf-8")
-                    .rstrip("=")
-                )
-
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                }
-                async with httpx.AsyncClient() as client:
-                    request_data = {
-                        "client_id": CLIENT_ID,
-                        "scope": SCOPE,
-                        "code_challenge": code_challenge,
-                        "code_challenge_method": "S256",
-                    }
-                    lib_logger.debug(f"Qwen device code request data: {request_data}")
-                    try:
-                        dev_response = await client.post(
-                            "https://chat.qwen.ai/api/v1/oauth2/device/code",
-                            headers=headers,
-                            data=request_data,
-                        )
-                        dev_response.raise_for_status()
-                        dev_data = dev_response.json()
-                        lib_logger.debug(f"Qwen device auth response: {dev_data}")
-                    except httpx.HTTPStatusError as e:
-                        lib_logger.error(
-                            f"Qwen device code request failed with status {e.response.status_code}: {e.response.text}"
-                        )
-                        raise e
-
-                    # [HEADLESS SUPPORT] Display appropriate instructions
-                    if is_headless:
-                        auth_panel_text = Text.from_markup(
-                            "Running in headless environment (no GUI detected).\n"
-                            "Please open the URL below in a browser on another machine to authorize:\n"
-                            "1. Visit the URL below to sign in.\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
-                            "3. You will be prompted to enter your identifier after authorization."
-                        )
-                    else:
-                        auth_panel_text = Text.from_markup(
-                            "1. Visit the URL below to sign in.\n"
-                            "2. [bold]Copy your email[/bold] or another unique identifier and authorize the application.\n"
-                            "3. You will be prompted to enter your identifier after authorization."
-                        )
-
-                    console.print(
-                        Panel(
-                            auth_panel_text,
-                            title=f"Qwen OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
-                            style="bold blue",
-                        )
-                    )
-                    # [URL DISPLAY] Print URL with proper escaping to prevent Rich markup issues.
-                    # IMPORTANT: OAuth URLs contain special characters (=, &, etc.) that Rich might
-                    # interpret as markup in some terminal configurations. We escape the URL to
-                    # ensure it displays correctly.
-                    #
-                    # KNOWN ISSUE: If Rich rendering fails entirely (e.g., terminal doesn't support
-                    # ANSI codes, or output is piped), the escaped URL should still be valid.
-                    # However, if the terminal strips or mangles the output, users should copy
-                    # the URL directly from logs or use --verbose to see the raw URL.
-                    #
-                    # The [link=...] markup creates a clickable hyperlink in supported terminals
-                    # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
-                    # which can be safely copied even if the hyperlink doesn't work.
-                    verification_url = dev_data["verification_uri_complete"]
-                    escaped_url = rich_escape(verification_url)
-                    console.print(
-                        f"[bold]URL:[/bold] [link={verification_url}]{escaped_url}[/link]\n"
-                    )
-
-                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
-                    if not is_headless:
-                        try:
-                            webbrowser.open(dev_data["verification_uri_complete"])
-                            lib_logger.info(
-                                "Browser opened successfully for Qwen OAuth flow"
-                            )
-                        except Exception as e:
-                            lib_logger.warning(
-                                f"Failed to open browser automatically: {e}. Please open the URL manually."
-                            )
-
-                    token_data = None
-                    start_time = time.time()
-                    interval = dev_data.get("interval", 5)
-
-                    with console.status(
-                        "[bold green]Polling for token, please complete authentication in the browser...[/bold green]",
-                        spinner="dots",
-                    ) as status:
-                        while time.time() - start_time < dev_data["expires_in"]:
-                            poll_response = await client.post(
-                                TOKEN_ENDPOINT,
-                                headers=headers,
-                                data={
-                                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                                    "device_code": dev_data["device_code"],
-                                    "client_id": CLIENT_ID,
-                                    "code_verifier": code_verifier,
-                                },
-                            )
-                            if poll_response.status_code == 200:
-                                token_data = poll_response.json()
-                                lib_logger.info("Successfully received token.")
-                                break
-                            elif poll_response.status_code == 400:
-                                poll_data = poll_response.json()
-                                error_type = poll_data.get("error")
-                                if error_type == "authorization_pending":
-                                    lib_logger.debug(
-                                        f"Polling status: {error_type}, waiting {interval}s"
-                                    )
-                                elif error_type == "slow_down":
-                                    interval = int(interval * 1.5)
-                                    if interval > 10:
-                                        interval = 10
-                                    lib_logger.debug(
-                                        f"Polling status: {error_type}, waiting {interval}s"
-                                    )
-                                else:
-                                    raise ValueError(
-                                        f"Token polling failed: {poll_data.get('error_description', error_type)}"
-                                    )
-                            else:
-                                poll_response.raise_for_status()
-
-                            await asyncio.sleep(interval)
-
-                    if not token_data:
-                        raise TimeoutError("Qwen device flow timed out.")
-
-                    creds.update(
-                        {
-                            "access_token": token_data["access_token"],
-                            "refresh_token": token_data.get("refresh_token"),
-                            "expiry_date": (time.time() + token_data["expires_in"])
-                            * 1000,
-                            "resource_url": token_data.get("resource_url"),
-                        }
-                    )
-
-                    # Prompt for user identifier and create metadata object if needed
-                    if not creds.get("_proxy_metadata", {}).get("email"):
-                        try:
-                            prompt_text = Text.from_markup(
-                                f"\\n[bold]Please enter your email or a unique identifier for [yellow]'{display_name}'[/yellow][/bold]"
-                            )
-                            email = Prompt.ask(prompt_text)
-                            creds["_proxy_metadata"] = {
-                                "email": email.strip(),
-                                "last_check_timestamp": time.time(),
-                            }
-                        except (EOFError, KeyboardInterrupt):
-                            console.print(
-                                "\\n[bold yellow]No identifier provided. Deduplication will not be possible.[/bold yellow]"
-                            )
-                            creds["_proxy_metadata"] = {
-                                "email": None,
-                                "last_check_timestamp": time.time(),
-                            }
-
-                    if path:
-                        await self._save_credentials(path, creds)
-                    lib_logger.info(
-                        f"Qwen OAuth initialized successfully for '{display_name}'."
-                    )
-                return creds
 
             lib_logger.info(f"Qwen OAuth token at '{display_name}' is valid.")
             return creds

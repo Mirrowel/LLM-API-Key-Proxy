@@ -19,6 +19,7 @@ from rich.text import Text
 from rich.markup import escape as rich_escape
 
 from ..utils.headless_detection import is_headless_environment
+from ..utils.reauth_coordinator import get_reauth_coordinator
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -85,11 +86,11 @@ class GoogleOAuthBase:
         # [QUEUE SYSTEM] Sequential refresh processing
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queued_credentials: set = set()  # Track credentials already in queue
-        # [FIX 4] Changed from set to dict mapping credential path to timestamp
+        # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
         # This enables TTL-based stale entry cleanup as defense in depth
-        self._unavailable_credentials: Dict[str, float] = (
-            {}
-        )  # Maps credential path -> timestamp when marked unavailable
+        self._unavailable_credentials: Dict[
+            str, float
+        ] = {}  # Maps credential path -> timestamp when marked unavailable
         self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
         self._queue_processor_task: Optional[asyncio.Task] = (
@@ -530,15 +531,15 @@ class GoogleOAuthBase:
 
     def is_credential_available(self, path: str) -> bool:
         """Check if a credential is available for rotation (not queued/refreshing).
-        
-        [FIX 4] Now includes TTL-based stale entry cleanup as defense in depth.
+
+        [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
         If a credential has been unavailable for longer than _unavailable_ttl_seconds,
         it is automatically cleaned up and considered available.
         """
         if path not in self._unavailable_credentials:
             return True
-        
-        # [FIX 4] Check if the entry is stale (TTL expired)
+
+        # [FIX PR#34] Check if the entry is stale (TTL expired)
         marked_time = self._unavailable_credentials.get(path)
         if marked_time is not None:
             now = time.time()
@@ -550,11 +551,11 @@ class GoogleOAuthBase:
                     f"Auto-cleaning stale entry."
                 )
                 # Note: This is a sync method, so we can't use async lock here.
-                # However, discard from dict is thread-safe for single operations.
+                # However, pop from dict is thread-safe for single operations.
                 # The _queue_tracking_lock protects concurrent modifications in async context.
                 self._unavailable_credentials.pop(path, None)
                 return True
-        
+
         return False
 
     async def _ensure_queue_processor_running(self):
@@ -591,7 +592,7 @@ class GoogleOAuthBase:
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                # [FIX 4] Store timestamp when marking unavailable (for TTL cleanup)
+                # [FIX PR#34] Store timestamp when marking unavailable (for TTL cleanup)
                 self._unavailable_credentials[path] = time.time()
                 lib_logger.debug(
                     f"Marked '{Path(path).name}' as unavailable. "
@@ -611,7 +612,7 @@ class GoogleOAuthBase:
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # [FIX 2] Clean up any stale unavailable entries before exiting
+                    # [FIX PR#34] Clean up any stale unavailable entries before exiting
                     # If we're idle for 60s, no refreshes are in progress
                     async with self._queue_tracking_lock:
                         if self._unavailable_credentials:
@@ -653,11 +654,11 @@ class GoogleOAuthBase:
                             )
 
                 finally:
-                    # [FIX 1] Remove from BOTH queued set AND unavailable credentials
+                    # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
                     # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
-                        # [FIX 1] Always clean up unavailable credentials in finally block
+                        # [FIX PR#34] Always clean up unavailable credentials in finally block
                         self._unavailable_credentials.pop(path, None)
                         lib_logger.debug(
                             f"Finally cleanup for '{Path(path).name}'. "
@@ -665,7 +666,7 @@ class GoogleOAuthBase:
                         )
                     self._refresh_queue.task_done()
             except asyncio.CancelledError:
-                # [FIX 3] Clean up the current credential before breaking
+                # [FIX PR#34] Clean up the current credential before breaking
                 if path:
                     async with self._queue_tracking_lock:
                         self._unavailable_credentials.pop(path, None)
@@ -685,9 +686,196 @@ class GoogleOAuthBase:
                             f"Remaining unavailable: {len(self._unavailable_credentials)}"
                         )
 
+    async def _perform_interactive_oauth(
+        self, path: str, creds: Dict[str, Any], display_name: str
+    ) -> Dict[str, Any]:
+        """
+        Perform interactive OAuth flow (browser-based authentication).
+
+        This method is called via the global ReauthCoordinator to ensure
+        only one interactive OAuth flow runs at a time across all providers.
+
+        Args:
+            path: Credential file path
+            creds: Current credentials dict (will be updated)
+            display_name: Display name for logging/UI
+
+        Returns:
+            Updated credentials dict with new tokens
+        """
+        # [HEADLESS DETECTION] Check if running in headless environment
+        is_headless = is_headless_environment()
+
+        auth_code_future = asyncio.get_event_loop().create_future()
+        server = None
+
+        async def handle_callback(reader, writer):
+            try:
+                request_line_bytes = await reader.readline()
+                if not request_line_bytes:
+                    return
+                path_str = request_line_bytes.decode("utf-8").strip().split(" ")[1]
+                while await reader.readline() != b"\r\n":
+                    pass
+                from urllib.parse import urlparse, parse_qs
+
+                query_params = parse_qs(urlparse(path_str).query)
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
+                if "code" in query_params:
+                    if not auth_code_future.done():
+                        auth_code_future.set_result(query_params["code"][0])
+                    writer.write(
+                        b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>"
+                    )
+                else:
+                    error = query_params.get("error", ["Unknown error"])[0]
+                    if not auth_code_future.done():
+                        auth_code_future.set_exception(
+                            Exception(f"OAuth failed: {error}")
+                        )
+                    writer.write(
+                        f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode()
+                    )
+                await writer.drain()
+            except Exception as e:
+                lib_logger.error(f"Error in OAuth callback handler: {e}")
+            finally:
+                writer.close()
+
+        try:
+            server = await asyncio.start_server(
+                handle_callback, "127.0.0.1", self.CALLBACK_PORT
+            )
+            from urllib.parse import urlencode
+
+            auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
+                {
+                    "client_id": self.CLIENT_ID,
+                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "scope": " ".join(self.OAUTH_SCOPES),
+                    "access_type": "offline",
+                    "response_type": "code",
+                    "prompt": "consent",
+                }
+            )
+
+            # [HEADLESS SUPPORT] Display appropriate instructions
+            if is_headless:
+                auth_panel_text = Text.from_markup(
+                    "Running in headless environment (no GUI detected).\n"
+                    "Please open the URL below in a browser on another machine to authorize:\n"
+                )
+            else:
+                auth_panel_text = Text.from_markup(
+                    "1. Your browser will now open to log in and authorize the application.\n"
+                    "2. If it doesn't open automatically, please open the URL below manually."
+                )
+
+            console.print(
+                Panel(
+                    auth_panel_text,
+                    title=f"{self.ENV_PREFIX} OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                    style="bold blue",
+                )
+            )
+            # [URL DISPLAY] Print URL with proper escaping to prevent Rich markup issues.
+            # IMPORTANT: OAuth URLs contain special characters (=, &, etc.) that Rich might
+            # interpret as markup in some terminal configurations. We escape the URL to
+            # ensure it displays correctly.
+            #
+            # KNOWN ISSUE: If Rich rendering fails entirely (e.g., terminal doesn't support
+            # ANSI codes, or output is piped), the escaped URL should still be valid.
+            # However, if the terminal strips or mangles the output, users should copy
+            # the URL directly from logs or use --verbose to see the raw URL.
+            #
+            # The [link=...] markup creates a clickable hyperlink in supported terminals
+            # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
+            # which can be safely copied even if the hyperlink doesn't work.
+            escaped_url = rich_escape(auth_url)
+            console.print(f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n")
+
+            # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
+            if not is_headless:
+                try:
+                    webbrowser.open(auth_url)
+                    lib_logger.info("Browser opened successfully for OAuth flow")
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Failed to open browser automatically: {e}. Please open the URL manually."
+                    )
+
+            with console.status(
+                f"[bold green]Waiting for you to complete authentication in the browser...[/bold green]",
+                spinner="dots",
+            ):
+                # Note: The 300s timeout here is handled by the ReauthCoordinator
+                # We use a slightly longer internal timeout to let the coordinator handle it
+                auth_code = await asyncio.wait_for(auth_code_future, timeout=310)
+        except asyncio.TimeoutError:
+            raise Exception("OAuth flow timed out. Please try again.")
+        finally:
+            if server:
+                server.close()
+                await server.wait_closed()
+
+        lib_logger.info(f"Attempting to exchange authorization code for tokens...")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.TOKEN_URI,
+                data={
+                    "code": auth_code.strip(),
+                    "client_id": self.CLIENT_ID,
+                    "client_secret": self.CLIENT_SECRET,
+                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "grant_type": "authorization_code",
+                },
+            )
+            response.raise_for_status()
+            token_data = response.json()
+            # Start with the full token data from the exchange
+            new_creds = token_data.copy()
+
+            # Convert 'expires_in' to 'expiry_date' in milliseconds
+            new_creds["expiry_date"] = (
+                time.time() + new_creds.pop("expires_in")
+            ) * 1000
+
+            # Ensure client_id and client_secret are present
+            new_creds["client_id"] = self.CLIENT_ID
+            new_creds["client_secret"] = self.CLIENT_SECRET
+
+            new_creds["token_uri"] = self.TOKEN_URI
+            new_creds["universe_domain"] = "googleapis.com"
+
+            # Fetch user info and add metadata
+            user_info_response = await client.get(
+                self.USER_INFO_URI,
+                headers={"Authorization": f"Bearer {new_creds['access_token']}"},
+            )
+            user_info_response.raise_for_status()
+            user_info = user_info_response.json()
+            new_creds["_proxy_metadata"] = {
+                "email": user_info.get("email"),
+                "last_check_timestamp": time.time(),
+            }
+
+            if path:
+                await self._save_credentials(path, new_creds)
+            lib_logger.info(
+                f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
+            )
+        return new_creds
+
     async def initialize_token(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:
+        """
+        Initialize OAuth token, triggering interactive OAuth flow if needed.
+
+        If interactive OAuth is required (expired refresh token, missing credentials, etc.),
+        the flow is coordinated globally via ReauthCoordinator to ensure only one
+        interactive OAuth flow runs at a time across all providers.
+        """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
         # Get display name from metadata if available, otherwise derive from path
@@ -724,181 +912,23 @@ class GoogleOAuthBase:
                     f"{self.ENV_PREFIX} OAuth token for '{display_name}' needs setup: {reason}."
                 )
 
-                # [HEADLESS DETECTION] Check if running in headless environment
-                is_headless = is_headless_environment()
+                # [GLOBAL REAUTH COORDINATION] Use the global coordinator to ensure
+                # only one interactive OAuth flow runs at a time across all providers
+                coordinator = get_reauth_coordinator()
 
-                auth_code_future = asyncio.get_event_loop().create_future()
-                server = None
-
-                async def handle_callback(reader, writer):
-                    try:
-                        request_line_bytes = await reader.readline()
-                        if not request_line_bytes:
-                            return
-                        path_str = (
-                            request_line_bytes.decode("utf-8").strip().split(" ")[1]
-                        )
-                        while await reader.readline() != b"\r\n":
-                            pass
-                        from urllib.parse import urlparse, parse_qs
-
-                        query_params = parse_qs(urlparse(path_str).query)
-                        writer.write(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
-                        )
-                        if "code" in query_params:
-                            if not auth_code_future.done():
-                                auth_code_future.set_result(query_params["code"][0])
-                            writer.write(
-                                b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>"
-                            )
-                        else:
-                            error = query_params.get("error", ["Unknown error"])[0]
-                            if not auth_code_future.done():
-                                auth_code_future.set_exception(
-                                    Exception(f"OAuth failed: {error}")
-                                )
-                            writer.write(
-                                f"<html><body><h1>Authentication Failed</h1><p>Error: {error}. Please try again.</p></body></html>".encode()
-                            )
-                        await writer.drain()
-                    except Exception as e:
-                        lib_logger.error(f"Error in OAuth callback handler: {e}")
-                    finally:
-                        writer.close()
-
-                try:
-                    server = await asyncio.start_server(
-                        handle_callback, "127.0.0.1", self.CALLBACK_PORT
-                    )
-                    from urllib.parse import urlencode
-
-                    auth_url = (
-                        "https://accounts.google.com/o/oauth2/v2/auth?"
-                        + urlencode(
-                            {
-                                "client_id": self.CLIENT_ID,
-                                "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
-                                "scope": " ".join(self.OAUTH_SCOPES),
-                                "access_type": "offline",
-                                "response_type": "code",
-                                "prompt": "consent",
-                            }
-                        )
+                # Define the interactive OAuth function to be executed by coordinator
+                async def _do_interactive_oauth():
+                    return await self._perform_interactive_oauth(
+                        path, creds, display_name
                     )
 
-                    # [HEADLESS SUPPORT] Display appropriate instructions
-                    if is_headless:
-                        auth_panel_text = Text.from_markup(
-                            "Running in headless environment (no GUI detected).\n"
-                            "Please open the URL below in a browser on another machine to authorize:\n"
-                        )
-                    else:
-                        auth_panel_text = Text.from_markup(
-                            "1. Your browser will now open to log in and authorize the application.\n"
-                            "2. If it doesn't open automatically, please open the URL below manually."
-                        )
-
-                    console.print(
-                        Panel(
-                            auth_panel_text,
-                            title=f"{self.ENV_PREFIX} OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
-                            style="bold blue",
-                        )
-                    )
-                    # [URL DISPLAY] Print URL with proper escaping to prevent Rich markup issues.
-                    # IMPORTANT: OAuth URLs contain special characters (=, &, etc.) that Rich might
-                    # interpret as markup in some terminal configurations. We escape the URL to
-                    # ensure it displays correctly.
-                    #
-                    # KNOWN ISSUE: If Rich rendering fails entirely (e.g., terminal doesn't support
-                    # ANSI codes, or output is piped), the escaped URL should still be valid.
-                    # However, if the terminal strips or mangles the output, users should copy
-                    # the URL directly from logs or use --verbose to see the raw URL.
-                    #
-                    # The [link=...] markup creates a clickable hyperlink in supported terminals
-                    # (iTerm2, Windows Terminal, etc.), but the displayed text is the escaped URL
-                    # which can be safely copied even if the hyperlink doesn't work.
-                    escaped_url = rich_escape(auth_url)
-                    console.print(
-                        f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n"
-                    )
-
-                    # [HEADLESS SUPPORT] Only attempt browser open if NOT headless
-                    if not is_headless:
-                        try:
-                            webbrowser.open(auth_url)
-                            lib_logger.info(
-                                "Browser opened successfully for OAuth flow"
-                            )
-                        except Exception as e:
-                            lib_logger.warning(
-                                f"Failed to open browser automatically: {e}. Please open the URL manually."
-                            )
-
-                    with console.status(
-                        f"[bold green]Waiting for you to complete authentication in the browser...[/bold green]",
-                        spinner="dots",
-                    ):
-                        auth_code = await asyncio.wait_for(
-                            auth_code_future, timeout=300
-                        )
-                except asyncio.TimeoutError:
-                    raise Exception("OAuth flow timed out. Please try again.")
-                finally:
-                    if server:
-                        server.close()
-                        await server.wait_closed()
-
-                lib_logger.info(
-                    f"Attempting to exchange authorization code for tokens..."
+                # Execute via global coordinator (ensures only one at a time)
+                return await coordinator.execute_reauth(
+                    credential_path=path or display_name,
+                    provider_name=self.ENV_PREFIX,
+                    reauth_func=_do_interactive_oauth,
+                    timeout=300.0,  # 5 minute timeout for user to complete OAuth
                 )
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        self.TOKEN_URI,
-                        data={
-                            "code": auth_code.strip(),
-                            "client_id": self.CLIENT_ID,
-                            "client_secret": self.CLIENT_SECRET,
-                            "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
-                            "grant_type": "authorization_code",
-                        },
-                    )
-                    response.raise_for_status()
-                    token_data = response.json()
-                    # Start with the full token data from the exchange
-                    creds = token_data.copy()
-
-                    # Convert 'expires_in' to 'expiry_date' in milliseconds
-                    creds["expiry_date"] = (
-                        time.time() + creds.pop("expires_in")
-                    ) * 1000
-
-                    # Ensure client_id and client_secret are present
-                    creds["client_id"] = self.CLIENT_ID
-                    creds["client_secret"] = self.CLIENT_SECRET
-
-                    creds["token_uri"] = self.TOKEN_URI
-                    creds["universe_domain"] = "googleapis.com"
-
-                    # Fetch user info and add metadata
-                    user_info_response = await client.get(
-                        self.USER_INFO_URI,
-                        headers={"Authorization": f"Bearer {creds['access_token']}"},
-                    )
-                    user_info_response.raise_for_status()
-                    user_info = user_info_response.json()
-                    creds["_proxy_metadata"] = {
-                        "email": user_info.get("email"),
-                        "last_check_timestamp": time.time(),
-                    }
-
-                    if path:
-                        await self._save_credentials(path, creds)
-                    lib_logger.info(
-                        f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
-                    )
-                return creds
 
             lib_logger.info(
                 f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid."
