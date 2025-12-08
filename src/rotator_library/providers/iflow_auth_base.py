@@ -749,15 +749,28 @@ class IFlowAuthBase:
         Proactively refreshes tokens if they're close to expiry.
         Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
         """
-        # Check if it's an env:// virtual path (OAuth credentials from environment)
-        is_env_path = credential_identifier.startswith("env://")
+        lib_logger.debug(f"proactively_refresh called for: {credential_identifier}")
 
-        # Only refresh if it's an OAuth credential (file path or env:// path)
-        if not is_env_path and not os.path.isfile(credential_identifier):
-            return  # Direct API key, no refresh needed
+        # Try to load credentials - this will fail for direct API keys
+        # and succeed for OAuth credentials (file paths or env:// paths)
+        try:
+            creds = await self._load_credentials(credential_identifier)
+        except IOError as e:
+            # Not a valid credential path (likely a direct API key string)
+            lib_logger.debug(
+                f"Skipping refresh for '{credential_identifier}' - not an OAuth credential: {e}"
+            )
+            return
 
-        creds = await self._load_credentials(credential_identifier)
-        if self._is_token_expired(creds):
+        is_expired = self._is_token_expired(creds)
+        lib_logger.debug(
+            f"Token expired check for '{Path(credential_identifier).name}': {is_expired}"
+        )
+
+        if is_expired:
+            lib_logger.debug(
+                f"Queueing refresh for '{Path(credential_identifier).name}'"
+            )
             # Queue for refresh with needs_reauth=False (automated refresh)
             await self._queue_refresh(
                 credential_identifier, force=False, needs_reauth=False
@@ -861,6 +874,12 @@ class IFlowAuthBase:
                                 f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
                             )
                             self._unavailable_credentials.clear()
+                        # [FIX BUG#6] Also clear queued credentials to prevent stuck state
+                        if self._queued_credentials:
+                            lib_logger.debug(
+                                f"Clearing {len(self._queued_credentials)} queued credentials on timeout"
+                            )
+                            self._queued_credentials.clear()
                     self._queue_processor_task = None
                     return
 
