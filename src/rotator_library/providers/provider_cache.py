@@ -197,10 +197,14 @@ class ProviderCache:
     # DISK PERSISTENCE
     # =========================================================================
 
-    async def _save_to_disk(self) -> None:
-        """Persist cache to disk using atomic write with health tracking."""
+    async def _save_to_disk(self) -> bool:
+        """Persist cache to disk using atomic write with health tracking.
+
+        Returns:
+            True if write succeeded, False otherwise.
+        """
         if not self._enable_disk:
-            return
+            return True  # Not an error if disk is disabled
 
         async with self._disk_lock:
             cache_data = {
@@ -226,9 +230,11 @@ class ProviderCache:
                 lib_logger.debug(
                     f"ProviderCache[{self._cache_name}]: Saved {len(self._cache)} entries"
                 )
+                return True
             else:
                 self._stats["disk_errors"] += 1
                 self._disk_available = False
+                return False
 
     # =========================================================================
     # BACKGROUND TASKS
@@ -251,8 +257,10 @@ class ProviderCache:
                 await asyncio.sleep(self._write_interval)
                 if self._dirty:
                     try:
-                        await self._save_to_disk()
-                        self._dirty = False
+                        success = await self._save_to_disk()
+                        if success:
+                            self._dirty = False
+                        # If save failed, _dirty remains True so we retry next interval
                     except Exception as e:
                         lib_logger.error(
                             f"ProviderCache[{self._cache_name}]: Writer error: {e}"

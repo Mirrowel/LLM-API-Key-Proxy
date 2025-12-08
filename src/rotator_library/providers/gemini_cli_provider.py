@@ -1166,7 +1166,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                     func_part["thoughtSignature"] = (
                                         "skip_thought_signature_validator"
                                     )
-                                    lib_logger.warning(
+                                    lib_logger.debug(
                                         f"Missing thoughtSignature for first func call {tool_id}, using bypass"
                                     )
                                 # Subsequent parallel calls: no signature field at all

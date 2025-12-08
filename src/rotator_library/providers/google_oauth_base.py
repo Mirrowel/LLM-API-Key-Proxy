@@ -273,13 +273,16 @@ class GoogleOAuthBase:
             return
 
         # Attempt disk write - if it fails, we still have the cache
-        if safe_write_json(path, creds, lib_logger, secure_permissions=True):
+        # buffer_on_failure ensures data is retried periodically and saved on shutdown
+        if safe_write_json(
+            path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
+        ):
             lib_logger.debug(
                 f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'."
             )
         else:
             lib_logger.warning(
-                f"Credentials for {self.ENV_PREFIX} cached in memory only (will be lost on restart)."
+                f"Credentials for {self.ENV_PREFIX} cached in memory only (buffered for retry)."
             )
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
