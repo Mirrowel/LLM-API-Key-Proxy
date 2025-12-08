@@ -50,7 +50,7 @@ lib_logger = logging.getLogger("rotator_library")
 # Priority: daily (sandbox) → autopush (sandbox) → production
 BASE_URLS = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
-    #"https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    # "https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
 
@@ -541,7 +541,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     # Models in the same group share quota - when one is exhausted, all are
     model_quota_groups: QuotaGroupMap = {
-        #"claude": ["claude-sonnet-4-5", "claude-opus-4-5"], - commented out for later use if needed
+        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
     }
 
     # Model usage weights for grouped usage calculation
@@ -2559,9 +2559,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                                 f"Ignoring duplicate - this may indicate malformed conversation history."
                             )
                             continue
-                        lib_logger.debug(
-                            f"[Grouping] Collected response for ID: {resp_id}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Collected response for ID: {resp_id}"
+                        #)
                         collected_responses[resp_id] = resp
 
                 # Try to satisfy pending groups (newest first)
@@ -2576,10 +2576,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             collected_responses.pop(gid) for gid in group_ids
                         ]
                         new_contents.append({"parts": group_responses, "role": "user"})
-                        lib_logger.debug(
-                            f"[Grouping] Satisfied group with {len(group_responses)} responses: "
-                            f"ids={group_ids}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Satisfied group with {len(group_responses)} responses: "
+                        #    f"ids={group_ids}"
+                        #)
                         pending_groups.pop(i)
                         break
                 continue
@@ -2599,10 +2599,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     ]
 
                     if call_ids:
-                        lib_logger.debug(
-                            f"[Grouping] Created pending group expecting {len(call_ids)} responses: "
-                            f"ids={call_ids}, names={func_names}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Created pending group expecting {len(call_ids)} responses: "
+                        #    f"ids={call_ids}, names={func_names}"
+                        #)
                         pending_groups.append(
                             {
                                 "ids": call_ids,
@@ -3634,7 +3634,28 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 return await self._handle_non_streaming(
                     client, url, headers, payload, model, file_logger
                 )
+        except httpx.HTTPStatusError as e:
+            # 429 = Rate limit/quota exhausted - tied to credential, not URL
+            # Do NOT retry on different URL, just raise immediately
+            if e.response.status_code == 429:
+                lib_logger.debug(f"429 quota error - not retrying on fallback URL: {e}")
+                raise
+
+            # For other HTTP errors (403, 500, etc.), try fallback URL
+            if self._try_next_base_url():
+                lib_logger.warning(f"Retrying with fallback URL: {e}")
+                url = f"{self._get_base_url()}{endpoint}"
+                if stream:
+                    return self._handle_streaming(
+                        client, url, headers, payload, model, file_logger
+                    )
+                else:
+                    return await self._handle_non_streaming(
+                        client, url, headers, payload, model, file_logger
+                    )
+            raise
         except Exception as e:
+            # Non-HTTP errors (network issues, timeouts, etc.) - try fallback URL
             if self._try_next_base_url():
                 lib_logger.warning(f"Retrying with fallback URL: {e}")
                 url = f"{self._get_base_url()}{endpoint}"
@@ -3718,11 +3739,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "POST", url, headers=headers, json=payload, timeout=600.0
         ) as response:
             if response.status_code >= 400:
+                # Read error body for raise_for_status to include in exception
+                # Terminal logging commented out - errors are logged in failures.log
                 try:
-                    error_body = await response.aread()
-                    lib_logger.error(
-                        f"API error {response.status_code}: {error_body.decode()}"
-                    )
+                    await response.aread()
+                    # lib_logger.error(
+                    #     f"API error {response.status_code}: {error_body.decode()}"
+                    # )
                 except Exception:
                     pass
 
