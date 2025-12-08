@@ -12,8 +12,6 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Tuple, Union, Optional
 from urllib.parse import urlencode, parse_qs, urlparse
-import tempfile
-import shutil
 
 import httpx
 from aiohttp import web
@@ -24,6 +22,7 @@ from rich.text import Text
 from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
+from ..utils.resilient_io import safe_write_json
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -316,65 +315,22 @@ class IFlowAuthBase:
             return await self._read_creds_from_file(path)
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
-        """Saves credentials to cache and file using atomic writes."""
+        """Save credentials with in-memory fallback if disk unavailable."""
+        # Always update cache first (memory is reliable)
+        self._credentials_cache[path] = creds
+
         # Don't save to file if credentials were loaded from environment
         if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
             lib_logger.debug("Credentials loaded from env, skipping file save")
-            # Still update cache for in-memory consistency
-            self._credentials_cache[path] = creds
             return
 
-        # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
-        # This prevents credential corruption if the process is interrupted during write
-        parent_dir = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent_dir, exist_ok=True)
-
-        tmp_fd = None
-        tmp_path = None
-        try:
-            # Create temp file in same directory as target (ensures same filesystem)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
+        # Attempt disk write - if it fails, we still have the cache
+        if safe_write_json(path, creds, lib_logger, secure_permissions=True):
+            lib_logger.debug(f"Saved updated iFlow OAuth credentials to '{path}'.")
+        else:
+            lib_logger.warning(
+                "iFlow credentials cached in memory only (will be lost on restart)."
             )
-
-            # Write JSON to temp file
-            with os.fdopen(tmp_fd, "w") as f:
-                json.dump(creds, f, indent=2)
-                tmp_fd = None  # fdopen closes the fd
-
-            # Set secure permissions (0600 = owner read/write only)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except (OSError, AttributeError):
-                # Windows may not support chmod, ignore
-                pass
-
-            # Atomic move (overwrites target if it exists)
-            shutil.move(tmp_path, path)
-            tmp_path = None  # Successfully moved
-
-            # Update cache AFTER successful file write
-            self._credentials_cache[path] = creds
-            lib_logger.debug(
-                f"Saved updated iFlow OAuth credentials to '{path}' (atomic write)."
-            )
-
-        except Exception as e:
-            lib_logger.error(
-                f"Failed to save updated iFlow OAuth credentials to '{path}': {e}"
-            )
-            # Clean up temp file if it still exists
-            if tmp_fd is not None:
-                try:
-                    os.close(tmp_fd)
-                except:
-                    pass
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-            raise
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         """Checks if the token is expired (with buffer for proactive refresh)."""

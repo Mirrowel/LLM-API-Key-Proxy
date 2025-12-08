@@ -3,20 +3,27 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 import logging
+
+from rotator_library.utils.resilient_io import (
+    safe_write_json,
+    safe_log_write,
+    safe_mkdir,
+)
 
 LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 DETAILED_LOGS_DIR = LOGS_DIR / "detailed_logs"
 
+
 class DetailedLogger:
     """
     Logs comprehensive details of each API transaction to a unique, timestamped directory.
+
+    Uses fire-and-forget logging - if disk writes fail, logs are dropped (not buffered)
+    to prevent memory issues, especially with streaming responses.
     """
-    # Class-level fallback flags for resilience
-    _disk_available = True
-    _console_fallback_warned = False
-    
+
     def __init__(self):
         """
         Initializes the logger for a single request, creating a unique directory to store all related log files.
@@ -26,33 +33,24 @@ class DetailedLogger:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = DETAILED_LOGS_DIR / f"{timestamp}_{self.request_id}"
         self.streaming = False
-        self._in_memory_logs = []  # Fallback storage
-        
-        # Attempt directory creation with resilience
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            DetailedLogger._disk_available = True
-        except (OSError, PermissionError) as e:
-            DetailedLogger._disk_available = False
-            if not DetailedLogger._console_fallback_warned:
-                logging.warning(f"Detailed logging disabled - cannot create log directory: {e}")
-                DetailedLogger._console_fallback_warned = True
+        self._dir_available = safe_mkdir(self.log_dir, logging)
 
     def _write_json(self, filename: str, data: Dict[str, Any]):
         """Helper to write data to a JSON file in the log directory."""
-        if not DetailedLogger._disk_available:
-            self._in_memory_logs.append({"file": filename, "data": data})
-            return
-        
-        try:
-            # Attempt directory recreation if needed
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.log_dir / filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-        except (OSError, PermissionError, IOError) as e:
-            DetailedLogger._disk_available = False
-            logging.error(f"[{self.request_id}] Failed to write to {filename}: {e}")
-            self._in_memory_logs.append({"file": filename, "data": data})
+        if not self._dir_available:
+            # Try to create directory again in case it was recreated
+            self._dir_available = safe_mkdir(self.log_dir, logging)
+            if not self._dir_available:
+                return
+
+        safe_write_json(
+            self.log_dir / filename,
+            data,
+            logging,
+            atomic=False,
+            indent=4,
+            ensure_ascii=False,
+        )
 
     def log_request(self, headers: Dict[str, Any], body: Dict[str, Any]):
         """Logs the initial request details."""
@@ -61,29 +59,22 @@ class DetailedLogger:
             "request_id": self.request_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
             "headers": dict(headers),
-            "body": body
+            "body": body,
         }
         self._write_json("request.json", request_data)
 
     def log_stream_chunk(self, chunk: Dict[str, Any]):
         """Logs an individual chunk from a streaming response to a JSON Lines file."""
-        # Intentionally skip memory fallback for streams to prevent OOM - unlike _write_json, we don't buffer stream chunks in memory
-        if not DetailedLogger._disk_available:
+        if not self._dir_available:
             return
-        
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            log_entry = {
-                "timestamp_utc": datetime.utcnow().isoformat(),
-                "chunk": chunk
-            }
-            with open(self.log_dir / "streaming_chunks.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-        except (OSError, PermissionError, IOError) as e:
-            DetailedLogger._disk_available = False
-            logging.error(f"[{self.request_id}] Failed to write stream chunk: {e}")
 
-    def log_final_response(self, status_code: int, headers: Optional[Dict[str, Any]], body: Dict[str, Any]):
+        log_entry = {"timestamp_utc": datetime.utcnow().isoformat(), "chunk": chunk}
+        content = json.dumps(log_entry, ensure_ascii=False) + "\n"
+        safe_log_write(self.log_dir / "streaming_chunks.jsonl", content, logging)
+
+    def log_final_response(
+        self, status_code: int, headers: Optional[Dict[str, Any]], body: Dict[str, Any]
+    ):
         """Logs the complete final response, either from a non-streaming call or after reassembling a stream."""
         end_time = time.time()
         duration_ms = (end_time - self.start_time) * 1000
@@ -94,7 +85,7 @@ class DetailedLogger:
             "status_code": status_code,
             "duration_ms": round(duration_ms),
             "headers": dict(headers) if headers else None,
-            "body": body
+            "body": body,
         }
         self._write_json("final_response.json", response_data)
         self._log_metadata(response_data)
@@ -103,10 +94,10 @@ class DetailedLogger:
         """Recursively searches for and extracts 'reasoning' fields from the response body."""
         if not isinstance(response_body, dict):
             return None
-        
+
         if "reasoning" in response_body:
             return response_body["reasoning"]
-            
+
         if "choices" in response_body and response_body["choices"]:
             message = response_body["choices"][0].get("message", {})
             if "reasoning" in message:
@@ -121,8 +112,13 @@ class DetailedLogger:
         usage = response_data.get("body", {}).get("usage") or {}
         model = response_data.get("body", {}).get("model", "N/A")
         finish_reason = "N/A"
-        if "choices" in response_data.get("body", {}) and response_data["body"]["choices"]:
-            finish_reason = response_data["body"]["choices"][0].get("finish_reason", "N/A")
+        if (
+            "choices" in response_data.get("body", {})
+            and response_data["body"]["choices"]
+        ):
+            finish_reason = response_data["body"]["choices"][0].get(
+                "finish_reason", "N/A"
+            )
 
         metadata = {
             "request_id": self.request_id,
@@ -138,12 +134,12 @@ class DetailedLogger:
             },
             "finish_reason": finish_reason,
             "reasoning_found": False,
-            "reasoning_content": None
+            "reasoning_content": None,
         }
 
         reasoning = self._extract_reasoning(response_data.get("body", {}))
         if reasoning:
             metadata["reasoning_found"] = True
             metadata["reasoning_content"] = reasoning
-        
+
         self._write_json("metadata.json", metadata)
