@@ -5,7 +5,7 @@ import logging
 import asyncio
 import random
 from datetime import date, datetime, timezone, time as dt_time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 import aiofiles
 import litellm
 
@@ -42,6 +42,10 @@ class UsageManager:
 
     This ensures lower-usage credentials are preferred while tolerance controls how much
     randomness is introduced into the selection process.
+
+    Additionally, providers can specify a rotation mode:
+    - "balanced" (default): Rotate credentials to distribute load evenly
+    - "sequential": Use one credential until exhausted (preserves caching)
     """
 
     def __init__(
@@ -49,6 +53,13 @@ class UsageManager:
         file_path: str = "key_usage.json",
         daily_reset_time_utc: Optional[str] = "03:00",
         rotation_tolerance: float = 0.0,
+        provider_rotation_modes: Optional[Dict[str, str]] = None,
+        provider_plugins: Optional[Dict[str, Any]] = None,
+        priority_multipliers: Optional[Dict[str, Dict[int, int]]] = None,
+        priority_multipliers_by_mode: Optional[
+            Dict[str, Dict[str, Dict[int, int]]]
+        ] = None,
+        sequential_fallback_multipliers: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -60,9 +71,28 @@ class UsageManager:
                 - 0.0: Deterministic, least-used credential always selected
                 - tolerance = 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
                 - 5.0+: High randomness, more unpredictable selection patterns
+            provider_rotation_modes: Dict mapping provider names to rotation modes.
+                - "balanced": Rotate credentials to distribute load evenly (default)
+                - "sequential": Use one credential until exhausted (preserves caching)
+            provider_plugins: Dict mapping provider names to provider plugin instances.
+                Used for per-provider usage reset configuration (window durations, field names).
+            priority_multipliers: Dict mapping provider -> priority -> multiplier.
+                Universal multipliers that apply regardless of rotation mode.
+                Example: {"antigravity": {1: 5, 2: 3}}
+            priority_multipliers_by_mode: Dict mapping provider -> mode -> priority -> multiplier.
+                Mode-specific overrides. Example: {"antigravity": {"balanced": {3: 1}}}
+            sequential_fallback_multipliers: Dict mapping provider -> fallback multiplier.
+                Used in sequential mode when priority not in priority_multipliers.
+                Example: {"antigravity": 2}
         """
         self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
+        self.provider_rotation_modes = provider_rotation_modes or {}
+        self.provider_plugins = provider_plugins or PROVIDER_PLUGINS
+        self.priority_multipliers = priority_multipliers or {}
+        self.priority_multipliers_by_mode = priority_multipliers_by_mode or {}
+        self.sequential_fallback_multipliers = sequential_fallback_multipliers or {}
+        self._provider_instances: Dict[str, Any] = {}  # Cache for provider instances
         self.key_states: Dict[str, Dict[str, Any]] = {}
 
         self._data_lock = asyncio.Lock()
@@ -80,6 +110,426 @@ class UsageManager:
             )
         else:
             self.daily_reset_time_utc = None
+
+    def _get_rotation_mode(self, provider: str) -> str:
+        """
+        Get the rotation mode for a provider.
+
+        Args:
+            provider: Provider name (e.g., "antigravity", "gemini_cli")
+
+        Returns:
+            "balanced" or "sequential"
+        """
+        return self.provider_rotation_modes.get(provider, "balanced")
+
+    def _get_priority_multiplier(
+        self, provider: str, priority: int, rotation_mode: str
+    ) -> int:
+        """
+        Get the concurrency multiplier for a provider/priority/mode combination.
+
+        Lookup order:
+        1. Mode-specific tier override: priority_multipliers_by_mode[provider][mode][priority]
+        2. Universal tier multiplier: priority_multipliers[provider][priority]
+        3. Sequential fallback (if mode is sequential): sequential_fallback_multipliers[provider]
+        4. Global default: 1 (no multiplier effect)
+
+        Args:
+            provider: Provider name (e.g., "antigravity")
+            priority: Priority level (1 = highest priority)
+            rotation_mode: Current rotation mode ("sequential" or "balanced")
+
+        Returns:
+            Multiplier value
+        """
+        provider_lower = provider.lower()
+
+        # 1. Check mode-specific override
+        if provider_lower in self.priority_multipliers_by_mode:
+            mode_multipliers = self.priority_multipliers_by_mode[provider_lower]
+            if rotation_mode in mode_multipliers:
+                if priority in mode_multipliers[rotation_mode]:
+                    return mode_multipliers[rotation_mode][priority]
+
+        # 2. Check universal tier multiplier
+        if provider_lower in self.priority_multipliers:
+            if priority in self.priority_multipliers[provider_lower]:
+                return self.priority_multipliers[provider_lower][priority]
+
+        # 3. Sequential fallback (only for sequential mode)
+        if rotation_mode == "sequential":
+            if provider_lower in self.sequential_fallback_multipliers:
+                return self.sequential_fallback_multipliers[provider_lower]
+
+        # 4. Global default
+        return 1
+
+    def _get_provider_from_credential(self, credential: str) -> Optional[str]:
+        """
+        Extract provider name from credential path or identifier.
+
+        Supports multiple credential formats:
+        - OAuth: "oauth_creds/antigravity_oauth_15.json" -> "antigravity"
+        - OAuth: "C:\\...\\oauth_creds\\gemini_cli_oauth_1.json" -> "gemini_cli"
+        - API key style: stored with provider prefix metadata
+
+        Args:
+            credential: The credential identifier (path or key)
+
+        Returns:
+            Provider name string or None if cannot be determined
+        """
+        import re
+
+        # Normalize path separators
+        normalized = credential.replace("\\", "/")
+
+        # Pattern: {provider}_oauth_{number}.json
+        match = re.search(r"/([a-z_]+)_oauth_\d+\.json$", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
+        # Pattern: oauth_creds/{provider}_...
+        match = re.search(r"oauth_creds/([a-z_]+)_", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
+        return None
+
+    def _get_provider_instance(self, provider: str) -> Optional[Any]:
+        """
+        Get or create a provider plugin instance.
+
+        Args:
+            provider: The provider name
+
+        Returns:
+            Provider plugin instance or None
+        """
+        if not provider:
+            return None
+
+        plugin_class = self.provider_plugins.get(provider)
+        if not plugin_class:
+            return None
+
+        # Get or create provider instance from cache
+        if provider not in self._provider_instances:
+            # Instantiate the plugin if it's a class, or use it directly if already an instance
+            if isinstance(plugin_class, type):
+                self._provider_instances[provider] = plugin_class()
+            else:
+                self._provider_instances[provider] = plugin_class
+
+        return self._provider_instances[provider]
+
+    def _get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the usage reset configuration for a credential from its provider plugin.
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            Configuration dict with window_seconds, field_name, etc.
+            or None to use default daily reset.
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_usage_reset_config"):
+            return plugin_instance.get_usage_reset_config(credential)
+
+        return None
+
+    def _get_reset_mode(self, credential: str) -> str:
+        """
+        Get the reset mode for a credential: 'credential' or 'per_model'.
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            "per_model" or "credential" (default)
+        """
+        config = self._get_usage_reset_config(credential)
+        return config.get("mode", "credential") if config else "credential"
+
+    def _get_model_quota_group(self, credential: str, model: str) -> Optional[str]:
+        """
+        Get the quota group for a model, if the provider defines one.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Group name (e.g., "claude") or None if not grouped
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_model_quota_group"):
+            return plugin_instance.get_model_quota_group(model)
+
+        return None
+
+    def _get_grouped_models(self, credential: str, group: str) -> List[str]:
+        """
+        Get all model names in a quota group (with provider prefix).
+
+        Args:
+            credential: The credential identifier
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of full model names (e.g., ["antigravity/claude-opus-4-5", ...])
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_models_in_quota_group"):
+            models = plugin_instance.get_models_in_quota_group(group)
+            # Add provider prefix
+            return [f"{provider}/{m}" for m in models]
+
+        return []
+
+    def _get_model_usage_weight(self, credential: str, model: str) -> int:
+        """
+        Get the usage weight for a model when calculating grouped usage.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Weight multiplier (default 1 if not configured)
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_model_usage_weight"):
+            return plugin_instance.get_model_usage_weight(model)
+
+        return 1
+
+    def _get_grouped_usage_count(self, key: str, model: str) -> int:
+        """
+        Get usage count for credential selection, considering quota groups.
+
+        If the model belongs to a quota group, returns the weighted combined usage
+        across all models in the group. Otherwise returns individual model usage.
+
+        Weights are applied per-model to account for models that consume more quota
+        per request (e.g., Opus might count 2x compared to Sonnet).
+
+        Args:
+            key: Credential identifier
+            model: Model name (with provider prefix, e.g., "antigravity/claude-sonnet-4-5")
+
+        Returns:
+            Weighted combined usage if grouped, otherwise individual model usage
+        """
+        # Check if model is in a quota group
+        group = self._get_model_quota_group(key, model)
+
+        if group:
+            # Get all models in the group
+            grouped_models = self._get_grouped_models(key, group)
+
+            # Sum weighted usage across all models in the group
+            total_weighted_usage = 0
+            for grouped_model in grouped_models:
+                usage = self._get_usage_count(key, grouped_model)
+                weight = self._get_model_usage_weight(key, grouped_model)
+                total_weighted_usage += usage * weight
+            return total_weighted_usage
+
+        # Not grouped - return individual model usage (no weight applied)
+        return self._get_usage_count(key, model)
+
+    def _get_usage_field_name(self, credential: str) -> str:
+        """
+        Get the usage tracking field name for a credential.
+
+        Returns the provider-specific field name if configured,
+        otherwise falls back to "daily".
+
+        Args:
+            credential: The credential identifier
+
+        Returns:
+            Field name string (e.g., "5h_window", "weekly", "daily")
+        """
+        config = self._get_usage_reset_config(credential)
+        if config and "field_name" in config:
+            return config["field_name"]
+
+        # Check provider default
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "get_default_usage_field_name"):
+            return plugin_instance.get_default_usage_field_name()
+
+        return "daily"
+
+    def _get_usage_count(self, key: str, model: str) -> int:
+        """
+        Get the current usage count for a model from the appropriate usage structure.
+
+        Supports both:
+        - New per-model structure: {"models": {"model_name": {"success_count": N, ...}}}
+        - Legacy structure: {"daily": {"models": {"model_name": {"success_count": N, ...}}}}
+
+        Args:
+            key: Credential identifier
+            model: Model name
+
+        Returns:
+            Usage count (success_count) for the model in the current window/period
+        """
+        if self._usage_data is None:
+            return 0
+
+        key_data = self._usage_data.get(key, {})
+        reset_mode = self._get_reset_mode(key)
+
+        if reset_mode == "per_model":
+            # New per-model structure: key_data["models"][model]["success_count"]
+            return key_data.get("models", {}).get(model, {}).get("success_count", 0)
+        else:
+            # Legacy structure: key_data["daily"]["models"][model]["success_count"]
+            return (
+                key_data.get("daily", {})
+                .get("models", {})
+                .get(model, {})
+                .get("success_count", 0)
+            )
+
+    # =========================================================================
+    # TIMESTAMP FORMATTING HELPERS
+    # =========================================================================
+
+    def _format_timestamp_local(self, ts: Optional[float]) -> Optional[str]:
+        """
+        Format Unix timestamp as local time string with timezone offset.
+
+        Args:
+            ts: Unix timestamp or None
+
+        Returns:
+            Formatted string like "2025-12-07 14:30:17 +0100" or None
+        """
+        if ts is None:
+            return None
+        try:
+            dt = datetime.fromtimestamp(ts).astimezone()  # Local timezone
+            # Use UTC offset for conciseness (works on all platforms)
+            return dt.strftime("%Y-%m-%d %H:%M:%S %z")
+        except (OSError, ValueError, OverflowError):
+            return None
+
+    def _add_readable_timestamps(self, data: Dict) -> Dict:
+        """
+        Add human-readable timestamp fields to usage data before saving.
+
+        Adds 'window_started' and 'quota_resets' fields derived from
+        Unix timestamps for easier debugging and monitoring.
+
+        Args:
+            data: The usage data dict to enhance
+
+        Returns:
+            The same dict with readable timestamp fields added
+        """
+        for key, key_data in data.items():
+            # Handle per-model structure
+            models = key_data.get("models", {})
+            for model_name, model_stats in models.items():
+                if not isinstance(model_stats, dict):
+                    continue
+
+                # Add readable window start time
+                window_start = model_stats.get("window_start_ts")
+                if window_start:
+                    model_stats["window_started"] = self._format_timestamp_local(
+                        window_start
+                    )
+                elif "window_started" in model_stats:
+                    del model_stats["window_started"]
+
+                # Add readable reset time
+                quota_reset = model_stats.get("quota_reset_ts")
+                if quota_reset:
+                    model_stats["quota_resets"] = self._format_timestamp_local(
+                        quota_reset
+                    )
+                elif "quota_resets" in model_stats:
+                    del model_stats["quota_resets"]
+
+        return data
+
+    def _sort_sequential(
+        self,
+        candidates: List[Tuple[str, int]],
+        credential_priorities: Optional[Dict[str, int]] = None,
+    ) -> List[Tuple[str, int]]:
+        """
+        Sort credentials for sequential mode with position retention.
+
+        Credentials maintain their position based on established usage patterns,
+        ensuring that actively-used credentials remain primary until exhausted.
+
+        Sorting order (within each sort key, lower value = higher priority):
+        1. Priority tier (lower number = higher priority)
+        2. Usage count (higher = more established in rotation, maintains position)
+        3. Last used timestamp (higher = more recent, tiebreaker for stickiness)
+        4. Credential ID (alphabetical, stable ordering)
+
+        Args:
+            candidates: List of (credential_id, usage_count) tuples
+            credential_priorities: Optional dict mapping credentials to priority levels
+
+        Returns:
+            Sorted list of candidates (same format as input)
+        """
+        if not candidates:
+            return []
+
+        if len(candidates) == 1:
+            return candidates
+
+        def sort_key(item: Tuple[str, int]) -> Tuple[int, int, float, str]:
+            cred, usage_count = item
+            priority = (
+                credential_priorities.get(cred, 999) if credential_priorities else 999
+            )
+            last_used = (
+                self._usage_data.get(cred, {}).get("last_used_ts", 0)
+                if self._usage_data
+                else 0
+            )
+            return (
+                priority,  # ASC: lower priority number = higher priority
+                -usage_count,  # DESC: higher usage = more established
+                -last_used,  # DESC: more recent = preferred for ties
+                cred,  # ASC: stable alphabetical ordering
+            )
+
+        sorted_candidates = sorted(candidates, key=sort_key)
+
+        # Debug logging - show top 3 credentials in ordering
+        if lib_logger.isEnabledFor(logging.DEBUG):
+            order_info = [
+                f"{mask_credential(c)}(p={credential_priorities.get(c, 999) if credential_priorities else 'N/A'}, u={u})"
+                for c, u in sorted_candidates[:3]
+            ]
+            lib_logger.debug(f"Sequential ordering: {' → '.join(order_info)}")
+
+        return sorted_candidates
 
     async def _lazy_init(self):
         """Initializes the usage data by loading it from the file asynchronously."""
@@ -107,84 +557,411 @@ class UsageManager:
         if self._usage_data is None:
             return
         async with self._data_lock:
+            # Add human-readable timestamp fields before saving
+            self._add_readable_timestamps(self._usage_data)
             async with aiofiles.open(self.file_path, "w") as f:
                 await f.write(json.dumps(self._usage_data, indent=2))
 
     async def _reset_daily_stats_if_needed(self):
-        """Checks if daily stats need to be reset for any key."""
-        if self._usage_data is None or not self.daily_reset_time_utc:
+        """
+        Checks if usage stats need to be reset for any key.
+
+        Supports three reset modes:
+        1. per_model: Each model has its own window, resets based on quota_reset_ts or fallback window
+        2. credential: One window per credential (legacy with custom window duration)
+        3. daily: Legacy daily reset at daily_reset_time_utc
+        """
+        if self._usage_data is None:
             return
 
         now_utc = datetime.now(timezone.utc)
+        now_ts = time.time()
         today_str = now_utc.date().isoformat()
         needs_saving = False
 
         for key, data in self._usage_data.items():
-            last_reset_str = data.get("last_daily_reset", "")
+            reset_config = self._get_usage_reset_config(key)
 
-            if last_reset_str != today_str:
-                last_reset_dt = None
-                if last_reset_str:
-                    # Ensure the parsed datetime is timezone-aware (UTC)
-                    last_reset_dt = datetime.fromisoformat(last_reset_str).replace(
-                        tzinfo=timezone.utc
+            if reset_config:
+                reset_mode = reset_config.get("mode", "credential")
+
+                if reset_mode == "per_model":
+                    # Per-model window reset
+                    needs_saving |= await self._check_per_model_resets(
+                        key, data, reset_config, now_ts
                     )
-
-                # Determine the reset threshold for today
-                reset_threshold_today = datetime.combine(
-                    now_utc.date(), self.daily_reset_time_utc
+                else:
+                    # Credential-level window reset (legacy)
+                    needs_saving |= await self._check_window_reset(
+                        key, data, reset_config, now_ts
+                    )
+            elif self.daily_reset_time_utc:
+                # Legacy daily reset
+                needs_saving |= await self._check_daily_reset(
+                    key, data, now_utc, today_str, now_ts
                 )
-
-                if (
-                    last_reset_dt is None
-                    or last_reset_dt < reset_threshold_today <= now_utc
-                ):
-                    lib_logger.debug(
-                        f"Performing daily reset for key {mask_credential(key)}"
-                    )
-                    needs_saving = True
-
-                    # Reset cooldowns
-                    data["model_cooldowns"] = {}
-                    data["key_cooldown_until"] = None
-
-                    # Reset consecutive failures
-                    if "failures" in data:
-                        data["failures"] = {}
-
-                    # Archive global stats from the previous day's 'daily'
-                    daily_data = data.get("daily", {})
-                    if daily_data:
-                        global_data = data.setdefault("global", {"models": {}})
-                        for model, stats in daily_data.get("models", {}).items():
-                            global_model_stats = global_data["models"].setdefault(
-                                model,
-                                {
-                                    "success_count": 0,
-                                    "prompt_tokens": 0,
-                                    "completion_tokens": 0,
-                                    "approx_cost": 0.0,
-                                },
-                            )
-                            global_model_stats["success_count"] += stats.get(
-                                "success_count", 0
-                            )
-                            global_model_stats["prompt_tokens"] += stats.get(
-                                "prompt_tokens", 0
-                            )
-                            global_model_stats["completion_tokens"] += stats.get(
-                                "completion_tokens", 0
-                            )
-                            global_model_stats["approx_cost"] += stats.get(
-                                "approx_cost", 0.0
-                            )
-
-                    # Reset daily stats
-                    data["daily"] = {"date": today_str, "models": {}}
-                    data["last_daily_reset"] = today_str
 
         if needs_saving:
             await self._save_usage()
+
+    async def _check_per_model_resets(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        reset_config: Dict[str, Any],
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform per-model resets for a credential.
+
+        Each model resets independently based on:
+        1. quota_reset_ts (authoritative, from quota exhausted error) if set
+        2. window_start_ts + window_seconds (fallback) otherwise
+
+        Grouped models reset together - all models in a group must be ready.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            reset_config: Provider's reset configuration
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        window_seconds = reset_config.get("window_seconds", 86400)
+        models_data = data.get("models", {})
+
+        if not models_data:
+            return False
+
+        modified = False
+        processed_groups = set()
+
+        for model, model_data in list(models_data.items()):
+            # Check if this model is in a quota group
+            group = self._get_model_quota_group(key, model)
+
+            if group:
+                if group in processed_groups:
+                    continue  # Already handled this group
+
+                # Check if entire group should reset
+                if self._should_group_reset(
+                    key, group, models_data, window_seconds, now_ts
+                ):
+                    # Archive and reset all models in group
+                    grouped_models = self._get_grouped_models(key, group)
+                    archived_count = 0
+
+                    for grouped_model in grouped_models:
+                        if grouped_model in models_data:
+                            gm_data = models_data[grouped_model]
+                            self._archive_model_to_global(data, grouped_model, gm_data)
+                            self._reset_model_data(gm_data)
+                            archived_count += 1
+
+                    if archived_count > 0:
+                        lib_logger.info(
+                            f"Reset model group '{group}' ({archived_count} models) for {mask_credential(key)}"
+                        )
+                        modified = True
+
+                processed_groups.add(group)
+
+            else:
+                # Ungrouped model - check individually
+                if self._should_model_reset(model_data, window_seconds, now_ts):
+                    self._archive_model_to_global(data, model, model_data)
+                    self._reset_model_data(model_data)
+                    lib_logger.info(f"Reset model {model} for {mask_credential(key)}")
+                    modified = True
+
+        # Preserve unexpired cooldowns
+        if modified:
+            self._preserve_unexpired_cooldowns(key, data, now_ts)
+            if "failures" in data:
+                data["failures"] = {}
+
+        return modified
+
+    def _should_model_reset(
+        self, model_data: Dict[str, Any], window_seconds: int, now_ts: float
+    ) -> bool:
+        """
+        Check if a single model should reset.
+
+        Returns True if:
+        - quota_reset_ts is set AND now >= quota_reset_ts, OR
+        - quota_reset_ts is NOT set AND now >= window_start_ts + window_seconds
+        """
+        quota_reset = model_data.get("quota_reset_ts")
+        window_start = model_data.get("window_start_ts")
+
+        if quota_reset:
+            return now_ts >= quota_reset
+        elif window_start:
+            return now_ts >= window_start + window_seconds
+        return False
+
+    def _should_group_reset(
+        self,
+        key: str,
+        group: str,
+        models_data: Dict[str, Dict],
+        window_seconds: int,
+        now_ts: float,
+    ) -> bool:
+        """
+        Check if all models in a group should reset.
+
+        All models in the group must be ready to reset.
+        If any model has an active cooldown/window, the whole group waits.
+        """
+        grouped_models = self._get_grouped_models(key, group)
+
+        # Track if any model in group has data
+        any_has_data = False
+
+        for grouped_model in grouped_models:
+            model_data = models_data.get(grouped_model, {})
+
+            if not model_data or (
+                model_data.get("window_start_ts") is None
+                and model_data.get("success_count", 0) == 0
+            ):
+                continue  # No stats for this model yet
+
+            any_has_data = True
+
+            if not self._should_model_reset(model_data, window_seconds, now_ts):
+                return False  # At least one model not ready
+
+        return any_has_data
+
+    def _archive_model_to_global(
+        self, data: Dict[str, Any], model: str, model_data: Dict[str, Any]
+    ) -> None:
+        """Archive a single model's stats to global."""
+        global_data = data.setdefault("global", {"models": {}})
+        global_model = global_data["models"].setdefault(
+            model,
+            {
+                "success_count": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "approx_cost": 0.0,
+            },
+        )
+
+        global_model["success_count"] += model_data.get("success_count", 0)
+        global_model["prompt_tokens"] += model_data.get("prompt_tokens", 0)
+        global_model["completion_tokens"] += model_data.get("completion_tokens", 0)
+        global_model["approx_cost"] += model_data.get("approx_cost", 0.0)
+
+    def _reset_model_data(self, model_data: Dict[str, Any]) -> None:
+        """Reset a model's window and stats."""
+        model_data["window_start_ts"] = None
+        model_data["quota_reset_ts"] = None
+        model_data["success_count"] = 0
+        model_data["prompt_tokens"] = 0
+        model_data["completion_tokens"] = 0
+        model_data["approx_cost"] = 0.0
+
+    async def _check_window_reset(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        reset_config: Dict[str, Any],
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform rolling window reset for a credential.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            reset_config: Provider's reset configuration
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        window_seconds = reset_config.get("window_seconds", 86400)  # Default 24h
+        field_name = reset_config.get("field_name", "window")
+        description = reset_config.get("description", "rolling window")
+
+        # Get current window data
+        window_data = data.get(field_name, {})
+        window_start = window_data.get("start_ts")
+
+        # No window started yet - nothing to reset
+        if window_start is None:
+            return False
+
+        # Check if window has expired
+        window_end = window_start + window_seconds
+        if now_ts < window_end:
+            # Window still active
+            return False
+
+        # Window expired - perform reset
+        hours_elapsed = (now_ts - window_start) / 3600
+        lib_logger.info(
+            f"Resetting {field_name} for {mask_credential(key)} - "
+            f"{description} expired after {hours_elapsed:.1f}h"
+        )
+
+        # Archive to global
+        self._archive_to_global(data, window_data)
+
+        # Preserve unexpired cooldowns
+        self._preserve_unexpired_cooldowns(key, data, now_ts)
+
+        # Reset window stats (but don't start new window until first request)
+        data[field_name] = {"start_ts": None, "models": {}}
+
+        # Reset consecutive failures
+        if "failures" in data:
+            data["failures"] = {}
+
+        return True
+
+    async def _check_daily_reset(
+        self,
+        key: str,
+        data: Dict[str, Any],
+        now_utc: datetime,
+        today_str: str,
+        now_ts: float,
+    ) -> bool:
+        """
+        Check and perform legacy daily reset for a credential.
+
+        Args:
+            key: Credential identifier
+            data: Usage data for this credential
+            now_utc: Current datetime in UTC
+            today_str: Today's date as ISO string
+            now_ts: Current timestamp
+
+        Returns:
+            True if data was modified and needs saving
+        """
+        last_reset_str = data.get("last_daily_reset", "")
+
+        if last_reset_str == today_str:
+            return False
+
+        last_reset_dt = None
+        if last_reset_str:
+            try:
+                last_reset_dt = datetime.fromisoformat(last_reset_str).replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                pass
+
+        # Determine the reset threshold for today
+        reset_threshold_today = datetime.combine(
+            now_utc.date(), self.daily_reset_time_utc
+        )
+
+        if not (
+            last_reset_dt is None or last_reset_dt < reset_threshold_today <= now_utc
+        ):
+            return False
+
+        lib_logger.debug(f"Performing daily reset for key {mask_credential(key)}")
+
+        # Preserve unexpired cooldowns
+        self._preserve_unexpired_cooldowns(key, data, now_ts)
+
+        # Reset consecutive failures
+        if "failures" in data:
+            data["failures"] = {}
+
+        # Archive daily stats to global
+        daily_data = data.get("daily", {})
+        if daily_data:
+            self._archive_to_global(data, daily_data)
+
+        # Reset daily stats
+        data["daily"] = {"date": today_str, "models": {}}
+        data["last_daily_reset"] = today_str
+
+        return True
+
+    def _archive_to_global(
+        self, data: Dict[str, Any], source_data: Dict[str, Any]
+    ) -> None:
+        """
+        Archive usage stats from a source field (daily/window) to global.
+
+        Args:
+            data: The credential's usage data
+            source_data: The source field data to archive (has "models" key)
+        """
+        global_data = data.setdefault("global", {"models": {}})
+        for model, stats in source_data.get("models", {}).items():
+            global_model_stats = global_data["models"].setdefault(
+                model,
+                {
+                    "success_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "approx_cost": 0.0,
+                },
+            )
+            global_model_stats["success_count"] += stats.get("success_count", 0)
+            global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+            global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
+            global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
+
+    def _preserve_unexpired_cooldowns(
+        self, key: str, data: Dict[str, Any], now_ts: float
+    ) -> None:
+        """
+        Preserve unexpired cooldowns during reset (important for long quota cooldowns).
+
+        Args:
+            key: Credential identifier (for logging)
+            data: The credential's usage data
+            now_ts: Current timestamp
+        """
+        # Preserve unexpired model cooldowns
+        if "model_cooldowns" in data:
+            active_cooldowns = {
+                model: end_time
+                for model, end_time in data["model_cooldowns"].items()
+                if end_time > now_ts
+            }
+            if active_cooldowns:
+                max_remaining = max(
+                    end_time - now_ts for end_time in active_cooldowns.values()
+                )
+                hours_remaining = max_remaining / 3600
+                lib_logger.info(
+                    f"Preserving {len(active_cooldowns)} active cooldown(s) "
+                    f"for key {mask_credential(key)} during reset "
+                    f"(longest: {hours_remaining:.1f}h remaining)"
+                )
+            data["model_cooldowns"] = active_cooldowns
+        else:
+            data["model_cooldowns"] = {}
+
+        # Preserve unexpired key-level cooldown
+        if data.get("key_cooldown_until"):
+            if data["key_cooldown_until"] <= now_ts:
+                data["key_cooldown_until"] = None
+            else:
+                hours_remaining = (data["key_cooldown_until"] - now_ts) / 3600
+                lib_logger.info(
+                    f"Preserving key-level cooldown for {mask_credential(key)} "
+                    f"during reset ({hours_remaining:.1f}h remaining)"
+                )
+        else:
+            data["key_cooldown_until"] = None
 
     def _initialize_key_states(self, keys: List[str]):
         """Initializes state tracking for all provided keys if not already present."""
@@ -306,12 +1083,8 @@ class UsageManager:
                         priority = credential_priorities.get(key, 999)
 
                         # Get usage count for load balancing within priority groups
-                        usage_count = (
-                            key_data.get("daily", {})
-                            .get("models", {})
-                            .get(model, {})
-                            .get("success_count", 0)
-                        )
+                        # Uses grouped usage if model is in a quota group
+                        usage_count = self._get_grouped_usage_count(key, model)
 
                         # Group by priority
                         if priority not in priority_groups:
@@ -324,6 +1097,16 @@ class UsageManager:
                 for priority_level in sorted_priorities:
                     keys_in_priority = priority_groups[priority_level]
 
+                    # Determine selection method based on provider's rotation mode
+                    provider = model.split("/")[0] if "/" in model else ""
+                    rotation_mode = self._get_rotation_mode(provider)
+
+                    # Calculate effective concurrency based on priority tier
+                    multiplier = self._get_priority_multiplier(
+                        provider, priority_level, rotation_mode
+                    )
+                    effective_max_concurrent = max_concurrent * multiplier
+
                     # Within each priority group, use existing tier1/tier2 logic
                     tier1_keys, tier2_keys = [], []
                     for key, usage_count in keys_in_priority:
@@ -333,18 +1116,27 @@ class UsageManager:
                         if not key_state["models_in_use"]:
                             tier1_keys.append((key, usage_count))
                         # Tier 2: Keys that can accept more concurrent requests
-                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                        elif (
+                            key_state["models_in_use"].get(model, 0)
+                            < effective_max_concurrent
+                        ):
                             tier2_keys.append((key, usage_count))
 
-                    # Apply weighted random selection or deterministic sorting
-                    selection_method = (
-                        "weighted-random"
-                        if self.rotation_tolerance > 0
-                        else "least-used"
-                    )
-
-                    if self.rotation_tolerance > 0:
-                        # Weighted random selection within each tier
+                    if rotation_mode == "sequential":
+                        # Sequential mode: sort credentials by priority, usage, recency
+                        # Keep all candidates in sorted order (no filtering to single key)
+                        selection_method = "sequential"
+                        if tier1_keys:
+                            tier1_keys = self._sort_sequential(
+                                tier1_keys, credential_priorities
+                            )
+                        if tier2_keys:
+                            tier2_keys = self._sort_sequential(
+                                tier2_keys, credential_priorities
+                            )
+                    elif self.rotation_tolerance > 0:
+                        # Balanced mode with weighted randomness
+                        selection_method = "weighted-random"
                         if tier1_keys:
                             selected_key = self._select_weighted_random(
                                 tier1_keys, self.rotation_tolerance
@@ -361,6 +1153,7 @@ class UsageManager:
                             ]
                     else:
                         # Deterministic: sort by usage within each tier
+                        selection_method = "least-used"
                         tier1_keys.sort(key=lambda x: x[1])
                         tier2_keys.sort(key=lambda x: x[1])
 
@@ -386,7 +1179,7 @@ class UsageManager:
                         state = self.key_states[key]
                         async with state["lock"]:
                             current_count = state["models_in_use"].get(model, 0)
-                            if current_count < max_concurrent:
+                            if current_count < effective_max_concurrent:
                                 state["models_in_use"][model] = current_count + 1
                                 tier_name = (
                                     credential_tier_names.get(key, "unknown")
@@ -395,7 +1188,7 @@ class UsageManager:
                                 )
                                 lib_logger.info(
                                     f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
                                 )
                                 return key
 
@@ -424,6 +1217,19 @@ class UsageManager:
 
             else:
                 # Original logic when no priorities specified
+
+                # Determine selection method based on provider's rotation mode
+                provider = model.split("/")[0] if "/" in model else ""
+                rotation_mode = self._get_rotation_mode(provider)
+
+                # Calculate effective concurrency for default priority (999)
+                # When no priorities are specified, all credentials get default priority
+                default_priority = 999
+                multiplier = self._get_priority_multiplier(
+                    provider, default_priority, rotation_mode
+                )
+                effective_max_concurrent = max_concurrent * multiplier
+
                 tier1_keys, tier2_keys = [], []
 
                 # First, filter the list of available keys to exclude any on cooldown.
@@ -437,28 +1243,35 @@ class UsageManager:
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
-                        usage_count = (
-                            key_data.get("daily", {})
-                            .get("models", {})
-                            .get(model, {})
-                            .get("success_count", 0)
-                        )
+                        # Uses grouped usage if model is in a quota group
+                        usage_count = self._get_grouped_usage_count(key, model)
                         key_state = self.key_states[key]
 
                         # Tier 1: Completely idle keys (preferred).
                         if not key_state["models_in_use"]:
                             tier1_keys.append((key, usage_count))
                         # Tier 2: Keys that can accept more concurrent requests for this model.
-                        elif key_state["models_in_use"].get(model, 0) < max_concurrent:
+                        elif (
+                            key_state["models_in_use"].get(model, 0)
+                            < effective_max_concurrent
+                        ):
                             tier2_keys.append((key, usage_count))
 
-                # Apply weighted random selection or deterministic sorting
-                selection_method = (
-                    "weighted-random" if self.rotation_tolerance > 0 else "least-used"
-                )
-
-                if self.rotation_tolerance > 0:
-                    # Weighted random selection within each tier
+                if rotation_mode == "sequential":
+                    # Sequential mode: sort credentials by priority, usage, recency
+                    # Keep all candidates in sorted order (no filtering to single key)
+                    selection_method = "sequential"
+                    if tier1_keys:
+                        tier1_keys = self._sort_sequential(
+                            tier1_keys, credential_priorities
+                        )
+                    if tier2_keys:
+                        tier2_keys = self._sort_sequential(
+                            tier2_keys, credential_priorities
+                        )
+                elif self.rotation_tolerance > 0:
+                    # Balanced mode with weighted randomness
+                    selection_method = "weighted-random"
                     if tier1_keys:
                         selected_key = self._select_weighted_random(
                             tier1_keys, self.rotation_tolerance
@@ -475,6 +1288,7 @@ class UsageManager:
                         ]
                 else:
                     # Deterministic: sort by usage within each tier
+                    selection_method = "least-used"
                     tier1_keys.sort(key=lambda x: x[1])
                     tier2_keys.sort(key=lambda x: x[1])
 
@@ -501,7 +1315,7 @@ class UsageManager:
                     state = self.key_states[key]
                     async with state["lock"]:
                         current_count = state["models_in_use"].get(model, 0)
-                        if current_count < max_concurrent:
+                        if current_count < effective_max_concurrent:
                             state["models_in_use"][model] = current_count + 1
                             tier_name = (
                                 credential_tier_names.get(key)
@@ -511,7 +1325,7 @@ class UsageManager:
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
                             lib_logger.info(
                                 f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{max_concurrent}, usage: {usage})"
+                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
                             )
                             return key
 
@@ -585,70 +1399,131 @@ class UsageManager:
         """
         Records a successful API call, resetting failure counters.
         It safely handles cases where token usage data is not available.
+
+        Supports two modes based on provider configuration:
+        - per_model: Each model has its own window_start_ts and stats in key_data["models"]
+        - credential: Legacy mode with key_data["daily"]["models"]
         """
         await self._lazy_init()
         async with self._data_lock:
+            now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
-            key_data = self._usage_data.setdefault(
-                key,
-                {
-                    "daily": {"date": today_utc_str, "models": {}},
-                    "global": {"models": {}},
-                    "model_cooldowns": {},
-                    "failures": {},
-                },
+
+            reset_config = self._get_usage_reset_config(key)
+            reset_mode = (
+                reset_config.get("mode", "credential") if reset_config else "credential"
             )
 
-            # If the key is new, ensure its reset date is initialized to prevent an immediate reset.
-            if "last_daily_reset" not in key_data:
-                key_data["last_daily_reset"] = today_utc_str
+            if reset_mode == "per_model":
+                # New per-model structure
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "models": {},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
 
-            # Always record a success and reset failures
+                # Ensure models dict exists
+                if "models" not in key_data:
+                    key_data["models"] = {}
+
+                # Get or create per-model data with window tracking
+                model_data = key_data["models"].setdefault(
+                    model,
+                    {
+                        "window_start_ts": None,
+                        "quota_reset_ts": None,
+                        "success_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "approx_cost": 0.0,
+                    },
+                )
+
+                # Start window on first request for this model
+                if model_data.get("window_start_ts") is None:
+                    model_data["window_start_ts"] = now_ts
+
+                    # Set expected quota reset time from provider config
+                    window_seconds = (
+                        reset_config.get("window_seconds", 0) if reset_config else 0
+                    )
+                    if window_seconds > 0:
+                        model_data["quota_reset_ts"] = now_ts + window_seconds
+
+                    window_hours = window_seconds / 3600 if window_seconds else 0
+                    lib_logger.info(
+                        f"Started {window_hours:.1f}h window for model {model} on {mask_credential(key)}"
+                    )
+
+                # Record stats
+                model_data["success_count"] += 1
+                usage_data_ref = model_data  # For token/cost recording below
+
+            else:
+                # Legacy credential-level structure
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "daily": {"date": today_utc_str, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
+
+                if "last_daily_reset" not in key_data:
+                    key_data["last_daily_reset"] = today_utc_str
+
+                # Get or create model data in daily structure
+                usage_data_ref = key_data["daily"]["models"].setdefault(
+                    model,
+                    {
+                        "success_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "approx_cost": 0.0,
+                    },
+                )
+                usage_data_ref["success_count"] += 1
+
+            # Reset failures for this model
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
             model_failures["consecutive_failures"] = 0
+
+            # Clear transient cooldown on success (but NOT quota_reset_ts)
             if model in key_data.get("model_cooldowns", {}):
                 del key_data["model_cooldowns"][model]
 
-            daily_model_data = key_data["daily"]["models"].setdefault(
-                model,
-                {
-                    "success_count": 0,
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "approx_cost": 0.0,
-                },
-            )
-            daily_model_data["success_count"] += 1
-
-            # Safely attempt to record token and cost usage
+            # Record token and cost usage
             if (
                 completion_response
                 and hasattr(completion_response, "usage")
                 and completion_response.usage
             ):
                 usage = completion_response.usage
-                daily_model_data["prompt_tokens"] += usage.prompt_tokens
-                daily_model_data["completion_tokens"] += getattr(
+                usage_data_ref["prompt_tokens"] += usage.prompt_tokens
+                usage_data_ref["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
-                )  # Not present in embedding responses
+                )
                 lib_logger.info(
                     f"Recorded usage from response object for key {mask_credential(key)}"
                 )
                 try:
                     provider_name = model.split("/")[0]
-                    provider_plugin = PROVIDER_PLUGINS.get(provider_name)
+                    provider_instance = self._get_provider_instance(provider_name)
 
-                    # Check class attribute directly - no need to instantiate
-                    if provider_plugin and getattr(
-                        provider_plugin, "skip_cost_calculation", False
+                    if provider_instance and getattr(
+                        provider_instance, "skip_cost_calculation", False
                     ):
                         lib_logger.debug(
                             f"Skipping cost calculation for provider '{provider_name}' (custom provider)."
                         )
                     else:
-                        # Differentiate cost calculation based on response type
                         if isinstance(completion_response, litellm.EmbeddingResponse):
-                            # Manually calculate cost for embeddings
                             model_info = litellm.get_model_info(model)
                             input_cost = model_info.get("input_cost_per_token")
                             if input_cost:
@@ -663,7 +1538,7 @@ class UsageManager:
                             )
 
                         if cost is not None:
-                            daily_model_data["approx_cost"] += cost
+                            usage_data_ref["approx_cost"] += cost
                 except Exception as e:
                     lib_logger.warning(
                         f"Could not calculate cost for model {model}: {e}"
@@ -671,14 +1546,13 @@ class UsageManager:
             elif isinstance(completion_response, asyncio.Future) or hasattr(
                 completion_response, "__aiter__"
             ):
-                # This is an unconsumed stream object. Do not log a warning, as usage will be recorded from the chunks.
-                pass
+                pass  # Stream - usage recorded from chunks
             else:
                 lib_logger.warning(
                     f"No usage data found in completion response for model {model}. Recording success without token count."
                 )
 
-            key_data["last_used_ts"] = time.time()
+            key_data["last_used_ts"] = now_ts
 
         await self._save_usage()
 
@@ -689,7 +1563,13 @@ class UsageManager:
         classified_error: ClassifiedError,
         increment_consecutive_failures: bool = True,
     ):
-        """Records a failure and applies cooldowns based on an escalating backoff strategy.
+        """Records a failure and applies cooldowns based on error type.
+
+        Distinguishes between:
+        - quota_exceeded: Long cooldown with exact reset time (from quota_reset_timestamp)
+          Sets quota_reset_ts on model (and group) - this becomes authoritative stats reset time
+        - rate_limit: Short transient cooldown (just wait and retry)
+          Only sets model_cooldowns - does NOT affect stats reset timing
 
         Args:
             key: The API key or credential identifier
@@ -700,16 +1580,35 @@ class UsageManager:
         """
         await self._lazy_init()
         async with self._data_lock:
+            now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
-            key_data = self._usage_data.setdefault(
-                key,
-                {
-                    "daily": {"date": today_utc_str, "models": {}},
-                    "global": {"models": {}},
-                    "model_cooldowns": {},
-                    "failures": {},
-                },
+
+            reset_config = self._get_usage_reset_config(key)
+            reset_mode = (
+                reset_config.get("mode", "credential") if reset_config else "credential"
             )
+
+            # Initialize key data with appropriate structure
+            if reset_mode == "per_model":
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "models": {},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
+            else:
+                key_data = self._usage_data.setdefault(
+                    key,
+                    {
+                        "daily": {"date": today_utc_str, "models": {}},
+                        "global": {"models": {}},
+                        "model_cooldowns": {},
+                        "failures": {},
+                    },
+                )
 
             # Provider-level errors (transient issues) should not count against the key
             provider_level_errors = {"server_error", "api_connection"}
@@ -722,22 +1621,94 @@ class UsageManager:
 
             # Calculate cooldown duration based on error type
             cooldown_seconds = None
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
 
-            if classified_error.error_type in ["rate_limit", "quota_exceeded"]:
-                # Rate limit / Quota errors: use retry_after if available, otherwise default to 60s
+            if classified_error.error_type == "quota_exceeded":
+                # Quota exhausted - use authoritative reset timestamp if available
+                quota_reset_ts = classified_error.quota_reset_timestamp
                 cooldown_seconds = classified_error.retry_after or 60
+
+                if quota_reset_ts and reset_mode == "per_model":
+                    # Set quota_reset_ts on model - this becomes authoritative stats reset time
+                    models_data = key_data.setdefault("models", {})
+                    model_data = models_data.setdefault(
+                        model,
+                        {
+                            "window_start_ts": None,
+                            "quota_reset_ts": None,
+                            "success_count": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "approx_cost": 0.0,
+                        },
+                    )
+                    model_data["quota_reset_ts"] = quota_reset_ts
+
+                    # Apply to all models in the same quota group
+                    group = self._get_model_quota_group(key, model)
+                    if group:
+                        grouped_models = self._get_grouped_models(key, group)
+                        for grouped_model in grouped_models:
+                            group_model_data = models_data.setdefault(
+                                grouped_model,
+                                {
+                                    "window_start_ts": None,
+                                    "quota_reset_ts": None,
+                                    "success_count": 0,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "approx_cost": 0.0,
+                                },
+                            )
+                            group_model_data["quota_reset_ts"] = quota_reset_ts
+                            # Also set transient cooldown for selection logic
+                            model_cooldowns[grouped_model] = quota_reset_ts
+
+                        reset_dt = datetime.fromtimestamp(
+                            quota_reset_ts, tz=timezone.utc
+                        )
+                        lib_logger.info(
+                            f"Quota exhausted for group '{group}' ({len(grouped_models)} models) "
+                            f"on {mask_credential(key)}. Resets at {reset_dt.isoformat()}"
+                        )
+                    else:
+                        reset_dt = datetime.fromtimestamp(
+                            quota_reset_ts, tz=timezone.utc
+                        )
+                        hours = (quota_reset_ts - now_ts) / 3600
+                        lib_logger.info(
+                            f"Quota exhausted for model {model} on {mask_credential(key)}. "
+                            f"Resets at {reset_dt.isoformat()} ({hours:.1f}h)"
+                        )
+
+                    # Set transient cooldown for selection logic
+                    model_cooldowns[model] = quota_reset_ts
+                else:
+                    # No authoritative timestamp or legacy mode - just use retry_after
+                    model_cooldowns[model] = now_ts + cooldown_seconds
+                    hours = cooldown_seconds / 3600
+                    lib_logger.info(
+                        f"Quota exhausted on {mask_credential(key)} for model {model}. "
+                        f"Cooldown: {cooldown_seconds}s ({hours:.1f}h)"
+                    )
+
+            elif classified_error.error_type == "rate_limit":
+                # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
+                cooldown_seconds = classified_error.retry_after or 60
+                model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
-                    f"Rate limit error on key {mask_credential(key)} for model {model}. "
-                    f"Using {'provided' if classified_error.retry_after else 'default'} retry_after: {cooldown_seconds}s"
+                    f"Rate limit on {mask_credential(key)} for model {model}. "
+                    f"Transient cooldown: {cooldown_seconds}s"
                 )
+
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
-                key_data["key_cooldown_until"] = time.time() + 300
+                key_data["key_cooldown_until"] = now_ts + 300
+                cooldown_seconds = 300
+                model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.warning(
                     f"Authentication error on key {mask_credential(key)}. Applying 5-minute key-level lockout."
                 )
-                # Auth errors still use escalating backoff for the specific model
-                cooldown_seconds = 300  # 5 minutes for model cooldown
 
             # If we should increment failures, calculate escalating backoff
             if should_increment:
@@ -751,35 +1722,27 @@ class UsageManager:
                 # If cooldown wasn't set by specific error type, use escalating backoff
                 if cooldown_seconds is None:
                     backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
-                    cooldown_seconds = backoff_tiers.get(
-                        count, 7200
-                    )  # Default to 2 hours for "spent" keys
+                    cooldown_seconds = backoff_tiers.get(count, 7200)
+                    model_cooldowns[model] = now_ts + cooldown_seconds
                     lib_logger.warning(
                         f"Failure #{count} for key {mask_credential(key)} with model {model}. "
-                        f"Error type: {classified_error.error_type}"
+                        f"Error type: {classified_error.error_type}, cooldown: {cooldown_seconds}s"
                     )
             else:
                 # Provider-level errors: apply short cooldown but don't count against key
                 if cooldown_seconds is None:
-                    cooldown_seconds = 30  # 30s cooldown for provider issues
+                    cooldown_seconds = 30
+                    model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
-                    f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} with model {model}. "
-                    f"NOT incrementing consecutive failures. Applying {cooldown_seconds}s cooldown."
+                    f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} "
+                    f"with model {model}. NOT incrementing failures. Cooldown: {cooldown_seconds}s"
                 )
-
-            # Apply the cooldown
-            model_cooldowns = key_data.setdefault("model_cooldowns", {})
-            model_cooldowns[model] = time.time() + cooldown_seconds
-            lib_logger.warning(
-                f"Cooldown applied for key {mask_credential(key)} with model {model}: {cooldown_seconds}s. "
-                f"Error type: {classified_error.error_type}"
-            )
 
             # Check for key-level lockout condition
             await self._check_key_lockout(key, key_data)
 
             key_data["last_failure"] = {
-                "timestamp": time.time(),
+                "timestamp": now_ts,
                 "model": model,
                 "error": str(classified_error.original_exception),
             }

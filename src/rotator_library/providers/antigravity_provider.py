@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
@@ -50,7 +50,7 @@ lib_logger = logging.getLogger("rotator_library")
 # Priority: daily (sandbox) → autopush (sandbox) → production
 BASE_URLS = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
-    "https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    # "https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
 
@@ -494,6 +494,227 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     skip_cost_calculation = True
 
+    # Sequential mode by default - preserves thinking signature caches between requests
+    default_rotation_mode: str = "sequential"
+
+    # =========================================================================
+    # TIER & USAGE CONFIGURATION
+    # =========================================================================
+
+    # Provider name for env var lookups (QUOTA_GROUPS_ANTIGRAVITY_*)
+    provider_env_name: str = "antigravity"
+
+    # Tier name -> priority mapping (Single Source of Truth)
+    # Lower numbers = higher priority
+    tier_priorities = {
+        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
+        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
+        # Priority 2: Standard paid tier
+        "standard-tier": 2,
+        # Priority 3: Free tier
+        "free-tier": 3,
+        # Priority 10: Legacy/Unknown (lowest)
+        "legacy-tier": 10,
+        "unknown": 10,
+    }
+
+    # Default priority for tiers not in the mapping
+    default_tier_priority: int = 10
+
+    # Usage reset configs keyed by priority sets
+    # Priorities 1-2 (paid tiers) get 5h window, others get 7d window
+    usage_reset_configs = {
+        frozenset({1, 2}): UsageResetConfigDef(
+            window_seconds=5 * 60 * 60,  # 5 hours
+            mode="per_model",
+            description="5-hour per-model window (paid tier)",
+            field_name="models",
+        ),
+        "default": UsageResetConfigDef(
+            window_seconds=7 * 24 * 60 * 60,  # 7 days
+            mode="per_model",
+            description="7-day per-model window (free/unknown tier)",
+            field_name="models",
+        ),
+    }
+
+    # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
+    # Models in the same group share quota - when one is exhausted, all are
+    model_quota_groups: QuotaGroupMap = {
+        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+    }
+
+    # Model usage weights for grouped usage calculation
+    # Opus consumes more quota per request, so its usage counts 2x when
+    # comparing credentials for selection
+    model_usage_weights = {
+        "claude-opus-4-5": 2,
+    }
+
+    # Priority-based concurrency multipliers
+    # Higher priority credentials (lower number) get higher multipliers
+    # Priority 1 (paid ultra): 5x concurrent requests
+    # Priority 2 (standard paid): 3x concurrent requests
+    # Others: Use sequential fallback (2x) or balanced default (1x)
+    default_priority_multipliers = {1: 5, 2: 3}
+
+    # For sequential mode, lower priority tiers still get 2x to maintain stickiness
+    # For balanced mode, this doesn't apply (falls back to 1x)
+    default_sequential_fallback_multiplier = 2
+
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse Antigravity/Google RPC quota errors.
+
+        Handles the Google Cloud API error format with ErrorInfo and RetryInfo details.
+
+        Example error format:
+        {
+          "error": {
+            "code": 429,
+            "details": [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "QUOTA_EXHAUSTED",
+                "metadata": {
+                  "quotaResetDelay": "143h4m52.730699158s",
+                  "quotaResetTimeStamp": "2025-12-11T22:53:16Z"
+                }
+              },
+              {
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "515092.730699158s"
+              }
+            ]
+          }
+        }
+
+        Args:
+            error: The caught exception
+            error_body: Optional raw response body string
+
+        Returns:
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,
+                "reason": str,
+                "reset_timestamp": str | None,
+            }
+        """
+        import re as regex_module
+
+        def parse_duration(duration_str: str) -> Optional[int]:
+            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds."""
+            if not duration_str:
+                return None
+
+            # Handle pure seconds format: "515092.730699158s"
+            pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
+            if pure_seconds_match:
+                return int(float(pure_seconds_match.group(1)))
+
+            # Handle compound format: "143h4m52.730699158s"
+            total_seconds = 0
+            patterns = [
+                (r"(\d+)h", 3600),  # hours
+                (r"(\d+)m", 60),  # minutes
+                (r"([\d.]+)s", 1),  # seconds
+            ]
+            for pattern, multiplier in patterns:
+                match = regex_module.search(pattern, duration_str)
+                if match:
+                    total_seconds += float(match.group(1)) * multiplier
+
+            return int(total_seconds) if total_seconds > 0 else None
+
+        # Get error body from exception if not provided
+        body = error_body
+        if not body:
+            # Try to extract from various exception attributes
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                body = error.response.text
+            elif hasattr(error, "body"):
+                body = str(error.body)
+            elif hasattr(error, "message"):
+                body = str(error.message)
+            else:
+                body = str(error)
+
+        # Try to find JSON in the body
+        try:
+            # Handle cases where JSON is embedded in a larger string
+            json_match = regex_module.search(r"\{[\s\S]*\}", body)
+            if not json_match:
+                return None
+
+            data = json.loads(json_match.group(0))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return None
+
+        # Navigate to error.details
+        error_obj = data.get("error", data)
+        details = error_obj.get("details", [])
+
+        if not details:
+            return None
+
+        result = {
+            "retry_after": None,
+            "reason": None,
+            "reset_timestamp": None,
+            "quota_reset_timestamp": None,  # Unix timestamp for quota reset
+        }
+
+        for detail in details:
+            detail_type = detail.get("@type", "")
+
+            # Parse RetryInfo - most authoritative source for retry delay
+            if "RetryInfo" in detail_type:
+                retry_delay = detail.get("retryDelay")
+                if retry_delay:
+                    parsed = parse_duration(retry_delay)
+                    if parsed:
+                        result["retry_after"] = parsed
+
+            # Parse ErrorInfo - contains reason and quota reset metadata
+            elif "ErrorInfo" in detail_type:
+                result["reason"] = detail.get("reason")
+                metadata = detail.get("metadata", {})
+
+                # Get quotaResetDelay as fallback if RetryInfo not present
+                if not result["retry_after"]:
+                    quota_delay = metadata.get("quotaResetDelay")
+                    if quota_delay:
+                        parsed = parse_duration(quota_delay)
+                        if parsed:
+                            result["retry_after"] = parsed
+
+                # Capture reset timestamp for logging and authoritative reset time
+                reset_ts_str = metadata.get("quotaResetTimeStamp")
+                result["reset_timestamp"] = reset_ts_str
+
+                # Parse ISO timestamp to Unix timestamp for usage tracking
+                if reset_ts_str:
+                    try:
+                        # Handle ISO format: "2025-12-11T22:53:16Z"
+                        reset_dt = datetime.fromisoformat(
+                            reset_ts_str.replace("Z", "+00:00")
+                        )
+                        result["quota_reset_timestamp"] = reset_dt.timestamp()
+                    except (ValueError, AttributeError) as e:
+                        lib_logger.warning(
+                            f"Failed to parse quota reset timestamp '{reset_ts_str}': {e}"
+                        )
+
+        # Return None if we couldn't extract retry_after
+        if not result["retry_after"]:
+            return None
+
+        return result
+
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()
@@ -576,43 +797,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
         )
-
-    # =========================================================================
-    # CREDENTIAL PRIORITIZATION
-    # =========================================================================
-
-    def get_credential_priority(self, credential: str) -> Optional[int]:
-        """
-        Returns priority based on Antigravity tier.
-        Paid tiers: priority 1 (highest)
-        Free tier: priority 2
-        Legacy/Unknown: priority 10 (lowest)
-
-        Args:
-            credential: The credential path
-
-        Returns:
-            Priority level (1-10) or None if tier not yet discovered
-        """
-        tier = self.project_tier_cache.get(credential)
-
-        # Lazy load from file if not in cache
-        if not tier:
-            tier = self._load_tier_from_file(credential)
-
-        if not tier:
-            return None  # Not yet discovered
-
-        # Paid tiers get highest priority
-        if tier not in ["free-tier", "legacy-tier", "unknown"]:
-            return 1
-
-        # Free tier gets lower priority
-        if tier == "free-tier":
-            return 2
-
-        # Legacy and unknown get even lower
-        return 10
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
         """
@@ -2375,9 +2559,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                                 f"Ignoring duplicate - this may indicate malformed conversation history."
                             )
                             continue
-                        lib_logger.debug(
-                            f"[Grouping] Collected response for ID: {resp_id}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Collected response for ID: {resp_id}"
+                        #)
                         collected_responses[resp_id] = resp
 
                 # Try to satisfy pending groups (newest first)
@@ -2392,10 +2576,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                             collected_responses.pop(gid) for gid in group_ids
                         ]
                         new_contents.append({"parts": group_responses, "role": "user"})
-                        lib_logger.debug(
-                            f"[Grouping] Satisfied group with {len(group_responses)} responses: "
-                            f"ids={group_ids}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Satisfied group with {len(group_responses)} responses: "
+                        #    f"ids={group_ids}"
+                        #)
                         pending_groups.pop(i)
                         break
                 continue
@@ -2415,10 +2599,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     ]
 
                     if call_ids:
-                        lib_logger.debug(
-                            f"[Grouping] Created pending group expecting {len(call_ids)} responses: "
-                            f"ids={call_ids}, names={func_names}"
-                        )
+                        #lib_logger.debug(
+                        #    f"[Grouping] Created pending group expecting {len(call_ids)} responses: "
+                        #    f"ids={call_ids}, names={func_names}"
+                        #)
                         pending_groups.append(
                             {
                                 "ids": call_ids,
@@ -3450,7 +3634,28 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 return await self._handle_non_streaming(
                     client, url, headers, payload, model, file_logger
                 )
+        except httpx.HTTPStatusError as e:
+            # 429 = Rate limit/quota exhausted - tied to credential, not URL
+            # Do NOT retry on different URL, just raise immediately
+            if e.response.status_code == 429:
+                lib_logger.debug(f"429 quota error - not retrying on fallback URL: {e}")
+                raise
+
+            # For other HTTP errors (403, 500, etc.), try fallback URL
+            if self._try_next_base_url():
+                lib_logger.warning(f"Retrying with fallback URL: {e}")
+                url = f"{self._get_base_url()}{endpoint}"
+                if stream:
+                    return self._handle_streaming(
+                        client, url, headers, payload, model, file_logger
+                    )
+                else:
+                    return await self._handle_non_streaming(
+                        client, url, headers, payload, model, file_logger
+                    )
+            raise
         except Exception as e:
+            # Non-HTTP errors (network issues, timeouts, etc.) - try fallback URL
             if self._try_next_base_url():
                 lib_logger.warning(f"Retrying with fallback URL: {e}")
                 url = f"{self._get_base_url()}{endpoint}"
@@ -3534,11 +3739,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "POST", url, headers=headers, json=payload, timeout=600.0
         ) as response:
             if response.status_code >= 400:
+                # Read error body for raise_for_status to include in exception
+                # Terminal logging commented out - errors are logged in failures.log
                 try:
-                    error_body = await response.aread()
-                    lib_logger.error(
-                        f"API error {response.status_code}: {error_body.decode()}"
-                    )
+                    await response.aread()
+                    # lib_logger.error(
+                    #     f"API error {response.status_code}: {error_body.decode()}"
+                    # )
                 except Exception:
                     pass
 

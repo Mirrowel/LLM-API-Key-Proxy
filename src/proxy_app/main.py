@@ -10,10 +10,18 @@ import logging
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
-parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
+parser.add_argument(
+    "--host", type=str, default="0.0.0.0", help="Host to bind the server to."
+)
 parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
-parser.add_argument("--enable-request-logging", action="store_true", help="Enable request logging.")
-parser.add_argument("--add-credential", action="store_true", help="Launch the interactive tool to add a new OAuth credential.")
+parser.add_argument(
+    "--enable-request-logging", action="store_true", help="Enable request logging."
+)
+parser.add_argument(
+    "--add-credential",
+    action="store_true",
+    help="Launch the interactive tool to add a new OAuth credential.",
+)
 args, _ = parser.parse_known_args()
 
 # Add the 'src' directory to the Python path
@@ -23,6 +31,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 if len(sys.argv) == 1:
     # TUI MODE - Load ONLY what's needed for the launcher (fast path!)
     from proxy_app.launcher_tui import run_launcher_tui
+
     run_launcher_tui()
     # Launcher modifies sys.argv and returns, or exits if user chose Exit
     # If we get here, user chose "Run Proxy" and sys.argv is modified
@@ -32,6 +41,7 @@ if len(sys.argv) == 1:
 # Check if credential tool mode (also doesn't need heavy proxy imports)
 if args.add_credential:
     from rotator_library.credential_tool import run_credential_tool
+
     run_credential_tool()
     sys.exit(0)
 
@@ -74,6 +84,7 @@ print("Loading server components...")
 
 # Phase 2: Load Rich for loading spinner (lightweight)
 from rich.console import Console
+
 _console = Console()
 
 # Phase 3: Heavy dependencies with granular loading messages
@@ -92,7 +103,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, Field
-    
+
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
@@ -100,7 +111,7 @@ print("  → Loading LiteLLM library...")
 with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
     import litellm
 
-# Phase 4: Application imports with granular loading messages  
+# Phase 4: Application imports with granular loading messages
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
@@ -115,11 +126,14 @@ print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
 _provider_start = time.time()
 with _console.status("[dim]Discovering provider plugins...", spinner="dots"):
-    from rotator_library import PROVIDER_PLUGINS  # This triggers lazy load via __getattr__
+    from rotator_library import (
+        PROVIDER_PLUGINS,
+    )  # This triggers lazy load via __getattr__
 _provider_time = time.time() - _provider_start
 
 # Get count after import (without timing to avoid double-counting)
 _plugin_count = len(PROVIDER_PLUGINS)
+
 
 # --- Pydantic Models ---
 class EmbeddingRequest(BaseModel):
@@ -129,15 +143,19 @@ class EmbeddingRequest(BaseModel):
     dimensions: Optional[int] = None
     user: Optional[str] = None
 
+
 class ModelCard(BaseModel):
     """Basic model card for minimal response."""
+
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "Mirro-Proxy"
 
+
 class ModelCapabilities(BaseModel):
     """Model capability flags."""
+
     tool_choice: bool = False
     function_calling: bool = False
     reasoning: bool = False
@@ -146,8 +164,10 @@ class ModelCapabilities(BaseModel):
     prompt_caching: bool = False
     assistant_prefill: bool = False
 
+
 class EnrichedModelCard(BaseModel):
     """Extended model card with pricing and capabilities."""
+
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
@@ -169,28 +189,36 @@ class EnrichedModelCard(BaseModel):
     # Debug info (optional)
     _sources: Optional[List[str]] = None
     _match_type: Optional[str] = None
-    
+
     class Config:
         extra = "allow"  # Allow extra fields from the service
 
+
 class ModelList(BaseModel):
     """List of models response."""
+
     object: str = "list"
     data: List[ModelCard]
 
+
 class EnrichedModelList(BaseModel):
     """List of enriched models with pricing and capabilities."""
+
     object: str = "list"
     data: List[EnrichedModelCard]
 
+
 # Calculate total loading time
 _elapsed = time.time() - _start_time
-print(f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)")
+print(
+    f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)"
+)
 
 # Clear screen and reprint header for clean startup view
 # This pushes loading messages up (still in scroll history) but shows a clean final screen
 import os as _os_module
-_os_module.system('cls' if _os_module.name == 'nt' else 'clear')
+
+_os_module.system("cls" if _os_module.name == "nt" else "clear")
 
 # Reprint header
 print("━" * 70)
@@ -198,7 +226,9 @@ print(f"Starting proxy on {args.host}:{args.port}")
 print(f"Proxy API Key: {key_display}")
 print(f"GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
 print("━" * 70)
-print(f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)")
+print(
+    f"✓ Server ready in {_elapsed:.2f}s ({_plugin_count} providers discovered in {_provider_time:.2f}s)"
+)
 
 
 # Note: Debug logging will be added after logging configuration below
@@ -211,52 +241,64 @@ LOG_DIR.mkdir(exist_ok=True)
 console_handler = colorlog.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 formatter = colorlog.ColoredFormatter(
-    '%(log_color)s%(message)s',
+    "%(log_color)s%(message)s",
     log_colors={
-        'DEBUG':    'cyan',
-        'INFO':     'green',
-        'WARNING':  'yellow',
-        'ERROR':    'red',
-        'CRITICAL': 'red,bg_white',
-    }
+        "DEBUG": "cyan",
+        "INFO": "green",
+        "WARNING": "yellow",
+        "ERROR": "red",
+        "CRITICAL": "red,bg_white",
+    },
 )
 console_handler.setFormatter(formatter)
 
 # Configure a file handler for INFO-level logs and higher
 info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
 info_file_handler.setLevel(logging.INFO)
-info_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+info_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+)
 
 # Configure a dedicated file handler for all DEBUG-level logs
 debug_file_handler = logging.FileHandler(LOG_DIR / "proxy_debug.log", encoding="utf-8")
 debug_file_handler.setLevel(logging.DEBUG)
-debug_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+debug_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+)
+
 
 # Create a filter to ensure the debug handler ONLY gets DEBUG messages from the rotator_library
 class RotatorDebugFilter(logging.Filter):
     def filter(self, record):
-        return record.levelno == logging.DEBUG and record.name.startswith('rotator_library')
+        return record.levelno == logging.DEBUG and record.name.startswith(
+            "rotator_library"
+        )
+
+
 debug_file_handler.addFilter(RotatorDebugFilter())
 
 # Configure a console handler with color
 console_handler = colorlog.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 formatter = colorlog.ColoredFormatter(
-    '%(log_color)s%(message)s',
+    "%(log_color)s%(message)s",
     log_colors={
-        'DEBUG':    'cyan',
-        'INFO':     'green',
-        'WARNING':  'yellow',
-        'ERROR':    'red',
-        'CRITICAL': 'red,bg_white',
-    }
+        "DEBUG": "cyan",
+        "INFO": "green",
+        "WARNING": "yellow",
+        "ERROR": "red",
+        "CRITICAL": "red,bg_white",
+    },
 )
 console_handler.setFormatter(formatter)
+
 
 # Add a filter to prevent any LiteLLM logs from cluttering the console
 class NoLiteLLMLogFilter(logging.Filter):
     def filter(self, record):
-        return not record.name.startswith('LiteLLM')
+        return not record.name.startswith("LiteLLM")
+
+
 console_handler.addFilter(NoLiteLLMLogFilter())
 
 # Get the root logger and set it to DEBUG to capture all messages
@@ -306,18 +348,26 @@ ignore_models = {}
 for key, value in os.environ.items():
     if key.startswith("IGNORE_MODELS_"):
         provider = key.replace("IGNORE_MODELS_", "").lower()
-        models_to_ignore = [model.strip() for model in value.split(',') if model.strip()]
+        models_to_ignore = [
+            model.strip() for model in value.split(",") if model.strip()
+        ]
         ignore_models[provider] = models_to_ignore
-        logging.debug(f"Loaded ignore list for provider '{provider}': {models_to_ignore}")
+        logging.debug(
+            f"Loaded ignore list for provider '{provider}': {models_to_ignore}"
+        )
 
 # Load model whitelist from environment variables
 whitelist_models = {}
 for key, value in os.environ.items():
     if key.startswith("WHITELIST_MODELS_"):
         provider = key.replace("WHITELIST_MODELS_", "").lower()
-        models_to_whitelist = [model.strip() for model in value.split(',') if model.strip()]
+        models_to_whitelist = [
+            model.strip() for model in value.split(",") if model.strip()
+        ]
         whitelist_models[provider] = models_to_whitelist
-        logging.debug(f"Loaded whitelist for provider '{provider}': {models_to_whitelist}")
+        logging.debug(
+            f"Loaded whitelist for provider '{provider}': {models_to_whitelist}"
+        )
 
 # Load max concurrent requests per key from environment variables
 max_concurrent_requests_per_key = {}
@@ -327,12 +377,19 @@ for key, value in os.environ.items():
         try:
             max_concurrent = int(value)
             if max_concurrent < 1:
-                logging.warning(f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1).")
+                logging.warning(
+                    f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1)."
+                )
                 max_concurrent = 1
             max_concurrent_requests_per_key[provider] = max_concurrent
-            logging.debug(f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}")
+            logging.debug(
+                f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}"
+            )
         except ValueError:
-            logging.warning(f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1).")
+            logging.warning(
+                f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1)."
+            )
+
 
 # --- Lifespan Management ---
 @asynccontextmanager
@@ -349,11 +406,11 @@ async def lifespan(app: FastAPI):
     if not skip_oauth_init and oauth_credentials:
         logging.info("Starting OAuth credential validation and deduplication...")
         processed_emails = {}  # email -> {provider: path}
-        credentials_to_initialize = {} # provider -> [paths]
+        credentials_to_initialize = {}  # provider -> [paths]
         final_oauth_credentials = {}
 
         # --- Pass 1: Pre-initialization Scan & Deduplication ---
-        #logging.info("Pass 1: Scanning for existing metadata to find duplicates...")
+        # logging.info("Pass 1: Scanning for existing metadata to find duplicates...")
         for provider, paths in oauth_credentials.items():
             if provider not in credentials_to_initialize:
                 credentials_to_initialize[provider] = []
@@ -362,9 +419,9 @@ async def lifespan(app: FastAPI):
                 if path.startswith("env://"):
                     credentials_to_initialize[provider].append(path)
                     continue
-                    
+
                 try:
-                    with open(path, 'r') as f:
+                    with open(path, "r") as f:
                         data = json.load(f)
                     metadata = data.get("_proxy_metadata", {})
                     email = metadata.get("email")
@@ -372,28 +429,32 @@ async def lifespan(app: FastAPI):
                     if email:
                         if email not in processed_emails:
                             processed_emails[email] = {}
-                        
+
                         if provider in processed_emails[email]:
                             original_path = processed_emails[email][provider]
-                            logging.warning(f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping.")
+                            logging.warning(
+                                f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
+                            )
                             continue
                         else:
                             processed_emails[email][provider] = path
-                    
+
                     credentials_to_initialize[provider].append(path)
 
                 except (FileNotFoundError, json.JSONDecodeError) as e:
-                    logging.warning(f"Could not pre-read metadata from '{path}': {e}. Will process during initialization.")
+                    logging.warning(
+                        f"Could not pre-read metadata from '{path}': {e}. Will process during initialization."
+                    )
                     credentials_to_initialize[provider].append(path)
-        
+
         # --- Pass 2: Parallel Initialization of Filtered Credentials ---
-        #logging.info("Pass 2: Initializing unique credentials and performing final check...")
+        # logging.info("Pass 2: Initializing unique credentials and performing final check...")
         async def process_credential(provider: str, path: str, provider_instance):
             """Process a single credential: initialize and fetch user info."""
             try:
                 await provider_instance.initialize_token(path)
 
-                if not hasattr(provider_instance, 'get_user_info'):
+                if not hasattr(provider_instance, "get_user_info"):
                     return (provider, path, None, None)
 
                 user_info = await provider_instance.get_user_info(path)
@@ -401,7 +462,9 @@ async def lifespan(app: FastAPI):
                 return (provider, path, email, None)
 
             except Exception as e:
-                logging.error(f"Failed to process OAuth token for {provider} at '{path}': {e}")
+                logging.error(
+                    f"Failed to process OAuth token for {provider} at '{path}': {e}"
+                )
                 return (provider, path, None, e)
 
         # Collect all tasks for parallel execution
@@ -413,9 +476,9 @@ async def lifespan(app: FastAPI):
             provider_plugin_class = PROVIDER_PLUGINS.get(provider)
             if not provider_plugin_class:
                 continue
-            
+
             provider_instance = provider_plugin_class()
-            
+
             for path in paths:
                 tasks.append(process_credential(provider, path, provider_instance))
 
@@ -430,7 +493,7 @@ async def lifespan(app: FastAPI):
                 continue
 
             provider, path, email, error = result
-            
+
             # Skip if there was an error
             if error:
                 continue
@@ -444,7 +507,9 @@ async def lifespan(app: FastAPI):
 
             # Handle empty email
             if not email:
-                logging.warning(f"Could not retrieve email for '{path}'. Treating as unique.")
+                logging.warning(
+                    f"Could not retrieve email for '{path}'. Treating as unique."
+                )
                 if provider not in final_oauth_credentials:
                     final_oauth_credentials[provider] = []
                 final_oauth_credentials[provider].append(path)
@@ -453,10 +518,15 @@ async def lifespan(app: FastAPI):
             # Deduplication check
             if email not in processed_emails:
                 processed_emails[email] = {}
-            
-            if provider in processed_emails[email] and processed_emails[email][provider] != path:
+
+            if (
+                provider in processed_emails[email]
+                and processed_emails[email][provider] != path
+            ):
                 original_path = processed_emails[email][provider]
-                logging.warning(f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping.")
+                logging.warning(
+                    f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
+                )
                 continue
             else:
                 processed_emails[email][provider] = path
@@ -467,7 +537,7 @@ async def lifespan(app: FastAPI):
                 # Update metadata (skip for env-based credentials - they don't have files)
                 if not path.startswith("env://"):
                     try:
-                        with open(path, 'r+') as f:
+                        with open(path, "r+") as f:
                             data = json.load(f)
                             metadata = data.get("_proxy_metadata", {})
                             metadata["email"] = email
@@ -490,15 +560,15 @@ async def lifespan(app: FastAPI):
     # The client now uses the root logger configuration
     client = RotatingClient(
         api_keys=api_keys,
-        oauth_credentials=oauth_credentials, # Pass OAuth config
+        oauth_credentials=oauth_credentials,  # Pass OAuth config
         configure_logging=True,
         litellm_provider_params=litellm_provider_params,
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,
         enable_request_logging=ENABLE_REQUEST_LOGGING,
-        max_concurrent_requests_per_key=max_concurrent_requests_per_key
+        max_concurrent_requests_per_key=max_concurrent_requests_per_key,
     )
-    
+
     # Log loaded credentials summary (compact, always visible for deployment verification)
     #_api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
     #_oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
@@ -506,17 +576,19 @@ async def lifespan(app: FastAPI):
     #print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start() # Start the background task
     app.state.rotating_client = client
-    
+
     # Warn if no provider credentials are configured
     if not client.all_credentials:
         logging.warning("=" * 70)
         logging.warning("⚠️  NO PROVIDER CREDENTIALS CONFIGURED")
         logging.warning("The proxy is running but cannot serve any LLM requests.")
-        logging.warning("Launch the credential tool to add API keys or OAuth credentials.")
+        logging.warning(
+            "Launch the credential tool to add API keys or OAuth credentials."
+        )
         logging.warning("  • Executable: Run with --add-credential flag")
         logging.warning("  • Source: python src/proxy_app/main.py --add-credential")
         logging.warning("=" * 70)
-    
+
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
     litellm.drop_params = True
@@ -527,28 +599,29 @@ async def lifespan(app: FastAPI):
     else:
         app.state.embedding_batcher = None
         logging.info("RotatingClient initialized (EmbeddingBatcher disabled).")
-    
+
     # Start model info service in background (fetches pricing/capabilities data)
     # This runs asynchronously and doesn't block proxy startup
     model_info_service = await init_model_info_service()
     app.state.model_info_service = model_info_service
     logging.info("Model info service started (fetching pricing data in background).")
-        
+
     yield
-    
-    await client.background_refresher.stop() # Stop the background task on shutdown
+
+    await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
     await client.close()
-    
+
     # Stop model info service
-    if hasattr(app.state, 'model_info_service') and app.state.model_info_service:
+    if hasattr(app.state, "model_info_service") and app.state.model_info_service:
         await app.state.model_info_service.stop()
-    
+
     if app.state.embedding_batcher:
         logging.info("RotatingClient and EmbeddingBatcher closed.")
     else:
         logging.info("RotatingClient closed.")
+
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
@@ -563,25 +636,32 @@ app.add_middleware(
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
+
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
     return request.app.state.rotating_client
+
 
 def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     """Dependency to get the embedding batcher instance from the app state."""
     return request.app.state.embedding_batcher
 
+
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
+    # If PROXY_API_KEY is not set or empty, skip verification (open access)
+    if not PROXY_API_KEY:
+        return auth
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
+
 
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
     response_stream: AsyncGenerator[str, None],
-    logger: Optional[DetailedLogger] = None
+    logger: Optional[DetailedLogger] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion
@@ -589,7 +669,7 @@ async def streaming_response_wrapper(
     """
     response_chunks = []
     full_response = {}
-    
+
     try:
         async for chunk_str in response_stream:
             if await request.is_disconnected():
@@ -597,7 +677,7 @@ async def streaming_response_wrapper(
                 break
             yield chunk_str
             if chunk_str.strip() and chunk_str.startswith("data:"):
-                content = chunk_str[len("data:"):].strip()
+                content = chunk_str[len("data:") :].strip()
                 if content != "[DONE]":
                     try:
                         chunk_data = json.loads(content)
@@ -613,15 +693,17 @@ async def streaming_response_wrapper(
             "error": {
                 "message": f"An unexpected error occurred during the stream: {str(e)}",
                 "type": "proxy_internal_error",
-                "code": 500
+                "code": 500,
             }
         }
         yield f"data: {json.dumps(error_payload)}\n\n"
         yield "data: [DONE]\n\n"
         # Also log this as a failed request
         if logger:
-            logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
-        return # Stop further processing
+            logger.log_final_response(
+                status_code=500, headers=None, body={"error": str(e)}
+            )
+        return  # Stop further processing
     finally:
         if response_chunks:
             # --- Aggregation Logic ---
@@ -645,36 +727,56 @@ async def streaming_response_wrapper(
                                 final_message["content"] = ""
                             if value:
                                 final_message["content"] += value
-                        
+
                         elif key == "tool_calls":
                             for tc_chunk in value:
                                 index = tc_chunk["index"]
                                 if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
+                                    aggregated_tool_calls[index] = {
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }
                                 # Ensure 'function' key exists for this index before accessing its sub-keys
                                 if "function" not in aggregated_tool_calls[index]:
-                                    aggregated_tool_calls[index]["function"] = {"name": "", "arguments": ""}
+                                    aggregated_tool_calls[index]["function"] = {
+                                        "name": "",
+                                        "arguments": "",
+                                    }
                                 if tc_chunk.get("id"):
                                     aggregated_tool_calls[index]["id"] = tc_chunk["id"]
                                 if "function" in tc_chunk:
                                     if "name" in tc_chunk["function"]:
                                         if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
+                                            aggregated_tool_calls[index]["function"][
+                                                "name"
+                                            ] += tc_chunk["function"]["name"]
                                     if "arguments" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["arguments"] is not None:
-                                            aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
-                        
+                                        if (
+                                            tc_chunk["function"]["arguments"]
+                                            is not None
+                                        ):
+                                            aggregated_tool_calls[index]["function"][
+                                                "arguments"
+                                            ] += tc_chunk["function"]["arguments"]
+
                         elif key == "function_call":
                             if "function_call" not in final_message:
-                                final_message["function_call"] = {"name": "", "arguments": ""}
+                                final_message["function_call"] = {
+                                    "name": "",
+                                    "arguments": "",
+                                }
                             if "name" in value:
                                 if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value["name"]
+                                    final_message["function_call"]["name"] += value[
+                                        "name"
+                                    ]
                             if "arguments" in value:
                                 if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += value["arguments"]
-                        
-                        else: # Generic key handling for other data like 'reasoning'
+                                    final_message["function_call"]["arguments"] += (
+                                        value["arguments"]
+                                    )
+
+                        else:  # Generic key handling for other data like 'reasoning'
                             # FIX: Role should always replace, never concatenate
                             if key == "role":
                                 final_message[key] = value
@@ -707,7 +809,7 @@ async def streaming_response_wrapper(
             final_choice = {
                 "index": 0,
                 "message": final_message,
-                "finish_reason": finish_reason
+                "finish_reason": finish_reason,
             }
 
             full_response = {
@@ -716,21 +818,22 @@ async def streaming_response_wrapper(
                 "created": first_chunk.get("created"),
                 "model": first_chunk.get("model"),
                 "choices": [final_choice],
-                "usage": usage_data
+                "usage": usage_data,
             }
 
         if logger:
             logger.log_final_response(
                 status_code=200,
                 headers=None,  # Headers are not available at this stage
-                body=full_response
+                body=full_response,
             )
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _ = Depends(verify_api_key)
+    _=Depends(verify_api_key),
 ):
     """
     OpenAI-compatible endpoint powered by the RotatingClient.
@@ -749,16 +852,24 @@ async def chat_completions(
         # instead of actual schemas, which can cause tool hallucination
         # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
         override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
-        
-        if override_temp_zero in ("remove", "set", "true", "1", "yes") and "temperature" in request_data and request_data["temperature"] == 0:
+
+        if (
+            override_temp_zero in ("remove", "set", "true", "1", "yes")
+            and "temperature" in request_data
+            and request_data["temperature"] == 0
+        ):
             if override_temp_zero == "remove":
                 # Remove temperature key entirely
                 del request_data["temperature"]
-                logging.debug("OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request")
+                logging.debug(
+                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
+                )
             else:
                 # Set to 1.0 (for "set", "true", "1", "yes")
                 request_data["temperature"] = 1.0
-                logging.debug("OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0")
+                logging.debug(
+                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
+                )
 
         # If logging is enabled, perform all logging operations using the parsed data.
         if logger:
@@ -766,9 +877,17 @@ async def chat_completions(
 
         # Extract and log specific reasoning parameters for monitoring.
         model = request_data.get("model")
-        generation_cfg = request_data.get("generationConfig", {}) or request_data.get("generation_config", {}) or {}
-        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get("reasoning_effort")
-        custom_reasoning_budget = request_data.get("custom_reasoning_budget") or generation_cfg.get("custom_reasoning_budget", False)
+        generation_cfg = (
+            request_data.get("generationConfig", {})
+            or request_data.get("generation_config", {})
+            or {}
+        )
+        reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
+            "reasoning_effort"
+        )
+        custom_reasoning_budget = request_data.get(
+            "custom_reasoning_budget"
+        ) or generation_cfg.get("custom_reasoning_budget", False)
 
         logging.getLogger("rotator_library").debug(
             f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
@@ -779,31 +898,41 @@ async def chat_completions(
             url=str(request.url),
             headers=dict(request.headers),
             client_info=(request.client.host, request.client.port),
-            request_data=request_data
+            request_data=request_data,
         )
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
             response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
-                streaming_response_wrapper(request, request_data, response_generator, logger),
-                media_type="text/event-stream"
+                streaming_response_wrapper(
+                    request, request_data, response_generator, logger
+                ),
+                media_type="text/event-stream",
             )
         else:
             response = await client.acompletion(request=request, **request_data)
             if logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object
-                response_headers = response.headers if hasattr(response, 'headers') else None
-                status_code = response.status_code if hasattr(response, 'status_code') else 200
+                response_headers = (
+                    response.headers if hasattr(response, "headers") else None
+                )
+                status_code = (
+                    response.status_code if hasattr(response, "status_code") else 200
+                )
                 logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
-                    body=response.model_dump()
+                    body=response.model_dump(),
                 )
             return response
 
-    except (litellm.InvalidRequestError, ValueError, litellm.ContextWindowExceededError) as e:
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
         raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
     except litellm.AuthenticationError as e:
         raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
@@ -824,8 +953,11 @@ async def chat_completions(
             except json.JSONDecodeError:
                 request_data = {"error": "Could not parse request body"}
             if logger:
-                logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
+                logger.log_final_response(
+                    status_code=500, headers=None, body={"error": str(e)}
+                )
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/v1/embeddings")
 async def embeddings(
@@ -833,7 +965,7 @@ async def embeddings(
     body: EmbeddingRequest,
     client: RotatingClient = Depends(get_rotating_client),
     batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
-    _ = Depends(verify_api_key)
+    _=Depends(verify_api_key),
 ):
     """
     OpenAI-compatible endpoint for creating embeddings.
@@ -847,7 +979,7 @@ async def embeddings(
             url=str(request.url),
             headers=dict(request.headers),
             client_info=(request.client.host, request.client.port),
-            request_data=request_data
+            request_data=request_data,
         )
         if USE_EMBEDDING_BATCHER and batcher:
             # --- Server-Side Batching Logic ---
@@ -861,7 +993,7 @@ async def embeddings(
                 individual_request = request_data.copy()
                 individual_request["input"] = single_input
                 tasks.append(batcher.add_request(individual_request))
-            
+
             results = await asyncio.gather(*tasks)
 
             all_data = []
@@ -877,16 +1009,19 @@ async def embeddings(
                 "object": "list",
                 "model": results[0]["model"],
                 "data": all_data,
-                "usage": { "prompt_tokens": total_prompt_tokens, "total_tokens": total_tokens },
+                "usage": {
+                    "prompt_tokens": total_prompt_tokens,
+                    "total_tokens": total_tokens,
+                },
             }
             response = litellm.EmbeddingResponse(**final_response_data)
-        
+
         else:
             # --- Direct Pass-Through Logic ---
             request_data = body.model_dump(exclude_none=True)
             if isinstance(request_data.get("input"), str):
                 request_data["input"] = [request_data["input"]]
-            
+
             response = await client.aembedding(request=request, **request_data)
 
         return response
@@ -894,7 +1029,11 @@ async def embeddings(
     except HTTPException as e:
         # Re-raise HTTPException to ensure it's not caught by the generic Exception handler
         raise e
-    except (litellm.InvalidRequestError, ValueError, litellm.ContextWindowExceededError) as e:
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
         raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
     except litellm.AuthenticationError as e:
         raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
@@ -910,9 +1049,11 @@ async def embeddings(
         logging.error(f"Embedding request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/")
 def read_root():
     return {"Status": "API Key Proxy is running"}
+
 
 @app.get("/v1/models")
 async def list_models(
@@ -923,22 +1064,30 @@ async def list_models(
 ):
     """
     Returns a list of available models in the OpenAI-compatible format.
-    
+
     Query Parameters:
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
     """
     model_ids = await client.get_all_available_models(grouped=False)
-    
-    if enriched and hasattr(request.app.state, 'model_info_service'):
+
+    if enriched and hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
         if model_info_service.is_ready:
             # Return enriched model data
             enriched_data = model_info_service.enrich_model_list(model_ids)
             return {"object": "list", "data": enriched_data}
-    
+
     # Fallback to basic model cards
-    model_cards = [{"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "Mirro-Proxy"} for model_id in model_ids]
+    model_cards = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "Mirro-Proxy",
+        }
+        for model_id in model_ids
+    ]
     return {"object": "list", "data": model_cards}
 
 
@@ -950,17 +1099,17 @@ async def get_model(
 ):
     """
     Returns detailed information about a specific model.
-    
+
     Path Parameters:
         model_id: The model ID (e.g., "anthropic/claude-3-opus", "openrouter/openai/gpt-4")
     """
-    if hasattr(request.app.state, 'model_info_service'):
+    if hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
         if model_info_service.is_ready:
             info = model_info_service.get_model_info(model_id)
             if info:
                 return info.to_dict()
-    
+
     # Return basic info if service not ready or model not found
     return {
         "id": model_id,
@@ -978,7 +1127,7 @@ async def model_info_stats(
     """
     Returns statistics about the model info service (for monitoring/debugging).
     """
-    if hasattr(request.app.state, 'model_info_service'):
+    if hasattr(request.app.state, "model_info_service"):
         return request.app.state.model_info_service.get_stats()
     return {"error": "Model info service not initialized"}
 
@@ -990,11 +1139,12 @@ async def list_providers(_=Depends(verify_api_key)):
     """
     return list(PROVIDER_PLUGINS.keys())
 
+
 @app.post("/v1/token-count")
 async def token_count(
-    request: Request, 
+    request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key)
+    _=Depends(verify_api_key),
 ):
     """
     Calculates the token count for a given list of messages and a model.
@@ -1005,7 +1155,9 @@ async def token_count(
         messages = data.get("messages")
 
         if not model or not messages:
-            raise HTTPException(status_code=400, detail="'model' and 'messages' are required.")
+            raise HTTPException(
+                status_code=400, detail="'model' and 'messages' are required."
+            )
 
         count = client.token_count(**data)
         return {"token_count": count}
@@ -1016,13 +1168,10 @@ async def token_count(
 
 
 @app.post("/v1/cost-estimate")
-async def cost_estimate(
-    request: Request,
-    _=Depends(verify_api_key)
-):
+async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     """
     Estimates the cost for a request based on token counts and model pricing.
-    
+
     Request body:
         {
             "model": "anthropic/claude-3-opus",
@@ -1031,7 +1180,7 @@ async def cost_estimate(
             "cache_read_tokens": 0,       # optional
             "cache_creation_tokens": 0    # optional
         }
-    
+
     Returns:
         {
             "model": "anthropic/claude-3-opus",
@@ -1051,25 +1200,28 @@ async def cost_estimate(
         completion_tokens = data.get("completion_tokens", 0)
         cache_read_tokens = data.get("cache_read_tokens", 0)
         cache_creation_tokens = data.get("cache_creation_tokens", 0)
-        
+
         if not model:
             raise HTTPException(status_code=400, detail="'model' is required.")
-        
+
         result = {
             "model": model,
             "cost": None,
             "currency": "USD",
             "pricing": {},
-            "source": None
+            "source": None,
         }
-        
+
         # Try model info service first
-        if hasattr(request.app.state, 'model_info_service'):
+        if hasattr(request.app.state, "model_info_service"):
             model_info_service = request.app.state.model_info_service
             if model_info_service.is_ready:
                 cost = model_info_service.calculate_cost(
-                    model, prompt_tokens, completion_tokens,
-                    cache_read_tokens, cache_creation_tokens
+                    model,
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
                 )
                 if cost is not None:
                     cost_info = model_info_service.get_cost_info(model)
@@ -1077,31 +1229,32 @@ async def cost_estimate(
                     result["pricing"] = cost_info or {}
                     result["source"] = "model_info_service"
                     return result
-        
+
         # Fallback to litellm
         try:
             import litellm
+
             # Create a mock response for cost calculation
             model_info = litellm.get_model_info(model)
             input_cost = model_info.get("input_cost_per_token", 0)
             output_cost = model_info.get("output_cost_per_token", 0)
-            
+
             if input_cost or output_cost:
                 cost = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
                 result["cost"] = cost
                 result["pricing"] = {
                     "input_cost_per_token": input_cost,
-                    "output_cost_per_token": output_cost
+                    "output_cost_per_token": output_cost,
                 }
                 result["source"] = "litellm_fallback"
                 return result
         except Exception:
             pass
-        
+
         result["source"] = "unknown"
         result["error"] = "Pricing data not available for this model"
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1112,17 +1265,18 @@ async def cost_estimate(
 if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks
     ENV_FILE = Path.cwd() / ".env"
-    
+
     # Check if launcher TUI should be shown (no arguments provided)
     if len(sys.argv) == 1:
         # No arguments - show launcher TUI (lazy import)
         from proxy_app.launcher_tui import run_launcher_tui
+
         run_launcher_tui()
         # Launcher modifies sys.argv and returns, or exits if user chose Exit
         # If we get here, user chose "Run Proxy" and sys.argv is modified
         # Re-parse arguments with modified sys.argv
         args = parser.parse_args()
-    
+
     def needs_onboarding() -> bool:
         """
         Check if the proxy needs onboarding (first-time setup).
@@ -1132,40 +1286,49 @@ if __name__ == "__main__":
         # PROXY_API_KEY is optional (will show warning if not set)
         if not ENV_FILE.is_file():
             return True
-        
+
         return False
 
     def show_onboarding_message():
         """Display clear explanatory message for why onboarding is needed."""
-        os.system('cls' if os.name == 'nt' else 'clear')  # Clear terminal for clean presentation
-        console.print(Panel.fit(
-            "[bold cyan]🚀 LLM API Key Proxy - First Time Setup[/bold cyan]",
-            border_style="cyan"
-        ))
+        os.system(
+            "cls" if os.name == "nt" else "clear"
+        )  # Clear terminal for clean presentation
+        console.print(
+            Panel.fit(
+                "[bold cyan]🚀 LLM API Key Proxy - First Time Setup[/bold cyan]",
+                border_style="cyan",
+            )
+        )
         console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
-        
+
         console.print("The proxy needs initial configuration:")
         console.print("  [red]❌ No .env file found[/red]")
-        
+
         console.print("\n[bold]Why this matters:[/bold]")
         console.print("  • The .env file stores your credentials and settings")
         console.print("  • PROXY_API_KEY protects your proxy from unauthorized access")
         console.print("  • Provider API keys enable LLM access")
-        
+
         console.print("\n[bold]What happens next:[/bold]")
         console.print("  1. We'll create a .env file with PROXY_API_KEY")
         console.print("  2. You can add LLM provider credentials (API keys or OAuth)")
         console.print("  3. The proxy will then start normally")
-        
-        console.print("\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default.")
+
+        console.print(
+            "\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
+        )
         console.print("   You can remove it later if you want an unsecured proxy.\n")
-        
-        console.input("[bold green]Press Enter to launch the credential setup tool...[/bold green]")
+
+        console.input(
+            "[bold green]Press Enter to launch the credential setup tool...[/bold green]"
+        )
 
     # Check if user explicitly wants to add credentials
     if args.add_credential:
         # Import and call ensure_env_defaults to create .env and PROXY_API_KEY if needed
         from rotator_library.credential_tool import ensure_env_defaults
+
         ensure_env_defaults()
         # Reload environment variables after ensure_env_defaults creates/updates .env
         load_dotenv(override=True)
@@ -1176,36 +1339,35 @@ if __name__ == "__main__":
             # Import console from rich for better messaging
             from rich.console import Console
             from rich.panel import Panel
+
             console = Console()
-            
+
             # Show clear explanatory message
             show_onboarding_message()
-            
+
             # Launch credential tool automatically
             from rotator_library.credential_tool import ensure_env_defaults
+
             ensure_env_defaults()
             load_dotenv(override=True)
             run_credential_tool()
-            
+
             # After credential tool exits, reload and re-check
             load_dotenv(override=True)
             # Re-read PROXY_API_KEY from environment
             PROXY_API_KEY = os.getenv("PROXY_API_KEY")
-            
+
             # Verify onboarding is complete
             if needs_onboarding():
                 console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
-                console.print("The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n")
+                console.print(
+                    "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
+                )
                 sys.exit(1)
             else:
                 console.print("\n[bold green]✅ Configuration complete![/bold green]")
                 console.print("\nStarting proxy server...\n")
-        
-        # Validate PROXY_API_KEY before starting the server
-        if not PROXY_API_KEY:
-            raise ValueError("PROXY_API_KEY environment variable not set. Please run with --add-credential to set up your environment.")
-        
+
         import uvicorn
+
         uvicorn.run(app, host=args.host, port=args.port)
-
-
