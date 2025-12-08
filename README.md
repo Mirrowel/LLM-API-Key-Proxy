@@ -38,6 +38,12 @@ This project provides a powerful solution for developers building complex applic
     - Automatic thinking block sanitization for Claude models (with recovery strategies)
     - Note: Claude thinking mode requires careful conversation state management (see [Antigravity documentation](DOCUMENTATION.md#antigravity-claude-extended-thinking-sanitization) for details)
 -   **🆕 Credential Prioritization**: Automatic tier detection and priority-based credential selection ensures paid-tier credentials are used for premium models that require them.
+-   **🆕 Sequential Rotation Mode**: Choose between balanced (distribute load evenly) or sequential (use until exhausted) credential rotation strategies. Sequential mode maximizes cache hit rates for providers like Antigravity.
+-   **🆕 Per-Model Quota Tracking**: Granular per-model usage tracking with authoritative quota reset timestamps from provider error responses. Each model maintains its own window with `window_start_ts` and `quota_reset_ts`.
+-   **🆕 Model Quota Groups**: Group models that share quota limits (e.g., Claude Sonnet and Opus). When one model in a group hits quota, all receive the same cooldown timestamp.
+-   **🆕 Priority-Based Concurrency**: Assign credentials to priority tiers (1=highest) with configurable concurrency multipliers. Paid-tier credentials can handle more concurrent requests than free-tier ones.
+-   **🆕 Provider-Specific Quota Parsing**: Extended provider interface with `parse_quota_error()` method to extract precise retry-after times from provider-specific error formats (e.g., Google RPC format).
+-   **🆕 Flexible Rolling Windows**: Support for provider-specific quota reset configurations (5-hour, 7-day, etc.) replacing hardcoded daily resets.
 -   **🆕 Weighted Random Rotation**: Configurable credential rotation strategy - choose between deterministic (perfect balance) or weighted random (unpredictable, harder to fingerprint) selection.
 -   **🆕 Enhanced Gemini CLI**: Improved project discovery, paid vs free tier detection, and Gemini 3 support with thoughtSignature caching.
 -   **🆕 Temperature Override**: Global temperature=0 override option to prevent tool hallucination issues with low-temperature settings.
@@ -129,6 +135,8 @@ The proxy now includes a powerful **interactive Text User Interface (TUI)** that
   - Configure custom OpenAI-compatible providers
   - Define provider models (simple or advanced JSON format)
   - Set concurrency limits per provider
+  - Configure rotation modes (balanced vs sequential)
+  - Manage priority-based concurrency multipliers
   - Interactive numbered menus for easy selection
   - Pending changes system with save/discard options
 
@@ -544,6 +552,47 @@ ANTIGRAVITY_GEMINI3_TOOL_FIX=true  # Prevent tool hallucination
 
 
     ```
+
+#### Credential Rotation Modes
+
+-   **`ROTATION_MODE_<PROVIDER>`**: Controls how credentials are rotated when multiple are available. Default: `balanced` (except Antigravity which defaults to `sequential`).
+    - `balanced`: Rotate credentials evenly across requests to distribute load. Best for per-minute rate limits.
+    - `sequential`: Use one credential until exhausted (429 error), then switch to next. Best for daily/weekly quotas.
+    ```env
+    ROTATION_MODE_GEMINI=sequential    # Use Gemini keys until quota exhausted
+    ROTATION_MODE_OPENAI=balanced      # Distribute load across OpenAI keys (default)
+    ROTATION_MODE_ANTIGRAVITY=balanced # Override Antigravity's sequential default
+    ```
+
+#### Priority-Based Concurrency Multipliers
+
+-   **`CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>`**: Assign concurrency multipliers to priority tiers. Higher-tier credentials handle more concurrent requests.
+    ```env
+    # Universal multipliers (apply to all rotation modes)
+    CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_1=10   # 10x for paid ultra tier
+    CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_3=1    # 1x for lower tiers
+    
+    # Mode-specific overrides
+    CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2_BALANCED=1  # P2 = 1x in balanced mode only
+    ```
+    
+    **Provider Defaults** (built into provider classes):
+    - **Antigravity**: Priority 1: 5x, Priority 2: 3x, Priority 3+: 2x (sequential) or 1x (balanced)
+    - **Gemini CLI**: Priority 1: 5x, Priority 2: 3x, Others: 1x
+
+#### Model Quota Groups
+
+-   **`QUOTA_GROUPS_<PROVIDER>_<GROUP>`**: Define models that share quota/cooldown timing. When one model hits quota, all in the group receive the same cooldown timestamp.
+    ```env
+    QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+    QUOTA_GROUPS_ANTIGRAVITY_GEMINI="gemini-3-pro-preview,gemini-3-pro-image-preview"
+    
+    # To disable a default group:
+    QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
+    ```
+    
+    **Default Groups**:
+    - **Antigravity**: Claude group (Sonnet 4.5 + Opus 4.5) with Opus counting 2x vs Sonnet
 
 #### Concurrency Control
 
