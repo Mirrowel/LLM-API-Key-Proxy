@@ -3405,7 +3405,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         }
 
         self._thinking_cache.store(cache_key, json.dumps(data))
-        lib_logger.info(f"Cached thinking: {cache_key[:50]}...")
+        lib_logger.debug(f"Cached thinking: {cache_key[:50]}...")
 
     # =========================================================================
     # PROVIDER INTERFACE IMPLEMENTATION

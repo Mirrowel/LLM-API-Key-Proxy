@@ -234,22 +234,151 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         error: Exception, error_body: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Parse Gemini CLI quota errors.
+        Parse Gemini CLI rate limit/quota errors.
 
-        Uses the same Google RPC format as Antigravity but typically has
-        much shorter cooldown durations (seconds to minutes, not hours).
+        Handles the Gemini CLI error format which embeds reset time in the message:
+        "You have exhausted your capacity on this model. Your quota will reset after 2s."
+
+        Unlike Antigravity which uses structured RetryInfo/quotaResetDelay metadata,
+        Gemini CLI embeds the reset time in a human-readable message.
+
+        Example error format:
+        {
+          "error": {
+            "code": 429,
+            "message": "You have exhausted your capacity on this model. Your quota will reset after 2s.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "RATE_LIMIT_EXCEEDED",
+                "domain": "cloudcode-pa.googleapis.com",
+                "metadata": { "uiMessage": "true", "model": "gemini-3-pro-preview" }
+              }
+            ]
+          }
+        }
 
         Args:
             error: The caught exception
             error_body: Optional raw response body string
 
         Returns:
-            Same format as AntigravityProvider.parse_quota_error()
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,
+                "reason": str | None,
+                "reset_timestamp": str | None,
+                "quota_reset_timestamp": float | None,
+            }
         """
-        # Reuse the same parsing logic as Antigravity since both use Google RPC format
-        from .antigravity_provider import AntigravityProvider
+        import re as regex_module
 
-        return AntigravityProvider.parse_quota_error(error, error_body)
+        # Get error body from exception if not provided
+        body = error_body
+        if not body:
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                try:
+                    body = error.response.text
+                except Exception:
+                    pass
+            if not body and hasattr(error, "body"):
+                body = str(error.body)
+            if not body and hasattr(error, "message"):
+                body = str(error.message)
+            if not body:
+                body = str(error)
+
+        if not body:
+            return None
+
+        result = {
+            "retry_after": None,
+            "reason": None,
+            "reset_timestamp": None,
+            "quota_reset_timestamp": None,
+        }
+
+        # 1. Try to extract retry time from human-readable message
+        # Pattern: "Your quota will reset after 2s." or "quota will reset after 156h14m36s"
+        retry_after = extract_retry_after_from_body(body)
+        if retry_after:
+            result["retry_after"] = retry_after
+
+        # 2. Try to parse JSON to get structured details (reason, any RetryInfo fallback)
+        try:
+            json_match = regex_module.search(r"\{[\s\S]*\}", body)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                error_obj = data.get("error", data)
+                details = error_obj.get("details", [])
+
+                for detail in details:
+                    detail_type = detail.get("@type", "")
+
+                    # Extract reason from ErrorInfo
+                    if "ErrorInfo" in detail_type:
+                        if not result["reason"]:
+                            result["reason"] = detail.get("reason")
+                        # Check metadata for any additional timing info
+                        metadata = detail.get("metadata", {})
+                        quota_delay = metadata.get("quotaResetDelay")
+                        if quota_delay and not result["retry_after"]:
+                            parsed = GeminiCliProvider._parse_duration(quota_delay)
+                            if parsed:
+                                result["retry_after"] = parsed
+
+                    # Check for RetryInfo (fallback, in case format changes)
+                    if "RetryInfo" in detail_type and not result["retry_after"]:
+                        retry_delay = detail.get("retryDelay")
+                        if retry_delay:
+                            parsed = GeminiCliProvider._parse_duration(retry_delay)
+                            if parsed:
+                                result["retry_after"] = parsed
+
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # Return None if we couldn't extract retry_after
+        if not result["retry_after"]:
+            return None
+
+        return result
+
+    @staticmethod
+    def _parse_duration(duration_str: str) -> Optional[int]:
+        """
+        Parse duration strings like '2s', '156h14m36.73s', '515092.73s' to seconds.
+
+        Args:
+            duration_str: Duration string to parse
+
+        Returns:
+            Total seconds as integer, or None if parsing fails
+        """
+        import re as regex_module
+
+        if not duration_str:
+            return None
+
+        # Handle pure seconds format: "515092.730699158s" or "2s"
+        pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
+        if pure_seconds_match:
+            return int(float(pure_seconds_match.group(1)))
+
+        # Handle compound format: "143h4m52.730699158s"
+        total_seconds = 0
+        patterns = [
+            (r"(\d+)h", 3600),  # hours
+            (r"(\d+)m", 60),  # minutes
+            (r"([\d.]+)s", 1),  # seconds
+        ]
+        for pattern, multiplier in patterns:
+            match = regex_module.search(pattern, duration_str)
+            if match:
+                total_seconds += float(match.group(1)) * multiplier
+
+        return int(total_seconds) if total_seconds > 0 else None
 
     def __init__(self):
         super().__init__()
