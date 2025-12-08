@@ -18,6 +18,9 @@ class BackgroundRefresher:
     """
 
     def __init__(self, client: "RotatingClient"):
+        self._client = client
+        self._task: Optional[asyncio.Task] = None
+        self._initialized = False
         try:
             interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "600")
             self._interval = int(interval_str)
@@ -26,9 +29,6 @@ class BackgroundRefresher:
                 f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. Falling back to 600s."
             )
             self._interval = 600
-        self._client = client
-        self._task: Optional[asyncio.Task] = None
-        self._initialized = False
 
     def start(self):
         """Starts the background refresh task."""
