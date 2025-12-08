@@ -35,6 +35,7 @@ class ReauthCoordinator:
     """
 
     _instance: Optional["ReauthCoordinator"] = None
+    _initialized: bool = False  # Class-level declaration for Pylint
 
     def __new__(cls):
         # Singleton pattern - only one coordinator exists
