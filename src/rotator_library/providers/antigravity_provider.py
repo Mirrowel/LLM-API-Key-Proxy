@@ -50,7 +50,7 @@ lib_logger = logging.getLogger("rotator_library")
 # Priority: daily (sandbox) → autopush (sandbox) → production
 BASE_URLS = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
-    "https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    #"https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal",
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
 
