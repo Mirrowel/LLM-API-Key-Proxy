@@ -1065,19 +1065,185 @@ class RotatingClient:
                                 is_budget_enabled
                             )
 
-                    # The plugin handles the entire call, including retries on 401, etc.
-                    # The main retry loop here is for key rotation on other errors.
-                    response = await provider_plugin.acompletion(
-                        self.http_client, **litellm_kwargs
-                    )
+                    # Retry loop for custom providers - mirrors streaming path error handling
+                    for attempt in range(self.max_retries):
+                        try:
+                            lib_logger.info(
+                                f"Attempting call with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
+                            )
 
-                    # For non-streaming, success is immediate, and this function only handles non-streaming.
-                    await self.usage_manager.record_success(
-                        current_cred, model, response
-                    )
-                    await self.usage_manager.release_key(current_cred, model)
-                    key_acquired = False
-                    return response
+                            if pre_request_callback:
+                                try:
+                                    await pre_request_callback(request, litellm_kwargs)
+                                except Exception as e:
+                                    if self.abort_on_callback_error:
+                                        raise PreRequestCallbackError(
+                                            f"Pre-request callback failed: {e}"
+                                        ) from e
+                                    else:
+                                        lib_logger.warning(
+                                            f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
+                                        )
+
+                            response = await provider_plugin.acompletion(
+                                self.http_client, **litellm_kwargs
+                            )
+
+                            # For non-streaming, success is immediate
+                            await self.usage_manager.record_success(
+                                current_cred, model, response
+                            )
+                            await self.usage_manager.release_key(current_cred, model)
+                            key_acquired = False
+                            return response
+
+                        except (
+                            litellm.RateLimitError,
+                            httpx.HTTPStatusError,
+                        ) as e:
+                            last_exception = e
+                            classified_error = classify_error(e, provider=provider)
+                            error_message = str(e).split("\n")[0]
+
+                            log_failure(
+                                api_key=current_cred,
+                                model=model,
+                                attempt=attempt + 1,
+                                error=e,
+                                request_headers=dict(request.headers)
+                                if request
+                                else {},
+                            )
+
+                            # Record in accumulator for client reporting
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message
+                            )
+
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}) during custom provider call. Failing."
+                                )
+                                raise last_exception
+
+                            # Handle rate limits with cooldown (exclude quota_exceeded)
+                            if classified_error.error_type == "rate_limit":
+                                cooldown_duration = classified_error.retry_after or 60
+                                await self.cooldown_manager.start_cooldown(
+                                    provider, cooldown_duration
+                                )
+
+                            await self.usage_manager.record_failure(
+                                current_cred, model, classified_error
+                            )
+                            lib_logger.warning(
+                                f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code}). Rotating."
+                            )
+                            break  # Rotate to next credential
+
+                        except (
+                            APIConnectionError,
+                            litellm.InternalServerError,
+                            litellm.ServiceUnavailableError,
+                        ) as e:
+                            last_exception = e
+                            log_failure(
+                                api_key=current_cred,
+                                model=model,
+                                attempt=attempt + 1,
+                                error=e,
+                                request_headers=dict(request.headers)
+                                if request
+                                else {},
+                            )
+                            classified_error = classify_error(e, provider=provider)
+                            error_message = str(e).split("\n")[0]
+
+                            # Provider-level error: don't increment consecutive failures
+                            await self.usage_manager.record_failure(
+                                current_cred,
+                                model,
+                                classified_error,
+                                increment_consecutive_failures=False,
+                            )
+
+                            if attempt >= self.max_retries - 1:
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
+                                lib_logger.warning(
+                                    f"Cred {mask_credential(current_cred)} failed after max retries. Rotating."
+                                )
+                                break
+
+                            wait_time = classified_error.retry_after or (
+                                2**attempt
+                            ) + random.uniform(0, 1)
+                            remaining_budget = deadline - time.time()
+                            if wait_time > remaining_budget:
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
+                                lib_logger.warning(
+                                    f"Retry wait ({wait_time:.2f}s) exceeds budget. Rotating."
+                                )
+                                break
+
+                            lib_logger.warning(
+                                f"Cred {mask_credential(current_cred)} server error. Retrying in {wait_time:.2f}s."
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+
+                        except Exception as e:
+                            last_exception = e
+                            log_failure(
+                                api_key=current_cred,
+                                model=model,
+                                attempt=attempt + 1,
+                                error=e,
+                                request_headers=dict(request.headers)
+                                if request
+                                else {},
+                            )
+                            classified_error = classify_error(e, provider=provider)
+                            error_message = str(e).split("\n")[0]
+
+                            # Record in accumulator
+                            error_accumulator.record_error(
+                                current_cred, classified_error, error_message
+                            )
+
+                            lib_logger.warning(
+                                f"Cred {mask_credential(current_cred)} {classified_error.error_type} (HTTP {classified_error.status_code})."
+                            )
+
+                            # Check if this error should trigger rotation
+                            if not should_rotate_on_error(classified_error):
+                                lib_logger.error(
+                                    f"Non-recoverable error ({classified_error.error_type}). Failing."
+                                )
+                                raise last_exception
+
+                            # Handle rate limits with cooldown (exclude quota_exceeded)
+                            if (
+                                classified_error.status_code == 429
+                                and classified_error.error_type != "quota_exceeded"
+                            ) or classified_error.error_type == "rate_limit":
+                                cooldown_duration = classified_error.retry_after or 60
+                                await self.cooldown_manager.start_cooldown(
+                                    provider, cooldown_duration
+                                )
+
+                            await self.usage_manager.record_failure(
+                                current_cred, model, classified_error
+                            )
+                            break  # Rotate to next credential
+
+                    # If the inner loop breaks, it means the key failed and we need to rotate.
+                    # Continue to the next iteration of the outer while loop to pick a new key.
+                    continue
 
                 else:  # This is the standard API Key / litellm-handled provider logic
                     is_oauth = provider in self.oauth_providers
