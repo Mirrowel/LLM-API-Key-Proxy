@@ -246,7 +246,7 @@ class AIChatWindow(ctk.CTkToplevel):
     def _create_buttons(self) -> None:
         """Create the status bar (buttons moved to input area)."""
         status_frame = ctk.CTkFrame(self, fg_color="transparent")
-        status_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
+        status_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
 
         # Status label
         self.status_label = ctk.CTkLabel(
