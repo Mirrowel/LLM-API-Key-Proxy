@@ -96,16 +96,15 @@ class ThinkingSection(ctk.CTkFrame):
         if self._expanded:
             self.content_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
-        # Text display
-        self.text_display = ctk.CTkTextbox(
+        # Text display - use CTkLabel for auto-sizing (no scrollbar)
+        self.text_display = ctk.CTkLabel(
             self.content_frame,
+            text="",
             font=get_font("small"),
-            fg_color=THINKING_BG,
             text_color=THINKING_TEXT,
-            wrap="word",
-            height=100,
-            activate_scrollbars=True,
-            state="disabled",
+            wraplength=450,  # Wrap text to fit container
+            justify="left",
+            anchor="nw",
         )
         self.text_display.pack(fill="both", expand=True)
 
@@ -114,6 +113,9 @@ class ThinkingSection(ctk.CTkFrame):
         self.indicator.bind("<Button-1>", self._toggle)
         self.title_label.bind("<Button-1>", self._toggle)
         self.preview_label.bind("<Button-1>", self._toggle)
+
+        # Bind mousewheel to stop propagation when over thinking content
+        self._bind_mousewheel_capture()
 
     def _toggle(self, event=None) -> None:
         """Toggle expanded/collapsed state."""
@@ -147,11 +149,8 @@ class ThinkingSection(ctk.CTkFrame):
         """
         self._full_text += text
 
-        # Update text display
-        self.text_display.configure(state="normal")
-        self.text_display.insert("end", text)
-        self.text_display.configure(state="disabled")
-        self.text_display.see("end")
+        # Update label text
+        self.text_display.configure(text=self._full_text)
 
         # Update preview if collapsed
         if not self._expanded:
@@ -165,12 +164,7 @@ class ThinkingSection(ctk.CTkFrame):
             text: Complete thinking text
         """
         self._full_text = text
-
-        self.text_display.configure(state="normal")
-        self.text_display.delete("1.0", "end")
-        self.text_display.insert("1.0", text)
-        self.text_display.configure(state="disabled")
-
+        self.text_display.configure(text=text)
         self._update_display()
 
     def auto_collapse(self) -> None:
@@ -196,9 +190,7 @@ class ThinkingSection(ctk.CTkFrame):
     def clear(self) -> None:
         """Clear all content."""
         self._full_text = ""
-        self.text_display.configure(state="normal")
-        self.text_display.delete("1.0", "end")
-        self.text_display.configure(state="disabled")
+        self.text_display.configure(text="")
         self._update_display()
 
     @property
@@ -215,3 +207,21 @@ class ThinkingSection(ctk.CTkFrame):
     def has_content(self) -> bool:
         """Check if there is any thinking content."""
         return bool(self._full_text.strip())
+
+    def _bind_mousewheel_capture(self) -> None:
+        """Bind mousewheel events to prevent scroll propagation when expanded."""
+
+        def on_mousewheel(event):
+            # Only capture scroll if expanded and has content
+            if self._expanded and self._full_text:
+                # Stop event propagation - don't scroll parent
+                return "break"
+            # Allow propagation to parent scroll
+            return None
+
+        # Bind to all child widgets
+        widgets = [self, self.content_frame, self.text_display, self.header]
+        for widget in widgets:
+            widget.bind("<MouseWheel>", on_mousewheel)  # Windows
+            widget.bind("<Button-4>", on_mousewheel)  # Linux scroll up
+            widget.bind("<Button-5>", on_mousewheel)  # Linux scroll down

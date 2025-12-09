@@ -171,12 +171,13 @@ class AIChatWindow(ctk.CTkToplevel):
         self.checkpoint_dropdown.grid(row=0, column=2, sticky="e")
 
     def _create_input_area(self) -> None:
-        """Create the input area."""
+        """Create the input area with buttons stacked on the right."""
         input_frame = ctk.CTkFrame(self, fg_color="transparent")
         input_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(8, 0))
-        input_frame.grid_columnconfigure(0, weight=1)
+        input_frame.grid_columnconfigure(0, weight=1)  # Input takes remaining space
+        input_frame.grid_columnconfigure(1, weight=0)  # Buttons column fixed
 
-        # Multi-line text input
+        # Multi-line text input (left side)
         self.input_text = ctk.CTkTextbox(
             input_frame,
             font=get_font("normal"),
@@ -188,7 +189,41 @@ class AIChatWindow(ctk.CTkToplevel):
             height=INPUT_MIN_HEIGHT,
             wrap="word",
         )
-        self.input_text.grid(row=0, column=0, sticky="ew")
+        self.input_text.grid(row=0, column=0, sticky="nsew")
+
+        # Button stack (right side)
+        btn_stack = ctk.CTkFrame(input_frame, fg_color="transparent")
+        btn_stack.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+
+        # New Session button (top)
+        self.new_session_btn = ctk.CTkButton(
+            btn_stack,
+            text="New Session",
+            font=get_font("small"),
+            fg_color=BG_SECONDARY,
+            hover_color=BG_HOVER,
+            text_color=TEXT_PRIMARY,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=90,
+            height=26,
+            command=self._on_new_session,
+        )
+        self.new_session_btn.pack(side="top", pady=(0, 4))
+
+        # Send button (bottom)
+        self.send_btn = ctk.CTkButton(
+            btn_stack,
+            text="Send →",
+            font=get_font("small", bold=True),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8eef",
+            text_color=TEXT_PRIMARY,
+            width=90,
+            height=26,
+            command=self._on_send,
+        )
+        self.send_btn.pack(side="top")
 
         # Placeholder text handling
         self._placeholder_active = True
@@ -209,53 +244,18 @@ class AIChatWindow(ctk.CTkToplevel):
             self._placeholder_active = False
 
     def _create_buttons(self) -> None:
-        """Create the button row."""
-        button_frame = ctk.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
-        button_frame.grid_columnconfigure(0, weight=1)
+        """Create the status bar (buttons moved to input area)."""
+        status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        status_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
 
-        # Status label (left side)
+        # Status label
         self.status_label = ctk.CTkLabel(
-            button_frame,
+            status_frame,
             text="",
             font=get_font("small"),
             text_color=TEXT_MUTED,
         )
-        self.status_label.grid(row=0, column=0, sticky="w")
-
-        # Buttons (right side)
-        btn_container = ctk.CTkFrame(button_frame, fg_color="transparent")
-        btn_container.grid(row=0, column=1, sticky="e")
-
-        # New Session button
-        self.new_session_btn = ctk.CTkButton(
-            btn_container,
-            text="New Session",
-            font=get_font("normal"),
-            fg_color=BG_SECONDARY,
-            hover_color=BG_HOVER,
-            text_color=TEXT_PRIMARY,
-            border_width=1,
-            border_color=BORDER_COLOR,
-            width=100,
-            height=32,
-            command=self._on_new_session,
-        )
-        self.new_session_btn.pack(side="left", padx=(0, 8))
-
-        # Send button
-        self.send_btn = ctk.CTkButton(
-            btn_container,
-            text="Send →",
-            font=get_font("normal", bold=True),
-            fg_color=ACCENT_BLUE,
-            hover_color="#3a8eef",
-            text_color=TEXT_PRIMARY,
-            width=80,
-            height=32,
-            command=self._on_send,
-        )
-        self.send_btn.pack(side="left")
+        self.status_label.pack(side="left")
 
     def _setup_callbacks(self) -> None:
         """Set up AI core callbacks."""

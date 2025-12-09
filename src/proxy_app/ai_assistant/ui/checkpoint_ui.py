@@ -57,17 +57,17 @@ class CheckpointDropdown(ctk.CTkFrame):
 
     def _create_widgets(self) -> None:
         """Create the UI widgets."""
-        # Dropdown button
+        # Dropdown button with undo icon
         self.button = ctk.CTkButton(
             self,
-            text="Checkpoints",
+            text="↩️",
             font=get_font("normal"),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
             text_color=TEXT_PRIMARY,
             border_width=1,
             border_color=BORDER_COLOR,
-            width=120,
+            width=40,
             height=28,
             command=self._toggle_popup,
         )

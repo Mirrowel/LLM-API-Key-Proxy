@@ -95,7 +95,7 @@ MESSAGE_PADDING = 12  # Internal padding for message boxes
 CORNER_RADIUS = 8  # Border radius for message boxes
 
 # Input area
-INPUT_MIN_HEIGHT = 80  # Minimum height (about 3 lines)
+INPUT_MIN_HEIGHT = 55  # Minimum height (about 2 lines)
 INPUT_MAX_HEIGHT = 200  # Maximum height before scrolling
 
 # ============================================================================
