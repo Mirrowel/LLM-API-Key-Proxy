@@ -274,6 +274,69 @@ class FilterEngine:
             # Exact match against full ID or provider model name
             return model_id == pattern or provider_model_name == pattern
 
+    def pattern_is_covered_by(self, new_pattern: str, existing_pattern: str) -> bool:
+        """
+        Check if new_pattern is already covered by existing_pattern.
+
+        A pattern A is covered by pattern B if every model that would match A
+        would also match B.
+
+        Examples:
+        - "gpt-4" is covered by "gpt-4*" (prefix covers exact)
+        - "gpt-4-turbo" is covered by "gpt-4*" (prefix covers longer)
+        - "gpt-4*" is covered by "gpt-*" (broader prefix covers narrower)
+        - Anything is covered by "*" (match-all covers everything)
+        - "gpt-4" is covered by "gpt-4" (exact duplicate)
+        """
+        # Exact duplicate
+        if new_pattern == existing_pattern:
+            return True
+
+        # Existing is wildcard-all - covers everything
+        if existing_pattern == "*":
+            return True
+
+        # If existing is a prefix wildcard
+        if existing_pattern.endswith("*"):
+            existing_prefix = existing_pattern[:-1]
+
+            # New is exact match - check if it starts with existing prefix
+            if not new_pattern.endswith("*"):
+                return new_pattern.startswith(existing_prefix)
+
+            # New is also a prefix wildcard - check if new prefix starts with existing
+            new_prefix = new_pattern[:-1]
+            return new_prefix.startswith(existing_prefix)
+
+        # Existing is exact match - only covers exact duplicate (already handled)
+        return False
+
+    def is_pattern_covered(self, new_pattern: str, rule_type: str) -> bool:
+        """
+        Check if a new pattern is already covered by any existing rule of the same type.
+        """
+        rules = self.ignore_rules if rule_type == "ignore" else self.whitelist_rules
+        for rule in rules:
+            if self.pattern_is_covered_by(new_pattern, rule.pattern):
+                return True
+        return False
+
+    def get_covered_patterns(self, new_pattern: str, rule_type: str) -> List[str]:
+        """
+        Get list of existing patterns that would be covered (made redundant)
+        by adding new_pattern.
+
+        Used for smart merge: when adding a broader pattern, remove the
+        narrower patterns it covers.
+        """
+        rules = self.ignore_rules if rule_type == "ignore" else self.whitelist_rules
+        covered = []
+        for rule in rules:
+            if self.pattern_is_covered_by(rule.pattern, new_pattern):
+                # The existing rule would be covered by the new pattern
+                covered.append(rule.pattern)
+        return covered
+
     def _compute_status(self, model_id: str) -> ModelStatus:
         """
         Compute the status of a model based on current rules (no caching).
@@ -624,6 +687,7 @@ class ModelFetcher:
 class HelpWindow(ctk.CTkToplevel):
     """
     Modal help popup with comprehensive filtering documentation.
+    Uses CTkTextbox for proper scrolling with dark theme styling.
     """
 
     def __init__(self, parent):
@@ -656,31 +720,103 @@ class HelpWindow(ctk.CTkToplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
     def _create_content(self):
-        """Build the help content."""
-        # Main scrollable frame
-        main_frame = ctk.CTkScrollableFrame(
-            self,
-            fg_color=BG_PRIMARY,
-            scrollbar_fg_color=BG_SECONDARY,
-            scrollbar_button_color=BORDER_COLOR,
+        """Build the help content using CTkTextbox for proper scrolling."""
+        # Main container
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=(20, 10))
+
+        # Use CTkTextbox - CustomTkinter's styled text widget with built-in scrolling
+        self.text_box = ctk.CTkTextbox(
+            main_frame,
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            fg_color=BG_SECONDARY,
+            text_color=TEXT_SECONDARY,
+            corner_radius=8,
+            wrap="word",
+            activate_scrollbars=True,
         )
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        self.text_box.pack(fill="both", expand=True)
+
+        # Configure text tags for formatting
+        # Access the underlying tk.Text widget for tag configuration
+        text_widget = self.text_box._textbox
+
+        text_widget.tag_configure(
+            "title",
+            font=(FONT_FAMILY, FONT_SIZE_HEADER, "bold"),
+            foreground=TEXT_PRIMARY,
+            spacing1=5,
+            spacing3=15,
+        )
+        text_widget.tag_configure(
+            "section_title",
+            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
+            foreground=ACCENT_BLUE,
+            spacing1=20,
+            spacing3=8,
+        )
+        text_widget.tag_configure(
+            "separator",
+            font=(FONT_FAMILY, 6),
+            foreground=BORDER_COLOR,
+            spacing3=5,
+        )
+        text_widget.tag_configure(
+            "content",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            foreground=TEXT_SECONDARY,
+            spacing1=2,
+            spacing3=5,
+            lmargin1=5,
+            lmargin2=5,
+        )
+
+        # Insert content
+        self._insert_help_content()
+
+        # Make read-only by disabling
+        self.text_box.configure(state="disabled")
+
+        # Bind mouse wheel for faster scrolling on the internal canvas
+        self.text_box.bind("<MouseWheel>", self._on_mousewheel)
+        # Also bind on the textbox's internal widget
+        self.text_box._textbox.bind("<MouseWheel>", self._on_mousewheel)
+
+        # Close button at bottom
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(10, 15))
+
+        close_btn = ctk.CTkButton(
+            btn_frame,
+            text="Got it!",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8aee",
+            height=40,
+            width=120,
+            command=self.destroy,
+        )
+        close_btn.pack()
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel with faster scrolling."""
+        # CTkTextbox uses _textbox internally
+        self.text_box._textbox.yview_scroll(-1 * (event.delta // 40), "units")
+        return "break"
+
+    def _insert_help_content(self):
+        """Insert all help text with formatting."""
+        # Access internal text widget for inserting with tags
+        text_widget = self.text_box._textbox
 
         # Title
-        title = ctk.CTkLabel(
-            main_frame,
-            text="📖 Model Filtering Guide",
-            font=(FONT_FAMILY, FONT_SIZE_HEADER, "bold"),
-            text_color=TEXT_PRIMARY,
-        )
-        title.pack(anchor="w", pady=(0, 20))
+        text_widget.insert("end", "📖 Model Filtering Guide\n", "title")
 
-        # Sections
+        # Sections with emojis
         sections = [
             (
                 "🎯 Overview",
-                """
-Model filtering allows you to control which models are available through your proxy for each provider.
+                """Model filtering allows you to control which models are available through your proxy for each provider.
 
 • Use the IGNORE list to block specific models
 • Use the WHITELIST to ensure specific models are always available
@@ -688,8 +824,7 @@ Model filtering allows you to control which models are available through your pr
             ),
             (
                 "⚖️ Filtering Priority",
-                """
-When a model is checked, the following order is used:
+                """When a model is checked, the following order is used:
 
 1. WHITELIST CHECK
    If the model matches any whitelist pattern → AVAILABLE
@@ -703,25 +838,23 @@ When a model is checked, the following order is used:
             ),
             (
                 "✏️ Pattern Syntax",
-                """
-Three types of patterns are supported:
+                """Three types of patterns are supported:
 
 EXACT MATCH
   Pattern: gpt-4
   Matches: only "gpt-4", nothing else
-  
+   
 PREFIX WILDCARD  
   Pattern: gpt-4*
   Matches: "gpt-4", "gpt-4-turbo", "gpt-4-preview", etc.
-  
+   
 MATCH ALL
   Pattern: *
   Matches: every model for this provider""",
             ),
             (
                 "💡 Common Patterns",
-                """
-BLOCK ALL, ALLOW SPECIFIC:
+                """BLOCK ALL, ALLOW SPECIFIC:
   Ignore:    *
   Whitelist: gpt-4o, gpt-4o-mini
   Result:    Only gpt-4o and gpt-4o-mini available
@@ -741,8 +874,7 @@ ALLOW ONLY LATEST:
             ),
             (
                 "🖱️ Interface Guide",
-                """
-PROVIDER DROPDOWN
+                """PROVIDER DROPDOWN
   Select which provider to configure
 
 MODEL LISTS
@@ -763,18 +895,21 @@ CLICKING RULES
   • Highlights all models affected by that rule
   • Shows which models will be blocked/allowed
 
-RULE INPUT
+RULE INPUT (Merge Mode)
   • Enter patterns separated by commas
+  • Only adds patterns not covered by existing rules
   • Press Add or Enter to create rules
-  • Preview updates in real-time as you type
+
+IMPORT BUTTON (Replace Mode)
+  • Replaces ALL existing rules with imported ones
+  • Paste comma-separated patterns
 
 DELETE RULES
   • Click the × button on any rule to remove it""",
             ),
             (
                 "⌨️ Keyboard Shortcuts",
-                """
-Ctrl+S     Save changes
+                """Ctrl+S     Save changes
 Ctrl+R     Refresh models from provider
 Ctrl+F     Focus search box
 F1         Open this help window
@@ -782,8 +917,7 @@ Escape     Clear search / Close dialogs""",
             ),
             (
                 "💾 Saving Changes",
-                """
-Changes are saved to your .env file in this format:
+                """Changes are saved to your .env file in this format:
 
   IGNORE_MODELS_OPENAI=pattern1,pattern2*
   WHITELIST_MODELS_OPENAI=specific-model
@@ -793,47 +927,10 @@ Closing the window with unsaved changes will prompt you.""",
             ),
         ]
 
-        for title_text, content in sections:
-            self._add_section(main_frame, title_text, content)
-
-        # Close button
-        close_btn = ctk.CTkButton(
-            main_frame,
-            text="Got it!",
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
-            fg_color=ACCENT_BLUE,
-            hover_color="#3a8aee",
-            height=40,
-            width=120,
-            command=self.destroy,
-        )
-        close_btn.pack(pady=20)
-
-    def _add_section(self, parent, title: str, content: str):
-        """Add a help section."""
-        # Section title
-        title_label = ctk.CTkLabel(
-            parent,
-            text=title,
-            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
-            text_color=ACCENT_BLUE,
-        )
-        title_label.pack(anchor="w", pady=(15, 5))
-
-        # Separator
-        sep = ctk.CTkFrame(parent, height=1, fg_color=BORDER_COLOR)
-        sep.pack(fill="x", pady=(0, 10))
-
-        # Content
-        content_label = ctk.CTkLabel(
-            parent,
-            text=content.strip(),
-            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
-            text_color=TEXT_SECONDARY,
-            justify="left",
-            anchor="w",
-        )
-        content_label.pack(anchor="w", fill="x")
+        for section_title, content in sections:
+            text_widget.insert("end", f"\n{section_title}\n", "section_title")
+            text_widget.insert("end", "─" * 50 + "\n", "separator")
+            text_widget.insert("end", content.strip() + "\n", "content")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -966,6 +1063,238 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
         """Show dialog and return result."""
         self.wait_window()
         return self.result
+
+
+class ImportRulesDialog(ctk.CTkToplevel):
+    """Modal dialog for importing rules from comma-separated text."""
+
+    def __init__(self, parent, rule_type: str):
+        super().__init__(parent)
+
+        self.result: Optional[List[str]] = None
+        self.rule_type = rule_type
+
+        title_text = (
+            "Import Ignore Rules" if rule_type == "ignore" else "Import Whitelist Rules"
+        )
+        self.title(title_text)
+        self.geometry("500x300")
+        self.minsize(400, 250)
+
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+
+        # Configure appearance
+        self.configure(fg_color=BG_PRIMARY)
+
+        # Build content
+        self._create_content()
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Focus
+        self.focus_force()
+        self.text_box.focus_set()
+
+        # Bind escape to cancel
+        self.bind("<Escape>", lambda e: self._on_cancel())
+
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+    def _create_content(self):
+        """Build dialog content."""
+        # Instructions at TOP
+        instruction_frame = ctk.CTkFrame(self, fg_color="transparent")
+        instruction_frame.pack(fill="x", padx=20, pady=(15, 10))
+
+        instruction = ctk.CTkLabel(
+            instruction_frame,
+            text="Paste comma-separated patterns below (will REPLACE all existing rules):",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            text_color=TEXT_PRIMARY,
+            anchor="w",
+        )
+        instruction.pack(anchor="w")
+
+        example = ctk.CTkLabel(
+            instruction_frame,
+            text="Example: gpt-4*, claude-3*, model-name",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            text_color=TEXT_MUTED,
+            anchor="w",
+        )
+        example.pack(anchor="w")
+
+        # Buttons at BOTTOM - pack BEFORE textbox to reserve space
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent", height=50)
+        btn_frame.pack(side="bottom", fill="x", padx=20, pady=(10, 15))
+        btn_frame.pack_propagate(False)
+
+        cancel_btn = ctk.CTkButton(
+            btn_frame,
+            text="Cancel",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            fg_color=BG_SECONDARY,
+            hover_color=BG_HOVER,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=100,
+            height=32,
+            command=self._on_cancel,
+        )
+        cancel_btn.pack(side="right", padx=(10, 0))
+
+        import_btn = ctk.CTkButton(
+            btn_frame,
+            text="Replace All",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8aee",
+            width=110,
+            height=32,
+            command=self._on_import,
+        )
+        import_btn.pack(side="right")
+
+        # Text box fills MIDDLE space - pack LAST
+        self.text_box = ctk.CTkTextbox(
+            self,
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            fg_color=BG_TERTIARY,
+            border_color=BORDER_COLOR,
+            border_width=1,
+            text_color=TEXT_PRIMARY,
+            wrap="word",
+        )
+        self.text_box.pack(fill="both", expand=True, padx=20, pady=(0, 0))
+
+        # Bind Ctrl+Enter to import
+        self.text_box.bind("<Control-Return>", lambda e: self._on_import())
+
+    def _on_import(self):
+        """Parse and return the patterns."""
+        text = self.text_box.get("1.0", "end").strip()
+        if text:
+            # Parse comma-separated patterns
+            patterns = [p.strip() for p in text.split(",") if p.strip()]
+            self.result = patterns
+        else:
+            self.result = []
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self) -> Optional[List[str]]:
+        """Show dialog and return list of patterns, or None if cancelled."""
+        self.wait_window()
+        return self.result
+
+
+class ImportResultDialog(ctk.CTkToplevel):
+    """Simple dialog showing import results."""
+
+    def __init__(self, parent, added: int, skipped: int, is_replace: bool = False):
+        super().__init__(parent)
+
+        self.title("Import Complete")
+        self.geometry("380x160")
+        self.resizable(False, False)
+
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+
+        # Configure appearance
+        self.configure(fg_color=BG_PRIMARY)
+
+        # Build content
+        self._create_content(added, skipped, is_replace)
+
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Focus
+        self.focus_force()
+
+        # Bind escape and enter to close
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.destroy())
+
+    def _create_content(self, added: int, skipped: int, is_replace: bool):
+        """Build dialog content."""
+        # Icon and message
+        msg_frame = ctk.CTkFrame(self, fg_color="transparent")
+        msg_frame.pack(fill="x", padx=30, pady=(25, 15))
+
+        icon = ctk.CTkLabel(
+            msg_frame,
+            text="✅" if added > 0 else "ℹ️",
+            font=(FONT_FAMILY, 28),
+            text_color=ACCENT_GREEN if added > 0 else ACCENT_BLUE,
+        )
+        icon.pack(side="left", padx=(0, 15))
+
+        text_frame = ctk.CTkFrame(msg_frame, fg_color="transparent")
+        text_frame.pack(side="left", fill="x", expand=True)
+
+        # Title text differs based on mode
+        if is_replace:
+            if added > 0:
+                added_text = f"Replaced with {added} rule{'s' if added != 1 else ''}"
+            else:
+                added_text = "All rules cleared"
+        else:
+            if added > 0:
+                added_text = f"Added {added} rule{'s' if added != 1 else ''}"
+            else:
+                added_text = "No new rules added"
+
+        title = ctk.CTkLabel(
+            text_frame,
+            text=added_text,
+            font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
+            text_color=TEXT_PRIMARY,
+            anchor="w",
+        )
+        title.pack(anchor="w")
+
+        # Subtitle for skipped/duplicates
+        if skipped > 0:
+            skip_text = f"{skipped} duplicate{'s' if skipped != 1 else ''} skipped"
+            subtitle = ctk.CTkLabel(
+                text_frame,
+                text=skip_text,
+                font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+                text_color=TEXT_MUTED,
+                anchor="w",
+            )
+            subtitle.pack(anchor="w")
+
+        # OK button
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=30, pady=(0, 20))
+
+        ok_btn = ctk.CTkButton(
+            btn_frame,
+            text="OK",
+            font=(FONT_FAMILY, FONT_SIZE_NORMAL),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8aee",
+            width=80,
+            command=self.destroy,
+        )
+        ok_btn.pack(side="right")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1385,33 +1714,77 @@ class VirtualSyncModelLists(ctk.CTkFrame):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        # Left header
+        # Left header frame
+        left_header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        left_header_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(0, 5))
+
         left_header = ctk.CTkLabel(
-            self,
+            left_header_frame,
             text="All Fetched Models",
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             text_color=TEXT_PRIMARY,
         )
-        left_header.grid(row=0, column=0, sticky="w", padx=8, pady=(0, 5))
+        left_header.pack(side="left")
 
         self.left_count_label = ctk.CTkLabel(
-            self, text="(0)", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
+            left_header_frame,
+            text="(0)",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            text_color=TEXT_MUTED,
         )
-        self.left_count_label.grid(row=0, column=0, sticky="e", padx=8, pady=(0, 5))
+        self.left_count_label.pack(side="left", padx=(5, 0))
 
-        # Right header
+        # Copy button for all models
+        self.left_copy_btn = ctk.CTkButton(
+            left_header_frame,
+            text="Copy",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=BG_SECONDARY,
+            hover_color=BG_HOVER,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=50,
+            height=20,
+            command=self._copy_all_models,
+        )
+        self.left_copy_btn.pack(side="right")
+        ToolTip(self.left_copy_btn, "Copy all model names (comma-separated)")
+
+        # Right header frame
+        right_header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        right_header_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=(0, 5))
+
         right_header = ctk.CTkLabel(
-            self,
+            right_header_frame,
             text="Filtered Status",
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             text_color=TEXT_PRIMARY,
         )
-        right_header.grid(row=0, column=1, sticky="w", padx=8, pady=(0, 5))
+        right_header.pack(side="left")
 
         self.right_count_label = ctk.CTkLabel(
-            self, text="", font=(FONT_FAMILY, FONT_SIZE_SMALL), text_color=TEXT_MUTED
+            right_header_frame,
+            text="",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            text_color=TEXT_MUTED,
         )
-        self.right_count_label.grid(row=0, column=1, sticky="e", padx=8, pady=(0, 5))
+        self.right_count_label.pack(side="left", padx=(5, 0))
+
+        # Copy button for filtered models
+        self.right_copy_btn = ctk.CTkButton(
+            right_header_frame,
+            text="Copy",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=BG_SECONDARY,
+            hover_color=BG_HOVER,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=50,
+            height=20,
+            command=self._copy_filtered_models,
+        )
+        self.right_copy_btn.pack(side="right")
+        ToolTip(self.right_copy_btn, "Copy available model names (comma-separated)")
 
         # Create virtual lists
         self.left_list = VirtualModelList(
@@ -1605,6 +1978,39 @@ class VirtualSyncModelLists(ctk.CTkFrame):
             self.left_list.scroll_to_model(affected_models[0])
             pos = self.left_list.get_scroll_position()
             self.right_list.set_scroll_position(pos)
+
+    def _get_model_display_name(self, model_id: str) -> str:
+        """Get model name without provider prefix."""
+        if "/" in model_id:
+            return model_id.split("/", 1)[1]
+        return model_id
+
+    def _copy_all_models(self):
+        """Copy all model names to clipboard (comma-separated, without provider prefix)."""
+        if not self.models:
+            return
+        names = [self._get_model_display_name(m) for m in self.models]
+        text = ", ".join(names)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def _copy_filtered_models(self):
+        """Copy filtered/available model names to clipboard (comma-separated)."""
+        if not self.models:
+            return
+        # Get only models that are not ignored
+        available = [
+            self._get_model_display_name(m)
+            for m in self.models
+            if self.statuses.get(m) and self.statuses[m].status != "ignored"
+        ]
+        # Also include models with no status (default to available)
+        for m in self.models:
+            if m not in self.statuses:
+                available.append(self._get_model_display_name(m))
+        text = ", ".join(available)
+        self.clipboard_clear()
+        self.clipboard_append(text)
 
     def get_model_at_position(self, model_id: str) -> Optional[ModelStatus]:
         """Get the status of a model."""
@@ -1869,8 +2275,8 @@ class VirtualRuleList:
         x = self.canvas.winfo_rootx() + 20
         y = (
             self.canvas.winfo_rooty()
-            + int(self.canvas.canvasy(0))
             + (index + 1) * RULE_ITEM_HEIGHT
+            - int(self.canvas.canvasy(0))
         )
 
         # Create tooltip window
@@ -2053,14 +2459,54 @@ class RulePanel(ctk.CTkFrame):
 
     def _create_content(self):
         """Build panel content."""
-        # Title at top (compact)
-        title_label = ctk.CTkLabel(
-            self,
-            text=self.title,
+        # Title row at top (compact) with count and buttons
+        title_frame = ctk.CTkFrame(self, fg_color="transparent", height=22)
+        title_frame.pack(side="top", fill="x", padx=10, pady=(4, 2))
+        title_frame.pack_propagate(False)
+
+        # Base title (without count)
+        self._base_title = self.title
+        self._rule_count = 0
+
+        self.title_label = ctk.CTkLabel(
+            title_frame,
+            text=f"{self.title}: 0",
             font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
             text_color=TEXT_PRIMARY,
         )
-        title_label.pack(side="top", anchor="w", padx=10, pady=(4, 2))
+        self.title_label.pack(side="left")
+
+        # Import button (right side)
+        import_btn = ctk.CTkButton(
+            title_frame,
+            text="Import",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=BG_TERTIARY,
+            hover_color=BG_HOVER,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=50,
+            height=18,
+            command=self._on_import_clicked,
+        )
+        import_btn.pack(side="right", padx=(4, 0))
+        ToolTip(import_btn, "Import rules from comma-separated text")
+
+        # Copy button
+        copy_btn = ctk.CTkButton(
+            title_frame,
+            text="Copy",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=BG_TERTIARY,
+            hover_color=BG_HOVER,
+            border_width=1,
+            border_color=BORDER_COLOR,
+            width=45,
+            height=18,
+            command=self._on_copy_clicked,
+        )
+        copy_btn.pack(side="right")
+        ToolTip(copy_btn, "Copy all rules (comma-separated)")
 
         # Input frame at BOTTOM - pack BEFORE rule_list to reserve space
         input_frame = ctk.CTkFrame(self, fg_color="transparent", height=32)
@@ -2149,6 +2595,12 @@ class RulePanel(ctk.CTkFrame):
     def update_rule_counts(self, rules: List[FilterRule], models: List[str]):
         """Update affected counts for all rules."""
         self.rule_list.update_rule_counts(rules)
+        self._update_title_count(len(rules))
+
+    def _update_title_count(self, count: int):
+        """Update the rule count in the title."""
+        self._rule_count = count
+        self.title_label.configure(text=f"{self._base_title}: {count}")
 
     def highlight_rule(self, pattern: str):
         """Highlight a specific rule and scroll to it."""
@@ -2169,6 +2621,72 @@ class RulePanel(ctk.CTkFrame):
     def clear_input(self):
         """Clear the input field."""
         self.input_entry.delete(0, "end")
+
+    def _on_copy_clicked(self):
+        """Copy all rule patterns to clipboard as comma-separated string."""
+        patterns = [r.pattern for r in self.rule_list.rules]
+        if patterns:
+            text = ", ".join(patterns)
+            self.clipboard_clear()
+            self.clipboard_append(text)
+
+    def _on_import_clicked(self):
+        """
+        Open import dialog and REPLACE ALL existing rules.
+
+        This is a full replace operation - all existing rules are removed
+        and replaced with the imported patterns.
+        """
+        dialog = ImportRulesDialog(self.winfo_toplevel(), self.rule_type)
+        patterns = dialog.show()
+
+        if patterns is None:
+            # Cancelled
+            return
+
+        if not patterns:
+            # Empty input - show message
+            ImportResultDialog(self.winfo_toplevel(), 0, 0, is_replace=True)
+            return
+
+        # Deduplicate the imported patterns (keep first occurrence)
+        seen = set()
+        unique_patterns = []
+        duplicates_in_import = 0
+        for p in patterns:
+            if p not in seen:
+                seen.add(p)
+                unique_patterns.append(p)
+            else:
+                duplicates_in_import += 1
+
+        # Clear all existing rules first
+        if hasattr(self, "_clear_all_callback"):
+            self._clear_all_callback()
+
+        # Add all unique patterns (skip coverage check since we're replacing)
+        added = 0
+        if hasattr(self, "_replace_add_callback"):
+            for pattern in unique_patterns:
+                if self._replace_add_callback(pattern):
+                    added += 1
+
+        # Show result dialog
+        ImportResultDialog(
+            self.winfo_toplevel(), added, duplicates_in_import, is_replace=True
+        )
+
+    def set_clear_all_callback(self, callback: Callable[[], None]):
+        """Set the callback for clearing all rules (used by replace import)."""
+        self._clear_all_callback = callback
+
+    def set_replace_add_callback(self, callback: Callable[[str], bool]):
+        """Set the callback for adding patterns in replace mode (skips coverage check)."""
+        self._replace_add_callback = callback
+
+    def get_all_patterns(self) -> List[str]:
+        """Get all rule patterns."""
+        return [r.pattern for r in self.rule_list.rules]
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2408,6 +2926,10 @@ class ModelFilterGUI(ctk.CTk):
         self.ignore_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.ignore_panel.set_add_callback(self._add_ignore_pattern)
         self.ignore_panel.set_delete_callback(self._remove_ignore_pattern)
+        self.ignore_panel.set_clear_all_callback(self._clear_all_ignore_rules)
+        self.ignore_panel.set_replace_add_callback(
+            lambda p: self._add_ignore_pattern(p, skip_coverage_check=True)
+        )
 
         # Whitelist panel
         self.whitelist_panel = RulePanel(
@@ -2421,6 +2943,10 @@ class ModelFilterGUI(ctk.CTk):
         self.whitelist_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         self.whitelist_panel.set_add_callback(self._add_whitelist_pattern)
         self.whitelist_panel.set_delete_callback(self._remove_whitelist_pattern)
+        self.whitelist_panel.set_clear_all_callback(self._clear_all_whitelist_rules)
+        self.whitelist_panel.set_replace_add_callback(
+            lambda p: self._add_whitelist_pattern(p, skip_coverage_check=True)
+        )
 
     def _create_status_bar(self):
         """Create the status bar showing available count and action buttons (compact)."""
@@ -2693,19 +3219,61 @@ class ModelFilterGUI(ctk.CTk):
         for rule in self.filter_engine.whitelist_rules:
             self.whitelist_panel.add_rule_chip(rule)
 
-    def _add_ignore_pattern(self, pattern: str):
-        """Add an ignore pattern."""
+    def _add_ignore_pattern(self, pattern: str, skip_coverage_check: bool = False):
+        """
+        Add an ignore pattern with smart merge logic.
+
+        If skip_coverage_check is False (default - from main input):
+        - Skip if pattern is already covered by existing rules
+        - Remove existing patterns that would be covered by this new pattern
+
+        If skip_coverage_check is True (from replace import):
+        - Just add without coverage checks
+        """
+        if not skip_coverage_check:
+            # Check if this pattern is already covered
+            if self.filter_engine.is_pattern_covered(pattern, "ignore"):
+                return False  # Pattern already covered, skip
+
+            # Remove patterns that this new pattern would cover
+            covered = self.filter_engine.get_covered_patterns(pattern, "ignore")
+            for covered_pattern in covered:
+                self._remove_ignore_pattern(covered_pattern)
+
         rule = self.filter_engine.add_ignore_rule(pattern)
         if rule:
             self.ignore_panel.add_rule_chip(rule)
             self._on_rules_changed()
+            return True
+        return False
 
-    def _add_whitelist_pattern(self, pattern: str):
-        """Add a whitelist pattern."""
+    def _add_whitelist_pattern(self, pattern: str, skip_coverage_check: bool = False):
+        """
+        Add a whitelist pattern with smart merge logic.
+
+        If skip_coverage_check is False (default - from main input):
+        - Skip if pattern is already covered by existing rules
+        - Remove existing patterns that would be covered by this new pattern
+
+        If skip_coverage_check is True (from replace import):
+        - Just add without coverage checks
+        """
+        if not skip_coverage_check:
+            # Check if this pattern is already covered
+            if self.filter_engine.is_pattern_covered(pattern, "whitelist"):
+                return False  # Pattern already covered, skip
+
+            # Remove patterns that this new pattern would cover
+            covered = self.filter_engine.get_covered_patterns(pattern, "whitelist")
+            for covered_pattern in covered:
+                self._remove_whitelist_pattern(covered_pattern)
+
         rule = self.filter_engine.add_whitelist_rule(pattern)
         if rule:
             self.whitelist_panel.add_rule_chip(rule)
             self._on_rules_changed()
+            return True
+        return False
 
     def _remove_ignore_pattern(self, pattern: str):
         """Remove an ignore pattern."""
@@ -2717,6 +3285,26 @@ class ModelFilterGUI(ctk.CTk):
         """Remove a whitelist pattern."""
         self.filter_engine.remove_whitelist_rule(pattern)
         self.whitelist_panel.remove_rule_chip(pattern)
+        self._on_rules_changed()
+
+    def _clear_all_ignore_rules(self):
+        """Clear all ignore rules (used by replace import)."""
+        # Remove all rules from engine
+        patterns = [r.pattern for r in self.filter_engine.ignore_rules]
+        for pattern in patterns:
+            self.filter_engine.remove_ignore_rule(pattern)
+        # Clear the panel
+        self.ignore_panel.clear_all()
+        self._on_rules_changed()
+
+    def _clear_all_whitelist_rules(self):
+        """Clear all whitelist rules (used by replace import)."""
+        # Remove all rules from engine
+        patterns = [r.pattern for r in self.filter_engine.whitelist_rules]
+        for pattern in patterns:
+            self.filter_engine.remove_whitelist_rule(pattern)
+        # Clear the panel
+        self.whitelist_panel.clear_all()
         self._on_rules_changed()
 
     def _on_rules_changed(self):
