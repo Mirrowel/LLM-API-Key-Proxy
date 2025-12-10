@@ -36,8 +36,13 @@ class Message:
         """Convert to OpenAI-compatible message format."""
         msg: Dict[str, Any] = {"role": self.role}
 
+        # Content handling: when tool_calls are present, some providers require
+        # content to be present (even if null/empty)
         if self.content is not None:
             msg["content"] = self.content
+        elif self.tool_calls:
+            # Ensure content is present when tool_calls exist
+            msg["content"] = None
 
         if self.tool_calls:
             msg["tool_calls"] = [
@@ -109,7 +114,7 @@ class AIAssistantCore:
         self._session = ChatSession(session_id=session_id, model=default_model)
 
         # Initialize components
-        self._bridge = LLMBridge(schedule_on_gui)
+        self._bridge = LLMBridge(schedule_on_gui, session_id=session_id)
         self._checkpoint_manager = CheckpointManager(session_id)
         self._tool_executor = ToolExecutor(window_adapter.get_tools())
 
@@ -283,6 +288,24 @@ class AIAssistantCore:
         for msg in self._session.messages:
             messages.append(msg.to_openai_format())
 
+        # Log summary of messages being sent
+        role_counts = {}
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+            # Log tool_calls in assistant messages
+            if role == "assistant" and msg.get("tool_calls"):
+                tc_names = [tc["function"]["name"] for tc in msg.get("tool_calls", [])]
+                logger.debug(f"  Assistant message has tool_calls: {tc_names}")
+            # Log tool responses
+            if role == "tool":
+                logger.debug(
+                    f"  Tool response: id={msg.get('tool_call_id')}, "
+                    f"content_preview={str(msg.get('content', ''))[:100]}"
+                )
+
+        logger.debug(f"Built messages array: {role_counts}")
+
         return messages
 
     def _handle_thinking_chunk(self, chunk: str) -> None:
@@ -316,6 +339,12 @@ class AIAssistantCore:
 
     def _handle_stream_complete(self) -> None:
         """Handle stream completion."""
+        logger.info(
+            f"Stream complete: content_len={len(self._current_content)}, "
+            f"thinking_len={len(self._current_thinking)}, "
+            f"tool_calls={len(self._pending_tool_calls)}"
+        )
+
         # Create assistant message
         assistant_message = Message(
             role="assistant",
@@ -327,19 +356,29 @@ class AIAssistantCore:
         )
         self._session.messages.append(assistant_message)
 
+        logger.debug(
+            f"Added assistant message to history. Total messages: {len(self._session.messages)}"
+        )
+
         # Notify UI of message completion
         if self._ui_callbacks.get("on_message_complete"):
             self._ui_callbacks["on_message_complete"](assistant_message)
 
         # Execute tool calls if any
         if self._pending_tool_calls:
+            logger.info(
+                f"Processing {len(self._pending_tool_calls)} pending tool call(s)"
+            )
             self._execute_tool_calls(self._pending_tool_calls)
         else:
             # No tool calls - response is complete
+            logger.info("No tool calls - finishing response")
             self._finish_response()
 
     def _execute_tool_calls(self, tool_calls: List[ToolCall]) -> None:
         """Execute pending tool calls and handle results."""
+        logger.info(f"Executing {len(tool_calls)} tool call(s)")
+
         # Check if we need to create a checkpoint
         if self._tool_executor.has_write_tools(tool_calls):
             if self._checkpoint_manager.should_create_checkpoint():
@@ -363,8 +402,14 @@ class AIAssistantCore:
         # Execute each tool
         all_results: List[Message] = []
         has_errors = False
+        assistant_logger = self._bridge.current_logger
 
         for tool_call in tool_calls:
+            logger.info(
+                f"Executing tool: {tool_call.name} (id={tool_call.id}) "
+                f"args={json.dumps(tool_call.arguments)[:200]}"
+            )
+
             # Notify UI
             if self._ui_callbacks.get("on_tool_start"):
                 self._ui_callbacks["on_tool_start"](tool_call)
@@ -372,6 +417,23 @@ class AIAssistantCore:
             # Execute
             result = self._tool_executor.execute(tool_call, self._adapter)
             tool_call.result = result
+
+            logger.info(
+                f"Tool result: {tool_call.name} -> "
+                f"{'SUCCESS' if result.success else 'FAILED'}: {result.message[:100]}"
+            )
+
+            # Log to assistant logger
+            if assistant_logger:
+                assistant_logger.log_tool_execution(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    arguments=tool_call.arguments,
+                    result_success=result.success,
+                    result_message=result.message,
+                    result_data=result.data,
+                    error_code=result.error_code,
+                )
 
             # Notify UI
             if self._ui_callbacks.get("on_tool_result"):
@@ -390,6 +452,10 @@ class AIAssistantCore:
 
         # Add tool results to history
         self._session.messages.extend(all_results)
+        logger.info(
+            f"Added {len(all_results)} tool result message(s) to history. "
+            f"Total messages: {len(self._session.messages)}"
+        )
 
         # Handle retry logic for invalid tool calls
         if has_errors:
@@ -418,6 +484,8 @@ class AIAssistantCore:
 
     def _continue_agentic_loop(self) -> None:
         """Continue the conversation after tool execution."""
+        logger.info("Continuing agentic loop after tool execution")
+
         # Reset current response state
         self._current_thinking = ""
         self._current_content = ""
@@ -426,6 +494,16 @@ class AIAssistantCore:
         # Build messages (includes tool results)
         messages = self._build_messages()
         tools = self._tool_executor.get_tools_openai_format()
+
+        # Log the continuation request
+        assistant_logger = self._bridge.current_logger
+        if assistant_logger:
+            assistant_logger.log_messages_sent(messages)
+
+        logger.debug(
+            f"Continuation request: {len(messages)} messages, "
+            f"last message role={messages[-1]['role'] if messages else 'N/A'}"
+        )
 
         callbacks = StreamCallbacks(
             on_thinking_chunk=self._handle_thinking_chunk,
@@ -523,6 +601,7 @@ class AIAssistantCore:
         new_session_id = str(uuid.uuid4())[:8]
         self._session.session_id = new_session_id
         self._checkpoint_manager.session_id = new_session_id
+        self._bridge.set_session_id(new_session_id)
 
         logger.info(f"Started new session: {new_session_id}")
 

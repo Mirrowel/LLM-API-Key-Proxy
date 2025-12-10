@@ -25,6 +25,7 @@ Usage:
     )
 """
 
+from .assistant_logger import AssistantLogger
 from .bridge import LLMBridge, StreamCallbacks
 from .checkpoint import Checkpoint, CheckpointManager
 from .context import (
@@ -70,4 +71,6 @@ __all__ = [
     # Prompts
     "BASE_ASSISTANT_PROMPT",
     "MODEL_FILTER_SYSTEM_PROMPT",
+    # Logging
+    "AssistantLogger",
 ]

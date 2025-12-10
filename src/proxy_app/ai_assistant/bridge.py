@@ -9,9 +9,11 @@ import asyncio
 import json
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from .assistant_logger import AssistantLogger
 from .tools import ToolCall
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,7 @@ class LLMBridge:
         schedule_on_gui: Callable[[Callable], None],
         ignore_models: Optional[Dict[str, List[str]]] = None,
         whitelist_models: Optional[Dict[str, List[str]]] = None,
+        session_id: Optional[str] = None,
     ):
         """
         Initialize the LLM Bridge.
@@ -65,14 +68,17 @@ class LLMBridge:
                              (typically window.after(0, callback))
             ignore_models: Model patterns to ignore (passed to RotatingClient)
             whitelist_models: Model patterns to whitelist (passed to RotatingClient)
+            session_id: Session ID for logging (optional)
         """
         self._schedule_on_gui = schedule_on_gui
         self._ignore_models = ignore_models
         self._whitelist_models = whitelist_models
+        self._session_id = session_id or str(uuid.uuid4())[:8]
         self._client = None
         self._current_thread: Optional[threading.Thread] = None
         self._cancel_requested = False
         self._models_cache: Optional[Dict[str, List[str]]] = None
+        self._current_logger: Optional[AssistantLogger] = None
 
     def _get_client(self):
         """Get or create the RotatingClient instance."""
@@ -136,6 +142,15 @@ class LLMBridge:
         """Check if a stream is currently in progress."""
         return self._current_thread is not None and self._current_thread.is_alive()
 
+    @property
+    def current_logger(self) -> Optional[AssistantLogger]:
+        """Get the current assistant logger for this turn."""
+        return self._current_logger
+
+    def set_session_id(self, session_id: str) -> None:
+        """Update the session ID for logging."""
+        self._session_id = session_id
+
     def stream_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -155,6 +170,10 @@ class LLMBridge:
             reasoning_effort: Optional reasoning effort level ("low", "medium", "high")
         """
         self._cancel_requested = False
+
+        # Create logger for this turn
+        self._current_logger = AssistantLogger(self._session_id)
+        self._current_logger.log_request(messages, tools, model, reasoning_effort)
 
         def run_in_thread():
             loop = asyncio.new_event_loop()
@@ -199,9 +218,11 @@ class LLMBridge:
     ) -> None:
         """Async implementation of streaming completion."""
         client = self._get_client()
+        assistant_logger = self._current_logger
 
         # Accumulate tool calls across chunks
         accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
+        finish_reason: Optional[str] = None
 
         try:
             # Build completion kwargs
@@ -216,6 +237,7 @@ class LLMBridge:
             if reasoning_effort and reasoning_effort in ("low", "medium", "high"):
                 completion_kwargs["reasoning_effort"] = reasoning_effort
 
+            logger.debug(f"Starting completion request: model={model}")
             response = client.acompletion(**completion_kwargs)
 
             async for chunk in response:
@@ -225,8 +247,22 @@ class LLMBridge:
 
                 parsed = self._parse_chunk(chunk)
 
+                # Track finish reason
+                if parsed.finish_reason:
+                    finish_reason = parsed.finish_reason
+                    logger.debug(f"Got finish_reason: {finish_reason}")
+
                 if parsed.is_done:
                     break
+
+                # Log chunk with parsed data
+                if assistant_logger:
+                    assistant_logger.log_chunk(
+                        chunk,
+                        parsed_content=parsed.content,
+                        parsed_reasoning=parsed.reasoning_content,
+                        parsed_tool_calls=parsed.tool_calls,
+                    )
 
                 # Handle reasoning/thinking content
                 if parsed.reasoning_content and callbacks.on_thinking_chunk:
@@ -266,35 +302,76 @@ class LLMBridge:
                                 "arguments"
                             ]
 
-            # Process accumulated tool calls
+            # Process accumulated tool calls with validation
             if accumulated_tool_calls and callbacks.on_tool_calls:
                 tool_calls = []
+                skipped_count = 0
+
                 for index in sorted(accumulated_tool_calls.keys()):
                     tc_data = accumulated_tool_calls[index]
+
+                    # Validate: skip tool calls with empty name
+                    if not tc_data["name"]:
+                        logger.warning(
+                            f"Skipping tool call at index {index}: empty name. "
+                            f"ID={tc_data['id']!r}, args={tc_data['arguments'][:100]!r}"
+                        )
+                        skipped_count += 1
+                        continue
+
+                    # Generate ID if missing
+                    tool_call_id = tc_data["id"]
+                    if not tool_call_id:
+                        tool_call_id = f"call_{uuid.uuid4().hex[:8]}"
+                        logger.warning(
+                            f"Generated missing ID for tool call {tc_data['name']}: {tool_call_id}"
+                        )
+
+                    # Parse arguments
                     try:
                         arguments = (
                             json.loads(tc_data["arguments"])
                             if tc_data["arguments"]
                             else {}
                         )
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
                         logger.warning(
-                            f"Failed to parse tool arguments: {tc_data['arguments']}"
+                            f"Failed to parse tool arguments for {tc_data['name']}: "
+                            f"{tc_data['arguments']!r} - {e}"
                         )
                         arguments = {}
 
                     tool_calls.append(
                         ToolCall(
-                            id=tc_data["id"],
+                            id=tool_call_id,
                             name=tc_data["name"],
                             arguments=arguments,
                         )
                     )
 
+                if skipped_count > 0:
+                    logger.warning(f"Skipped {skipped_count} invalid tool call(s)")
+
+                # Log parsed tool calls
+                if assistant_logger and tool_calls:
+                    assistant_logger.log_tool_calls_parsed(tool_calls)
+
                 if tool_calls:
                     self._schedule_on_gui(
                         lambda tc=tool_calls: callbacks.on_tool_calls(tc)
                     )
+                elif skipped_count > 0 and not tool_calls:
+                    # All tool calls were invalid - log error
+                    error_msg = (
+                        f"All {skipped_count} tool call(s) were invalid (empty names)"
+                    )
+                    logger.error(error_msg)
+                    if assistant_logger:
+                        assistant_logger.log_error(error_msg)
+
+            # Log completion
+            if assistant_logger:
+                assistant_logger.log_completion(finish_reason)
 
             # Signal completion
             if callbacks.on_complete and not self._cancel_requested:
@@ -302,6 +379,9 @@ class LLMBridge:
 
         except Exception as e:
             logger.exception("Error during streaming")
+            if assistant_logger:
+                assistant_logger.log_error(str(e))
+                assistant_logger.log_completion(finish_reason="error")
             if callbacks.on_error:
                 error_msg = self._format_error(e)
                 self._schedule_on_gui(lambda msg=error_msg: callbacks.on_error(msg))
