@@ -552,6 +552,26 @@ class IFlowAuthBase:
                         )
                         response.raise_for_status()
                         new_token_data = response.json()
+
+                        # [FIX] Handle wrapped response format: {success: bool, data: {...}}
+                        # iFlow API may return tokens nested inside a 'data' key
+                        if (
+                            isinstance(new_token_data, dict)
+                            and "data" in new_token_data
+                        ):
+                            lib_logger.debug(
+                                f"iFlow refresh response wrapped in 'data' key, extracting..."
+                            )
+                            # Check for error in wrapped response
+                            if not new_token_data.get("success", True):
+                                error_msg = new_token_data.get(
+                                    "message", "Unknown error"
+                                )
+                                raise ValueError(
+                                    f"iFlow token refresh failed: {error_msg}"
+                                )
+                            new_token_data = new_token_data.get("data", {})
+
                         break  # Success
 
                     except httpx.HTTPStatusError as e:
@@ -653,6 +673,16 @@ class IFlowAuthBase:
             # Update tokens
             access_token = new_token_data.get("access_token")
             if not access_token:
+                # Log response keys for debugging
+                response_keys = (
+                    list(new_token_data.keys())
+                    if isinstance(new_token_data, dict)
+                    else type(new_token_data).__name__
+                )
+                lib_logger.error(
+                    f"Missing access_token in refresh response for '{Path(path).name}'. "
+                    f"Response keys: {response_keys}"
+                )
                 raise ValueError("Missing access_token in refresh response")
 
             creds_from_file["access_token"] = access_token
