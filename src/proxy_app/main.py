@@ -1625,6 +1625,12 @@ async def anthropic_messages(
                     openai_request["reasoning_effort"] = "low"
             elif body.thinking.type == "disabled":
                 openai_request["reasoning_effort"] = "disable"
+        elif "opus" in body.model.lower():
+            # Force high thinking for Opus models when no thinking config is provided
+            # Opus 4.5 always uses the -thinking variant, so we want maximum thinking budget
+            # Without this, the backend defaults to thinkingBudget: -1 (auto) instead of high
+            openai_request["reasoning_effort"] = "high"
+            openai_request["custom_reasoning_budget"] = True
 
         log_request_to_console(
             url=str(request.url),
