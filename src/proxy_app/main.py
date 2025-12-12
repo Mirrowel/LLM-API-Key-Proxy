@@ -282,6 +282,13 @@ class AnthropicTool(BaseModel):
     input_schema: dict
 
 
+class AnthropicThinkingConfig(BaseModel):
+    """Anthropic thinking configuration."""
+
+    type: str  # "enabled" or "disabled"
+    budget_tokens: Optional[int] = None
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request format."""
 
@@ -297,6 +304,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[dict] = None
     metadata: Optional[dict] = None
+    thinking: Optional[AnthropicThinkingConfig] = None
 
 
 class AnthropicUsage(BaseModel):
@@ -973,6 +981,15 @@ def openai_to_anthropic_response(openai_response: dict, original_model: str) -> 
     # Build content blocks
     content_blocks = []
 
+    # Add thinking content block if reasoning_content is present
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        content_blocks.append({
+            "type": "thinking",
+            "thinking": reasoning_content,
+            "signature": "",  # Signature is typically empty for proxied responses
+        })
+
     # Add text content if present
     text_content = message.get("content")
     if text_content:
@@ -1050,8 +1067,10 @@ async def anthropic_streaming_wrapper(
     """
     message_started = False
     content_block_started = False
+    thinking_block_started = False
     current_block_index = 0
     accumulated_text = ""
+    accumulated_thinking = ""
     tool_calls_by_index = {}  # Track tool calls by their index
     input_tokens = 0
     output_tokens = 0
@@ -1066,8 +1085,8 @@ async def anthropic_streaming_wrapper(
 
             data_content = chunk_str[len("data:") :].strip()
             if data_content == "[DONE]":
-                # Close any open content blocks (text or tool_use)
-                if content_block_started or tool_calls_by_index:
+                # Close any open content blocks (thinking, text, or tool_use)
+                if thinking_block_started or content_block_started or tool_calls_by_index:
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
 
                 # Determine stop_reason based on whether we had tool calls
@@ -1115,9 +1134,37 @@ async def anthropic_streaming_wrapper(
             delta = choices[0].get("delta", {})
             finish_reason = choices[0].get("finish_reason")
 
+            # Handle reasoning/thinking content (from OpenAI-style reasoning_content)
+            reasoning_content = delta.get("reasoning_content")
+            if reasoning_content:
+                if not thinking_block_started:
+                    # Start a thinking content block
+                    block_start = {
+                        "type": "content_block_start",
+                        "index": current_block_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    thinking_block_started = True
+
+                # Send thinking delta
+                block_delta = {
+                    "type": "content_block_delta",
+                    "index": current_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning_content},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                accumulated_thinking += reasoning_content
+
             # Handle text content
             content = delta.get("content")
             if content:
+                # If we were in a thinking block, close it first
+                if thinking_block_started and not content_block_started:
+                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    current_block_index += 1
+                    thinking_block_started = False
+
                 if not content_block_started:
                     # Start a text content block
                     block_start = {
@@ -1143,6 +1190,12 @@ async def anthropic_streaming_wrapper(
                 tc_index = tc.get("index", 0)
 
                 if tc_index not in tool_calls_by_index:
+                    # Close previous thinking block if open
+                    if thinking_block_started:
+                        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                        current_block_index += 1
+                        thinking_block_started = False
+
                     # Close previous text block if open
                     if content_block_started:
                         yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
@@ -1554,6 +1607,24 @@ async def anthropic_messages(
             openai_request["tools"] = openai_tools
         if openai_tool_choice:
             openai_request["tool_choice"] = openai_tool_choice
+
+        # Handle Anthropic thinking config -> reasoning_effort translation
+        if body.thinking:
+            if body.thinking.type == "enabled":
+                # Map budget_tokens to reasoning_effort level
+                # Default to "medium" if enabled but budget not specified
+                budget = body.thinking.budget_tokens or 10000
+                if budget >= 32000:
+                    openai_request["reasoning_effort"] = "high"
+                    openai_request["custom_reasoning_budget"] = True
+                elif budget >= 10000:
+                    openai_request["reasoning_effort"] = "high"
+                elif budget >= 5000:
+                    openai_request["reasoning_effort"] = "medium"
+                else:
+                    openai_request["reasoning_effort"] = "low"
+            elif body.thinking.type == "disabled":
+                openai_request["reasoning_effort"] = "disable"
 
         log_request_to_console(
             url=str(request.url),
