@@ -595,6 +595,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             Priority level (1-10) or None if tier not yet discovered
         """
         tier = self.project_tier_cache.get(credential)
+
+        # Lazy load from file if not in cache
+        if not tier:
+            tier = self._load_tier_from_file(credential)
+
         if not tier:
             return None  # Not yet discovered
 
@@ -609,6 +614,60 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Legacy and unknown get even lower
         return 10
 
+    def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
+        """
+        Load tier from credential file's _proxy_metadata and cache it.
+
+        This is used as a fallback when the tier isn't in the memory cache,
+        typically on first access before initialize_credentials() has run.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            Tier string if found, None otherwise
+        """
+        # Skip env:// paths (environment-based credentials)
+        if self._parse_env_credential_path(credential_path) is not None:
+            return None
+
+        try:
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+
+            metadata = creds.get("_proxy_metadata", {})
+            tier = metadata.get("tier")
+            project_id = metadata.get("project_id")
+
+            if tier:
+                self.project_tier_cache[credential_path] = tier
+                lib_logger.debug(
+                    f"Lazy-loaded tier '{tier}' for credential: {Path(credential_path).name}"
+                )
+
+            if project_id and credential_path not in self.project_id_cache:
+                self.project_id_cache[credential_path] = project_id
+
+            return tier
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            lib_logger.debug(f"Could not lazy-load tier from {credential_path}: {e}")
+            return None
+
+    def get_credential_tier_name(self, credential: str) -> Optional[str]:
+        """
+        Returns the human-readable tier name for a credential.
+
+        Args:
+            credential: The credential path
+
+        Returns:
+            Tier name string (e.g., "free-tier") or None if unknown
+        """
+        tier = self.project_tier_cache.get(credential)
+        if not tier:
+            tier = self._load_tier_from_file(credential)
+        return tier
+
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """
         Returns the minimum priority tier required for a model.
@@ -621,6 +680,72 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             None - no restrictions for any model
         """
         return None
+
+    async def initialize_credentials(self, credential_paths: List[str]) -> None:
+        """
+        Load persisted tier information from credential files at startup.
+
+        This ensures all credential priorities are known before any API calls,
+        preventing unknown credentials from getting priority 999.
+        """
+        await self._load_persisted_tiers(credential_paths)
+
+    async def _load_persisted_tiers(
+        self, credential_paths: List[str]
+    ) -> Dict[str, str]:
+        """
+        Load persisted tier information from credential files into memory cache.
+
+        Args:
+            credential_paths: List of credential file paths
+
+        Returns:
+            Dict mapping credential path to tier name for logging purposes
+        """
+        loaded = {}
+        for path in credential_paths:
+            # Skip env:// paths (environment-based credentials)
+            if self._parse_env_credential_path(path) is not None:
+                continue
+
+            # Skip if already in cache
+            if path in self.project_tier_cache:
+                continue
+
+            try:
+                with open(path, "r") as f:
+                    creds = json.load(f)
+
+                metadata = creds.get("_proxy_metadata", {})
+                tier = metadata.get("tier")
+                project_id = metadata.get("project_id")
+
+                if tier:
+                    self.project_tier_cache[path] = tier
+                    loaded[path] = tier
+                    lib_logger.debug(
+                        f"Loaded persisted tier '{tier}' for credential: {Path(path).name}"
+                    )
+
+                if project_id:
+                    self.project_id_cache[path] = project_id
+
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                lib_logger.debug(f"Could not load persisted tier from {path}: {e}")
+
+        if loaded:
+            # Log summary at debug level
+            tier_counts: Dict[str, int] = {}
+            for tier in loaded.values():
+                tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            lib_logger.debug(
+                f"Antigravity: Loaded {len(loaded)} credential tiers from disk: "
+                + ", ".join(
+                    f"{tier}={count}" for tier, count in sorted(tier_counts.items())
+                )
+            )
+
+        return loaded
 
     # =========================================================================
     # MODEL UTILITIES

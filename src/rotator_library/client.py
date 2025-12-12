@@ -447,12 +447,23 @@ class RotatingClient:
 
         Args:
             provider_name: The name of the provider to get an instance for.
+                          For OAuth providers, this may include "_oauth" suffix
+                          (e.g., "antigravity_oauth"), but credentials are stored
+                          under the base name (e.g., "antigravity").
 
         Returns:
             Provider instance if credentials exist, None otherwise.
         """
+        # For OAuth providers, credentials are stored under base name (without _oauth suffix)
+        # e.g., "antigravity_oauth" plugin → credentials under "antigravity"
+        credential_key = provider_name
+        if provider_name.endswith("_oauth"):
+            base_name = provider_name[:-6]  # Remove "_oauth"
+            if base_name in self.oauth_providers:
+                credential_key = base_name
+
         # Only initialize providers for which we have credentials
-        if provider_name not in self.all_credentials:
+        if credential_key not in self.all_credentials:
             lib_logger.debug(
                 f"Skipping provider '{provider_name}' initialization: no credentials configured"
             )
@@ -824,13 +835,20 @@ class RotatingClient:
                         f"Request will likely fail."
                     )
 
-        # Build priority map for usage_manager
+        # Build priority map and tier names map for usage_manager
+        credential_tier_names = None
         if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
+            credential_tier_names = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
+                # Also get tier name for logging
+                if hasattr(provider_plugin, "get_credential_tier_name"):
+                    tier_name = provider_plugin.get_credential_tier_name(cred)
+                    if tier_name:
+                        credential_tier_names[cred] = tier_name
 
             if credential_priorities:
                 lib_logger.debug(
@@ -883,6 +901,7 @@ class RotatingClient:
                     deadline=deadline,
                     max_concurrent=max_concurrent,
                     credential_priorities=credential_priorities,
+                    credential_tier_names=credential_tier_names,
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -1371,13 +1390,20 @@ class RotatingClient:
                         f"Request will likely fail."
                     )
 
-        # Build priority map for usage_manager
+        # Build priority map and tier names map for usage_manager
+        credential_tier_names = None
         if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
             credential_priorities = {}
+            credential_tier_names = {}
             for cred in credentials_for_provider:
                 priority = provider_plugin.get_credential_priority(cred)
                 if priority is not None:
                     credential_priorities[cred] = priority
+                # Also get tier name for logging
+                if hasattr(provider_plugin, "get_credential_tier_name"):
+                    tier_name = provider_plugin.get_credential_tier_name(cred)
+                    if tier_name:
+                        credential_tier_names[cred] = tier_name
 
             if credential_priorities:
                 lib_logger.debug(
@@ -1433,6 +1459,7 @@ class RotatingClient:
                         deadline=deadline,
                         max_concurrent=max_concurrent,
                         credential_priorities=credential_priorities,
+                        credential_tier_names=credential_tier_names,
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)

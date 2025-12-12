@@ -24,10 +24,23 @@ class ModelDefinitions:
     - IFLOW_MODELS='{"glm-4.6": {}}' - dict format, uses "glm-4.6" as both name and ID
     - IFLOW_MODELS='{"custom-name": {"id": "actual-id"}}' - dict format with custom ID
     - IFLOW_MODELS='{"model": {"id": "id", "options": {"temperature": 0.7}}}' - with options
+
+    This class is a singleton - instantiated once and shared across all providers.
     """
 
+    _instance: Optional["ModelDefinitions"] = None
+    _initialized: bool = False
+
+    def __new__(cls, config_path: Optional[str] = None):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self, config_path: Optional[str] = None):
-        """Initialize model definitions loader."""
+        """Initialize model definitions loader (only runs once due to singleton)."""
+        if ModelDefinitions._initialized:
+            return
+        ModelDefinitions._initialized = True
         self.config_path = config_path
         self.definitions = {}
         self._load_definitions()
@@ -49,7 +62,11 @@ class ModelDefinitions:
                     # Handle array format: ["model-1", "model-2", "model-3"]
                     elif isinstance(models_json, list):
                         # Convert array to dict format with empty definitions
-                        models_dict = {model_name: {} for model_name in models_json if isinstance(model_name, str)}
+                        models_dict = {
+                            model_name: {}
+                            for model_name in models_json
+                            if isinstance(model_name, str)
+                        }
                         self.definitions[provider_name] = models_dict
                         lib_logger.info(
                             f"Loaded {len(models_dict)} models for provider: {provider_name} (array format)"
