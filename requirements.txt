@@ -19,3 +19,6 @@ aiohttp
 colorlog
 
 rich
+
+# GUI for model filter configuration
+customtkinter
