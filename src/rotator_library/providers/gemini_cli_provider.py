@@ -1256,13 +1256,22 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     schema = self._gemini_cli_transform_schema(
                         new_function["parameters"]
                     )
+                    # Workaround: Gemini fails to emit functionCall for tools
+                    # with empty properties {}. Inject a dummy optional param.
+                    props = schema.get("properties", {})
+                    if not props:
+                        schema["properties"] = {
+                            "_": {"type": "string", "description": "Unused"}
+                        }
                     new_function["parametersJsonSchema"] = schema
                     del new_function["parameters"]
                 elif "parametersJsonSchema" not in new_function:
-                    # Set default empty schema if neither exists
+                    # Set default schema with dummy param if neither exists
                     new_function["parametersJsonSchema"] = {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "_": {"type": "string", "description": "Unused"}
+                        },
                     }
 
                 # Gemini 3 specific transformations

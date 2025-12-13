@@ -2450,9 +2450,23 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 schema.pop("$schema", None)
                 schema.pop("strict", None)
                 schema = _normalize_type_arrays(schema)
+
+                # Workaround: Antigravity/Gemini fails to emit functionCall
+                # when tool has empty properties {}. Inject a dummy optional
+                # parameter to ensure the tool call is emitted.
+                props = schema.get("properties", {})
+                if not props:
+                    schema["properties"] = {
+                        "_": {"type": "string", "description": "Unused"}
+                    }
+
                 func_decl["parametersJsonSchema"] = schema
             else:
-                func_decl["parametersJsonSchema"] = {"type": "object", "properties": {}}
+                # No parameters provided - use default with dummy param
+                func_decl["parametersJsonSchema"] = {
+                    "type": "object",
+                    "properties": {"_": {"type": "string", "description": "Unused"}},
+                }
 
             gemini_tools.append({"functionDeclarations": [func_decl]})
 
@@ -2577,7 +2591,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         return antigravity_payload
 
     def _apply_claude_tool_transform(self, payload: Dict[str, Any]) -> None:
-        """Apply Claude-specific tool schema transformations."""
+        """Apply Claude-specific tool schema transformations.
+
+        Converts parametersJsonSchema to parameters and applies Claude-specific
+        schema cleaning (removes unsupported JSON Schema fields).
+        """
         tools = payload["request"].get("tools", [])
         for tool in tools:
             for func_decl in tool.get("functionDeclarations", []):
@@ -3219,8 +3237,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "POST", url, headers=headers, json=payload, timeout=600.0
         ) as response:
             if response.status_code >= 400:
-                # Read error body for raise_for_status to include in exception
-                # Terminal logging commented out - errors are logged in failures.log
+                # Read error body so it's available in response.text for logging
+                # The actual logging happens in failure_logger via _extract_response_body
                 try:
                     await response.aread()
                     # lib_logger.error(
