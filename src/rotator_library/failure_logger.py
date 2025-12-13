@@ -55,10 +55,27 @@ def _extract_response_body(error: Exception) -> str:
     Extract the full response body from various error types.
 
     Handles:
+    - StreamedAPIError: wraps original exception in .data attribute
     - httpx.HTTPStatusError: response.text or response.content
     - litellm exceptions: various response attributes
     - Other exceptions: str(error)
     """
+    # Handle StreamedAPIError which wraps the original exception in .data
+    # This is used by our streaming wrapper when catching provider errors
+    if hasattr(error, "data") and error.data is not None:
+        inner = error.data
+        # If data is a dict (parsed JSON error), return it as JSON
+        if isinstance(inner, dict):
+            try:
+                return json.dumps(inner, indent=2)
+            except Exception:
+                return str(inner)
+        # If data is an exception, recurse to extract from it
+        if isinstance(inner, Exception):
+            result = _extract_response_body(inner)
+            if result:
+                return result
+
     # Try to get response body from httpx errors
     if hasattr(error, "response") and error.response is not None:
         response = error.response
