@@ -3537,6 +3537,28 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             gen_config["maxOutputTokens"] = DEFAULT_MAX_OUTPUT_TOKENS
         # For non-Claude models without explicit max_tokens, don't set it
 
+        # CRITICAL: For Claude with extended thinking, max_tokens MUST be > thinking.budget_tokens
+        # Per Claude docs: https://docs.claude.com/en/docs/build-with-claude/extended-thinking
+        # If this constraint is violated, the API returns 400 INVALID_ARGUMENT
+        thinking_config = gen_config.get("thinkingConfig", {})
+        thinking_budget = thinking_config.get("thinkingBudget", 0)
+        current_max_tokens = gen_config.get("maxOutputTokens")
+
+        if (
+            is_claude
+            and thinking_budget
+            and thinking_budget > 0
+            and current_max_tokens is not None
+        ):
+            # Ensure max_tokens > thinkingBudget (add buffer for actual response content)
+            min_required_tokens = thinking_budget + 1024  # 1024 buffer for response
+            if current_max_tokens <= thinking_budget:
+                lib_logger.warning(
+                    f"max_tokens ({current_max_tokens}) must be > thinkingBudget ({thinking_budget}). "
+                    f"Adjusting to {min_required_tokens}"
+                )
+                gen_config["maxOutputTokens"] = min_required_tokens
+
         antigravity_payload["request"]["generationConfig"] = gen_config
 
         # Set toolConfig based on tool_choice parameter
