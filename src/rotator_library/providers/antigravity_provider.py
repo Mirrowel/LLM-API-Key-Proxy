@@ -2454,18 +2454,31 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 # Workaround: Antigravity/Gemini fails to emit functionCall
                 # when tool has empty properties {}. Inject a dummy optional
                 # parameter to ensure the tool call is emitted.
+                # Using a required confirmation parameter forces the model to
+                # commit to the tool call rather than just thinking about it.
                 props = schema.get("properties", {})
                 if not props:
                     schema["properties"] = {
-                        "_": {"type": "string", "description": "Unused"}
+                        "_confirm": {
+                            "type": "string",
+                            "description": "Enter 'yes' to proceed",
+                        }
                     }
+                    schema["required"] = ["_confirm"]
 
                 func_decl["parametersJsonSchema"] = schema
             else:
-                # No parameters provided - use default with dummy param
+                # No parameters provided - use default with required confirm param
+                # to ensure the tool call is emitted properly
                 func_decl["parametersJsonSchema"] = {
                     "type": "object",
-                    "properties": {"_": {"type": "string", "description": "Unused"}},
+                    "properties": {
+                        "_confirm": {
+                            "type": "string",
+                            "description": "Enter 'yes' to proceed",
+                        }
+                    },
+                    "required": ["_confirm"],
                 }
 
             gemini_tools.append({"functionDeclarations": [func_decl]})
@@ -2833,6 +2846,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         raw_args = func_call.get("args", {})
         parsed_args = _recursively_parse_json_strings(raw_args)
+
+        # Strip the injected _confirm parameter ONLY if it's the sole parameter
+        # This ensures we only strip our injection, not legitimate user params
+        if isinstance(parsed_args, dict) and "_confirm" in parsed_args:
+            if len(parsed_args) == 1:
+                # _confirm is the only param - this was our injection
+                parsed_args.pop("_confirm")
 
         tool_call = {
             "id": tool_id,

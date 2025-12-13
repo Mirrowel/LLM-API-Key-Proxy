@@ -942,13 +942,21 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Get current tool index from accumulator (default 0) and increment
                 current_tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
 
+                # Get args and strip _confirm ONLY if it's the sole parameter
+                # This ensures we only strip our injection, not legitimate user params
+                tool_args = function_call.get("args", {})
+                if isinstance(tool_args, dict) and "_confirm" in tool_args:
+                    if len(tool_args) == 1:
+                        # _confirm is the only param - this was our injection
+                        tool_args.pop("_confirm")
+
                 tool_call = {
                     "index": current_tool_idx,
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
                         "name": function_name,
-                        "arguments": json.dumps(function_call.get("args", {})),
+                        "arguments": json.dumps(tool_args),
                     },
                 }
 
@@ -1257,21 +1265,31 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         new_function["parameters"]
                     )
                     # Workaround: Gemini fails to emit functionCall for tools
-                    # with empty properties {}. Inject a dummy optional param.
+                    # with empty properties {}. Inject a required confirmation param.
+                    # Using a required parameter forces the model to commit to
+                    # the tool call rather than just thinking about it.
                     props = schema.get("properties", {})
                     if not props:
                         schema["properties"] = {
-                            "_": {"type": "string", "description": "Unused"}
+                            "_confirm": {
+                                "type": "string",
+                                "description": "Enter 'yes' to proceed",
+                            }
                         }
+                        schema["required"] = ["_confirm"]
                     new_function["parametersJsonSchema"] = schema
                     del new_function["parameters"]
                 elif "parametersJsonSchema" not in new_function:
-                    # Set default schema with dummy param if neither exists
+                    # Set default schema with required confirm param if neither exists
                     new_function["parametersJsonSchema"] = {
                         "type": "object",
                         "properties": {
-                            "_": {"type": "string", "description": "Unused"}
+                            "_confirm": {
+                                "type": "string",
+                                "description": "Enter 'yes' to proceed",
+                            }
                         },
+                        "required": ["_confirm"],
                     }
 
                 # Gemini 3 specific transformations
