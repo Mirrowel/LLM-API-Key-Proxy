@@ -1965,7 +1965,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         headers=final_headers,
                         json=request_payload,
                         params={"alt": "sse"},
-                        timeout=600,
+                        timeout=httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=120.0),
                     ) as response:
                         # Read and log error body before raise_for_status for better debugging
                         if response.status_code >= 400:

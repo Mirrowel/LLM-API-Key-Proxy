@@ -503,7 +503,10 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             file_logger.log_request(payload)
             lib_logger.debug(f"Qwen Code Request URL: {url}")
 
-            return client.stream("POST", url, headers=headers, json=payload, timeout=600)
+            return client.stream(
+                "POST", url, headers=headers, json=payload,
+                timeout=httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=120.0)
+            )
 
         async def stream_handler(response_stream, attempt=1):
             """Handles the streaming response and converts chunks."""
