@@ -984,11 +984,13 @@ def openai_to_anthropic_response(openai_response: dict, original_model: str) -> 
     # Add thinking content block if reasoning_content is present
     reasoning_content = message.get("reasoning_content")
     if reasoning_content:
-        content_blocks.append({
-            "type": "thinking",
-            "thinking": reasoning_content,
-            "signature": "",  # Signature is typically empty for proxied responses
-        })
+        content_blocks.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning_content,
+                "signature": "",  # Signature is typically empty for proxied responses
+            }
+        )
 
     # Add text content if present
     text_content = message.get("content")
@@ -1086,7 +1088,11 @@ async def anthropic_streaming_wrapper(
             data_content = chunk_str[len("data:") :].strip()
             if data_content == "[DONE]":
                 # Close any open content blocks (thinking, text, or tool_use)
-                if thinking_block_started or content_block_started or tool_calls_by_index:
+                if (
+                    thinking_block_started
+                    or content_block_started
+                    or tool_calls_by_index
+                ):
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
 
                 # Determine stop_reason based on whether we had tool calls
@@ -1245,6 +1251,48 @@ async def anthropic_streaming_wrapper(
 
     except Exception as e:
         logging.error(f"Error in Anthropic streaming wrapper: {e}")
+
+        # If we haven't sent message_start yet, send it now so the client can display the error
+        # Claude Code and other clients may ignore events that come before message_start
+        if not message_started:
+            message_start = {
+                "type": "message_start",
+                "message": {
+                    "id": request_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": original_model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }
+            yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+        # Send the error as a text content block so it's visible to the user
+        error_message = f"Error: {str(e)}"
+        error_block_start = {
+            "type": "content_block_start",
+            "index": current_block_index,
+            "content_block": {"type": "text", "text": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(error_block_start)}\n\n"
+
+        error_block_delta = {
+            "type": "content_block_delta",
+            "index": current_block_index,
+            "delta": {"type": "text_delta", "text": error_message},
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(error_block_delta)}\n\n"
+
+        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+
+        # Send message_delta and message_stop to properly close the stream
+        yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "end_turn", "stop_sequence": null}}, "usage": {{"output_tokens": 0}}}}\n\n'
+        yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+        # Also send the formal error event for clients that handle it
         error_event = {
             "type": "error",
             "error": {"type": "api_error", "message": str(e)},
