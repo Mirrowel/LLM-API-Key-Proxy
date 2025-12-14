@@ -340,6 +340,33 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
     return obj
 
 
+def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Inline local $ref definitions before sanitization."""
+    if not isinstance(schema, dict):
+        return schema
+
+    defs = schema.get("$defs", schema.get("definitions", {}))
+    if not defs:
+        return schema
+
+    def resolve(node, seen=()):
+        if not isinstance(node, dict):
+            return [resolve(x, seen) for x in node] if isinstance(node, list) else node
+        if "$ref" in node:
+            ref = node["$ref"]
+            if ref in seen:  # Circular - drop it
+                return {k: resolve(v, seen) for k, v in node.items() if k != "$ref"}
+            for prefix in ("#/$defs/", "#/definitions/"):
+                if isinstance(ref, str) and ref.startswith(prefix):
+                    name = ref[len(prefix) :]
+                    if name in defs:
+                        return resolve(copy.deepcopy(defs[name]), seen + (ref,))
+            return {k: resolve(v, seen) for k, v in node.items() if k != "$ref"}
+        return {k: resolve(v, seen) for k, v in node.items()}
+
+    return resolve(schema)
+
+
 def _clean_claude_schema(schema: Any) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
@@ -397,7 +424,6 @@ def _clean_claude_schema(schema: Any) -> Any:
             return first_option
 
     cleaned = {}
-
     # Handle 'const' by converting to 'enum' with single value
     if "const" in schema:
         const_value = schema["const"]
@@ -2507,8 +2533,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
             if params and isinstance(params, dict):
                 schema = dict(params)
-                schema.pop("$schema", None)
                 schema.pop("strict", None)
+                # Inline $ref definitions, then strip unsupported keywords
+                schema = _inline_schema_refs(schema)
+                schema = _clean_claude_schema(schema)
                 schema = _normalize_type_arrays(schema)
 
                 # Workaround: Antigravity/Gemini fails to emit functionCall
@@ -2667,18 +2695,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """Apply Claude-specific tool schema transformations.
 
         Converts parametersJsonSchema to parameters and applies Claude-specific
-        schema cleaning (removes unsupported JSON Schema fields).
+        schema sanitization (inlines $ref, removes unsupported JSON Schema fields).
         """
         tools = payload["request"].get("tools", [])
         for tool in tools:
             for func_decl in tool.get("functionDeclarations", []):
                 if "parametersJsonSchema" in func_decl:
                     params = func_decl["parametersJsonSchema"]
-                    params = (
-                        _clean_claude_schema(params)
-                        if isinstance(params, dict)
-                        else params
-                    )
+                    if isinstance(params, dict):
+                        params = _inline_schema_refs(params)
+                        params = _clean_claude_schema(params)
                     func_decl["parameters"] = params
                     del func_decl["parametersJsonSchema"]
 
