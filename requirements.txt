@@ -22,3 +22,6 @@ rich
 
 # GUI for model filter configuration
 customtkinter
+
+# For building the executable
+pyinstaller

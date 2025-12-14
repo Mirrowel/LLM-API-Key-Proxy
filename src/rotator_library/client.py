@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import json
 import re
 import codecs
@@ -274,7 +275,14 @@ class RotatingClient:
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
         Checks if a model should be ignored based on the ignore list.
-        Supports exact and partial matching for both full model IDs and model names.
+        Supports full glob/fnmatch patterns for both full model IDs and model names.
+
+        Pattern examples:
+        - "gpt-4" - exact match
+        - "gpt-4*" - prefix wildcard (matches gpt-4, gpt-4-turbo, etc.)
+        - "*-preview" - suffix wildcard (matches gpt-4-preview, o1-preview, etc.)
+        - "*-preview*" - contains wildcard (matches anything with -preview)
+        - "*" - match all
         """
         model_provider = model_id.split("/")[0]
         if model_provider not in self.ignore_models:
@@ -291,52 +299,43 @@ class RotatingClient:
             provider_model_name = model_id
 
         for ignored_pattern in ignore_list:
-            if ignored_pattern.endswith("*"):
-                match_pattern = ignored_pattern[:-1]
-                # Match wildcard against the provider's model name
-                if provider_model_name.startswith(match_pattern):
-                    return True
-            else:
-                # Exact match against the full proxy ID OR the provider's model name
-                if (
-                    model_id == ignored_pattern
-                    or provider_model_name == ignored_pattern
-                ):
-                    return True
+            # Use fnmatch for full glob pattern support
+            if fnmatch.fnmatch(provider_model_name, ignored_pattern) or fnmatch.fnmatch(
+                model_id, ignored_pattern
+            ):
+                return True
         return False
 
     def _is_model_whitelisted(self, provider: str, model_id: str) -> bool:
         """
         Checks if a model is explicitly whitelisted.
-        Supports exact and partial matching for both full model IDs and model names.
+        Supports full glob/fnmatch patterns for both full model IDs and model names.
+
+        Pattern examples:
+        - "gpt-4" - exact match
+        - "gpt-4*" - prefix wildcard (matches gpt-4, gpt-4-turbo, etc.)
+        - "*-preview" - suffix wildcard (matches gpt-4-preview, o1-preview, etc.)
+        - "*-preview*" - contains wildcard (matches anything with -preview)
+        - "*" - match all
         """
         model_provider = model_id.split("/")[0]
         if model_provider not in self.whitelist_models:
             return False
 
         whitelist = self.whitelist_models[model_provider]
+
+        try:
+            # This is the model name as the provider sees it (e.g., "gpt-4" or "google/gemma-7b")
+            provider_model_name = model_id.split("/", 1)[1]
+        except IndexError:
+            provider_model_name = model_id
+
         for whitelisted_pattern in whitelist:
-            if whitelisted_pattern == "*":
+            # Use fnmatch for full glob pattern support
+            if fnmatch.fnmatch(
+                provider_model_name, whitelisted_pattern
+            ) or fnmatch.fnmatch(model_id, whitelisted_pattern):
                 return True
-
-            try:
-                # This is the model name as the provider sees it (e.g., "gpt-4" or "google/gemma-7b")
-                provider_model_name = model_id.split("/", 1)[1]
-            except IndexError:
-                provider_model_name = model_id
-
-            if whitelisted_pattern.endswith("*"):
-                match_pattern = whitelisted_pattern[:-1]
-                # Match wildcard against the provider's model name
-                if provider_model_name.startswith(match_pattern):
-                    return True
-            else:
-                # Exact match against the full proxy ID OR the provider's model name
-                if (
-                    model_id == whitelisted_pattern
-                    or provider_model_name == whitelisted_pattern
-                ):
-                    return True
         return False
 
     def _sanitize_litellm_log(self, log_data: dict) -> dict:

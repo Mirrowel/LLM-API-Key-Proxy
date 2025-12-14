@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotator_library"
-version = "1.0"
+version = "1.05"
 authors = [
     { name="Mirrowel", email="nuh@uh.com" },
 ]
@@ -16,11 +16,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = [
-    "litellm",
-    "filelock",
-    "httpx"
-]
+dependencies = []
 
 [project.urls]
 "Homepage" = "https://github.com/Mirrowel/LLM-API-Key-Proxy"

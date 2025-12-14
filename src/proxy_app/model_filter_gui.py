@@ -16,9 +16,12 @@ Features:
 import customtkinter as ctk
 from tkinter import Menu
 import asyncio
+import fnmatch
+import platform
 import threading
 import os
 import re
+import traceback
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Set
@@ -88,6 +91,34 @@ FONT_SIZE_NORMAL = 12
 FONT_SIZE_LARGE = 14
 FONT_SIZE_TITLE = 16
 FONT_SIZE_HEADER = 20
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CROSS-PLATFORM UTILITIES
+# ════════════════════════════════════════════════════════════════════════════════
+
+
+def get_scroll_delta(event) -> int:
+    """
+    Calculate scroll delta in a cross-platform manner.
+
+    On Windows, event.delta is typically ±120 per notch.
+    On macOS, event.delta is typically ±1 per scroll event.
+    On Linux/X11, behavior varies but is usually similar to macOS.
+
+    Returns a normalized scroll direction value (typically ±1).
+    """
+    system = platform.system()
+    if system == "Darwin":  # macOS
+        return -event.delta
+    elif system == "Linux":
+        # Linux with X11 typically uses ±1 like macOS
+        # but some configurations may use larger values
+        if abs(event.delta) >= 120:
+            return -1 * (event.delta // 120)
+        return -event.delta
+    else:  # Windows
+        return -1 * (event.delta // 120)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -254,10 +285,14 @@ class FilterEngine:
         """
         Check if a pattern matches a model ID.
 
-        Supports:
+        Supports full glob/fnmatch syntax:
         - Exact match: "gpt-4" matches only "gpt-4"
         - Prefix wildcard: "gpt-4*" matches "gpt-4", "gpt-4-turbo", etc.
+        - Suffix wildcard: "*-preview" matches "gpt-4-preview", "o1-preview", etc.
+        - Contains wildcard: "*-preview*" matches anything containing "-preview"
         - Match all: "*" matches everything
+        - Single char wildcard: "gpt-?" matches "gpt-4", "gpt-5", etc.
+        - Character sets: "gpt-[45]*" matches "gpt-4*", "gpt-5*"
         """
         # Extract model name without provider prefix
         if "/" in model_id:
@@ -265,14 +300,11 @@ class FilterEngine:
         else:
             provider_model_name = model_id
 
-        if pattern == "*":
-            return True
-        elif pattern.endswith("*"):
-            prefix = pattern[:-1]
-            return provider_model_name.startswith(prefix) or model_id.startswith(prefix)
-        else:
-            # Exact match against full ID or provider model name
-            return model_id == pattern or provider_model_name == pattern
+        # Use fnmatch for full glob pattern support
+        # Match against both the provider model name and the full model ID
+        return fnmatch.fnmatch(provider_model_name, pattern) or fnmatch.fnmatch(
+            model_id, pattern
+        )
 
     def pattern_is_covered_by(self, new_pattern: str, existing_pattern: str) -> bool:
         """
@@ -491,6 +523,7 @@ class FilterEngine:
             return True
         except Exception as e:
             print(f"Error saving to .env: {e}")
+            traceback.print_exc()
             return False
 
     def has_unsaved_changes(self) -> bool:
@@ -801,7 +834,9 @@ class HelpWindow(ctk.CTkToplevel):
     def _on_mousewheel(self, event):
         """Handle mouse wheel with faster scrolling."""
         # CTkTextbox uses _textbox internally
-        self.text_box._textbox.yview_scroll(-1 * (event.delta // 40), "units")
+        # Use larger scroll amount (3 units) for faster scrolling in help window
+        delta = get_scroll_delta(event) * 3
+        self.text_box._textbox.yview_scroll(delta, "units")
         return "break"
 
     def _insert_help_content(self):
@@ -838,7 +873,7 @@ class HelpWindow(ctk.CTkToplevel):
             ),
             (
                 "✏️ Pattern Syntax",
-                """Three types of patterns are supported:
+                """Full glob/wildcard patterns are supported:
 
 EXACT MATCH
   Pattern: gpt-4
@@ -847,10 +882,26 @@ EXACT MATCH
 PREFIX WILDCARD  
   Pattern: gpt-4*
   Matches: "gpt-4", "gpt-4-turbo", "gpt-4-preview", etc.
-   
+
+SUFFIX WILDCARD
+  Pattern: *-preview
+  Matches: "gpt-4-preview", "o1-preview", etc.
+
+CONTAINS WILDCARD
+  Pattern: *-preview*
+  Matches: anything containing "-preview"
+
 MATCH ALL
   Pattern: *
-  Matches: every model for this provider""",
+  Matches: every model for this provider
+
+SINGLE CHARACTER
+  Pattern: gpt-?
+  Matches: "gpt-4", "gpt-5", etc. (any single char)
+
+CHARACTER SET
+  Pattern: gpt-[45]*
+  Matches: "gpt-4", "gpt-4-turbo", "gpt-5", etc.""",
             ),
             (
                 "💡 Common Patterns",
@@ -1533,7 +1584,7 @@ class VirtualModelList:
 
     def _on_mousewheel(self, event):
         """Handle mouse wheel scrolling."""
-        delta = -1 * (event.delta // 120)
+        delta = get_scroll_delta(event)
         self.canvas.yview_scroll(delta, "units")
         self._render()
         return "break"
@@ -1998,16 +2049,12 @@ class VirtualSyncModelLists(ctk.CTkFrame):
         """Copy filtered/available model names to clipboard (comma-separated)."""
         if not self.models:
             return
-        # Get only models that are not ignored
+        # Get only models that are not ignored (models without status default to available)
         available = [
             self._get_model_display_name(m)
             for m in self.models
-            if self.statuses.get(m) and self.statuses[m].status != "ignored"
+            if self.statuses.get(m) is None or self.statuses[m].status != "ignored"
         ]
-        # Also include models with no status (default to available)
-        for m in self.models:
-            if m not in self.statuses:
-                available.append(self._get_model_display_name(m))
         text = ", ".join(available)
         self.clipboard_clear()
         self.clipboard_append(text)
@@ -2182,7 +2229,7 @@ class VirtualRuleList:
 
     def _on_mousewheel(self, event):
         """Handle mouse wheel scrolling."""
-        delta = -1 * (event.delta // 120)
+        delta = get_scroll_delta(event)
         self.canvas.yview_scroll(delta, "units")
         self._render()
         return "break"
