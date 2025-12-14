@@ -11,6 +11,7 @@ from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
+from ..timeout_config import TimeoutConfig
 import litellm
 from litellm.exceptions import RateLimitError
 from ..error_handler import extract_retry_after_from_body
@@ -1965,7 +1966,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         headers=final_headers,
                         json=request_payload,
                         params={"alt": "sse"},
-                        timeout=httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=120.0),
+                        timeout=TimeoutConfig.streaming(),
                     ) as response:
                         # Read and log error body before raise_for_status for better debugging
                         if response.status_code >= 400:

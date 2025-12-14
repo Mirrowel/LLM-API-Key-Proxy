@@ -10,19 +10,22 @@ from typing import Union, AsyncGenerator, List, Dict, Any
 from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 from ..model_definitions import ModelDefinitions
+from ..timeout_config import TimeoutConfig
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 from pathlib import Path
 import uuid
 from datetime import datetime
 
-lib_logger = logging.getLogger('rotator_library')
+lib_logger = logging.getLogger("rotator_library")
 
 LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
 QWEN_CODE_LOGS_DIR = LOGS_DIR / "qwen_code_logs"
 
+
 class _QwenCodeFileLogger:
     """A simple file logger for a single Qwen Code transaction."""
+
     def __init__(self, model_name: str, enabled: bool = True):
         self.enabled = enabled
         if not self.enabled:
@@ -31,8 +34,10 @@ class _QwenCodeFileLogger:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         request_id = str(uuid.uuid4())
         # Sanitize model name for directory
-        safe_model_name = model_name.replace('/', '_').replace(':', '_')
-        self.log_dir = QWEN_CODE_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        safe_model_name = model_name.replace("/", "_").replace(":", "_")
+        self.log_dir = (
+            QWEN_CODE_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        )
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -41,25 +46,32 @@ class _QwenCodeFileLogger:
 
     def log_request(self, payload: Dict[str, Any]):
         """Logs the request payload sent to Qwen Code."""
-        if not self.enabled: return
+        if not self.enabled:
+            return
         try:
-            with open(self.log_dir / "request_payload.json", "w", encoding="utf-8") as f:
+            with open(
+                self.log_dir / "request_payload.json", "w", encoding="utf-8"
+            ) as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
         except Exception as e:
             lib_logger.error(f"_QwenCodeFileLogger: Failed to write request: {e}")
 
     def log_response_chunk(self, chunk: str):
         """Logs a raw chunk from the Qwen Code response stream."""
-        if not self.enabled: return
+        if not self.enabled:
+            return
         try:
             with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
                 f.write(chunk + "\n")
         except Exception as e:
-            lib_logger.error(f"_QwenCodeFileLogger: Failed to write response chunk: {e}")
+            lib_logger.error(
+                f"_QwenCodeFileLogger: Failed to write response chunk: {e}"
+            )
 
     def log_error(self, error_message: str):
         """Logs an error message."""
-        if not self.enabled: return
+        if not self.enabled:
+            return
         try:
             with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
@@ -68,28 +80,41 @@ class _QwenCodeFileLogger:
 
     def log_final_response(self, response_data: Dict[str, Any]):
         """Logs the final, reassembled response."""
-        if not self.enabled: return
+        if not self.enabled:
+            return
         try:
             with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
                 json.dump(response_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            lib_logger.error(f"_QwenCodeFileLogger: Failed to write final response: {e}")
+            lib_logger.error(
+                f"_QwenCodeFileLogger: Failed to write final response: {e}"
+            )
 
-HARDCODED_MODELS = [
-    "qwen3-coder-plus",
-    "qwen3-coder-flash"
-]
+
+HARDCODED_MODELS = ["qwen3-coder-plus", "qwen3-coder-flash"]
 
 # OpenAI-compatible parameters supported by Qwen Code API
 SUPPORTED_PARAMS = {
-    'model', 'messages', 'temperature', 'top_p', 'max_tokens',
-    'stream', 'tools', 'tool_choice', 'presence_penalty',
-    'frequency_penalty', 'n', 'stop', 'seed', 'response_format'
+    "model",
+    "messages",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "stream",
+    "tools",
+    "tool_choice",
+    "presence_penalty",
+    "frequency_penalty",
+    "n",
+    "stop",
+    "seed",
+    "response_format",
 }
+
 
 class QwenCodeProvider(QwenAuthBase, ProviderInterface):
     skip_cost_calculation = True
-    REASONING_START_MARKER = 'THINK||'
+    REASONING_START_MARKER = "THINK||"
 
     def __init__(self):
         super().__init__()
@@ -111,7 +136,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         Validates OAuth credentials if applicable.
         """
         models = []
-        env_var_ids = set()  # Track IDs from env vars to prevent hardcoded/dynamic duplicates
+        env_var_ids = (
+            set()
+        )  # Track IDs from env vars to prevent hardcoded/dynamic duplicates
 
         def extract_model_id(item) -> str:
             """Extract model ID from various formats (dict, string with/without provider prefix)."""
@@ -137,7 +164,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                 # Track the ID to prevent hardcoded/dynamic duplicates
                 if model_id:
                     env_var_ids.add(model_id)
-            lib_logger.info(f"Loaded {len(static_models)} static models for qwen_code from environment variables")
+            lib_logger.info(
+                f"Loaded {len(static_models)} static models for qwen_code from environment variables"
+            )
 
         # Source 2: Add hardcoded models (only if ID not already in env vars)
         for model_id in HARDCODED_MODELS:
@@ -155,14 +184,17 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             models_url = f"{api_base.rstrip('/')}/v1/models"
 
             response = await client.get(
-                models_url,
-                headers={"Authorization": f"Bearer {access_token}"}
+                models_url, headers={"Authorization": f"Bearer {access_token}"}
             )
             response.raise_for_status()
 
             dynamic_data = response.json()
             # Handle both {data: [...]} and direct [...] formats
-            model_list = dynamic_data.get("data", dynamic_data) if isinstance(dynamic_data, dict) else dynamic_data
+            model_list = (
+                dynamic_data.get("data", dynamic_data)
+                if isinstance(dynamic_data, dict)
+                else dynamic_data
+            )
 
             dynamic_count = 0
             for model in model_list:
@@ -173,7 +205,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     dynamic_count += 1
 
             if dynamic_count > 0:
-                lib_logger.debug(f"Discovered {dynamic_count} additional models for qwen_code from API")
+                lib_logger.debug(
+                    f"Discovered {dynamic_count} additional models for qwen_code from API"
+                )
 
         except Exception as e:
             # Silently ignore dynamic discovery errors
@@ -238,10 +272,10 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         payload = {k: v for k, v in kwargs.items() if k in SUPPORTED_PARAMS}
 
         # Always force streaming for internal processing
-        payload['stream'] = True
+        payload["stream"] = True
 
         # Always include usage data in stream
-        payload['stream_options'] = {"include_usage": True}
+        payload["stream_options"] = {"include_usage": True}
 
         # Handle tool schema cleaning
         if "tools" in payload and payload["tools"]:
@@ -250,22 +284,26 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         elif not payload.get("tools"):
             # Per Qwen Code API bug (see: https://github.com/qianwen-team/flash-dance/issues/2),
             # injecting a dummy tool prevents stream corruption when no tools are provided
-            payload["tools"] = [{
-                "type": "function",
-                "function": {
-                    "name": "do_not_call_me",
-                    "description": "Do not call this tool.",
-                    "parameters": {"type": "object", "properties": {}}
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "do_not_call_me",
+                        "description": "Do not call this tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
                 }
-            }]
-            lib_logger.debug("Injected dummy tool to prevent Qwen API stream corruption")
+            ]
+            lib_logger.debug(
+                "Injected dummy tool to prevent Qwen API stream corruption"
+            )
 
         return payload
 
     def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
         """
         Converts a raw Qwen SSE chunk to an OpenAI-compatible chunk.
-        
+
         CRITICAL FIX: Handle chunks with BOTH usage and choices (final chunk)
         without early return to ensure finish_reason is properly processed.
         """
@@ -287,32 +325,42 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
             # Yield the choice chunk first (contains finish_reason)
             yield {
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-                "model": model_id, "object": "chat.completion.chunk",
-                "id": chunk_id, "created": chunk_created
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk_id,
+                "created": chunk_created,
             }
             # Then yield the usage chunk
             yield {
-                "choices": [], "model": model_id, "object": "chat.completion.chunk",
-                "id": chunk_id, "created": chunk_created,
+                "choices": [],
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk_id,
+                "created": chunk_created,
                 "usage": {
                     "prompt_tokens": usage_data.get("prompt_tokens", 0),
                     "completion_tokens": usage_data.get("completion_tokens", 0),
                     "total_tokens": usage_data.get("total_tokens", 0),
-                }
+                },
             }
             return
 
         # Handle usage-only chunks
         if usage_data:
             yield {
-                "choices": [], "model": model_id, "object": "chat.completion.chunk",
-                "id": chunk_id, "created": chunk_created,
+                "choices": [],
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk_id,
+                "created": chunk_created,
                 "usage": {
                     "prompt_tokens": usage_data.get("prompt_tokens", 0),
                     "completion_tokens": usage_data.get("completion_tokens", 0),
                     "total_tokens": usage_data.get("total_tokens", 0),
-                }
+                },
             }
             return
 
@@ -327,35 +375,52 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         # Handle <think> tags for reasoning content
         content = delta.get("content")
         if content and ("<think>" in content or "</think>" in content):
-            parts = content.replace("<think>", f"||{self.REASONING_START_MARKER}").replace("</think>", f"||/{self.REASONING_START_MARKER}").split("||")
+            parts = (
+                content.replace("<think>", f"||{self.REASONING_START_MARKER}")
+                .replace("</think>", f"||/{self.REASONING_START_MARKER}")
+                .split("||")
+            )
             for part in parts:
-                if not part: continue
-                
+                if not part:
+                    continue
+
                 new_delta = {}
                 if part.startswith(self.REASONING_START_MARKER):
-                    new_delta['reasoning_content'] = part.replace(self.REASONING_START_MARKER, "")
+                    new_delta["reasoning_content"] = part.replace(
+                        self.REASONING_START_MARKER, ""
+                    )
                 elif part.startswith(f"/{self.REASONING_START_MARKER}"):
                     continue
                 else:
-                    new_delta['content'] = part
-                
+                    new_delta["content"] = part
+
                 yield {
-                    "choices": [{"index": 0, "delta": new_delta, "finish_reason": None}],
-                    "model": model_id, "object": "chat.completion.chunk",
-                    "id": chunk_id, "created": chunk_created
+                    "choices": [
+                        {"index": 0, "delta": new_delta, "finish_reason": None}
+                    ],
+                    "model": model_id,
+                    "object": "chat.completion.chunk",
+                    "id": chunk_id,
+                    "created": chunk_created,
                 }
         else:
             # Standard content chunk
             yield {
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-                "model": model_id, "object": "chat.completion.chunk",
-                "id": chunk_id, "created": chunk_created
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk_id,
+                "created": chunk_created,
             }
 
-    def _stream_to_completion_response(self, chunks: List[litellm.ModelResponse]) -> litellm.ModelResponse:
+    def _stream_to_completion_response(
+        self, chunks: List[litellm.ModelResponse]
+    ) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
-        
+
         Key improvements:
         - Determines finish_reason based on accumulated state (tool_calls vs stop)
         - Properly initializes tool_calls with type field
@@ -368,14 +433,16 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         final_message = {"role": "assistant"}
         aggregated_tool_calls = {}
         usage_data = None
-        chunk_finish_reason = None  # Track finish_reason from chunks (but we'll override)
+        chunk_finish_reason = (
+            None  # Track finish_reason from chunks (but we'll override)
+        )
 
         # Get the first chunk for basic response metadata
         first_chunk = chunks[0]
 
         # Process each chunk to aggregate content
         for chunk in chunks:
-            if not hasattr(chunk, 'choices') or not chunk.choices:
+            if not hasattr(chunk, "choices") or not chunk.choices:
                 continue
 
             choice = chunk.choices[0]
@@ -399,25 +466,48 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         # Initialize with type field for OpenAI compatibility
-                        aggregated_tool_calls[index] = {"type": "function", "function": {"name": "", "arguments": ""}}
+                        aggregated_tool_calls[index] = {
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
                     if "id" in tc_chunk:
                         aggregated_tool_calls[index]["id"] = tc_chunk["id"]
                     if "type" in tc_chunk:
                         aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
-                        if "name" in tc_chunk["function"] and tc_chunk["function"]["name"] is not None:
-                            aggregated_tool_calls[index]["function"]["name"] += tc_chunk["function"]["name"]
-                        if "arguments" in tc_chunk["function"] and tc_chunk["function"]["arguments"] is not None:
-                            aggregated_tool_calls[index]["function"]["arguments"] += tc_chunk["function"]["arguments"]
+                        if (
+                            "name" in tc_chunk["function"]
+                            and tc_chunk["function"]["name"] is not None
+                        ):
+                            aggregated_tool_calls[index]["function"]["name"] += (
+                                tc_chunk["function"]["name"]
+                            )
+                        if (
+                            "arguments" in tc_chunk["function"]
+                            and tc_chunk["function"]["arguments"] is not None
+                        ):
+                            aggregated_tool_calls[index]["function"]["arguments"] += (
+                                tc_chunk["function"]["arguments"]
+                            )
 
             # Aggregate function calls (legacy format)
             if "function_call" in delta and delta["function_call"] is not None:
                 if "function_call" not in final_message:
                     final_message["function_call"] = {"name": "", "arguments": ""}
-                if "name" in delta["function_call"] and delta["function_call"]["name"] is not None:
-                    final_message["function_call"]["name"] += delta["function_call"]["name"]
-                if "arguments" in delta["function_call"] and delta["function_call"]["arguments"] is not None:
-                    final_message["function_call"]["arguments"] += delta["function_call"]["arguments"]
+                if (
+                    "name" in delta["function_call"]
+                    and delta["function_call"]["name"] is not None
+                ):
+                    final_message["function_call"]["name"] += delta["function_call"][
+                        "name"
+                    ]
+                if (
+                    "arguments" in delta["function_call"]
+                    and delta["function_call"]["arguments"] is not None
+                ):
+                    final_message["function_call"]["arguments"] += delta[
+                        "function_call"
+                    ]["arguments"]
 
             # Track finish_reason from chunks (for reference only)
             if choice.get("finish_reason"):
@@ -425,7 +515,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
-            if hasattr(chunk, 'usage') and chunk.usage:
+            if hasattr(chunk, "usage") and chunk.usage:
                 usage_data = chunk.usage
                 break
 
@@ -451,7 +541,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         final_choice = {
             "index": 0,
             "message": final_message,
-            "finish_reason": finish_reason
+            "finish_reason": finish_reason,
         }
 
         # Create the final ModelResponse
@@ -461,20 +551,21 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             "created": first_chunk.created,
             "model": first_chunk.model,
             "choices": [final_choice],
-            "usage": usage_data
+            "usage": usage_data,
         }
 
         return litellm.ModelResponse(**final_response_data)
 
-    async def acompletion(self, client: httpx.AsyncClient, **kwargs) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    async def acompletion(
+        self, client: httpx.AsyncClient, **kwargs
+    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         credential_path = kwargs.pop("credential_identifier")
         enable_request_logging = kwargs.pop("enable_request_logging", False)
         model = kwargs["model"]
 
         # Create dedicated file logger for this request
         file_logger = _QwenCodeFileLogger(
-            model_name=model,
-            enabled=enable_request_logging
+            model_name=model, enabled=enable_request_logging
         )
 
         async def make_request():
@@ -482,8 +573,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             api_base, access_token = await self.get_api_details(credential_path)
 
             # Strip provider prefix from model name (e.g., "qwen_code/qwen3-coder-plus" -> "qwen3-coder-plus")
-            model_name = model.split('/')[-1]
-            kwargs_with_stripped_model = {**kwargs, 'model': model_name}
+            model_name = model.split("/")[-1]
+            kwargs_with_stripped_model = {**kwargs, "model": model_name}
 
             # Build clean payload with only supported parameters
             payload = self._build_request_payload(**kwargs_with_stripped_model)
@@ -504,8 +595,11 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             lib_logger.debug(f"Qwen Code Request URL: {url}")
 
             return client.stream(
-                "POST", url, headers=headers, json=payload,
-                timeout=httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=120.0)
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+                timeout=TimeoutConfig.streaming(),
             )
 
         async def stream_handler(response_stream, attempt=1):
@@ -515,11 +609,17 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     # Check for HTTP errors before processing stream
                     if response.status_code >= 400:
                         error_text = await response.aread()
-                        error_text = error_text.decode('utf-8') if isinstance(error_text, bytes) else error_text
+                        error_text = (
+                            error_text.decode("utf-8")
+                            if isinstance(error_text, bytes)
+                            else error_text
+                        )
 
                         # Handle 401: Force token refresh and retry once
                         if response.status_code == 401 and attempt == 1:
-                            lib_logger.warning("Qwen Code returned 401. Forcing token refresh and retrying once.")
+                            lib_logger.warning(
+                                "Qwen Code returned 401. Forcing token refresh and retrying once."
+                            )
                             await self._refresh_token(credential_path, force=True)
                             retry_stream = await make_request()
                             async for chunk in stream_handler(retry_stream, attempt=2):
@@ -527,12 +627,15 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                             return
 
                         # Handle 429: Rate limit
-                        elif response.status_code == 429 or "slow_down" in error_text.lower():
+                        elif (
+                            response.status_code == 429
+                            or "slow_down" in error_text.lower()
+                        ):
                             raise RateLimitError(
                                 f"Qwen Code rate limit exceeded: {error_text}",
                                 llm_provider="qwen_code",
                                 model=model,
-                                response=response
+                                response=response,
                             )
 
                         # Handle other errors
@@ -542,28 +645,34 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                             raise httpx.HTTPStatusError(
                                 f"HTTP {response.status_code}: {error_text}",
                                 request=response.request,
-                                response=response
+                                response=response,
                             )
 
                     # Process successful streaming response
                     async for line in response.aiter_lines():
                         file_logger.log_response_chunk(line)
-                        if line.startswith('data: '):
+                        if line.startswith("data: "):
                             data_str = line[6:]
                             if data_str == "[DONE]":
                                 break
                             try:
                                 chunk = json.loads(data_str)
-                                for openai_chunk in self._convert_chunk_to_openai(chunk, model):
+                                for openai_chunk in self._convert_chunk_to_openai(
+                                    chunk, model
+                                ):
                                     yield litellm.ModelResponse(**openai_chunk)
                             except json.JSONDecodeError:
-                                lib_logger.warning(f"Could not decode JSON from Qwen Code: {line}")
+                                lib_logger.warning(
+                                    f"Could not decode JSON from Qwen Code: {line}"
+                                )
 
             except httpx.HTTPStatusError:
                 raise  # Re-raise HTTP errors we already handled
             except Exception as e:
                 file_logger.log_error(f"Error during Qwen Code stream processing: {e}")
-                lib_logger.error(f"Error during Qwen Code stream processing: {e}", exc_info=True)
+                lib_logger.error(
+                    f"Error during Qwen Code stream processing: {e}", exc_info=True
+                )
                 raise
 
         async def logging_stream_wrapper():
@@ -581,7 +690,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         if kwargs.get("stream"):
             return logging_stream_wrapper()
         else:
+
             async def non_stream_wrapper():
                 chunks = [chunk async for chunk in logging_stream_wrapper()]
                 return self._stream_to_completion_response(chunks)
+
             return await non_stream_wrapper()
