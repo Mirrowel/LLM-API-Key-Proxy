@@ -12,6 +12,8 @@ from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from dotenv import set_key, unset_key
 
+from rotator_library.utils.paths import get_data_file
+
 console = Console()
 
 # Import default OAuth port values from provider modules
@@ -54,7 +56,7 @@ class AdvancedSettings:
     """Manages pending changes to .env"""
 
     def __init__(self):
-        self.env_file = Path.cwd() / ".env"
+        self.env_file = get_data_file(".env")
         self.pending_changes = {}  # key -> value (None means delete)
         self.load_current_settings()
 
@@ -561,7 +563,7 @@ class SettingsTool:
 
     def get_available_providers(self) -> List[str]:
         """Get list of providers that have credentials configured"""
-        env_file = Path.cwd() / ".env"
+        env_file = get_data_file(".env")
         providers = set()
 
         # Scan for providers with API keys from local .env
@@ -584,7 +586,9 @@ class SettingsTool:
                 pass
 
         # Also check for OAuth providers from files
-        oauth_dir = Path("oauth_creds")
+        from rotator_library.utils.paths import get_oauth_dir
+
+        oauth_dir = get_oauth_dir()
         if oauth_dir.exists():
             for file in oauth_dir.glob("*_oauth_*.json"):
                 provider = file.name.split("_oauth_")[0]

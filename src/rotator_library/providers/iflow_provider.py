@@ -11,6 +11,7 @@ from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
+from ..utils.paths import get_logs_dir
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 from pathlib import Path
@@ -19,8 +20,12 @@ from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
 
-LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
-IFLOW_LOGS_DIR = LOGS_DIR / "iflow_logs"
+
+def _get_iflow_logs_dir() -> Path:
+    """Get the iFlow logs directory."""
+    logs_dir = get_logs_dir() / "iflow_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
 
 
 class _IFlowFileLogger:
@@ -35,7 +40,9 @@ class _IFlowFileLogger:
         request_id = str(uuid.uuid4())
         # Sanitize model name for directory
         safe_model_name = model_name.replace("/", "_").replace(":", "_")
-        self.log_dir = IFLOW_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+        self.log_dir = (
+            _get_iflow_logs_dir() / f"{timestamp}_{safe_model_name}_{request_id}"
+        )
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:

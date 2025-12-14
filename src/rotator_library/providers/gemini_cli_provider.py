@@ -12,6 +12,7 @@ from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
+from ..utils.paths import get_logs_dir, get_cache_dir
 import litellm
 from litellm.exceptions import RateLimitError
 from ..error_handler import extract_retry_after_from_body
@@ -22,8 +23,22 @@ from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
 
-LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
-GEMINI_CLI_LOGS_DIR = LOGS_DIR / "gemini_cli_logs"
+
+def _get_gemini_cli_logs_dir() -> Path:
+    """Get the Gemini CLI logs directory."""
+    logs_dir = get_logs_dir() / "gemini_cli_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
+def _get_gemini_cli_cache_dir() -> Path:
+    """Get the Gemini CLI cache directory."""
+    return get_cache_dir(subdir="gemini_cli")
+
+
+def _get_gemini3_signature_cache_file() -> Path:
+    """Get the Gemini 3 signature cache file path."""
+    return _get_gemini_cli_cache_dir() / "gemini3_signatures.json"
 
 
 class _GeminiCliFileLogger:
@@ -39,7 +54,7 @@ class _GeminiCliFileLogger:
         # Sanitize model name for directory
         safe_model_name = model_name.replace("/", "_").replace(":", "_")
         self.log_dir = (
-            GEMINI_CLI_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+            _get_gemini_cli_logs_dir() / f"{timestamp}_{safe_model_name}_{request_id}"
         )
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -102,12 +117,6 @@ HARDCODED_MODELS = [
     "gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
 ]
-
-# Cache directory for Gemini CLI
-CACHE_DIR = (
-    Path(__file__).resolve().parent.parent.parent.parent / "cache" / "gemini_cli"
-)
-GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
 DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
@@ -392,7 +401,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Initialize signature cache for Gemini 3 thoughtSignatures
         self._signature_cache = ProviderCache(
-            GEMINI3_SIGNATURE_CACHE_FILE,
+            _get_gemini3_signature_cache_file(),
             memory_ttl,
             disk_ttl,
             env_prefix="GEMINI_CLI_SIGNATURE",

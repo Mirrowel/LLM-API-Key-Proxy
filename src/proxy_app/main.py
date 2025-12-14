@@ -51,12 +51,15 @@ _start_time = time.time()
 # Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
 from glob import glob
+from rotator_library.utils.paths import get_default_root, get_logs_dir, get_data_file
+
+# Get the application root directory (EXE dir if frozen, else CWD)
+_root_dir = get_default_root()
 
 # Load main .env first
-load_dotenv()
+load_dotenv(_root_dir / ".env")
 
 # Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
-_root_dir = Path.cwd()
 _env_files_found = list(_root_dir.glob("*.env"))
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
@@ -234,8 +237,7 @@ print(
 # Note: Debug logging will be added after logging configuration below
 
 # --- Logging Configuration ---
-LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = get_logs_dir(_root_dir)
 
 # Configure a console handler with color (INFO and above only, no DEBUG)
 console_handler = colorlog.StreamHandler(sys.stdout)
@@ -570,11 +572,11 @@ async def lifespan(app: FastAPI):
     )
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
-    #_api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
-    #_oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
-    #_total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
-    #print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
-    client.background_refresher.start() # Start the background task
+    # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
+    # _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
+    # _total_summary = ', '.join([f"{p}:{len(c)}" for p, c in client.all_credentials.items()])
+    # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
+    client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
 
     # Warn if no provider credentials are configured
@@ -1263,8 +1265,8 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
 
 
 if __name__ == "__main__":
-    # Define ENV_FILE for onboarding checks
-    ENV_FILE = Path.cwd() / ".env"
+    # Define ENV_FILE for onboarding checks using centralized path
+    ENV_FILE = get_data_file(".env")
 
     # Check if launcher TUI should be shown (no arguments provided)
     if len(sys.argv) == 1:

@@ -11,9 +11,15 @@ from rotator_library.utils.resilient_io import (
     safe_log_write,
     safe_mkdir,
 )
+from rotator_library.utils.paths import get_logs_dir
 
-LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
-DETAILED_LOGS_DIR = LOGS_DIR / "detailed_logs"
+
+def _get_detailed_logs_dir() -> Path:
+    """Get the detailed logs directory, creating it if needed."""
+    logs_dir = get_logs_dir()
+    detailed_dir = logs_dir / "detailed_logs"
+    detailed_dir.mkdir(parents=True, exist_ok=True)
+    return detailed_dir
 
 
 class DetailedLogger:
@@ -31,7 +37,7 @@ class DetailedLogger:
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = DETAILED_LOGS_DIR / f"{timestamp}_{self.request_id}"
+        self.log_dir = _get_detailed_logs_dir() / f"{timestamp}_{self.request_id}"
         self.streaming = False
         self._dir_available = safe_mkdir(self.log_dir, logging)
 

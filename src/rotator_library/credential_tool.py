@@ -14,10 +14,20 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
 
-OAUTH_BASE_DIR = Path.cwd() / "oauth_creds"
-OAUTH_BASE_DIR.mkdir(exist_ok=True)
-# Use a direct path to the .env file in the project root
-ENV_FILE = Path.cwd() / ".env"
+from .utils.paths import get_oauth_dir, get_data_file
+
+
+def _get_oauth_base_dir() -> Path:
+    """Get the OAuth base directory (lazy, respects EXE vs script mode)."""
+    oauth_dir = get_oauth_dir()
+    oauth_dir.mkdir(parents=True, exist_ok=True)
+    return oauth_dir
+
+
+def _get_env_file() -> Path:
+    """Get the .env file path (lazy, respects EXE vs script mode)."""
+    return get_data_file(".env")
+
 
 console = Console()
 
@@ -54,19 +64,19 @@ def ensure_env_defaults():
     """
     Ensures the .env file exists and contains essential default values like PROXY_API_KEY.
     """
-    if not ENV_FILE.is_file():
-        ENV_FILE.touch()
+    if not _get_env_file().is_file():
+        _get_env_file().touch()
         console.print(
-            f"Creating a new [bold yellow]{ENV_FILE.name}[/bold yellow] file..."
+            f"Creating a new [bold yellow]{_get_env_file().name}[/bold yellow] file..."
         )
 
     # Check for PROXY_API_KEY, similar to setup_env.bat
-    if get_key(str(ENV_FILE), "PROXY_API_KEY") is None:
+    if get_key(str(_get_env_file()), "PROXY_API_KEY") is None:
         default_key = "VerysecretKey"
         console.print(
-            f"Adding default [bold cyan]PROXY_API_KEY[/bold cyan] to [bold yellow]{ENV_FILE.name}[/bold yellow]..."
+            f"Adding default [bold cyan]PROXY_API_KEY[/bold cyan] to [bold yellow]{_get_env_file().name}[/bold yellow]..."
         )
-        set_key(str(ENV_FILE), "PROXY_API_KEY", default_key)
+        set_key(str(_get_env_file()), "PROXY_API_KEY", default_key)
 
 
 async def setup_api_key():
@@ -224,8 +234,8 @@ async def setup_api_key():
             api_key = Prompt.ask(f"Enter the API key for {display_name}")
 
             # Check for duplicate API key value
-            if ENV_FILE.is_file():
-                with open(ENV_FILE, "r") as f:
+            if _get_env_file().is_file():
+                with open(_get_env_file(), "r") as f:
                     for line in f:
                         line = line.strip()
                         if line.startswith(api_var_base) and "=" in line:
@@ -244,7 +254,9 @@ async def setup_api_key():
                                     )
                                 )
 
-                                set_key(str(ENV_FILE), existing_key_name, api_key)
+                                set_key(
+                                    str(_get_env_file()), existing_key_name, api_key
+                                )
 
                                 success_text = Text.from_markup(
                                     f"Successfully updated existing key [bold yellow]'{existing_key_name}'[/bold yellow]."
@@ -275,8 +287,8 @@ async def setup_api_key():
             key_index = 1
             while True:
                 key_name = f"{api_var_base}_{key_index}"
-                if ENV_FILE.is_file():
-                    with open(ENV_FILE, "r") as f:
+                if _get_env_file().is_file():
+                    with open(_get_env_file(), "r") as f:
                         if not any(line.startswith(f"{key_name}=") for line in f):
                             break
                 else:
@@ -284,7 +296,7 @@ async def setup_api_key():
                 key_index += 1
 
             key_name = f"{api_var_base}_{key_index}"
-            set_key(str(ENV_FILE), key_name, api_key)
+            set_key(str(_get_env_file()), key_name, api_key)
 
             success_text = Text.from_markup(
                 f"Successfully added {display_name} API key as [bold yellow]'{key_name}'[/bold yellow]."
@@ -327,7 +339,7 @@ async def setup_new_credential(provider_name: str):
         # - File path determination (new or existing)
         # - Credential file saving
         # - Post-auth discovery (tier/project for Google OAuth providers)
-        result = await auth_instance.setup_credential(OAUTH_BASE_DIR)
+        result = await auth_instance.setup_credential(_get_oauth_base_dir())
 
         if not result.success:
             console.print(
@@ -386,7 +398,7 @@ async def export_gemini_cli_to_env():
     auth_instance = auth_class()
 
     # List available credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -427,7 +439,7 @@ async def export_gemini_cli_to_env():
 
             # Use auth class to export
             env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], OAUTH_BASE_DIR
+                cred_info["file_path"], _get_oauth_base_dir()
             )
 
             if env_path:
@@ -481,7 +493,7 @@ async def export_qwen_code_to_env():
     auth_instance = auth_class()
 
     # List available credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -522,7 +534,7 @@ async def export_qwen_code_to_env():
 
             # Use auth class to export
             env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], OAUTH_BASE_DIR
+                cred_info["file_path"], _get_oauth_base_dir()
             )
 
             if env_path:
@@ -573,7 +585,7 @@ async def export_iflow_to_env():
     auth_instance = auth_class()
 
     # List available credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -614,7 +626,7 @@ async def export_iflow_to_env():
 
             # Use auth class to export
             env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], OAUTH_BASE_DIR
+                cred_info["file_path"], _get_oauth_base_dir()
             )
 
             if env_path:
@@ -667,7 +679,7 @@ async def export_antigravity_to_env():
     auth_instance = auth_class()
 
     # List available credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -708,7 +720,7 @@ async def export_antigravity_to_env():
 
             # Use auth class to export
             env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], OAUTH_BASE_DIR
+                cred_info["file_path"], _get_oauth_base_dir()
             )
 
             if env_path:
@@ -769,7 +781,7 @@ async def export_all_provider_credentials(provider_name: str):
     )
 
     # List all credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -786,7 +798,7 @@ async def export_all_provider_credentials(provider_name: str):
         try:
             # Use auth class to export
             env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], OAUTH_BASE_DIR
+                cred_info["file_path"], _get_oauth_base_dir()
             )
 
             if env_path:
@@ -837,7 +849,7 @@ async def combine_provider_credentials(provider_name: str):
     )
 
     # List all credentials using auth class
-    credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
     if not credentials:
         console.print(
@@ -879,7 +891,7 @@ async def combine_provider_credentials(provider_name: str):
 
     # Write combined file
     combined_filename = f"{provider_name}_all_combined.env"
-    combined_filepath = OAUTH_BASE_DIR / combined_filename
+    combined_filepath = _get_oauth_base_dir() / combined_filename
 
     with open(combined_filepath, "w") as f:
         f.write("\n".join(combined_lines))
@@ -929,7 +941,7 @@ async def combine_all_credentials():
         except Exception:
             continue  # Skip providers that don't have auth classes
 
-        credentials = auth_instance.list_credentials(OAUTH_BASE_DIR)
+        credentials = auth_instance.list_credentials(_get_oauth_base_dir())
 
         if not credentials:
             continue
@@ -972,7 +984,7 @@ async def combine_all_credentials():
 
     # Write combined file
     combined_filename = "all_providers_combined.env"
-    combined_filepath = OAUTH_BASE_DIR / combined_filename
+    combined_filepath = _get_oauth_base_dir() / combined_filename
 
     with open(combined_filepath, "w") as f:
         f.write("\n".join(combined_lines))

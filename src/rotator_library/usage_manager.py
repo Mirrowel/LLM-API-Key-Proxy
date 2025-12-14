@@ -5,13 +5,15 @@ import logging
 import asyncio
 import random
 from datetime import date, datetime, timezone, time as dt_time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import aiofiles
 import litellm
 
 from .error_handler import ClassifiedError, NoAvailableKeysError, mask_credential
 from .providers import PROVIDER_PLUGINS
 from .utils.resilient_io import ResilientStateWriter
+from .utils.paths import get_data_file
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
@@ -51,7 +53,7 @@ class UsageManager:
 
     def __init__(
         self,
-        file_path: str = "key_usage.json",
+        file_path: Optional[Union[str, Path]] = None,
         daily_reset_time_utc: Optional[str] = "03:00",
         rotation_tolerance: float = 0.0,
         provider_rotation_modes: Optional[Dict[str, str]] = None,
@@ -66,7 +68,8 @@ class UsageManager:
         Initialize the UsageManager.
 
         Args:
-            file_path: Path to the usage data JSON file
+            file_path: Path to the usage data JSON file. If None, uses get_data_file("key_usage.json").
+                       Can be absolute Path, relative Path, or string.
             daily_reset_time_utc: Time in UTC when daily stats should reset (HH:MM format)
             rotation_tolerance: Tolerance for weighted random credential rotation.
                 - 0.0: Deterministic, least-used credential always selected
@@ -86,7 +89,14 @@ class UsageManager:
                 Used in sequential mode when priority not in priority_multipliers.
                 Example: {"antigravity": 2}
         """
-        self.file_path = file_path
+        # Resolve file_path - use default if not provided
+        if file_path is None:
+            self.file_path = str(get_data_file("key_usage.json"))
+        elif isinstance(file_path, Path):
+            self.file_path = str(file_path)
+        else:
+            # String path - could be relative or absolute
+            self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
         self.provider_rotation_modes = provider_rotation_modes or {}
         self.provider_plugins = provider_plugins or PROVIDER_PLUGINS

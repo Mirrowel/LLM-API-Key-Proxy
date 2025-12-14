@@ -1,9 +1,12 @@
 import logging
 import json
 from logging.handlers import RotatingFileHandler
-import os
+from pathlib import Path
 from datetime import datetime
+from typing import Optional, Union
+
 from .error_handler import mask_credential
+from .utils.paths import get_logs_dir
 
 
 class JsonFormatter(logging.Formatter):
@@ -14,9 +17,37 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(record.msg)
 
 
-def setup_failure_logger():
-    """Sets up a dedicated JSON logger for writing detailed failure logs to a file."""
-    log_dir = "logs"
+# Module-level state for lazy initialization
+_failure_logger: Optional[logging.Logger] = None
+_configured_logs_dir: Optional[Path] = None
+
+
+def configure_failure_logger(logs_dir: Optional[Union[Path, str]] = None) -> None:
+    """
+    Configure the failure logger to use a specific logs directory.
+
+    Call this before first use if you want to override the default location.
+    If not called, the logger will use get_logs_dir() on first use.
+
+    Args:
+        logs_dir: Path to the logs directory. If None, uses get_logs_dir().
+    """
+    global _configured_logs_dir, _failure_logger
+    _configured_logs_dir = Path(logs_dir) if logs_dir else None
+    # Reset logger so it gets reconfigured on next use
+    _failure_logger = None
+
+
+def _setup_failure_logger(logs_dir: Path) -> logging.Logger:
+    """
+    Sets up a dedicated JSON logger for writing detailed failure logs to a file.
+
+    Args:
+        logs_dir: Path to the logs directory.
+
+    Returns:
+        Configured logger instance.
+    """
     logger = logging.getLogger("failure_logger")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -25,11 +56,10 @@ def setup_failure_logger():
     logger.handlers.clear()
 
     try:
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
 
         handler = RotatingFileHandler(
-            os.path.join(log_dir, "failures.log"),
+            logs_dir / "failures.log",
             maxBytes=5 * 1024 * 1024,  # 5 MB
             backupCount=2,
         )
@@ -43,8 +73,21 @@ def setup_failure_logger():
     return logger
 
 
-# Initialize the dedicated logger for detailed failure logs
-failure_logger = setup_failure_logger()
+def get_failure_logger() -> logging.Logger:
+    """
+    Get the failure logger, initializing it lazily if needed.
+
+    Returns:
+        The configured failure logger.
+    """
+    global _failure_logger, _configured_logs_dir
+
+    if _failure_logger is None:
+        logs_dir = _configured_logs_dir if _configured_logs_dir else get_logs_dir()
+        _failure_logger = _setup_failure_logger(logs_dir)
+
+    return _failure_logger
+
 
 # Get the main library logger for concise, propagated messages
 main_lib_logger = logging.getLogger("rotator_library")
@@ -174,7 +217,7 @@ def log_failure(
 
     # Log to failure logger with resilience - if it fails, just continue
     try:
-        failure_logger.error(detailed_log_data)
+        get_failure_logger().error(detailed_log_data)
     except (OSError, IOError) as e:
         # Log file write failed - log to console instead
         logging.warning(f"Failed to write to failures.log: {e}")

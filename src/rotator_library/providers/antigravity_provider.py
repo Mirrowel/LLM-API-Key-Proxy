@@ -39,6 +39,7 @@ from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
+from ..utils.paths import get_logs_dir, get_cache_dir
 
 
 # =============================================================================
@@ -106,12 +107,23 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
 ]
 
-# Directory paths
-_BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
-LOGS_DIR = _BASE_DIR / "logs" / "antigravity_logs"
-CACHE_DIR = _BASE_DIR / "cache" / "antigravity"
-GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
-CLAUDE_THINKING_CACHE_FILE = CACHE_DIR / "claude_thinking.json"
+
+# Directory paths - use centralized path management
+def _get_antigravity_logs_dir():
+    return get_logs_dir() / "antigravity_logs"
+
+
+def _get_antigravity_cache_dir():
+    return get_cache_dir(subdir="antigravity")
+
+
+def _get_gemini3_signature_cache_file():
+    return _get_antigravity_cache_dir() / "gemini3_signatures.json"
+
+
+def _get_claude_thinking_cache_file():
+    return _get_antigravity_cache_dir() / "claude_thinking.json"
+
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
 DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
@@ -426,7 +438,9 @@ class AntigravityFileLogger:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_model = model_name.replace("/", "_").replace(":", "_")
-        self.log_dir = LOGS_DIR / f"{timestamp}_{safe_model}_{uuid.uuid4()}"
+        self.log_dir = (
+            _get_antigravity_logs_dir() / f"{timestamp}_{safe_model}_{uuid.uuid4()}"
+        )
 
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -731,13 +745,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         # Initialize caches using shared ProviderCache
         self._signature_cache = ProviderCache(
-            GEMINI3_SIGNATURE_CACHE_FILE,
+            _get_gemini3_signature_cache_file(),
             memory_ttl,
             disk_ttl,
             env_prefix="ANTIGRAVITY_SIGNATURE",
         )
         self._thinking_cache = ProviderCache(
-            CLAUDE_THINKING_CACHE_FILE,
+            _get_claude_thinking_cache_file(),
             memory_ttl,
             disk_ttl,
             env_prefix="ANTIGRAVITY_THINKING",
