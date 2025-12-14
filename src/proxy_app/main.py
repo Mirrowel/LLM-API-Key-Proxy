@@ -51,10 +51,13 @@ _start_time = time.time()
 # Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
 from glob import glob
-from rotator_library.utils.paths import get_default_root, get_logs_dir, get_data_file
 
 # Get the application root directory (EXE dir if frozen, else CWD)
-_root_dir = get_default_root()
+# Inlined here to avoid triggering heavy rotator_library imports before loading screen
+if getattr(sys, "frozen", False):
+    _root_dir = Path(sys.executable).parent
+else:
+    _root_dir = Path.cwd()
 
 # Load main .env first
 load_dotenv(_root_dir / ".env")
@@ -237,6 +240,9 @@ print(
 # Note: Debug logging will be added after logging configuration below
 
 # --- Logging Configuration ---
+# Import path utilities here (after loading screen) to avoid triggering heavy imports early
+from rotator_library.utils.paths import get_logs_dir, get_data_file
+
 LOG_DIR = get_logs_dir(_root_dir)
 
 # Configure a console handler with color (INFO and above only, no DEBUG)
