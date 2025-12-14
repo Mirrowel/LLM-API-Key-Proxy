@@ -867,8 +867,47 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         This ensures all credential priorities are known before any API calls,
         preventing unknown credentials from getting priority 999.
+
+        For credentials without persisted tier info (new or corrupted), performs
+        full discovery to ensure proper prioritization in sequential rotation mode.
         """
+        # Step 1: Load persisted tiers from files
         await self._load_persisted_tiers(credential_paths)
+
+        # Step 2: Identify credentials still missing tier info
+        credentials_needing_discovery = [
+            path
+            for path in credential_paths
+            if path not in self.project_tier_cache
+            and self._parse_env_credential_path(path) is None  # Skip env:// paths
+        ]
+
+        if not credentials_needing_discovery:
+            return  # All credentials have tier info
+
+        lib_logger.info(
+            f"Antigravity: Discovering tier info for {len(credentials_needing_discovery)} credential(s)..."
+        )
+
+        # Step 3: Perform discovery for each missing credential (sequential to avoid rate limits)
+        for credential_path in credentials_needing_discovery:
+            try:
+                auth_header = await self.get_auth_header(credential_path)
+                access_token = auth_header["Authorization"].split(" ")[1]
+                await self._discover_project_id(
+                    credential_path, access_token, litellm_params={}
+                )
+                discovered_tier = self.project_tier_cache.get(
+                    credential_path, "unknown"
+                )
+                lib_logger.debug(
+                    f"Discovered tier '{discovered_tier}' for {Path(credential_path).name}"
+                )
+            except Exception as e:
+                lib_logger.warning(
+                    f"Failed to discover tier for {Path(credential_path).name}: {e}. "
+                    f"Credential will use default priority."
+                )
 
     async def _load_persisted_tiers(
         self, credential_paths: List[str]
