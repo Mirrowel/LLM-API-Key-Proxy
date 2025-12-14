@@ -673,9 +673,6 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         error_obj = data.get("error", data)
         details = error_obj.get("details", [])
 
-        if not details:
-            return None
-
         result = {
             "retry_after": None,
             "reason": None,
@@ -726,6 +723,15 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         # Return None if we couldn't extract retry_after
         if not result["retry_after"]:
+            # Handle bare RESOURCE_EXHAUSTED without timing details
+            error_status = error_obj.get("status", "")
+            error_code = error_obj.get("code")
+
+            if error_status == "RESOURCE_EXHAUSTED" or error_code == 429:
+                result["retry_after"] = 60  # Default fallback
+                result["reason"] = result.get("reason") or "RESOURCE_EXHAUSTED"
+                return result
+
             return None
 
         return result
