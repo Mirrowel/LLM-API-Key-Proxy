@@ -894,6 +894,106 @@ Each OAuth provider uses a local callback server during authentication. The call
 
 ---
 
+### 2.14. HTTP Timeout Configuration (`timeout_config.py`)
+
+Centralized timeout configuration for all HTTP requests to LLM providers.
+
+#### Purpose
+
+The `TimeoutConfig` class provides fine-grained control over HTTP timeouts for streaming and non-streaming LLM requests. This addresses the common issue of proxy hangs when upstream providers stall during connection establishment or response generation.
+
+#### Timeout Types Explained
+
+| Timeout | Description |
+|---------|-------------|
+| **connect** | Maximum time to establish a TCP/TLS connection to the upstream server |
+| **read** | Maximum time to wait between receiving data chunks (resets on each chunk for streaming) |
+| **write** | Maximum time to wait while sending the request body |
+| **pool** | Maximum time to wait for a connection from the connection pool |
+
+#### Default Values
+
+| Setting | Streaming | Non-Streaming | Rationale |
+|---------|-----------|---------------|-----------|
+| **connect** | 30s | 30s | Fast fail if server is unreachable |
+| **read** | 180s (3 min) | 600s (10 min) | Streaming expects periodic chunks; non-streaming may wait for full generation |
+| **write** | 30s | 30s | Request bodies are typically small |
+| **pool** | 60s | 60s | Reasonable wait for connection pool |
+
+#### Environment Variable Overrides
+
+All timeout values can be customized via environment variables:
+
+```env
+# Connection establishment timeout (seconds)
+TIMEOUT_CONNECT=30
+
+# Request body send timeout (seconds)
+TIMEOUT_WRITE=30
+
+# Connection pool acquisition timeout (seconds)
+TIMEOUT_POOL=60
+
+# Read timeout between chunks for streaming requests (seconds)
+# If no data arrives for this duration, the connection is considered stalled
+TIMEOUT_READ_STREAMING=180
+
+# Read timeout for non-streaming responses (seconds)
+# Longer to accommodate models that take time to generate full responses
+TIMEOUT_READ_NON_STREAMING=600
+```
+
+#### Streaming vs Non-Streaming Behavior
+
+**Streaming Requests** (`TimeoutConfig.streaming()`):
+- Uses shorter read timeout (default 3 minutes)
+- Timer resets every time a chunk arrives
+- If no data for 3 minutes → connection considered dead → failover to next credential
+- Appropriate for chat completions where tokens should arrive periodically
+
+**Non-Streaming Requests** (`TimeoutConfig.non_streaming()`):
+- Uses longer read timeout (default 10 minutes)
+- Server may take significant time to generate the complete response before sending anything
+- Complex reasoning tasks or large outputs may legitimately take several minutes
+- Only used by Antigravity provider's `_handle_non_streaming()` method
+
+#### Provider Usage
+
+The following providers use `TimeoutConfig`:
+
+| Provider | Method | Timeout Type |
+|----------|--------|--------------|
+| `antigravity_provider.py` | `_handle_non_streaming()` | `non_streaming()` |
+| `antigravity_provider.py` | `_handle_streaming()` | `streaming()` |
+| `gemini_cli_provider.py` | `acompletion()` | `streaming()` |
+| `iflow_provider.py` | `acompletion()` | `streaming()` |
+| `qwen_code_provider.py` | `acompletion()` | `streaming()` |
+
+**Note:** iFlow, Qwen Code, and Gemini CLI providers always use streaming internally (even for non-streaming requests), aggregating chunks into a complete response. Only Antigravity has a true non-streaming path.
+
+#### Tuning Recommendations
+
+| Use Case | Recommendation |
+|----------|----------------|
+| **Long thinking tasks** | Increase `TIMEOUT_READ_STREAMING` to 300-360s |
+| **Unstable network** | Increase `TIMEOUT_CONNECT` to 60s |
+| **High concurrency** | Increase `TIMEOUT_POOL` if seeing pool exhaustion |
+| **Large context/output** | Increase `TIMEOUT_READ_NON_STREAMING` to 900s+ |
+
+#### Example Configuration
+
+```env
+# For environments with complex reasoning tasks
+TIMEOUT_READ_STREAMING=300
+TIMEOUT_READ_NON_STREAMING=900
+
+# For unstable network conditions
+TIMEOUT_CONNECT=60
+TIMEOUT_POOL=120
+```
+
+---
+
 
 ---
 

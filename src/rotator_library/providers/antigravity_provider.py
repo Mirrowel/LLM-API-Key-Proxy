@@ -38,6 +38,7 @@ from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGro
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
+from ..timeout_config import TimeoutConfig
 
 
 # =============================================================================
@@ -3221,7 +3222,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None,
     ) -> litellm.ModelResponse:
         """Handle non-streaming completion."""
-        response = await client.post(url, headers=headers, json=payload, timeout=600.0)
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=TimeoutConfig.non_streaming(),
+        )
         response.raise_for_status()
 
         data = response.json()
@@ -3254,7 +3260,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         }
 
         async with client.stream(
-            "POST", url, headers=headers, json=payload, timeout=600.0
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            timeout=TimeoutConfig.streaming(),
         ) as response:
             if response.status_code >= 400:
                 # Read error body so it's available in response.text for logging
