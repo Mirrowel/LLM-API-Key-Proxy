@@ -1547,6 +1547,20 @@ async def chat_completions(
             "custom_reasoning_budget"
         ) or generation_cfg.get("custom_reasoning_budget", False)
 
+        # Auto-enable full thinking budget for Opus with high reasoning effort
+        # Opus is THE reasoning model - if you're asking for "high", you want full budget
+        if (
+            model
+            and "opus" in model.lower()
+            and reasoning_effort in ("high", "medium")
+            and not custom_reasoning_budget
+        ):
+            request_data["custom_reasoning_budget"] = True
+            custom_reasoning_budget = True
+            logging.info(
+                f"🧠 Thinking: auto-enabled custom_reasoning_budget for Opus (effort={reasoning_effort})"
+            )
+
         logging.getLogger("rotator_library").debug(
             f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
         )
