@@ -26,6 +26,7 @@ from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
+from ..error_handler import CredentialNeedsReauthError
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -371,26 +372,42 @@ class IFlowAuthBase:
                     return env_creds
                 raise  # Re-raise the original file not found error
 
-    async def _save_credentials(self, path: str, creds: Dict[str, Any]):
-        """Save credentials with in-memory fallback if disk unavailable."""
-        # Always update cache first (memory is reliable)
-        self._credentials_cache[path] = creds
+    async def _save_credentials(self, path: str, creds: Dict[str, Any]) -> bool:
+        """Save credentials to disk, then update cache. Returns True only if disk write succeeded.
 
+        For providers with rotating refresh tokens, disk persistence is CRITICAL.
+        If we update the cache but fail to write to disk:
+        - The old refresh_token on disk may become invalid (consumed by API)
+        - On restart, we'd load the invalid token and require re-auth
+
+        By writing to disk FIRST, we ensure:
+        - Cache only updated after disk succeeds (guaranteed parity)
+        - If disk fails, cache keeps old tokens, refresh is retried
+        - No desync between cache and disk is possible
+        """
         # Don't save to file if credentials were loaded from environment
         if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
+            self._credentials_cache[path] = creds
             lib_logger.debug("Credentials loaded from env, skipping file save")
-            return
+            return True
 
-        # Attempt disk write - if it fails, we still have the cache
-        # buffer_on_failure ensures data is retried periodically and saved on shutdown
-        if safe_write_json(
-            path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
+        # Write to disk FIRST - do NOT buffer on failure for rotating tokens
+        # Buffering is dangerous because the refresh_token may be stale by retry time
+        if not safe_write_json(
+            path, creds, lib_logger, secure_permissions=True, buffer_on_failure=False
         ):
-            lib_logger.debug(f"Saved updated iFlow OAuth credentials to '{path}'.")
-        else:
-            lib_logger.warning(
-                "iFlow credentials cached in memory only (buffered for retry)."
+            lib_logger.error(
+                f"Failed to write iFlow credentials to disk for '{Path(path).name}'. "
+                f"Cache NOT updated to maintain parity with disk."
             )
+            return False
+
+        # Disk write succeeded - now update cache (guaranteed parity)
+        self._credentials_cache[path] = creds
+        lib_logger.debug(
+            f"Saved updated iFlow OAuth credentials to '{Path(path).name}'."
+        )
+        return True
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         """Checks if the token is expired (with buffer for proactive refresh)."""
@@ -550,10 +567,11 @@ class IFlowAuthBase:
             if not force and cached_creds and not self._is_token_expired(cached_creds):
                 return cached_creds
 
-            # If cache is empty, read from file
-            if path not in self._credentials_cache:
-                await self._read_creds_from_file(path)
-
+            # [ROTATING TOKEN FIX] Always read fresh from disk before refresh.
+            # iFlow may use rotating refresh tokens - each refresh could invalidate the previous token.
+            # If we use a stale cached token, refresh will fail.
+            # Reading fresh from disk ensures we have the latest token.
+            await self._read_creds_from_file(path)
             creds_from_file = self._credentials_cache[path]
 
             lib_logger.debug(f"Refreshing iFlow OAuth token for '{Path(path).name}'...")
@@ -565,7 +583,6 @@ class IFlowAuthBase:
             max_retries = 3
             new_token_data = None
             last_error = None
-            needs_reauth = False
 
             # Create Basic Auth header
             auth_string = f"{IFLOW_CLIENT_ID}:{IFLOW_CLIENT_SECRET}"
@@ -624,14 +641,58 @@ class IFlowAuthBase:
                         )
 
                         # [STATUS CODE HANDLING]
-                        # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
-                        if status_code in (401, 403):
-                            lib_logger.warning(
-                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
-                                f"Token may have been revoked or expired. Starting re-authentication..."
+                        # [INVALID GRANT HANDLING] Handle 400/401/403 by raising
+                        # Queue for re-auth in background so credential gets fixed automatically
+                        if status_code == 400:
+                            # Check if this is an invalid refresh token error
+                            try:
+                                error_data = e.response.json()
+                                error_type = error_data.get("error", "")
+                                error_desc = error_data.get("error_description", "")
+                                if not error_desc:
+                                    error_desc = error_data.get("message", error_body)
+                            except Exception:
+                                error_type = ""
+                                error_desc = error_body
+
+                            if (
+                                "invalid" in error_desc.lower()
+                                or error_type == "invalid_request"
+                            ):
+                                lib_logger.info(
+                                    f"Credential '{Path(path).name}' needs re-auth (HTTP 400: {error_desc}). "
+                                    f"Queued for re-authentication, rotating to next credential."
+                                )
+                                # Queue for re-auth in background (non-blocking, fire-and-forget)
+                                # This ensures credential gets fixed even if caller doesn't handle it
+                                asyncio.create_task(
+                                    self._queue_refresh(
+                                        path, force=True, needs_reauth=True
+                                    )
+                                )
+                                # Raise rotatable error instead of raw HTTPStatusError
+                                raise CredentialNeedsReauthError(
+                                    credential_path=path,
+                                    message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                )
+                            else:
+                                # Other 400 error - raise it
+                                raise
+
+                        elif status_code in (401, 403):
+                            lib_logger.info(
+                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code}). "
+                                f"Queued for re-authentication, rotating to next credential."
                             )
-                            needs_reauth = True
-                            break  # Exit retry loop to trigger re-auth
+                            # Queue for re-auth in background (non-blocking, fire-and-forget)
+                            asyncio.create_task(
+                                self._queue_refresh(path, force=True, needs_reauth=True)
+                            )
+                            # Raise rotatable error instead of raw HTTPStatusError
+                            raise CredentialNeedsReauthError(
+                                credential_path=path,
+                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                            )
 
                         elif status_code == 429:
                             retry_after = int(e.response.headers.get("Retry-After", 60))
@@ -666,37 +727,6 @@ class IFlowAuthBase:
                             await asyncio.sleep(wait_time)
                             continue
                         raise
-
-            # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
-            if needs_reauth:
-                lib_logger.info(
-                    f"Starting re-authentication for '{Path(path).name}'..."
-                )
-                try:
-                    # Call initialize_token to trigger OAuth flow
-                    new_creds = await self.initialize_token(path)
-                    # Clear backoff on successful re-auth
-                    self._refresh_failures.pop(path, None)
-                    self._next_refresh_after.pop(path, None)
-                    return new_creds
-                except Exception as reauth_error:
-                    lib_logger.error(
-                        f"Re-authentication failed for '{Path(path).name}': {reauth_error}"
-                    )
-                    # [BACKOFF TRACKING] Increment failure count and set backoff timer
-                    self._refresh_failures[path] = (
-                        self._refresh_failures.get(path, 0) + 1
-                    )
-                    backoff_seconds = min(
-                        300, 30 * (2 ** self._refresh_failures[path])
-                    )  # Max 5 min backoff
-                    self._next_refresh_after[path] = time.time() + backoff_seconds
-                    lib_logger.debug(
-                        f"Setting backoff for '{Path(path).name}': {backoff_seconds}s"
-                    )
-                    raise ValueError(
-                        f"Refresh token invalid and re-authentication failed: {reauth_error}"
-                    )
 
             if new_token_data is None:
                 # [BACKOFF TRACKING] Increment failure count and set backoff timer
@@ -775,11 +805,19 @@ class IFlowAuthBase:
             self._refresh_failures.pop(path, None)
             self._next_refresh_after.pop(path, None)
 
-            await self._save_credentials(path, creds_from_file)
+            # Save credentials - MUST succeed for rotating token providers
+            if not await self._save_credentials(path, creds_from_file):
+                # CRITICAL: If we can't persist the new token, the old token may be
+                # invalidated. This is a critical failure - raise so retry logic kicks in.
+                raise IOError(
+                    f"Failed to persist refreshed credentials for '{Path(path).name}'. "
+                    f"Disk write failed - refresh will be retried."
+                )
+
             lib_logger.debug(
                 f"Successfully refreshed iFlow OAuth token for '{Path(path).name}'."
             )
-            return creds_from_file
+            return self._credentials_cache[path]  # Return from cache (synced with disk)
 
     async def get_api_details(self, credential_identifier: str) -> Tuple[str, str]:
         """
@@ -1026,12 +1064,39 @@ class IFlowAuthBase:
 
                     except httpx.HTTPStatusError as e:
                         status_code = e.response.status_code
-                        if status_code in (401, 403):
-                            # Invalid refresh token - route to re-auth queue
-                            lib_logger.warning(
-                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                        # Check for invalid refresh token errors (400/401/403)
+                        # These need to be routed to re-auth queue for interactive OAuth
+                        needs_reauth = False
+
+                        if status_code == 400:
+                            # Check if this is an invalid refresh token error
+                            try:
+                                error_data = e.response.json()
+                                error_type = error_data.get("error", "")
+                                error_desc = error_data.get("error_description", "")
+                                if not error_desc:
+                                    error_desc = error_data.get("message", str(e))
+                            except Exception:
+                                error_type = ""
+                                error_desc = str(e)
+
+                            if (
+                                "invalid" in error_desc.lower()
+                                or error_type == "invalid_request"
+                            ):
+                                needs_reauth = True
+                                lib_logger.info(
+                                    f"Credential '{Path(path).name}' needs re-auth (HTTP 400: {error_desc}). "
+                                    f"Routing to re-auth queue."
+                                )
+                        elif status_code in (401, 403):
+                            needs_reauth = True
+                            lib_logger.info(
+                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code}). "
                                 f"Routing to re-auth queue."
                             )
+
+                        if needs_reauth:
                             self._queue_retry_count.pop(path, None)  # Clear retry count
                             async with self._queue_tracking_lock:
                                 self._queued_credentials.discard(
@@ -1126,7 +1191,7 @@ class IFlowAuthBase:
 
                 try:
                     lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
-                    await self.initialize_token(path)
+                    await self.initialize_token(path, force_interactive=True)
                     lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
 
                 except Exception as e:
@@ -1270,7 +1335,11 @@ class IFlowAuthBase:
                 }
 
             if path:
-                await self._save_credentials(path, creds)
+                if not await self._save_credentials(path, creds):
+                    raise IOError(
+                        f"Failed to save OAuth credentials to disk for '{display_name}'. "
+                        f"Please retry authentication."
+                    )
 
             lib_logger.info(
                 f"iFlow OAuth initialized successfully for '{display_name}'."
@@ -1281,7 +1350,9 @@ class IFlowAuthBase:
             await callback_server.stop()
 
     async def initialize_token(
-        self, creds_or_path: Union[Dict[str, Any], str]
+        self,
+        creds_or_path: Union[Dict[str, Any], str],
+        force_interactive: bool = False,
     ) -> Dict[str, Any]:
         """
         Initialize OAuth token, triggering interactive authorization flow if needed.
@@ -1289,6 +1360,12 @@ class IFlowAuthBase:
         If interactive OAuth is required (expired refresh token, missing credentials, etc.),
         the flow is coordinated globally via ReauthCoordinator to ensure only one
         interactive OAuth flow runs at a time across all providers.
+
+        Args:
+            creds_or_path: Either a credentials dict or path to credentials file.
+            force_interactive: If True, skip expiry checks and force interactive OAuth.
+                               Use this when the refresh token is known to be invalid
+                               (e.g., after HTTP 400 from token endpoint).
         """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
@@ -1308,7 +1385,11 @@ class IFlowAuthBase:
             )
 
             reason = ""
-            if not creds.get("refresh_token"):
+            if force_interactive:
+                reason = (
+                    "re-authentication was explicitly requested (refresh token invalid)"
+                )
+            elif not creds.get("refresh_token"):
                 reason = "refresh token is missing"
             elif self._is_token_expired(creds):
                 reason = "token is expired"
@@ -1389,10 +1470,15 @@ class IFlowAuthBase:
                     f"No email found in iFlow credentials for '{path or 'in-memory object'}'."
                 )
 
-            # Update timestamp on check
+            # Update timestamp in cache only (not disk) to avoid overwriting
+            # potentially newer tokens that were saved by another process/refresh.
+            # The timestamp is non-critical metadata - losing it on restart is fine.
             if path and "_proxy_metadata" in creds:
                 creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
-                await self._save_credentials(path, creds)
+                # Note: We intentionally don't save to disk here because:
+                # 1. The cache may have older tokens than disk (if external refresh occurred)
+                # 2. Saving would overwrite the newer disk tokens with stale cached ones
+                # 3. The timestamp is non-critical and will be updated on next refresh
 
             return {"email": email}
         except Exception as e:
@@ -1513,7 +1599,11 @@ class IFlowAuthBase:
                 )
 
             # Step 4: Save credentials to file
-            await self._save_credentials(str(file_path), new_creds)
+            if not await self._save_credentials(str(file_path), new_creds):
+                return IFlowCredentialSetupResult(
+                    success=False,
+                    error=f"Failed to save credentials to disk at {file_path.name}",
+                )
 
             return IFlowCredentialSetupResult(
                 success=True,

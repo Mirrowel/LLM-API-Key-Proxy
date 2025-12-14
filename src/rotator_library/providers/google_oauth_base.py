@@ -22,6 +22,7 @@ from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
+from ..error_handler import CredentialNeedsReauthError
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -366,7 +367,6 @@ class GoogleOAuthBase:
             max_retries = 3
             new_token_data = None
             last_error = None
-            needs_reauth = False
 
             async with httpx.AsyncClient() as client:
                 for attempt in range(max_retries):
@@ -390,15 +390,42 @@ class GoogleOAuthBase:
                     except httpx.HTTPStatusError as e:
                         last_error = e
                         status_code = e.response.status_code
+                        error_body = e.response.text
 
-                        # [INVALID GRANT HANDLING] Handle 401/403 by triggering re-authentication
-                        if status_code == 401 or status_code == 403:
-                            lib_logger.warning(
-                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
-                                f"Token may have been revoked or expired. Starting re-authentication..."
+                        # [INVALID GRANT HANDLING] Handle 400/401/403 by queuing for re-auth
+                        # We must NOT call initialize_token from here as we hold a lock (would deadlock)
+                        if status_code == 400:
+                            # Check if this is an invalid_grant error
+                            if "invalid_grant" in error_body.lower():
+                                lib_logger.info(
+                                    f"Credential '{Path(path).name}' needs re-auth (HTTP 400: invalid_grant). "
+                                    f"Queued for re-authentication, rotating to next credential."
+                                )
+                                asyncio.create_task(
+                                    self._queue_refresh(
+                                        path, force=True, needs_reauth=True
+                                    )
+                                )
+                                raise CredentialNeedsReauthError(
+                                    credential_path=path,
+                                    message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                )
+                            else:
+                                # Other 400 error - raise it
+                                raise
+
+                        elif status_code in (401, 403):
+                            lib_logger.info(
+                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code}). "
+                                f"Queued for re-authentication, rotating to next credential."
                             )
-                            needs_reauth = True
-                            break  # Exit retry loop to trigger re-auth
+                            asyncio.create_task(
+                                self._queue_refresh(path, force=True, needs_reauth=True)
+                            )
+                            raise CredentialNeedsReauthError(
+                                credential_path=path,
+                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                            )
 
                         elif status_code == 429:
                             # Rate limit - honor Retry-After header if present
@@ -437,23 +464,6 @@ class GoogleOAuthBase:
                             await asyncio.sleep(wait_time)
                             continue
                         raise
-
-            # [INVALID GRANT RE-AUTH] Trigger OAuth flow if refresh token is invalid
-            if needs_reauth:
-                lib_logger.info(
-                    f"Starting re-authentication for '{Path(path).name}'..."
-                )
-                try:
-                    # Call initialize_token to trigger OAuth flow
-                    new_creds = await self.initialize_token(path)
-                    return new_creds
-                except Exception as reauth_error:
-                    lib_logger.error(
-                        f"Re-authentication failed for '{Path(path).name}': {reauth_error}"
-                    )
-                    raise ValueError(
-                        f"Refresh token invalid and re-authentication failed: {reauth_error}"
-                    )
 
             # If we exhausted retries without success
             if new_token_data is None:
@@ -832,7 +842,7 @@ class GoogleOAuthBase:
 
                 try:
                     lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
-                    await self.initialize_token(path)
+                    await self.initialize_token(path, force_interactive=True)
                     lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
 
                 except Exception as e:
@@ -1058,7 +1068,9 @@ class GoogleOAuthBase:
         return new_creds
 
     async def initialize_token(
-        self, creds_or_path: Union[Dict[str, Any], str]
+        self,
+        creds_or_path: Union[Dict[str, Any], str],
+        force_interactive: bool = False,
     ) -> Dict[str, Any]:
         """
         Initialize OAuth token, triggering interactive OAuth flow if needed.
@@ -1066,6 +1078,12 @@ class GoogleOAuthBase:
         If interactive OAuth is required (expired refresh token, missing credentials, etc.),
         the flow is coordinated globally via ReauthCoordinator to ensure only one
         interactive OAuth flow runs at a time across all providers.
+
+        Args:
+            creds_or_path: Either a credentials dict or path to credentials file.
+            force_interactive: If True, skip expiry checks and force interactive OAuth.
+                               Use this when the refresh token is known to be invalid
+                               (e.g., after HTTP 400 from token endpoint).
         """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
@@ -1085,7 +1103,11 @@ class GoogleOAuthBase:
                 await self._load_credentials(creds_or_path) if path else creds_or_path
             )
             reason = ""
-            if not creds.get("refresh_token"):
+            if force_interactive:
+                reason = (
+                    "re-authentication was explicitly requested (refresh token invalid)"
+                )
+            elif not creds.get("refresh_token"):
                 reason = "refresh token is missing"
             elif self._is_token_expired(creds):
                 reason = "token is expired"

@@ -23,6 +23,7 @@ from .usage_manager import UsageManager
 from .failure_logger import log_failure, configure_failure_logger
 from .error_handler import (
     PreRequestCallbackError,
+    CredentialNeedsReauthError,
     classify_error,
     AllProviders,
     NoAvailableKeysError,
@@ -754,6 +755,12 @@ class RotatingClient:
                         # If no usage seen (rare), record success without tokens/cost
                         await self.usage_manager.record_success(key, model)
                     break
+
+                except CredentialNeedsReauthError as e:
+                    # This credential needs re-authentication but re-auth is already queued.
+                    # Wrap it so the outer retry loop can rotate to the next credential.
+                    # No scary traceback needed - this is an expected recovery scenario.
+                    raise StreamedAPIError("Credential needs re-authentication", data=e)
 
                 except (
                     litellm.RateLimitError,
