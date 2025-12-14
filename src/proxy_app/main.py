@@ -1074,6 +1074,7 @@ async def anthropic_streaming_wrapper(
     accumulated_text = ""
     accumulated_thinking = ""
     tool_calls_by_index = {}  # Track tool calls by their index
+    tool_block_indices = {}  # Track which block index each tool call uses
     input_tokens = 0
     output_tokens = 0
 
@@ -1087,13 +1088,22 @@ async def anthropic_streaming_wrapper(
 
             data_content = chunk_str[len("data:") :].strip()
             if data_content == "[DONE]":
-                # Close any open content blocks (thinking, text, or tool_use)
-                if (
-                    thinking_block_started
-                    or content_block_started
-                    or tool_calls_by_index
-                ):
+                # Close any open thinking block
+                if thinking_block_started:
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    current_block_index += 1
+                    thinking_block_started = False
+
+                # Close any open text block
+                if content_block_started:
+                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    current_block_index += 1
+                    content_block_started = False
+
+                # Close all open tool_use blocks
+                for tc_index in sorted(tool_block_indices.keys()):
+                    block_idx = tool_block_indices[tc_index]
+                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {block_idx}}}\n\n'
 
                 # Determine stop_reason based on whether we had tool calls
                 stop_reason = "tool_use" if tool_calls_by_index else "end_turn"
@@ -1214,6 +1224,8 @@ async def anthropic_streaming_wrapper(
                         "name": tc.get("function", {}).get("name", ""),
                         "arguments": "",
                     }
+                    # Track which block index this tool call uses
+                    tool_block_indices[tc_index] = current_block_index
 
                     block_start = {
                         "type": "content_block_start",
@@ -1226,6 +1238,8 @@ async def anthropic_streaming_wrapper(
                         },
                     }
                     yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    # Increment for the next block
+                    current_block_index += 1
 
                 # Accumulate arguments
                 func = tc.get("function", {})
@@ -1234,10 +1248,10 @@ async def anthropic_streaming_wrapper(
                 if func.get("arguments"):
                     tool_calls_by_index[tc_index]["arguments"] += func["arguments"]
 
-                    # Send partial JSON delta
+                    # Send partial JSON delta using the correct block index for this tool
                     block_delta = {
                         "type": "content_block_delta",
-                        "index": current_block_index,
+                        "index": tool_block_indices[tc_index],
                         "delta": {
                             "type": "input_json_delta",
                             "partial_json": func["arguments"],
