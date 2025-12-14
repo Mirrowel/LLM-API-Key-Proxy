@@ -326,7 +326,7 @@ litellm_logger.propagate = False
 logging.debug(f"Modules loaded in {_elapsed:.2f}s")
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(_root_dir / ".env")
 
 # --- Configuration ---
 USE_EMBEDDING_BATCHER = False
@@ -1333,7 +1333,7 @@ if __name__ == "__main__":
 
         ensure_env_defaults()
         # Reload environment variables after ensure_env_defaults creates/updates .env
-        load_dotenv(override=True)
+        load_dotenv(ENV_FILE, override=True)
         run_credential_tool()
     else:
         # Check if onboarding is needed
@@ -1351,11 +1351,11 @@ if __name__ == "__main__":
             from rotator_library.credential_tool import ensure_env_defaults
 
             ensure_env_defaults()
-            load_dotenv(override=True)
+            load_dotenv(ENV_FILE, override=True)
             run_credential_tool()
 
             # After credential tool exits, reload and re-check
-            load_dotenv(override=True)
+            load_dotenv(ENV_FILE, override=True)
             # Re-read PROXY_API_KEY from environment
             PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 

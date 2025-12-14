@@ -16,6 +16,20 @@ from dotenv import load_dotenv, set_key
 console = Console()
 
 
+def _get_env_file() -> Path:
+    """
+    Get .env file path (lightweight - no heavy imports).
+
+    Returns:
+        Path to .env file - EXE directory if frozen, else current working directory
+    """
+    if getattr(sys, "frozen", False):
+        # Running as PyInstaller EXE - use EXE's directory
+        return Path(sys.executable).parent / ".env"
+    # Running as script - use current working directory
+    return Path.cwd() / ".env"
+
+
 def clear_screen():
     """
     Cross-platform terminal clear that works robustly on both
@@ -74,7 +88,7 @@ class LauncherConfig:
     @staticmethod
     def update_proxy_api_key(new_key: str):
         """Update PROXY_API_KEY in .env only"""
-        env_file = Path.cwd() / ".env"
+        env_file = _get_env_file()
         set_key(str(env_file), "PROXY_API_KEY", new_key)
         load_dotenv(dotenv_path=env_file, override=True)
 
@@ -85,7 +99,7 @@ class SettingsDetector:
     @staticmethod
     def _load_local_env() -> dict:
         """Load environment variables from local .env file only"""
-        env_file = Path.cwd() / ".env"
+        env_file = _get_env_file()
         env_dict = {}
         if not env_file.exists():
             return env_dict
@@ -271,7 +285,7 @@ class LauncherTUI:
         self.console = Console()
         self.config = LauncherConfig()
         self.running = True
-        self.env_file = Path.cwd() / ".env"
+        self.env_file = _get_env_file()
         # Load .env file to ensure environment variables are available
         load_dotenv(dotenv_path=self.env_file, override=True)
 
@@ -428,7 +442,7 @@ class LauncherTUI:
         elif choice == "4":
             self.show_provider_settings_menu()
         elif choice == "5":
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
             self.console.print("\n[green]✅ Configuration reloaded![/green]")
         elif choice == "6":
@@ -824,7 +838,7 @@ class LauncherTUI:
         # Run the tool with from_launcher=True to skip duplicate loading screen
         run_credential_tool(from_launcher=True)
         # Reload environment after credential tool
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+        load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def launch_settings_tool(self):
         """Launch settings configuration tool"""
@@ -848,7 +862,7 @@ class LauncherTUI:
 
         run_settings_tool()
         # Reload environment after settings tool
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+        load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def show_about(self):
         """Display About page with project information"""
@@ -936,9 +950,9 @@ class LauncherTUI:
             )
 
             ensure_env_defaults()
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
             run_credential_tool()
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
 
             # Check again after credential tool
             if not os.getenv("PROXY_API_KEY"):

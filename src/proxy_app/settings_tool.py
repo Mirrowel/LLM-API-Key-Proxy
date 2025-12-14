@@ -64,7 +64,7 @@ class AdvancedSettings:
         """Load current .env values into env vars"""
         from dotenv import load_dotenv
 
-        load_dotenv(override=True)
+        load_dotenv(self.env_file, override=True)
 
     def set(self, key: str, value: str):
         """Stage a change"""
