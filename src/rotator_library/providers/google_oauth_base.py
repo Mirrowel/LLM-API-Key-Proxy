@@ -133,13 +133,13 @@ class GoogleOAuthBase:
 
         # Tracking sets/dicts
         self._queued_credentials: set = set()  # Track credentials in either queue
-        # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
-        # This enables TTL-based stale entry cleanup as defense in depth
-        # NOTE: Only credentials in re-auth queue are marked unavailable
+        # Only credentials in re-auth queue are marked unavailable (not normal refresh)
+        # TTL cleanup is defense-in-depth for edge cases where re-auth processor crashes
         self._unavailable_credentials: Dict[
             str, float
         ] = {}  # Maps credential path -> timestamp when marked unavailable
-        self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
+        # TTL should exceed reauth timeout (300s) to avoid premature cleanup
+        self._unavailable_ttl_seconds: int = 360  # 6 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
 
         # Retry tracking for normal refresh queue
@@ -532,7 +532,7 @@ class GoogleOAuthBase:
         """Proactively refresh a credential by queueing it for refresh."""
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
-            # Queue for refresh with needs_reauth=False (automated refresh)
+            # lib_logger.info(f"Proactive refresh triggered for '{Path(credential_path).name}'")
             await self._queue_refresh(credential_path, force=False, needs_reauth=False)
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
@@ -557,32 +557,37 @@ class GoogleOAuthBase:
         return expiry_timestamp < time.time()
 
     def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not in re-auth queue).
+        """Check if a credential is available for rotation.
 
-        [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
-        If a credential has been unavailable for longer than _unavailable_ttl_seconds,
-        it is automatically cleaned up and considered available.
+        Credentials are unavailable if:
+        1. In re-auth queue (token is truly broken, requires user interaction)
+        2. Token is TRULY expired (past actual expiry, not just threshold)
 
-        [NEW] Also checks if token is TRULY expired (not just threshold-expired).
-        Credentials in normal refresh queue are still available (old token still valid).
-        Only credentials in re-auth queue (unavailable_credentials) are blocked.
+        Note: Credentials in normal refresh queue are still available because
+        the old token is valid until actual expiry.
+
+        TTL cleanup (defense-in-depth): If a credential has been in the re-auth
+        queue longer than _unavailable_ttl_seconds without being processed, it's
+        cleaned up. This should only happen if the re-auth processor crashes or
+        is cancelled without proper cleanup.
         """
         # Check if in re-auth queue (truly unavailable)
         if path in self._unavailable_credentials:
-            # [FIX PR#34] Check if the entry is stale (TTL expired)
             marked_time = self._unavailable_credentials.get(path)
             if marked_time is not None:
                 now = time.time()
                 if now - marked_time > self._unavailable_ttl_seconds:
                     # Entry is stale - clean it up and return available
+                    # This is a defense-in-depth for edge cases where re-auth
+                    # processor crashed or was cancelled without cleanup
                     lib_logger.warning(
-                        f"Credential '{Path(path).name}' was stuck in unavailable state for "
+                        f"Credential '{Path(path).name}' stuck in re-auth queue for "
                         f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
-                        f"Auto-cleaning stale entry."
+                        f"Re-auth processor may have crashed. Auto-cleaning stale entry."
                     )
-                    # Note: This is a sync method, so we can't use async lock here.
-                    # However, pop from dict is thread-safe for single operations.
+                    # Clean up both tracking structures for consistency
                     self._unavailable_credentials.pop(path, None)
+                    self._queued_credentials.discard(path)
                 else:
                     return False  # Still in re-auth, not available
 
@@ -592,10 +597,9 @@ class GoogleOAuthBase:
             # Token is actually expired - should not be used
             # Queue for refresh if not already queued
             if path not in self._queued_credentials:
-                lib_logger.debug(
-                    f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
-                )
-                # Can't await here (sync method), so create task
+                # lib_logger.debug(
+                #     f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
+                # )
                 asyncio.create_task(
                     self._queue_refresh(path, force=True, needs_reauth=False)
                 )
@@ -640,10 +644,10 @@ class GoogleOAuthBase:
                 backoff_until = self._next_refresh_after[path]
                 if now < backoff_until:
                     # Credential is in backoff for automated refresh, do not queue
-                    remaining = int(backoff_until - now)
-                    lib_logger.debug(
-                        f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
-                    )
+                    # remaining = int(backoff_until - now)
+                    # lib_logger.debug(
+                    #     f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
+                    # )
                     return
 
         async with self._queue_tracking_lock:
@@ -653,18 +657,18 @@ class GoogleOAuthBase:
                 if needs_reauth:
                     # Re-auth queue: mark as unavailable (token is truly broken)
                     self._unavailable_credentials[path] = time.time()
-                    lib_logger.debug(
-                        f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
-                        f"Total unavailable: {len(self._unavailable_credentials)}"
-                    )
+                    # lib_logger.debug(
+                    #     f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
+                    #     f"Total unavailable: {len(self._unavailable_credentials)}"
+                    # )
                     await self._reauth_queue.put(path)
                     await self._ensure_reauth_processor_running()
                 else:
                     # Normal refresh queue: do NOT mark unavailable (old token still valid)
-                    lib_logger.debug(
-                        f"Queued '{Path(path).name}' for refresh (still available). "
-                        f"Queue size: {self._refresh_queue.qsize() + 1}"
-                    )
+                    # lib_logger.debug(
+                    #     f"Queued '{Path(path).name}' for refresh (still available). "
+                    #     f"Queue size: {self._refresh_queue.qsize() + 1}"
+                    # )
                     await self._refresh_queue.put((path, force))
                     await self._ensure_queue_processor_running()
 
@@ -678,6 +682,7 @@ class GoogleOAuthBase:
         - If 401/403 detected: routes to re-auth queue
         - Does NOT mark credentials unavailable (old token still valid)
         """
+        # lib_logger.info("Refresh queue processor started")
         while True:
             path = None
             try:
@@ -692,7 +697,7 @@ class GoogleOAuthBase:
                         # Clear any stale retry counts
                         self._queue_retry_count.clear()
                     self._queue_processor_task = None
-                    lib_logger.debug("Refresh queue processor idle, shutting down")
+                    # lib_logger.debug("Refresh queue processor idle, shutting down")
                     return
 
                 try:
@@ -700,9 +705,9 @@ class GoogleOAuthBase:
                     creds = self._credentials_cache.get(path)
                     if creds and not self._is_token_expired(creds):
                         # No longer expired, skip refresh
-                        lib_logger.debug(
-                            f"Credential '{Path(path).name}' no longer expired, skipping refresh"
-                        )
+                        # lib_logger.debug(
+                        #     f"Credential '{Path(path).name}' no longer expired, skipping refresh"
+                        # )
                         # Clear retry count on skip (not a failure)
                         self._queue_retry_count.pop(path, None)
                         continue
@@ -717,7 +722,7 @@ class GoogleOAuthBase:
 
                         # SUCCESS: Clear retry count
                         self._queue_retry_count.pop(path, None)
-                        lib_logger.debug(f"Refresh SUCCESS for '{Path(path).name}'")
+                        # lib_logger.info(f"Refresh SUCCESS for '{Path(path).name}'")
 
                     except asyncio.TimeoutError:
                         lib_logger.warning(
@@ -764,7 +769,7 @@ class GoogleOAuthBase:
                 await asyncio.sleep(self._refresh_interval_seconds)
 
             except asyncio.CancelledError:
-                lib_logger.debug("Refresh queue processor cancelled")
+                # lib_logger.debug("Refresh queue processor cancelled")
                 break
             except Exception as e:
                 lib_logger.error(f"Error in refresh queue processor: {e}")
@@ -810,6 +815,7 @@ class GoogleOAuthBase:
         - No automatic retry (requires user action)
         - Cleans up unavailable status when done
         """
+        # lib_logger.info("Re-auth queue processor started")
         while True:
             path = None
             try:
@@ -821,7 +827,7 @@ class GoogleOAuthBase:
                 except asyncio.TimeoutError:
                     # Queue is empty and idle for 60s - exit
                     self._reauth_processor_task = None
-                    lib_logger.debug("Re-auth queue processor idle, shutting down")
+                    # lib_logger.debug("Re-auth queue processor idle, shutting down")
                     return
 
                 try:
@@ -838,10 +844,10 @@ class GoogleOAuthBase:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
                         self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"Re-auth cleanup for '{Path(path).name}'. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                        # lib_logger.debug(
+                        #     f"Re-auth cleanup for '{Path(path).name}'. "
+                        #     f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        # )
                     self._reauth_queue.task_done()
 
             except asyncio.CancelledError:
@@ -850,7 +856,7 @@ class GoogleOAuthBase:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
                         self._unavailable_credentials.pop(path, None)
-                lib_logger.debug("Re-auth queue processor cancelled")
+                # lib_logger.debug("Re-auth queue processor cancelled")
                 break
             except Exception as e:
                 lib_logger.error(f"Error in re-auth queue processor: {e}")
