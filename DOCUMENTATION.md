@@ -856,6 +856,142 @@ class AntigravityAuthBase(GoogleOAuthBase):
 - Headless environment detection
 - Sequential refresh queue processing
 
+#### OAuth Callback Port Configuration
+
+Each OAuth provider uses a local callback server during authentication. The callback port can be customized via environment variables to avoid conflicts with other services.
+
+**Default Ports:**
+
+| Provider | Default Port | Environment Variable |
+|----------|-------------|---------------------|
+| Gemini CLI | 8085 | `GEMINI_CLI_OAUTH_PORT` |
+| Antigravity | 51121 | `ANTIGRAVITY_OAUTH_PORT` |
+| iFlow | 11451 | `IFLOW_OAUTH_PORT` |
+
+**Configuration Methods:**
+
+1. **Via TUI Settings Menu:**
+   - Main Menu → `4. View Provider & Advanced Settings` → `1. Launch Settings Tool`
+   - Select the provider (Gemini CLI, Antigravity, or iFlow)
+   - Modify the `*_OAUTH_PORT` setting
+   - Use "Reset to Default" to restore the original port
+
+2. **Via `.env` file:**
+   ```env
+   # Custom OAuth callback ports (optional)
+   GEMINI_CLI_OAUTH_PORT=8085
+   ANTIGRAVITY_OAUTH_PORT=51121
+   IFLOW_OAUTH_PORT=11451
+   ```
+
+**When to Change Ports:**
+
+- If the default port conflicts with another service on your system
+- If running multiple proxy instances on the same machine
+- If firewall rules require specific port ranges
+
+**Note:** Port changes take effect on the next OAuth authentication attempt. Existing tokens are not affected.
+
+---
+
+### 2.14. HTTP Timeout Configuration (`timeout_config.py`)
+
+Centralized timeout configuration for all HTTP requests to LLM providers.
+
+#### Purpose
+
+The `TimeoutConfig` class provides fine-grained control over HTTP timeouts for streaming and non-streaming LLM requests. This addresses the common issue of proxy hangs when upstream providers stall during connection establishment or response generation.
+
+#### Timeout Types Explained
+
+| Timeout | Description |
+|---------|-------------|
+| **connect** | Maximum time to establish a TCP/TLS connection to the upstream server |
+| **read** | Maximum time to wait between receiving data chunks (resets on each chunk for streaming) |
+| **write** | Maximum time to wait while sending the request body |
+| **pool** | Maximum time to wait for a connection from the connection pool |
+
+#### Default Values
+
+| Setting | Streaming | Non-Streaming | Rationale |
+|---------|-----------|---------------|-----------|
+| **connect** | 30s | 30s | Fast fail if server is unreachable |
+| **read** | 180s (3 min) | 600s (10 min) | Streaming expects periodic chunks; non-streaming may wait for full generation |
+| **write** | 30s | 30s | Request bodies are typically small |
+| **pool** | 60s | 60s | Reasonable wait for connection pool |
+
+#### Environment Variable Overrides
+
+All timeout values can be customized via environment variables:
+
+```env
+# Connection establishment timeout (seconds)
+TIMEOUT_CONNECT=30
+
+# Request body send timeout (seconds)
+TIMEOUT_WRITE=30
+
+# Connection pool acquisition timeout (seconds)
+TIMEOUT_POOL=60
+
+# Read timeout between chunks for streaming requests (seconds)
+# If no data arrives for this duration, the connection is considered stalled
+TIMEOUT_READ_STREAMING=180
+
+# Read timeout for non-streaming responses (seconds)
+# Longer to accommodate models that take time to generate full responses
+TIMEOUT_READ_NON_STREAMING=600
+```
+
+#### Streaming vs Non-Streaming Behavior
+
+**Streaming Requests** (`TimeoutConfig.streaming()`):
+- Uses shorter read timeout (default 3 minutes)
+- Timer resets every time a chunk arrives
+- If no data for 3 minutes → connection considered dead → failover to next credential
+- Appropriate for chat completions where tokens should arrive periodically
+
+**Non-Streaming Requests** (`TimeoutConfig.non_streaming()`):
+- Uses longer read timeout (default 10 minutes)
+- Server may take significant time to generate the complete response before sending anything
+- Complex reasoning tasks or large outputs may legitimately take several minutes
+- Only used by Antigravity provider's `_handle_non_streaming()` method
+
+#### Provider Usage
+
+The following providers use `TimeoutConfig`:
+
+| Provider | Method | Timeout Type |
+|----------|--------|--------------|
+| `antigravity_provider.py` | `_handle_non_streaming()` | `non_streaming()` |
+| `antigravity_provider.py` | `_handle_streaming()` | `streaming()` |
+| `gemini_cli_provider.py` | `acompletion()` | `streaming()` |
+| `iflow_provider.py` | `acompletion()` | `streaming()` |
+| `qwen_code_provider.py` | `acompletion()` | `streaming()` |
+
+**Note:** iFlow, Qwen Code, and Gemini CLI providers always use streaming internally (even for non-streaming requests), aggregating chunks into a complete response. Only Antigravity has a true non-streaming path.
+
+#### Tuning Recommendations
+
+| Use Case | Recommendation |
+|----------|----------------|
+| **Long thinking tasks** | Increase `TIMEOUT_READ_STREAMING` to 300-360s |
+| **Unstable network** | Increase `TIMEOUT_CONNECT` to 60s |
+| **High concurrency** | Increase `TIMEOUT_POOL` if seeing pool exhaustion |
+| **Large context/output** | Increase `TIMEOUT_READ_NON_STREAMING` to 900s+ |
+
+#### Example Configuration
+
+```env
+# For environments with complex reasoning tasks
+TIMEOUT_READ_STREAMING=300
+TIMEOUT_READ_NON_STREAMING=900
+
+# For unstable network conditions
+TIMEOUT_CONNECT=60
+TIMEOUT_POOL=120
+```
+
 ---
 
 
@@ -877,8 +1013,8 @@ The `GeminiCliProvider` is the most complex implementation, mimicking the Google
 
 #### Authentication (`gemini_auth_base.py`)
 
- *   **Device Flow**: Uses a standard OAuth 2.0 flow. The `credential_tool` spins up a local web server (`localhost:8085`) to capture the callback from Google's auth page.
-*   **Token Lifecycle**:
+ *   **Device Flow**: Uses a standard OAuth 2.0 flow. The `credential_tool` spins up a local web server (default: `localhost:8085`, configurable via `GEMINI_CLI_OAUTH_PORT`) to capture the callback from Google's auth page.
+ *   **Token Lifecycle**:
     *   **Proactive Refresh**: Tokens are refreshed 5 minutes before expiry.
     *   **Atomic Writes**: Credential files are updated using a temp-file-and-move strategy to prevent corruption during writes.
     *   **Revocation Handling**: If a `400` or `401` occurs during refresh, the token is marked as revoked, preventing infinite retry loops.
@@ -907,7 +1043,7 @@ The provider employs a sophisticated, cached discovery mechanism to find a valid
 ### 3.3. iFlow (`iflow_provider.py`)
 
 *   **Hybrid Auth**: Uses a custom OAuth flow (Authorization Code) to obtain an `access_token`. However, the *actual* API calls use a separate `apiKey` that is retrieved from the user's profile (`/api/oauth/getUserInfo`) using the access token.
-*   **Callback Server**: The auth flow spins up a local server on port `11451` to capture the redirect.
+*   **Callback Server**: The auth flow spins up a local server (default: port `11451`, configurable via `IFLOW_OAUTH_PORT`) to capture the redirect.
 *   **Token Management**: Automatically refreshes the OAuth token and re-fetches the API key if needed.
 *   **Schema Cleaning**: Similar to Qwen, it aggressively sanitizes tool schemas to prevent 400 errors.
 *   **Dedicated Logging**: Implements `_IFlowFileLogger` to capture raw chunks for debugging proprietary API behaviors.
@@ -935,4 +1071,177 @@ To facilitate robust debugging, the proxy includes a comprehensive transaction l
 
 This level of detail allows developers to trace exactly why a request failed or why a specific key was rotated.
 
+---
+
+## 5. Runtime Resilience
+
+The proxy is engineered to maintain high availability even in the face of runtime filesystem disruptions. This "Runtime Resilience" capability ensures that the service continues to process API requests even if data files or directories are deleted while the application is running.
+
+### 5.1. Centralized Resilient I/O (`resilient_io.py`)
+
+All file operations are centralized in a single utility module that provides consistent error handling, graceful degradation, and automatic retry with shutdown flush:
+
+#### `BufferedWriteRegistry` (Singleton)
+
+Global registry for buffered writes with periodic retry and shutdown flush. Ensures critical data is saved even if disk writes fail temporarily:
+
+- **Per-file buffering**: Each file path has its own pending write (latest data always wins)
+- **Periodic retries**: Background thread retries failed writes every 30 seconds
+- **Shutdown flush**: `atexit` hook ensures final write attempt on app exit (Ctrl+C)
+- **Thread-safe**: Safe for concurrent access from multiple threads
+
+```python
+# Get the singleton instance
+registry = BufferedWriteRegistry.get_instance()
+
+# Check pending writes (for monitoring)
+pending_count = registry.get_pending_count()
+pending_files = registry.get_pending_paths()
+
+# Manual flush (optional - atexit handles this automatically)
+results = registry.flush_all()  # Returns {path: success_bool}
+
+# Manual shutdown (if needed before atexit)
+results = registry.shutdown()
+```
+
+#### `ResilientStateWriter`
+
+For stateful files that must persist (usage stats):
+- **Memory-first**: Always updates in-memory state before attempting disk write
+- **Atomic writes**: Uses tempfile + move pattern to prevent corruption
+- **Automatic retry with backoff**: If disk fails, waits `retry_interval` seconds before trying again
+- **Shutdown integration**: Registers with `BufferedWriteRegistry` on failure for final flush
+- **Health monitoring**: Exposes `is_healthy` property for monitoring
+
+```python
+writer = ResilientStateWriter("data.json", logger, retry_interval=30.0)
+writer.write({"key": "value"})  # Always succeeds (memory update)
+if not writer.is_healthy:
+    logger.warning("Disk writes failing, data in memory only")
+# On next write() call after retry_interval, disk write is attempted again
+# On app exit (Ctrl+C), BufferedWriteRegistry attempts final save
+```
+
+#### `safe_write_json()`
+
+For JSON writes with configurable options (credentials, cache):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | required | File path to write to |
+| `data` | required | JSON-serializable data |
+| `logger` | required | Logger for warnings |
+| `atomic` | `True` | Use atomic write pattern (tempfile + move) |
+| `indent` | `2` | JSON indentation level |
+| `ensure_ascii` | `True` | Escape non-ASCII characters |
+| `secure_permissions` | `False` | Set file permissions to 0o600 |
+| `buffer_on_failure` | `False` | Register with BufferedWriteRegistry on failure |
+
+When `buffer_on_failure=True`:
+- Failed writes are registered with `BufferedWriteRegistry`
+- Data is retried every 30 seconds in background
+- On app exit, final write attempt is made automatically
+- Success unregisters the pending write
+
+```python
+# For critical data (auth tokens) - use buffer_on_failure
+safe_write_json(path, creds, logger, secure_permissions=True, buffer_on_failure=True)
+
+# For non-critical data (logs) - no buffering needed
+safe_write_json(path, data, logger)
+```
+
+#### `safe_log_write()`
+
+For log files where occasional loss is acceptable:
+- Fire-and-forget pattern
+- Creates parent directories if needed
+- Returns `True`/`False`, never raises
+- **No buffering** - logs are dropped on failure
+
+#### `safe_mkdir()`
+
+For directory creation with error handling.
+
+### 5.2. Resilience Hierarchy
+
+The system follows a strict hierarchy of survival:
+
+1. **Core API Handling (Level 1)**: The Python runtime keeps all necessary code in memory. Deleting source code files while the proxy is running will **not** crash active requests.
+
+2. **Credential Management (Level 2)**: OAuth tokens are cached in memory first. If credential files are deleted, the proxy continues using cached tokens. If a token refresh succeeds but the file cannot be written, the new token is buffered for retry and saved on shutdown.
+
+3. **Usage Tracking (Level 3)**: Usage statistics (`key_usage.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
+
+4. **Provider Cache (Level 4)**: The provider cache tracks disk health and continues operating in memory-only mode if disk writes fail. Has its own shutdown mechanism.
+
+5. **Logging (Level 5)**: Logging is treated as non-critical. If the `logs/` directory is removed, the system attempts to recreate it. If creation fails, logging degrades gracefully without interrupting the request flow. **No buffering or retry**.
+
+### 5.3. Component Integration
+
+| Component | Utility Used | Behavior on Disk Failure | Shutdown Flush |
+|-----------|--------------|--------------------------|----------------|
+| `UsageManager` | `ResilientStateWriter` | Continues in memory, retries after 30s | Yes (via registry) |
+| `GoogleOAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `QwenAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `IFlowAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
+| `ProviderCache` | `safe_write_json` + own shutdown | Retries via own background loop | Yes (own mechanism) |
+| `DetailedLogger` | `safe_write_json` | Logs dropped, no crash | No |
+| `failure_logger` | Python `logging.RotatingFileHandler` | Falls back to NullHandler | No |
+
+### 5.4. Shutdown Behavior
+
+When the application exits (including Ctrl+C):
+
+1. **atexit handler fires**: `BufferedWriteRegistry._atexit_handler()` is called
+2. **Pending writes counted**: Registry checks how many files have pending writes
+3. **Flush attempted**: Each pending file gets a final write attempt
+4. **Results logged**:
+   - Success: `"Shutdown flush: all N write(s) succeeded"`
+   - Partial: `"Shutdown flush: X succeeded, Y failed"` with failed file names
+
+**Console output example:**
+```
+INFO:rotator_library.resilient_io:Flushing 2 pending write(s) on shutdown...
+INFO:rotator_library.resilient_io:Shutdown flush: all 2 write(s) succeeded
+```
+
+### 5.5. "Develop While Running"
+
+This architecture supports a robust development workflow:
+
+- **Log Cleanup**: You can safely run `rm -rf logs/` while the proxy is serving traffic. The system will recreate the directory structure on the next request.
+- **Config Reset**: Deleting `key_usage.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
+- **File Recovery**: If you delete a critical file, the system attempts directory auto-recreation before every write operation.
+- **Safe Exit**: Ctrl+C triggers graceful shutdown with final data flush attempt.
+
+### 5.6. Graceful Degradation & Data Loss
+
+While functionality is preserved, persistence may be compromised during filesystem failures:
+
+- **Logs**: If disk writes fail, detailed request logs may be lost (no buffering).
+- **Usage Stats**: Buffered in memory and flushed on shutdown. Data loss only if shutdown flush also fails.
+- **Credentials**: Buffered in memory and flushed on shutdown. Re-authentication only needed if shutdown flush fails.
+- **Cache**: Provider cache entries may need to be regenerated after restart if its own shutdown mechanism fails.
+
+### 5.7. Monitoring Disk Health
+
+Components expose health information for monitoring:
+
+```python
+# BufferedWriteRegistry
+registry = BufferedWriteRegistry.get_instance()
+pending = registry.get_pending_count()  # Number of files with pending writes
+files = registry.get_pending_paths()    # List of pending file names
+
+# UsageManager
+writer = usage_manager._state_writer
+health = writer.get_health_info()
+# Returns: {"healthy": True, "failure_count": 0, "last_success": 1234567890.0, ...}
+
+# ProviderCache
+stats = cache.get_stats()
+# Includes: {"disk_available": True, "disk_errors": 0, ...}
+```
 

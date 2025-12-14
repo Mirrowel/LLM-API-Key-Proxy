@@ -1,16 +1,17 @@
 # src/rotator_library/providers/google_oauth_base.py
 
 import os
+import re
 import webbrowser
-from typing import Union, Optional
+from dataclasses import dataclass, field
+from typing import Union, Optional, List
 import json
 import time
 import asyncio
 import logging
 from pathlib import Path
 from typing import Dict, Any
-import tempfile
-import shutil
+from glob import glob
 
 import httpx
 from rich.console import Console
@@ -20,10 +21,29 @@ from rich.markup import escape as rich_escape
 
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
+from ..utils.resilient_io import safe_write_json
 
 lib_logger = logging.getLogger("rotator_library")
 
 console = Console()
+
+
+@dataclass
+class CredentialSetupResult:
+    """
+    Standardized result structure for credential setup operations.
+
+    Used by all auth classes to return consistent setup results to the credential tool.
+    """
+
+    success: bool
+    file_path: Optional[str] = None
+    email: Optional[str] = None
+    tier: Optional[str] = None
+    project_id: Optional[str] = None
+    is_update: bool = False
+    error: Optional[str] = None
+    credentials: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
 
 class GoogleOAuthBase:
@@ -55,6 +75,25 @@ class GoogleOAuthBase:
     CALLBACK_PATH: str = "/oauth2callback"
     REFRESH_EXPIRY_BUFFER_SECONDS: int = 30 * 60  # 30 minutes
 
+    @property
+    def callback_port(self) -> int:
+        """
+        Get the OAuth callback port, checking environment variable first.
+
+        Reads from {ENV_PREFIX}_OAUTH_PORT environment variable, falling back
+        to the class's CALLBACK_PORT default if not set.
+        """
+        env_var = f"{self.ENV_PREFIX}_OAUTH_PORT"
+        env_value = os.getenv(env_var)
+        if env_value:
+            try:
+                return int(env_value)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid {env_var} value: {env_value}, using default {self.CALLBACK_PORT}"
+                )
+        return self.CALLBACK_PORT
+
     def __init__(self):
         # Validate that subclass has set required attributes
         if self.CLIENT_ID is None:
@@ -83,19 +122,36 @@ class GoogleOAuthBase:
             str, float
         ] = {}  # Track backoff timers (Unix timestamp)
 
-        # [QUEUE SYSTEM] Sequential refresh processing
+        # [QUEUE SYSTEM] Sequential refresh processing with two separate queues
+        # Normal refresh queue: for proactive token refresh (old token still valid)
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
-        self._queued_credentials: set = set()  # Track credentials already in queue
-        # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
-        # This enables TTL-based stale entry cleanup as defense in depth
+        self._queue_processor_task: Optional[asyncio.Task] = None
+
+        # Re-auth queue: for invalid refresh tokens (requires user interaction)
+        self._reauth_queue: asyncio.Queue = asyncio.Queue()
+        self._reauth_processor_task: Optional[asyncio.Task] = None
+
+        # Tracking sets/dicts
+        self._queued_credentials: set = set()  # Track credentials in either queue
+        # Only credentials in re-auth queue are marked unavailable (not normal refresh)
+        # TTL cleanup is defense-in-depth for edge cases where re-auth processor crashes
         self._unavailable_credentials: Dict[
             str, float
         ] = {}  # Maps credential path -> timestamp when marked unavailable
-        self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
+        # TTL should exceed reauth timeout (300s) to avoid premature cleanup
+        self._unavailable_ttl_seconds: int = 360  # 6 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
-        self._queue_processor_task: Optional[asyncio.Task] = (
-            None  # Background worker task
-        )
+
+        # Retry tracking for normal refresh queue
+        self._queue_retry_count: Dict[
+            str, int
+        ] = {}  # Track retry attempts per credential
+
+        # Configuration constants
+        self._refresh_timeout_seconds: int = 15  # Max time for single refresh
+        self._refresh_interval_seconds: int = 30  # Delay between queue items
+        self._refresh_max_retries: int = 3  # Attempts before kicked out
+        self._reauth_timeout_seconds: int = 300  # Time for user to complete OAuth
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """
@@ -228,17 +284,7 @@ class GoogleOAuthBase:
                         f"Environment variables for {self.ENV_PREFIX} credential index {credential_index} not found"
                     )
 
-            # For file paths, first try loading from legacy env vars (for backwards compatibility)
-            env_creds = self._load_from_env()
-            if env_creds:
-                lib_logger.info(
-                    f"Using {self.ENV_PREFIX} credentials from environment variables"
-                )
-                # Cache env-based credentials using the path as key
-                self._credentials_cache[path] = env_creds
-                return env_creds
-
-            # Fall back to file-based loading
+            # Try file-based loading first (preferred for explicit file paths)
             try:
                 lib_logger.debug(
                     f"Loading {self.ENV_PREFIX} credentials from file: {path}"
@@ -251,6 +297,15 @@ class GoogleOAuthBase:
                 self._credentials_cache[path] = creds
                 return creds
             except FileNotFoundError:
+                # File not found - fall back to legacy env vars for backwards compatibility
+                # This handles the case where only env vars are set and file paths are placeholders
+                env_creds = self._load_from_env()
+                if env_creds:
+                    lib_logger.info(
+                        f"File '{path}' not found, using {self.ENV_PREFIX} credentials from environment variables"
+                    )
+                    self._credentials_cache[path] = env_creds
+                    return env_creds
                 raise IOError(
                     f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'"
                 )
@@ -258,70 +313,29 @@ class GoogleOAuthBase:
                 raise IOError(
                     f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
                 )
-            except Exception as e:
-                raise IOError(
-                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
-                )
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
+        """Save credentials with in-memory fallback if disk unavailable."""
+        # Always update cache first (memory is reliable)
+        self._credentials_cache[path] = creds
+
         # Don't save to file if credentials were loaded from environment
         if creds.get("_proxy_metadata", {}).get("loaded_from_env"):
             lib_logger.debug("Credentials loaded from env, skipping file save")
-            # Still update cache for in-memory consistency
-            self._credentials_cache[path] = creds
             return
 
-        # [ATOMIC WRITE] Use tempfile + move pattern to ensure atomic writes
-        # This prevents credential corruption if the process is interrupted during write
-        parent_dir = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent_dir, exist_ok=True)
-
-        tmp_fd = None
-        tmp_path = None
-        try:
-            # Create temp file in same directory as target (ensures same filesystem)
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=parent_dir, prefix=".tmp_", suffix=".json", text=True
-            )
-
-            # Write JSON to temp file
-            with os.fdopen(tmp_fd, "w") as f:
-                json.dump(creds, f, indent=2)
-                tmp_fd = None  # fdopen closes the fd
-
-            # Set secure permissions (0600 = owner read/write only)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except (OSError, AttributeError):
-                # Windows may not support chmod, ignore
-                pass
-
-            # Atomic move (overwrites target if it exists)
-            shutil.move(tmp_path, path)
-            tmp_path = None  # Successfully moved
-
-            # Update cache AFTER successful file write (prevents cache/file inconsistency)
-            self._credentials_cache[path] = creds
+        # Attempt disk write - if it fails, we still have the cache
+        # buffer_on_failure ensures data is retried periodically and saved on shutdown
+        if safe_write_json(
+            path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
+        ):
             lib_logger.debug(
-                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}' (atomic write)."
+                f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'."
             )
-
-        except Exception as e:
-            lib_logger.error(
-                f"Failed to save updated {self.ENV_PREFIX} OAuth credentials to '{path}': {e}"
+        else:
+            lib_logger.warning(
+                f"Credentials for {self.ENV_PREFIX} cached in memory only (buffered for retry)."
             )
-            # Clean up temp file if it still exists
-            if tmp_fd is not None:
-                try:
-                    os.close(tmp_fd)
-                except:
-                    pass
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-            raise
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         expiry = creds.get("token_expiry")  # gcloud format
@@ -518,7 +532,7 @@ class GoogleOAuthBase:
         """Proactively refresh a credential by queueing it for refresh."""
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
-            # Queue for refresh with needs_reauth=False (automated refresh)
+            # lib_logger.info(f"Proactive refresh triggered for '{Path(credential_path).name}'")
             await self._queue_refresh(credential_path, force=False, needs_reauth=False)
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
@@ -529,34 +543,69 @@ class GoogleOAuthBase:
                 self._refresh_locks[path] = asyncio.Lock()
             return self._refresh_locks[path]
 
-    def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not queued/refreshing).
+    def _is_token_truly_expired(self, creds: Dict[str, Any]) -> bool:
+        """Check if token is TRULY expired (past actual expiry, not just threshold).
 
-        [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
-        If a credential has been unavailable for longer than _unavailable_ttl_seconds,
-        it is automatically cleaned up and considered available.
+        This is different from _is_token_expired() which uses a buffer for proactive refresh.
+        This method checks if the token is actually unusable.
         """
-        if path not in self._unavailable_credentials:
-            return True
+        expiry = creds.get("token_expiry")  # gcloud format
+        if not expiry:  # gemini-cli format
+            expiry_timestamp = creds.get("expiry_date", 0) / 1000
+        else:
+            expiry_timestamp = time.mktime(time.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ"))
+        return expiry_timestamp < time.time()
 
-        # [FIX PR#34] Check if the entry is stale (TTL expired)
-        marked_time = self._unavailable_credentials.get(path)
-        if marked_time is not None:
-            now = time.time()
-            if now - marked_time > self._unavailable_ttl_seconds:
-                # Entry is stale - clean it up and return available
-                lib_logger.warning(
-                    f"Credential '{Path(path).name}' was stuck in unavailable state for "
-                    f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
-                    f"Auto-cleaning stale entry."
+    def is_credential_available(self, path: str) -> bool:
+        """Check if a credential is available for rotation.
+
+        Credentials are unavailable if:
+        1. In re-auth queue (token is truly broken, requires user interaction)
+        2. Token is TRULY expired (past actual expiry, not just threshold)
+
+        Note: Credentials in normal refresh queue are still available because
+        the old token is valid until actual expiry.
+
+        TTL cleanup (defense-in-depth): If a credential has been in the re-auth
+        queue longer than _unavailable_ttl_seconds without being processed, it's
+        cleaned up. This should only happen if the re-auth processor crashes or
+        is cancelled without proper cleanup.
+        """
+        # Check if in re-auth queue (truly unavailable)
+        if path in self._unavailable_credentials:
+            marked_time = self._unavailable_credentials.get(path)
+            if marked_time is not None:
+                now = time.time()
+                if now - marked_time > self._unavailable_ttl_seconds:
+                    # Entry is stale - clean it up and return available
+                    # This is a defense-in-depth for edge cases where re-auth
+                    # processor crashed or was cancelled without cleanup
+                    lib_logger.warning(
+                        f"Credential '{Path(path).name}' stuck in re-auth queue for "
+                        f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
+                        f"Re-auth processor may have crashed. Auto-cleaning stale entry."
+                    )
+                    # Clean up both tracking structures for consistency
+                    self._unavailable_credentials.pop(path, None)
+                    self._queued_credentials.discard(path)
+                else:
+                    return False  # Still in re-auth, not available
+
+        # Check if token is TRULY expired (not just threshold-expired)
+        creds = self._credentials_cache.get(path)
+        if creds and self._is_token_truly_expired(creds):
+            # Token is actually expired - should not be used
+            # Queue for refresh if not already queued
+            if path not in self._queued_credentials:
+                # lib_logger.debug(
+                #     f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
+                # )
+                asyncio.create_task(
+                    self._queue_refresh(path, force=True, needs_reauth=False)
                 )
-                # Note: This is a sync method, so we can't use async lock here.
-                # However, pop from dict is thread-safe for single operations.
-                # The _queue_tracking_lock protects concurrent modifications in async context.
-                self._unavailable_credentials.pop(path, None)
-                return True
+            return False
 
-        return False
+        return True
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -565,15 +614,27 @@ class GoogleOAuthBase:
                 self._process_refresh_queue()
             )
 
+    async def _ensure_reauth_processor_running(self):
+        """Lazily starts the re-auth queue processor if not already running."""
+        if self._reauth_processor_task is None or self._reauth_processor_task.done():
+            self._reauth_processor_task = asyncio.create_task(
+                self._process_reauth_queue()
+            )
+
     async def _queue_refresh(
         self, path: str, force: bool = False, needs_reauth: bool = False
     ):
-        """Add a credential to the refresh queue if not already queued.
+        """Add a credential to the appropriate refresh queue if not already queued.
 
         Args:
             path: Credential file path
             force: Force refresh even if not expired
-            needs_reauth: True if full re-authentication needed (bypasses backoff)
+            needs_reauth: True if full re-authentication needed (routes to re-auth queue)
+
+        Queue routing:
+        - needs_reauth=True: Goes to re-auth queue, marks as unavailable
+        - needs_reauth=False: Goes to normal refresh queue, does NOT mark unavailable
+          (old token is still valid until actual expiry)
         """
         # IMPORTANT: Only check backoff for simple automated refreshes
         # Re-authentication (interactive OAuth) should BYPASS backoff since it needs user input
@@ -583,108 +644,226 @@ class GoogleOAuthBase:
                 backoff_until = self._next_refresh_after[path]
                 if now < backoff_until:
                     # Credential is in backoff for automated refresh, do not queue
-                    remaining = int(backoff_until - now)
-                    lib_logger.debug(
-                        f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
-                    )
+                    # remaining = int(backoff_until - now)
+                    # lib_logger.debug(
+                    #     f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
+                    # )
                     return
 
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                # [FIX PR#34] Store timestamp when marking unavailable (for TTL cleanup)
-                self._unavailable_credentials[path] = time.time()
-                lib_logger.debug(
-                    f"Marked '{Path(path).name}' as unavailable. "
-                    f"Total unavailable: {len(self._unavailable_credentials)}"
-                )
-                await self._refresh_queue.put((path, force, needs_reauth))
-                await self._ensure_queue_processor_running()
+
+                if needs_reauth:
+                    # Re-auth queue: mark as unavailable (token is truly broken)
+                    self._unavailable_credentials[path] = time.time()
+                    # lib_logger.debug(
+                    #     f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
+                    #     f"Total unavailable: {len(self._unavailable_credentials)}"
+                    # )
+                    await self._reauth_queue.put(path)
+                    await self._ensure_reauth_processor_running()
+                else:
+                    # Normal refresh queue: do NOT mark unavailable (old token still valid)
+                    # lib_logger.debug(
+                    #     f"Queued '{Path(path).name}' for refresh (still available). "
+                    #     f"Queue size: {self._refresh_queue.qsize() + 1}"
+                    # )
+                    await self._refresh_queue.put((path, force))
+                    await self._ensure_queue_processor_running()
 
     async def _process_refresh_queue(self):
-        """Background worker that processes refresh requests sequentially."""
+        """Background worker that processes normal refresh requests sequentially.
+
+        Key behaviors:
+        - 15s timeout per refresh operation
+        - 30s delay between processing credentials (prevents thundering herd)
+        - On failure: back of queue, max 3 retries before kicked
+        - If 401/403 detected: routes to re-auth queue
+        - Does NOT mark credentials unavailable (old token still valid)
+        """
+        # lib_logger.info("Refresh queue processor started")
         while True:
             path = None
             try:
                 # Wait for an item with timeout to allow graceful shutdown
                 try:
-                    path, force, needs_reauth = await asyncio.wait_for(
+                    path, force = await asyncio.wait_for(
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # [FIX PR#34] Clean up any stale unavailable entries before exiting
-                    # If we're idle for 60s, no refreshes are in progress
+                    # Queue is empty and idle for 60s - clean up and exit
                     async with self._queue_tracking_lock:
-                        if self._unavailable_credentials:
-                            stale_count = len(self._unavailable_credentials)
-                            lib_logger.warning(
-                                f"Queue processor idle timeout. Cleaning {stale_count} "
-                                f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
-                            )
-                            self._unavailable_credentials.clear()
+                        # Clear any stale retry counts
+                        self._queue_retry_count.clear()
                     self._queue_processor_task = None
+                    # lib_logger.debug("Refresh queue processor idle, shutting down")
                     return
 
                 try:
-                    # Perform the actual refresh (still using per-credential lock)
-                    async with await self._get_lock(path):
-                        # Re-check if still expired (may have changed since queueing)
-                        creds = self._credentials_cache.get(path)
-                        if creds and not self._is_token_expired(creds):
-                            # No longer expired, mark as available
+                    # Quick check if still expired (optimization to avoid unnecessary refresh)
+                    creds = self._credentials_cache.get(path)
+                    if creds and not self._is_token_expired(creds):
+                        # No longer expired, skip refresh
+                        # lib_logger.debug(
+                        #     f"Credential '{Path(path).name}' no longer expired, skipping refresh"
+                        # )
+                        # Clear retry count on skip (not a failure)
+                        self._queue_retry_count.pop(path, None)
+                        continue
+
+                    # Perform refresh with timeout
+                    if not creds:
+                        creds = await self._load_credentials(path)
+
+                    try:
+                        async with asyncio.timeout(self._refresh_timeout_seconds):
+                            await self._refresh_token(path, creds, force=force)
+
+                        # SUCCESS: Clear retry count
+                        self._queue_retry_count.pop(path, None)
+                        # lib_logger.info(f"Refresh SUCCESS for '{Path(path).name}'")
+
+                    except asyncio.TimeoutError:
+                        lib_logger.warning(
+                            f"Refresh timeout ({self._refresh_timeout_seconds}s) for '{Path(path).name}'"
+                        )
+                        await self._handle_refresh_failure(path, force, "timeout")
+
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        if status_code in (401, 403):
+                            # Invalid refresh token - route to re-auth queue
+                            lib_logger.warning(
+                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                f"Routing to re-auth queue."
+                            )
+                            self._queue_retry_count.pop(path, None)  # Clear retry count
                             async with self._queue_tracking_lock:
-                                self._unavailable_credentials.pop(path, None)
-                                lib_logger.debug(
-                                    f"Credential '{Path(path).name}' no longer expired, marked available. "
-                                    f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                                )
-                            continue
-
-                        # Perform refresh
-                        if not creds:
-                            creds = await self._load_credentials(path)
-                        await self._refresh_token(path, creds, force=force)
-
-                        # SUCCESS: Mark as available again
-                        async with self._queue_tracking_lock:
-                            self._unavailable_credentials.pop(path, None)
-                            lib_logger.debug(
-                                f"Refresh SUCCESS for '{Path(path).name}', marked available. "
-                                f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                                self._queued_credentials.discard(
+                                    path
+                                )  # Remove from queued
+                            await self._queue_refresh(
+                                path, force=True, needs_reauth=True
+                            )
+                        else:
+                            await self._handle_refresh_failure(
+                                path, force, f"HTTP {status_code}"
                             )
 
+                    except Exception as e:
+                        await self._handle_refresh_failure(path, force, str(e))
+
                 finally:
-                    # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
-                    # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
+                    # Remove from queued set (unless re-queued by failure handler)
                     async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        # [FIX PR#34] Always clean up unavailable credentials in finally block
-                        self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"Finally cleanup for '{Path(path).name}'. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                        # Only discard if not re-queued (check if still in queue set from retry)
+                        if (
+                            path in self._queued_credentials
+                            and self._queue_retry_count.get(path, 0) == 0
+                        ):
+                            self._queued_credentials.discard(path)
                     self._refresh_queue.task_done()
+
+                # Wait between credentials to spread load
+                await asyncio.sleep(self._refresh_interval_seconds)
+
             except asyncio.CancelledError:
-                # [FIX PR#34] Clean up the current credential before breaking
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"CancelledError cleanup for '{Path(path).name}'. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                # lib_logger.debug("Refresh queue processor cancelled")
                 break
             except Exception as e:
-                lib_logger.error(f"Error in queue processor: {e}")
-                # Even on error, mark as available (backoff will prevent immediate retry)
+                lib_logger.error(f"Error in refresh queue processor: {e}")
                 if path:
                     async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+
+    async def _handle_refresh_failure(self, path: str, force: bool, error: str):
+        """Handle a refresh failure with back-of-line retry logic.
+
+        - Increments retry count
+        - If under max retries: re-adds to END of queue
+        - If at max retries: kicks credential out (retried next BackgroundRefresher cycle)
+        """
+        retry_count = self._queue_retry_count.get(path, 0) + 1
+        self._queue_retry_count[path] = retry_count
+
+        if retry_count >= self._refresh_max_retries:
+            # Kicked out until next BackgroundRefresher cycle
+            lib_logger.error(
+                f"Max retries ({self._refresh_max_retries}) reached for '{Path(path).name}' "
+                f"(last error: {error}). Will retry next refresh cycle."
+            )
+            self._queue_retry_count.pop(path, None)
+            async with self._queue_tracking_lock:
+                self._queued_credentials.discard(path)
+            return
+
+        # Re-add to END of queue for retry
+        lib_logger.warning(
+            f"Refresh failed for '{Path(path).name}' ({error}). "
+            f"Retry {retry_count}/{self._refresh_max_retries}, back of queue."
+        )
+        # Keep in queued_credentials set, add back to queue
+        await self._refresh_queue.put((path, force))
+
+    async def _process_reauth_queue(self):
+        """Background worker that processes re-auth requests.
+
+        Key behaviors:
+        - Credentials ARE marked unavailable (token is truly broken)
+        - Uses ReauthCoordinator for interactive OAuth
+        - No automatic retry (requires user action)
+        - Cleans up unavailable status when done
+        """
+        # lib_logger.info("Re-auth queue processor started")
+        while True:
+            path = None
+            try:
+                # Wait for an item with timeout to allow graceful shutdown
+                try:
+                    path = await asyncio.wait_for(
+                        self._reauth_queue.get(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # Queue is empty and idle for 60s - exit
+                    self._reauth_processor_task = None
+                    # lib_logger.debug("Re-auth queue processor idle, shutting down")
+                    return
+
+                try:
+                    lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
+                    await self.initialize_token(path)
+                    lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
+
+                except Exception as e:
+                    lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
+                    # No automatic retry for re-auth (requires user action)
+
+                finally:
+                    # Always clean up
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
                         self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"Error cleanup for '{Path(path).name}': {e}. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                        # lib_logger.debug(
+                        #     f"Re-auth cleanup for '{Path(path).name}'. "
+                        #     f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        # )
+                    self._reauth_queue.task_done()
+
+            except asyncio.CancelledError:
+                # Clean up current credential before breaking
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
+                # lib_logger.debug("Re-auth queue processor cancelled")
+                break
+            except Exception as e:
+                lib_logger.error(f"Error in re-auth queue processor: {e}")
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
 
     async def _perform_interactive_oauth(
         self, path: str, creds: Dict[str, Any], display_name: str
@@ -744,14 +923,14 @@ class GoogleOAuthBase:
 
         try:
             server = await asyncio.start_server(
-                handle_callback, "127.0.0.1", self.CALLBACK_PORT
+                handle_callback, "127.0.0.1", self.callback_port
             )
             from urllib.parse import urlencode
 
             auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
                 {
                     "client_id": self.CLIENT_ID,
-                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "redirect_uri": f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}",
                     "scope": " ".join(self.OAUTH_SCOPES),
                     "access_type": "offline",
                     "response_type": "code",
@@ -826,7 +1005,7 @@ class GoogleOAuthBase:
                     "code": auth_code.strip(),
                     "client_id": self.CLIENT_ID,
                     "client_secret": self.CLIENT_SECRET,
-                    "redirect_uri": f"http://localhost:{self.CALLBACK_PORT}{self.CALLBACK_PATH}",
+                    "redirect_uri": f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}",
                     "grant_type": "authorization_code",
                 },
             )
@@ -864,6 +1043,18 @@ class GoogleOAuthBase:
             lib_logger.info(
                 f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
             )
+
+            # Perform post-auth discovery (tier, project, etc.) while we have a fresh token
+            if path:
+                try:
+                    await self._post_auth_discovery(path, new_creds["access_token"])
+                except Exception as e:
+                    # Don't fail auth if discovery fails - it can be retried on first request
+                    lib_logger.warning(
+                        f"Post-auth discovery failed for '{display_name}': {e}. "
+                        "Tier/project will be discovered on first request."
+                    )
+
         return new_creds
 
     async def initialize_token(
@@ -940,10 +1131,51 @@ class GoogleOAuthBase:
             )
 
     async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
-        creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path, creds)
-        return {"Authorization": f"Bearer {creds['access_token']}"}
+        """Get auth header with graceful degradation if refresh fails."""
+        try:
+            creds = await self._load_credentials(credential_path)
+            if self._is_token_expired(creds):
+                try:
+                    creds = await self._refresh_token(credential_path, creds)
+                except Exception as e:
+                    # Check if we have a cached token that might still work
+                    cached = self._credentials_cache.get(credential_path)
+                    if cached and cached.get("access_token"):
+                        lib_logger.warning(
+                            f"Token refresh failed for {Path(credential_path).name}: {e}. "
+                            "Using cached token (may be expired)."
+                        )
+                        creds = cached
+                    else:
+                        raise
+            return {"Authorization": f"Bearer {creds['access_token']}"}
+        except Exception as e:
+            # Check if any cached credential exists as last resort
+            cached = self._credentials_cache.get(credential_path)
+            if cached and cached.get("access_token"):
+                lib_logger.error(
+                    f"Credential load failed for {credential_path}: {e}. "
+                    "Using stale cached token as last resort."
+                )
+                return {"Authorization": f"Bearer {cached['access_token']}"}
+            raise
+
+    async def _post_auth_discovery(
+        self, credential_path: str, access_token: str
+    ) -> None:
+        """
+        Hook for subclasses to perform post-authentication discovery.
+
+        Called after successful OAuth authentication (both initial and re-auth).
+        Subclasses can override this to discover and cache tier/project information
+        during the authentication flow rather than waiting for the first API request.
+
+        Args:
+            credential_path: Path to the credential file
+            access_token: The newly obtained access token
+        """
+        # Default implementation does nothing - subclasses can override
+        pass
 
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
@@ -976,3 +1208,372 @@ class GoogleOAuthBase:
             if path:
                 await self._save_credentials(path, creds)
             return {"email": user_info.get("email")}
+
+    # =========================================================================
+    # CREDENTIAL MANAGEMENT METHODS
+    # =========================================================================
+
+    def _get_provider_file_prefix(self) -> str:
+        """
+        Get the file name prefix for this provider's credential files.
+
+        Override in subclasses if the prefix differs from ENV_PREFIX.
+        Default: lowercase ENV_PREFIX with underscores (e.g., "gemini_cli")
+        """
+        return self.ENV_PREFIX.lower()
+
+    def _get_oauth_base_dir(self) -> Path:
+        """
+        Get the base directory for OAuth credential files.
+
+        Can be overridden to customize credential storage location.
+        """
+        return Path.cwd() / "oauth_creds"
+
+    def _find_existing_credential_by_email(
+        self, email: str, base_dir: Optional[Path] = None
+    ) -> Optional[Path]:
+        """
+        Find an existing credential file for the given email.
+
+        Args:
+            email: Email address to search for
+            base_dir: Directory to search in (defaults to oauth_creds)
+
+        Returns:
+            Path to existing credential file, or None if not found
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        for cred_file in glob(pattern):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+                existing_email = creds.get("_proxy_metadata", {}).get("email")
+                if existing_email == email:
+                    return Path(cred_file)
+            except (json.JSONDecodeError, IOError) as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return None
+
+    def _get_next_credential_number(self, base_dir: Optional[Path] = None) -> int:
+        """
+        Get the next available credential number for new credential files.
+
+        Args:
+            base_dir: Directory to scan (defaults to oauth_creds)
+
+        Returns:
+            Next available credential number (1, 2, 3, etc.)
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        existing_numbers = []
+        for cred_file in glob(pattern):
+            match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+            if match:
+                existing_numbers.append(int(match.group(1)))
+
+        if not existing_numbers:
+            return 1
+        return max(existing_numbers) + 1
+
+    def _build_credential_path(
+        self, base_dir: Optional[Path] = None, number: Optional[int] = None
+    ) -> Path:
+        """
+        Build a path for a new credential file.
+
+        Args:
+            base_dir: Directory for credential files (defaults to oauth_creds)
+            number: Credential number (auto-determined if None)
+
+        Returns:
+            Path for the new credential file
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        if number is None:
+            number = self._get_next_credential_number(base_dir)
+
+        prefix = self._get_provider_file_prefix()
+        filename = f"{prefix}_oauth_{number}.json"
+        return base_dir / filename
+
+    async def setup_credential(
+        self, base_dir: Optional[Path] = None
+    ) -> CredentialSetupResult:
+        """
+        Complete credential setup flow: OAuth -> save -> discovery.
+
+        This is the main entry point for setting up new credentials.
+        Handles the entire lifecycle:
+        1. Perform OAuth authentication
+        2. Get user info (email) for deduplication
+        3. Find existing credential or create new file path
+        4. Save credentials to file
+        5. Perform post-auth discovery (tier/project for Google OAuth)
+
+        Args:
+            base_dir: Directory for credential files (defaults to oauth_creds)
+
+        Returns:
+            CredentialSetupResult with status and details
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        # Ensure directory exists
+        base_dir.mkdir(exist_ok=True)
+
+        try:
+            # Step 1: Perform OAuth authentication (returns credentials dict)
+            temp_creds = {
+                "_proxy_metadata": {"display_name": f"new {self.ENV_PREFIX} credential"}
+            }
+            new_creds = await self.initialize_token(temp_creds)
+
+            # Step 2: Get user info for deduplication
+            user_info = await self.get_user_info(new_creds)
+            email = user_info.get("email")
+
+            if not email:
+                return CredentialSetupResult(
+                    success=False, error="Could not retrieve email from OAuth response"
+                )
+
+            # Step 3: Check for existing credential with same email
+            existing_path = self._find_existing_credential_by_email(email, base_dir)
+            is_update = existing_path is not None
+
+            if is_update:
+                file_path = existing_path
+                lib_logger.info(
+                    f"Found existing credential for {email}, updating {file_path.name}"
+                )
+            else:
+                file_path = self._build_credential_path(base_dir)
+                lib_logger.info(
+                    f"Creating new credential for {email} at {file_path.name}"
+                )
+
+            # Step 4: Save credentials to file
+            await self._save_credentials(str(file_path), new_creds)
+
+            # Step 5: Perform post-auth discovery (tier, project_id)
+            # This is already called in _perform_interactive_oauth, but we call it again
+            # in case credentials were loaded from existing token
+            tier = None
+            project_id = None
+            try:
+                await self._post_auth_discovery(
+                    str(file_path), new_creds["access_token"]
+                )
+                # Reload credentials to get discovered metadata
+                with open(file_path, "r") as f:
+                    updated_creds = json.load(f)
+                tier = updated_creds.get("_proxy_metadata", {}).get("tier")
+                project_id = updated_creds.get("_proxy_metadata", {}).get("project_id")
+                new_creds = updated_creds
+            except Exception as e:
+                lib_logger.warning(
+                    f"Post-auth discovery failed: {e}. Tier/project will be discovered on first request."
+                )
+
+            return CredentialSetupResult(
+                success=True,
+                file_path=str(file_path),
+                email=email,
+                tier=tier,
+                project_id=project_id,
+                is_update=is_update,
+                credentials=new_creds,
+            )
+
+        except Exception as e:
+            lib_logger.error(f"Credential setup failed: {e}")
+            return CredentialSetupResult(success=False, error=str(e))
+
+    def build_env_lines(self, creds: Dict[str, Any], cred_number: int) -> List[str]:
+        """
+        Generate .env file lines for a credential.
+
+        Subclasses should override to include provider-specific fields
+        (e.g., tier, project_id for Google OAuth providers).
+
+        Args:
+            creds: Credential dictionary loaded from JSON
+            cred_number: Credential number (1, 2, 3, etc.)
+
+        Returns:
+            List of .env file lines
+        """
+        email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+        prefix = f"{self.ENV_PREFIX}_{cred_number}"
+
+        lines = [
+            f"# {self.ENV_PREFIX} Credential #{cred_number} for: {email}",
+            f"# Exported from: {self._get_provider_file_prefix()}_oauth_{cred_number}.json",
+            f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "#",
+            "# To combine multiple credentials into one .env file, copy these lines",
+            "# and ensure each credential has a unique number (1, 2, 3, etc.)",
+            "",
+            f"{prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+            f"{prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+            f"{prefix}_SCOPE={creds.get('scope', '')}",
+            f"{prefix}_TOKEN_TYPE={creds.get('token_type', 'Bearer')}",
+            f"{prefix}_ID_TOKEN={creds.get('id_token', '')}",
+            f"{prefix}_EXPIRY_DATE={creds.get('expiry_date', 0)}",
+            f"{prefix}_CLIENT_ID={creds.get('client_id', '')}",
+            f"{prefix}_CLIENT_SECRET={creds.get('client_secret', '')}",
+            f"{prefix}_TOKEN_URI={creds.get('token_uri', 'https://oauth2.googleapis.com/token')}",
+            f"{prefix}_UNIVERSE_DOMAIN={creds.get('universe_domain', 'googleapis.com')}",
+            f"{prefix}_EMAIL={email}",
+        ]
+
+        return lines
+
+    def export_credential_to_env(
+        self, credential_path: str, output_dir: Optional[Path] = None
+    ) -> Optional[str]:
+        """
+        Export a credential file to .env format.
+
+        Args:
+            credential_path: Path to the credential JSON file
+            output_dir: Directory for output .env file (defaults to same as credential)
+
+        Returns:
+            Path to the exported .env file, or None on error
+        """
+        try:
+            cred_path = Path(credential_path)
+
+            # Load credential
+            with open(cred_path, "r") as f:
+                creds = json.load(f)
+
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+
+            # Get credential number from filename
+            match = re.search(r"_oauth_(\d+)\.json$", cred_path.name)
+            cred_number = int(match.group(1)) if match else 1
+
+            # Build output path
+            if output_dir is None:
+                output_dir = cred_path.parent
+
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            prefix = self._get_provider_file_prefix()
+            env_filename = f"{prefix}_{cred_number}_{safe_email}.env"
+            env_path = output_dir / env_filename
+
+            # Build and write content
+            env_lines = self.build_env_lines(creds, cred_number)
+            with open(env_path, "w") as f:
+                f.write("\n".join(env_lines))
+
+            lib_logger.info(f"Exported credential to {env_path}")
+            return str(env_path)
+
+        except Exception as e:
+            lib_logger.error(f"Failed to export credential: {e}")
+            return None
+
+    def list_credentials(self, base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """
+        List all credential files for this provider.
+
+        Args:
+            base_dir: Directory to search (defaults to oauth_creds)
+
+        Returns:
+            List of dicts with credential info:
+            - file_path: Path to credential file
+            - email: User email
+            - tier: Tier info (if available)
+            - project_id: Project ID (if available)
+            - number: Credential number
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_oauth_*.json")
+
+        credentials = []
+        for cred_file in sorted(glob(pattern)):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+
+                metadata = creds.get("_proxy_metadata", {})
+
+                # Extract number from filename
+                match = re.search(r"_oauth_(\d+)\.json$", cred_file)
+                number = int(match.group(1)) if match else 0
+
+                credentials.append(
+                    {
+                        "file_path": cred_file,
+                        "email": metadata.get("email", "unknown"),
+                        "tier": metadata.get("tier"),
+                        "project_id": metadata.get("project_id"),
+                        "number": number,
+                    }
+                )
+            except Exception as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return credentials
+
+    def delete_credential(self, credential_path: str) -> bool:
+        """
+        Delete a credential file.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        try:
+            cred_path = Path(credential_path)
+
+            # Validate that it's one of our credential files
+            prefix = self._get_provider_file_prefix()
+            if not cred_path.name.startswith(f"{prefix}_oauth_"):
+                lib_logger.error(
+                    f"File {cred_path.name} does not appear to be a {self.ENV_PREFIX} credential"
+                )
+                return False
+
+            if not cred_path.exists():
+                lib_logger.warning(f"Credential file does not exist: {credential_path}")
+                return False
+
+            # Remove from cache if present
+            self._credentials_cache.pop(credential_path, None)
+
+            # Delete the file
+            cred_path.unlink()
+            lib_logger.info(f"Deleted credential file: {credential_path}")
+            return True
+
+        except Exception as e:
+            lib_logger.error(f"Failed to delete credential: {e}")
+            return False

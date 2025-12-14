@@ -10,6 +10,7 @@ import litellm
 from litellm.exceptions import APIConnectionError
 from litellm.litellm_core_utils.token_counter import token_counter
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, AsyncGenerator, Optional, Union
 
 lib_logger = logging.getLogger("rotator_library")
@@ -19,7 +20,7 @@ lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
 
 from .usage_manager import UsageManager
-from .failure_logger import log_failure
+from .failure_logger import log_failure, configure_failure_logger
 from .error_handler import (
     PreRequestCallbackError,
     classify_error,
@@ -37,6 +38,7 @@ from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
+from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
 
 
 class StreamedAPIError(Exception):
@@ -58,7 +60,7 @@ class RotatingClient:
         api_keys: Optional[Dict[str, List[str]]] = None,
         oauth_credentials: Optional[Dict[str, List[str]]] = None,
         max_retries: int = 2,
-        usage_file_path: str = "key_usage.json",
+        usage_file_path: Optional[Union[str, Path]] = None,
         configure_logging: bool = True,
         global_timeout: int = 30,
         abort_on_callback_error: bool = True,
@@ -68,6 +70,7 @@ class RotatingClient:
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
         rotation_tolerance: float = 3.0,
+        data_dir: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize the RotatingClient with intelligent credential rotation.
@@ -76,7 +79,7 @@ class RotatingClient:
             api_keys: Dictionary mapping provider names to lists of API keys
             oauth_credentials: Dictionary mapping provider names to OAuth credential paths
             max_retries: Maximum number of retry attempts per credential
-            usage_file_path: Path to store usage statistics
+            usage_file_path: Path to store usage statistics. If None, uses data_dir/key_usage.json
             configure_logging: Whether to configure library logging
             global_timeout: Global timeout for requests in seconds
             abort_on_callback_error: Whether to abort on pre-request callback errors
@@ -89,7 +92,18 @@ class RotatingClient:
                 - 0.0: Deterministic, least-used credential always selected
                 - 2.0 - 4.0 (default, recommended): Balanced randomness, can pick credentials within 2 uses of max
                 - 5.0+: High randomness, more unpredictable selection patterns
+            data_dir: Root directory for all data files (logs, cache, oauth_creds, key_usage.json).
+                      If None, auto-detects: EXE directory if frozen, else current working directory.
         """
+        # Resolve data_dir early - this becomes the root for all file operations
+        if data_dir is not None:
+            self.data_dir = Path(data_dir).resolve()
+        else:
+            self.data_dir = get_default_root()
+
+        # Configure failure logger to use correct logs directory
+        configure_failure_logger(get_logs_dir(self.data_dir))
+
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
@@ -124,7 +138,9 @@ class RotatingClient:
         if oauth_credentials:
             self.oauth_credentials = oauth_credentials
         else:
-            self.credential_manager = CredentialManager(os.environ)
+            self.credential_manager = CredentialManager(
+                os.environ, oauth_dir=get_oauth_dir(self.data_dir)
+            )
             self.oauth_credentials = self.credential_manager.discover_and_prepare()
         self.background_refresher = BackgroundRefresher(self)
         self.oauth_providers = set(self.oauth_credentials.keys())
@@ -242,8 +258,14 @@ class RotatingClient:
                 f"Provider '{provider}' sequential fallback multiplier: {fallback}x"
             )
 
+        # Resolve usage file path - use provided path or default to data_dir
+        if usage_file_path is not None:
+            resolved_usage_path = Path(usage_file_path)
+        else:
+            resolved_usage_path = self.data_dir / "key_usage.json"
+
         self.usage_manager = UsageManager(
-            file_path=usage_file_path,
+            file_path=resolved_usage_path,
             rotation_tolerance=rotation_tolerance,
             provider_rotation_modes=provider_rotation_modes,
             provider_plugins=PROVIDER_PLUGINS,

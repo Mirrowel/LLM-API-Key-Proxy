@@ -5,12 +5,15 @@ import logging
 import asyncio
 import random
 from datetime import date, datetime, timezone, time as dt_time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import aiofiles
 import litellm
 
 from .error_handler import ClassifiedError, NoAvailableKeysError, mask_credential
 from .providers import PROVIDER_PLUGINS
+from .utils.resilient_io import ResilientStateWriter
+from .utils.paths import get_data_file
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
@@ -50,7 +53,7 @@ class UsageManager:
 
     def __init__(
         self,
-        file_path: str = "key_usage.json",
+        file_path: Optional[Union[str, Path]] = None,
         daily_reset_time_utc: Optional[str] = "03:00",
         rotation_tolerance: float = 0.0,
         provider_rotation_modes: Optional[Dict[str, str]] = None,
@@ -65,7 +68,8 @@ class UsageManager:
         Initialize the UsageManager.
 
         Args:
-            file_path: Path to the usage data JSON file
+            file_path: Path to the usage data JSON file. If None, uses get_data_file("key_usage.json").
+                       Can be absolute Path, relative Path, or string.
             daily_reset_time_utc: Time in UTC when daily stats should reset (HH:MM format)
             rotation_tolerance: Tolerance for weighted random credential rotation.
                 - 0.0: Deterministic, least-used credential always selected
@@ -85,7 +89,14 @@ class UsageManager:
                 Used in sequential mode when priority not in priority_multipliers.
                 Example: {"antigravity": 2}
         """
-        self.file_path = file_path
+        # Resolve file_path - use default if not provided
+        if file_path is None:
+            self.file_path = str(get_data_file("key_usage.json"))
+        elif isinstance(file_path, Path):
+            self.file_path = str(file_path)
+        else:
+            # String path - could be relative or absolute
+            self.file_path = file_path
         self.rotation_tolerance = rotation_tolerance
         self.provider_rotation_modes = provider_rotation_modes or {}
         self.provider_plugins = provider_plugins or PROVIDER_PLUGINS
@@ -102,6 +113,9 @@ class UsageManager:
 
         self._timeout_lock = asyncio.Lock()
         self._claimed_on_timeout: Set[str] = set()
+
+        # Resilient writer for usage data persistence
+        self._state_writer = ResilientStateWriter(file_path, lib_logger)
 
         if daily_reset_time_utc:
             hour, minute = map(int, daily_reset_time_utc.split(":"))
@@ -540,27 +554,40 @@ class UsageManager:
                 self._initialized.set()
 
     async def _load_usage(self):
-        """Loads usage data from the JSON file asynchronously."""
+        """Loads usage data from the JSON file asynchronously with resilience."""
         async with self._data_lock:
             if not os.path.exists(self.file_path):
                 self._usage_data = {}
                 return
+
             try:
                 async with aiofiles.open(self.file_path, "r") as f:
                     content = await f.read()
-                    self._usage_data = json.loads(content)
-            except (json.JSONDecodeError, IOError, FileNotFoundError):
+                    self._usage_data = json.loads(content) if content.strip() else {}
+            except FileNotFoundError:
+                # File deleted between exists check and open
+                self._usage_data = {}
+            except json.JSONDecodeError as e:
+                lib_logger.warning(
+                    f"Corrupted usage file {self.file_path}: {e}. Starting fresh."
+                )
+                self._usage_data = {}
+            except (OSError, PermissionError, IOError) as e:
+                lib_logger.warning(
+                    f"Cannot read usage file {self.file_path}: {e}. Using empty state."
+                )
                 self._usage_data = {}
 
     async def _save_usage(self):
-        """Saves the current usage data to the JSON file asynchronously."""
+        """Saves the current usage data using the resilient state writer."""
         if self._usage_data is None:
             return
+
         async with self._data_lock:
             # Add human-readable timestamp fields before saving
             self._add_readable_timestamps(self._usage_data)
-            async with aiofiles.open(self.file_path, "w") as f:
-                await f.write(json.dumps(self._usage_data, indent=2))
+            # Hand off to resilient writer - handles retries and disk failures
+            self._state_writer.write(self._usage_data)
 
     async def _reset_daily_stats_if_needed(self):
         """

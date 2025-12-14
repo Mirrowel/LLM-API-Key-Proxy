@@ -11,6 +11,8 @@ from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
+from ..timeout_config import TimeoutConfig
+from ..utils.paths import get_logs_dir, get_cache_dir
 import litellm
 from litellm.exceptions import RateLimitError
 from ..error_handler import extract_retry_after_from_body
@@ -21,8 +23,22 @@ from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
 
-LOGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "logs"
-GEMINI_CLI_LOGS_DIR = LOGS_DIR / "gemini_cli_logs"
+
+def _get_gemini_cli_logs_dir() -> Path:
+    """Get the Gemini CLI logs directory."""
+    logs_dir = get_logs_dir() / "gemini_cli_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
+def _get_gemini_cli_cache_dir() -> Path:
+    """Get the Gemini CLI cache directory."""
+    return get_cache_dir(subdir="gemini_cli")
+
+
+def _get_gemini3_signature_cache_file() -> Path:
+    """Get the Gemini 3 signature cache file path."""
+    return _get_gemini_cli_cache_dir() / "gemini3_signatures.json"
 
 
 class _GeminiCliFileLogger:
@@ -38,7 +54,7 @@ class _GeminiCliFileLogger:
         # Sanitize model name for directory
         safe_model_name = model_name.replace("/", "_").replace(":", "_")
         self.log_dir = (
-            GEMINI_CLI_LOGS_DIR / f"{timestamp}_{safe_model_name}_{request_id}"
+            _get_gemini_cli_logs_dir() / f"{timestamp}_{safe_model_name}_{request_id}"
         )
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -101,12 +117,6 @@ HARDCODED_MODELS = [
     "gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
 ]
-
-# Cache directory for Gemini CLI
-CACHE_DIR = (
-    Path(__file__).resolve().parent.parent.parent.parent / "cache" / "gemini_cli"
-)
-GEMINI3_SIGNATURE_CACHE_FILE = CACHE_DIR / "gemini3_signatures.json"
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
 DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
@@ -173,6 +183,98 @@ FINISH_REASON_MAP = {
 }
 
 
+def _recursively_parse_json_strings(obj: Any) -> Any:
+    """
+    Recursively parse JSON strings in nested data structures.
+
+    Gemini sometimes returns tool arguments with JSON-stringified values:
+    {"files": "[{...}]"} instead of {"files": [{...}]}.
+
+    Additionally handles:
+    - Malformed double-encoded JSON (extra trailing '}' or ']')
+    - Escaped string content (\n, \t, etc.)
+    """
+    if isinstance(obj, dict):
+        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_recursively_parse_json_strings(item) for item in obj]
+    elif isinstance(obj, str):
+        stripped = obj.strip()
+
+        # Check if string contains control character escape sequences that need unescaping
+        # This handles cases where diff content has literal \n or \t instead of actual newlines/tabs
+        #
+        # IMPORTANT: We intentionally do NOT unescape strings containing \" or \\
+        # because these are typically intentional escapes in code/config content
+        # (e.g., JSON embedded in YAML: BOT_NAMES_JSON: '["mirrobot", ...]')
+        # Unescaping these would corrupt the content and cause issues like
+        # oldString and newString becoming identical when they should differ.
+        has_control_char_escapes = "\\n" in obj or "\\t" in obj
+        has_intentional_escapes = '\\"' in obj or "\\\\" in obj
+
+        if has_control_char_escapes and not has_intentional_escapes:
+            try:
+                # Use json.loads with quotes to properly unescape the string
+                # This converts \n -> newline, \t -> tab
+                unescaped = json.loads(f'"{obj}"')
+                # Log the fix with a snippet for debugging
+                snippet = obj[:80] + "..." if len(obj) > 80 else obj
+                lib_logger.debug(
+                    f"[GeminiCli] Unescaped control chars in string: "
+                    f"{len(obj) - len(unescaped)} chars changed. Snippet: {snippet!r}"
+                )
+                return unescaped
+            except (json.JSONDecodeError, ValueError):
+                # If unescaping fails, continue with original processing
+                pass
+
+        # Check if it looks like JSON (starts with { or [)
+        if stripped and stripped[0] in ("{", "["):
+            # Try standard parsing first
+            if (stripped.startswith("{") and stripped.endswith("}")) or (
+                stripped.startswith("[") and stripped.endswith("]")
+            ):
+                try:
+                    parsed = json.loads(obj)
+                    return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Handle malformed JSON: array that doesn't end with ]
+            # e.g., '[{"path": "..."}]}' instead of '[{"path": "..."}]'
+            if stripped.startswith("[") and not stripped.endswith("]"):
+                try:
+                    # Find the last ] and truncate there
+                    last_bracket = stripped.rfind("]")
+                    if last_bracket > 0:
+                        cleaned = stripped[: last_bracket + 1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"[GeminiCli] Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Handle malformed JSON: object that doesn't end with }
+            if stripped.startswith("{") and not stripped.endswith("}"):
+                try:
+                    # Find the last } and truncate there
+                    last_brace = stripped.rfind("}")
+                    if last_brace > 0:
+                        cleaned = stripped[: last_brace + 1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"[GeminiCli] Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    return obj
+
+
 def _env_bool(key: str, default: bool = False) -> bool:
     """Get boolean from environment variable."""
     return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
@@ -186,8 +288,8 @@ def _env_int(key: str, default: int) -> int:
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
 
-    # Balanced by default - Gemini CLI has short cooldowns (seconds, not hours)
-    default_rotation_mode: str = "balanced"
+    # Sequential mode - stick with one credential until it gets a 429, then switch
+    default_rotation_mode: str = "sequential"
 
     # =========================================================================
     # TIER CONFIGURATION
@@ -234,32 +336,156 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         error: Exception, error_body: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Parse Gemini CLI quota errors.
+        Parse Gemini CLI rate limit/quota errors.
 
-        Uses the same Google RPC format as Antigravity but typically has
-        much shorter cooldown durations (seconds to minutes, not hours).
+        Handles the Gemini CLI error format which embeds reset time in the message:
+        "You have exhausted your capacity on this model. Your quota will reset after 2s."
+
+        Unlike Antigravity which uses structured RetryInfo/quotaResetDelay metadata,
+        Gemini CLI embeds the reset time in a human-readable message.
+
+        Example error format:
+        {
+          "error": {
+            "code": 429,
+            "message": "You have exhausted your capacity on this model. Your quota will reset after 2s.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "RATE_LIMIT_EXCEEDED",
+                "domain": "cloudcode-pa.googleapis.com",
+                "metadata": { "uiMessage": "true", "model": "gemini-3-pro-preview" }
+              }
+            ]
+          }
+        }
 
         Args:
             error: The caught exception
             error_body: Optional raw response body string
 
         Returns:
-            Same format as AntigravityProvider.parse_quota_error()
+            None if not a parseable quota error, otherwise:
+            {
+                "retry_after": int,
+                "reason": str | None,
+                "reset_timestamp": str | None,
+                "quota_reset_timestamp": float | None,
+            }
         """
-        # Reuse the same parsing logic as Antigravity since both use Google RPC format
-        from .antigravity_provider import AntigravityProvider
+        import re as regex_module
 
-        return AntigravityProvider.parse_quota_error(error, error_body)
+        # Get error body from exception if not provided
+        body = error_body
+        if not body:
+            if hasattr(error, "response") and hasattr(error.response, "text"):
+                try:
+                    body = error.response.text
+                except Exception:
+                    pass
+            if not body and hasattr(error, "body"):
+                body = str(error.body)
+            if not body and hasattr(error, "message"):
+                body = str(error.message)
+            if not body:
+                body = str(error)
+
+        if not body:
+            return None
+
+        result = {
+            "retry_after": None,
+            "reason": None,
+            "reset_timestamp": None,
+            "quota_reset_timestamp": None,
+        }
+
+        # 1. Try to extract retry time from human-readable message
+        # Pattern: "Your quota will reset after 2s." or "quota will reset after 156h14m36s"
+        retry_after = extract_retry_after_from_body(body)
+        if retry_after:
+            result["retry_after"] = retry_after
+
+        # 2. Try to parse JSON to get structured details (reason, any RetryInfo fallback)
+        try:
+            json_match = regex_module.search(r"\{[\s\S]*\}", body)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                error_obj = data.get("error", data)
+                details = error_obj.get("details", [])
+
+                for detail in details:
+                    detail_type = detail.get("@type", "")
+
+                    # Extract reason from ErrorInfo
+                    if "ErrorInfo" in detail_type:
+                        if not result["reason"]:
+                            result["reason"] = detail.get("reason")
+                        # Check metadata for any additional timing info
+                        metadata = detail.get("metadata", {})
+                        quota_delay = metadata.get("quotaResetDelay")
+                        if quota_delay and not result["retry_after"]:
+                            parsed = GeminiCliProvider._parse_duration(quota_delay)
+                            if parsed:
+                                result["retry_after"] = parsed
+
+                    # Check for RetryInfo (fallback, in case format changes)
+                    if "RetryInfo" in detail_type and not result["retry_after"]:
+                        retry_delay = detail.get("retryDelay")
+                        if retry_delay:
+                            parsed = GeminiCliProvider._parse_duration(retry_delay)
+                            if parsed:
+                                result["retry_after"] = parsed
+
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # Return None if we couldn't extract retry_after
+        if not result["retry_after"]:
+            return None
+
+        return result
+
+    @staticmethod
+    def _parse_duration(duration_str: str) -> Optional[int]:
+        """
+        Parse duration strings like '2s', '156h14m36.73s', '515092.73s' to seconds.
+
+        Args:
+            duration_str: Duration string to parse
+
+        Returns:
+            Total seconds as integer, or None if parsing fails
+        """
+        import re as regex_module
+
+        if not duration_str:
+            return None
+
+        # Handle pure seconds format: "515092.730699158s" or "2s"
+        pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
+        if pure_seconds_match:
+            return int(float(pure_seconds_match.group(1)))
+
+        # Handle compound format: "143h4m52.730699158s"
+        total_seconds = 0
+        patterns = [
+            (r"(\d+)h", 3600),  # hours
+            (r"(\d+)m", 60),  # minutes
+            (r"([\d.]+)s", 1),  # seconds
+        ]
+        for pattern, multiplier in patterns:
+            match = regex_module.search(pattern, duration_str)
+            if match:
+                total_seconds += float(match.group(1)) * multiplier
+
+        return int(total_seconds) if total_seconds > 0 else None
 
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()
-        self.project_id_cache: Dict[
-            str, str
-        ] = {}  # Cache project ID per credential path
-        self.project_tier_cache: Dict[
-            str, str
-        ] = {}  # Cache project tier per credential path
+        # NOTE: project_id_cache and project_tier_cache are inherited from GeminiAuthBase
 
         # Gemini 3 configuration from environment
         memory_ttl = _env_int("GEMINI_CLI_SIGNATURE_CACHE_TTL", 3600)
@@ -267,7 +493,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Initialize signature cache for Gemini 3 thoughtSignatures
         self._signature_cache = ProviderCache(
-            GEMINI3_SIGNATURE_CACHE_FILE,
+            _get_gemini3_signature_cache_file(),
             memory_ttl,
             disk_ttl,
             env_prefix="GEMINI_CLI_SIGNATURE",
@@ -381,7 +607,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Gemini 3 requires paid tier
         if model_name.startswith("gemini-3-"):
-            return 1  # Only priority 1 (paid) credentials
+            return 2  # Only priority 2 (paid) credentials
 
         return None  # All other models have no restrictions
 
@@ -391,8 +617,47 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         This ensures all credential priorities are known before any API calls,
         preventing unknown credentials from getting priority 999.
+
+        For credentials without persisted tier info (new or corrupted), performs
+        full discovery to ensure proper prioritization in sequential rotation mode.
         """
+        # Step 1: Load persisted tiers from files
         await self._load_persisted_tiers(credential_paths)
+
+        # Step 2: Identify credentials still missing tier info
+        credentials_needing_discovery = [
+            path
+            for path in credential_paths
+            if path not in self.project_tier_cache
+            and self._parse_env_credential_path(path) is None  # Skip env:// paths
+        ]
+
+        if not credentials_needing_discovery:
+            return  # All credentials have tier info
+
+        lib_logger.info(
+            f"GeminiCli: Discovering tier info for {len(credentials_needing_discovery)} credential(s)..."
+        )
+
+        # Step 3: Perform discovery for each missing credential (sequential to avoid rate limits)
+        for credential_path in credentials_needing_discovery:
+            try:
+                auth_header = await self.get_auth_header(credential_path)
+                access_token = auth_header["Authorization"].split(" ")[1]
+                await self._discover_project_id(
+                    credential_path, access_token, litellm_params={}
+                )
+                discovered_tier = self.project_tier_cache.get(
+                    credential_path, "unknown"
+                )
+                lib_logger.debug(
+                    f"Discovered tier '{discovered_tier}' for {Path(credential_path).name}"
+                )
+            except Exception as e:
+                lib_logger.warning(
+                    f"Failed to discover tier for {Path(credential_path).name}: {e}. "
+                    f"Credential will use default priority."
+                )
 
     async def _load_persisted_tiers(
         self, credential_paths: List[str]
@@ -451,6 +716,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         return loaded
 
+    # NOTE: _post_auth_discovery() is inherited from GeminiAuthBase
+
     # =========================================================================
     # MODEL UTILITIES
     # =========================================================================
@@ -466,520 +733,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             return name[len(self._gemini3_tool_prefix) :]
         return name
 
-    async def _discover_project_id(
-        self, credential_path: str, access_token: str, litellm_params: Dict[str, Any]
-    ) -> str:
-        """
-        Discovers the Google Cloud Project ID, with caching and onboarding for new accounts.
-
-        This follows the official Gemini CLI discovery flow:
-        1. Check in-memory cache
-        2. Check configured project_id override (litellm_params or env var)
-        3. Check persisted project_id in credential file
-        4. Call loadCodeAssist to check if user is already known (has currentTier)
-           - If currentTier exists AND cloudaicompanionProject returned: use server's project
-           - If currentTier exists but NO cloudaicompanionProject: use configured project_id (paid tier requires this)
-           - If no currentTier: user needs onboarding
-        5. Onboard user based on tier:
-           - FREE tier: pass cloudaicompanionProject=None (server-managed)
-           - PAID tier: pass cloudaicompanionProject=configured_project_id
-        6. Fallback to GCP Resource Manager project listing
-        """
-        lib_logger.debug(
-            f"Starting project discovery for credential: {credential_path}"
-        )
-
-        # Check in-memory cache first
-        if credential_path in self.project_id_cache:
-            cached_project = self.project_id_cache[credential_path]
-            lib_logger.debug(f"Using cached project ID: {cached_project}")
-            return cached_project
-
-        # Check for configured project ID override (from litellm_params or env var)
-        # This is REQUIRED for paid tier users per the official CLI behavior
-        configured_project_id = litellm_params.get("project_id")
-        if configured_project_id:
-            lib_logger.debug(
-                f"Found configured project_id override: {configured_project_id}"
-            )
-
-        # Load credentials from file to check for persisted project_id and tier
-        # Skip for env:// paths (environment-based credentials don't persist to files)
-        credential_index = self._parse_env_credential_path(credential_path)
-        if credential_index is None:
-            # Only try to load from file if it's not an env:// path
-            try:
-                with open(credential_path, "r") as f:
-                    creds = json.load(f)
-
-                metadata = creds.get("_proxy_metadata", {})
-                persisted_project_id = metadata.get("project_id")
-                persisted_tier = metadata.get("tier")
-
-                if persisted_project_id:
-                    lib_logger.info(
-                        f"Loaded persisted project ID from credential file: {persisted_project_id}"
-                    )
-                    self.project_id_cache[credential_path] = persisted_project_id
-
-                    # Also load tier if available
-                    if persisted_tier:
-                        self.project_tier_cache[credential_path] = persisted_tier
-                        lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
-
-                    return persisted_project_id
-            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                lib_logger.debug(f"Could not load persisted project ID from file: {e}")
-
-        lib_logger.debug(
-            "No cached or configured project ID found, initiating discovery..."
-        )
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        }
-
-        discovered_project_id = None
-        discovered_tier = None
-
-        async with httpx.AsyncClient() as client:
-            # 1. Try discovery endpoint with loadCodeAssist
-            lib_logger.debug(
-                "Attempting project discovery via Code Assist loadCodeAssist endpoint..."
-            )
-            try:
-                # Build metadata - include duetProject only if we have a configured project
-                core_client_metadata = {
-                    "ideType": "IDE_UNSPECIFIED",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                }
-                if configured_project_id:
-                    core_client_metadata["duetProject"] = configured_project_id
-
-                # Build load request - pass configured_project_id if available, otherwise None
-                load_request = {
-                    "cloudaicompanionProject": configured_project_id,  # Can be None
-                    "metadata": core_client_metadata,
-                }
-
-                lib_logger.debug(
-                    f"Sending loadCodeAssist request with cloudaicompanionProject={configured_project_id}"
-                )
-                response = await client.post(
-                    f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist",
-                    headers=headers,
-                    json=load_request,
-                    timeout=20,
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                # Log full response for debugging
-                lib_logger.debug(
-                    f"loadCodeAssist full response keys: {list(data.keys())}"
-                )
-
-                # Extract and log ALL tier information for debugging
-                allowed_tiers = data.get("allowedTiers", [])
-                current_tier = data.get("currentTier")
-
-                lib_logger.debug(f"=== Tier Information ===")
-                lib_logger.debug(f"currentTier: {current_tier}")
-                lib_logger.debug(f"allowedTiers count: {len(allowed_tiers)}")
-                for i, tier in enumerate(allowed_tiers):
-                    tier_id = tier.get("id", "unknown")
-                    is_default = tier.get("isDefault", False)
-                    user_defined = tier.get("userDefinedCloudaicompanionProject", False)
-                    lib_logger.debug(
-                        f"  Tier {i + 1}: id={tier_id}, isDefault={is_default}, userDefinedProject={user_defined}"
-                    )
-                lib_logger.debug(f"========================")
-
-                # Determine the current tier ID
-                current_tier_id = None
-                if current_tier:
-                    current_tier_id = current_tier.get("id")
-                    lib_logger.debug(f"User has currentTier: {current_tier_id}")
-
-                # Check if user is already known to server (has currentTier)
-                if current_tier_id:
-                    # User is already onboarded - check for project from server
-                    server_project = data.get("cloudaicompanionProject")
-
-                    # Check if this tier requires user-defined project (paid tiers)
-                    requires_user_project = any(
-                        t.get("id") == current_tier_id
-                        and t.get("userDefinedCloudaicompanionProject", False)
-                        for t in allowed_tiers
-                    )
-                    is_free_tier = current_tier_id == "free-tier"
-
-                    if server_project:
-                        # Server returned a project - use it (server wins)
-                        # This is the normal case for FREE tier users
-                        project_id = server_project
-                        lib_logger.debug(f"Server returned project: {project_id}")
-                    elif configured_project_id:
-                        # No server project but we have configured one - use it
-                        # This is the PAID TIER case where server doesn't return a project
-                        project_id = configured_project_id
-                        lib_logger.debug(
-                            f"No server project, using configured: {project_id}"
-                        )
-                    elif is_free_tier:
-                        # Free tier user without server project - this shouldn't happen normally
-                        # but let's not fail, just proceed to onboarding
-                        lib_logger.debug(
-                            "Free tier user with currentTier but no project - will try onboarding"
-                        )
-                        project_id = None
-                    elif requires_user_project:
-                        # Paid tier requires a project ID to be set
-                        raise ValueError(
-                            f"Paid tier '{current_tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
-                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
-                        )
-                    else:
-                        # Unknown tier without project - proceed carefully
-                        lib_logger.warning(
-                            f"Tier '{current_tier_id}' has no project and none configured - will try onboarding"
-                        )
-                        project_id = None
-
-                    if project_id:
-                        # Cache tier info
-                        self.project_tier_cache[credential_path] = current_tier_id
-                        discovered_tier = current_tier_id
-
-                        # Log appropriately based on tier
-                        is_paid = current_tier_id and current_tier_id not in [
-                            "free-tier",
-                            "legacy-tier",
-                            "unknown",
-                        ]
-                        if is_paid:
-                            lib_logger.info(
-                                f"Using Gemini paid tier '{current_tier_id}' with project: {project_id}"
-                            )
-                        else:
-                            lib_logger.info(
-                                f"Discovered Gemini project ID via loadCodeAssist: {project_id}"
-                            )
-
-                        self.project_id_cache[credential_path] = project_id
-                        discovered_project_id = project_id
-
-                        # Persist to credential file
-                        await self._persist_project_metadata(
-                            credential_path, project_id, discovered_tier
-                        )
-
-                        return project_id
-
-                # 2. User needs onboarding - no currentTier
-                lib_logger.info(
-                    "No existing Gemini session found (no currentTier), attempting to onboard user..."
-                )
-
-                # Determine which tier to onboard with
-                onboard_tier = None
-                for tier in allowed_tiers:
-                    if tier.get("isDefault"):
-                        onboard_tier = tier
-                        break
-
-                # Fallback to LEGACY tier if no default (requires user project)
-                if not onboard_tier and allowed_tiers:
-                    # Look for legacy-tier as fallback
-                    for tier in allowed_tiers:
-                        if tier.get("id") == "legacy-tier":
-                            onboard_tier = tier
-                            break
-                    # If still no tier, use first available
-                    if not onboard_tier:
-                        onboard_tier = allowed_tiers[0]
-
-                if not onboard_tier:
-                    raise ValueError("No onboarding tiers available from server")
-
-                tier_id = onboard_tier.get("id", "free-tier")
-                requires_user_project = onboard_tier.get(
-                    "userDefinedCloudaicompanionProject", False
-                )
-
-                lib_logger.debug(
-                    f"Onboarding with tier: {tier_id}, requiresUserProject: {requires_user_project}"
-                )
-
-                # Build onboard request based on tier type (following official CLI logic)
-                # FREE tier: cloudaicompanionProject = None (server-managed)
-                # PAID tier: cloudaicompanionProject = configured_project_id (user must provide)
-                is_free_tier = tier_id == "free-tier"
-
-                if is_free_tier:
-                    # Free tier uses server-managed project
-                    onboard_request = {
-                        "tierId": tier_id,
-                        "cloudaicompanionProject": None,  # Server will create/manage
-                        "metadata": core_client_metadata,
-                    }
-                    lib_logger.debug(
-                        "Free tier onboarding: using server-managed project"
-                    )
-                else:
-                    # Paid/legacy tier requires user-provided project
-                    if not configured_project_id and requires_user_project:
-                        raise ValueError(
-                            f"Tier '{tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
-                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
-                        )
-                    onboard_request = {
-                        "tierId": tier_id,
-                        "cloudaicompanionProject": configured_project_id,
-                        "metadata": {
-                            **core_client_metadata,
-                            "duetProject": configured_project_id,
-                        }
-                        if configured_project_id
-                        else core_client_metadata,
-                    }
-                    lib_logger.debug(
-                        f"Paid tier onboarding: using project {configured_project_id}"
-                    )
-
-                lib_logger.debug("Initiating onboardUser request...")
-                lro_response = await client.post(
-                    f"{CODE_ASSIST_ENDPOINT}:onboardUser",
-                    headers=headers,
-                    json=onboard_request,
-                    timeout=30,
-                )
-                lro_response.raise_for_status()
-                lro_data = lro_response.json()
-                lib_logger.debug(
-                    f"Initial onboarding response: done={lro_data.get('done')}"
-                )
-
-                for i in range(150):  # Poll for up to 5 minutes (150 × 2s)
-                    if lro_data.get("done"):
-                        lib_logger.debug(
-                            f"Onboarding completed after {i} polling attempts"
-                        )
-                        break
-                    await asyncio.sleep(2)
-                    if (i + 1) % 15 == 0:  # Log every 30 seconds
-                        lib_logger.info(
-                            f"Still waiting for onboarding completion... ({(i + 1) * 2}s elapsed)"
-                        )
-                    lib_logger.debug(
-                        f"Polling onboarding status... (Attempt {i + 1}/150)"
-                    )
-                    lro_response = await client.post(
-                        f"{CODE_ASSIST_ENDPOINT}:onboardUser",
-                        headers=headers,
-                        json=onboard_request,
-                        timeout=30,
-                    )
-                    lro_response.raise_for_status()
-                    lro_data = lro_response.json()
-
-                if not lro_data.get("done"):
-                    lib_logger.error("Onboarding process timed out after 5 minutes")
-                    raise ValueError(
-                        "Onboarding process timed out after 5 minutes. Please try again or contact support."
-                    )
-
-                # Extract project ID from LRO response
-                # Note: onboardUser returns response.cloudaicompanionProject as an object with .id
-                lro_response_data = lro_data.get("response", {})
-                lro_project_obj = lro_response_data.get("cloudaicompanionProject", {})
-                project_id = (
-                    lro_project_obj.get("id")
-                    if isinstance(lro_project_obj, dict)
-                    else None
-                )
-
-                # Fallback to configured project if LRO didn't return one
-                if not project_id and configured_project_id:
-                    project_id = configured_project_id
-                    lib_logger.debug(
-                        f"LRO didn't return project, using configured: {project_id}"
-                    )
-
-                if not project_id:
-                    lib_logger.error(
-                        "Onboarding completed but no project ID in response and none configured"
-                    )
-                    raise ValueError(
-                        "Onboarding completed, but no project ID was returned. "
-                        "For paid tiers, set GEMINI_CLI_PROJECT_ID environment variable."
-                    )
-
-                lib_logger.debug(
-                    f"Successfully extracted project ID from onboarding response: {project_id}"
-                )
-
-                # Cache tier info
-                self.project_tier_cache[credential_path] = tier_id
-                discovered_tier = tier_id
-                lib_logger.debug(f"Cached tier information: {tier_id}")
-
-                # Log concise message for paid projects
-                is_paid = tier_id and tier_id not in ["free-tier", "legacy-tier"]
-                if is_paid:
-                    lib_logger.info(
-                        f"Using Gemini paid tier '{tier_id}' with project: {project_id}"
-                    )
-                else:
-                    lib_logger.info(
-                        f"Successfully onboarded user and discovered project ID: {project_id}"
-                    )
-
-                self.project_id_cache[credential_path] = project_id
-                discovered_project_id = project_id
-
-                # Persist to credential file
-                await self._persist_project_metadata(
-                    credential_path, project_id, discovered_tier
-                )
-
-                return project_id
-
-            except httpx.HTTPStatusError as e:
-                error_body = ""
-                try:
-                    error_body = e.response.text
-                except Exception:
-                    pass
-                if e.response.status_code == 403:
-                    lib_logger.error(
-                        f"Gemini Code Assist API access denied (403). Response: {error_body}"
-                    )
-                    lib_logger.error(
-                        "Possible causes: 1) cloudaicompanion.googleapis.com API not enabled, 2) Wrong project ID for paid tier, 3) Account lacks permissions"
-                    )
-                elif e.response.status_code == 404:
-                    lib_logger.warning(
-                        f"Gemini Code Assist endpoint not found (404). Falling back to project listing."
-                    )
-                elif e.response.status_code == 412:
-                    # Precondition Failed - often means wrong project for free tier onboarding
-                    lib_logger.error(
-                        f"Precondition failed (412): {error_body}. This may mean the project ID is incompatible with the selected tier."
-                    )
-                else:
-                    lib_logger.warning(
-                        f"Gemini onboarding/discovery failed with status {e.response.status_code}: {error_body}. Falling back to project listing."
-                    )
-            except httpx.RequestError as e:
-                lib_logger.warning(
-                    f"Gemini onboarding/discovery network error: {e}. Falling back to project listing."
-                )
-
-        # 3. Fallback to listing all available GCP projects (last resort)
-        lib_logger.debug(
-            "Attempting to discover project via GCP Resource Manager API..."
-        )
-        try:
-            async with httpx.AsyncClient() as client:
-                lib_logger.debug(
-                    "Querying Cloud Resource Manager for available projects..."
-                )
-                response = await client.get(
-                    "https://cloudresourcemanager.googleapis.com/v1/projects",
-                    headers=headers,
-                    timeout=20,
-                )
-                response.raise_for_status()
-                projects = response.json().get("projects", [])
-                lib_logger.debug(f"Found {len(projects)} total projects")
-                active_projects = [
-                    p for p in projects if p.get("lifecycleState") == "ACTIVE"
-                ]
-                lib_logger.debug(f"Found {len(active_projects)} active projects")
-
-                if not projects:
-                    lib_logger.error(
-                        "No GCP projects found for this account. Please create a project in Google Cloud Console."
-                    )
-                elif not active_projects:
-                    lib_logger.error(
-                        "No active GCP projects found. Please activate a project in Google Cloud Console."
-                    )
-                else:
-                    project_id = active_projects[0]["projectId"]
-                    lib_logger.info(
-                        f"Discovered Gemini project ID from active projects list: {project_id}"
-                    )
-                    lib_logger.debug(
-                        f"Selected first active project: {project_id} (out of {len(active_projects)} active projects)"
-                    )
-                    self.project_id_cache[credential_path] = project_id
-                    discovered_project_id = project_id
-
-                    # [NEW] Persist to credential file (no tier info from resource manager)
-                    await self._persist_project_metadata(
-                        credential_path, project_id, None
-                    )
-
-                    return project_id
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
-                lib_logger.error(
-                    "Failed to list GCP projects due to a 403 Forbidden error. The Cloud Resource Manager API may not be enabled, or your account lacks the 'resourcemanager.projects.list' permission."
-                )
-            else:
-                lib_logger.error(
-                    f"Failed to list GCP projects with status {e.response.status_code}: {e}"
-                )
-        except httpx.RequestError as e:
-            lib_logger.error(f"Network error while listing GCP projects: {e}")
-
-        raise ValueError(
-            "Could not auto-discover Gemini project ID. Possible causes:\n"
-            "  1. The cloudaicompanion.googleapis.com API is not enabled (enable it in Google Cloud Console)\n"
-            "  2. No active GCP projects exist for this account (create one in Google Cloud Console)\n"
-            "  3. Account lacks necessary permissions\n"
-            "To manually specify a project, set GEMINI_CLI_PROJECT_ID in your .env file."
-        )
-
-    async def _persist_project_metadata(
-        self, credential_path: str, project_id: str, tier: Optional[str]
-    ):
-        """Persists project ID and tier to the credential file for faster future startups."""
-        # Skip persistence for env:// paths (environment-based credentials)
-        credential_index = self._parse_env_credential_path(credential_path)
-        if credential_index is not None:
-            lib_logger.debug(
-                f"Skipping project metadata persistence for env:// credential path: {credential_path}"
-            )
-            return
-
-        try:
-            # Load current credentials
-            with open(credential_path, "r") as f:
-                creds = json.load(f)
-
-            # Update metadata
-            if "_proxy_metadata" not in creds:
-                creds["_proxy_metadata"] = {}
-
-            creds["_proxy_metadata"]["project_id"] = project_id
-            if tier:
-                creds["_proxy_metadata"]["tier"] = tier
-
-            # Save back using the existing save method (handles atomic writes and permissions)
-            await self._save_credentials(credential_path, creds)
-
-            lib_logger.debug(
-                f"Persisted project_id and tier to credential file: {credential_path}"
-            )
-        except Exception as e:
-            lib_logger.warning(
-                f"Failed to persist project metadata to credential file: {e}"
-            )
-            # Non-fatal - just means slower startup next time
+    # NOTE: _discover_project_id() and _persist_project_metadata() are inherited from GeminiAuthBase
 
     def _check_mixed_tier_warning(self):
         """Check if mixed free/paid tier credentials are loaded and emit warning."""
@@ -1166,7 +920,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                                     func_part["thoughtSignature"] = (
                                         "skip_thought_signature_validator"
                                     )
-                                    lib_logger.warning(
+                                    lib_logger.debug(
                                         f"Missing thoughtSignature for first func call {tool_id}, using bypass"
                                     )
                                 # Subsequent parallel calls: no signature field at all
@@ -1178,23 +932,39 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             elif role == "tool":
                 tool_call_id = msg.get("tool_call_id")
                 function_name = tool_call_id_to_name.get(tool_call_id)
-                if function_name:
-                    # Add prefix for Gemini 3
-                    if is_gemini_3 and self._enable_gemini3_tool_fix:
-                        function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
-                    # Wrap the tool response in a 'result' object
-                    response_content = {"result": content}
-                    # Accumulate tool responses - they'll be combined into one user message
-                    pending_tool_parts.append(
-                        {
-                            "functionResponse": {
-                                "name": function_name,
-                                "response": response_content,
-                                "id": tool_call_id,
-                            }
-                        }
+                # Log warning if tool_call_id not found in mapping (can happen after context compaction)
+                if not function_name:
+                    lib_logger.warning(
+                        f"[ID Mismatch] Tool response has ID '{tool_call_id}' which was not found in tool_id_to_name map. "
+                        f"Available IDs: {list(tool_call_id_to_name.keys())}. Using 'unknown_function' as fallback."
                     )
+                    function_name = "unknown_function"
+
+                # Add prefix for Gemini 3
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
+
+                # Try to parse content as JSON first, fall back to string
+                try:
+                    parsed_content = (
+                        json.loads(content) if isinstance(content, str) else content
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    parsed_content = content
+
+                # Wrap the tool response in a 'result' object
+                response_content = {"result": parsed_content}
+                # Accumulate tool responses - they'll be combined into one user message
+                pending_tool_parts.append(
+                    {
+                        "functionResponse": {
+                            "name": function_name,
+                            "response": response_content,
+                            "id": tool_call_id,
+                        }
+                    }
+                )
                 # Don't add parts here - tool responses are handled via pending_tool_parts
                 continue
 
@@ -1209,6 +979,216 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
 
         return system_instruction, gemini_contents
+
+    def _fix_tool_response_grouping(
+        self, contents: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Group function calls with their responses for Gemini CLI compatibility.
+
+        Converts linear format (call, response, call, response)
+        to grouped format (model with calls, user with all responses).
+
+        IMPORTANT: Preserves ID-based pairing to prevent mismatches.
+        When IDs don't match, attempts recovery by:
+        1. Matching by function name first
+        2. Matching by order if names don't match
+        3. Inserting placeholder responses if responses are missing
+        4. Inserting responses at the CORRECT position (after their corresponding call)
+        """
+        new_contents = []
+        # Each pending group tracks:
+        # - ids: expected response IDs
+        # - func_names: expected function names (for orphan matching)
+        # - insert_after_idx: position in new_contents where model message was added
+        pending_groups = []
+        collected_responses = {}  # Dict mapping ID -> response_part
+
+        for content in contents:
+            role = content.get("role")
+            parts = content.get("parts", [])
+
+            response_parts = [p for p in parts if "functionResponse" in p]
+
+            if response_parts:
+                # Collect responses by ID (ignore duplicates - keep first occurrence)
+                for resp in response_parts:
+                    resp_id = resp.get("functionResponse", {}).get("id", "")
+                    if resp_id:
+                        if resp_id in collected_responses:
+                            lib_logger.warning(
+                                f"[Grouping] Duplicate response ID detected: {resp_id}. "
+                                f"Ignoring duplicate - this may indicate malformed conversation history."
+                            )
+                            continue
+                        collected_responses[resp_id] = resp
+
+                # Try to satisfy pending groups (newest first)
+                for i in range(len(pending_groups) - 1, -1, -1):
+                    group = pending_groups[i]
+                    group_ids = group["ids"]
+
+                    # Check if we have ALL responses for this group
+                    if all(gid in collected_responses for gid in group_ids):
+                        # Extract responses in the same order as the function calls
+                        group_responses = [
+                            collected_responses.pop(gid) for gid in group_ids
+                        ]
+                        new_contents.append({"parts": group_responses, "role": "user"})
+                        pending_groups.pop(i)
+                        break
+                continue
+
+            if role == "model":
+                func_calls = [p for p in parts if "functionCall" in p]
+                new_contents.append(content)
+                if func_calls:
+                    call_ids = [
+                        fc.get("functionCall", {}).get("id", "") for fc in func_calls
+                    ]
+                    call_ids = [cid for cid in call_ids if cid]  # Filter empty IDs
+
+                    # Also extract function names for orphan matching
+                    func_names = [
+                        fc.get("functionCall", {}).get("name", "") for fc in func_calls
+                    ]
+
+                    if call_ids:
+                        pending_groups.append(
+                            {
+                                "ids": call_ids,
+                                "func_names": func_names,
+                                "insert_after_idx": len(new_contents) - 1,
+                            }
+                        )
+            else:
+                new_contents.append(content)
+
+        # Handle remaining groups (shouldn't happen in well-formed conversations)
+        # Attempt recovery by matching orphans to unsatisfied calls
+        # Process in REVERSE order of insert_after_idx so insertions don't shift indices
+        pending_groups.sort(key=lambda g: g["insert_after_idx"], reverse=True)
+
+        for group in pending_groups:
+            group_ids = group["ids"]
+            group_func_names = group.get("func_names", [])
+            insert_idx = group["insert_after_idx"] + 1
+            group_responses = []
+
+            lib_logger.debug(
+                f"[Grouping Recovery] Processing unsatisfied group: "
+                f"ids={group_ids}, names={group_func_names}, insert_at={insert_idx}"
+            )
+
+            for i, expected_id in enumerate(group_ids):
+                expected_name = group_func_names[i] if i < len(group_func_names) else ""
+
+                if expected_id in collected_responses:
+                    # Direct ID match
+                    group_responses.append(collected_responses.pop(expected_id))
+                    lib_logger.debug(
+                        f"[Grouping Recovery] Direct ID match for '{expected_id}'"
+                    )
+                elif collected_responses:
+                    # Try to find orphan with matching function name first
+                    matched_orphan_id = None
+
+                    # First pass: match by function name
+                    for orphan_id, orphan_resp in collected_responses.items():
+                        orphan_name = orphan_resp.get("functionResponse", {}).get(
+                            "name", ""
+                        )
+                        # Match if names are equal
+                        if orphan_name == expected_name:
+                            matched_orphan_id = orphan_id
+                            lib_logger.debug(
+                                f"[Grouping Recovery] Matched orphan '{orphan_id}' by name '{orphan_name}'"
+                            )
+                            break
+
+                    # Second pass: if no name match, try "unknown_function" orphans
+                    if not matched_orphan_id:
+                        for orphan_id, orphan_resp in collected_responses.items():
+                            orphan_name = orphan_resp.get("functionResponse", {}).get(
+                                "name", ""
+                            )
+                            if orphan_name == "unknown_function":
+                                matched_orphan_id = orphan_id
+                                lib_logger.debug(
+                                    f"[Grouping Recovery] Matched unknown_function orphan '{orphan_id}' "
+                                    f"to expected '{expected_name}'"
+                                )
+                                break
+
+                    # Third pass: if still no match, take first available (order-based)
+                    if not matched_orphan_id:
+                        matched_orphan_id = next(iter(collected_responses))
+                        lib_logger.debug(
+                            f"[Grouping Recovery] No name match, using first available orphan '{matched_orphan_id}'"
+                        )
+
+                    if matched_orphan_id:
+                        orphan_resp = collected_responses.pop(matched_orphan_id)
+
+                        # Fix the ID in the response to match the call
+                        old_id = orphan_resp["functionResponse"].get("id", "")
+                        orphan_resp["functionResponse"]["id"] = expected_id
+
+                        # Fix the name if it was "unknown_function"
+                        if (
+                            orphan_resp["functionResponse"].get("name")
+                            == "unknown_function"
+                            and expected_name
+                        ):
+                            orphan_resp["functionResponse"]["name"] = expected_name
+                            lib_logger.info(
+                                f"[Grouping Recovery] Fixed function name from 'unknown_function' to '{expected_name}'"
+                            )
+
+                        lib_logger.warning(
+                            f"[Grouping] Auto-repaired ID mismatch: mapped response '{old_id}' "
+                            f"to call '{expected_id}' (function: {expected_name})"
+                        )
+                        group_responses.append(orphan_resp)
+                else:
+                    # No responses available - create placeholder
+                    placeholder_resp = {
+                        "functionResponse": {
+                            "name": expected_name or "unknown_function",
+                            "response": {
+                                "result": {
+                                    "error": "Tool response was lost during context processing. "
+                                    "This is a recovered placeholder.",
+                                    "recovered": True,
+                                }
+                            },
+                            "id": expected_id,
+                        }
+                    }
+                    lib_logger.warning(
+                        f"[Grouping Recovery] Created placeholder response for missing tool: "
+                        f"id='{expected_id}', name='{expected_name}'"
+                    )
+                    group_responses.append(placeholder_resp)
+
+            if group_responses:
+                # Insert at the correct position (right after the model message with the calls)
+                new_contents.insert(
+                    insert_idx, {"parts": group_responses, "role": "user"}
+                )
+                lib_logger.info(
+                    f"[Grouping Recovery] Inserted {len(group_responses)} responses at position {insert_idx} "
+                    f"(expected {len(group_ids)})"
+                )
+
+        # Warn about unmatched responses
+        if collected_responses:
+            lib_logger.warning(
+                f"[Grouping] {len(collected_responses)} unmatched responses remaining: "
+                f"ids={list(collected_responses.keys())}"
+            )
+
+        return new_contents
 
     def _handle_reasoning_parameters(
         self, payload: Dict[str, Any], model: str
@@ -1329,13 +1309,24 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Get current tool index from accumulator (default 0) and increment
                 current_tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
 
+                # Get args, recursively parse any JSON strings, and strip _confirm if sole param
+                raw_args = function_call.get("args", {})
+                tool_args = _recursively_parse_json_strings(raw_args)
+
+                # Strip _confirm ONLY if it's the sole parameter
+                # This ensures we only strip our injection, not legitimate user params
+                if isinstance(tool_args, dict) and "_confirm" in tool_args:
+                    if len(tool_args) == 1:
+                        # _confirm is the only param - this was our injection
+                        tool_args.pop("_confirm")
+
                 tool_call = {
                     "index": current_tool_idx,
                     "id": tool_call_id,
                     "type": "function",
                     "function": {
                         "name": function_name,
-                        "arguments": json.dumps(function_call.get("args", {})),
+                        "arguments": json.dumps(tool_args),
                     },
                 }
 
@@ -1643,13 +1634,32 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     schema = self._gemini_cli_transform_schema(
                         new_function["parameters"]
                     )
+                    # Workaround: Gemini fails to emit functionCall for tools
+                    # with empty properties {}. Inject a required confirmation param.
+                    # Using a required parameter forces the model to commit to
+                    # the tool call rather than just thinking about it.
+                    props = schema.get("properties", {})
+                    if not props:
+                        schema["properties"] = {
+                            "_confirm": {
+                                "type": "string",
+                                "description": "Enter 'yes' to proceed",
+                            }
+                        }
+                        schema["required"] = ["_confirm"]
                     new_function["parametersJsonSchema"] = schema
                     del new_function["parameters"]
                 elif "parametersJsonSchema" not in new_function:
-                    # Set default empty schema if neither exists
+                    # Set default schema with required confirm param if neither exists
                     new_function["parametersJsonSchema"] = {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "_confirm": {
+                                "type": "string",
+                                "description": "Enter 'yes' to proceed",
+                            }
+                        },
+                        "required": ["_confirm"],
                     }
 
                 # Gemini 3 specific transformations
@@ -1889,6 +1899,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             system_instruction, contents = self._transform_messages(
                 kwargs.get("messages", []), model_name
             )
+            # Fix tool response grouping (handles ID mismatches, missing responses)
+            contents = self._fix_tool_response_grouping(contents)
+
             request_payload = {
                 "model": model_name,
                 "project": project_id,
@@ -1965,7 +1978,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                         headers=final_headers,
                         json=request_payload,
                         params={"alt": "sse"},
-                        timeout=600,
+                        timeout=TimeoutConfig.streaming(),
                     ) as response:
                         # Read and log error body before raise_for_status for better debugging
                         if response.status_code >= 400:
@@ -2176,6 +2189,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Transform messages to Gemini format
         system_instruction, contents = self._transform_messages(messages)
+        # Fix tool response grouping (handles ID mismatches, missing responses)
+        contents = self._fix_tool_response_grouping(contents)
 
         # Build request payload
         request_payload = {

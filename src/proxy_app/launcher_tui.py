@@ -16,6 +16,20 @@ from dotenv import load_dotenv, set_key
 console = Console()
 
 
+def _get_env_file() -> Path:
+    """
+    Get .env file path (lightweight - no heavy imports).
+
+    Returns:
+        Path to .env file - EXE directory if frozen, else current working directory
+    """
+    if getattr(sys, "frozen", False):
+        # Running as PyInstaller EXE - use EXE's directory
+        return Path(sys.executable).parent / ".env"
+    # Running as script - use current working directory
+    return Path.cwd() / ".env"
+
+
 def clear_screen():
     """
     Cross-platform terminal clear that works robustly on both
@@ -74,7 +88,7 @@ class LauncherConfig:
     @staticmethod
     def update_proxy_api_key(new_key: str):
         """Update PROXY_API_KEY in .env only"""
-        env_file = Path.cwd() / ".env"
+        env_file = _get_env_file()
         set_key(str(env_file), "PROXY_API_KEY", new_key)
         load_dotenv(dotenv_path=env_file, override=True)
 
@@ -85,7 +99,7 @@ class SettingsDetector:
     @staticmethod
     def _load_local_env() -> dict:
         """Load environment variables from local .env file only"""
-        env_file = Path.cwd() / ".env"
+        env_file = _get_env_file()
         env_dict = {}
         if not env_file.exists():
             return env_dict
@@ -107,7 +121,7 @@ class SettingsDetector:
 
     @staticmethod
     def get_all_settings() -> dict:
-        """Returns comprehensive settings overview"""
+        """Returns comprehensive settings overview (includes provider_settings which triggers heavy imports)"""
         return {
             "credentials": SettingsDetector.detect_credentials(),
             "custom_bases": SettingsDetector.detect_custom_api_bases(),
@@ -115,6 +129,17 @@ class SettingsDetector:
             "concurrency_limits": SettingsDetector.detect_concurrency_limits(),
             "model_filters": SettingsDetector.detect_model_filters(),
             "provider_settings": SettingsDetector.detect_provider_settings(),
+        }
+
+    @staticmethod
+    def get_basic_settings() -> dict:
+        """Returns basic settings overview without provider_settings (avoids heavy imports)"""
+        return {
+            "credentials": SettingsDetector.detect_credentials(),
+            "custom_bases": SettingsDetector.detect_custom_api_bases(),
+            "model_definitions": SettingsDetector.detect_model_definitions(),
+            "concurrency_limits": SettingsDetector.detect_concurrency_limits(),
+            "model_filters": SettingsDetector.detect_model_filters(),
         }
 
     @staticmethod
@@ -260,7 +285,7 @@ class LauncherTUI:
         self.console = Console()
         self.config = LauncherConfig()
         self.running = True
-        self.env_file = Path.cwd() / ".env"
+        self.env_file = _get_env_file()
         # Load .env file to ensure environment variables are available
         load_dotenv(dotenv_path=self.env_file, override=True)
 
@@ -277,8 +302,8 @@ class LauncherTUI:
         """Display main menu and handle selection"""
         clear_screen()
 
-        # Detect all settings
-        settings = SettingsDetector.get_all_settings()
+        # Detect basic settings (excludes provider_settings to avoid heavy imports)
+        settings = SettingsDetector.get_basic_settings()
         credentials = settings["credentials"]
         custom_bases = settings["custom_bases"]
 
@@ -363,18 +388,17 @@ class LauncherTUI:
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
-        provider_settings = settings.get("provider_settings", {})
+
+        self.console.print(f"   Providers:           {provider_count} configured")
+        self.console.print(f"   Custom Providers:    {custom_count} configured")
+        # Note: provider_settings detection is deferred to avoid heavy imports on startup
         has_advanced = bool(
             settings["model_definitions"]
             or settings["concurrency_limits"]
             or settings["model_filters"]
-            or provider_settings
         )
-
-        self.console.print(f"   Providers:           {provider_count} configured")
-        self.console.print(f"   Custom Providers:    {custom_count} configured")
         self.console.print(
-            f"   Advanced Settings:   {'Active (view in menu 4)' if has_advanced else 'None'}"
+            f"   Advanced Settings:   {'Active (view in menu 4)' if has_advanced else 'None (view menu 4 for details)'}"
         )
 
         # Show menu
@@ -418,7 +442,7 @@ class LauncherTUI:
         elif choice == "4":
             self.show_provider_settings_menu()
         elif choice == "5":
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
             self.console.print("\n[green]✅ Configuration reloaded![/green]")
         elif choice == "6":
@@ -659,13 +683,14 @@ class LauncherTUI:
         """Display provider/advanced settings (read-only + launch tool)"""
         clear_screen()
 
-        settings = SettingsDetector.get_all_settings()
+        # Use basic settings to avoid heavy imports - provider_settings deferred to Settings Tool
+        settings = SettingsDetector.get_basic_settings()
+
         credentials = settings["credentials"]
         custom_bases = settings["custom_bases"]
         model_defs = settings["model_definitions"]
         concurrency = settings["concurrency_limits"]
         filters = settings["model_filters"]
-        provider_settings = settings.get("provider_settings", {})
 
         self.console.print(
             Panel.fit(
@@ -740,23 +765,13 @@ class LauncherTUI:
                 status = " + ".join(status_parts) if status_parts else "None"
                 self.console.print(f"   • {provider:15} ✅ {status}")
 
-        # Provider-Specific Settings
+        # Provider-Specific Settings (deferred to Settings Tool to avoid heavy imports)
         self.console.print()
         self.console.print("[bold]🔬 Provider-Specific Settings[/bold]")
         self.console.print("━" * 70)
-        try:
-            from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
-        except ImportError:
-            from .settings_tool import PROVIDER_SETTINGS_MAP
-        for provider in PROVIDER_SETTINGS_MAP.keys():
-            display_name = provider.replace("_", " ").title()
-            modified = provider_settings.get(provider, 0)
-            if modified > 0:
-                self.console.print(
-                    f"   • {display_name:20} [yellow]{modified} setting{'s' if modified > 1 else ''} modified[/yellow]"
-                )
-            else:
-                self.console.print(f"   • {display_name:20} [dim]using defaults[/dim]")
+        self.console.print(
+            "   [dim]Launch Settings Tool to view/configure provider-specific settings[/dim]"
+        )
 
         # Actions
         self.console.print()
@@ -823,15 +838,31 @@ class LauncherTUI:
         # Run the tool with from_launcher=True to skip duplicate loading screen
         run_credential_tool(from_launcher=True)
         # Reload environment after credential tool
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+        load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def launch_settings_tool(self):
         """Launch settings configuration tool"""
-        from proxy_app.settings_tool import run_settings_tool
+        import time
+
+        clear_screen()
+
+        self.console.print("━" * 70)
+        self.console.print("Advanced Settings Configuration Tool")
+        self.console.print("━" * 70)
+
+        _start_time = time.time()
+
+        with self.console.status("Initializing settings tool...", spinner="dots"):
+            from proxy_app.settings_tool import run_settings_tool
+
+        _elapsed = time.time() - _start_time
+        self.console.print(f"✓ Settings tool ready in {_elapsed:.2f}s")
+
+        time.sleep(0.3)
 
         run_settings_tool()
         # Reload environment after settings tool
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+        load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def show_about(self):
         """Display About page with project information"""
@@ -919,9 +950,9 @@ class LauncherTUI:
             )
 
             ensure_env_defaults()
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
             run_credential_tool()
-            load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
+            load_dotenv(dotenv_path=_get_env_file(), override=True)
 
             # Check again after credential tool
             if not os.getenv("PROXY_API_KEY"):
