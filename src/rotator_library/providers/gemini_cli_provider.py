@@ -183,6 +183,98 @@ FINISH_REASON_MAP = {
 }
 
 
+def _recursively_parse_json_strings(obj: Any) -> Any:
+    """
+    Recursively parse JSON strings in nested data structures.
+
+    Gemini sometimes returns tool arguments with JSON-stringified values:
+    {"files": "[{...}]"} instead of {"files": [{...}]}.
+
+    Additionally handles:
+    - Malformed double-encoded JSON (extra trailing '}' or ']')
+    - Escaped string content (\n, \t, etc.)
+    """
+    if isinstance(obj, dict):
+        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_recursively_parse_json_strings(item) for item in obj]
+    elif isinstance(obj, str):
+        stripped = obj.strip()
+
+        # Check if string contains control character escape sequences that need unescaping
+        # This handles cases where diff content has literal \n or \t instead of actual newlines/tabs
+        #
+        # IMPORTANT: We intentionally do NOT unescape strings containing \" or \\
+        # because these are typically intentional escapes in code/config content
+        # (e.g., JSON embedded in YAML: BOT_NAMES_JSON: '["mirrobot", ...]')
+        # Unescaping these would corrupt the content and cause issues like
+        # oldString and newString becoming identical when they should differ.
+        has_control_char_escapes = "\\n" in obj or "\\t" in obj
+        has_intentional_escapes = '\\"' in obj or "\\\\" in obj
+
+        if has_control_char_escapes and not has_intentional_escapes:
+            try:
+                # Use json.loads with quotes to properly unescape the string
+                # This converts \n -> newline, \t -> tab
+                unescaped = json.loads(f'"{obj}"')
+                # Log the fix with a snippet for debugging
+                snippet = obj[:80] + "..." if len(obj) > 80 else obj
+                lib_logger.debug(
+                    f"[GeminiCli] Unescaped control chars in string: "
+                    f"{len(obj) - len(unescaped)} chars changed. Snippet: {snippet!r}"
+                )
+                return unescaped
+            except (json.JSONDecodeError, ValueError):
+                # If unescaping fails, continue with original processing
+                pass
+
+        # Check if it looks like JSON (starts with { or [)
+        if stripped and stripped[0] in ("{", "["):
+            # Try standard parsing first
+            if (stripped.startswith("{") and stripped.endswith("}")) or (
+                stripped.startswith("[") and stripped.endswith("]")
+            ):
+                try:
+                    parsed = json.loads(obj)
+                    return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Handle malformed JSON: array that doesn't end with ]
+            # e.g., '[{"path": "..."}]}' instead of '[{"path": "..."}]'
+            if stripped.startswith("[") and not stripped.endswith("]"):
+                try:
+                    # Find the last ] and truncate there
+                    last_bracket = stripped.rfind("]")
+                    if last_bracket > 0:
+                        cleaned = stripped[: last_bracket + 1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"[GeminiCli] Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Handle malformed JSON: object that doesn't end with }
+            if stripped.startswith("{") and not stripped.endswith("}"):
+                try:
+                    # Find the last } and truncate there
+                    last_brace = stripped.rfind("}")
+                    if last_brace > 0:
+                        cleaned = stripped[: last_brace + 1]
+                        parsed = json.loads(cleaned)
+                        lib_logger.warning(
+                            f"[GeminiCli] Auto-corrected malformed JSON string: "
+                            f"truncated {len(stripped) - len(cleaned)} extra chars"
+                        )
+                        return _recursively_parse_json_strings(parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    return obj
+
+
 def _env_bool(key: str, default: bool = False) -> bool:
     """Get boolean from environment variable."""
     return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
@@ -840,23 +932,39 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             elif role == "tool":
                 tool_call_id = msg.get("tool_call_id")
                 function_name = tool_call_id_to_name.get(tool_call_id)
-                if function_name:
-                    # Add prefix for Gemini 3
-                    if is_gemini_3 and self._enable_gemini3_tool_fix:
-                        function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
-                    # Wrap the tool response in a 'result' object
-                    response_content = {"result": content}
-                    # Accumulate tool responses - they'll be combined into one user message
-                    pending_tool_parts.append(
-                        {
-                            "functionResponse": {
-                                "name": function_name,
-                                "response": response_content,
-                                "id": tool_call_id,
-                            }
-                        }
+                # Log warning if tool_call_id not found in mapping (can happen after context compaction)
+                if not function_name:
+                    lib_logger.warning(
+                        f"[ID Mismatch] Tool response has ID '{tool_call_id}' which was not found in tool_id_to_name map. "
+                        f"Available IDs: {list(tool_call_id_to_name.keys())}. Using 'unknown_function' as fallback."
                     )
+                    function_name = "unknown_function"
+
+                # Add prefix for Gemini 3
+                if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = f"{self._gemini3_tool_prefix}{function_name}"
+
+                # Try to parse content as JSON first, fall back to string
+                try:
+                    parsed_content = (
+                        json.loads(content) if isinstance(content, str) else content
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    parsed_content = content
+
+                # Wrap the tool response in a 'result' object
+                response_content = {"result": parsed_content}
+                # Accumulate tool responses - they'll be combined into one user message
+                pending_tool_parts.append(
+                    {
+                        "functionResponse": {
+                            "name": function_name,
+                            "response": response_content,
+                            "id": tool_call_id,
+                        }
+                    }
+                )
                 # Don't add parts here - tool responses are handled via pending_tool_parts
                 continue
 
@@ -871,6 +979,216 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             gemini_contents.insert(0, {"role": "user", "parts": [{"text": ""}]})
 
         return system_instruction, gemini_contents
+
+    def _fix_tool_response_grouping(
+        self, contents: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Group function calls with their responses for Gemini CLI compatibility.
+
+        Converts linear format (call, response, call, response)
+        to grouped format (model with calls, user with all responses).
+
+        IMPORTANT: Preserves ID-based pairing to prevent mismatches.
+        When IDs don't match, attempts recovery by:
+        1. Matching by function name first
+        2. Matching by order if names don't match
+        3. Inserting placeholder responses if responses are missing
+        4. Inserting responses at the CORRECT position (after their corresponding call)
+        """
+        new_contents = []
+        # Each pending group tracks:
+        # - ids: expected response IDs
+        # - func_names: expected function names (for orphan matching)
+        # - insert_after_idx: position in new_contents where model message was added
+        pending_groups = []
+        collected_responses = {}  # Dict mapping ID -> response_part
+
+        for content in contents:
+            role = content.get("role")
+            parts = content.get("parts", [])
+
+            response_parts = [p for p in parts if "functionResponse" in p]
+
+            if response_parts:
+                # Collect responses by ID (ignore duplicates - keep first occurrence)
+                for resp in response_parts:
+                    resp_id = resp.get("functionResponse", {}).get("id", "")
+                    if resp_id:
+                        if resp_id in collected_responses:
+                            lib_logger.warning(
+                                f"[Grouping] Duplicate response ID detected: {resp_id}. "
+                                f"Ignoring duplicate - this may indicate malformed conversation history."
+                            )
+                            continue
+                        collected_responses[resp_id] = resp
+
+                # Try to satisfy pending groups (newest first)
+                for i in range(len(pending_groups) - 1, -1, -1):
+                    group = pending_groups[i]
+                    group_ids = group["ids"]
+
+                    # Check if we have ALL responses for this group
+                    if all(gid in collected_responses for gid in group_ids):
+                        # Extract responses in the same order as the function calls
+                        group_responses = [
+                            collected_responses.pop(gid) for gid in group_ids
+                        ]
+                        new_contents.append({"parts": group_responses, "role": "user"})
+                        pending_groups.pop(i)
+                        break
+                continue
+
+            if role == "model":
+                func_calls = [p for p in parts if "functionCall" in p]
+                new_contents.append(content)
+                if func_calls:
+                    call_ids = [
+                        fc.get("functionCall", {}).get("id", "") for fc in func_calls
+                    ]
+                    call_ids = [cid for cid in call_ids if cid]  # Filter empty IDs
+
+                    # Also extract function names for orphan matching
+                    func_names = [
+                        fc.get("functionCall", {}).get("name", "") for fc in func_calls
+                    ]
+
+                    if call_ids:
+                        pending_groups.append(
+                            {
+                                "ids": call_ids,
+                                "func_names": func_names,
+                                "insert_after_idx": len(new_contents) - 1,
+                            }
+                        )
+            else:
+                new_contents.append(content)
+
+        # Handle remaining groups (shouldn't happen in well-formed conversations)
+        # Attempt recovery by matching orphans to unsatisfied calls
+        # Process in REVERSE order of insert_after_idx so insertions don't shift indices
+        pending_groups.sort(key=lambda g: g["insert_after_idx"], reverse=True)
+
+        for group in pending_groups:
+            group_ids = group["ids"]
+            group_func_names = group.get("func_names", [])
+            insert_idx = group["insert_after_idx"] + 1
+            group_responses = []
+
+            lib_logger.debug(
+                f"[Grouping Recovery] Processing unsatisfied group: "
+                f"ids={group_ids}, names={group_func_names}, insert_at={insert_idx}"
+            )
+
+            for i, expected_id in enumerate(group_ids):
+                expected_name = group_func_names[i] if i < len(group_func_names) else ""
+
+                if expected_id in collected_responses:
+                    # Direct ID match
+                    group_responses.append(collected_responses.pop(expected_id))
+                    lib_logger.debug(
+                        f"[Grouping Recovery] Direct ID match for '{expected_id}'"
+                    )
+                elif collected_responses:
+                    # Try to find orphan with matching function name first
+                    matched_orphan_id = None
+
+                    # First pass: match by function name
+                    for orphan_id, orphan_resp in collected_responses.items():
+                        orphan_name = orphan_resp.get("functionResponse", {}).get(
+                            "name", ""
+                        )
+                        # Match if names are equal
+                        if orphan_name == expected_name:
+                            matched_orphan_id = orphan_id
+                            lib_logger.debug(
+                                f"[Grouping Recovery] Matched orphan '{orphan_id}' by name '{orphan_name}'"
+                            )
+                            break
+
+                    # Second pass: if no name match, try "unknown_function" orphans
+                    if not matched_orphan_id:
+                        for orphan_id, orphan_resp in collected_responses.items():
+                            orphan_name = orphan_resp.get("functionResponse", {}).get(
+                                "name", ""
+                            )
+                            if orphan_name == "unknown_function":
+                                matched_orphan_id = orphan_id
+                                lib_logger.debug(
+                                    f"[Grouping Recovery] Matched unknown_function orphan '{orphan_id}' "
+                                    f"to expected '{expected_name}'"
+                                )
+                                break
+
+                    # Third pass: if still no match, take first available (order-based)
+                    if not matched_orphan_id:
+                        matched_orphan_id = next(iter(collected_responses))
+                        lib_logger.debug(
+                            f"[Grouping Recovery] No name match, using first available orphan '{matched_orphan_id}'"
+                        )
+
+                    if matched_orphan_id:
+                        orphan_resp = collected_responses.pop(matched_orphan_id)
+
+                        # Fix the ID in the response to match the call
+                        old_id = orphan_resp["functionResponse"].get("id", "")
+                        orphan_resp["functionResponse"]["id"] = expected_id
+
+                        # Fix the name if it was "unknown_function"
+                        if (
+                            orphan_resp["functionResponse"].get("name")
+                            == "unknown_function"
+                            and expected_name
+                        ):
+                            orphan_resp["functionResponse"]["name"] = expected_name
+                            lib_logger.info(
+                                f"[Grouping Recovery] Fixed function name from 'unknown_function' to '{expected_name}'"
+                            )
+
+                        lib_logger.warning(
+                            f"[Grouping] Auto-repaired ID mismatch: mapped response '{old_id}' "
+                            f"to call '{expected_id}' (function: {expected_name})"
+                        )
+                        group_responses.append(orphan_resp)
+                else:
+                    # No responses available - create placeholder
+                    placeholder_resp = {
+                        "functionResponse": {
+                            "name": expected_name or "unknown_function",
+                            "response": {
+                                "result": {
+                                    "error": "Tool response was lost during context processing. "
+                                    "This is a recovered placeholder.",
+                                    "recovered": True,
+                                }
+                            },
+                            "id": expected_id,
+                        }
+                    }
+                    lib_logger.warning(
+                        f"[Grouping Recovery] Created placeholder response for missing tool: "
+                        f"id='{expected_id}', name='{expected_name}'"
+                    )
+                    group_responses.append(placeholder_resp)
+
+            if group_responses:
+                # Insert at the correct position (right after the model message with the calls)
+                new_contents.insert(
+                    insert_idx, {"parts": group_responses, "role": "user"}
+                )
+                lib_logger.info(
+                    f"[Grouping Recovery] Inserted {len(group_responses)} responses at position {insert_idx} "
+                    f"(expected {len(group_ids)})"
+                )
+
+        # Warn about unmatched responses
+        if collected_responses:
+            lib_logger.warning(
+                f"[Grouping] {len(collected_responses)} unmatched responses remaining: "
+                f"ids={list(collected_responses.keys())}"
+            )
+
+        return new_contents
 
     def _handle_reasoning_parameters(
         self, payload: Dict[str, Any], model: str
@@ -991,9 +1309,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Get current tool index from accumulator (default 0) and increment
                 current_tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
 
-                # Get args and strip _confirm ONLY if it's the sole parameter
+                # Get args, recursively parse any JSON strings, and strip _confirm if sole param
+                raw_args = function_call.get("args", {})
+                tool_args = _recursively_parse_json_strings(raw_args)
+
+                # Strip _confirm ONLY if it's the sole parameter
                 # This ensures we only strip our injection, not legitimate user params
-                tool_args = function_call.get("args", {})
                 if isinstance(tool_args, dict) and "_confirm" in tool_args:
                     if len(tool_args) == 1:
                         # _confirm is the only param - this was our injection
@@ -1578,6 +1899,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             system_instruction, contents = self._transform_messages(
                 kwargs.get("messages", []), model_name
             )
+            # Fix tool response grouping (handles ID mismatches, missing responses)
+            contents = self._fix_tool_response_grouping(contents)
+
             request_payload = {
                 "model": model_name,
                 "project": project_id,
@@ -1865,6 +2189,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Transform messages to Gemini format
         system_instruction, contents = self._transform_messages(messages)
+        # Fix tool response grouping (handles ID mismatches, missing responses)
+        contents = self._fix_tool_response_grouping(contents)
 
         # Build request payload
         request_payload = {
