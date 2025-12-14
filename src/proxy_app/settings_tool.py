@@ -16,6 +16,9 @@ from rotator_library.utils.paths import get_data_file
 
 console = Console()
 
+# Sentinel value for distinguishing "no pending change" from "pending change to None"
+_NOT_FOUND = object()
+
 # Import default OAuth port values from provider modules
 # These serve as the source of truth for default port values
 try:
@@ -94,6 +97,70 @@ class AdvancedSettings:
     def has_pending(self) -> bool:
         """Check if there are pending changes"""
         return bool(self.pending_changes)
+
+    def get_pending_value(self, key: str):
+        """Get pending value for a key. Returns sentinel _NOT_FOUND if no pending change."""
+        return self.pending_changes.get(key, _NOT_FOUND)
+
+    def get_original_value(self, key: str) -> Optional[str]:
+        """Get the current .env value (before pending changes)"""
+        return os.getenv(key)
+
+    def get_change_type(self, key: str) -> Optional[str]:
+        """Returns 'add', 'edit', 'remove', or None if no pending change"""
+        if key not in self.pending_changes:
+            return None
+        if self.pending_changes[key] is None:
+            return "remove"
+        elif os.getenv(key) is not None:
+            return "edit"
+        else:
+            return "add"
+
+    def get_pending_keys_by_pattern(
+        self, prefix: str = "", suffix: str = ""
+    ) -> List[str]:
+        """Get all pending change keys that match prefix and/or suffix"""
+        return [
+            k
+            for k in self.pending_changes.keys()
+            if k.startswith(prefix) and k.endswith(suffix)
+        ]
+
+    def get_changes_summary(self) -> Dict[str, List[tuple]]:
+        """Get categorized summary of all pending changes.
+        Returns dict with 'add', 'edit', 'remove' keys,
+        each containing list of (key, old_val, new_val) tuples.
+        """
+        summary: Dict[str, List[tuple]] = {"add": [], "edit": [], "remove": []}
+        for key, new_val in self.pending_changes.items():
+            old_val = os.getenv(key)
+            change_type = self.get_change_type(key)
+            if change_type:
+                summary[change_type].append((key, old_val, new_val))
+        # Sort each list alphabetically by key
+        for change_type in summary:
+            summary[change_type].sort(key=lambda x: x[0])
+        return summary
+
+    def get_pending_counts(self) -> Dict[str, int]:
+        """Get counts of pending changes by type"""
+        adds = len(
+            [
+                k
+                for k, v in self.pending_changes.items()
+                if v is not None and os.getenv(k) is None
+            ]
+        )
+        edits = len(
+            [
+                k
+                for k, v in self.pending_changes.items()
+                if v is not None and os.getenv(k) is not None
+            ]
+        )
+        removes = len([k for k, v in self.pending_changes.items() if v is None])
+        return {"add": adds, "edit": edits, "remove": removes}
 
 
 class CustomProviderManager:
@@ -561,6 +628,58 @@ class SettingsTool:
         self.provider_settings_mgr = ProviderSettingsManager(self.settings)
         self.running = True
 
+    def _format_item(
+        self,
+        name: str,
+        value: str,
+        change_type: Optional[str],
+        old_value: Optional[str] = None,
+        width: int = 15,
+    ) -> str:
+        """Format a list item with change indicator.
+
+        change_type: None, 'add', 'edit', 'remove'
+        Returns formatted string like:
+          "   + myapi          https://api.example.com" (green)
+          "   ~ openai         1 → 5 requests/key" (yellow)
+          "   - oldapi         https://old.api.com" (red)
+          "   • groq           3 requests/key" (normal)
+        """
+        if change_type == "add":
+            return f"   [green]+ {name:{width}} {value}[/green]"
+        elif change_type == "edit":
+            if old_value is not None:
+                return f"   [yellow]~ {name:{width}} {old_value} → {value}[/yellow]"
+            else:
+                return f"   [yellow]~ {name:{width}} {value}[/yellow]"
+        elif change_type == "remove":
+            return f"   [red]- {name:{width}} {value}[/red]"
+        else:
+            return f"   • {name:{width}} {value}"
+
+    def _get_pending_status_text(self) -> str:
+        """Get formatted pending changes status text for main menu."""
+        if not self.settings.has_pending():
+            return "[dim]ℹ️  No pending changes[/dim]"
+
+        counts = self.settings.get_pending_counts()
+        parts = []
+        if counts["add"]:
+            parts.append(
+                f"[green]{counts['add']} addition{'s' if counts['add'] > 1 else ''}[/green]"
+            )
+        if counts["edit"]:
+            parts.append(
+                f"[yellow]{counts['edit']} modification{'s' if counts['edit'] > 1 else ''}[/yellow]"
+            )
+        if counts["remove"]:
+            parts.append(
+                f"[red]{counts['remove']} removal{'s' if counts['remove'] > 1 else ''}[/red]"
+            )
+
+        return f"[bold]ℹ️  Pending changes: {', '.join(parts)}[/bold]"
+        self.running = True
+
     def get_available_providers(self) -> List[str]:
         """Get list of providers that have credentials configured"""
         env_file = get_data_file(".env")
@@ -626,12 +745,7 @@ class SettingsTool:
         self.console.print()
         self.console.print("━" * 70)
 
-        if self.settings.has_pending():
-            self.console.print(
-                '[yellow]ℹ️  Changes are pending until you select "Save & Exit"[/yellow]'
-            )
-        else:
-            self.console.print("[dim]ℹ️  No pending changes[/dim]")
+        self.console.print(self._get_pending_status_text())
 
         self.console.print()
         self.console.print(
@@ -665,6 +779,7 @@ class SettingsTool:
         while True:
             clear_screen()
 
+            # Get current providers from env
             providers = self.provider_mgr.get_current_providers()
 
             self.console.print(
@@ -678,9 +793,48 @@ class SettingsTool:
             self.console.print("[bold]📋 Configured Custom Providers[/bold]")
             self.console.print("━" * 70)
 
-            if providers:
-                for name, base in providers.items():
-                    self.console.print(f"   • {name:15} {base}")
+            # Build combined view with pending changes
+            all_providers: Dict[str, Dict[str, Any]] = {}
+
+            # Add current providers (from env)
+            for name, base in providers.items():
+                key = f"{name.upper()}_API_BASE"
+                change_type = self.settings.get_change_type(key)
+                if change_type == "remove":
+                    all_providers[name] = {"value": base, "type": "remove", "old": None}
+                elif change_type == "edit":
+                    new_val = self.settings.pending_changes[key]
+                    all_providers[name] = {
+                        "value": new_val,
+                        "type": "edit",
+                        "old": base,
+                    }
+                else:
+                    all_providers[name] = {"value": base, "type": None, "old": None}
+
+            # Add pending new providers (additions)
+            for key in self.settings.get_pending_keys_by_pattern(suffix="_API_BASE"):
+                if self.settings.get_change_type(key) == "add":
+                    name = key.replace("_API_BASE", "").lower()
+                    if name not in all_providers:
+                        all_providers[name] = {
+                            "value": self.settings.pending_changes[key],
+                            "type": "add",
+                            "old": None,
+                        }
+
+            if all_providers:
+                # Sort alphabetically
+                for name in sorted(all_providers.keys()):
+                    info = all_providers[name]
+                    self.console.print(
+                        self._format_item(
+                            name,
+                            info["value"],
+                            info["type"],
+                            info["old"],
+                        )
+                    )
             else:
                 self.console.print("   [dim]No custom providers configured[/dim]")
 
@@ -709,7 +863,7 @@ class SettingsTool:
                     if api_base:
                         self.provider_mgr.add_provider(name, api_base)
                         self.console.print(
-                            f"\n[green]✅ Custom provider '{name}' configured![/green]"
+                            f"\n[green]✅ Custom provider '{name}' staged![/green]"
                         )
                         self.console.print(
                             f"   To use: set {name.upper()}_API_KEY in credentials"
@@ -717,14 +871,18 @@ class SettingsTool:
                         input("\nPress Enter to continue...")
 
             elif choice == "2":
-                if not providers:
+                # Get editable providers (existing + pending additions, excluding pending removals)
+                editable = {
+                    k: v for k, v in all_providers.items() if v["type"] != "remove"
+                }
+                if not editable:
                     self.console.print("\n[yellow]No providers to edit[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
 
                 # Show numbered list
                 self.console.print("\n[bold]Select provider to edit:[/bold]")
-                providers_list = list(providers.keys())
+                providers_list = sorted(editable.keys())
                 for idx, prov in enumerate(providers_list, 1):
                     self.console.print(f"   {idx}. {prov}")
 
@@ -733,7 +891,9 @@ class SettingsTool:
                     choices=[str(i) for i in range(1, len(providers_list) + 1)],
                 )
                 name = providers_list[choice_idx - 1]
-                current_base = providers.get(name, "")
+                info = editable[name]
+                # Get effective current value (could be pending or from env)
+                current_base = info["value"]
 
                 self.console.print(f"\nCurrent API Base: {current_base}")
                 new_base = Prompt.ask(
@@ -750,16 +910,33 @@ class SettingsTool:
                 input("\nPress Enter to continue...")
 
             elif choice == "3":
-                if not providers:
+                # Get removable providers (existing ones not already pending removal)
+                removable = {
+                    k: v
+                    for k, v in all_providers.items()
+                    if v["type"] != "remove" and v["type"] != "add"
+                }
+                # For pending additions, we can "undo" by removing from pending
+                pending_adds = {
+                    k: v for k, v in all_providers.items() if v["type"] == "add"
+                }
+
+                if not removable and not pending_adds:
                     self.console.print("\n[yellow]No providers to remove[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
 
                 # Show numbered list
                 self.console.print("\n[bold]Select provider to remove:[/bold]")
-                providers_list = list(providers.keys())
+                # Show existing providers first, then pending additions
+                providers_list = sorted(removable.keys()) + sorted(pending_adds.keys())
                 for idx, prov in enumerate(providers_list, 1):
-                    self.console.print(f"   {idx}. {prov}")
+                    if prov in pending_adds:
+                        self.console.print(
+                            f"   {idx}. {prov} [green](pending add)[/green]"
+                        )
+                    else:
+                        self.console.print(f"   {idx}. {prov}")
 
                 choice_idx = IntPrompt.ask(
                     "Select option",
@@ -768,10 +945,18 @@ class SettingsTool:
                 name = providers_list[choice_idx - 1]
 
                 if Confirm.ask(f"Remove '{name}'?"):
-                    self.provider_mgr.remove_provider(name)
-                    self.console.print(
-                        f"\n[green]✅ Provider '{name}' removed![/green]"
-                    )
+                    if name in pending_adds:
+                        # Undo pending addition - remove from pending_changes
+                        key = f"{name.upper()}_API_BASE"
+                        del self.settings.pending_changes[key]
+                        self.console.print(
+                            f"\n[green]✅ Pending addition of '{name}' cancelled![/green]"
+                        )
+                    else:
+                        self.provider_mgr.remove_provider(name)
+                        self.console.print(
+                            f"\n[green]✅ Provider '{name}' marked for removal![/green]"
+                        )
                     input("\nPress Enter to continue...")
 
             elif choice == "4":
@@ -782,7 +967,8 @@ class SettingsTool:
         while True:
             clear_screen()
 
-            all_providers = self.model_mgr.get_all_providers_with_models()
+            # Get current providers with models from env
+            all_providers_env = self.model_mgr.get_all_providers_with_models()
 
             self.console.print(
                 Panel.fit(
@@ -795,10 +981,69 @@ class SettingsTool:
             self.console.print("[bold]📋 Configured Provider Models[/bold]")
             self.console.print("━" * 70)
 
-            if all_providers:
-                for provider, count in all_providers.items():
+            # Build combined view with pending changes
+            all_models: Dict[str, Dict[str, Any]] = {}
+            suffix = "_MODELS"
+
+            # Add current providers (from env)
+            for provider, count in all_providers_env.items():
+                key = f"{provider.upper()}{suffix}"
+                change_type = self.settings.get_change_type(key)
+                if change_type == "remove":
+                    all_models[provider] = {
+                        "value": f"{count} model{'s' if count > 1 else ''}",
+                        "type": "remove",
+                        "old": None,
+                    }
+                elif change_type == "edit":
+                    # Get new model count from pending
+                    new_val = self.settings.pending_changes[key]
+                    try:
+                        parsed = json.loads(new_val)
+                        new_count = (
+                            len(parsed) if isinstance(parsed, (dict, list)) else 0
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        new_count = 0
+                    all_models[provider] = {
+                        "value": f"{new_count} model{'s' if new_count > 1 else ''}",
+                        "type": "edit",
+                        "old": f"{count} model{'s' if count > 1 else ''}",
+                    }
+                else:
+                    all_models[provider] = {
+                        "value": f"{count} model{'s' if count > 1 else ''}",
+                        "type": None,
+                        "old": None,
+                    }
+
+            # Add pending new model definitions (additions)
+            for key in self.settings.get_pending_keys_by_pattern(suffix=suffix):
+                if self.settings.get_change_type(key) == "add":
+                    provider = key.replace(suffix, "").lower()
+                    if provider not in all_models:
+                        new_val = self.settings.pending_changes[key]
+                        try:
+                            parsed = json.loads(new_val)
+                            new_count = (
+                                len(parsed) if isinstance(parsed, (dict, list)) else 0
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            new_count = 0
+                        all_models[provider] = {
+                            "value": f"{new_count} model{'s' if new_count > 1 else ''}",
+                            "type": "add",
+                            "old": None,
+                        }
+
+            if all_models:
+                # Sort alphabetically
+                for provider in sorted(all_models.keys()):
+                    info = all_models[provider]
                     self.console.print(
-                        f"   • {provider:15} {count} model{'s' if count > 1 else ''}"
+                        self._format_item(
+                            provider, info["value"], info["type"], info["old"]
+                        )
                     )
             else:
                 self.console.print("   [dim]No model definitions configured[/dim]")
@@ -825,19 +1070,36 @@ class SettingsTool:
             if choice == "1":
                 self.add_model_definitions()
             elif choice == "2":
-                if not all_providers:
+                # Get editable models (existing + pending additions, excluding pending removals)
+                editable = {
+                    k: v for k, v in all_models.items() if v["type"] != "remove"
+                }
+                if not editable:
                     self.console.print("\n[yellow]No providers to edit[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
-                self.edit_model_definitions(list(all_providers.keys()))
+                self.edit_model_definitions(sorted(editable.keys()))
             elif choice == "3":
-                if not all_providers:
+                viewable = {
+                    k: v for k, v in all_models.items() if v["type"] != "remove"
+                }
+                if not viewable:
                     self.console.print("\n[yellow]No providers to view[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
-                self.view_model_definitions(list(all_providers.keys()))
+                self.view_model_definitions(sorted(viewable.keys()))
             elif choice == "4":
-                if not all_providers:
+                # Get removable models (existing ones not already pending removal)
+                removable = {
+                    k: v
+                    for k, v in all_models.items()
+                    if v["type"] != "remove" and v["type"] != "add"
+                }
+                pending_adds = {
+                    k: v for k, v in all_models.items() if v["type"] == "add"
+                }
+
+                if not removable and not pending_adds:
                     self.console.print("\n[yellow]No providers to remove[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
@@ -846,9 +1108,14 @@ class SettingsTool:
                 self.console.print(
                     "\n[bold]Select provider to remove models from:[/bold]"
                 )
-                providers_list = list(all_providers.keys())
+                providers_list = sorted(removable.keys()) + sorted(pending_adds.keys())
                 for idx, prov in enumerate(providers_list, 1):
-                    self.console.print(f"   {idx}. {prov}")
+                    if prov in pending_adds:
+                        self.console.print(
+                            f"   {idx}. {prov} [green](pending add)[/green]"
+                        )
+                    else:
+                        self.console.print(f"   {idx}. {prov}")
 
                 choice_idx = IntPrompt.ask(
                     "Select option",
@@ -857,10 +1124,18 @@ class SettingsTool:
                 provider = providers_list[choice_idx - 1]
 
                 if Confirm.ask(f"Remove all model definitions for '{provider}'?"):
-                    self.model_mgr.remove_models(provider)
-                    self.console.print(
-                        f"\n[green]✅ Model definitions removed for '{provider}'![/green]"
-                    )
+                    if provider in pending_adds:
+                        # Undo pending addition
+                        key = f"{provider.upper()}{suffix}"
+                        del self.settings.pending_changes[key]
+                        self.console.print(
+                            f"\n[green]✅ Pending models for '{provider}' cancelled![/green]"
+                        )
+                    else:
+                        self.model_mgr.remove_models(provider)
+                        self.console.print(
+                            f"\n[green]✅ Model definitions marked for removal for '{provider}'![/green]"
+                        )
                     input("\nPress Enter to continue...")
             elif choice == "5":
                 break
@@ -1187,7 +1462,7 @@ class SettingsTool:
             self.console.print("[bold]📋 Current Settings[/bold]")
             self.console.print("━" * 70)
 
-            # Display all settings with current values
+            # Display all settings with current values and pending changes
             settings_list = list(definitions.keys())
             for idx, key in enumerate(settings_list, 1):
                 definition = definitions[key]
@@ -1196,37 +1471,88 @@ class SettingsTool:
                 setting_type = definition.get("type", "str")
                 description = definition.get("description", "")
 
+                # Check for pending changes
+                change_type = self.settings.get_change_type(key)
+                pending_val = self.settings.get_pending_value(key)
+
+                # Determine effective value to display
+                if pending_val is not _NOT_FOUND and pending_val is not None:
+                    # Has pending change - convert to proper type for display
+                    if setting_type == "bool":
+                        effective = pending_val.lower() in ("true", "1", "yes")
+                    elif setting_type == "int":
+                        try:
+                            effective = int(pending_val)
+                        except (ValueError, TypeError):
+                            effective = pending_val
+                    else:
+                        effective = pending_val
+                elif pending_val is None and change_type == "remove":
+                    # Pending removal - will revert to default
+                    effective = default
+                else:
+                    effective = current
+
                 # Format value display
                 if setting_type == "bool":
                     value_display = (
                         "[green]✓ Enabled[/green]"
-                        if current
+                        if effective
                         else "[red]✗ Disabled[/red]"
                     )
+                    old_display = (
+                        (
+                            "[green]✓ Enabled[/green]"
+                            if current
+                            else "[red]✗ Disabled[/red]"
+                        )
+                        if change_type
+                        else None
+                    )
                 elif setting_type == "int":
-                    value_display = f"[cyan]{current}[/cyan]"
+                    value_display = f"[cyan]{effective}[/cyan]"
+                    old_display = f"[cyan]{current}[/cyan]" if change_type else None
                 else:
                     value_display = (
-                        f"[cyan]{current or '(not set)'}[/cyan]"
-                        if current
+                        f"[cyan]{effective or '(not set)'}[/cyan]"
+                        if effective
                         else "[dim](not set)[/dim]"
                     )
-
-                # Check if modified from default
-                modified = current != default
-                mod_marker = "[yellow]*[/yellow]" if modified else " "
+                    old_display = (
+                        f"[cyan]{current}[/cyan]" if change_type and current else None
+                    )
 
                 # Short key name for display (strip provider prefix)
                 short_key = key.replace(f"{provider.upper()}_", "")
 
-                self.console.print(
-                    f"  {mod_marker}{idx:2}. {short_key:35} {value_display}"
-                )
+                # Determine display marker based on pending change type
+                if change_type == "add":
+                    self.console.print(
+                        f"  [green]+{idx:2}. {short_key:35} {value_display}[/green]"
+                    )
+                elif change_type == "edit":
+                    self.console.print(
+                        f"  [yellow]~{idx:2}. {short_key:35} {old_display} → {value_display}[/yellow]"
+                    )
+                elif change_type == "remove":
+                    self.console.print(
+                        f"  [red]-{idx:2}. {short_key:35} {old_display} → [dim](default: {default})[/dim][/red]"
+                    )
+                else:
+                    # Check if modified from default (in env, not pending)
+                    modified = current != default
+                    mod_marker = "[yellow]*[/yellow]" if modified else " "
+                    self.console.print(
+                        f"  {mod_marker}{idx:2}. {short_key:35} {value_display}"
+                    )
+
                 self.console.print(f"       [dim]{description}[/dim]")
 
             self.console.print()
             self.console.print("━" * 70)
-            self.console.print("[dim]* = modified from default[/dim]")
+            self.console.print(
+                "[dim]* = modified from default, + = pending add, ~ = pending edit, - = pending reset[/dim]"
+            )
             self.console.print()
             self.console.print("[bold]⚙️  Actions[/bold]")
             self.console.print()
@@ -1346,6 +1672,7 @@ class SettingsTool:
         while True:
             clear_screen()
 
+            # Get current modes from env
             modes = self.rotation_mgr.get_current_modes()
             available_providers = self.get_available_providers()
 
@@ -1369,20 +1696,78 @@ class SettingsTool:
             self.console.print("[bold]📋 Current Rotation Mode Settings[/bold]")
             self.console.print("━" * 70)
 
-            if modes:
-                for provider, mode in modes.items():
-                    default_mode = self.rotation_mgr.get_default_mode(provider)
-                    is_custom = mode != default_mode
-                    marker = "[yellow]*[/yellow]" if is_custom else " "
+            # Build combined view with pending changes
+            all_modes: Dict[str, Dict[str, Any]] = {}
+            prefix = "ROTATION_MODE_"
+
+            # Add current modes (from env)
+            for provider, mode in modes.items():
+                key = f"{prefix}{provider.upper()}"
+                change_type = self.settings.get_change_type(key)
+                default_mode = self.rotation_mgr.get_default_mode(provider)
+                if change_type == "remove":
+                    all_modes[provider] = {"value": mode, "type": "remove", "old": None}
+                elif change_type == "edit":
+                    new_val = self.settings.pending_changes[key]
+                    all_modes[provider] = {
+                        "value": new_val,
+                        "type": "edit",
+                        "old": mode,
+                    }
+                else:
+                    all_modes[provider] = {"value": mode, "type": None, "old": None}
+
+            # Add pending new modes (additions)
+            for key in self.settings.get_pending_keys_by_pattern(prefix=prefix):
+                if self.settings.get_change_type(key) == "add":
+                    provider = key.replace(prefix, "").lower()
+                    if provider not in all_modes:
+                        all_modes[provider] = {
+                            "value": self.settings.pending_changes[key],
+                            "type": "add",
+                            "old": None,
+                        }
+
+            if all_modes:
+                # Sort alphabetically
+                for provider in sorted(all_modes.keys()):
+                    info = all_modes[provider]
+                    mode = info["value"]
                     mode_display = (
                         f"[green]{mode}[/green]"
                         if mode == "sequential"
                         else f"[blue]{mode}[/blue]"
                     )
-                    self.console.print(f"  {marker}• {provider:20} {mode_display}")
+                    old_display = None
+                    if info["old"]:
+                        old_display = (
+                            f"[green]{info['old']}[/green]"
+                            if info["old"] == "sequential"
+                            else f"[blue]{info['old']}[/blue]"
+                        )
+
+                    if info["type"] == "add":
+                        self.console.print(
+                            f"   [green]+ {provider:20} {mode_display}[/green]"
+                        )
+                    elif info["type"] == "edit":
+                        self.console.print(
+                            f"   [yellow]~ {provider:20} {old_display} → {mode_display}[/yellow]"
+                        )
+                    elif info["type"] == "remove":
+                        self.console.print(
+                            f"   [red]- {provider:20} {mode_display}[/red]"
+                        )
+                    else:
+                        default_mode = self.rotation_mgr.get_default_mode(provider)
+                        is_custom = mode != default_mode
+                        marker = "[yellow]*[/yellow]" if is_custom else " "
+                        self.console.print(f"  {marker}• {provider:20} {mode_display}")
 
             # Show providers with default modes
-            providers_with_defaults = [p for p in available_providers if p not in modes]
+            providers_with_defaults = [
+                p for p in available_providers if p not in modes and p not in all_modes
+            ]
             if providers_with_defaults:
                 self.console.print()
                 self.console.print("[dim]Providers using default modes:[/dim]")
@@ -1470,12 +1855,16 @@ class SettingsTool:
 
                     self.rotation_mgr.set_mode(provider, new_mode)
                     self.console.print(
-                        f"\n[green]✅ Rotation mode for '{provider}' set to {new_mode}![/green]"
+                        f"\n[green]✅ Rotation mode for '{provider}' staged as {new_mode}![/green]"
                     )
                     input("\nPress Enter to continue...")
 
             elif choice == "2":
-                if not modes:
+                # Get resettable modes (existing + pending adds, excluding pending removes)
+                resettable = {
+                    k: v for k, v in all_modes.items() if v["type"] != "remove"
+                }
+                if not resettable:
                     self.console.print(
                         "\n[yellow]No custom rotation modes to reset[/yellow]"
                     )
@@ -1486,12 +1875,18 @@ class SettingsTool:
                 self.console.print(
                     "\n[bold]Select provider to reset to default:[/bold]"
                 )
-                modes_list = list(modes.keys())
+                modes_list = sorted(resettable.keys())
                 for idx, prov in enumerate(modes_list, 1):
                     default_mode = self.rotation_mgr.get_default_mode(prov)
-                    self.console.print(
-                        f"   {idx}. {prov} (will reset to: {default_mode})"
-                    )
+                    info = resettable[prov]
+                    if info["type"] == "add":
+                        self.console.print(
+                            f"   {idx}. {prov} [green](pending add)[/green] - will cancel"
+                        )
+                    else:
+                        self.console.print(
+                            f"   {idx}. {prov} (will reset to: {default_mode})"
+                        )
 
                 choice_idx = IntPrompt.ask(
                     "Select option",
@@ -1499,12 +1894,21 @@ class SettingsTool:
                 )
                 provider = modes_list[choice_idx - 1]
                 default_mode = self.rotation_mgr.get_default_mode(provider)
+                info = resettable[provider]
 
                 if Confirm.ask(f"Reset '{provider}' to default mode ({default_mode})?"):
-                    self.rotation_mgr.remove_mode(provider)
-                    self.console.print(
-                        f"\n[green]✅ Rotation mode for '{provider}' reset to default ({default_mode})![/green]"
-                    )
+                    if info["type"] == "add":
+                        # Undo pending addition
+                        key = f"{prefix}{provider.upper()}"
+                        del self.settings.pending_changes[key]
+                        self.console.print(
+                            f"\n[green]✅ Pending mode for '{provider}' cancelled![/green]"
+                        )
+                    else:
+                        self.rotation_mgr.remove_mode(provider)
+                        self.console.print(
+                            f"\n[green]✅ Rotation mode for '{provider}' marked for reset to default ({default_mode})![/green]"
+                        )
                     input("\nPress Enter to continue...")
 
             elif choice == "3":
@@ -1677,6 +2081,7 @@ class SettingsTool:
         while True:
             clear_screen()
 
+            # Get current limits from env
             limits = self.concurrency_mgr.get_current_limits()
 
             self.console.print(
@@ -1690,10 +2095,57 @@ class SettingsTool:
             self.console.print("[bold]📋 Current Concurrency Settings[/bold]")
             self.console.print("━" * 70)
 
-            if limits:
-                for provider, limit in limits.items():
-                    self.console.print(f"   • {provider:15} {limit} requests/key")
-                self.console.print(f"   • Default:        1 request/key (all others)")
+            # Build combined view with pending changes
+            all_limits: Dict[str, Dict[str, Any]] = {}
+            prefix = "MAX_CONCURRENT_REQUESTS_PER_KEY_"
+
+            # Add current limits (from env)
+            for provider, limit in limits.items():
+                key = f"{prefix}{provider.upper()}"
+                change_type = self.settings.get_change_type(key)
+                if change_type == "remove":
+                    all_limits[provider] = {
+                        "value": str(limit),
+                        "type": "remove",
+                        "old": None,
+                    }
+                elif change_type == "edit":
+                    new_val = self.settings.pending_changes[key]
+                    all_limits[provider] = {
+                        "value": new_val,
+                        "type": "edit",
+                        "old": str(limit),
+                    }
+                else:
+                    all_limits[provider] = {
+                        "value": str(limit),
+                        "type": None,
+                        "old": None,
+                    }
+
+            # Add pending new limits (additions)
+            for key in self.settings.get_pending_keys_by_pattern(prefix=prefix):
+                if self.settings.get_change_type(key) == "add":
+                    provider = key.replace(prefix, "").lower()
+                    if provider not in all_limits:
+                        all_limits[provider] = {
+                            "value": self.settings.pending_changes[key],
+                            "type": "add",
+                            "old": None,
+                        }
+
+            if all_limits:
+                # Sort alphabetically
+                for provider in sorted(all_limits.keys()):
+                    info = all_limits[provider]
+                    value_display = f"{info['value']} requests/key"
+                    old_display = f"{info['old']} requests/key" if info["old"] else None
+                    self.console.print(
+                        self._format_item(
+                            provider, value_display, info["type"], old_display
+                        )
+                    )
+                self.console.print("   • Default:        1 request/key (all others)")
             else:
                 self.console.print("   • Default:        1 request/key (all providers)")
 
@@ -1751,7 +2203,7 @@ class SettingsTool:
                     if 1 <= limit <= 100:
                         self.concurrency_mgr.set_limit(provider, limit)
                         self.console.print(
-                            f"\n[green]✅ Concurrency limit set for '{provider}': {limit} requests/key[/green]"
+                            f"\n[green]✅ Concurrency limit staged for '{provider}': {limit} requests/key[/green]"
                         )
                     else:
                         self.console.print(
@@ -1760,14 +2212,18 @@ class SettingsTool:
                     input("\nPress Enter to continue...")
 
             elif choice == "2":
-                if not limits:
+                # Get editable limits (existing + pending additions, excluding pending removals)
+                editable = {
+                    k: v for k, v in all_limits.items() if v["type"] != "remove"
+                }
+                if not editable:
                     self.console.print("\n[yellow]No limits to edit[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
 
                 # Show numbered list
                 self.console.print("\n[bold]Select provider to edit:[/bold]")
-                limits_list = list(limits.keys())
+                limits_list = sorted(editable.keys())
                 for idx, prov in enumerate(limits_list, 1):
                     self.console.print(f"   {idx}. {prov}")
 
@@ -1776,7 +2232,8 @@ class SettingsTool:
                     choices=[str(i) for i in range(1, len(limits_list) + 1)],
                 )
                 provider = limits_list[choice_idx - 1]
-                current_limit = limits.get(provider, 1)
+                info = editable[provider]
+                current_limit = int(info["value"])
 
                 self.console.print(f"\nCurrent limit: {current_limit} requests/key")
                 new_limit = IntPrompt.ask(
@@ -1797,7 +2254,18 @@ class SettingsTool:
                 input("\nPress Enter to continue...")
 
             elif choice == "3":
-                if not limits:
+                # Get removable limits (existing ones not already pending removal)
+                removable = {
+                    k: v
+                    for k, v in all_limits.items()
+                    if v["type"] != "remove" and v["type"] != "add"
+                }
+                # For pending additions, we can "undo" by removing from pending
+                pending_adds = {
+                    k: v for k, v in all_limits.items() if v["type"] == "add"
+                }
+
+                if not removable and not pending_adds:
                     self.console.print("\n[yellow]No limits to remove[/yellow]")
                     input("\nPress Enter to continue...")
                     continue
@@ -1806,9 +2274,14 @@ class SettingsTool:
                 self.console.print(
                     "\n[bold]Select provider to remove limit from:[/bold]"
                 )
-                limits_list = list(limits.keys())
+                limits_list = sorted(removable.keys()) + sorted(pending_adds.keys())
                 for idx, prov in enumerate(limits_list, 1):
-                    self.console.print(f"   {idx}. {prov}")
+                    if prov in pending_adds:
+                        self.console.print(
+                            f"   {idx}. {prov} [green](pending add)[/green]"
+                        )
+                    else:
+                        self.console.print(f"   {idx}. {prov}")
 
                 choice_idx = IntPrompt.ask(
                     "Select option",
@@ -1819,18 +2292,118 @@ class SettingsTool:
                 if Confirm.ask(
                     f"Remove concurrency limit for '{provider}' (reset to default 1)?"
                 ):
-                    self.concurrency_mgr.remove_limit(provider)
-                    self.console.print(
-                        f"\n[green]✅ Limit removed for '{provider}' - using default (1 request/key)[/green]"
-                    )
+                    if provider in pending_adds:
+                        # Undo pending addition
+                        key = f"{prefix}{provider.upper()}"
+                        del self.settings.pending_changes[key]
+                        self.console.print(
+                            f"\n[green]✅ Pending limit for '{provider}' cancelled![/green]"
+                        )
+                    else:
+                        self.concurrency_mgr.remove_limit(provider)
+                        self.console.print(
+                            f"\n[green]✅ Limit marked for removal for '{provider}'[/green]"
+                        )
                     input("\nPress Enter to continue...")
 
             elif choice == "4":
                 break
 
+    def _show_changes_summary(self):
+        """Display categorized summary of all pending changes."""
+        self.console.print(
+            Panel.fit(
+                "[bold cyan]📋 Pending Changes Summary[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        self.console.print()
+
+        # Define categories with their key patterns
+        categories = [
+            ("Custom Provider API Bases", "_API_BASE", "suffix"),
+            ("Model Definitions", "_MODELS", "suffix"),
+            ("Concurrency Limits", "MAX_CONCURRENT_REQUESTS_PER_KEY_", "prefix"),
+            ("Rotation Modes", "ROTATION_MODE_", "prefix"),
+            ("Priority Multipliers", "CONCURRENCY_MULTIPLIER_", "prefix"),
+        ]
+
+        # Get provider-specific settings keys
+        provider_settings_keys = set()
+        for provider_settings in PROVIDER_SETTINGS_MAP.values():
+            provider_settings_keys.update(provider_settings.keys())
+
+        changes = self.settings.get_changes_summary()
+        displayed_keys = set()
+
+        for category_name, pattern, pattern_type in categories:
+            category_changes = {"add": [], "edit": [], "remove": []}
+
+            for change_type in ["add", "edit", "remove"]:
+                for key, old_val, new_val in changes[change_type]:
+                    matches = False
+                    if pattern_type == "suffix" and key.endswith(pattern):
+                        matches = True
+                    elif pattern_type == "prefix" and key.startswith(pattern):
+                        matches = True
+
+                    if matches:
+                        category_changes[change_type].append((key, old_val, new_val))
+                        displayed_keys.add(key)
+
+            # Check if this category has any changes
+            has_changes = any(category_changes[t] for t in ["add", "edit", "remove"])
+            if has_changes:
+                self.console.print(f"[bold]{category_name}:[/bold]")
+                # Sort: additions, modifications, removals (alphabetically within each)
+                for change_type in ["add", "edit", "remove"]:
+                    for key, old_val, new_val in sorted(
+                        category_changes[change_type], key=lambda x: x[0]
+                    ):
+                        if change_type == "add":
+                            self.console.print(f"  [green]+ {key} = {new_val}[/green]")
+                        elif change_type == "edit":
+                            self.console.print(
+                                f"  [yellow]~ {key}: {old_val} → {new_val}[/yellow]"
+                            )
+                        else:
+                            self.console.print(f"  [red]- {key}[/red]")
+                self.console.print()
+
+        # Handle provider-specific settings that don't match the patterns above
+        provider_changes = {"add": [], "edit": [], "remove": []}
+        for change_type in ["add", "edit", "remove"]:
+            for key, old_val, new_val in changes[change_type]:
+                if key not in displayed_keys and key in provider_settings_keys:
+                    provider_changes[change_type].append((key, old_val, new_val))
+
+        has_provider_changes = any(
+            provider_changes[t] for t in ["add", "edit", "remove"]
+        )
+        if has_provider_changes:
+            self.console.print("[bold]Provider-Specific Settings:[/bold]")
+            for change_type in ["add", "edit", "remove"]:
+                for key, old_val, new_val in sorted(
+                    provider_changes[change_type], key=lambda x: x[0]
+                ):
+                    if change_type == "add":
+                        self.console.print(f"  [green]+ {key} = {new_val}[/green]")
+                    elif change_type == "edit":
+                        self.console.print(
+                            f"  [yellow]~ {key}: {old_val} → {new_val}[/yellow]"
+                        )
+                    else:
+                        self.console.print(f"  [red]- {key}[/red]")
+            self.console.print()
+
+        self.console.print("━" * 70)
+
     def save_and_exit(self):
         """Save pending changes and exit"""
         if self.settings.has_pending():
+            clear_screen()
+            self._show_changes_summary()
+
             if Confirm.ask("\n[bold yellow]Save all pending changes?[/bold yellow]"):
                 self.settings.save()
                 self.console.print("\n[green]✅ All changes saved to .env![/green]")
@@ -1848,6 +2421,9 @@ class SettingsTool:
     def exit_without_saving(self):
         """Exit without saving"""
         if self.settings.has_pending():
+            clear_screen()
+            self._show_changes_summary()
+
             if Confirm.ask("\n[bold red]Discard all pending changes?[/bold red]"):
                 self.settings.discard()
                 self.console.print("\n[yellow]Changes discarded[/yellow]")
