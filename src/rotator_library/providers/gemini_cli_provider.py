@@ -187,8 +187,8 @@ def _env_int(key: str, default: int) -> int:
 class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
     skip_cost_calculation = True
 
-    # Balanced by default - Gemini CLI has short cooldowns (seconds, not hours)
-    default_rotation_mode: str = "balanced"
+    # Sequential mode - stick with one credential until it gets a 429, then switch
+    default_rotation_mode: str = "sequential"
 
     # =========================================================================
     # TIER CONFIGURATION
@@ -506,7 +506,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Gemini 3 requires paid tier
         if model_name.startswith("gemini-3-"):
-            return 1  # Only priority 1 (paid) credentials
+            return 2  # Only priority 2 (paid) credentials
 
         return None  # All other models have no restrictions
 
