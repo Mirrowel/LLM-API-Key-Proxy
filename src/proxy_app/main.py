@@ -1,4 +1,5 @@
 import time
+import uuid
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
