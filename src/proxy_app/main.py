@@ -101,7 +101,6 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse, JSONResponse
-    import uuid
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
