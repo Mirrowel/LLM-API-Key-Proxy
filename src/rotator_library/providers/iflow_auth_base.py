@@ -206,19 +206,36 @@ class IFlowAuthBase:
             str, float
         ] = {}  # Track backoff timers (Unix timestamp)
 
-        # [QUEUE SYSTEM] Sequential refresh processing
+        # [QUEUE SYSTEM] Sequential refresh processing with two separate queues
+        # Normal refresh queue: for proactive token refresh (old token still valid)
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
-        self._queued_credentials: set = set()  # Track credentials already in queue
+        self._queue_processor_task: Optional[asyncio.Task] = None
+
+        # Re-auth queue: for invalid refresh tokens (requires user interaction)
+        self._reauth_queue: asyncio.Queue = asyncio.Queue()
+        self._reauth_processor_task: Optional[asyncio.Task] = None
+
+        # Tracking sets/dicts
+        self._queued_credentials: set = set()  # Track credentials in either queue
         # [FIX PR#34] Changed from set to dict mapping credential path to timestamp
         # This enables TTL-based stale entry cleanup as defense in depth
+        # NOTE: Only credentials in re-auth queue are marked unavailable
         self._unavailable_credentials: Dict[
             str, float
         ] = {}  # Maps credential path -> timestamp when marked unavailable
         self._unavailable_ttl_seconds: int = 300  # 5 minutes TTL for stale entries
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
-        self._queue_processor_task: Optional[asyncio.Task] = (
-            None  # Background worker task
-        )
+
+        # Retry tracking for normal refresh queue
+        self._queue_retry_count: Dict[
+            str, int
+        ] = {}  # Track retry attempts per credential
+
+        # Configuration constants
+        self._refresh_timeout_seconds: int = 15  # Max time for single refresh
+        self._refresh_interval_seconds: int = 30  # Delay between queue items
+        self._refresh_max_retries: int = 3  # Attempts before kicked out
+        self._reauth_timeout_seconds: int = 300  # Time for user to complete OAuth
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """
@@ -397,6 +414,29 @@ class IFlowAuthBase:
                 return True
 
         return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
+
+    def _is_token_truly_expired(self, creds: Dict[str, Any]) -> bool:
+        """Check if token is TRULY expired (past actual expiry, not just threshold).
+
+        This is different from _is_token_expired() which uses a buffer for proactive refresh.
+        This method checks if the token is actually unusable.
+        """
+        expiry_str = creds.get("expiry_date")
+        if not expiry_str:
+            return True
+
+        try:
+            from datetime import datetime
+
+            expiry_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+            expiry_timestamp = expiry_dt.timestamp()
+        except (ValueError, AttributeError):
+            try:
+                expiry_timestamp = float(expiry_str)
+            except (ValueError, TypeError):
+                return True
+
+        return expiry_timestamp < time.time()
 
     async def _fetch_user_info(self, access_token: str) -> Dict[str, Any]:
         """
@@ -814,30 +854,48 @@ class IFlowAuthBase:
             return self._refresh_locks[path]
 
     def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation (not queued/refreshing).
+        """Check if a credential is available for rotation (not in re-auth queue).
 
         [FIX PR#34] Now includes TTL-based stale entry cleanup as defense in depth.
         If a credential has been unavailable for longer than _unavailable_ttl_seconds,
         it is automatically cleaned up and considered available.
+
+        [NEW] Also checks if token is TRULY expired (not just threshold-expired).
+        Credentials in normal refresh queue are still available (old token still valid).
+        Only credentials in re-auth queue (unavailable_credentials) are blocked.
         """
-        if path not in self._unavailable_credentials:
-            return True
+        # Check if in re-auth queue (truly unavailable)
+        if path in self._unavailable_credentials:
+            # [FIX PR#34] Check if the entry is stale (TTL expired)
+            marked_time = self._unavailable_credentials.get(path)
+            if marked_time is not None:
+                now = time.time()
+                if now - marked_time > self._unavailable_ttl_seconds:
+                    # Entry is stale - clean it up and return available
+                    lib_logger.warning(
+                        f"Credential '{Path(path).name}' was stuck in unavailable state for "
+                        f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
+                        f"Auto-cleaning stale entry."
+                    )
+                    self._unavailable_credentials.pop(path, None)
+                else:
+                    return False  # Still in re-auth, not available
 
-        # [FIX PR#34] Check if the entry is stale (TTL expired)
-        marked_time = self._unavailable_credentials.get(path)
-        if marked_time is not None:
-            now = time.time()
-            if now - marked_time > self._unavailable_ttl_seconds:
-                # Entry is stale - clean it up and return available
-                lib_logger.warning(
-                    f"Credential '{Path(path).name}' was stuck in unavailable state for "
-                    f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
-                    f"Auto-cleaning stale entry."
+        # Check if token is TRULY expired (not just threshold-expired)
+        creds = self._credentials_cache.get(path)
+        if creds and self._is_token_truly_expired(creds):
+            # Token is actually expired - should not be used
+            # Queue for refresh if not already queued
+            if path not in self._queued_credentials:
+                lib_logger.debug(
+                    f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
                 )
-                self._unavailable_credentials.pop(path, None)
-                return True
+                asyncio.create_task(
+                    self._queue_refresh(path, force=True, needs_reauth=False)
+                )
+            return False
 
-        return False
+        return True
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -846,15 +904,27 @@ class IFlowAuthBase:
                 self._process_refresh_queue()
             )
 
+    async def _ensure_reauth_processor_running(self):
+        """Lazily starts the re-auth queue processor if not already running."""
+        if self._reauth_processor_task is None or self._reauth_processor_task.done():
+            self._reauth_processor_task = asyncio.create_task(
+                self._process_reauth_queue()
+            )
+
     async def _queue_refresh(
         self, path: str, force: bool = False, needs_reauth: bool = False
     ):
-        """Add a credential to the refresh queue if not already queued.
+        """Add a credential to the appropriate refresh queue if not already queued.
 
         Args:
             path: Credential file path
             force: Force refresh even if not expired
-            needs_reauth: True if full re-authentication needed (bypasses backoff)
+            needs_reauth: True if full re-authentication needed (routes to re-auth queue)
+
+        Queue routing:
+        - needs_reauth=True: Goes to re-auth queue, marks as unavailable
+        - needs_reauth=False: Goes to normal refresh queue, does NOT mark unavailable
+          (old token is still valid until actual expiry)
         """
         # IMPORTANT: Only check backoff for simple automated refreshes
         # Re-authentication (interactive OAuth) should BYPASS backoff since it needs user input
@@ -873,105 +943,212 @@ class IFlowAuthBase:
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-                # [FIX PR#34] Store timestamp when marking unavailable (for TTL cleanup)
-                self._unavailable_credentials[path] = time.time()
-                lib_logger.debug(
-                    f"Marked '{Path(path).name}' as unavailable. "
-                    f"Total unavailable: {len(self._unavailable_credentials)}"
-                )
-                await self._refresh_queue.put((path, force, needs_reauth))
-                await self._ensure_queue_processor_running()
+
+                if needs_reauth:
+                    # Re-auth queue: mark as unavailable (token is truly broken)
+                    self._unavailable_credentials[path] = time.time()
+                    lib_logger.debug(
+                        f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
+                        f"Total unavailable: {len(self._unavailable_credentials)}"
+                    )
+                    await self._reauth_queue.put(path)
+                    await self._ensure_reauth_processor_running()
+                else:
+                    # Normal refresh queue: do NOT mark unavailable (old token still valid)
+                    lib_logger.debug(
+                        f"Queued '{Path(path).name}' for refresh (still available). "
+                        f"Queue size: {self._refresh_queue.qsize() + 1}"
+                    )
+                    await self._refresh_queue.put((path, force))
+                    await self._ensure_queue_processor_running()
 
     async def _process_refresh_queue(self):
-        """Background worker that processes refresh requests sequentially."""
+        """Background worker that processes normal refresh requests sequentially.
+
+        Key behaviors:
+        - 15s timeout per refresh operation
+        - 30s delay between processing credentials (prevents thundering herd)
+        - On failure: back of queue, max 3 retries before kicked
+        - If 401/403 detected: routes to re-auth queue
+        - Does NOT mark credentials unavailable (old token still valid)
+        """
         while True:
             path = None
             try:
                 # Wait for an item with timeout to allow graceful shutdown
                 try:
-                    path, force, needs_reauth = await asyncio.wait_for(
+                    path, force = await asyncio.wait_for(
                         self._refresh_queue.get(), timeout=60.0
                     )
                 except asyncio.TimeoutError:
-                    # [FIX PR#34] Clean up any stale unavailable entries before exiting
-                    # If we're idle for 60s, no refreshes are in progress
+                    # Queue is empty and idle for 60s - clean up and exit
                     async with self._queue_tracking_lock:
-                        if self._unavailable_credentials:
-                            stale_count = len(self._unavailable_credentials)
-                            lib_logger.warning(
-                                f"Queue processor idle timeout. Cleaning {stale_count} "
-                                f"stale unavailable credentials: {list(self._unavailable_credentials.keys())}"
-                            )
-                            self._unavailable_credentials.clear()
-                        # [FIX BUG#6] Also clear queued credentials to prevent stuck state
-                        if self._queued_credentials:
-                            lib_logger.debug(
-                                f"Clearing {len(self._queued_credentials)} queued credentials on timeout"
-                            )
-                            self._queued_credentials.clear()
+                        # Clear any stale retry counts
+                        self._queue_retry_count.clear()
                     self._queue_processor_task = None
+                    lib_logger.debug("Refresh queue processor idle, shutting down")
                     return
 
                 try:
                     # Quick check if still expired (optimization to avoid unnecessary refresh)
-                    # Note: _refresh_token() will do its own locking and expiry check
                     creds = self._credentials_cache.get(path)
                     if creds and not self._is_token_expired(creds):
-                        # No longer expired, mark as available
-                        async with self._queue_tracking_lock:
-                            self._unavailable_credentials.pop(path, None)
-                            lib_logger.debug(
-                                f"Credential '{Path(path).name}' no longer expired, marked available. "
-                                f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                            )
+                        # No longer expired, skip refresh
+                        lib_logger.debug(
+                            f"Credential '{Path(path).name}' no longer expired, skipping refresh"
+                        )
+                        # Clear retry count on skip (not a failure)
+                        self._queue_retry_count.pop(path, None)
                         continue
 
-                    # Perform refresh - _refresh_token handles its own locking
-                    # DO NOT acquire lock here as _refresh_token also acquires it (would deadlock)
-                    if not creds:
-                        creds = await self._load_credentials(path)
-                    await self._refresh_token(path, force=force)
+                    # Perform refresh with timeout
+                    try:
+                        async with asyncio.timeout(self._refresh_timeout_seconds):
+                            await self._refresh_token(path, force=force)
 
-                    # SUCCESS: Mark as available again
-                    async with self._queue_tracking_lock:
-                        self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"Refresh SUCCESS for '{Path(path).name}', marked available. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
+                        # SUCCESS: Clear retry count
+                        self._queue_retry_count.pop(path, None)
+                        lib_logger.debug(f"Refresh SUCCESS for '{Path(path).name}'")
+
+                    except asyncio.TimeoutError:
+                        lib_logger.warning(
+                            f"Refresh timeout ({self._refresh_timeout_seconds}s) for '{Path(path).name}'"
                         )
+                        await self._handle_refresh_failure(path, force, "timeout")
+
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        if status_code in (401, 403):
+                            # Invalid refresh token - route to re-auth queue
+                            lib_logger.warning(
+                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
+                                f"Routing to re-auth queue."
+                            )
+                            self._queue_retry_count.pop(path, None)  # Clear retry count
+                            async with self._queue_tracking_lock:
+                                self._queued_credentials.discard(
+                                    path
+                                )  # Remove from queued
+                            await self._queue_refresh(
+                                path, force=True, needs_reauth=True
+                            )
+                        else:
+                            await self._handle_refresh_failure(
+                                path, force, f"HTTP {status_code}"
+                            )
+
+                    except Exception as e:
+                        await self._handle_refresh_failure(path, force, str(e))
 
                 finally:
-                    # [FIX PR#34] Remove from BOTH queued set AND unavailable credentials
-                    # This ensures cleanup happens in ALL exit paths (success, exception, etc.)
+                    # Remove from queued set (unless re-queued by failure handler)
                     async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        # [FIX PR#34] Always clean up unavailable credentials in finally block
-                        self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"Finally cleanup for '{Path(path).name}'. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                        # Only discard if not re-queued (check if still in queue set from retry)
+                        if (
+                            path in self._queued_credentials
+                            and self._queue_retry_count.get(path, 0) == 0
+                        ):
+                            self._queued_credentials.discard(path)
                     self._refresh_queue.task_done()
+
+                # Wait between credentials to spread load
+                await asyncio.sleep(self._refresh_interval_seconds)
+
             except asyncio.CancelledError:
-                # [FIX PR#34] Clean up the current credential before breaking
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._unavailable_credentials.pop(path, None)
-                        lib_logger.debug(
-                            f"CancelledError cleanup for '{Path(path).name}'. "
-                            f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        )
+                lib_logger.debug("Refresh queue processor cancelled")
                 break
             except Exception as e:
-                lib_logger.error(f"Error in queue processor: {e}")
-                # Even on error, mark as available (backoff will prevent immediate retry)
+                lib_logger.error(f"Error in refresh queue processor: {e}")
                 if path:
                     async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+
+    async def _handle_refresh_failure(self, path: str, force: bool, error: str):
+        """Handle a refresh failure with back-of-line retry logic.
+
+        - Increments retry count
+        - If under max retries: re-adds to END of queue
+        - If at max retries: kicks credential out (retried next BackgroundRefresher cycle)
+        """
+        retry_count = self._queue_retry_count.get(path, 0) + 1
+        self._queue_retry_count[path] = retry_count
+
+        if retry_count >= self._refresh_max_retries:
+            # Kicked out until next BackgroundRefresher cycle
+            lib_logger.error(
+                f"Max retries ({self._refresh_max_retries}) reached for '{Path(path).name}' "
+                f"(last error: {error}). Will retry next refresh cycle."
+            )
+            self._queue_retry_count.pop(path, None)
+            async with self._queue_tracking_lock:
+                self._queued_credentials.discard(path)
+            return
+
+        # Re-add to END of queue for retry
+        lib_logger.warning(
+            f"Refresh failed for '{Path(path).name}' ({error}). "
+            f"Retry {retry_count}/{self._refresh_max_retries}, back of queue."
+        )
+        # Keep in queued_credentials set, add back to queue
+        await self._refresh_queue.put((path, force))
+
+    async def _process_reauth_queue(self):
+        """Background worker that processes re-auth requests.
+
+        Key behaviors:
+        - Credentials ARE marked unavailable (token is truly broken)
+        - Uses ReauthCoordinator for interactive OAuth
+        - No automatic retry (requires user action)
+        - Cleans up unavailable status when done
+        """
+        while True:
+            path = None
+            try:
+                # Wait for an item with timeout to allow graceful shutdown
+                try:
+                    path = await asyncio.wait_for(
+                        self._reauth_queue.get(), timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    # Queue is empty and idle for 60s - exit
+                    self._reauth_processor_task = None
+                    lib_logger.debug("Re-auth queue processor idle, shutting down")
+                    return
+
+                try:
+                    lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
+                    await self.initialize_token(path)
+                    lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
+
+                except Exception as e:
+                    lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
+                    # No automatic retry for re-auth (requires user action)
+
+                finally:
+                    # Always clean up
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
                         self._unavailable_credentials.pop(path, None)
                         lib_logger.debug(
-                            f"Error cleanup for '{Path(path).name}': {e}. "
+                            f"Re-auth cleanup for '{Path(path).name}'. "
                             f"Remaining unavailable: {len(self._unavailable_credentials)}"
                         )
+                    self._reauth_queue.task_done()
+
+            except asyncio.CancelledError:
+                # Clean up current credential before breaking
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
+                lib_logger.debug("Re-auth queue processor cancelled")
+                break
+            except Exception as e:
+                lib_logger.error(f"Error in re-auth queue processor: {e}")
+                if path:
+                    async with self._queue_tracking_lock:
+                        self._queued_credentials.discard(path)
+                        self._unavailable_credentials.pop(path, None)
 
     async def _perform_interactive_oauth(
         self, path: str, creds: Dict[str, Any], display_name: str
