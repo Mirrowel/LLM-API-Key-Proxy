@@ -3225,7 +3225,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Host": host,
-            "User-Agent": "antigravity/1.11.9",
+            "User-Agent": "antigravity/1.11.9 windows/amd64",
             "Accept": "text/event-stream" if stream else "application/json",
         }
 
