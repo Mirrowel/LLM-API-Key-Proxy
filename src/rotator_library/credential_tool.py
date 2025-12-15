@@ -541,19 +541,177 @@ async def _edit_oauth_credential_email(provider_name: str):
         console.print(f"[bold red]Error editing credential: {e}[/bold red]")
 
 
+async def view_credentials_menu():
+    """
+    Menu for viewing credentials. Shows summary first, then allows drilling
+    down to view detailed credentials for a specific provider.
+    """
+    while True:
+        clear_screen("View Credentials")
+
+        # Display summary
+        _display_credentials_summary()
+
+        # Build list of all providers with credentials
+        api_keys = _get_api_keys_from_env()
+        oauth_creds = _get_oauth_credentials_summary()
+
+        all_providers = []
+
+        # Add API key providers
+        for provider in sorted(api_keys.keys()):
+            count = len(api_keys[provider])
+            all_providers.append(("api", provider, count))
+
+        # Add OAuth providers with credentials
+        for provider in sorted(oauth_creds.keys()):
+            if oauth_creds[provider]:
+                count = len(oauth_creds[provider])
+                display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
+                all_providers.append(("oauth", provider, count, display_name))
+
+        if not all_providers:
+            console.print("[bold yellow]No credentials configured.[/bold yellow]")
+            console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+            input()
+            break
+
+        # Display provider selection menu
+        console.print(
+            Panel(
+                Text.from_markup("[bold]Select a provider to view details:[/bold]"),
+                title="View Provider Credentials",
+                style="bold blue",
+            )
+        )
+
+        for i, provider_info in enumerate(all_providers, 1):
+            if provider_info[0] == "api":
+                _, provider, count = provider_info
+                console.print(f"  {i}. [cyan]API:[/cyan] {provider} ({count} key(s))")
+            else:
+                _, provider, count, display_name = provider_info
+                console.print(
+                    f"  {i}. [cyan]OAuth:[/cyan] {display_name} ({count} credential(s))"
+                )
+
+        choice = Prompt.ask(
+            Text.from_markup(
+                "\n[bold]Select provider or type [red]'b'[/red] to go back[/bold]"
+            ),
+            choices=[str(i) for i in range(1, len(all_providers) + 1)] + ["b"],
+            show_choices=False,
+        )
+
+        if choice.lower() == "b":
+            break
+
+        try:
+            idx = int(choice) - 1
+            provider_info = all_providers[idx]
+
+            if provider_info[0] == "api":
+                _, provider, _ = provider_info
+                await _view_api_keys_detail(provider)
+            else:
+                _, provider, _, _ = provider_info
+                await _view_oauth_credentials_detail(provider)
+
+        except (ValueError, IndexError):
+            console.print("[bold red]Invalid choice.[/bold red]")
+            await asyncio.sleep(1)
+
+
+async def _view_api_keys_detail(provider_name: str):
+    """Display detailed view of API keys for a specific provider."""
+    clear_screen(f"View {provider_name} API Keys")
+
+    api_keys = _get_api_keys_from_env()
+    keys = api_keys.get(provider_name, [])
+
+    if not keys:
+        console.print(
+            f"[bold yellow]No API keys found for {provider_name}.[/bold yellow]"
+        )
+        console.print("\n[dim]Press Enter to go back...[/dim]")
+        input()
+        return
+
+    # Display detailed table
+    table = Table(title=f"{provider_name} API Keys", box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Key Name", style="yellow")
+    table.add_column("Value (masked)", style="dim")
+
+    for i, (key_name, key_value) in enumerate(keys, 1):
+        masked = f"****{key_value[-4:]}" if len(key_value) > 4 else "****"
+        table.add_row(str(i), key_name, masked)
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(keys)} key(s)[/dim]")
+    console.print("\n[dim]Press Enter to go back...[/dim]")
+    input()
+
+
+async def _view_oauth_credentials_detail(provider_name: str):
+    """Display detailed view of OAuth credentials for a specific provider."""
+    display_name = OAUTH_FRIENDLY_NAMES.get(provider_name, provider_name.title())
+    clear_screen(f"View {display_name} Credentials")
+
+    provider_factory, _ = _ensure_providers_loaded()
+
+    try:
+        auth_class = provider_factory.get_provider_auth_class(provider_name)
+        auth_instance = auth_class()
+        credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+    except Exception:
+        credentials = []
+
+    if not credentials:
+        console.print(
+            f"[bold yellow]No credentials found for {display_name}.[/bold yellow]"
+        )
+        console.print("\n[dim]Press Enter to go back...[/dim]")
+        input()
+        return
+
+    # Display detailed table
+    table = Table(title=f"{display_name} Credentials", box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=4)
+    table.add_column("File", style="yellow")
+    table.add_column("Email/Identifier", style="cyan")
+
+    # Add tier/project columns for Google OAuth providers
+    if provider_name in ["gemini_cli", "antigravity"]:
+        table.add_column("Tier", style="green")
+        table.add_column("Project", style="dim")
+
+    for i, cred in enumerate(credentials, 1):
+        file_name = Path(cred["file_path"]).name
+        email = cred.get("email", "unknown")
+
+        if provider_name in ["gemini_cli", "antigravity"]:
+            tier = _normalize_tier_name(cred.get("tier")) if cred.get("tier") else "-"
+            project = cred.get("project_id", "-")
+            if project and len(project) > 25:
+                project = project[:22] + "..."
+            table.add_row(str(i), file_name, email, tier, project or "-")
+        else:
+            table.add_row(str(i), file_name, email)
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(credentials)} credential(s)[/dim]")
+    console.print("\n[dim]Press Enter to go back...[/dim]")
+    input()
+
+
 async def manage_credentials_submenu():
     """
     Submenu for viewing and managing all credentials (API keys and OAuth).
     Allows deletion of any credential and editing email for OAuth credentials.
     """
     while True:
-        clear_screen()
-        console.print(
-            Panel(
-                "[bold cyan]View / Manage All Credentials[/bold cyan]",
-                title="--- API Key Proxy ---",
-            )
-        )
+        clear_screen("Manage Credentials")
 
         # Display full summary
         _display_credentials_summary()
@@ -603,7 +761,7 @@ async def manage_credentials_submenu():
 
 async def _delete_api_key_menu():
     """Menu for deleting an API key from the .env file."""
-    clear_screen()
+    clear_screen("Delete API Key")
     api_keys = _get_api_keys_from_env()
 
     if not api_keys:
@@ -680,7 +838,7 @@ async def _delete_api_key_menu():
 
 async def _delete_oauth_credential_menu():
     """Menu for deleting an OAuth credential file."""
-    clear_screen()
+    clear_screen("Delete OAuth Credential")
     oauth_summary = _get_oauth_credentials_summary()
 
     # Check if there are any credentials
@@ -771,7 +929,7 @@ async def _delete_oauth_credential_menu():
 
 async def _edit_oauth_credential_menu():
     """Menu for editing an OAuth credential's email field."""
-    clear_screen()
+    clear_screen("Edit OAuth Credential")
     oauth_summary = _get_oauth_credentials_summary()
 
     # Check if there are any credentials
@@ -826,16 +984,27 @@ async def _edit_oauth_credential_menu():
         console.print(f"[bold red]Error: {e}[/bold red]")
 
 
-def clear_screen():
+def clear_screen(subtitle: str = "Interactive Credential Setup"):
     """
-    Cross-platform terminal clear that works robustly on both
-    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    Cross-platform terminal clear with header display.
+
+    Clears the terminal and displays the application header with an optional subtitle.
+
+    Args:
+        subtitle: The subtitle text to display in the header panel.
+                  Defaults to "Interactive Credential Setup".
 
     Uses native OS commands instead of ANSI escape sequences:
     - Windows (conhost & Windows Terminal): cls
     - Unix-like systems (Linux, Mac): clear
     """
     os.system("cls" if os.name == "nt" else "clear")
+    console.print(
+        Panel(
+            f"[bold cyan]{subtitle}[/bold cyan]",
+            title="--- API Key Proxy ---",
+        )
+    )
 
 
 def ensure_env_defaults():
@@ -861,8 +1030,7 @@ async def setup_api_key():
     """
     Interactively sets up a new API key for a provider.
     """
-    clear_screen()
-    console.print(Panel("[bold cyan]API Key Setup[/bold cyan]", expand=False))
+    clear_screen("Add API Key")
 
     # Debug toggle: Set to True to see env var names next to each provider
     SHOW_ENV_VAR_NAMES = True
@@ -1169,12 +1337,7 @@ async def export_gemini_cli_to_env():
     Export a Gemini CLI credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
-    clear_screen()
-    console.print(
-        Panel(
-            "[bold cyan]Export Gemini CLI Credential to .env[/bold cyan]", expand=False
-        )
-    )
+    clear_screen("Export Gemini CLI Credential")
 
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
@@ -1269,12 +1432,7 @@ async def export_qwen_code_to_env():
     Export a Qwen Code credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
-    clear_screen()
-    console.print(
-        Panel(
-            "[bold cyan]Export Qwen Code Credential to .env[/bold cyan]", expand=False
-        )
-    )
+    clear_screen("Export Qwen Code Credential")
 
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
@@ -1368,10 +1526,7 @@ async def export_iflow_to_env():
     Export an iFlow credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
-    clear_screen()
-    console.print(
-        Panel("[bold cyan]Export iFlow Credential to .env[/bold cyan]", expand=False)
-    )
+    clear_screen("Export iFlow Credential")
 
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
@@ -1465,12 +1620,7 @@ async def export_antigravity_to_env():
     Export an Antigravity credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
-    clear_screen()
-    console.print(
-        Panel(
-            "[bold cyan]Export Antigravity Credential to .env[/bold cyan]", expand=False
-        )
-    )
+    clear_screen("Export Antigravity Credential")
 
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
@@ -1565,7 +1715,8 @@ async def export_all_provider_credentials(provider_name: str):
     Export all credentials for a specific provider to individual .env files.
     Uses the auth class's list_credentials() and export_credential_to_env() methods.
     """
-    clear_screen()
+    display_name = provider_name.replace("_", " ").title()
+    clear_screen(f"Export All {display_name} Credentials")
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
     try:
@@ -1634,7 +1785,8 @@ async def combine_provider_credentials(provider_name: str):
     Combine all credentials for a specific provider into a single .env file.
     Uses the auth class's list_credentials() and build_env_lines() methods.
     """
-    clear_screen()
+    display_name = provider_name.replace("_", " ").title()
+    clear_screen(f"Combine {display_name} Credentials")
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
     try:
@@ -1719,10 +1871,7 @@ async def combine_all_credentials():
     Combine ALL credentials from ALL providers into a single .env file.
     Uses auth class list_credentials() and build_env_lines() methods.
     """
-    clear_screen()
-    console.print(
-        Panel("[bold cyan]Combine All Provider Credentials[/bold cyan]", expand=False)
-    )
+    clear_screen("Combine All Credentials")
 
     # List of providers that support OAuth credentials
     oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity"]
@@ -1820,14 +1969,7 @@ async def export_credentials_submenu():
     Submenu for credential export options.
     """
     while True:
-        clear_screen()
-        console.print(
-            Panel(
-                "[bold cyan]Export Credentials to .env[/bold cyan]",
-                title="--- API Key Proxy ---",
-                expand=False,
-            )
-        )
+        clear_screen("Export Credentials")
 
         console.print(
             Panel(
@@ -1952,22 +2094,11 @@ async def main(clear_on_start=True):
 
     # Only show header if we're clearing (standalone mode)
     if clear_on_start:
-        console.print(
-            Panel(
-                "[bold cyan]Interactive Credential Setup[/bold cyan]",
-                title="--- API Key Proxy ---",
-            )
-        )
+        clear_screen()
 
     while True:
         # Clear screen between menu selections for cleaner UX
         clear_screen()
-        console.print(
-            Panel(
-                "[bold cyan]Interactive Credential Setup[/bold cyan]",
-                title="--- API Key Proxy ---",
-            )
-        )
 
         # Display credentials summary at the top
         _display_credentials_summary()
@@ -1978,7 +2109,8 @@ async def main(clear_on_start=True):
                     "1. Add OAuth Credential\n"
                     "2. Add API Key\n"
                     "3. Export Credentials\n"
-                    "4. View / Manage All Credentials"
+                    "4. View Credentials\n"
+                    "5. Manage Credentials"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -1989,7 +2121,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"
             ),
-            choices=["1", "2", "3", "4", "q"],
+            choices=["1", "2", "3", "4", "5", "q"],
             show_choices=False,
         )
 
@@ -1998,13 +2130,7 @@ async def main(clear_on_start=True):
 
         if setup_type == "1":
             # Clear and show OAuth providers summary before listing providers
-            clear_screen()
-            console.print(
-                Panel(
-                    "[bold cyan]Add OAuth Credential[/bold cyan]",
-                    title="--- API Key Proxy ---",
-                )
-            )
+            clear_screen("Add OAuth Credential")
             _display_oauth_providers_summary()
 
             provider_factory, _ = _ensure_providers_loaded()
@@ -2074,6 +2200,9 @@ async def main(clear_on_start=True):
             await export_credentials_submenu()
 
         elif setup_type == "4":
+            await view_credentials_menu()
+
+        elif setup_type == "5":
             await manage_credentials_submenu()
 
 
