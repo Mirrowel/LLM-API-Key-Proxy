@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from dotenv import set_key, get_key
@@ -11,7 +12,8 @@ from dotenv import set_key, get_key
 # to avoid 6-7 second delay before showing loading screen
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
+from rich.table import Table
 from rich.text import Text
 
 from .utils.paths import get_oauth_dir, get_data_file
@@ -46,6 +48,782 @@ def _ensure_providers_loaded():
         _provider_factory = pf
         _provider_plugins = pp
     return _provider_factory, _provider_plugins
+
+
+# OAuth provider display names mapping (no "(OAuth)" suffix - context makes it clear)
+OAUTH_FRIENDLY_NAMES = {
+    "gemini_cli": "Gemini CLI",
+    "qwen_code": "Qwen Code",
+    "iflow": "iFlow",
+    "antigravity": "Antigravity",
+}
+
+
+def _extract_key_number(key_name: str) -> int:
+    """Extract the numeric suffix from a key name for proper sorting.
+
+    Examples:
+        GEMINI_API_KEY_1 -> 1
+        GEMINI_API_KEY_10 -> 10
+        GEMINI_API_KEY -> 0
+    """
+    match = re.search(r"_(\d+)$", key_name)
+    return int(match.group(1)) if match else 0
+
+
+def _normalize_tier_name(tier: str) -> str:
+    """Normalize tier names for consistent display.
+
+    Examples:
+        "free-tier" -> "free"
+        "FREE_TIER" -> "free"
+        "PAID" -> "paid"
+        "standard" -> "standard"
+        None -> "unknown"
+    """
+    if not tier:
+        return "unknown"
+
+    # Lowercase and remove common suffixes/prefixes
+    normalized = tier.lower().strip()
+    normalized = normalized.replace("-tier", "").replace("_tier", "")
+    normalized = normalized.replace("-", "").replace("_", "")
+
+    return normalized
+
+
+def _count_tiers(credentials: list) -> dict:
+    """Count credentials by tier.
+
+    Args:
+        credentials: List of credential info dicts with optional 'tier' key
+
+    Returns:
+        Dict mapping normalized tier names to counts, e.g. {"free": 15, "paid": 2}
+    """
+    tier_counts = {}
+    for cred in credentials:
+        tier = cred.get("tier")
+        if tier:
+            normalized = _normalize_tier_name(tier)
+            tier_counts[normalized] = tier_counts.get(normalized, 0) + 1
+    return tier_counts
+
+
+def _format_tier_counts(tier_counts: dict) -> str:
+    """Format tier counts as a compact string.
+
+    Examples:
+        {"free": 15, "paid": 2} -> "(15 free, 2 paid)"
+        {"free": 5} -> "(5 free)"
+        {} -> ""
+    """
+    if not tier_counts:
+        return ""
+
+    # Sort by count descending, then alphabetically
+    sorted_tiers = sorted(tier_counts.items(), key=lambda x: (-x[1], x[0]))
+    parts = [f"{count} {tier}" for tier, count in sorted_tiers]
+    return f"({', '.join(parts)})"
+
+
+def _get_api_keys_from_env() -> dict:
+    """
+    Parse the .env file and return a dictionary of API keys grouped by provider.
+    Keys are sorted numerically within each provider.
+
+    Returns:
+        Dict mapping provider names to lists of (key_name, key_value) tuples.
+        Example: {"GEMINI": [("GEMINI_API_KEY_1", "abc123"), ("GEMINI_API_KEY_2", "def456")]}
+    """
+    api_keys = {}
+    env_file = _get_env_file()
+
+    if not env_file.is_file():
+        return api_keys
+
+    try:
+        with open(env_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+
+                # Look for lines with API_KEY pattern
+                if "_API_KEY" in line and "=" in line:
+                    key_name, _, key_value = line.partition("=")
+                    key_name = key_name.strip()
+                    key_value = key_value.strip().strip('"').strip("'")
+
+                    # Skip PROXY_API_KEY and empty values
+                    if key_name == "PROXY_API_KEY" or not key_value:
+                        continue
+
+                    # Skip placeholder values
+                    if key_value.startswith("YOUR_") or key_value == "":
+                        continue
+
+                    # Extract provider name (everything before _API_KEY)
+                    # Handle cases like GEMINI_API_KEY_1 -> GEMINI
+                    parts = key_name.split("_API_KEY")
+                    if parts:
+                        provider_name = parts[0]
+                        if provider_name not in api_keys:
+                            api_keys[provider_name] = []
+                        api_keys[provider_name].append((key_name, key_value))
+
+        # Sort keys numerically within each provider
+        for provider_name in api_keys:
+            api_keys[provider_name].sort(key=lambda x: _extract_key_number(x[0]))
+
+    except Exception as e:
+        console.print(f"[bold red]Error reading .env file: {e}[/bold red]")
+
+    return api_keys
+
+
+def _delete_api_key_from_env(key_name: str) -> bool:
+    """
+    Delete an API key from the .env file with safety backup and comparison.
+
+    This function creates a backup of all API keys before deletion,
+    performs the deletion, and then verifies no unintended keys were lost.
+
+    Args:
+        key_name: The exact key name to delete (e.g., "GEMINI_API_KEY_2")
+
+    Returns:
+        True if deletion was successful and verified, False otherwise
+    """
+    env_file = _get_env_file()
+
+    if not env_file.is_file():
+        console.print("[bold red]Error: .env file not found[/bold red]")
+        return False
+
+    try:
+        # Step 1: Read all lines and backup all API keys
+        with open(env_file, "r") as f:
+            original_lines = f.readlines()
+
+        # Create backup of all API keys before modification
+        api_keys_before = _get_api_keys_from_env()
+        all_keys_before = set()
+        for provider_keys in api_keys_before.values():
+            for kn, kv in provider_keys:
+                all_keys_before.add((kn, kv))
+
+        # Step 2: Find and remove the target key
+        new_lines = []
+        key_found = False
+        deleted_key_value = None
+
+        for line in original_lines:
+            stripped = line.strip()
+            # Check if this line contains our target key
+            if stripped.startswith(f"{key_name}="):
+                key_found = True
+                # Store the value being deleted for verification
+                _, _, deleted_key_value = stripped.partition("=")
+                deleted_key_value = deleted_key_value.strip().strip('"').strip("'")
+                continue  # Skip this line (delete it)
+            new_lines.append(line)
+
+        if not key_found:
+            console.print(
+                f"[bold red]Error: Key '{key_name}' not found in .env file[/bold red]"
+            )
+            return False
+
+        # Step 3: Write the modified content
+        with open(env_file, "w") as f:
+            f.writelines(new_lines)
+
+        # Step 4: Verify the deletion - compare before and after
+        api_keys_after = _get_api_keys_from_env()
+        all_keys_after = set()
+        for provider_keys in api_keys_after.values():
+            for kn, kv in provider_keys:
+                all_keys_after.add((kn, kv))
+
+        # Check that only the intended key was removed
+        expected_remaining = all_keys_before - {(key_name, deleted_key_value)}
+
+        if all_keys_after != expected_remaining:
+            # Something went wrong - restore from backup
+            console.print(
+                "[bold red]Error: Unexpected keys were affected during deletion![/bold red]"
+            )
+            console.print("[bold yellow]Restoring original file...[/bold yellow]")
+            with open(env_file, "w") as f:
+                f.writelines(original_lines)
+            return False
+
+        return True
+
+    except Exception as e:
+        console.print(f"[bold red]Error during API key deletion: {e}[/bold red]")
+        return False
+
+
+def _get_oauth_credentials_summary() -> dict:
+    """
+    Get a summary of all OAuth credentials for all providers.
+
+    Returns:
+        Dict mapping provider names to lists of credential info dicts.
+        Example: {"gemini_cli": [{"email": "user@example.com", "tier": "free-tier", ...}, ...]}
+    """
+    provider_factory, _ = _ensure_providers_loaded()
+    oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity"]
+    oauth_summary = {}
+
+    for provider_name in oauth_providers:
+        try:
+            auth_class = provider_factory.get_provider_auth_class(provider_name)
+            auth_instance = auth_class()
+            credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+            oauth_summary[provider_name] = credentials
+        except Exception:
+            oauth_summary[provider_name] = []
+
+    return oauth_summary
+
+
+def _get_all_credentials_summary() -> dict:
+    """
+    Get a complete summary of all credentials (API keys and OAuth).
+
+    Returns:
+        Dict with "api_keys" and "oauth" sections containing credential summaries.
+    """
+    return {
+        "api_keys": _get_api_keys_from_env(),
+        "oauth": _get_oauth_credentials_summary(),
+    }
+
+
+def _display_credentials_summary():
+    """
+    Display a compact 2-column summary of all configured credentials.
+    API Keys on the left, OAuth credentials on the right.
+    Handles cases where only one type exists or neither.
+    """
+    from rich.columns import Columns
+
+    summary = _get_all_credentials_summary()
+    api_keys = summary["api_keys"]
+    oauth_creds = summary["oauth"]
+
+    # Calculate totals
+    total_api_keys = sum(len(keys) for keys in api_keys.values())
+    total_oauth = sum(len(creds) for creds in oauth_creds.values() if creds)
+
+    # Handle empty case
+    if total_api_keys == 0 and total_oauth == 0:
+        console.print("[dim]No credentials configured yet.[/dim]\n")
+        return
+
+    # Build API Keys table (left column)
+    api_table = None
+    if total_api_keys > 0:
+        api_table = Table(
+            title="API Keys", box=None, padding=(0, 1), title_style="bold cyan"
+        )
+        api_table.add_column("Provider", style="yellow", no_wrap=True)
+        api_table.add_column("Count", style="green", justify="right")
+
+        for provider, keys in sorted(api_keys.items()):
+            api_table.add_row(provider, str(len(keys)))
+
+        # Add total row
+        api_table.add_row("─" * 12, "─" * 5, style="dim")
+        api_table.add_row("Total", str(total_api_keys), style="bold")
+
+    # Build OAuth table (right column)
+    oauth_table = None
+    if total_oauth > 0:
+        oauth_table = Table(
+            title="OAuth Credentials", box=None, padding=(0, 1), title_style="bold cyan"
+        )
+        oauth_table.add_column("Provider", style="yellow", no_wrap=True)
+        oauth_table.add_column("Count", style="green", justify="right")
+        oauth_table.add_column("Tiers", style="dim", no_wrap=True)
+
+        for provider, creds in sorted(oauth_creds.items()):
+            if not creds:
+                continue
+            display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
+            count = len(creds)
+
+            # Count and format tiers for providers that have tier info
+            tier_counts = _count_tiers(creds)
+            tier_str = _format_tier_counts(tier_counts)
+
+            oauth_table.add_row(display_name, str(count), tier_str)
+
+        # Add total row
+        oauth_table.add_row("─" * 12, "─" * 5, "", style="dim")
+        oauth_table.add_row("Total", str(total_oauth), "", style="bold")
+
+    # Display based on what's available
+    if api_table and oauth_table:
+        # Both columns - use Columns for side-by-side layout
+        console.print(Columns([api_table, oauth_table], padding=(0, 4), expand=False))
+    elif api_table:
+        # Only API keys
+        console.print(api_table)
+    elif oauth_table:
+        # Only OAuth
+        console.print(oauth_table)
+
+    console.print("")  # Blank line after summary
+
+
+def _display_oauth_providers_summary():
+    """
+    Display a compact summary of OAuth providers only (used when adding OAuth credentials).
+    """
+    oauth_summary = _get_oauth_credentials_summary()
+
+    total = sum(len(creds) for creds in oauth_summary.values())
+
+    # Build compact table
+    table = Table(
+        title="Current OAuth Credentials",
+        box=None,
+        padding=(0, 1),
+        title_style="bold cyan",
+    )
+    table.add_column("Provider", style="yellow", no_wrap=True)
+    table.add_column("Count", style="green", justify="right")
+
+    for provider, creds in sorted(oauth_summary.items()):
+        display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
+        table.add_row(display_name, str(len(creds)))
+
+    if total > 0:
+        table.add_row("─" * 12, "─" * 5, style="dim")
+        table.add_row("Total", str(total), style="bold")
+
+    console.print(table)
+    console.print("")
+
+
+def _display_provider_credentials(provider_name: str):
+    """
+    Display all credentials for a specific OAuth provider.
+
+    Args:
+        provider_name: The provider key (e.g., "gemini_cli", "qwen_code")
+    """
+    provider_factory, _ = _ensure_providers_loaded()
+
+    try:
+        auth_class = provider_factory.get_provider_auth_class(provider_name)
+        auth_instance = auth_class()
+        credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+    except Exception:
+        credentials = []
+
+    display_name = OAUTH_FRIENDLY_NAMES.get(provider_name, provider_name.title())
+
+    if not credentials:
+        console.print(f"\n[dim]No existing credentials for {display_name}[/dim]\n")
+        return
+
+    console.print(f"\n[bold cyan]Existing {display_name} Credentials:[/bold cyan]")
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=3)
+    table.add_column("File", style="yellow")
+    table.add_column("Email/Identifier", style="cyan")
+
+    # Add tier/project columns for Google OAuth providers
+    if provider_name in ["gemini_cli", "antigravity"]:
+        table.add_column("Tier", style="green")
+        table.add_column("Project", style="dim")
+
+    for i, cred in enumerate(credentials, 1):
+        file_name = Path(cred["file_path"]).name
+        email = cred.get("email", "unknown")
+
+        if provider_name in ["gemini_cli", "antigravity"]:
+            tier = cred.get("tier", "-")
+            project = cred.get("project_id", "-")
+            if project and len(project) > 20:
+                project = project[:17] + "..."
+            table.add_row(str(i), file_name, email, tier or "-", project or "-")
+        else:
+            table.add_row(str(i), file_name, email)
+
+    console.print(table)
+    console.print("")
+
+
+async def _edit_oauth_credential_email(provider_name: str):
+    """
+    Edit the email field of an OAuth credential.
+
+    Args:
+        provider_name: The provider key (e.g., "qwen_code")
+    """
+    provider_factory, _ = _ensure_providers_loaded()
+
+    try:
+        auth_class = provider_factory.get_provider_auth_class(provider_name)
+        auth_instance = auth_class()
+        credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+    except Exception as e:
+        console.print(f"[bold red]Error loading credentials: {e}[/bold red]")
+        return
+
+    display_name = OAUTH_FRIENDLY_NAMES.get(provider_name, provider_name.title())
+
+    if not credentials:
+        console.print(
+            f"[bold yellow]No {display_name} credentials found.[/bold yellow]"
+        )
+        return
+
+    # Display credentials for selection
+    _display_provider_credentials(provider_name)
+
+    choice = Prompt.ask(
+        Text.from_markup(
+            "[bold]Select credential to edit or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i) for i in range(1, len(credentials) + 1)] + ["b"],
+        show_choices=False,
+    )
+
+    if choice.lower() == "b":
+        return
+
+    try:
+        idx = int(choice) - 1
+        cred_info = credentials[idx]
+        cred_path = cred_info["file_path"]
+        current_email = cred_info.get("email", "unknown")
+
+        console.print(f"\nCurrent email: [cyan]{current_email}[/cyan]")
+        new_email = Prompt.ask("Enter new email/identifier")
+
+        if not new_email.strip():
+            console.print("[bold yellow]No changes made (empty input).[/bold yellow]")
+            return
+
+        # Load and update the credential file
+        with open(cred_path, "r") as f:
+            creds = json.load(f)
+
+        if "_proxy_metadata" not in creds:
+            creds["_proxy_metadata"] = {}
+
+        old_email = creds["_proxy_metadata"].get("email")
+        creds["_proxy_metadata"]["email"] = new_email.strip()
+
+        # Save the updated credentials
+        with open(cred_path, "w") as f:
+            json.dump(creds, f, indent=2)
+
+        console.print(
+            Panel(
+                f"Email updated from [yellow]'{old_email}'[/yellow] to [green]'{new_email.strip()}'[/green]",
+                style="bold green",
+                title="Success",
+                expand=False,
+            )
+        )
+
+    except Exception as e:
+        console.print(f"[bold red]Error editing credential: {e}[/bold red]")
+
+
+async def manage_credentials_submenu():
+    """
+    Submenu for viewing and managing all credentials (API keys and OAuth).
+    Allows deletion of any credential and editing email for OAuth credentials.
+    """
+    while True:
+        clear_screen()
+        console.print(
+            Panel(
+                "[bold cyan]View / Manage All Credentials[/bold cyan]",
+                title="--- API Key Proxy ---",
+            )
+        )
+
+        # Display full summary
+        _display_credentials_summary()
+
+        console.print(
+            Panel(
+                Text.from_markup(
+                    "[bold]Actions:[/bold]\n"
+                    "1. Delete an API Key\n"
+                    "2. Delete an OAuth Credential\n"
+                    "3. Edit OAuth Credential Email [dim](Qwen Code recommended)[/dim]"
+                ),
+                title="Choose action",
+                style="bold blue",
+            )
+        )
+
+        action = Prompt.ask(
+            Text.from_markup(
+                "[bold]Select an option or type [red]'b'[/red] to go back[/bold]"
+            ),
+            choices=["1", "2", "3", "b"],
+            show_choices=False,
+        )
+
+        if action.lower() == "b":
+            break
+
+        if action == "1":
+            # Delete API Key
+            await _delete_api_key_menu()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+
+        elif action == "2":
+            # Delete OAuth Credential
+            await _delete_oauth_credential_menu()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+
+        elif action == "3":
+            # Edit OAuth Credential Email
+            await _edit_oauth_credential_menu()
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+
+
+async def _delete_api_key_menu():
+    """Menu for deleting an API key from the .env file."""
+    clear_screen()
+    api_keys = _get_api_keys_from_env()
+
+    if not api_keys:
+        console.print("[bold yellow]No API keys configured.[/bold yellow]")
+        return
+
+    # Build a flat list of all keys for selection
+    all_keys = []
+    console.print("\n[bold cyan]Configured API Keys:[/bold cyan]")
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Key Name", style="yellow")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Value", style="dim")
+
+    idx = 1
+    for provider, keys in sorted(api_keys.items()):
+        for key_name, key_value in keys:
+            masked = f"****{key_value[-4:]}" if len(key_value) > 4 else "****"
+            table.add_row(str(idx), key_name, provider, masked)
+            all_keys.append((key_name, key_value, provider))
+            idx += 1
+
+    console.print(table)
+
+    choice = Prompt.ask(
+        Text.from_markup(
+            "\n[bold]Select API key to delete or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i) for i in range(1, len(all_keys) + 1)] + ["b"],
+        show_choices=False,
+    )
+
+    if choice.lower() == "b":
+        return
+
+    try:
+        idx = int(choice) - 1
+        key_name, key_value, provider = all_keys[idx]
+
+        # Confirmation prompt
+        masked = f"****{key_value[-4:]}" if len(key_value) > 4 else "****"
+        confirmed = Confirm.ask(
+            f"[bold red]Delete[/bold red] [yellow]{key_name}[/yellow] ({masked})?"
+        )
+
+        if not confirmed:
+            console.print("[dim]Deletion cancelled.[/dim]")
+            return
+
+        if _delete_api_key_from_env(key_name):
+            console.print(
+                Panel(
+                    f"Successfully deleted [yellow]{key_name}[/yellow]",
+                    style="bold green",
+                    title="Success",
+                    expand=False,
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    f"Failed to delete [yellow]{key_name}[/yellow]",
+                    style="bold red",
+                    title="Error",
+                    expand=False,
+                )
+            )
+
+    except Exception as e:
+        console.print(f"[bold red]Error: {e}[/bold red]")
+
+
+async def _delete_oauth_credential_menu():
+    """Menu for deleting an OAuth credential file."""
+    clear_screen()
+    oauth_summary = _get_oauth_credentials_summary()
+
+    # Check if there are any credentials
+    total = sum(len(creds) for creds in oauth_summary.values())
+    if total == 0:
+        console.print("[bold yellow]No OAuth credentials configured.[/bold yellow]")
+        return
+
+    # First, select provider
+    console.print("\n[bold cyan]Select OAuth Provider:[/bold cyan]")
+
+    providers_with_creds = [(p, c) for p, c in oauth_summary.items() if c]
+    for i, (provider, creds) in enumerate(providers_with_creds, 1):
+        display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
+        console.print(f"  {i}. {display_name} ({len(creds)} credential(s))")
+
+    provider_choice = Prompt.ask(
+        Text.from_markup(
+            "\n[bold]Select provider or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i) for i in range(1, len(providers_with_creds) + 1)] + ["b"],
+        show_choices=False,
+    )
+
+    if provider_choice.lower() == "b":
+        return
+
+    try:
+        provider_idx = int(provider_choice) - 1
+        provider_name, credentials = providers_with_creds[provider_idx]
+        display_name = OAUTH_FRIENDLY_NAMES.get(provider_name, provider_name.title())
+
+        # Now select credential
+        _display_provider_credentials(provider_name)
+
+        cred_choice = Prompt.ask(
+            Text.from_markup(
+                "[bold]Select credential to delete or type [red]'b'[/red] to go back[/bold]"
+            ),
+            choices=[str(i) for i in range(1, len(credentials) + 1)] + ["b"],
+            show_choices=False,
+        )
+
+        if cred_choice.lower() == "b":
+            return
+
+        cred_idx = int(cred_choice) - 1
+        cred_info = credentials[cred_idx]
+        cred_path = cred_info["file_path"]
+        email = cred_info.get("email", "unknown")
+
+        # Confirmation prompt
+        confirmed = Confirm.ask(
+            f"[bold red]Delete[/bold red] credential for [cyan]{email}[/cyan] from {display_name}?"
+        )
+
+        if not confirmed:
+            console.print("[dim]Deletion cancelled.[/dim]")
+            return
+
+        # Use the auth class's delete method
+        provider_factory, _ = _ensure_providers_loaded()
+        auth_class = provider_factory.get_provider_auth_class(provider_name)
+        auth_instance = auth_class()
+
+        if auth_instance.delete_credential(cred_path):
+            console.print(
+                Panel(
+                    f"Successfully deleted credential for [cyan]{email}[/cyan]",
+                    style="bold green",
+                    title="Success",
+                    expand=False,
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    f"Failed to delete credential for [cyan]{email}[/cyan]",
+                    style="bold red",
+                    title="Error",
+                    expand=False,
+                )
+            )
+
+    except Exception as e:
+        console.print(f"[bold red]Error: {e}[/bold red]")
+
+
+async def _edit_oauth_credential_menu():
+    """Menu for editing an OAuth credential's email field."""
+    clear_screen()
+    oauth_summary = _get_oauth_credentials_summary()
+
+    # Check if there are any credentials
+    total = sum(len(creds) for creds in oauth_summary.values())
+    if total == 0:
+        console.print("[bold yellow]No OAuth credentials configured.[/bold yellow]")
+        return
+
+    # Show warning about editing
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold yellow]Warning:[/bold yellow] Editing OAuth credentials is generally not recommended.\n"
+                "This is mainly useful for [bold]Qwen Code[/bold] where you manually enter an email identifier.\n\n"
+                "For Google OAuth providers (Gemini CLI, Antigravity), the email is automatically\n"
+                "retrieved during authentication and changing it may cause confusion."
+            ),
+            style="yellow",
+            title="Edit OAuth Credential",
+            expand=False,
+        )
+    )
+
+    # First, select provider
+    console.print("\n[bold cyan]Select OAuth Provider:[/bold cyan]")
+
+    providers_with_creds = [(p, c) for p, c in oauth_summary.items() if c]
+    for i, (provider, creds) in enumerate(providers_with_creds, 1):
+        display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
+        recommended = " [green](recommended)[/green]" if provider == "qwen_code" else ""
+        console.print(
+            f"  {i}. {display_name} ({len(creds)} credential(s)){recommended}"
+        )
+
+    provider_choice = Prompt.ask(
+        Text.from_markup(
+            "\n[bold]Select provider or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i) for i in range(1, len(providers_with_creds) + 1)] + ["b"],
+        show_choices=False,
+    )
+
+    if provider_choice.lower() == "b":
+        return
+
+    try:
+        provider_idx = int(provider_choice) - 1
+        provider_name, _ = providers_with_creds[provider_idx]
+        await _edit_oauth_credential_email(provider_name)
+
+    except Exception as e:
+        console.print(f"[bold red]Error: {e}[/bold red]")
 
 
 def clear_screen():
@@ -83,6 +861,7 @@ async def setup_api_key():
     """
     Interactively sets up a new API key for a provider.
     """
+    clear_screen()
     console.print(Panel("[bold cyan]API Key Setup[/bold cyan]", expand=False))
 
     # Debug toggle: Set to True to see env var names next to each provider
@@ -211,7 +990,11 @@ async def setup_api_key():
             provider_text.append(f"  {i + 1}. {provider_name}\n")
 
     console.print(
-        Panel(provider_text, title="Available Providers for API Key", style="bold blue")
+        Panel(
+            provider_text,
+            title="Available Providers for API Key",
+            style="bold blue",
+        )
     )
 
     choice = Prompt.ask(
@@ -386,6 +1169,7 @@ async def export_gemini_cli_to_env():
     Export a Gemini CLI credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
+    clear_screen()
     console.print(
         Panel(
             "[bold cyan]Export Gemini CLI Credential to .env[/bold cyan]", expand=False
@@ -418,7 +1202,11 @@ async def export_gemini_cli_to_env():
         )
 
     console.print(
-        Panel(cred_text, title="Available Gemini CLI Credentials", style="bold blue")
+        Panel(
+            cred_text,
+            title="Available Gemini CLI Credentials",
+            style="bold blue",
+        )
     )
 
     choice = Prompt.ask(
@@ -481,6 +1269,7 @@ async def export_qwen_code_to_env():
     Export a Qwen Code credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
+    clear_screen()
     console.print(
         Panel(
             "[bold cyan]Export Qwen Code Credential to .env[/bold cyan]", expand=False
@@ -513,7 +1302,11 @@ async def export_qwen_code_to_env():
         )
 
     console.print(
-        Panel(cred_text, title="Available Qwen Code Credentials", style="bold blue")
+        Panel(
+            cred_text,
+            title="Available Qwen Code Credentials",
+            style="bold blue",
+        )
     )
 
     choice = Prompt.ask(
@@ -575,6 +1368,7 @@ async def export_iflow_to_env():
     Export an iFlow credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
+    clear_screen()
     console.print(
         Panel("[bold cyan]Export iFlow Credential to .env[/bold cyan]", expand=False)
     )
@@ -605,7 +1399,11 @@ async def export_iflow_to_env():
         )
 
     console.print(
-        Panel(cred_text, title="Available iFlow Credentials", style="bold blue")
+        Panel(
+            cred_text,
+            title="Available iFlow Credentials",
+            style="bold blue",
+        )
     )
 
     choice = Prompt.ask(
@@ -667,6 +1465,7 @@ async def export_antigravity_to_env():
     Export an Antigravity credential JSON file to .env format.
     Uses the auth class's build_env_lines() and list_credentials() methods.
     """
+    clear_screen()
     console.print(
         Panel(
             "[bold cyan]Export Antigravity Credential to .env[/bold cyan]", expand=False
@@ -699,7 +1498,11 @@ async def export_antigravity_to_env():
         )
 
     console.print(
-        Panel(cred_text, title="Available Antigravity Credentials", style="bold blue")
+        Panel(
+            cred_text,
+            title="Available Antigravity Credentials",
+            style="bold blue",
+        )
     )
 
     choice = Prompt.ask(
@@ -762,6 +1565,7 @@ async def export_all_provider_credentials(provider_name: str):
     Export all credentials for a specific provider to individual .env files.
     Uses the auth class's list_credentials() and export_credential_to_env() methods.
     """
+    clear_screen()
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
     try:
@@ -830,6 +1634,7 @@ async def combine_provider_credentials(provider_name: str):
     Combine all credentials for a specific provider into a single .env file.
     Uses the auth class's list_credentials() and build_env_lines() methods.
     """
+    clear_screen()
     # Get auth instance for this provider
     provider_factory, _ = _ensure_providers_loaded()
     try:
@@ -914,6 +1719,7 @@ async def combine_all_credentials():
     Combine ALL credentials from ALL providers into a single .env file.
     Uses auth class list_credentials() and build_env_lines() methods.
     """
+    clear_screen()
     console.print(
         Panel("[bold cyan]Combine All Provider Credentials[/bold cyan]", expand=False)
     )
@@ -1150,7 +1956,6 @@ async def main(clear_on_start=True):
             Panel(
                 "[bold cyan]Interactive Credential Setup[/bold cyan]",
                 title="--- API Key Proxy ---",
-                expand=False,
             )
         )
 
@@ -1161,16 +1966,21 @@ async def main(clear_on_start=True):
             Panel(
                 "[bold cyan]Interactive Credential Setup[/bold cyan]",
                 title="--- API Key Proxy ---",
-                expand=False,
             )
         )
+
+        # Display credentials summary at the top
+        _display_credentials_summary()
 
         console.print(
             Panel(
                 Text.from_markup(
-                    "1. Add OAuth Credential\n2. Add API Key\n3. Export Credentials"
+                    "1. Add OAuth Credential\n"
+                    "2. Add API Key\n"
+                    "3. Export Credentials\n"
+                    "4. View / Manage All Credentials"
                 ),
-                title="Choose credential type",
+                title="Choose action",
                 style="bold blue",
             )
         )
@@ -1179,7 +1989,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"
             ),
-            choices=["1", "2", "3", "q"],
+            choices=["1", "2", "3", "4", "q"],
             show_choices=False,
         )
 
@@ -1187,18 +1997,22 @@ async def main(clear_on_start=True):
             break
 
         if setup_type == "1":
+            # Clear and show OAuth providers summary before listing providers
+            clear_screen()
+            console.print(
+                Panel(
+                    "[bold cyan]Add OAuth Credential[/bold cyan]",
+                    title="--- API Key Proxy ---",
+                )
+            )
+            _display_oauth_providers_summary()
+
             provider_factory, _ = _ensure_providers_loaded()
             available_providers = provider_factory.get_available_providers()
-            oauth_friendly_names = {
-                "gemini_cli": "Gemini CLI (OAuth)",
-                "qwen_code": "Qwen Code (OAuth - also supports API keys)",
-                "iflow": "iFlow (OAuth - also supports API keys)",
-                "antigravity": "Antigravity (OAuth)",
-            }
 
             provider_text = Text()
             for i, provider in enumerate(available_providers):
-                display_name = oauth_friendly_names.get(
+                display_name = OAUTH_FRIENDLY_NAMES.get(
                     provider, provider.replace("_", " ").title()
                 )
                 provider_text.append(f"  {i + 1}. {display_name}\n")
@@ -1226,11 +2040,15 @@ async def main(clear_on_start=True):
                 choice_index = int(choice) - 1
                 if 0 <= choice_index < len(available_providers):
                     provider_name = available_providers[choice_index]
-                    display_name = oauth_friendly_names.get(
+                    display_name = OAUTH_FRIENDLY_NAMES.get(
                         provider_name, provider_name.replace("_", " ").title()
                     )
+
+                    # Show existing credentials for this provider before proceeding
+                    _display_provider_credentials(provider_name)
+
                     console.print(
-                        f"\nStarting OAuth setup for [bold cyan]{display_name}[/bold cyan]..."
+                        f"Starting OAuth setup for [bold cyan]{display_name}[/bold cyan]..."
                     )
                     await setup_new_credential(provider_name)
                     # Don't clear after OAuth - user needs to see full flow
@@ -1254,6 +2072,9 @@ async def main(clear_on_start=True):
 
         elif setup_type == "3":
             await export_credentials_submenu()
+
+        elif setup_type == "4":
+            await manage_credentials_submenu()
 
 
 def run_credential_tool(from_launcher=False):
