@@ -85,8 +85,8 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
-# automatically retry up to this many times before giving up
-EMPTY_RESPONSE_MAX_RETRIES = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRIES", 3)
+# automatically retry up to this many attempts before giving up (minimum 1)
+EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 4))
 EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 2)
 
 # Model alias mappings (internal ↔ public)
@@ -3258,7 +3258,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         "This may indicate a temporary service issue. Please try again."
                     )
 
-                    for attempt in range(EMPTY_RESPONSE_MAX_RETRIES + 1):
+                    for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
                         result = await self._handle_non_streaming(
                             client, url, headers, payload, model, file_logger
                         )
@@ -3272,18 +3272,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         got_response = bool(result_dict.get("choices"))
 
                         if not got_response:
-                            if attempt < EMPTY_RESPONSE_MAX_RETRIES:
+                            if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
                                 lib_logger.warning(
                                     f"[Antigravity] Empty response from {model}, "
-                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_RETRIES + 1}. Retrying..."
+                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                                 )
                                 await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                                 continue
                             else:
-                                lib_logger.error(
-                                    f"[Antigravity] Empty response from {model} after "
-                                    f"{EMPTY_RESPONSE_MAX_RETRIES + 1} attempts. Giving up."
-                                )
+                                # Last attempt failed - raise without extra logging
+                                # (caller will log the error)
                                 raise EmptyResponseError(
                                     provider="antigravity",
                                     model=model,
@@ -3493,14 +3491,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Wrapper around _handle_streaming that retries on empty responses.
 
         If the stream yields zero chunks (Antigravity returned nothing),
-        retry up to EMPTY_RESPONSE_MAX_RETRIES times before giving up.
+        retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times before giving up.
         """
         error_msg = (
             "The model returned an empty response after multiple attempts. "
             "This may indicate a temporary service issue. Please try again."
         )
 
-        for attempt in range(EMPTY_RESPONSE_MAX_RETRIES + 1):
+        for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
             try:
@@ -3514,18 +3512,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     return  # Success - we got data
 
                 # Zero chunks - empty response
-                if attempt < EMPTY_RESPONSE_MAX_RETRIES:
+                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
                     lib_logger.warning(
                         f"[Antigravity] Empty stream from {model}, "
-                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_RETRIES + 1}. Retrying..."
+                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                     )
                     await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                     continue
                 else:
-                    lib_logger.error(
-                        f"[Antigravity] Empty stream from {model} after "
-                        f"{EMPTY_RESPONSE_MAX_RETRIES + 1} attempts. Giving up."
-                    )
+                    # Last attempt failed - raise without extra logging
+                    # (caller will log the error)
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
