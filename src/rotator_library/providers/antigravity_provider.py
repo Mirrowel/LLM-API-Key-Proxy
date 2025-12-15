@@ -39,12 +39,24 @@ from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
+from ..error_handler import EmptyResponseError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Get boolean from environment variable."""
+    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
+
+
+def _env_int(key: str, default: int) -> int:
+    """Get integer from environment variable."""
+    return int(os.getenv(key, str(default)))
+
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -70,6 +82,12 @@ AVAILABLE_MODELS = [
 
 # Default max output tokens (including thinking) - can be overridden per request
 DEFAULT_MAX_OUTPUT_TOKENS = 64000
+
+# Empty response retry configuration
+# When Antigravity returns an empty response (no content, no tool calls),
+# automatically retry up to this many times before giving up
+EMPTY_RESPONSE_MAX_RETRIES = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRIES", 3)
+EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 2)
 
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
@@ -199,16 +217,6 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment variable."""
-    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
-
-
-def _env_int(key: str, default: int) -> int:
-    """Get integer from environment variable."""
-    return int(os.getenv(key, str(default)))
 
 
 def _generate_request_id() -> str:
@@ -2799,6 +2807,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # Build usage if present
         usage = self._build_usage(chunk.get("usageMetadata", {}))
 
+        # Store last received usage for final chunk
+        if usage and accumulator is not None:
+            accumulator["last_usage"] = usage
+
         # Mark completion when we see usageMetadata
         if chunk.get("usageMetadata") and accumulator is not None:
             accumulator["is_complete"] = True
@@ -3229,49 +3241,98 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "Accept": "text/event-stream" if stream else "application/json",
         }
 
-        try:
-            if stream:
-                return self._handle_streaming(
-                    client, url, headers, payload, model, file_logger
-                )
-            else:
-                return await self._handle_non_streaming(
-                    client, url, headers, payload, model, file_logger
-                )
-        except httpx.HTTPStatusError as e:
-            # 429 = Rate limit/quota exhausted - tied to credential, not URL
-            # Do NOT retry on different URL, just raise immediately
-            if e.response.status_code == 429:
-                lib_logger.debug(f"429 quota error - not retrying on fallback URL: {e}")
+        # URL fallback loop - handles HTTP errors (except 429) and network errors
+        # by switching to fallback URLs. Empty response retry is handled separately
+        # inside _streaming_with_retry (streaming) or the inner loop (non-streaming).
+        while True:
+            try:
+                if stream:
+                    # Streaming: _streaming_with_retry handles empty response retries internally
+                    return self._streaming_with_retry(
+                        client, url, headers, payload, model, file_logger
+                    )
+                else:
+                    # Non-streaming: empty response retry loop
+                    error_msg = (
+                        "The model returned an empty response after multiple attempts. "
+                        "This may indicate a temporary service issue. Please try again."
+                    )
+
+                    for attempt in range(EMPTY_RESPONSE_MAX_RETRIES + 1):
+                        result = await self._handle_non_streaming(
+                            client, url, headers, payload, model, file_logger
+                        )
+
+                        # Check if we got anything - empty dict means no candidates
+                        result_dict = (
+                            result.model_dump()
+                            if hasattr(result, "model_dump")
+                            else dict(result)
+                        )
+                        got_response = bool(result_dict.get("choices"))
+
+                        if not got_response:
+                            if attempt < EMPTY_RESPONSE_MAX_RETRIES:
+                                lib_logger.warning(
+                                    f"[Antigravity] Empty response from {model}, "
+                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_RETRIES + 1}. Retrying..."
+                                )
+                                await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                continue
+                            else:
+                                lib_logger.error(
+                                    f"[Antigravity] Empty response from {model} after "
+                                    f"{EMPTY_RESPONSE_MAX_RETRIES + 1} attempts. Giving up."
+                                )
+                                raise EmptyResponseError(
+                                    provider="antigravity",
+                                    model=model,
+                                    message=error_msg,
+                                )
+
+                        return result
+
+                    # Should not reach here, but just in case
+                    lib_logger.error(
+                        f"[Antigravity] Unexpected exit from retry loop for {model}"
+                    )
+                    raise EmptyResponseError(
+                        provider="antigravity",
+                        model=model,
+                        message=error_msg,
+                    )
+
+            except httpx.HTTPStatusError as e:
+                # 429 = Rate limit/quota exhausted - tied to credential, not URL
+                # Do NOT retry on different URL, just raise immediately
+                if e.response.status_code == 429:
+                    lib_logger.debug(
+                        f"429 quota error - not retrying on fallback URL: {e}"
+                    )
+                    raise
+
+                # Other HTTP errors (403, 500, etc.) - try fallback URL
+                if self._try_next_base_url():
+                    lib_logger.warning(f"Retrying with fallback URL: {e}")
+                    url = f"{self._get_base_url()}{endpoint}"
+                    if stream:
+                        url = f"{url}?alt=sse"
+                    continue  # Retry with new URL
+                raise  # No more fallback URLs
+
+            except EmptyResponseError:
+                # Empty response already retried internally - don't catch, propagate
                 raise
 
-            # For other HTTP errors (403, 500, etc.), try fallback URL
-            if self._try_next_base_url():
-                lib_logger.warning(f"Retrying with fallback URL: {e}")
-                url = f"{self._get_base_url()}{endpoint}"
-                if stream:
-                    return self._handle_streaming(
-                        client, url, headers, payload, model, file_logger
-                    )
-                else:
-                    return await self._handle_non_streaming(
-                        client, url, headers, payload, model, file_logger
-                    )
-            raise
-        except Exception as e:
-            # Non-HTTP errors (network issues, timeouts, etc.) - try fallback URL
-            if self._try_next_base_url():
-                lib_logger.warning(f"Retrying with fallback URL: {e}")
-                url = f"{self._get_base_url()}{endpoint}"
-                if stream:
-                    return self._handle_streaming(
-                        client, url, headers, payload, model, file_logger
-                    )
-                else:
-                    return await self._handle_non_streaming(
-                        client, url, headers, payload, model, file_logger
-                    )
-            raise
+            except Exception as e:
+                # Non-HTTP errors (network issues, timeouts, etc.) - try fallback URL
+                if self._try_next_base_url():
+                    lib_logger.warning(f"Retrying with fallback URL: {e}")
+                    url = f"{self._get_base_url()}{endpoint}"
+                    if stream:
+                        url = f"{url}?alt=sse"
+                    continue  # Retry with new URL
+                raise  # No more fallback URLs
 
     def _inject_tool_hardening_instruction(
         self, payload: Dict[str, Any], instruction_text: str
@@ -3342,6 +3403,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "tool_calls": [],
             "tool_idx": 0,  # Track tool call index across chunks
             "is_complete": False,  # Track if we received usageMetadata
+            "last_usage": None,  # Track last received usage for final chunk
+            "yielded_any": False,  # Track if we yielded any real chunks
         }
 
         async with client.stream(
@@ -3381,42 +3444,115 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         )
 
                         yield litellm.ModelResponse(**openai_chunk)
+                        accumulator["yielded_any"] = True
                     except json.JSONDecodeError:
                         if file_logger:
                             file_logger.log_error(f"Parse error: {data_str[:100]}")
                         continue
 
-        # If stream ended without usageMetadata chunk, emit a final chunk with finish_reason
-        # Emit final chunk if stream ended without usageMetadata
-        # Client will determine the correct finish_reason based on accumulated state
-        if not accumulator.get("is_complete"):
-            final_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-                # Include minimal usage to signal this is the final chunk
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 1,
-                    "total_tokens": 1,
-                },
-            }
-            yield litellm.ModelResponse(**final_chunk)
+        # Only emit synthetic final chunk if we actually received real data
+        # If no data was received, the caller will detect zero chunks and retry
+        if accumulator.get("yielded_any"):
+            # If stream ended without usageMetadata chunk, emit a final chunk
+            if not accumulator.get("is_complete"):
+                final_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                }
+                # Only include usage if we received real data during streaming
+                if accumulator.get("last_usage"):
+                    final_chunk["usage"] = accumulator["last_usage"]
+                yield litellm.ModelResponse(**final_chunk)
 
-        # Cache Claude thinking after stream completes
-        if (
-            self._is_claude(model)
-            and self._enable_signature_cache
-            and accumulator.get("reasoning_content")
-        ):
-            self._cache_thinking(
-                accumulator["reasoning_content"],
-                accumulator["thought_signature"],
-                accumulator["text_content"],
-                accumulator["tool_calls"],
-            )
+            # Cache Claude thinking after stream completes
+            if (
+                self._is_claude(model)
+                and self._enable_signature_cache
+                and accumulator.get("reasoning_content")
+            ):
+                self._cache_thinking(
+                    accumulator["reasoning_content"],
+                    accumulator["thought_signature"],
+                    accumulator["text_content"],
+                    accumulator["tool_calls"],
+                )
+
+    async def _streaming_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        model: str,
+        file_logger: Optional[AntigravityFileLogger] = None,
+    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+        """
+        Wrapper around _handle_streaming that retries on empty responses.
+
+        If the stream yields zero chunks (Antigravity returned nothing),
+        retry up to EMPTY_RESPONSE_MAX_RETRIES times before giving up.
+        """
+        error_msg = (
+            "The model returned an empty response after multiple attempts. "
+            "This may indicate a temporary service issue. Please try again."
+        )
+
+        for attempt in range(EMPTY_RESPONSE_MAX_RETRIES + 1):
+            chunk_count = 0
+
+            try:
+                async for chunk in self._handle_streaming(
+                    client, url, headers, payload, model, file_logger
+                ):
+                    chunk_count += 1
+                    yield chunk  # Stream immediately - true streaming preserved
+
+                if chunk_count > 0:
+                    return  # Success - we got data
+
+                # Zero chunks - empty response
+                if attempt < EMPTY_RESPONSE_MAX_RETRIES:
+                    lib_logger.warning(
+                        f"[Antigravity] Empty stream from {model}, "
+                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_RETRIES + 1}. Retrying..."
+                    )
+                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                    continue
+                else:
+                    lib_logger.error(
+                        f"[Antigravity] Empty stream from {model} after "
+                        f"{EMPTY_RESPONSE_MAX_RETRIES + 1} attempts. Giving up."
+                    )
+                    raise EmptyResponseError(
+                        provider="antigravity",
+                        model=model,
+                        message=error_msg,
+                    )
+
+            except httpx.HTTPStatusError as e:
+                # 429 = Rate limit/quota exhausted - don't retry
+                if e.response.status_code == 429:
+                    lib_logger.debug(f"429 quota error - not retrying: {e}")
+                    raise
+                # Other HTTP errors - raise immediately (let caller handle)
+                raise
+
+            except Exception:
+                # Non-HTTP errors - raise immediately
+                raise
+
+        # Should not reach here, but just in case
+        lib_logger.error(
+            f"[Antigravity] Unexpected exit from streaming retry loop for {model}"
+        )
+        raise EmptyResponseError(
+            provider="antigravity",
+            model=model,
+            message=error_msg,
+        )
 
     async def count_tokens(
         self,

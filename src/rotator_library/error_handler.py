@@ -142,6 +142,29 @@ class CredentialNeedsReauthError(Exception):
         super().__init__(self.message)
 
 
+class EmptyResponseError(Exception):
+    """
+    Raised when a provider returns an empty response after multiple retry attempts.
+
+    This is a rotatable error - the request should try the next credential.
+    Treated as a transient server-side issue (503 equivalent).
+
+    Attributes:
+        provider: The provider name (e.g., "antigravity")
+        model: The model that was requested
+        message: Human-readable message about the error
+    """
+
+    def __init__(self, provider: str, model: str, message: str = ""):
+        self.provider = provider
+        self.model = model
+        self.message = (
+            message
+            or f"Empty response from {provider}/{model} after multiple retry attempts"
+        )
+        super().__init__(self.message)
+
+
 # =============================================================================
 # ERROR TRACKING FOR CLIENT REPORTING
 # =============================================================================
@@ -729,6 +752,15 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="credential_reauth_needed",
             original_exception=e,
             status_code=401,  # Treat as auth error for reporting purposes
+        )
+
+    if isinstance(e, EmptyResponseError):
+        # Transient server-side issue - provider returned empty response
+        # This is rotatable - try next credential
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=503,
         )
 
     if isinstance(e, RateLimitError):
