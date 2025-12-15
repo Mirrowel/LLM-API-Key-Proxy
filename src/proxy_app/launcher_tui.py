@@ -30,16 +30,26 @@ def _get_env_file() -> Path:
     return Path.cwd() / ".env"
 
 
-def clear_screen():
+def clear_screen(subtitle: str = ""):
     """
-    Cross-platform terminal clear that works robustly on both
-    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    Cross-platform terminal clear with optional header.
 
     Uses native OS commands instead of ANSI escape sequences:
     - Windows (conhost & Windows Terminal): cls
     - Unix-like systems (Linux, Mac): clear
+
+    Args:
+        subtitle: If provided, displays a header panel with this subtitle.
+                  If empty/None, just clears the screen.
     """
     os.system("cls" if os.name == "nt" else "clear")
+    if subtitle:
+        console.print(
+            Panel(
+                f"[bold cyan]{subtitle}[/bold cyan]",
+                title="--- API Key Proxy ---",
+            )
+        )
 
 
 class LauncherConfig:
@@ -967,11 +977,10 @@ class LauncherTUI:
             f"\n[bold green]🚀 Starting proxy on {self.config.config['host']}:{self.config.config['port']}...[/bold green]\n"
         )
 
-        # Clear console again to remove the starting message before main.py shows loading details
+        # Brief pause so user sees the message before main.py takes over
         import time
 
-        time.sleep(0.5)  # Brief pause so user sees the message
-        clear_screen()
+        time.sleep(0.5)
 
         # Reconstruct sys.argv for main.py
         sys.argv = [

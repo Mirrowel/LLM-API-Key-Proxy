@@ -43,16 +43,26 @@ except ImportError:
     IFLOW_DEFAULT_OAUTH_PORT = 11451
 
 
-def clear_screen():
+def clear_screen(subtitle: str = ""):
     """
-    Cross-platform terminal clear that works robustly on both
-    classic Windows conhost and modern terminals (Windows Terminal, Linux, Mac).
+    Cross-platform terminal clear with optional header.
 
     Uses native OS commands instead of ANSI escape sequences:
     - Windows (conhost & Windows Terminal): cls
     - Unix-like systems (Linux, Mac): clear
+
+    Args:
+        subtitle: If provided, displays a header panel with this subtitle.
+                  If empty/None, just clears the screen.
     """
     os.system("cls" if os.name == "nt" else "clear")
+    if subtitle:
+        console.print(
+            Panel(
+                f"[bold cyan]{subtitle}[/bold cyan]",
+                title="--- API Key Proxy ---",
+            )
+        )
 
 
 class AdvancedSettings:
@@ -1443,9 +1453,8 @@ class SettingsTool:
     def _manage_single_provider_settings(self, provider: str):
         """Manage settings for a single provider"""
         while True:
-            clear_screen()
-
             display_name = provider.replace("_", " ").title()
+            clear_screen()
             definitions = self.provider_settings_mgr.get_provider_settings_definitions(
                 provider
             )
@@ -2401,7 +2410,7 @@ class SettingsTool:
     def save_and_exit(self):
         """Save pending changes and exit"""
         if self.settings.has_pending():
-            clear_screen()
+            clear_screen("Save Changes")
             self._show_changes_summary()
 
             if Confirm.ask("\n[bold yellow]Save all pending changes?[/bold yellow]"):
@@ -2421,7 +2430,7 @@ class SettingsTool:
     def exit_without_saving(self):
         """Exit without saving"""
         if self.settings.has_pending():
-            clear_screen()
+            clear_screen("Exit Without Saving")
             self._show_changes_summary()
 
             if Confirm.ask("\n[bold red]Discard all pending changes?[/bold red]"):
