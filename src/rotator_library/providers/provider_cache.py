@@ -56,15 +56,18 @@ class ProviderCache:
     A generic, modular cache supporting any key-value data that providers need
     to persist across requests. Features:
 
-    - Dual-TTL system: configurable memory TTL, longer disk TTL
+    - Dual-TTL system: entries live in memory for memory_ttl, but persist on
+      disk for the longer disk_ttl. Memory cleanup does NOT affect disk entries.
+    - Merge-on-save: disk writes merge current memory with existing disk entries,
+      preserving disk-only entries until they exceed disk_ttl
     - Async disk persistence with batched writes
-    - Background cleanup task for expired entries
-    - Statistics tracking (hits, misses, writes)
+    - Background cleanup task for memory-expired entries (disk untouched)
+    - Statistics tracking (hits, misses, writes, disk preservation)
 
     Args:
         cache_file: Path to disk cache file
         memory_ttl_seconds: In-memory entry lifetime (default: 1 hour)
-        disk_ttl_seconds: Disk entry lifetime (default: 24 hours)
+        disk_ttl_seconds: Disk entry lifetime (default: 48 hours)
         enable_disk: Whether to enable disk persistence (default: from env or True)
         write_interval: Seconds between background disk writes (default: 60)
         cleanup_interval: Seconds between expired entry cleanup (default: 30 min)
@@ -80,7 +83,7 @@ class ProviderCache:
         self,
         cache_file: Path,
         memory_ttl_seconds: int = 3600,
-        disk_ttl_seconds: int = 86400,
+        disk_ttl_seconds: int = 172800,  # 48 hours
         enable_disk: Optional[bool] = None,
         write_interval: Optional[int] = None,
         cleanup_interval: Optional[int] = None,
@@ -200,6 +203,11 @@ class ProviderCache:
     async def _save_to_disk(self) -> bool:
         """Persist cache to disk using atomic write with health tracking.
 
+        Implements dual-TTL preservation: merges current memory state with
+        existing disk entries that haven't exceeded disk_ttl. This ensures
+        entries persist on disk for the full disk_ttl even after they expire
+        from memory (which uses the shorter memory_ttl).
+
         Returns:
             True if write succeeded, False otherwise.
         """
@@ -207,17 +215,48 @@ class ProviderCache:
             return True  # Not an error if disk is disabled
 
         async with self._disk_lock:
+            now = time.time()
+
+            # Step 1: Load existing disk entries (if any)
+            existing_entries: Dict[str, Dict[str, Any]] = {}
+            if self._cache_file.exists():
+                try:
+                    with open(self._cache_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    existing_entries = data.get("entries", {})
+                except (json.JSONDecodeError, IOError, OSError):
+                    pass  # Start fresh if corrupted or unreadable
+
+            # Step 2: Filter existing disk entries by disk_ttl (not memory_ttl)
+            # This preserves entries that expired from memory but are still valid on disk
+            valid_disk_entries = {
+                k: v
+                for k, v in existing_entries.items()
+                if now - v.get("timestamp", 0) <= self._disk_ttl
+            }
+
+            # Step 3: Merge - memory entries take precedence (fresher timestamps)
+            merged_entries = valid_disk_entries.copy()
+            for key, (val, ts) in self._cache.items():
+                merged_entries[key] = {"value": val, "timestamp": ts}
+
+            # Count entries that were preserved from disk (not in memory)
+            memory_keys = set(self._cache.keys())
+            preserved_from_disk = len(
+                [k for k in valid_disk_entries if k not in memory_keys]
+            )
+
+            # Step 4: Build and save merged cache data
             cache_data = {
                 "version": "1.0",
                 "memory_ttl_seconds": self._memory_ttl,
                 "disk_ttl_seconds": self._disk_ttl,
-                "entries": {
-                    key: {"value": val, "timestamp": ts}
-                    for key, (val, ts) in self._cache.items()
-                },
+                "entries": merged_entries,
                 "statistics": {
-                    "total_entries": len(self._cache),
-                    "last_write": time.time(),
+                    "total_entries": len(merged_entries),
+                    "memory_entries": len(self._cache),
+                    "disk_preserved": preserved_from_disk,
+                    "last_write": now,
                     **self._stats,
                 },
             }
@@ -227,9 +266,12 @@ class ProviderCache:
             ):
                 self._stats["writes"] += 1
                 self._disk_available = True
-                lib_logger.debug(
-                    f"ProviderCache[{self._cache_name}]: Saved {len(self._cache)} entries"
-                )
+                # Log merge info only when we preserved disk-only entries (infrequent)
+                if preserved_from_disk > 0:
+                    lib_logger.debug(
+                        f"ProviderCache[{self._cache_name}]: Saved {len(merged_entries)} entries "
+                        f"(memory={len(self._cache)}, preserved_from_disk={preserved_from_disk})"
+                    )
                 return True
             else:
                 self._stats["disk_errors"] += 1
@@ -278,7 +320,11 @@ class ProviderCache:
             pass
 
     async def _cleanup_expired(self) -> None:
-        """Remove expired entries from memory cache."""
+        """Remove expired entries from memory cache.
+
+        Only cleans memory - disk entries are preserved and cleaned during
+        _save_to_disk() based on their own disk_ttl.
+        """
         async with self._lock:
             now = time.time()
             expired = [
@@ -286,10 +332,11 @@ class ProviderCache:
             ]
             for k in expired:
                 del self._cache[k]
+            # Don't set dirty flag: memory cleanup shouldn't trigger disk write
+            # Disk entries are cleaned separately in _save_to_disk() by disk_ttl
             if expired:
-                self._dirty = True
                 lib_logger.debug(
-                    f"ProviderCache[{self._cache_name}]: Cleaned {len(expired)} expired entries"
+                    f"ProviderCache[{self._cache_name}]: Cleaned {len(expired)} expired entries from memory"
                 )
 
     # =========================================================================
@@ -336,8 +383,9 @@ class ProviderCache:
                 self._stats["memory_hits"] += 1
                 return value
             else:
+                # Entry expired from memory - remove from memory only
+                # Don't set dirty flag: disk copy should persist until disk_ttl
                 del self._cache[key]
-                self._dirty = True
 
         self._stats["misses"] += 1
         if self._enable_disk:
@@ -358,10 +406,11 @@ class ProviderCache:
                 self._stats["memory_hits"] += 1
                 return value
             else:
+                # Entry expired from memory - remove from memory only
+                # Don't set dirty flag: disk copy should persist until disk_ttl
                 async with self._lock:
                     if key in self._cache:
                         del self._cache[key]
-                        self._dirty = True
 
         # Check disk
         if self._enable_disk:
@@ -493,7 +542,7 @@ def create_provider_cache(
     name: str,
     cache_dir: Optional[Path] = None,
     memory_ttl_seconds: int = 3600,
-    disk_ttl_seconds: int = 86400,
+    disk_ttl_seconds: int = 172800,  # 48 hours
     env_prefix: Optional[str] = None,
 ) -> ProviderCache:
     """
