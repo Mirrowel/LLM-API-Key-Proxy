@@ -1088,6 +1088,25 @@ async def anthropic_streaming_wrapper(
 
             data_content = chunk_str[len("data:") :].strip()
             if data_content == "[DONE]":
+                # CRITICAL: Send message_start if we haven't yet (e.g., empty response)
+                # Claude Code and other clients require message_start before message_stop
+                if not message_started:
+                    message_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": request_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": original_model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                        },
+                    }
+                    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                    message_started = True
+
                 # Close any open thinking block
                 if thinking_block_started:
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
