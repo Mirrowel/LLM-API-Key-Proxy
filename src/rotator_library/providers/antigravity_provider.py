@@ -26,9 +26,18 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+)
 from urllib.parse import urlparse
 
 import httpx
@@ -37,10 +46,14 @@ import litellm
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
+from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..error_handler import EmptyResponseError
 from ..utils.paths import get_logs_dir, get_cache_dir
+
+if TYPE_CHECKING:
+    from ..usage_manager import UsageManager
 
 
 # =============================================================================
@@ -70,14 +83,18 @@ BASE_URLS = [
 
 # Available models via Antigravity
 AVAILABLE_MODELS = [
+    # Gemini models
     # "gemini-2.5-pro",
-    # "gemini-2.5-flash",
-    # "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",  # Uses -thinking variant when reasoning_effort provided
+    "gemini-2.5-flash-lite",  # Thinking budget configurable, no name change
     "gemini-3-pro-preview",  # Internally mapped to -low/-high variant based on thinkingLevel
-    # "gemini-3-pro-image-preview",
+    # "gemini-3-pro-image",  # Image generation model
     # "gemini-2.5-computer-use-preview-10-2025",
-    "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
+    # Claude models
+    "claude-sonnet-4-5",  # Uses -thinking variant when reasoning_effort provided
     "claude-opus-4-5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
+    # Other models
+    "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
@@ -524,7 +541,9 @@ class AntigravityFileLogger:
 # =============================================================================
 
 
-class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
+class AntigravityProvider(
+    AntigravityAuthBase, ProviderInterface, AntigravityQuotaTracker
+):
     """
     Antigravity provider for Gemini and Claude models via Google's internal API.
 
@@ -589,16 +608,36 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     # Models in the same group share quota - when one is exhausted, all are
+    # Based on empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
+    # Note: -thinking variants are included since they share the same quota pool
+    # (users call non-thinking names, proxy maps to -thinking internally)
     model_quota_groups: QuotaGroupMap = {
-        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+        # Claude and GPT-OSS share the same quota pool
+        "claude": [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking",
+            "gpt-oss-120b-medium",
+        ],
+        # Gemini 3 Pro variants share quota
+        "gemini-3-pro": [
+            "gemini-3-pro-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-preview",
+        ],
+        # Gemini 2.5 Flash variants share quota
+        "gemini-2.5-flash": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-flash-lite",
+        ],
     }
 
     # Model usage weights for grouped usage calculation
     # Opus consumes more quota per request, so its usage counts 2x when
     # comparing credentials for selection
-    model_usage_weights = {
-        "claude-opus-4-5": 2,
-    }
+    model_usage_weights = {}
 
     # Priority-based concurrency multipliers
     # Higher priority credentials (lower number) get higher multipliers
@@ -822,6 +861,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             env_prefix="ANTIGRAVITY_THINKING",
         )
 
+        # Quota tracking state
+        self._learned_costs: Dict[str, Dict[str, float]] = {}  # tier -> model -> cost
+        self._learned_costs_loaded: bool = False
+        self._quota_refresh_interval = _env_int(
+            "ANTIGRAVITY_QUOTA_REFRESH_INTERVAL", 300
+        )  # 5 min
+
         # Feature flags
         self._preserve_signatures_in_client = _env_bool(
             "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES", True
@@ -833,7 +879,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False
         )
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
-        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
+        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", False)
         self._enable_thinking_sanitization = _env_bool(
             "ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION", True
         )
@@ -988,6 +1034,55 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     f"Credential will use default priority."
                 )
 
+    # =========================================================================
+    # BACKGROUND JOB INTERFACE
+    # =========================================================================
+
+    def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Return background job configuration for quota baseline refresh.
+
+        The quota baseline refresh fetches current quota status from the API
+        and stores it in UsageManager for accurate quota estimation.
+        """
+        return {
+            "interval": self._quota_refresh_interval,  # default 900s (15 min)
+            "name": "quota_baseline_refresh",
+            "run_on_start": True,  # fetch baselines immediately at startup
+        }
+
+    async def run_background_job(
+        self,
+        usage_manager: "UsageManager",
+        credentials: List[str],
+    ) -> None:
+        """
+        Refresh quota baselines for recently used credentials.
+
+        Fetches current quota status from the Antigravity API and stores
+        the baselines in UsageManager for accurate quota estimation.
+        Only fetches for credentials that have been used since the last refresh.
+        """
+        # Get usage data to determine which credentials were recently used
+        usage_data = await usage_manager._get_usage_data_snapshot()
+
+        # Use refresh_active_quota_baselines which filters to recently used credentials
+        quota_results = await self.refresh_active_quota_baselines(
+            credentials, usage_data
+        )
+
+        if not quota_results:
+            return
+
+        # Store new baselines in UsageManager
+        stored = await self._store_baselines_to_usage_manager(
+            quota_results, usage_manager
+        )
+        if stored > 0:
+            lib_logger.debug(
+                f"Antigravity quota refresh: updated {stored} model baselines"
+            )
+
     async def _load_persisted_tiers(
         self, credential_paths: List[str]
     ) -> Dict[str, str]:
@@ -1081,6 +1176,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _get_base_url(self) -> str:
         """Get current base URL."""
         return self._current_base_url
+
+    def _get_available_models(self) -> List[str]:
+        """
+        Get list of user-facing model names available via this provider.
+
+        Used by quota tracker to filter which models to store baselines for.
+        Only models in this list will have quota baselines tracked.
+
+        Returns:
+            List of user-facing model names (e.g., ["claude-sonnet-4-5", "claude-opus-4-5"])
+        """
+        return AVAILABLE_MODELS
 
     def _try_next_base_url(self) -> bool:
         """Switch to next base URL in fallback list. Returns True if successful."""
@@ -2636,6 +2743,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             elif internal_model == "claude-sonnet-4-5" and reasoning_effort:
                 # Sonnet 4.5 uses -thinking only when reasoning_effort is provided
                 internal_model = "claude-sonnet-4-5-thinking"
+
+        # Map gemini-2.5-flash to -thinking variant when reasoning_effort is provided
+        if internal_model == "gemini-2.5-flash" and reasoning_effort:
+            internal_model = "gemini-2.5-flash-thinking"
 
         # Map gemini-3-pro-preview to -low/-high variant based on thinking config
         if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-preview":

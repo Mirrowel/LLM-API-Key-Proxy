@@ -655,7 +655,12 @@ class RotatingClient:
         return model
 
     async def _safe_streaming_wrapper(
-        self, stream: Any, key: str, model: str, request: Optional[Any] = None
+        self,
+        stream: Any,
+        key: str,
+        model: str,
+        request: Optional[Any] = None,
+        provider_plugin: Optional[Any] = None,
     ) -> AsyncGenerator[Any, None]:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
@@ -754,6 +759,7 @@ class RotatingClient:
                     else:
                         # If no usage seen (rare), record success without tokens/cost
                         await self.usage_manager.record_success(key, model)
+
                     break
 
                 except CredentialNeedsReauthError as e:
@@ -1122,6 +1128,7 @@ class RotatingClient:
                             await self.usage_manager.record_success(
                                 current_cred, model, response
                             )
+
                             await self.usage_manager.release_key(current_cred, model)
                             key_acquired = False
                             return response
@@ -1357,6 +1364,7 @@ class RotatingClient:
                             await self.usage_manager.record_success(
                                 current_cred, model, response
                             )
+
                             await self.usage_manager.release_key(current_cred, model)
                             key_acquired = False
                             return response
@@ -1853,7 +1861,11 @@ class RotatingClient:
 
                                 key_acquired = False
                                 stream_generator = self._safe_streaming_wrapper(
-                                    response, current_cred, model, request
+                                    response,
+                                    current_cred,
+                                    model,
+                                    request,
+                                    provider_plugin,
                                 )
 
                                 async for chunk in stream_generator:
@@ -2097,7 +2109,11 @@ class RotatingClient:
 
                             key_acquired = False
                             stream_generator = self._safe_streaming_wrapper(
-                                response, current_cred, model, request
+                                response,
+                                current_cred,
+                                model,
+                                request,
+                                provider_instance,
                             )
 
                             async for chunk in stream_generator:
