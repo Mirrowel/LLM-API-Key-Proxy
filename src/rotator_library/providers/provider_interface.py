@@ -576,7 +576,7 @@ class ProviderInterface(ABC):
         Returns:
             None if no background job, otherwise:
             {
-                "interval": 900,  # seconds between runs
+                "interval": 300,  # seconds between runs
                 "name": "my_job",  # for logging (e.g., "quota_refresh")
                 "run_on_start": True,  # whether to run immediately at startup
             }

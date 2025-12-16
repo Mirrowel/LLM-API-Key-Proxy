@@ -146,7 +146,7 @@ class AntigravityQuotaTracker:
     The provider class must initialize these instance attributes in __init__:
         self._learned_costs: Dict[str, Dict[str, float]] = {}
         self._learned_costs_loaded: bool = False
-        self._quota_refresh_interval: int = 900  # 15 min default
+        self._quota_refresh_interval: int = 300  # 5 min default
     """
 
     # Type hints for attributes that must exist on the provider

@@ -1057,7 +1057,7 @@ class AntigravityProvider(
         and stores it in UsageManager for accurate quota estimation.
         """
         return {
-            "interval": self._quota_refresh_interval,  # default 900s (15 min)
+            "interval": self._quota_refresh_interval,  # default 300s (5 min)
             "name": "quota_baseline_refresh",
             "run_on_start": True,  # fetch baselines immediately at startup
         }

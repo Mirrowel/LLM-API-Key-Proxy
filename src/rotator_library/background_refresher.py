@@ -178,7 +178,7 @@ class BackgroundRefresher:
             self._provider_job_tasks[provider] = task
 
             job_name = config.get("name", "background_job")
-            interval = config.get("interval", 900)
+            interval = config.get("interval", 300)
             lib_logger.info(f"Started {provider} {job_name} (interval: {interval}s)")
 
     async def _run_provider_background_job(
@@ -197,7 +197,7 @@ class BackgroundRefresher:
             credentials: List of credential paths for this provider
             config: Background job configuration from get_background_job_config()
         """
-        interval = config.get("interval", 900)
+        interval = config.get("interval", 300)
         job_name = config.get("name", "background_job")
         run_on_start = config.get("run_on_start", True)
 
