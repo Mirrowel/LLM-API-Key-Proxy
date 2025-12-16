@@ -103,7 +103,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
-EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 4))
+EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 6))
 EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 2)
 
 # Model alias mappings (internal ↔ public)
