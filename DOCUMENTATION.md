@@ -151,12 +151,48 @@ The `EmbeddingBatcher` class optimizes high-throughput embedding workloads.
     2.  A time window (`timeout`, default: 0.1s) elapses since the first request in the batch.
 *   **Efficiency**: This reduces dozens of HTTP calls to a single API request, significantly reducing overhead and rate limit usage.
 
-### 2.4. `background_refresher.py` - Automated Token Maintenance
+### 2.4. `background_refresher.py` - Automated Token Maintenance & Provider Jobs
 
-The `BackgroundRefresher` ensures that OAuth tokens (for providers like Gemini CLI, Qwen, iFlow) never expire while the proxy is running.
+The `BackgroundRefresher` manages background tasks for the proxy, including OAuth token refresh and provider-specific periodic jobs.
 
-*   **Periodic Checks**: It runs a background task that wakes up at a configurable interval (default: 3600 seconds/1 hour).
+#### OAuth Token Refresh
+
+*   **Periodic Checks**: It runs a background task that wakes up at a configurable interval (default: 600 seconds/10 minutes via `OAUTH_REFRESH_INTERVAL`).
 *   **Proactive Refresh**: It iterates through all loaded OAuth credentials and calls their `proactively_refresh` method to ensure tokens are valid before they are needed.
+
+#### Provider-Specific Background Jobs
+
+Providers can define their own background jobs that run on independent schedules:
+
+*   **Independent Timers**: Each provider's job runs on its own interval, separate from the OAuth refresh cycle.
+*   **Configuration**: Providers implement `get_background_job_config()` to define their job settings.
+*   **Execution**: Providers implement `run_background_job()` to execute the periodic task.
+
+**Provider Job Configuration:**
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    """Return configuration for provider-specific background job."""
+    return {
+        "interval": 300,      # seconds between runs
+        "name": "quota_refresh",  # for logging
+        "run_on_start": True,  # whether to run immediately at startup
+    }
+
+async def run_background_job(
+    self,
+    usage_manager: "UsageManager",
+    credentials: List[str],
+) -> None:
+    """Execute the provider's periodic background job."""
+    # Provider-specific logic here
+    pass
+```
+
+**Current Provider Jobs:**
+
+| Provider | Job Name | Default Interval | Purpose |
+|----------|----------|------------------|---------|
+| Antigravity | `quota_baseline_refresh` | 300s (5 min) | Fetches quota status from API to update remaining quota estimates |
 
 ### 2.6. Credential Management Architecture
 
@@ -295,15 +331,19 @@ class ErrorType(Enum):
    - `400` with "quota" → `QUOTA`
    - `500`/`502`/`503` → `SERVER_ERROR`
 
-2. **Message Analysis**: Fallback for ambiguous errors
+2. **Special Exception Types**:
+   - `EmptyResponseError` → `SERVER_ERROR` (status 503, rotatable)
+   - `TransientQuotaError` → `SERVER_ERROR` (status 503, rotatable - bare 429 without retry info)
+
+3. **Message Analysis**: Fallback for ambiguous errors
    - Searches for keywords like "quota exceeded", "rate limit", "invalid api key"
 
-3. **Provider-Specific Overrides**: Some providers use non-standard error formats
+4. **Provider-Specific Overrides**: Some providers use non-standard error formats
 
 **Usage in Client:**
 - `AUTHENTICATION` → Immediate 5-minute global lockout
 - `RATE_LIMIT`/`QUOTA` → Escalating per-model cooldown
-- `SERVER_ERROR` → Retry with same key (up to `max_retries`)
+- `SERVER_ERROR` → Retry with same key (up to `max_retries`), then rotate
 - `CONTEXT_LENGTH`/`CONTENT_FILTER` → Immediate failure (user needs to fix request)
 
 ---
@@ -409,6 +449,124 @@ A modular, shared caching system for providers to persist conversation state acr
 - **Background Persistence**: Batched disk writes every 60 seconds (configurable)
 - **Automatic Cleanup**: Background task removes expired entries from memory cache
 
+### 2.15. Antigravity Quota Tracker (`providers/utilities/antigravity_quota_tracker.py`)
+
+A mixin class providing quota tracking functionality for the Antigravity provider. This enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
+
+#### Core Concepts
+
+**Quota Baseline Tracking:**
+- Periodically fetches quota status from the Antigravity `fetchAvailableModels` API
+- Stores the remaining fraction as a baseline in UsageManager
+- Tracks requests since baseline to estimate current remaining quota
+- Syncs local request count with API's authoritative values
+
+**Quota Cost Constants:**
+Based on empirical testing (see `docs/ANTIGRAVITY_QUOTA_REPORT.md`), quota costs are known per model and tier:
+
+| Tier | Model Group | Cost per Request | Requests per 100% |
+|------|-------------|------------------|-------------------|
+| standard-tier | Claude/GPT-OSS | 0.40% | 250 |
+| standard-tier | Gemini 3 Pro | 0.25% | 400 |
+| standard-tier | Gemini 2.5 Flash | 0.0333% | ~3000 |
+| free-tier | Claude/GPT-OSS | 1.333% | 75 |
+| free-tier | Gemini 3 Pro | 0.40% | 250 |
+
+**Model Name Mappings:**
+Some user-facing model names don't exist directly in the API response:
+- `claude-opus-4-5` → `claude-opus-4-5-thinking` (Opus only exists as thinking variant)
+- `gemini-3-pro-preview` → `gemini-3-pro-high` (preview maps to high by default)
+
+#### Key Methods
+
+**`fetch_quota_from_api(credential_path)`:**
+Fetches current quota status from the Antigravity API. Returns remaining fraction and reset times for all models.
+
+**`estimate_remaining_quota(credential_path, model, model_data, tier)`:**
+Estimates remaining quota based on baseline + request tracking. Returns confidence level (high/medium/low) based on baseline age.
+
+**`refresh_active_quota_baselines(credentials, usage_data)`:**
+Only refreshes baselines for credentials that have been used recently (within the refresh interval).
+
+**`discover_quota_costs(credential_path, models_to_test)`:**
+Manual utility to discover quota costs by making test requests and measuring before/after quota. Saves learned costs to `cache/antigravity/learned_quota_costs.json`.
+
+#### Integration with Background Jobs
+
+The Antigravity provider defines a background job for quota baseline refresh:
+
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    return {
+        "interval": 300,  # 5 minutes (configurable via ANTIGRAVITY_QUOTA_REFRESH_INTERVAL)
+        "name": "quota_baseline_refresh",
+        "run_on_start": True,
+    }
+```
+
+This job:
+1. Identifies credentials used since the last refresh
+2. Fetches current quota from the API for those credentials
+3. Updates baselines in UsageManager for accurate estimation
+
+#### Data Storage
+
+Quota baselines are stored in UsageManager's per-model data:
+
+```json
+{
+  "credential_path": {
+    "models": {
+      "antigravity/claude-sonnet-4-5": {
+        "request_count": 15,
+        "baseline_remaining_fraction": 0.94,
+        "baseline_fetched_at": 1734567890.0,
+        "requests_at_baseline": 15,
+        "quota_max_requests": 250,
+        "quota_display": "15/250"
+      }
+    }
+  }
+}
+```
+
+### 2.16. TransientQuotaError (`error_handler.py`)
+
+A new error type for handling bare 429 responses without retry timing information.
+
+**When Raised:**
+- Provider returns HTTP 429 status code
+- Response doesn't contain retry timing info (no `quotaResetTimeStamp` or `retryDelay`)
+- After internal retry attempts are exhausted
+
+**Behavior:**
+- Classified as `server_error` (status 503) rather than quota exhaustion
+- Causes credential rotation to try the next credential
+- Does NOT trigger long-term quota cooldowns
+
+**Implementation in Antigravity:**
+```python
+# Non-streaming and streaming both retry bare 429s
+for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
+    try:
+        result = await self._handle_request(...)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            quota_info = self.parse_quota_error(e)
+            if quota_info is None:
+                # Bare 429 - retry like empty response
+                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                    continue
+                else:
+                    raise TransientQuotaError(provider, model, message)
+            # Has retry info - real quota exhaustion
+            raise
+```
+
+**Rationale:**
+Some 429 responses are transient rate limits rather than true quota exhaustion. These occur when the API is temporarily overloaded but the credential still has quota available. Retrying internally before rotating credentials provides better resilience.
+
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
 The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
@@ -421,8 +579,10 @@ The most sophisticated provider implementation, supporting Google's internal Ant
 - **Credential Prioritization**: Automatic tier detection with paid credentials prioritized over free (paid tier resets every 5 hours, free tier resets weekly)
 - **Sequential Rotation Mode**: Default rotation mode is sequential (use credentials until exhausted) to maximize thought signature cache hits
 - **Per-Model Quota Tracking**: Each model tracks independent usage windows with authoritative reset timestamps from quota errors
-- **Quota Groups**: Claude models (Sonnet 4.5 + Opus 4.5) can be grouped to share quota limits (disabled by default, configurable via `QUOTA_GROUPS_ANTIGRAVITY_CLAUDE`)
+- **Quota Groups**: Models that share quota limits are grouped together (Claude/GPT-OSS share quota, Gemini 3 Pro variants share quota, Gemini 2.5 Flash variants share quota)
 - **Priority Multipliers**: Paid tier credentials get higher concurrency limits (Priority 1: 5x, Priority 2: 3x, Priority 3+: 2x in sequential mode)
+- **Quota Baseline Tracking**: Background job fetches quota status from API to provide accurate remaining quota estimates
+- **TransientQuotaError Handling**: Bare 429 responses (without retry info) are retried internally before credential rotation
 
 #### Model Support
 
@@ -437,8 +597,18 @@ The most sophisticated provider implementation, supporting Google's internal Ant
   - Caching signatures from responses for reuse in follow-up messages
   - Automatic injection into functionCalls for multi-turn conversations
   - Fallback to bypass value if signature unavailable
+- **Parallel Tool Usage Instruction**: Configurable instruction injection to encourage parallel tool calls (disabled by default for Gemini 3)
 
-**Claude Opus 4.5 (NEW!):**
+**Gemini 2.5 Flash:**
+- Uses `-thinking` variant when `reasoning_effort` is provided
+- Shares quota with `gemini-2.5-flash-thinking` and `gemini-2.5-flash-lite` variants
+- Parallel tool usage instruction configurable
+
+**Gemini 2.5 Flash Lite:**
+- Configurable thinking budget, no name change required
+- Shares quota with Flash variants
+
+**Claude Opus 4.5:**
 - Anthropic's most powerful model, now available via Antigravity proxy
 - **Always uses thinking variant** - `claude-opus-4-5-thinking` is the only available variant (non-thinking version doesn't exist)
 - Uses `thinkingBudget` parameter for extended thinking control (-1 for auto, 0 to disable, or specific token count)
@@ -453,6 +623,11 @@ The most sophisticated provider implementation, supporting Google's internal Ant
   - Without `reasoning_effort`: Uses standard `claude-sonnet-4-5` variant
 - **Thinking Preservation**: Caches thinking content using composite keys (tool_call_id + text_hash)
 - **Schema Cleaning**: Removes unsupported properties (`$schema`, `additionalProperties`, `const` → `enum`)
+- **Parallel Tool Usage Instruction**: Automatic instruction injection to encourage parallel tool calls (enabled by default for Claude)
+
+**GPT-OSS 120B Medium:**
+- OpenAI-compatible model available via Antigravity
+- Shares quota with Claude models (Claude/GPT-OSS quota group)
 
 #### Base URL Fallback
 
@@ -494,6 +669,14 @@ ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable Claude thinking mode aut
 ANTIGRAVITY_GEMINI3_TOOL_PREFIX="gemini3_"  # Namespace prefix
 ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT="\n\nSTRICT PARAMETERS: {params}."
 ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
+
+# Parallel tool usage instruction
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Inject parallel tool instruction for Claude (default: true)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3=false  # Inject parallel tool instruction for Gemini 3 (default: false)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION="..."  # Custom instruction text
+
+# Quota tracking
+ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Background quota refresh interval in seconds (default: 300 = 5 min)
 ```
 
 #### Claude Extended Thinking Sanitization
@@ -714,15 +897,24 @@ Models that share the same quota limits can be grouped:
 **Configuration**:
 ```env
 # Models in a group share quota/cooldown timing
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-sonnet-4-5-thinking,claude-opus-4-5,claude-opus-4-5-thinking,gpt-oss-120b-medium"
+QUOTA_GROUPS_ANTIGRAVITY_GEMINI_3_PRO="gemini-3-pro-high,gemini-3-pro-low,gemini-3-pro-preview"
+QUOTA_GROUPS_ANTIGRAVITY_GEMINI_2_5_FLASH="gemini-2.5-flash,gemini-2.5-flash-thinking,gemini-2.5-flash-lite"
 
 # To disable a default group:
 QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
 ```
 
+**Default Quota Groups (Antigravity)**:
+
+| Group Name | Models | Shared Quota |
+|------------|--------|--------------|
+| `claude` | claude-sonnet-4-5, claude-sonnet-4-5-thinking, claude-opus-4-5, claude-opus-4-5-thinking, gpt-oss-120b-medium | Yes (Claude and GPT-OSS share quota) |
+| `gemini-3-pro` | gemini-3-pro-high, gemini-3-pro-low, gemini-3-pro-preview | Yes |
+| `gemini-2.5-flash` | gemini-2.5-flash, gemini-2.5-flash-thinking, gemini-2.5-flash-lite | Yes |
+
 **Behavior**:
 - When one model hits quota, all models in the group receive the same `quota_reset_ts`
-- Combined weighted usage for credential selection (e.g., Opus counts 2x vs Sonnet)
 - Group resets only when ALL models' quotas have reset
 - Preserves unexpired cooldowns during other resets
 
@@ -730,11 +922,26 @@ QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
 ```python
 class AntigravityProvider(ProviderInterface):
     model_quota_groups = {
-        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"]
-    }
-    
-    model_usage_weights = {
-        "claude-opus-4-5": 2  # Opus counts 2x vs Sonnet
+        # Claude and GPT-OSS share the same quota pool
+        "claude": [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking",
+            "gpt-oss-120b-medium",
+        ],
+        # Gemini 3 Pro variants share quota
+        "gemini-3-pro": [
+            "gemini-3-pro-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-preview",
+        ],
+        # Gemini 2.5 Flash variants share quota
+        "gemini-2.5-flash": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-flash-lite",
+        ],
     }
 ```
 

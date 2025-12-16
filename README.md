@@ -329,10 +329,19 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 **Antigravity:**
 - Gemini 3 Pro with `thinkingLevel` support
+- Gemini 2.5 Flash/Flash Lite with thinking mode
 - Claude Opus 4.5 (thinking mode)
 - Claude Sonnet 4.5 (thinking and non-thinking)
+- GPT-OSS 120B Medium
 - Thought signature caching for multi-turn conversations
 - Tool hallucination prevention
+- Quota baseline tracking with background refresh
+- Parallel tool usage instruction injection
+- **Quota Groups**: Models that share quota are automatically grouped:
+    - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
+    - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
+    - Gemini 2.5 Flash: `gemini-2.5-flash`, `gemini-2.5-flash-thinking`, `gemini-2.5-flash-lite`
+    - All models in a group deplete the usage of the group equally. So in claude group - it is beneficial to use only Opus, and forget about Sonnet and GPT-OSS.
 
 **Qwen Code:**
 - Dual auth (API key + OAuth Device Flow)
@@ -531,9 +540,11 @@ Access Google's internal Antigravity API for cutting-edge models.
 
 **Supported Models:**
 - **Gemini 3 Pro** — with `thinkingLevel` support (low/high)
+- **Gemini 2.5 Flash** — with thinking mode support
+- **Gemini 2.5 Flash Lite** — configurable thinking budget
 - **Claude Opus 4.5** — Anthropic's most powerful model (thinking mode only)
 - **Claude Sonnet 4.5** — supports both thinking and non-thinking modes
-- Gemini 2.5 Pro/Flash
+- **GPT-OSS 120B** — OpenAI-compatible model
 
 **Setup:**
 1. Run `python -m rotator_library.credential_tool`
@@ -545,6 +556,8 @@ Access Google's internal Antigravity API for cutting-edge models.
 - Tool hallucination prevention via parameter signature injection
 - Automatic thinking block sanitization for Claude
 - Credential prioritization (paid resets every 5 hours, free weekly)
+- Quota baseline tracking with background refresh (accurate remaining quota estimates)
+- Parallel tool usage instruction injection for Claude
 
 **Environment Variables:**
 ```env
@@ -556,6 +569,8 @@ ANTIGRAVITY_EMAIL="your-email@gmail.com"
 # Feature toggles
 ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
 ANTIGRAVITY_GEMINI3_TOOL_FIX=true
+ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval (seconds)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Parallel tool instruction for Claude
 ```
 
 > **Note:** Gemini 3 models require a paid-tier Google Cloud project.
