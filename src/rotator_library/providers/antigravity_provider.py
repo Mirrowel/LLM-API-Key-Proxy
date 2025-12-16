@@ -863,6 +863,9 @@ class AntigravityProvider(
         self._quota_refresh_interval = _env_int(
             "ANTIGRAVITY_QUOTA_REFRESH_INTERVAL", 300
         )  # 5 min
+        self._initial_quota_fetch_done: bool = (
+            False  # Track if initial full fetch completed
+        )
 
         # Feature flags
         self._preserve_signatures_in_client = _env_bool(
@@ -1068,19 +1071,27 @@ class AntigravityProvider(
         credentials: List[str],
     ) -> None:
         """
-        Refresh quota baselines for recently used credentials.
+        Refresh quota baselines for credentials.
+
+        On first run (startup): Fetches quota for ALL credentials to establish baselines.
+        On subsequent runs: Only fetches for credentials used since last refresh.
 
         Fetches current quota status from the Antigravity API and stores
         the baselines in UsageManager for accurate quota estimation.
-        Only fetches for credentials that have been used since the last refresh.
         """
-        # Get usage data to determine which credentials were recently used
-        usage_data = await usage_manager._get_usage_data_snapshot()
-
-        # Use refresh_active_quota_baselines which filters to recently used credentials
-        quota_results = await self.refresh_active_quota_baselines(
-            credentials, usage_data
-        )
+        if not self._initial_quota_fetch_done:
+            # First run: fetch ALL credentials to establish baselines
+            lib_logger.info(
+                f"Antigravity: Fetching initial quota baselines for {len(credentials)} credentials..."
+            )
+            quota_results = await self.fetch_initial_baselines(credentials)
+            self._initial_quota_fetch_done = True
+        else:
+            # Subsequent runs: only recently used credentials (incremental updates)
+            usage_data = await usage_manager._get_usage_data_snapshot()
+            quota_results = await self.refresh_active_quota_baselines(
+                credentials, usage_data
+            )
 
         if not quota_results:
             return
