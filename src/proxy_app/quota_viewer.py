@@ -417,25 +417,51 @@ class QuotaViewer:
                 if quota_groups:
                     quota_lines = []
                     for group_name, group_stats in quota_groups.items():
-                        avg_pct = group_stats.get("avg_remaining_pct", 0)
-                        exhausted = group_stats.get("credentials_exhausted", 0)
-                        total = group_stats.get("credentials_total", 0)
+                        # Use total requests for global view
+                        total_used = group_stats.get("total_requests_used", 0)
+                        total_max = group_stats.get("total_requests_max", 0)
+                        total_pct = group_stats.get("total_remaining_pct")
+                        tiers = group_stats.get("tiers", {})
 
-                        # Determine color based on remaining
-                        if exhausted > 0:
-                            color = "red"
-                            status = f"({exhausted}/{total} exhausted)"
-                        elif avg_pct < 20:
-                            color = "yellow"
-                            status = ""
+                        # Format tier info: "5(15)f/2s" = 5 active out of 15 free, 2 standard all active
+                        tier_parts = []
+                        for tier_name, tier_info in sorted(tiers.items()):
+                            if tier_name == "unknown":
+                                continue  # Skip unknown tiers in display
+                            total_t = tier_info.get("total", 0)
+                            active_t = tier_info.get("active", 0)
+                            # Use first letter: standard-tier -> s, free-tier -> f
+                            short = tier_name.replace("-tier", "")[0]
+
+                            if active_t < total_t:
+                                # Some exhausted - show active(total)
+                                tier_parts.append(f"{active_t}({total_t}){short}")
+                            else:
+                                # All active - just show total
+                                tier_parts.append(f"{total_t}{short}")
+                        tier_str = "/".join(tier_parts) if tier_parts else ""
+
+                        # Determine color based purely on remaining percentage
+                        if total_pct is not None:
+                            if total_pct <= 10:
+                                color = "red"
+                            elif total_pct < 30:
+                                color = "yellow"
+                            else:
+                                color = "green"
                         else:
-                            color = "green"
-                            status = ""
+                            color = "dim"
 
-                        bar = create_progress_bar(avg_pct)
-                        display_name = group_name[:10]
+                        bar = create_progress_bar(total_pct)
+                        display_name = group_name[:11]
+                        pct_str = f"{total_pct}%" if total_pct is not None else "?"
+
+                        # Build status suffix (just tiers now, no outer parens)
+                        status = tier_str
+
+                        # Compact format: "claude: 1228/1625 24% ████░░░░░░ (5(15)f/2s)"
                         quota_lines.append(
-                            f"[{color}]{display_name}: {avg_pct}% {bar}[/{color}] {status}"
+                            f"[{color}]{display_name}: {total_used}/{total_max} {pct_str} {bar}[/{color}] {status}"
                         )
 
                     # First line goes in the main row

@@ -2657,6 +2657,11 @@ class RotatingClient:
                         "credentials_exhausted": 0,
                         "avg_remaining_pct": 0,
                         "total_remaining_pcts": [],
+                        # Total requests tracking across all credentials
+                        "total_requests_used": 0,
+                        "total_requests_max": 0,
+                        # Tier breakdown: tier_name -> {"total": N, "active": M}
+                        "tiers": {},
                     }
 
                     # Calculate per-credential quota for this group
@@ -2664,17 +2669,44 @@ class RotatingClient:
                         models_data = cred.get("models", {})
                         group_stats["credentials_total"] += 1
 
-                        # Find any model from this group (try all with alias fallback)
+                        # Track tier - get directly from provider cache since cred["tier"] not set yet
+                        tier = cred.get("tier")
+                        if not tier and hasattr(
+                            provider_instance, "project_tier_cache"
+                        ):
+                            cred_path = cred.get("full_path", "")
+                            tier = provider_instance.project_tier_cache.get(cred_path)
+                        tier = tier or "unknown"
+
+                        # Initialize tier entry if needed
+                        if tier not in group_stats["tiers"]:
+                            group_stats["tiers"][tier] = {"total": 0, "active": 0}
+                        group_stats["tiers"][tier]["total"] += 1
+
+                        # Find model with VALID baseline (not just any model with stats)
                         model_stats = None
                         for model in group_models:
-                            model_stats = self._find_model_stats_in_data(
+                            candidate = self._find_model_stats_in_data(
                                 models_data, model, provider, provider_instance
                             )
-                            if model_stats:
-                                break
+                            if candidate:
+                                baseline = candidate.get("baseline_remaining_fraction")
+                                if baseline is not None:
+                                    model_stats = candidate
+                                    break
+                                # Keep first found as fallback (for request counts)
+                                if model_stats is None:
+                                    model_stats = candidate
 
                         if model_stats:
                             baseline = model_stats.get("baseline_remaining_fraction")
+                            req_count = model_stats.get("request_count", 0)
+                            max_req = model_stats.get("quota_max_requests") or 0
+
+                            # Accumulate totals (one model per group per credential)
+                            group_stats["total_requests_used"] += req_count
+                            group_stats["total_requests_max"] += max_req
+
                             if baseline is not None:
                                 remaining_pct = int(baseline * 100)
                                 group_stats["total_remaining_pcts"].append(
@@ -2682,14 +2714,27 @@ class RotatingClient:
                                 )
                                 if baseline <= 0:
                                     group_stats["credentials_exhausted"] += 1
+                                else:
+                                    # Credential is active (has quota remaining)
+                                    group_stats["tiers"][tier]["active"] += 1
 
-                    # Calculate average remaining percentage
+                    # Calculate average remaining percentage (per-credential average)
                     if group_stats["total_remaining_pcts"]:
                         group_stats["avg_remaining_pct"] = int(
                             sum(group_stats["total_remaining_pcts"])
                             / len(group_stats["total_remaining_pcts"])
                         )
                     del group_stats["total_remaining_pcts"]
+
+                    # Calculate total remaining percentage (global)
+                    if group_stats["total_requests_max"] > 0:
+                        used = group_stats["total_requests_used"]
+                        max_r = group_stats["total_requests_max"]
+                        group_stats["total_remaining_pct"] = max(
+                            0, int((1 - used / max_r) * 100)
+                        )
+                    else:
+                        group_stats["total_remaining_pct"] = None
 
                     prov_stats["quota_groups"][group_name] = group_stats
 
@@ -2699,14 +2744,20 @@ class RotatingClient:
                     models_data = cred.get("models", {})
 
                     for group_name, group_models in quota_groups.items():
-                        # Find representative model from this group (try all with alias fallback)
+                        # Find model with VALID baseline (prefer over any model with stats)
                         model_stats = None
                         for model in group_models:
-                            model_stats = self._find_model_stats_in_data(
+                            candidate = self._find_model_stats_in_data(
                                 models_data, model, provider, provider_instance
                             )
-                            if model_stats:
-                                break
+                            if candidate:
+                                baseline = candidate.get("baseline_remaining_fraction")
+                                if baseline is not None:
+                                    model_stats = candidate
+                                    break
+                                # Keep first found as fallback
+                                if model_stats is None:
+                                    model_stats = candidate
 
                         if model_stats:
                             baseline = model_stats.get("baseline_remaining_fraction")
