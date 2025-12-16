@@ -28,7 +28,7 @@ class TimeoutConfig:
     _CONNECT = 30.0
     _WRITE = 30.0
     _POOL = 60.0
-    _READ_STREAMING = 180.0  # 3 minutes between chunks
+    _READ_STREAMING = 300.0  # 5 minutes between chunks
     _READ_NON_STREAMING = 600.0  # 10 minutes for full response
 
     @classmethod
