@@ -230,6 +230,9 @@ You MUST follow these rules strictly:
 If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully.
 """
 
+# Parallel tool usage encouragement instruction
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -900,6 +903,19 @@ class AntigravityProvider(
             "ANTIGRAVITY_CLAUDE_SYSTEM_INSTRUCTION", DEFAULT_CLAUDE_SYSTEM_INSTRUCTION
         )
 
+        # Parallel tool usage instruction configuration
+        self._enable_parallel_tool_instruction_claude = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE",
+            True,  # ON for Claude
+        )
+        self._enable_parallel_tool_instruction_gemini3 = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3",
+            False,  # OFF for Gemini 3
+        )
+        self._parallel_tool_instruction = os.getenv(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION", DEFAULT_PARALLEL_TOOL_INSTRUCTION
+        )
+
         # Log configuration
         self._log_config()
 
@@ -909,7 +925,9 @@ class AntigravityProvider(
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
-            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
+            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
+            f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
+            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
@@ -3287,6 +3305,19 @@ class AntigravityProvider(
             elif self._is_claude(model) and self._enable_claude_tool_fix:
                 self._inject_tool_hardening_instruction(
                     gemini_payload, self._claude_system_instruction
+                )
+
+            # Inject parallel tool usage encouragement (independent of tool hardening)
+            if self._is_claude(model) and self._enable_parallel_tool_instruction_claude:
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
+                )
+            elif (
+                self._is_gemini_3(model)
+                and self._enable_parallel_tool_instruction_gemini3
+            ):
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
                 )
 
         # Add generation config
