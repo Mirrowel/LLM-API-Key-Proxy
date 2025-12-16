@@ -600,6 +600,43 @@ class UsageManager:
         async with self._data_lock:
             return dict(self._usage_data) if self._usage_data else {}
 
+    async def get_available_credentials_for_model(
+        self, credentials: List[str], model: str
+    ) -> List[str]:
+        """
+        Get credentials that are not on cooldown for a specific model.
+
+        Filters out credentials where:
+        - key_cooldown_until > now (key-level cooldown)
+        - model_cooldowns[model] > now (model-specific cooldown, includes quota exhausted)
+
+        Args:
+            credentials: List of credential identifiers to check
+            model: Model name to check cooldowns for
+
+        Returns:
+            List of credentials that are available (not on cooldown) for this model
+        """
+        await self._lazy_init()
+        now = time.time()
+        available = []
+
+        async with self._data_lock:
+            for key in credentials:
+                key_data = self._usage_data.get(key, {})
+
+                # Skip if key-level cooldown is active
+                if (key_data.get("key_cooldown_until") or 0) > now:
+                    continue
+
+                # Skip if model-specific cooldown is active
+                if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                    continue
+
+                available.append(key)
+
+        return available
+
     async def _reset_daily_stats_if_needed(self):
         """
         Checks if usage stats need to be reset for any key.

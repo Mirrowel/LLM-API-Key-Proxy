@@ -1033,8 +1033,17 @@ class RotatingClient:
                 if not creds_to_try:
                     break
 
+                # Get count of credentials not on cooldown for this model
+                available_creds = (
+                    await self.usage_manager.get_available_credentials_for_model(
+                        creds_to_try, model
+                    )
+                )
+                available_count = len(available_creds)
+                total_count = len(credentials_for_provider)
+
                 lib_logger.info(
-                    f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{len(credentials_for_provider)}"
+                    f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{available_count}({total_count})"
                 )
                 max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
@@ -1757,8 +1766,17 @@ class RotatingClient:
                         )
                         break
 
+                    # Get count of credentials not on cooldown for this model
+                    available_creds = (
+                        await self.usage_manager.get_available_credentials_for_model(
+                            creds_to_try, model
+                        )
+                    )
+                    available_count = len(available_creds)
+                    total_count = len(credentials_for_provider)
+
                     lib_logger.info(
-                        f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{len(credentials_for_provider)}"
+                        f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{available_count}({total_count})"
                     )
                     max_concurrent = self.max_concurrent_requests_per_key.get(
                         provider, 1
