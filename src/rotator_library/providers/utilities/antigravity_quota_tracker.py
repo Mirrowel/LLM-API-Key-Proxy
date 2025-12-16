@@ -651,41 +651,31 @@ class AntigravityQuotaTracker:
                         cred_usage = usage_data[cred_path]
                         models_usage = cred_usage.get("models", {})
 
-                        # Sum up request counts across all models in group
-                        total_requests = 0
-                        baseline_remaining = None
-                        baseline_fetched_at = None
+                        # Get request_count from representative model (synced across group)
+                        # Try with and without provider prefix for first model in group
+                        representative_model = group_models[0]
+                        prefixed_model = f"antigravity/{representative_model}"
+                        model_usage = models_usage.get(
+                            prefixed_model
+                        ) or models_usage.get(representative_model, {})
+
+                        total_requests = model_usage.get("request_count", 0)
+                        baseline_remaining = model_usage.get(
+                            "baseline_remaining_fraction"
+                        )
+                        baseline_fetched_at = model_usage.get("baseline_fetched_at")
+                        max_requests = model_usage.get("quota_max_requests")
+
+                        # Get reset time from any model in group (also synced)
                         reset_time_iso = None
-
-                        for gm in group_models:
-                            # Try with and without provider prefix
-                            prefixed_model = f"antigravity/{gm}"
-                            model_usage = models_usage.get(
-                                prefixed_model
-                            ) or models_usage.get(gm, {})
-
-                            total_requests += model_usage.get("request_count", 0)
-
-                            # Use the first available baseline
-                            if baseline_remaining is None:
-                                baseline_remaining = model_usage.get(
-                                    "baseline_remaining_fraction"
-                                )
-                                baseline_fetched_at = model_usage.get(
-                                    "baseline_fetched_at"
-                                )
-
-                            # Use earliest reset time
-                            if model_usage.get("quota_reset_ts"):
-                                ts = model_usage["quota_reset_ts"]
-                                try:
-                                    iso = datetime.fromtimestamp(
-                                        ts, tz=timezone.utc
-                                    ).isoformat()
-                                    if reset_time_iso is None or iso < reset_time_iso:
-                                        reset_time_iso = iso
-                                except (ValueError, OSError):
-                                    pass
+                        if model_usage.get("quota_reset_ts"):
+                            ts = model_usage["quota_reset_ts"]
+                            try:
+                                reset_time_iso = datetime.fromtimestamp(
+                                    ts, tz=timezone.utc
+                                ).isoformat()
+                            except (ValueError, OSError):
+                                pass
 
                         # Calculate estimate
                         # cost_per_request is in percentage (0.4 = 0.4%), convert to fraction
@@ -693,9 +683,11 @@ class AntigravityQuotaTracker:
                             group_models[0], tier
                         )
                         cost_per_request_fraction = cost_per_request_percent / 100.0
-                        max_requests = self.get_max_requests_for_model(
-                            group_models[0], tier
-                        )
+                        # Use max_requests from usage data if available, otherwise calculate
+                        if max_requests is None:
+                            max_requests = self.get_max_requests_for_model(
+                                group_models[0], tier
+                            )
 
                         if baseline_remaining is not None:
                             estimated_remaining = baseline_remaining - (

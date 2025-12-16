@@ -186,6 +186,7 @@ class UsageManager:
         Supports multiple credential formats:
         - OAuth: "oauth_creds/antigravity_oauth_15.json" -> "antigravity"
         - OAuth: "C:\\...\\oauth_creds\\gemini_cli_oauth_1.json" -> "gemini_cli"
+        - OAuth filename only: "antigravity_oauth_1.json" -> "antigravity"
         - API key style: stored with provider prefix metadata
 
         Args:
@@ -199,13 +200,18 @@ class UsageManager:
         # Normalize path separators
         normalized = credential.replace("\\", "/")
 
-        # Pattern: {provider}_oauth_{number}.json
+        # Pattern: path ending with {provider}_oauth_{number}.json
         match = re.search(r"/([a-z_]+)_oauth_\d+\.json$", normalized, re.IGNORECASE)
         if match:
             return match.group(1).lower()
 
         # Pattern: oauth_creds/{provider}_...
         match = re.search(r"oauth_creds/([a-z_]+)_", normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
+        # Pattern: filename only {provider}_oauth_{number}.json (no path)
+        match = re.match(r"([a-z_]+)_oauth_\d+\.json$", normalized, re.IGNORECASE)
         if match:
             return match.group(1).lower()
 
@@ -337,22 +343,20 @@ class UsageManager:
         """
         Get usage count for credential selection, considering quota groups.
 
-        If the model belongs to a quota group, returns the weighted combined usage
-        across all models in the group. Otherwise returns individual model usage.
-
-        Weights are applied per-model to account for models that consume more quota
-        per request (e.g., Opus might count 2x compared to Sonnet).
-
         For providers in _REQUEST_COUNT_PROVIDERS (e.g., antigravity), uses
         request_count instead of success_count since failed requests also
         consume quota.
+
+        If the model belongs to a quota group, the request_count is already
+        synced across all models in the group (by record_success/record_failure),
+        so we just read from the requested model directly.
 
         Args:
             key: Credential identifier
             model: Model name (with provider prefix, e.g., "antigravity/claude-sonnet-4-5")
 
         Returns:
-            Weighted combined usage if grouped, otherwise individual model usage
+            Usage count for the model (synced across group if applicable)
         """
         # Determine usage field based on provider
         # Some providers (antigravity) count failed requests against quota
@@ -363,7 +367,14 @@ class UsageManager:
             else "success_count"
         )
 
-        # Check if model is in a quota group
+        # For providers with synced quota groups (antigravity), request_count
+        # is already synced across all models in the group, so just read directly.
+        # For other providers, we still need to sum success_count across group.
+        if provider in self._REQUEST_COUNT_PROVIDERS:
+            # request_count is synced - just read the model's value
+            return self._get_usage_count(key, model, usage_field)
+
+        # For non-synced providers, check if model is in a quota group and sum
         group = self._get_model_quota_group(key, model)
 
         if group:
@@ -1571,6 +1582,35 @@ class UsageManager:
                 model_data["success_count"] += 1
                 model_data["request_count"] = model_data.get("request_count", 0) + 1
 
+                # Sync request_count across quota group (for providers with shared quota pools)
+                new_request_count = model_data["request_count"]
+                group = self._get_model_quota_group(key, model)
+                if group:
+                    grouped_models = self._get_grouped_models(key, group)
+                    for grouped_model in grouped_models:
+                        if grouped_model != model:
+                            other_model_data = key_data["models"].setdefault(
+                                grouped_model,
+                                {
+                                    "window_start_ts": None,
+                                    "quota_reset_ts": None,
+                                    "success_count": 0,
+                                    "failure_count": 0,
+                                    "request_count": 0,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "approx_cost": 0.0,
+                                },
+                            )
+                            other_model_data["request_count"] = new_request_count
+                            # Also sync quota_max_requests if set
+                            max_req = model_data.get("quota_max_requests")
+                            if max_req:
+                                other_model_data["quota_max_requests"] = max_req
+                                other_model_data["quota_display"] = (
+                                    f"{new_request_count}/{max_req}"
+                                )
+
                 # Update quota_display if max_requests is set (Antigravity-specific)
                 max_req = model_data.get("quota_max_requests")
                 if max_req:
@@ -1765,6 +1805,7 @@ class UsageManager:
                     # Track failure for quota estimation (request still consumes quota)
                     model_data["failure_count"] = model_data.get("failure_count", 0) + 1
                     model_data["request_count"] = model_data.get("request_count", 0) + 1
+                    new_request_count = model_data["request_count"]
 
                     # Apply to all models in the same quota group
                     group = self._get_model_quota_group(key, model)
@@ -1785,6 +1826,15 @@ class UsageManager:
                                 },
                             )
                             group_model_data["quota_reset_ts"] = quota_reset_ts
+                            # Sync request_count across quota group
+                            group_model_data["request_count"] = new_request_count
+                            # Also sync quota_max_requests if set
+                            max_req = model_data.get("quota_max_requests")
+                            if max_req:
+                                group_model_data["quota_max_requests"] = max_req
+                                group_model_data["quota_display"] = (
+                                    f"{new_request_count}/{max_req}"
+                                )
                             # Also set transient cooldown for selection logic
                             model_cooldowns[grouped_model] = quota_reset_ts
 
@@ -1886,6 +1936,35 @@ class UsageManager:
                 if classified_error.error_type != "quota_exceeded":
                     model_data["failure_count"] = model_data.get("failure_count", 0) + 1
                     model_data["request_count"] = model_data.get("request_count", 0) + 1
+
+                    # Sync request_count across quota group
+                    new_request_count = model_data["request_count"]
+                    group = self._get_model_quota_group(key, model)
+                    if group:
+                        grouped_models = self._get_grouped_models(key, group)
+                        for grouped_model in grouped_models:
+                            if grouped_model != model:
+                                other_model_data = models_data.setdefault(
+                                    grouped_model,
+                                    {
+                                        "window_start_ts": None,
+                                        "quota_reset_ts": None,
+                                        "success_count": 0,
+                                        "failure_count": 0,
+                                        "request_count": 0,
+                                        "prompt_tokens": 0,
+                                        "completion_tokens": 0,
+                                        "approx_cost": 0.0,
+                                    },
+                                )
+                                other_model_data["request_count"] = new_request_count
+                                # Also sync quota_max_requests if set
+                                max_req = model_data.get("quota_max_requests")
+                                if max_req:
+                                    other_model_data["quota_max_requests"] = max_req
+                                    other_model_data["quota_display"] = (
+                                        f"{new_request_count}/{max_req}"
+                                    )
 
             key_data["last_failure"] = {
                 "timestamp": now_ts,
@@ -1990,6 +2069,32 @@ class UsageManager:
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
                 model_data["quota_display"] = f"{used_requests}/{max_requests}"
+
+            # Sync request_count and quota_max_requests across quota group
+            group = self._get_model_quota_group(credential, model)
+            if group:
+                grouped_models = self._get_grouped_models(credential, group)
+                for grouped_model in grouped_models:
+                    if grouped_model != model:
+                        other_model_data = key_data["models"].setdefault(
+                            grouped_model,
+                            {
+                                "window_start_ts": None,
+                                "quota_reset_ts": None,
+                                "success_count": 0,
+                                "failure_count": 0,
+                                "request_count": 0,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "approx_cost": 0.0,
+                            },
+                        )
+                        other_model_data["request_count"] = used_requests
+                        if max_requests is not None:
+                            other_model_data["quota_max_requests"] = max_requests
+                            other_model_data["quota_display"] = (
+                                f"{used_requests}/{max_requests}"
+                            )
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
