@@ -656,28 +656,53 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         import re as regex_module
 
         def parse_duration(duration_str: str) -> Optional[int]:
-            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds."""
+            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds.
+
+            Also handles millisecond format: '290.979975ms' -> 0 seconds (rounded).
+            Returns 0 for sub-second durations (not None), as 0 is a valid value.
+            """
             if not duration_str:
                 return None
 
-            # Handle pure seconds format: "515092.730699158s"
+            # Handle pure milliseconds format: "290.979975ms"
+            # MUST check this BEFORE checking 'm' for minutes to avoid misinterpreting 'ms'
+            ms_match = regex_module.match(r"^([\d.]+)ms$", duration_str)
+            if ms_match:
+                ms_value = float(ms_match.group(1))
+                # Convert milliseconds to seconds, round up to at least 1 if > 0
+                seconds = ms_value / 1000.0
+                return max(1, int(seconds)) if seconds > 0 else 0
+
+            # Handle pure seconds format: "515092.730699158s" or "0.290979975s"
             pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
             if pure_seconds_match:
-                return int(float(pure_seconds_match.group(1)))
+                seconds = float(pure_seconds_match.group(1))
+                # For sub-second values, round up to 1 to avoid immediate retry floods
+                return max(1, int(seconds)) if seconds > 0 else 0
 
             # Handle compound format: "143h4m52.730699158s"
-            total_seconds = 0
+            # Note: 'm' here means minutes, not milliseconds (ms is handled above)
+            total_seconds = 0.0
             patterns = [
                 (r"(\d+)h", 3600),  # hours
-                (r"(\d+)m", 60),  # minutes
-                (r"([\d.]+)s", 1),  # seconds
+                (
+                    r"(\d+)m(?!s)",
+                    60,
+                ),  # minutes - negative lookahead to avoid matching 'ms'
+                (
+                    r"([\d.]+)s$",
+                    1,
+                ),  # seconds - anchor to end to avoid matching 's' in 'ms'
             ]
             for pattern, multiplier in patterns:
                 match = regex_module.search(pattern, duration_str)
                 if match:
                     total_seconds += float(match.group(1)) * multiplier
 
-            return int(total_seconds) if total_seconds > 0 else None
+            # Return 0 explicitly for very small values (it's valid, not "no value")
+            if total_seconds > 0:
+                return max(1, int(total_seconds))
+            return None
 
         # Get error body from exception if not provided
         body = error_body
@@ -722,7 +747,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 retry_delay = detail.get("retryDelay")
                 if retry_delay:
                     parsed = parse_duration(retry_delay)
-                    if parsed:
+                    if parsed is not None:  # 0 is valid, only None means "no value"
                         result["retry_after"] = parsed
 
             # Parse ErrorInfo - contains reason and quota reset metadata
@@ -731,11 +756,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 metadata = detail.get("metadata", {})
 
                 # Get quotaResetDelay as fallback if RetryInfo not present
-                if not result["retry_after"]:
+                if result["retry_after"] is None:
                     quota_delay = metadata.get("quotaResetDelay")
                     if quota_delay:
                         parsed = parse_duration(quota_delay)
-                        if parsed:
+                        if parsed is not None:  # 0 is valid, only None means "no value"
                             result["retry_after"] = parsed
 
                 # Capture reset timestamp for logging and authoritative reset time
@@ -756,7 +781,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         )
 
         # Return None if we couldn't extract retry_after
-        if not result["retry_after"]:
+        if result["retry_after"] is None:
             # Handle bare RESOURCE_EXHAUSTED without timing details
             error_status = error_obj.get("status", "")
             error_code = error_obj.get("code")
