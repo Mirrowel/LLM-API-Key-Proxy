@@ -1148,6 +1148,145 @@ async def list_providers(_=Depends(verify_api_key)):
     return list(PROVIDER_PLUGINS.keys())
 
 
+@app.get("/v1/quota-stats")
+async def get_quota_stats(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+    provider: str = None,
+):
+    """
+    Returns quota and usage statistics for all credentials.
+
+    This returns cached data from the proxy without making external API calls.
+    Use POST to reload from disk or force refresh from external APIs.
+
+    Query Parameters:
+        provider: Optional filter to return stats for a specific provider only
+
+    Returns:
+        {
+            "providers": {
+                "provider_name": {
+                    "credential_count": int,
+                    "active_count": int,
+                    "on_cooldown_count": int,
+                    "exhausted_count": int,
+                    "total_requests": int,
+                    "tokens": {...},
+                    "approx_cost": float | null,
+                    "quota_groups": {...},  // For Antigravity
+                    "credentials": [...]
+                }
+            },
+            "summary": {...},
+            "data_source": "cache",
+            "timestamp": float
+        }
+    """
+    try:
+        stats = await client.get_quota_stats(provider_filter=provider)
+        return stats
+    except Exception as e:
+        logging.error(f"Failed to get quota stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/quota-stats")
+async def refresh_quota_stats(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """
+    Refresh quota and usage statistics.
+
+    Request body:
+        {
+            "action": "reload" | "force_refresh",
+            "scope": "all" | "provider" | "credential",
+            "provider": "antigravity",  // required if scope != "all"
+            "credential": "antigravity_oauth_1.json"  // required if scope == "credential"
+        }
+
+    Actions:
+        - reload: Re-read data from disk (no external API calls)
+        - force_refresh: For Antigravity, fetch live quota from API.
+                        For other providers, same as reload.
+
+    Returns:
+        Same as GET, plus a "refresh_result" field with operation details.
+    """
+    try:
+        data = await request.json()
+        action = data.get("action", "reload")
+        scope = data.get("scope", "all")
+        provider = data.get("provider")
+        credential = data.get("credential")
+
+        # Validate parameters
+        if action not in ("reload", "force_refresh"):
+            raise HTTPException(
+                status_code=400,
+                detail="action must be 'reload' or 'force_refresh'",
+            )
+
+        if scope not in ("all", "provider", "credential"):
+            raise HTTPException(
+                status_code=400,
+                detail="scope must be 'all', 'provider', or 'credential'",
+            )
+
+        if scope in ("provider", "credential") and not provider:
+            raise HTTPException(
+                status_code=400,
+                detail="'provider' is required when scope is 'provider' or 'credential'",
+            )
+
+        if scope == "credential" and not credential:
+            raise HTTPException(
+                status_code=400,
+                detail="'credential' is required when scope is 'credential'",
+            )
+
+        refresh_result = {
+            "action": action,
+            "scope": scope,
+            "provider": provider,
+            "credential": credential,
+        }
+
+        if action == "reload":
+            # Just reload from disk
+            start_time = time.time()
+            await client.reload_usage_from_disk()
+            refresh_result["duration_ms"] = int((time.time() - start_time) * 1000)
+            refresh_result["success"] = True
+            refresh_result["message"] = "Reloaded usage data from disk"
+
+        elif action == "force_refresh":
+            # Force refresh from external API (for supported providers like Antigravity)
+            result = await client.force_refresh_quota(
+                provider=provider if scope in ("provider", "credential") else None,
+                credential=credential if scope == "credential" else None,
+            )
+            refresh_result.update(result)
+            refresh_result["success"] = result["failed_count"] == 0
+
+        # Get updated stats
+        stats = await client.get_quota_stats(provider_filter=provider)
+        stats["refresh_result"] = refresh_result
+        stats["data_source"] = "refreshed"
+
+        return stats
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to refresh quota stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/token-count")
 async def token_count(
     request: Request,

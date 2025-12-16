@@ -2612,3 +2612,280 @@ class RotatingClient:
             for models in all_provider_models.values():
                 flat_models.extend(models)
             return flat_models
+
+    async def get_quota_stats(
+        self,
+        provider_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get quota and usage stats for all credentials.
+
+        This returns cached/disk data aggregated by provider.
+        For provider-specific quota info (e.g., Antigravity quota groups),
+        it enriches the data from provider plugins.
+
+        Args:
+            provider_filter: If provided, only return stats for this provider
+
+        Returns:
+            Complete stats dict ready for the /v1/quota-stats endpoint
+        """
+        # Get base stats from usage manager
+        stats = await self.usage_manager.get_stats_for_endpoint(provider_filter)
+
+        # Enrich with provider-specific quota data
+        for provider, prov_stats in stats.get("providers", {}).items():
+            provider_class = self._provider_plugins.get(provider)
+            if not provider_class:
+                continue
+
+            # Get or create provider instance
+            if provider not in self._provider_instances:
+                self._provider_instances[provider] = provider_class()
+            provider_instance = self._provider_instances[provider]
+
+            # Check if provider has quota tracking (like Antigravity)
+            if hasattr(provider_instance, "_get_effective_quota_groups"):
+                # Add quota group summary
+                quota_groups = provider_instance._get_effective_quota_groups()
+                prov_stats["quota_groups"] = {}
+
+                for group_name, group_models in quota_groups.items():
+                    group_stats = {
+                        "models": group_models,
+                        "credentials_total": 0,
+                        "credentials_exhausted": 0,
+                        "avg_remaining_pct": 0,
+                        "total_remaining_pcts": [],
+                    }
+
+                    # Calculate per-credential quota for this group
+                    for cred in prov_stats.get("credentials", []):
+                        models_data = cred.get("models", {})
+                        group_stats["credentials_total"] += 1
+
+                        # Find any model from this group
+                        for model in group_models:
+                            # Try with and without provider prefix
+                            prefixed_model = f"{provider}/{model}"
+                            model_stats = models_data.get(
+                                prefixed_model
+                            ) or models_data.get(model)
+
+                            if model_stats:
+                                baseline = model_stats.get(
+                                    "baseline_remaining_fraction"
+                                )
+                                if baseline is not None:
+                                    remaining_pct = int(baseline * 100)
+                                    group_stats["total_remaining_pcts"].append(
+                                        remaining_pct
+                                    )
+                                    if baseline <= 0:
+                                        group_stats["credentials_exhausted"] += 1
+                                break
+
+                    # Calculate average remaining percentage
+                    if group_stats["total_remaining_pcts"]:
+                        group_stats["avg_remaining_pct"] = int(
+                            sum(group_stats["total_remaining_pcts"])
+                            / len(group_stats["total_remaining_pcts"])
+                        )
+                    del group_stats["total_remaining_pcts"]
+
+                    prov_stats["quota_groups"][group_name] = group_stats
+
+                # Also enrich each credential with formatted quota group info
+                for cred in prov_stats.get("credentials", []):
+                    cred["model_groups"] = {}
+                    models_data = cred.get("models", {})
+
+                    for group_name, group_models in quota_groups.items():
+                        # Find representative model from this group
+                        for model in group_models:
+                            prefixed_model = f"{provider}/{model}"
+                            model_stats = models_data.get(
+                                prefixed_model
+                            ) or models_data.get(model)
+
+                            if model_stats:
+                                baseline = model_stats.get(
+                                    "baseline_remaining_fraction"
+                                )
+                                max_req = model_stats.get("quota_max_requests")
+                                req_count = model_stats.get("request_count", 0)
+                                reset_ts = model_stats.get("quota_reset_ts")
+
+                                remaining_pct = (
+                                    int(baseline * 100)
+                                    if baseline is not None
+                                    else None
+                                )
+                                is_exhausted = baseline is not None and baseline <= 0
+
+                                # Format reset time
+                                reset_iso = None
+                                if reset_ts:
+                                    try:
+                                        from datetime import datetime, timezone
+
+                                        reset_iso = datetime.fromtimestamp(
+                                            reset_ts, tz=timezone.utc
+                                        ).isoformat()
+                                    except (ValueError, OSError):
+                                        pass
+
+                                cred["model_groups"][group_name] = {
+                                    "remaining_pct": remaining_pct,
+                                    "requests_used": req_count,
+                                    "requests_max": max_req,
+                                    "display": f"{req_count}/{max_req}"
+                                    if max_req
+                                    else f"{req_count}/?",
+                                    "is_exhausted": is_exhausted,
+                                    "reset_time_iso": reset_iso,
+                                    "models": group_models,
+                                    "confidence": self._get_baseline_confidence(
+                                        model_stats
+                                    ),
+                                }
+                                break
+
+                    # Try to get email from provider's cache
+                    cred_path = cred.get("full_path", "")
+                    if hasattr(provider_instance, "project_tier_cache"):
+                        tier = provider_instance.project_tier_cache.get(cred_path)
+                        if tier:
+                            cred["tier"] = tier
+
+        return stats
+
+    def _get_baseline_confidence(self, model_stats: Dict) -> str:
+        """
+        Determine confidence level based on baseline age.
+
+        Args:
+            model_stats: Model statistics dict with baseline_fetched_at
+
+        Returns:
+            "high" | "medium" | "low"
+        """
+        baseline_fetched_at = model_stats.get("baseline_fetched_at")
+        if not baseline_fetched_at:
+            return "low"
+
+        age_seconds = time.time() - baseline_fetched_at
+        if age_seconds < 300:  # 5 minutes
+            return "high"
+        elif age_seconds < 1800:  # 30 minutes
+            return "medium"
+        return "low"
+
+    async def reload_usage_from_disk(self) -> None:
+        """
+        Force reload usage data from disk.
+
+        Useful when wanting fresh stats without making external API calls.
+        """
+        await self.usage_manager.reload_from_disk()
+
+    async def force_refresh_quota(
+        self,
+        provider: Optional[str] = None,
+        credential: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Force refresh quota from external API.
+
+        For Antigravity, this fetches live quota data from the API.
+        For other providers, this is a no-op (just reloads from disk).
+
+        Args:
+            provider: If specified, only refresh this provider
+            credential: If specified, only refresh this specific credential
+
+        Returns:
+            Refresh result dict with success/failure info
+        """
+        result = {
+            "action": "force_refresh",
+            "scope": "credential"
+            if credential
+            else ("provider" if provider else "all"),
+            "provider": provider,
+            "credential": credential,
+            "credentials_refreshed": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "duration_ms": 0,
+            "errors": [],
+        }
+
+        start_time = time.time()
+
+        # Determine which providers to refresh
+        if provider:
+            providers_to_refresh = (
+                [provider] if provider in self.all_credentials else []
+            )
+        else:
+            providers_to_refresh = list(self.all_credentials.keys())
+
+        for prov in providers_to_refresh:
+            provider_class = self._provider_plugins.get(prov)
+            if not provider_class:
+                continue
+
+            # Get or create provider instance
+            if prov not in self._provider_instances:
+                self._provider_instances[prov] = provider_class()
+            provider_instance = self._provider_instances[prov]
+
+            # Check if provider supports quota refresh (like Antigravity)
+            if hasattr(provider_instance, "fetch_initial_baselines"):
+                # Get credentials to refresh
+                if credential:
+                    # Find full path for this credential
+                    creds_to_refresh = []
+                    for cred_path in self.all_credentials.get(prov, []):
+                        if cred_path.endswith(credential) or cred_path == credential:
+                            creds_to_refresh.append(cred_path)
+                            break
+                else:
+                    creds_to_refresh = self.all_credentials.get(prov, [])
+
+                if not creds_to_refresh:
+                    continue
+
+                try:
+                    # Fetch live quota from API for ALL specified credentials
+                    quota_results = await provider_instance.fetch_initial_baselines(
+                        creds_to_refresh
+                    )
+
+                    # Store baselines in usage manager
+                    if hasattr(provider_instance, "_store_baselines_to_usage_manager"):
+                        stored = (
+                            await provider_instance._store_baselines_to_usage_manager(
+                                quota_results, self.usage_manager
+                            )
+                        )
+                        result["success_count"] += stored
+
+                    result["credentials_refreshed"] += len(creds_to_refresh)
+
+                    # Count failures
+                    for cred_path, data in quota_results.items():
+                        if data.get("status") != "success":
+                            result["failed_count"] += 1
+                            result["errors"].append(
+                                f"{Path(cred_path).name}: {data.get('error', 'Unknown error')}"
+                            )
+
+                except Exception as e:
+                    lib_logger.error(f"Failed to refresh quota for {prov}: {e}")
+                    result["errors"].append(f"{prov}: {str(e)}")
+                    result["failed_count"] += len(creds_to_refresh)
+
+        result["duration_ms"] = int((time.time() - start_time) * 1000)
+        return result

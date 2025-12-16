@@ -429,9 +429,10 @@ class LauncherTUI:
             self.console.print("   3. 🔑 Manage Credentials")
 
         self.console.print("   4. 📊 View Provider & Advanced Settings")
-        self.console.print("   5. 🔄 Reload Configuration")
-        self.console.print("   6. ℹ️  About")
-        self.console.print("   7. 🚪 Exit")
+        self.console.print("   5. 📈 View Quota & Usage Stats")
+        self.console.print("   6. 🔄 Reload Configuration")
+        self.console.print("   7. ℹ️  About")
+        self.console.print("   8. 🚪 Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -439,7 +440,7 @@ class LauncherTUI:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
             show_choices=False,
         )
 
@@ -452,12 +453,14 @@ class LauncherTUI:
         elif choice == "4":
             self.show_provider_settings_menu()
         elif choice == "5":
+            self.launch_quota_viewer()
+        elif choice == "6":
             load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
             self.console.print("\n[green]✅ Configuration reloaded![/green]")
-        elif choice == "6":
-            self.show_about()
         elif choice == "7":
+            self.show_about()
+        elif choice == "8":
             self.running = False
             sys.exit(0)
 
@@ -873,6 +876,20 @@ class LauncherTUI:
         run_settings_tool()
         # Reload environment after settings tool
         load_dotenv(dotenv_path=_get_env_file(), override=True)
+
+    def launch_quota_viewer(self):
+        """Launch the quota stats viewer"""
+        clear_screen()
+
+        self.console.print("━" * 70)
+        self.console.print("Quota & Usage Statistics Viewer")
+        self.console.print("━" * 70)
+        self.console.print()
+
+        # Import the lightweight viewer (no heavy imports)
+        from proxy_app.quota_viewer import run_quota_viewer
+
+        run_quota_viewer()
 
     def show_about(self):
         """Display About page with project information"""
