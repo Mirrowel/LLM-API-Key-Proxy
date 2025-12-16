@@ -329,6 +329,10 @@ class UsageManager:
 
         return 1
 
+    # Providers where request_count should be used for credential selection
+    # instead of success_count (because failed requests also consume quota)
+    _REQUEST_COUNT_PROVIDERS = {"antigravity"}
+
     def _get_grouped_usage_count(self, key: str, model: str) -> int:
         """
         Get usage count for credential selection, considering quota groups.
@@ -339,6 +343,10 @@ class UsageManager:
         Weights are applied per-model to account for models that consume more quota
         per request (e.g., Opus might count 2x compared to Sonnet).
 
+        For providers in _REQUEST_COUNT_PROVIDERS (e.g., antigravity), uses
+        request_count instead of success_count since failed requests also
+        consume quota.
+
         Args:
             key: Credential identifier
             model: Model name (with provider prefix, e.g., "antigravity/claude-sonnet-4-5")
@@ -346,6 +354,15 @@ class UsageManager:
         Returns:
             Weighted combined usage if grouped, otherwise individual model usage
         """
+        # Determine usage field based on provider
+        # Some providers (antigravity) count failed requests against quota
+        provider = self._get_provider_from_credential(key)
+        usage_field = (
+            "request_count"
+            if provider in self._REQUEST_COUNT_PROVIDERS
+            else "success_count"
+        )
+
         # Check if model is in a quota group
         group = self._get_model_quota_group(key, model)
 
@@ -356,13 +373,13 @@ class UsageManager:
             # Sum weighted usage across all models in the group
             total_weighted_usage = 0
             for grouped_model in grouped_models:
-                usage = self._get_usage_count(key, grouped_model)
+                usage = self._get_usage_count(key, grouped_model, usage_field)
                 weight = self._get_model_usage_weight(key, grouped_model)
                 total_weighted_usage += usage * weight
             return total_weighted_usage
 
         # Not grouped - return individual model usage (no weight applied)
-        return self._get_usage_count(key, model)
+        return self._get_usage_count(key, model, usage_field)
 
     def _get_usage_field_name(self, credential: str) -> str:
         """
@@ -390,7 +407,9 @@ class UsageManager:
 
         return "daily"
 
-    def _get_usage_count(self, key: str, model: str) -> int:
+    def _get_usage_count(
+        self, key: str, model: str, field: str = "success_count"
+    ) -> int:
         """
         Get the current usage count for a model from the appropriate usage structure.
 
@@ -401,9 +420,12 @@ class UsageManager:
         Args:
             key: Credential identifier
             model: Model name
+            field: The field to read for usage count (default: "success_count").
+                   Use "request_count" for providers where failed requests also
+                   consume quota (e.g., antigravity).
 
         Returns:
-            Usage count (success_count) for the model in the current window/period
+            Usage count for the model in the current window/period
         """
         if self._usage_data is None:
             return 0
@@ -412,15 +434,12 @@ class UsageManager:
         reset_mode = self._get_reset_mode(key)
 
         if reset_mode == "per_model":
-            # New per-model structure: key_data["models"][model]["success_count"]
-            return key_data.get("models", {}).get(model, {}).get("success_count", 0)
+            # New per-model structure: key_data["models"][model][field]
+            return key_data.get("models", {}).get(model, {}).get(field, 0)
         else:
-            # Legacy structure: key_data["daily"]["models"][model]["success_count"]
+            # Legacy structure: key_data["daily"]["models"][model][field]
             return (
-                key_data.get("daily", {})
-                .get("models", {})
-                .get(model, {})
-                .get("success_count", 0)
+                key_data.get("daily", {}).get("models", {}).get(model, {}).get(field, 0)
             )
 
     # =========================================================================
