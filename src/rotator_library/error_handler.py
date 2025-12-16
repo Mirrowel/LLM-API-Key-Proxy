@@ -179,6 +179,32 @@ class EmptyResponseError(Exception):
         super().__init__(self.message)
 
 
+class TransientQuotaError(Exception):
+    """
+    Raised when a provider returns a 429 without retry timing information.
+
+    This indicates a transient rate limit rather than true quota exhaustion.
+    The request has already been retried internally; this error signals
+    that the credential should be rotated to try the next one.
+
+    Treated as a transient server-side issue (503 equivalent), same as EmptyResponseError.
+
+    Attributes:
+        provider: The provider name (e.g., "antigravity")
+        model: The model that was requested
+        message: Human-readable message about the error
+    """
+
+    def __init__(self, provider: str, model: str, message: str = ""):
+        self.provider = provider
+        self.model = model
+        self.message = (
+            message
+            or f"Transient 429 from {provider}/{model} after multiple retry attempts"
+        )
+        super().__init__(self.message)
+
+
 # =============================================================================
 # ERROR TRACKING FOR CLIENT REPORTING
 # =============================================================================
@@ -770,6 +796,15 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
     if isinstance(e, EmptyResponseError):
         # Transient server-side issue - provider returned empty response
+        # This is rotatable - try next credential
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=503,
+        )
+
+    if isinstance(e, TransientQuotaError):
+        # Transient 429 without retry info - provider returned bare rate limit
         # This is rotatable - try next credential
         return ClassifiedError(
             error_type="server_error",

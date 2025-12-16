@@ -49,7 +49,7 @@ from .provider_cache import ProviderCache
 from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError
+from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
@@ -821,15 +821,8 @@ class AntigravityProvider(
 
         # Return None if we couldn't extract retry_after
         if result["retry_after"] is None:
-            # Handle bare RESOURCE_EXHAUSTED without timing details
-            error_status = error_obj.get("status", "")
-            error_code = error_obj.get("code")
-
-            if error_status == "RESOURCE_EXHAUSTED" or error_code == 429:
-                result["retry_after"] = 60  # Default fallback
-                result["reason"] = result.get("reason") or "RESOURCE_EXHAUSTED"
-                return result
-
+            # Bare RESOURCE_EXHAUSTED without timing details
+            # Return None to signal transient error (caller will retry internally)
             return None
 
         return result
@@ -3388,43 +3381,75 @@ class AntigravityProvider(
                         client, url, headers, payload, model, file_logger
                     )
                 else:
-                    # Non-streaming: empty response retry loop
-                    error_msg = (
+                    # Non-streaming: empty response and bare 429 retry loop
+                    empty_error_msg = (
                         "The model returned an empty response after multiple attempts. "
+                        "This may indicate a temporary service issue. Please try again."
+                    )
+                    transient_429_msg = (
+                        "The model returned transient 429 errors after multiple attempts. "
                         "This may indicate a temporary service issue. Please try again."
                     )
 
                     for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
-                        result = await self._handle_non_streaming(
-                            client, url, headers, payload, model, file_logger
-                        )
+                        try:
+                            result = await self._handle_non_streaming(
+                                client, url, headers, payload, model, file_logger
+                            )
 
-                        # Check if we got anything - empty dict means no candidates
-                        result_dict = (
-                            result.model_dump()
-                            if hasattr(result, "model_dump")
-                            else dict(result)
-                        )
-                        got_response = bool(result_dict.get("choices"))
+                            # Check if we got anything - empty dict means no candidates
+                            result_dict = (
+                                result.model_dump()
+                                if hasattr(result, "model_dump")
+                                else dict(result)
+                            )
+                            got_response = bool(result_dict.get("choices"))
 
-                        if not got_response:
-                            if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
-                                lib_logger.warning(
-                                    f"[Antigravity] Empty response from {model}, "
-                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            if not got_response:
+                                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                    lib_logger.warning(
+                                        f"[Antigravity] Empty response from {model}, "
+                                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                    )
+                                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                    continue
+                                else:
+                                    # Last attempt failed - raise without extra logging
+                                    # (caller will log the error)
+                                    raise EmptyResponseError(
+                                        provider="antigravity",
+                                        model=model,
+                                        message=empty_error_msg,
+                                    )
+
+                            return result
+
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 429:
+                                # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                                quota_info = self.parse_quota_error(e)
+                                if quota_info is None:
+                                    # Bare 429 - retry like empty response
+                                    if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                        lib_logger.warning(
+                                            f"[Antigravity] Bare 429 from {model}, "
+                                            f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                        )
+                                        await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                        continue
+                                    else:
+                                        # Last attempt failed - raise TransientQuotaError to rotate
+                                        raise TransientQuotaError(
+                                            provider="antigravity",
+                                            model=model,
+                                            message=transient_429_msg,
+                                        )
+                                # Has retry info - real quota exhaustion, propagate for cooldown
+                                lib_logger.debug(
+                                    f"429 with retry info - propagating for cooldown: {e}"
                                 )
-                                await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
-                                continue
-                            else:
-                                # Last attempt failed - raise without extra logging
-                                # (caller will log the error)
-                                raise EmptyResponseError(
-                                    provider="antigravity",
-                                    model=model,
-                                    message=error_msg,
-                                )
-
-                        return result
+                            # Re-raise all HTTP errors (429 with retry info, or other errors)
+                            raise
 
                     # Should not reach here, but just in case
                     lib_logger.error(
@@ -3433,7 +3458,7 @@ class AntigravityProvider(
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
-                        message=error_msg,
+                        message=empty_error_msg,
                     )
 
             except httpx.HTTPStatusError as e:
@@ -3454,8 +3479,8 @@ class AntigravityProvider(
                     continue  # Retry with new URL
                 raise  # No more fallback URLs
 
-            except EmptyResponseError:
-                # Empty response already retried internally - don't catch, propagate
+            except (EmptyResponseError, TransientQuotaError):
+                # Already retried internally - don't catch, propagate for credential rotation
                 raise
 
             except Exception as e:
@@ -3624,13 +3649,18 @@ class AntigravityProvider(
         file_logger: Optional[AntigravityFileLogger] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _handle_streaming that retries on empty responses.
+        Wrapper around _handle_streaming that retries on empty responses and bare 429s.
 
-        If the stream yields zero chunks (Antigravity returned nothing),
-        retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times before giving up.
+        If the stream yields zero chunks (Antigravity returned nothing) or encounters
+        a bare 429 (no retry info), retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times
+        before giving up.
         """
-        error_msg = (
+        empty_error_msg = (
             "The model returned an empty response after multiple attempts. "
+            "This may indicate a temporary service issue. Please try again."
+        )
+        transient_429_msg = (
+            "The model returned transient 429 errors after multiple attempts. "
             "This may indicate a temporary service issue. Please try again."
         )
 
@@ -3661,13 +3691,33 @@ class AntigravityProvider(
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
-                        message=error_msg,
+                        message=empty_error_msg,
                     )
 
             except httpx.HTTPStatusError as e:
-                # 429 = Rate limit/quota exhausted - don't retry
                 if e.response.status_code == 429:
-                    lib_logger.debug(f"429 quota error - not retrying: {e}")
+                    # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                    quota_info = self.parse_quota_error(e)
+                    if quota_info is None:
+                        # Bare 429 - retry like empty response
+                        if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                            lib_logger.warning(
+                                f"[Antigravity] Bare 429 from {model}, "
+                                f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                            continue
+                        else:
+                            # Last attempt failed - raise TransientQuotaError to rotate
+                            raise TransientQuotaError(
+                                provider="antigravity",
+                                model=model,
+                                message=transient_429_msg,
+                            )
+                    # Has retry info - real quota exhaustion, propagate for cooldown
+                    lib_logger.debug(
+                        f"429 with retry info - propagating for cooldown: {e}"
+                    )
                     raise
                 # Other HTTP errors - raise immediately (let caller handle)
                 raise
@@ -3683,7 +3733,7 @@ class AntigravityProvider(
         raise EmptyResponseError(
             provider="antigravity",
             model=model,
-            message=error_msg,
+            message=empty_error_msg,
         )
 
     async def count_tokens(
