@@ -589,6 +589,54 @@ class UsageManager:
             # Hand off to resilient writer - handles retries and disk failures
             self._state_writer.write(self._usage_data)
 
+    async def _get_usage_data_snapshot(self) -> Dict[str, Any]:
+        """
+        Get a shallow copy of the current usage data.
+
+        Returns:
+            Copy of usage data dict (safe for reading without lock)
+        """
+        await self._lazy_init()
+        async with self._data_lock:
+            return dict(self._usage_data) if self._usage_data else {}
+
+    async def get_available_credentials_for_model(
+        self, credentials: List[str], model: str
+    ) -> List[str]:
+        """
+        Get credentials that are not on cooldown for a specific model.
+
+        Filters out credentials where:
+        - key_cooldown_until > now (key-level cooldown)
+        - model_cooldowns[model] > now (model-specific cooldown, includes quota exhausted)
+
+        Args:
+            credentials: List of credential identifiers to check
+            model: Model name to check cooldowns for
+
+        Returns:
+            List of credentials that are available (not on cooldown) for this model
+        """
+        await self._lazy_init()
+        now = time.time()
+        available = []
+
+        async with self._data_lock:
+            for key in credentials:
+                key_data = self._usage_data.get(key, {})
+
+                # Skip if key-level cooldown is active
+                if (key_data.get("key_cooldown_until") or 0) > now:
+                    continue
+
+                # Skip if model-specific cooldown is active
+                if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                    continue
+
+                available.append(key)
+
+        return available
+
     async def _reset_daily_stats_if_needed(self):
         """
         Checks if usage stats need to be reset for any key.
@@ -791,9 +839,21 @@ class UsageManager:
         model_data["window_start_ts"] = None
         model_data["quota_reset_ts"] = None
         model_data["success_count"] = 0
+        model_data["failure_count"] = 0
+        model_data["request_count"] = 0
         model_data["prompt_tokens"] = 0
         model_data["completion_tokens"] = 0
         model_data["approx_cost"] = 0.0
+        # Reset quota baseline fields only if they exist (Antigravity-specific)
+        # These are added by update_quota_baseline(), only called for Antigravity
+        if "baseline_remaining_fraction" in model_data:
+            model_data["baseline_remaining_fraction"] = None
+            model_data["baseline_fetched_at"] = None
+            model_data["requests_at_baseline"] = None
+            # Reset quota display but keep max_requests (it doesn't change between periods)
+            max_req = model_data.get("quota_max_requests")
+            if max_req:
+                model_data["quota_display"] = f"0/{max_req}"
 
     async def _check_window_reset(
         self,
@@ -1464,6 +1524,8 @@ class UsageManager:
                         "window_start_ts": None,
                         "quota_reset_ts": None,
                         "success_count": 0,
+                        "failure_count": 0,
+                        "request_count": 0,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "approx_cost": 0.0,
@@ -1488,6 +1550,15 @@ class UsageManager:
 
                 # Record stats
                 model_data["success_count"] += 1
+                model_data["request_count"] = model_data.get("request_count", 0) + 1
+
+                # Update quota_display if max_requests is set (Antigravity-specific)
+                max_req = model_data.get("quota_max_requests")
+                if max_req:
+                    model_data["quota_display"] = (
+                        f"{model_data['request_count']}/{max_req}"
+                    )
+
                 usage_data_ref = model_data  # For token/cost recording below
 
             else:
@@ -1664,12 +1735,17 @@ class UsageManager:
                             "window_start_ts": None,
                             "quota_reset_ts": None,
                             "success_count": 0,
+                            "failure_count": 0,
+                            "request_count": 0,
                             "prompt_tokens": 0,
                             "completion_tokens": 0,
                             "approx_cost": 0.0,
                         },
                     )
                     model_data["quota_reset_ts"] = quota_reset_ts
+                    # Track failure for quota estimation (request still consumes quota)
+                    model_data["failure_count"] = model_data.get("failure_count", 0) + 1
+                    model_data["request_count"] = model_data.get("request_count", 0) + 1
 
                     # Apply to all models in the same quota group
                     group = self._get_model_quota_group(key, model)
@@ -1682,6 +1758,8 @@ class UsageManager:
                                     "window_start_ts": None,
                                     "quota_reset_ts": None,
                                     "success_count": 0,
+                                    "failure_count": 0,
+                                    "request_count": 0,
                                     "prompt_tokens": 0,
                                     "completion_tokens": 0,
                                     "approx_cost": 0.0,
@@ -1768,6 +1846,28 @@ class UsageManager:
             # Check for key-level lockout condition
             await self._check_key_lockout(key, key_data)
 
+            # Track failure count for quota estimation (all failures consume quota)
+            # This is separate from consecutive_failures which is for backoff logic
+            if reset_mode == "per_model":
+                models_data = key_data.setdefault("models", {})
+                model_data = models_data.setdefault(
+                    model,
+                    {
+                        "window_start_ts": None,
+                        "quota_reset_ts": None,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "request_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "approx_cost": 0.0,
+                    },
+                )
+                # Only increment if not already incremented in quota_exceeded branch
+                if classified_error.error_type != "quota_exceeded":
+                    model_data["failure_count"] = model_data.get("failure_count", 0) + 1
+                    model_data["request_count"] = model_data.get("request_count", 0) + 1
+
             key_data["last_failure"] = {
                 "timestamp": now_ts,
                 "model": model,
@@ -1776,17 +1876,120 @@ class UsageManager:
 
         await self._save_usage()
 
-    async def _check_key_lockout(self, key: str, key_data: Dict):
-        """Checks if a key should be locked out due to multiple model failures."""
-        long_term_lockout_models = 0
-        now = time.time()
+    async def update_quota_baseline(
+        self,
+        credential: str,
+        model: str,
+        remaining_fraction: float,
+        max_requests: Optional[int] = None,
+    ) -> None:
+        """
+        Update quota baseline data for a credential/model after fetching from API.
 
-        for model, cooldown_end in key_data.get("model_cooldowns", {}).items():
-            if cooldown_end - now >= 7200:  # Check for 2-hour lockouts
-                long_term_lockout_models += 1
+        This stores the current quota state as a baseline, which is used to
+        estimate remaining quota based on subsequent request counts.
 
-        if long_term_lockout_models >= 3:
-            key_data["key_cooldown_until"] = now + 300  # 5-minute key lockout
-            lib_logger.error(
-                f"Key {mask_credential(key)} has {long_term_lockout_models} models in long-term lockout. Applying 5-minute key-level lockout."
+        Args:
+            credential: Credential identifier (file path or env:// URI)
+            model: Model name (with or without provider prefix)
+            remaining_fraction: Current remaining quota as fraction (0.0 to 1.0)
+            max_requests: Maximum requests allowed per quota period (e.g., 250 for Claude)
+        """
+        await self._lazy_init()
+        async with self._data_lock:
+            now_ts = time.time()
+
+            # Get or create key data structure
+            key_data = self._usage_data.setdefault(
+                credential,
+                {
+                    "models": {},
+                    "global": {"models": {}},
+                    "model_cooldowns": {},
+                    "failures": {},
+                },
             )
+
+            # Ensure models dict exists
+            if "models" not in key_data:
+                key_data["models"] = {}
+
+            # Get or create per-model data
+            model_data = key_data["models"].setdefault(
+                model,
+                {
+                    "window_start_ts": None,
+                    "quota_reset_ts": None,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "request_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "approx_cost": 0.0,
+                    "baseline_remaining_fraction": None,
+                    "baseline_fetched_at": None,
+                    "requests_at_baseline": None,
+                },
+            )
+
+            # Calculate actual used requests from API's remaining fraction
+            # The API is authoritative - sync our local count to match reality
+            if max_requests is not None:
+                used_requests = int((1.0 - remaining_fraction) * max_requests)
+            else:
+                # Estimate max_requests from provider's quota cost
+                # This matches how get_max_requests_for_model() calculates it
+                provider = self._get_provider_from_credential(credential)
+                plugin_instance = self._get_provider_instance(provider)
+                if plugin_instance and hasattr(
+                    plugin_instance, "get_max_requests_for_model"
+                ):
+                    # Get tier from provider's cache
+                    tier = getattr(plugin_instance, "project_tier_cache", {}).get(
+                        credential, "standard-tier"
+                    )
+                    # Strip provider prefix from model if present
+                    clean_model = model.split("/")[-1] if "/" in model else model
+                    max_requests = plugin_instance.get_max_requests_for_model(
+                        clean_model, tier
+                    )
+                    used_requests = int((1.0 - remaining_fraction) * max_requests)
+                else:
+                    # Fallback: keep existing count if we can't calculate
+                    used_requests = model_data.get("request_count", 0)
+                    max_requests = model_data.get("quota_max_requests")
+
+            # Sync local request count to API's authoritative value
+            model_data["request_count"] = used_requests
+            model_data["requests_at_baseline"] = used_requests
+
+            # Update baseline fields
+            model_data["baseline_remaining_fraction"] = remaining_fraction
+            model_data["baseline_fetched_at"] = now_ts
+
+            # Update max_requests and quota_display
+            if max_requests is not None:
+                model_data["quota_max_requests"] = max_requests
+                model_data["quota_display"] = f"{used_requests}/{max_requests}"
+
+            lib_logger.debug(
+                f"Updated quota baseline for {mask_credential(credential)} model={model}: "
+                f"remaining={remaining_fraction:.2%}, synced_request_count={used_requests}"
+            )
+
+        await self._save_usage()
+
+    async def _check_key_lockout(self, key: str, key_data: Dict):
+        """
+        Checks if a key should be locked out due to multiple model failures.
+
+        NOTE: This check is currently disabled. The original logic counted individual
+        models in long-term lockout, but this caused issues with quota groups - when
+        a single quota group (e.g., "claude" with 5 models) was exhausted, it would
+        count as 5 lockouts and trigger key-level lockout, blocking other quota groups
+        (like gemini) that were still available.
+
+        The per-model and per-group cooldowns already handle quota exhaustion properly.
+        """
+        # Disabled - see docstring above
+        pass

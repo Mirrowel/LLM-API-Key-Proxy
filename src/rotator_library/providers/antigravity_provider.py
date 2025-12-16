@@ -26,9 +26,18 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+)
 from urllib.parse import urlparse
 
 import httpx
@@ -37,10 +46,14 @@ import litellm
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
+from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError
+from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
+
+if TYPE_CHECKING:
+    from ..usage_manager import UsageManager
 
 
 # =============================================================================
@@ -70,14 +83,18 @@ BASE_URLS = [
 
 # Available models via Antigravity
 AVAILABLE_MODELS = [
+    # Gemini models
     # "gemini-2.5-pro",
-    # "gemini-2.5-flash",
-    # "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",  # Uses -thinking variant when reasoning_effort provided
+    "gemini-2.5-flash-lite",  # Thinking budget configurable, no name change
     "gemini-3-pro-preview",  # Internally mapped to -low/-high variant based on thinkingLevel
-    # "gemini-3-pro-image-preview",
+    # "gemini-3-pro-image",  # Image generation model
     # "gemini-2.5-computer-use-preview-10-2025",
-    "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
+    # Claude models
+    "claude-sonnet-4-5",  # Uses -thinking variant when reasoning_effort provided
     "claude-opus-4-5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
+    # Other models
+    "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
@@ -212,6 +229,9 @@ You MUST follow these rules strictly:
 
 If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully.
 """
+
+# Parallel tool usage encouragement instruction
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
 
 
 # =============================================================================
@@ -524,7 +544,9 @@ class AntigravityFileLogger:
 # =============================================================================
 
 
-class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
+class AntigravityProvider(
+    AntigravityAuthBase, ProviderInterface, AntigravityQuotaTracker
+):
     """
     Antigravity provider for Gemini and Claude models via Google's internal API.
 
@@ -589,16 +611,36 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     # Models in the same group share quota - when one is exhausted, all are
+    # Based on empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
+    # Note: -thinking variants are included since they share the same quota pool
+    # (users call non-thinking names, proxy maps to -thinking internally)
     model_quota_groups: QuotaGroupMap = {
-        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+        # Claude and GPT-OSS share the same quota pool
+        "claude": [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking",
+            "gpt-oss-120b-medium",
+        ],
+        # Gemini 3 Pro variants share quota
+        "gemini-3-pro": [
+            "gemini-3-pro-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-preview",
+        ],
+        # Gemini 2.5 Flash variants share quota
+        "gemini-2.5-flash": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-flash-lite",
+        ],
     }
 
     # Model usage weights for grouped usage calculation
     # Opus consumes more quota per request, so its usage counts 2x when
     # comparing credentials for selection
-    model_usage_weights = {
-        "claude-opus-4-5": 2,
-    }
+    model_usage_weights = {}
 
     # Priority-based concurrency multipliers
     # Higher priority credentials (lower number) get higher multipliers
@@ -782,15 +824,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         # Return None if we couldn't extract retry_after
         if result["retry_after"] is None:
-            # Handle bare RESOURCE_EXHAUSTED without timing details
-            error_status = error_obj.get("status", "")
-            error_code = error_obj.get("code")
-
-            if error_status == "RESOURCE_EXHAUSTED" or error_code == 429:
-                result["retry_after"] = 60  # Default fallback
-                result["reason"] = result.get("reason") or "RESOURCE_EXHAUSTED"
-                return result
-
+            # Bare RESOURCE_EXHAUSTED without timing details
+            # Return None to signal transient error (caller will retry internally)
             return None
 
         return result
@@ -822,6 +857,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             env_prefix="ANTIGRAVITY_THINKING",
         )
 
+        # Quota tracking state
+        self._learned_costs: Dict[str, Dict[str, float]] = {}  # tier -> model -> cost
+        self._learned_costs_loaded: bool = False
+        self._quota_refresh_interval = _env_int(
+            "ANTIGRAVITY_QUOTA_REFRESH_INTERVAL", 300
+        )  # 5 min
+
         # Feature flags
         self._preserve_signatures_in_client = _env_bool(
             "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES", True
@@ -833,7 +875,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False
         )
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
-        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
+        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", False)
         self._enable_thinking_sanitization = _env_bool(
             "ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION", True
         )
@@ -861,6 +903,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "ANTIGRAVITY_CLAUDE_SYSTEM_INSTRUCTION", DEFAULT_CLAUDE_SYSTEM_INSTRUCTION
         )
 
+        # Parallel tool usage instruction configuration
+        self._enable_parallel_tool_instruction_claude = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE",
+            True,  # ON for Claude
+        )
+        self._enable_parallel_tool_instruction_gemini3 = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3",
+            False,  # OFF for Gemini 3
+        )
+        self._parallel_tool_instruction = os.getenv(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION", DEFAULT_PARALLEL_TOOL_INSTRUCTION
+        )
+
         # Log configuration
         self._log_config()
 
@@ -870,7 +925,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
-            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
+            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
+            f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
+            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
@@ -988,6 +1045,55 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     f"Credential will use default priority."
                 )
 
+    # =========================================================================
+    # BACKGROUND JOB INTERFACE
+    # =========================================================================
+
+    def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Return background job configuration for quota baseline refresh.
+
+        The quota baseline refresh fetches current quota status from the API
+        and stores it in UsageManager for accurate quota estimation.
+        """
+        return {
+            "interval": self._quota_refresh_interval,  # default 300s (5 min)
+            "name": "quota_baseline_refresh",
+            "run_on_start": True,  # fetch baselines immediately at startup
+        }
+
+    async def run_background_job(
+        self,
+        usage_manager: "UsageManager",
+        credentials: List[str],
+    ) -> None:
+        """
+        Refresh quota baselines for recently used credentials.
+
+        Fetches current quota status from the Antigravity API and stores
+        the baselines in UsageManager for accurate quota estimation.
+        Only fetches for credentials that have been used since the last refresh.
+        """
+        # Get usage data to determine which credentials were recently used
+        usage_data = await usage_manager._get_usage_data_snapshot()
+
+        # Use refresh_active_quota_baselines which filters to recently used credentials
+        quota_results = await self.refresh_active_quota_baselines(
+            credentials, usage_data
+        )
+
+        if not quota_results:
+            return
+
+        # Store new baselines in UsageManager
+        stored = await self._store_baselines_to_usage_manager(
+            quota_results, usage_manager
+        )
+        if stored > 0:
+            lib_logger.debug(
+                f"Antigravity quota refresh: updated {stored} model baselines"
+            )
+
     async def _load_persisted_tiers(
         self, credential_paths: List[str]
     ) -> Dict[str, str]:
@@ -1081,6 +1187,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _get_base_url(self) -> str:
         """Get current base URL."""
         return self._current_base_url
+
+    def _get_available_models(self) -> List[str]:
+        """
+        Get list of user-facing model names available via this provider.
+
+        Used by quota tracker to filter which models to store baselines for.
+        Only models in this list will have quota baselines tracked.
+
+        Returns:
+            List of user-facing model names (e.g., ["claude-sonnet-4-5", "claude-opus-4-5"])
+        """
+        return AVAILABLE_MODELS
 
     def _try_next_base_url(self) -> bool:
         """Switch to next base URL in fallback list. Returns True if successful."""
@@ -2637,6 +2755,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 # Sonnet 4.5 uses -thinking only when reasoning_effort is provided
                 internal_model = "claude-sonnet-4-5-thinking"
 
+        # Map gemini-2.5-flash to -thinking variant when reasoning_effort is provided
+        if internal_model == "gemini-2.5-flash" and reasoning_effort:
+            internal_model = "gemini-2.5-flash-thinking"
+
         # Map gemini-3-pro-preview to -low/-high variant based on thinking config
         if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-preview":
             # Check thinking config to determine variant
@@ -3185,6 +3307,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     gemini_payload, self._claude_system_instruction
                 )
 
+            # Inject parallel tool usage encouragement (independent of tool hardening)
+            if self._is_claude(model) and self._enable_parallel_tool_instruction_claude:
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
+                )
+            elif (
+                self._is_gemini_3(model)
+                and self._enable_parallel_tool_instruction_gemini3
+            ):
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
+                )
+
         # Add generation config
         gen_config = {}
         if top_p is not None:
@@ -3277,43 +3412,75 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         client, url, headers, payload, model, file_logger
                     )
                 else:
-                    # Non-streaming: empty response retry loop
-                    error_msg = (
+                    # Non-streaming: empty response and bare 429 retry loop
+                    empty_error_msg = (
                         "The model returned an empty response after multiple attempts. "
+                        "This may indicate a temporary service issue. Please try again."
+                    )
+                    transient_429_msg = (
+                        "The model returned transient 429 errors after multiple attempts. "
                         "This may indicate a temporary service issue. Please try again."
                     )
 
                     for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
-                        result = await self._handle_non_streaming(
-                            client, url, headers, payload, model, file_logger
-                        )
+                        try:
+                            result = await self._handle_non_streaming(
+                                client, url, headers, payload, model, file_logger
+                            )
 
-                        # Check if we got anything - empty dict means no candidates
-                        result_dict = (
-                            result.model_dump()
-                            if hasattr(result, "model_dump")
-                            else dict(result)
-                        )
-                        got_response = bool(result_dict.get("choices"))
+                            # Check if we got anything - empty dict means no candidates
+                            result_dict = (
+                                result.model_dump()
+                                if hasattr(result, "model_dump")
+                                else dict(result)
+                            )
+                            got_response = bool(result_dict.get("choices"))
 
-                        if not got_response:
-                            if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
-                                lib_logger.warning(
-                                    f"[Antigravity] Empty response from {model}, "
-                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            if not got_response:
+                                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                    lib_logger.warning(
+                                        f"[Antigravity] Empty response from {model}, "
+                                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                    )
+                                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                    continue
+                                else:
+                                    # Last attempt failed - raise without extra logging
+                                    # (caller will log the error)
+                                    raise EmptyResponseError(
+                                        provider="antigravity",
+                                        model=model,
+                                        message=empty_error_msg,
+                                    )
+
+                            return result
+
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 429:
+                                # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                                quota_info = self.parse_quota_error(e)
+                                if quota_info is None:
+                                    # Bare 429 - retry like empty response
+                                    if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                        lib_logger.warning(
+                                            f"[Antigravity] Bare 429 from {model}, "
+                                            f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                        )
+                                        await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                        continue
+                                    else:
+                                        # Last attempt failed - raise TransientQuotaError to rotate
+                                        raise TransientQuotaError(
+                                            provider="antigravity",
+                                            model=model,
+                                            message=transient_429_msg,
+                                        )
+                                # Has retry info - real quota exhaustion, propagate for cooldown
+                                lib_logger.debug(
+                                    f"429 with retry info - propagating for cooldown: {e}"
                                 )
-                                await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
-                                continue
-                            else:
-                                # Last attempt failed - raise without extra logging
-                                # (caller will log the error)
-                                raise EmptyResponseError(
-                                    provider="antigravity",
-                                    model=model,
-                                    message=error_msg,
-                                )
-
-                        return result
+                            # Re-raise all HTTP errors (429 with retry info, or other errors)
+                            raise
 
                     # Should not reach here, but just in case
                     lib_logger.error(
@@ -3322,7 +3489,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
-                        message=error_msg,
+                        message=empty_error_msg,
                     )
 
             except httpx.HTTPStatusError as e:
@@ -3343,8 +3510,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     continue  # Retry with new URL
                 raise  # No more fallback URLs
 
-            except EmptyResponseError:
-                # Empty response already retried internally - don't catch, propagate
+            except (EmptyResponseError, TransientQuotaError):
+                # Already retried internally - don't catch, propagate for credential rotation
                 raise
 
             except Exception as e:
@@ -3513,13 +3680,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         file_logger: Optional[AntigravityFileLogger] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _handle_streaming that retries on empty responses.
+        Wrapper around _handle_streaming that retries on empty responses and bare 429s.
 
-        If the stream yields zero chunks (Antigravity returned nothing),
-        retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times before giving up.
+        If the stream yields zero chunks (Antigravity returned nothing) or encounters
+        a bare 429 (no retry info), retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times
+        before giving up.
         """
-        error_msg = (
+        empty_error_msg = (
             "The model returned an empty response after multiple attempts. "
+            "This may indicate a temporary service issue. Please try again."
+        )
+        transient_429_msg = (
+            "The model returned transient 429 errors after multiple attempts. "
             "This may indicate a temporary service issue. Please try again."
         )
 
@@ -3550,13 +3722,33 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
-                        message=error_msg,
+                        message=empty_error_msg,
                     )
 
             except httpx.HTTPStatusError as e:
-                # 429 = Rate limit/quota exhausted - don't retry
                 if e.response.status_code == 429:
-                    lib_logger.debug(f"429 quota error - not retrying: {e}")
+                    # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                    quota_info = self.parse_quota_error(e)
+                    if quota_info is None:
+                        # Bare 429 - retry like empty response
+                        if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                            lib_logger.warning(
+                                f"[Antigravity] Bare 429 from {model}, "
+                                f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                            continue
+                        else:
+                            # Last attempt failed - raise TransientQuotaError to rotate
+                            raise TransientQuotaError(
+                                provider="antigravity",
+                                model=model,
+                                message=transient_429_msg,
+                            )
+                    # Has retry info - real quota exhaustion, propagate for cooldown
+                    lib_logger.debug(
+                        f"429 with retry info - propagating for cooldown: {e}"
+                    )
                     raise
                 # Other HTTP errors - raise immediately (let caller handle)
                 raise
@@ -3572,7 +3764,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         raise EmptyResponseError(
             provider="antigravity",
             model=model,
-            message=error_msg,
+            message=empty_error_msg,
         )
 
     async def count_tokens(

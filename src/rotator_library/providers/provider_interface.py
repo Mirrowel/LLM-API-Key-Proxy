@@ -1,9 +1,21 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, AsyncGenerator, Union, FrozenSet
+from typing import (
+    List,
+    Dict,
+    Any,
+    Optional,
+    AsyncGenerator,
+    Union,
+    FrozenSet,
+    TYPE_CHECKING,
+)
 import os
 import httpx
 import litellm
+
+if TYPE_CHECKING:
+    from ..usage_manager import UsageManager
 
 
 # =============================================================================
@@ -546,3 +558,45 @@ class ProviderInterface(ABC):
         # Strip provider prefix if present
         clean_model = model.split("/")[-1] if "/" in model else model
         return self.model_usage_weights.get(clean_model, 1)
+
+    # =========================================================================
+    # BACKGROUND JOB INTERFACE - Override in subclass for periodic tasks
+    # =========================================================================
+
+    def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Return configuration for provider-specific background job, or None if none.
+
+        Providers that need periodic background tasks (e.g., quota refresh,
+        cache cleanup) should override this method.
+
+        The BackgroundRefresher will call run_background_job() at the specified
+        interval for each provider that returns a config.
+
+        Returns:
+            None if no background job, otherwise:
+            {
+                "interval": 300,  # seconds between runs
+                "name": "my_job",  # for logging (e.g., "quota_refresh")
+                "run_on_start": True,  # whether to run immediately at startup
+            }
+        """
+        return None
+
+    async def run_background_job(
+        self,
+        usage_manager: "UsageManager",
+        credentials: List[str],
+    ) -> None:
+        """
+        Execute the provider's periodic background job.
+
+        Called by BackgroundRefresher at the interval specified in
+        get_background_job_config(). Override this method to implement
+        provider-specific periodic tasks.
+
+        Args:
+            usage_manager: UsageManager instance for storing/reading usage data
+            credentials: List of credential paths for this provider
+        """
+        pass

@@ -3,7 +3,7 @@
 import os
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict, Any, List
 
 if TYPE_CHECKING:
     from .client import RotatingClient
@@ -13,13 +13,19 @@ lib_logger = logging.getLogger("rotator_library")
 
 class BackgroundRefresher:
     """
-    A background task that periodically checks and refreshes OAuth tokens
-    to ensure they remain valid.
+    A background task manager that handles:
+    1. Periodic OAuth token refresh for all providers
+    2. Provider-specific background jobs (e.g., quota refresh) with independent timers
+
+    Each provider can define its own background job via get_background_job_config()
+    and run_background_job(). These run on their own schedules, independent of the
+    OAuth refresh interval.
     """
 
     def __init__(self, client: "RotatingClient"):
         self._client = client
         self._task: Optional[asyncio.Task] = None
+        self._provider_job_tasks: Dict[str, asyncio.Task] = {}  # provider -> task
         self._initialized = False
         try:
             interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "600")
@@ -37,10 +43,22 @@ class BackgroundRefresher:
             lib_logger.info(
                 f"Background token refresher started. Check interval: {self._interval} seconds."
             )
-            # [NEW] Log if custom interval is set
 
     async def stop(self):
-        """Stops the background refresh task."""
+        """Stops all background tasks (main loop + provider jobs)."""
+        # Cancel provider job tasks first
+        for provider, task in self._provider_job_tasks.items():
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                lib_logger.debug(f"Stopped background job for '{provider}'")
+
+        self._provider_job_tasks.clear()
+
+        # Cancel main task
         if self._task:
             self._task.cancel()
             try:
@@ -126,15 +144,100 @@ class BackgroundRefresher:
 
         self._initialized = True
 
-    async def _run(self):
-        """The main loop for the background task."""
-        # Initialize credentials (load persisted tiers) before starting the refresh loop
-        await self._initialize_credentials()
+    def _start_provider_background_jobs(self):
+        """
+        Start independent background job tasks for providers that define them.
 
+        Each provider with a get_background_job_config() that returns a config
+        gets its own asyncio task running on its own schedule.
+        """
+        all_credentials = self._client.all_credentials
+
+        for provider, credentials in all_credentials.items():
+            if not credentials:
+                continue
+
+            provider_plugin = self._client._get_provider_instance(provider)
+            if not provider_plugin:
+                continue
+
+            # Check if provider has a background job
+            if not hasattr(provider_plugin, "get_background_job_config"):
+                continue
+
+            config = provider_plugin.get_background_job_config()
+            if not config:
+                continue
+
+            # Start the provider's background job task
+            task = asyncio.create_task(
+                self._run_provider_background_job(
+                    provider, provider_plugin, credentials, config
+                )
+            )
+            self._provider_job_tasks[provider] = task
+
+            job_name = config.get("name", "background_job")
+            interval = config.get("interval", 300)
+            lib_logger.info(f"Started {provider} {job_name} (interval: {interval}s)")
+
+    async def _run_provider_background_job(
+        self,
+        provider_name: str,
+        provider: Any,
+        credentials: List[str],
+        config: Dict[str, Any],
+    ) -> None:
+        """
+        Independent loop for a single provider's background job.
+
+        Args:
+            provider_name: Name of the provider (for logging)
+            provider: Provider plugin instance
+            credentials: List of credential paths for this provider
+            config: Background job configuration from get_background_job_config()
+        """
+        interval = config.get("interval", 300)
+        job_name = config.get("name", "background_job")
+        run_on_start = config.get("run_on_start", True)
+
+        # Run immediately on start if configured
+        if run_on_start:
+            try:
+                await provider.run_background_job(
+                    self._client.usage_manager, credentials
+                )
+                lib_logger.debug(f"{provider_name} {job_name}: initial run complete")
+            except Exception as e:
+                lib_logger.error(
+                    f"Error in {provider_name} {job_name} (initial run): {e}"
+                )
+
+        # Main loop
         while True:
             try:
-                # lib_logger.info("Running proactive token refresh check...")
+                await asyncio.sleep(interval)
+                await provider.run_background_job(
+                    self._client.usage_manager, credentials
+                )
+                lib_logger.debug(f"{provider_name} {job_name}: periodic run complete")
+            except asyncio.CancelledError:
+                lib_logger.debug(f"{provider_name} {job_name}: cancelled")
+                break
+            except Exception as e:
+                lib_logger.error(f"Error in {provider_name} {job_name}: {e}")
 
+    async def _run(self):
+        """The main loop for OAuth token refresh."""
+        # Initialize credentials (load persisted tiers) before starting
+        await self._initialize_credentials()
+
+        # Start provider-specific background jobs with their own timers
+        self._start_provider_background_jobs()
+
+        # Main OAuth refresh loop
+        while True:
+            try:
                 oauth_configs = self._client.get_oauth_credentials()
                 for provider, paths in oauth_configs.items():
                     provider_plugin = self._client._get_provider_instance(provider)
@@ -148,6 +251,7 @@ class BackgroundRefresher:
                                 lib_logger.error(
                                     f"Error during proactive refresh for '{path}': {e}"
                                 )
+
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
                 break
