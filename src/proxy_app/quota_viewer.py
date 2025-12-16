@@ -6,6 +6,7 @@ Uses only httpx + rich (no heavy rotator_library imports).
 """
 
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -126,6 +127,19 @@ def format_cooldown(seconds: int) -> str:
         hours = seconds // 3600
         mins = (seconds % 3600) // 60
         return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+
+
+def natural_sort_key(item: Dict[str, Any]) -> List:
+    """
+    Generate a sort key for natural/numeric sorting.
+
+    Sorts credentials like proj-1, proj-2, proj-10 correctly
+    instead of alphabetically (proj-1, proj-10, proj-2).
+    """
+    identifier = item.get("identifier", "")
+    # Split into text and numeric parts
+    parts = re.split(r"(\d+)", identifier)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
 class QuotaViewer:
@@ -548,6 +562,9 @@ class QuotaViewer:
                 prov_stats = self.cached_stats.get("providers", {}).get(provider, {})
                 credentials = prov_stats.get("credentials", [])
 
+                # Sort credentials naturally (1, 2, 10 not 1, 10, 2)
+                credentials = sorted(credentials, key=natural_sort_key)
+
                 if not credentials:
                     self.console.print(
                         "[dim]No credentials configured for this provider.[/dim]"
@@ -584,6 +601,8 @@ class QuotaViewer:
                     if self.cached_stats
                     else []
                 )
+                # Sort credentials naturally
+                credentials = sorted(credentials, key=natural_sort_key)
                 for idx, cred in enumerate(credentials, 1):
                     identifier = cred.get("identifier", f"credential {idx}")
                     email = cred.get("email", identifier)
@@ -640,6 +659,8 @@ class QuotaViewer:
                     if self.cached_stats
                     else []
                 )
+                # Sort credentials naturally to match display order
+                credentials = sorted(credentials, key=natural_sort_key)
                 if 1 <= idx <= len(credentials):
                     cred = credentials[idx - 1]
                     cred_id = cred.get("identifier", "")
@@ -717,21 +738,69 @@ class QuotaViewer:
             f"[dim]{stats_line}[/dim]",
         ]
 
-        # Show model cooldowns if any
-        if model_cooldowns:
-            content_lines.append("")
-            content_lines.append("[yellow]Active Cooldowns:[/yellow]")
-            for model_name, cooldown_info in model_cooldowns.items():
-                remaining = cooldown_info.get("remaining_seconds", 0)
-                if remaining > 0:
-                    # Shorten model name for display
-                    short_model = model_name.split("/")[-1][:35]
-                    content_lines.append(
-                        f"  [yellow]⏱️ {short_model}: {format_cooldown(int(remaining))}[/yellow]"
-                    )
-
         # Model groups (for providers with quota tracking)
         model_groups = cred.get("model_groups", {})
+
+        # Show cooldowns grouped by quota group (if model_groups exist)
+        if model_cooldowns:
+            if model_groups:
+                # Group cooldowns by quota group
+                group_cooldowns: Dict[
+                    str, int
+                ] = {}  # group_name -> max_remaining_seconds
+                ungrouped_cooldowns: List[Tuple[str, int]] = []
+
+                for model_name, cooldown_info in model_cooldowns.items():
+                    remaining = cooldown_info.get("remaining_seconds", 0)
+                    if remaining <= 0:
+                        continue
+
+                    # Find which group this model belongs to
+                    clean_model = model_name.split("/")[-1]
+                    found_group = None
+                    for group_name, group_info in model_groups.items():
+                        group_models = group_info.get("models", [])
+                        if clean_model in group_models:
+                            found_group = group_name
+                            break
+
+                    if found_group:
+                        group_cooldowns[found_group] = max(
+                            group_cooldowns.get(found_group, 0), remaining
+                        )
+                    else:
+                        ungrouped_cooldowns.append((model_name, remaining))
+
+                if group_cooldowns or ungrouped_cooldowns:
+                    content_lines.append("")
+                    content_lines.append("[yellow]Active Cooldowns:[/yellow]")
+
+                    # Show grouped cooldowns
+                    for group_name in sorted(group_cooldowns.keys()):
+                        remaining = group_cooldowns[group_name]
+                        content_lines.append(
+                            f"  [yellow]⏱️ {group_name}: {format_cooldown(remaining)}[/yellow]"
+                        )
+
+                    # Show ungrouped (shouldn't happen often)
+                    for model_name, remaining in ungrouped_cooldowns:
+                        short_model = model_name.split("/")[-1][:35]
+                        content_lines.append(
+                            f"  [yellow]⏱️ {short_model}: {format_cooldown(remaining)}[/yellow]"
+                        )
+            else:
+                # No model groups - show per-model cooldowns
+                content_lines.append("")
+                content_lines.append("[yellow]Active Cooldowns:[/yellow]")
+                for model_name, cooldown_info in model_cooldowns.items():
+                    remaining = cooldown_info.get("remaining_seconds", 0)
+                    if remaining > 0:
+                        short_model = model_name.split("/")[-1][:35]
+                        content_lines.append(
+                            f"  [yellow]⏱️ {short_model}: {format_cooldown(int(remaining))}[/yellow]"
+                        )
+
+        # Display model groups with quota info
         if model_groups:
             content_lines.append("")
             for group_name, group_stats in model_groups.items():

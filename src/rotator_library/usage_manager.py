@@ -392,6 +392,49 @@ class UsageManager:
         # Not grouped - return individual model usage (no weight applied)
         return self._get_usage_count(key, model, usage_field)
 
+    def _get_quota_display(self, key: str, model: str) -> str:
+        """
+        Get a formatted quota display string for logging.
+
+        For antigravity (providers in _REQUEST_COUNT_PROVIDERS), returns:
+            "quota: 170/250 [32%]" format
+
+        For other providers, returns:
+            "usage: 170" format (no max available)
+
+        Args:
+            key: Credential identifier
+            model: Model name (with provider prefix)
+
+        Returns:
+            Formatted string for logging
+        """
+        provider = self._get_provider_from_credential(key)
+
+        if provider not in self._REQUEST_COUNT_PROVIDERS:
+            # Non-antigravity: just show usage count
+            usage = self._get_usage_count(key, model, "success_count")
+            return f"usage: {usage}"
+
+        # Antigravity: show quota display with remaining percentage
+        if self._usage_data is None:
+            return "quota: 0/? [100%]"
+
+        key_data = self._usage_data.get(key, {})
+        model_data = key_data.get("models", {}).get(model, {})
+
+        request_count = model_data.get("request_count", 0)
+        max_requests = model_data.get("quota_max_requests")
+
+        if max_requests:
+            remaining = max_requests - request_count
+            remaining_pct = (
+                int((remaining / max_requests) * 100) if max_requests > 0 else 0
+            )
+            return f"quota: {request_count}/{max_requests} [{remaining_pct}%]"
+        else:
+            return f"quota: {request_count}"
+
     def _get_usage_field_name(self, credential: str) -> str:
         """
         Get the usage tracking field name for a credential.
@@ -1285,9 +1328,10 @@ class UsageManager:
                                     if credential_tier_names
                                     else "unknown"
                                 )
+                                quota_display = self._get_quota_display(key, model)
                                 lib_logger.info(
                                     f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, usage: {usage})"
+                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, {quota_display})"
                                 )
                                 return key
 
@@ -1303,9 +1347,10 @@ class UsageManager:
                                     if credential_tier_names
                                     else "unknown"
                                 )
+                                quota_display = self._get_quota_display(key, model)
                                 lib_logger.info(
                                     f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
+                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
                                 )
                                 return key
 
@@ -1421,9 +1466,10 @@ class UsageManager:
                                 else None
                             )
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
+                            quota_display = self._get_quota_display(key, model)
                             lib_logger.info(
                                 f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, usage: {usage})"
+                                f"({tier_info}selection: {selection_method}, {quota_display})"
                             )
                             return key
 
@@ -1440,9 +1486,10 @@ class UsageManager:
                                 else None
                             )
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
+                            quota_display = self._get_quota_display(key, model)
                             lib_logger.info(
                                 f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, usage: {usage})"
+                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
                             )
                             return key
 

@@ -2664,26 +2664,24 @@ class RotatingClient:
                         models_data = cred.get("models", {})
                         group_stats["credentials_total"] += 1
 
-                        # Find any model from this group
+                        # Find any model from this group (try all with alias fallback)
+                        model_stats = None
                         for model in group_models:
-                            # Try with and without provider prefix
-                            prefixed_model = f"{provider}/{model}"
-                            model_stats = models_data.get(
-                                prefixed_model
-                            ) or models_data.get(model)
-
+                            model_stats = self._find_model_stats_in_data(
+                                models_data, model, provider, provider_instance
+                            )
                             if model_stats:
-                                baseline = model_stats.get(
-                                    "baseline_remaining_fraction"
-                                )
-                                if baseline is not None:
-                                    remaining_pct = int(baseline * 100)
-                                    group_stats["total_remaining_pcts"].append(
-                                        remaining_pct
-                                    )
-                                    if baseline <= 0:
-                                        group_stats["credentials_exhausted"] += 1
                                 break
+
+                        if model_stats:
+                            baseline = model_stats.get("baseline_remaining_fraction")
+                            if baseline is not None:
+                                remaining_pct = int(baseline * 100)
+                                group_stats["total_remaining_pcts"].append(
+                                    remaining_pct
+                                )
+                                if baseline <= 0:
+                                    group_stats["credentials_exhausted"] += 1
 
                     # Calculate average remaining percentage
                     if group_stats["total_remaining_pcts"]:
@@ -2701,55 +2699,52 @@ class RotatingClient:
                     models_data = cred.get("models", {})
 
                     for group_name, group_models in quota_groups.items():
-                        # Find representative model from this group
+                        # Find representative model from this group (try all with alias fallback)
+                        model_stats = None
                         for model in group_models:
-                            prefixed_model = f"{provider}/{model}"
-                            model_stats = models_data.get(
-                                prefixed_model
-                            ) or models_data.get(model)
-
+                            model_stats = self._find_model_stats_in_data(
+                                models_data, model, provider, provider_instance
+                            )
                             if model_stats:
-                                baseline = model_stats.get(
-                                    "baseline_remaining_fraction"
-                                )
-                                max_req = model_stats.get("quota_max_requests")
-                                req_count = model_stats.get("request_count", 0)
-                                reset_ts = model_stats.get("quota_reset_ts")
-
-                                remaining_pct = (
-                                    int(baseline * 100)
-                                    if baseline is not None
-                                    else None
-                                )
-                                is_exhausted = baseline is not None and baseline <= 0
-
-                                # Format reset time
-                                reset_iso = None
-                                if reset_ts:
-                                    try:
-                                        from datetime import datetime, timezone
-
-                                        reset_iso = datetime.fromtimestamp(
-                                            reset_ts, tz=timezone.utc
-                                        ).isoformat()
-                                    except (ValueError, OSError):
-                                        pass
-
-                                cred["model_groups"][group_name] = {
-                                    "remaining_pct": remaining_pct,
-                                    "requests_used": req_count,
-                                    "requests_max": max_req,
-                                    "display": f"{req_count}/{max_req}"
-                                    if max_req
-                                    else f"{req_count}/?",
-                                    "is_exhausted": is_exhausted,
-                                    "reset_time_iso": reset_iso,
-                                    "models": group_models,
-                                    "confidence": self._get_baseline_confidence(
-                                        model_stats
-                                    ),
-                                }
                                 break
+
+                        if model_stats:
+                            baseline = model_stats.get("baseline_remaining_fraction")
+                            max_req = model_stats.get("quota_max_requests")
+                            req_count = model_stats.get("request_count", 0)
+                            reset_ts = model_stats.get("quota_reset_ts")
+
+                            remaining_pct = (
+                                int(baseline * 100) if baseline is not None else None
+                            )
+                            is_exhausted = baseline is not None and baseline <= 0
+
+                            # Format reset time
+                            reset_iso = None
+                            if reset_ts:
+                                try:
+                                    from datetime import datetime, timezone
+
+                                    reset_iso = datetime.fromtimestamp(
+                                        reset_ts, tz=timezone.utc
+                                    ).isoformat()
+                                except (ValueError, OSError):
+                                    pass
+
+                            cred["model_groups"][group_name] = {
+                                "remaining_pct": remaining_pct,
+                                "requests_used": req_count,
+                                "requests_max": max_req,
+                                "display": f"{req_count}/{max_req}"
+                                if max_req
+                                else f"{req_count}/?",
+                                "is_exhausted": is_exhausted,
+                                "reset_time_iso": reset_iso,
+                                "models": group_models,
+                                "confidence": self._get_baseline_confidence(
+                                    model_stats
+                                ),
+                            }
 
                     # Try to get email from provider's cache
                     cred_path = cred.get("full_path", "")
@@ -2759,6 +2754,46 @@ class RotatingClient:
                             cred["tier"] = tier
 
         return stats
+
+    def _find_model_stats_in_data(
+        self,
+        models_data: Dict[str, Any],
+        model: str,
+        provider: str,
+        provider_instance: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find model stats in models_data, trying various name variants.
+
+        Handles aliased model names (e.g., gemini-3-pro-preview -> gemini-3-pro-high)
+        by using the provider's _user_to_api_model() mapping.
+
+        Args:
+            models_data: Dict of model_name -> stats from credential
+            model: Model name to look up (user-facing name)
+            provider: Provider name for prefixing
+            provider_instance: Provider instance for alias methods
+
+        Returns:
+            Model stats dict if found, None otherwise
+        """
+        # Try direct match with and without provider prefix
+        prefixed_model = f"{provider}/{model}"
+        model_stats = models_data.get(prefixed_model) or models_data.get(model)
+
+        if model_stats:
+            return model_stats
+
+        # Try with API model name (e.g., gemini-3-pro-preview -> gemini-3-pro-high)
+        if hasattr(provider_instance, "_user_to_api_model"):
+            api_model = provider_instance._user_to_api_model(model)
+            if api_model != model:
+                prefixed_api = f"{provider}/{api_model}"
+                model_stats = models_data.get(prefixed_api) or models_data.get(
+                    api_model
+                )
+
+        return model_stats
 
     def _get_baseline_confidence(self, model_stats: Dict) -> str:
         """
