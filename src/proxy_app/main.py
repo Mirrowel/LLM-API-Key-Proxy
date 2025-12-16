@@ -329,6 +329,24 @@ class AnthropicMessagesResponse(BaseModel):
     usage: AnthropicUsage
 
 
+# --- Anthropic Count Tokens Models ---
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic count_tokens API request format."""
+
+    model: str
+    messages: List[AnthropicMessage]
+    system: Optional[Union[str, List[dict]]] = None
+    tools: Optional[List[AnthropicTool]] = None
+    tool_choice: Optional[dict] = None
+    thinking: Optional[AnthropicThinkingConfig] = None
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """Anthropic count_tokens API response format."""
+
+    input_tokens: int
+
+
 # Calculate total loading time
 _elapsed = time.time() - _start_time
 print(
@@ -1830,6 +1848,83 @@ async def anthropic_messages(
                 headers=None,
                 body={"error": str(e)},
             )
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=500, detail=error_response)
+
+
+# --- Anthropic Count Tokens Endpoint ---
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request,
+    body: AnthropicCountTokensRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible count_tokens endpoint.
+
+    Counts the number of tokens that would be used by a Messages API request.
+    This is useful for estimating costs and managing context windows.
+
+    Accepts requests in Anthropic's format and returns token count in Anthropic's format.
+    """
+    try:
+        # Convert Anthropic request to OpenAI format for token counting
+        anthropic_request = body.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        # Count tokens for messages
+        message_tokens = client.token_count(
+            model=body.model,
+            messages=openai_messages,
+        )
+
+        # Count tokens for tools if present
+        tool_tokens = 0
+        if body.tools:
+            # Tools add tokens based on their definitions
+            # Convert to JSON string and count tokens for tool definitions
+            openai_tools = anthropic_to_openai_tools(
+                [tool.model_dump() for tool in body.tools]
+            )
+            if openai_tools:
+                # Serialize tools to count their token contribution
+                tools_text = json.dumps(openai_tools)
+                tool_tokens = client.token_count(
+                    model=body.model,
+                    text=tools_text,
+                )
+
+        total_tokens = message_tokens + tool_tokens
+
+        return JSONResponse(
+            content={"input_tokens": total_tokens}
+        )
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=400, detail=error_response)
+    except litellm.AuthenticationError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=401, detail=error_response)
+    except Exception as e:
+        logging.error(f"Anthropic count_tokens endpoint error: {e}")
         error_response = {
             "type": "error",
             "error": {"type": "api_error", "message": str(e)},
