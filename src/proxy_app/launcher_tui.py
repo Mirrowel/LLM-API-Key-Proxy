@@ -429,7 +429,7 @@ class LauncherTUI:
             self.console.print("   3. 🔑 Manage Credentials")
 
         self.console.print("   4. 📊 View Provider & Advanced Settings")
-        self.console.print("   5. 📈 View Quota & Usage Stats")
+        self.console.print("   5. 📈 View Quota & Usage Stats (Alpha)")
         self.console.print("   6. 🔄 Reload Configuration")
         self.console.print("   7. ℹ️  About")
         self.console.print("   8. 🚪 Exit")

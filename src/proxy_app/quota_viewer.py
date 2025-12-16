@@ -3,6 +3,42 @@ Lightweight Quota Stats Viewer TUI.
 
 Connects to a running proxy to display quota and usage statistics.
 Uses only httpx + rich (no heavy rotator_library imports).
+
+TODO: Missing Features & Improvements
+======================================
+
+Display Improvements:
+- [ ] Add color legend/help screen explaining status colors and symbols
+- [ ] Show credential email/project ID if available (currently just filename)
+- [ ] Add keyboard shortcut hints (e.g., "Press ? for help")
+- [ ] Support terminal resize / responsive layout
+
+Global Stats Fix:
+- [ ] HACK: Global requests currently set to current period requests only
+      (see client.py get_quota_stats). This doesn't include archived stats.
+      Fix requires tracking archived requests per quota group in usage_manager.py
+      to avoid double-counting models that share quota groups.
+
+Data & Refresh:
+- [ ] Auto-refresh option (configurable interval)
+- [ ] Show last refresh timestamp more prominently
+- [ ] Cache invalidation when switching between current/global view
+- [ ] Support for non-OAuth providers (API keys like nvapi-*, gsk_*, etc.)
+
+Remote Management:
+- [ ] Test connection before saving remote
+- [ ] Import/export remote configurations
+- [ ] SSH tunnel support for remote proxies
+
+Quota Groups:
+- [ ] Show which models are in each quota group (expandable)
+- [ ] Historical quota usage graphs (if data available)
+- [ ] Alerts/notifications when quota is low
+
+Credential Details:
+- [ ] Show per-model breakdown within quota groups
+- [ ] Edit credential priority/tier manually
+- [ ] Disable/enable individual credentials
 """
 
 import os
@@ -257,6 +293,131 @@ class QuotaViewer:
             self.last_error = str(e)
             return None
 
+    def _merge_provider_stats(self, provider: str, result: Dict[str, Any]) -> None:
+        """
+        Merge provider-specific stats into the existing cache.
+
+        Updates just the specified provider's data and recalculates the
+        summary fields to reflect the change.
+
+        Args:
+            provider: Provider name that was refreshed
+            result: API response containing the refreshed provider data
+        """
+        if not self.cached_stats:
+            self.cached_stats = result
+            return
+
+        # Merge provider data
+        if "providers" in result and provider in result["providers"]:
+            if "providers" not in self.cached_stats:
+                self.cached_stats["providers"] = {}
+            self.cached_stats["providers"][provider] = result["providers"][provider]
+
+        # Update timestamp
+        if "timestamp" in result:
+            self.cached_stats["timestamp"] = result["timestamp"]
+
+        # Recalculate summary from all providers
+        self._recalculate_summary()
+
+    def _recalculate_summary(self) -> None:
+        """
+        Recalculate summary fields from all provider data in cache.
+
+        Updates both 'summary' and 'global_summary' based on current
+        provider stats.
+        """
+        providers = self.cached_stats.get("providers", {})
+        if not providers:
+            return
+
+        # Calculate summary from all providers
+        total_creds = 0
+        active_creds = 0
+        exhausted_creds = 0
+        total_requests = 0
+        total_input_cached = 0
+        total_input_uncached = 0
+        total_output = 0
+        total_cost = 0.0
+
+        for prov_stats in providers.values():
+            total_creds += prov_stats.get("credential_count", 0)
+            active_creds += prov_stats.get("active_count", 0)
+            exhausted_creds += prov_stats.get("exhausted_count", 0)
+            total_requests += prov_stats.get("total_requests", 0)
+
+            tokens = prov_stats.get("tokens", {})
+            total_input_cached += tokens.get("input_cached", 0)
+            total_input_uncached += tokens.get("input_uncached", 0)
+            total_output += tokens.get("output", 0)
+
+            cost = prov_stats.get("approx_cost")
+            if cost:
+                total_cost += cost
+
+        total_input = total_input_cached + total_input_uncached
+        input_cache_pct = (
+            round(total_input_cached / total_input * 100, 1) if total_input > 0 else 0
+        )
+
+        self.cached_stats["summary"] = {
+            "total_providers": len(providers),
+            "total_credentials": total_creds,
+            "active_credentials": active_creds,
+            "exhausted_credentials": exhausted_creds,
+            "total_requests": total_requests,
+            "tokens": {
+                "input_cached": total_input_cached,
+                "input_uncached": total_input_uncached,
+                "input_cache_pct": input_cache_pct,
+                "output": total_output,
+            },
+            "approx_total_cost": total_cost if total_cost > 0 else None,
+        }
+
+        # Also recalculate global_summary if it exists
+        if "global_summary" in self.cached_stats:
+            global_total_requests = 0
+            global_input_cached = 0
+            global_input_uncached = 0
+            global_output = 0
+            global_cost = 0.0
+
+            for prov_stats in providers.values():
+                global_data = prov_stats.get("global", prov_stats)
+                global_total_requests += global_data.get("total_requests", 0)
+
+                tokens = global_data.get("tokens", {})
+                global_input_cached += tokens.get("input_cached", 0)
+                global_input_uncached += tokens.get("input_uncached", 0)
+                global_output += tokens.get("output", 0)
+
+                cost = global_data.get("approx_cost")
+                if cost:
+                    global_cost += cost
+
+            global_total_input = global_input_cached + global_input_uncached
+            global_cache_pct = (
+                round(global_input_cached / global_total_input * 100, 1)
+                if global_total_input > 0
+                else 0
+            )
+
+            self.cached_stats["global_summary"] = {
+                "total_providers": len(providers),
+                "total_credentials": total_creds,
+                "total_requests": global_total_requests,
+                "tokens": {
+                    "input_cached": global_input_cached,
+                    "input_uncached": global_input_uncached,
+                    "input_cache_pct": global_cache_pct,
+                    "output": global_output,
+                },
+                "approx_total_cost": global_cost if global_cost > 0 else None,
+            }
+
     def post_action(
         self,
         action: str,
@@ -300,7 +461,14 @@ class QuotaViewer:
                     return None
 
                 result = response.json()
-                self.cached_stats = result
+
+                # If scope is provider-specific, merge into existing cache
+                if scope == "provider" and provider and self.cached_stats:
+                    self._merge_provider_stats(provider, result)
+                else:
+                    # Full refresh - replace everything
+                    self.cached_stats = result
+
                 self.last_error = None
                 return result
 
@@ -424,8 +592,12 @@ class QuotaViewer:
                         tiers = group_stats.get("tiers", {})
 
                         # Format tier info: "5(15)f/2s" = 5 active out of 15 free, 2 standard all active
+                        # Sort by priority (lower number = higher priority, appears first)
                         tier_parts = []
-                        for tier_name, tier_info in sorted(tiers.items()):
+                        sorted_tiers = sorted(
+                            tiers.items(), key=lambda x: x[1].get("priority", 10)
+                        )
+                        for tier_name, tier_info in sorted_tiers:
                             if tier_name == "unknown":
                                 continue  # Skip unknown tiers in display
                             total_t = tier_info.get("total", 0)
@@ -546,10 +718,13 @@ class QuotaViewer:
         valid_choices = [str(i) for i in range(1, len(provider_list) + 1)]
         valid_choices.extend(["r", "R", "s", "S", "m", "M", "b", "B", "g", "G"])
 
-        choice = Prompt.ask("Select option", default="B").strip()
+        choice = Prompt.ask("Select option", default="").strip()
 
         if choice.lower() == "b":
             self.running = False
+        elif choice == "":
+            # Empty input - just refresh the screen
+            pass
         elif choice.lower() == "g":
             # Toggle view mode
             self.view_mode = "global" if self.view_mode == "current" else "current"
@@ -659,6 +834,7 @@ class QuotaViewer:
                 ):
                     self.post_action("reload", scope="all")
             elif choice == "F" and has_quota_groups:
+                result = None
                 with self.console.status(
                     f"[bold]Fetching live quota for ALL {provider} credentials...",
                     spinner="dots",
@@ -666,16 +842,17 @@ class QuotaViewer:
                     result = self.post_action(
                         "force_refresh", scope="provider", provider=provider
                     )
-                    if result and result.get("refresh_result"):
-                        rr = result["refresh_result"]
-                        self.console.print(
-                            f"\n[green]Refreshed {rr.get('credentials_refreshed', 0)} credentials "
-                            f"in {rr.get('duration_ms', 0)}ms[/green]"
-                        )
-                        if rr.get("errors"):
-                            for err in rr["errors"]:
-                                self.console.print(f"[red]  Error: {err}[/red]")
-                        Prompt.ask("Press Enter to continue", default="")
+                # Handle result OUTSIDE spinner
+                if result and result.get("refresh_result"):
+                    rr = result["refresh_result"]
+                    self.console.print(
+                        f"\n[green]Refreshed {rr.get('credentials_refreshed', 0)} credentials "
+                        f"in {rr.get('duration_ms', 0)}ms[/green]"
+                    )
+                    if rr.get("errors"):
+                        for err in rr["errors"]:
+                            self.console.print(f"[red]  Error: {err}[/red]")
+                    Prompt.ask("Press Enter to continue", default="")
             elif choice.startswith("F") and choice[1:].isdigit() and has_quota_groups:
                 idx = int(choice[1:])
                 credentials = (
@@ -691,6 +868,7 @@ class QuotaViewer:
                     cred = credentials[idx - 1]
                     cred_id = cred.get("identifier", "")
                     email = cred.get("email", cred_id)
+                    result = None
                     with self.console.status(
                         f"[bold]Fetching live quota for {email}...", spinner="dots"
                     ):
@@ -700,15 +878,16 @@ class QuotaViewer:
                             provider=provider,
                             credential=cred_id,
                         )
-                        if result and result.get("refresh_result"):
-                            rr = result["refresh_result"]
-                            self.console.print(
-                                f"\n[green]Refreshed in {rr.get('duration_ms', 0)}ms[/green]"
-                            )
-                            if rr.get("errors"):
-                                for err in rr["errors"]:
-                                    self.console.print(f"[red]  Error: {err}[/red]")
-                            Prompt.ask("Press Enter to continue", default="")
+                    # Handle result OUTSIDE spinner
+                    if result and result.get("refresh_result"):
+                        rr = result["refresh_result"]
+                        self.console.print(
+                            f"\n[green]Refreshed in {rr.get('duration_ms', 0)}ms[/green]"
+                        )
+                        if rr.get("errors"):
+                            for err in rr["errors"]:
+                                self.console.print(f"[red]  Error: {err}[/red]")
+                        Prompt.ask("Press Enter to continue", default="")
 
     def _render_credential_panel(self, idx: int, cred: Dict[str, Any], provider: str):
         """Render a single credential as a panel."""
@@ -841,16 +1020,28 @@ class QuotaViewer:
                 display = group_stats.get("display", f"{requests_used}/?")
                 bar = create_progress_bar(remaining_pct)
 
+                # Build status text - always show reset time if available
+                has_reset_time = reset_time and reset_time != "-"
+
                 # Color based on status
                 if is_exhausted:
                     color = "red"
-                    status_text = "⛔ EXHAUSTED"
+                    if has_reset_time:
+                        status_text = f"⛔ Resets: {reset_time}"
+                    else:
+                        status_text = "⛔ EXHAUSTED"
                 elif remaining_pct is not None and remaining_pct < 20:
                     color = "yellow"
-                    status_text = "⚠️ LOW"
+                    if has_reset_time:
+                        status_text = f"⚠️ Resets: {reset_time}"
+                    else:
+                        status_text = "⚠️ LOW"
                 else:
                     color = "green"
-                    status_text = f"Resets: {reset_time}"
+                    if has_reset_time:
+                        status_text = f"Resets: {reset_time}"
+                    else:
+                        status_text = ""  # Hide if unused/no reset time
 
                 # Confidence indicator
                 conf_indicator = ""

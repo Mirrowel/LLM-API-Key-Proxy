@@ -2678,9 +2678,18 @@ class RotatingClient:
                             tier = provider_instance.project_tier_cache.get(cred_path)
                         tier = tier or "unknown"
 
-                        # Initialize tier entry if needed
+                        # Initialize tier entry if needed with priority for sorting
                         if tier not in group_stats["tiers"]:
-                            group_stats["tiers"][tier] = {"total": 0, "active": 0}
+                            priority = 10  # default
+                            if hasattr(provider_instance, "_resolve_tier_priority"):
+                                priority = provider_instance._resolve_tier_priority(
+                                    tier
+                                )
+                            group_stats["tiers"][tier] = {
+                                "total": 0,
+                                "active": 0,
+                                "priority": priority,
+                            }
                         group_stats["tiers"][tier]["total"] += 1
 
                         # Find model with VALID baseline (not just any model with stats)
@@ -2745,16 +2754,28 @@ class RotatingClient:
 
                     for group_name, group_models in quota_groups.items():
                         # Find model with VALID baseline (prefer over any model with stats)
+                        # Also track the best reset_ts across all models in the group
                         model_stats = None
+                        best_reset_ts = None
+
                         for model in group_models:
                             candidate = self._find_model_stats_in_data(
                                 models_data, model, provider, provider_instance
                             )
                             if candidate:
+                                # Track the best (latest) reset_ts from any model in group
+                                candidate_reset_ts = candidate.get("quota_reset_ts")
+                                if candidate_reset_ts:
+                                    if (
+                                        best_reset_ts is None
+                                        or candidate_reset_ts > best_reset_ts
+                                    ):
+                                        best_reset_ts = candidate_reset_ts
+
                                 baseline = candidate.get("baseline_remaining_fraction")
                                 if baseline is not None:
                                     model_stats = candidate
-                                    break
+                                    # Don't break - continue to find best reset_ts
                                 # Keep first found as fallback
                                 if model_stats is None:
                                     model_stats = candidate
@@ -2763,7 +2784,10 @@ class RotatingClient:
                             baseline = model_stats.get("baseline_remaining_fraction")
                             max_req = model_stats.get("quota_max_requests")
                             req_count = model_stats.get("request_count", 0)
-                            reset_ts = model_stats.get("quota_reset_ts")
+                            # Use best_reset_ts from any model in the group
+                            reset_ts = best_reset_ts or model_stats.get(
+                                "quota_reset_ts"
+                            )
 
                             remaining_pct = (
                                 int(baseline * 100) if baseline is not None else None
@@ -2796,6 +2820,25 @@ class RotatingClient:
                                     model_stats
                                 ),
                             }
+
+                    # Recalculate credential's requests from model_groups
+                    # This fixes double-counting when models share quota groups
+                    if cred.get("model_groups"):
+                        group_requests = sum(
+                            g.get("requests_used", 0)
+                            for g in cred["model_groups"].values()
+                        )
+                        cred["requests"] = group_requests
+
+                        # HACK: Fix global requests if present
+                        # This is a simplified fix that sets global.requests = current group_requests.
+                        # TODO: Properly track archived requests per quota group in usage_manager.py
+                        # so that global stats correctly sum: current_period + archived_periods
+                        # without double-counting models that share quota groups.
+                        # See: usage_manager.py lines 2388-2404 where global stats are built
+                        # by iterating all models (causing double-counting for grouped models).
+                        if cred.get("global"):
+                            cred["global"]["requests"] = group_requests
 
                     # Try to get email from provider's cache
                     cred_path = cred.get("full_path", "")
