@@ -84,6 +84,36 @@ def create_progress_bar(percent: Optional[int], width: int = 10) -> str:
     return "▓" * filled + "░" * (width - filled)
 
 
+def is_local_host(host: str) -> bool:
+    """Check if host is a local/private address (should use http, not https)."""
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    # Private IP ranges
+    if host.startswith("192.168.") or host.startswith("10."):
+        return True
+    if host.startswith("172."):
+        # 172.16.0.0 - 172.31.255.255
+        try:
+            second_octet = int(host.split(".")[1])
+            if 16 <= second_octet <= 31:
+                return True
+        except (ValueError, IndexError):
+            pass
+    return False
+
+
+def get_scheme_for_host(host: str, port: int) -> str:
+    """Determine http or https scheme based on host and port."""
+    if port == 443:
+        return "https"
+    if is_local_host(host):
+        return "http"
+    # For external domains, default to https
+    if "." in host:
+        return "https"
+    return "http"
+
+
 def format_cooldown(seconds: int) -> str:
     """Format cooldown seconds as human-readable string."""
     if seconds < 60:
@@ -131,8 +161,7 @@ class QuotaViewer:
             return "http://127.0.0.1:8000"
         host = self.current_remote.get("host", "127.0.0.1")
         port = self.current_remote.get("port", 8000)
-        # Use https if port is 443 or host looks like a domain
-        scheme = "https" if port == 443 or "." in host else "http"
+        scheme = get_scheme_for_host(host, port)
         return f"{scheme}://{host}:{port}"
 
     def check_connection(
@@ -150,7 +179,7 @@ class QuotaViewer:
         """
         host = remote.get("host", "127.0.0.1")
         port = remote.get("port", 8000)
-        scheme = "https" if port == 443 or "." in host else "http"
+        scheme = get_scheme_for_host(host, port)
         url = f"{scheme}://{host}:{port}/"
 
         headers = {}
