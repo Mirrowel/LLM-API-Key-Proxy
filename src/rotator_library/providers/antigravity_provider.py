@@ -398,18 +398,37 @@ def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
 def _clean_claude_schema(schema: Any) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
-    - Removes unsupported fields ($schema, additionalProperties, etc.)
+
+    Context-aware cleaning:
+    - Removes unsupported validation keywords at schema-definition level
+    - Preserves property NAMES even if they match validation keyword names
+      (e.g., a tool parameter named "pattern" is preserved)
     - Converts 'const' to 'enum' with single value (supported equivalent)
     - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
     """
     if not isinstance(schema, dict):
         return schema
 
-    # Fields not supported by Antigravity/Google's Proto-based API
-    # Note: Claude via Antigravity rejects JSON Schema draft 2020-12 validation keywords
-    incompatible = {
+    # Meta/structural keywords - always remove regardless of context
+    # These are JSON Schema infrastructure, never valid property names
+    meta_keywords = {
         "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
         "additionalProperties",
+    }
+
+    # Validation keywords - only remove at schema-definition level,
+    # NOT when they appear as property names under "properties"
+    # Note: These are common property names that could be used by tools:
+    # - "pattern" (glob, grep, regex tools)
+    # - "format" (export, date/time tools)
+    # - "default" (config tools)
+    # - "title" (document tools)
+    # - "minimum"/"maximum" (range tools)
+    validation_keywords = {
         "minItems",
         "maxItems",
         "pattern",
@@ -432,10 +451,6 @@ def _clean_claude_schema(schema: Any) -> Any:
         "readOnly",
         "writeOnly",
         "examples",
-        "$id",
-        "$ref",
-        "$defs",
-        "definitions",
         "title",
     }
 
@@ -458,9 +473,29 @@ def _clean_claude_schema(schema: Any) -> Any:
         cleaned["enum"] = [const_value]
 
     for key, value in schema.items():
-        if key in incompatible or key == "const":
+        # Always skip meta keywords and "const" (already handled above)
+        if key in meta_keywords or key == "const":
             continue
-        if isinstance(value, dict):
+
+        # Skip validation keywords at schema level (these are constraints, not data)
+        if key in validation_keywords:
+            continue
+
+        # Special handling for "properties" - preserve property NAMES
+        # The keys inside "properties" are user-defined property names, not schema keywords
+        # We must preserve them even if they match validation keyword names
+        if key == "properties" and isinstance(value, dict):
+            cleaned_props = {}
+            for prop_name, prop_schema in value.items():
+                # Log warning if property name matches a validation keyword
+                # This helps debug potential issues where the old code would have dropped it
+                if prop_name in validation_keywords:
+                    lib_logger.debug(
+                        f"[Schema] Preserving property '{prop_name}' (matches validation keyword name)"
+                    )
+                cleaned_props[prop_name] = _clean_claude_schema(prop_schema)
+            cleaned[key] = cleaned_props
+        elif isinstance(value, dict):
             cleaned[key] = _clean_claude_schema(value)
         elif isinstance(value, list):
             cleaned[key] = [
