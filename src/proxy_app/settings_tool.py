@@ -749,8 +749,9 @@ class SettingsTool:
         self.console.print("   3. ⚡ Concurrency Limits")
         self.console.print("   4. 🔄 Rotation Modes")
         self.console.print("   5. 🔬 Provider-Specific Settings")
-        self.console.print("   6. 💾 Save & Exit")
-        self.console.print("   7. 🚫 Exit Without Saving")
+        self.console.print("   6. 🎯 Model Filters (Ignore/Whitelist)")
+        self.console.print("   7. 💾 Save & Exit")
+        self.console.print("   8. 🚫 Exit Without Saving")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -758,14 +759,10 @@ class SettingsTool:
         self.console.print(self._get_pending_status_text())
 
         self.console.print()
-        self.console.print(
-            "[dim]⚠️  Model filters not supported - edit .env for IGNORE_MODELS_* / WHITELIST_MODELS_*[/dim]"
-        )
-        self.console.print()
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
             show_choices=False,
         )
 
@@ -780,8 +777,10 @@ class SettingsTool:
         elif choice == "5":
             self.manage_provider_settings()
         elif choice == "6":
-            self.save_and_exit()
+            self.launch_model_filter_gui()
         elif choice == "7":
+            self.save_and_exit()
+        elif choice == "8":
             self.exit_without_saving()
 
     def manage_custom_providers(self):
@@ -1392,6 +1391,28 @@ class SettingsTool:
                 self.console.print()
 
         input("Press Enter to return...")
+
+    def launch_model_filter_gui(self):
+        """Launch the Model Filter GUI for managing ignore/whitelist rules"""
+        clear_screen()
+        self.console.print("\n[cyan]Launching Model Filter GUI...[/cyan]\n")
+        self.console.print(
+            "[dim]The GUI will open in a separate window. Close it to return here.[/dim]\n"
+        )
+
+        try:
+            from proxy_app.model_filter_gui import run_model_filter_gui
+
+            run_model_filter_gui()  # Blocks until GUI closes
+        except ImportError as e:
+            self.console.print(f"\n[red]Failed to launch Model Filter GUI: {e}[/red]")
+            self.console.print()
+            self.console.print(
+                "[yellow]Make sure 'customtkinter' is installed:[/yellow]"
+            )
+            self.console.print("  [cyan]pip install customtkinter[/cyan]")
+            self.console.print()
+            input("Press Enter to continue...")
 
     def manage_provider_settings(self):
         """Manage provider-specific settings (Antigravity, Gemini CLI)"""
