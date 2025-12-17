@@ -403,6 +403,7 @@ def _clean_claude_schema(schema: Any) -> Any:
     - Removes unsupported validation keywords at schema-definition level
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
+    - Preserves additionalProperties when permissive (true or {}) for pass-through objects
     - Converts 'const' to 'enum' with single value (supported equivalent)
     - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
     """
@@ -417,7 +418,7 @@ def _clean_claude_schema(schema: Any) -> Any:
         "$ref",
         "$defs",
         "definitions",
-        "additionalProperties",
+        # Note: additionalProperties is handled specially below - preserved when permissive
     }
 
     # Validation keywords - only remove at schema-definition level,
@@ -475,6 +476,18 @@ def _clean_claude_schema(schema: Any) -> Any:
     for key, value in schema.items():
         # Always skip meta keywords and "const" (already handled above)
         if key in meta_keywords or key == "const":
+            continue
+
+        # Special handling for additionalProperties:
+        # - Normalize permissive values ({} or true) to true
+        # - Pass through false as-is
+        # - Skip complex schema values (not supported by Antigravity's proto-based API)
+        if key == "additionalProperties":
+            if value is True or value == {} or (isinstance(value, dict) and not value):
+                cleaned["additionalProperties"] = True  # Normalize {} to true
+            elif value is False:
+                cleaned["additionalProperties"] = False  # Pass through explicit false
+            # Skip complex schema values (e.g., {"type": "string"})
             continue
 
         # Skip validation keywords at schema level (these are constraints, not data)
@@ -2528,8 +2541,12 @@ class AntigravityProvider(
         """
         Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
 
-        Adds 'additionalProperties: false' recursively to all object schemas,
+        Adds 'additionalProperties: false' to object schemas that don't already have it set,
         which tells the model it CANNOT add properties not in the schema.
+
+        Exceptions (leaves schema unchanged):
+        - Objects that already have 'additionalProperties' set (true or false)
+        - Objects with empty 'properties: {}' (pass-through objects like batch tool's parameters)
         """
         if not tools:
             return tools
@@ -2550,9 +2567,17 @@ class AntigravityProvider(
                 else:
                     result[key] = value
 
-            # Add additionalProperties: false to object schemas
+            # Add additionalProperties: false to object schemas, with exceptions:
+            # 1. Skip if already set (respect explicit true or false from client)
+            # 2. Skip if properties is empty {} (dynamic/pass-through object)
             if result.get("type") == "object" and "properties" in result:
-                result["additionalProperties"] = False
+                if "additionalProperties" in result:
+                    pass  # Already set - respect client's choice
+                elif not result.get("properties"):
+                    pass  # Empty properties - leave permissive for dynamic objects
+                else:
+                    # Has defined properties and no explicit setting - enforce strict
+                    result["additionalProperties"] = False
 
             return result
 
