@@ -8,6 +8,7 @@ has certain methods and attributes available.
 Required from provider:
     - self._get_effective_quota_groups() -> Dict[str, List[str]]
     - self._get_available_models() -> List[str]  # User-facing model names
+    - self._get_antigravity_headers() -> Dict[str, str]  # API headers for requests
     - self.list_credentials(base_dir) -> List[Dict[str, Any]]
     - self.project_tier_cache: Dict[str, str]
     - self.project_id_cache: Dict[str, str]
@@ -62,6 +63,8 @@ DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
         "gemini-3-pro-high": 0.25,
         "gemini-3-pro-low": 0.25,
         "gemini-3-pro-preview": 0.25,
+        # Gemini 3 Flash (0.25% per request, 400 requests total - separate quota pool)
+        "gemini-3-flash": 0.25,
         # Gemini 2.5 Flash group (0.0333% per request, ~3000 requests)
         "gemini-2.5-flash": 0.0333,
         "gemini-2.5-flash-thinking": 0.0333,
@@ -80,6 +83,8 @@ DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
         "gemini-3-pro-high": 0.4,
         "gemini-3-pro-low": 0.4,
         "gemini-3-pro-preview": 0.4,
+        # Gemini 3 Flash (0.20% per request, 400 requests total - separate quota pool)
+        "gemini-3-flash": 0.20,
         # Gemini 2.5 Flash group (same as standard-tier)
         "gemini-2.5-flash": 0.0333,
         "gemini-2.5-flash-thinking": 0.0333,
@@ -349,7 +354,7 @@ class AntigravityQuotaTracker:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                "User-Agent": "antigravity/1.11.9 windows/amd64",
+                **self._get_antigravity_headers(),
             }
             payload = {"project": project_id} if project_id else {}
 
@@ -1171,7 +1176,7 @@ class AntigravityQuotaTracker:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                "User-Agent": "antigravity/1.11.9 windows/amd64",
+                **self._get_antigravity_headers(),
             }
 
             payload = {

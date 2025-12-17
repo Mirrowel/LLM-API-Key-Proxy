@@ -4,7 +4,7 @@ Antigravity Provider - Refactored Implementation
 
 A clean, well-structured provider for Google's Antigravity API, supporting:
 - Gemini 2.5 (Pro/Flash) with thinkingBudget
-- Gemini 3 (Pro/Image) with thinkingLevel
+- Gemini 3 (Pro/Flash/Image) with thinkingLevel
 - Claude (Sonnet 4.5) via Antigravity proxy
 - Claude (Opus 4.5) via Antigravity proxy
 
@@ -38,7 +38,6 @@ from typing import (
     Union,
     TYPE_CHECKING,
 )
-from urllib.parse import urlparse
 
 import httpx
 import litellm
@@ -81,6 +80,15 @@ BASE_URLS = [
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
 
+# Required headers for Antigravity API calls
+# These headers are CRITICAL for gemini-3-pro-high/low to work
+# Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
+ANTIGRAVITY_HEADERS = {
+    "User-Agent": "antigravity/1.12.4 windows/amd64",
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+}
+
 # Available models via Antigravity
 AVAILABLE_MODELS = [
     # Gemini models
@@ -88,6 +96,7 @@ AVAILABLE_MODELS = [
     "gemini-2.5-flash",  # Uses -thinking variant when reasoning_effort provided
     "gemini-2.5-flash-lite",  # Thinking budget configurable, no name change
     "gemini-3-pro-preview",  # Internally mapped to -low/-high variant based on thinkingLevel
+    "gemini-3-flash",  # New Gemini 3 Flash model (supports thinking with minBudget=32)
     # "gemini-3-pro-image",  # Image generation model
     # "gemini-2.5-computer-use-preview-10-2025",
     # Claude models
@@ -104,7 +113,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
 EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 6))
-EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 2)
+EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3)
 
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
@@ -131,6 +140,13 @@ FINISH_REASON_MAP = {
     "RECITATION": "content_filter",
     "OTHER": "stop",
 }
+
+# Gemini 3 tool name remapping
+# Turned out not useful - saved for later to unfuck if needed
+GEMINI3_TOOL_RENAMES = {
+    # "batch": "multi_tool",  # "batch" triggers internal format: call:default_api:...
+}
+GEMINI3_TOOL_RENAMES_REVERSE = {v: k for k, v in GEMINI3_TOOL_RENAMES.items()}
 
 # Default safety settings - disable content filtering for all categories
 # Per CLIProxyAPI: these are attached to prevent safety blocks during API calls
@@ -260,14 +276,23 @@ def _generate_project_id() -> str:
 def _normalize_type_arrays(schema: Any) -> Any:
     """
     Normalize type arrays in JSON Schema for Proto-based Antigravity API.
-    Converts `"type": ["string", "null"]` → `"type": "string"`.
+    Converts `"type": ["string", "null"]` → `"type": "string", "nullable": true`.
     """
     if isinstance(schema, dict):
         normalized = {}
         for key, value in schema.items():
             if key == "type" and isinstance(value, list):
-                non_null = [t for t in value if t != "null"]
-                normalized[key] = non_null[0] if non_null else value[0]
+                types = value
+                if "null" in types:
+                    normalized["nullable"] = True
+                    remaining_types = [t for t in types if t != "null"]
+                    if len(remaining_types) == 1:
+                        normalized[key] = remaining_types[0]
+                    elif len(remaining_types) > 1:
+                        normalized[key] = remaining_types
+                    # If no types remain, don't add "type" key
+                else:
+                    normalized[key] = value[0] if len(value) == 1 else value
             else:
                 normalized[key] = _normalize_type_arrays(value)
         return normalized
@@ -276,21 +301,46 @@ def _normalize_type_arrays(schema: Any) -> Any:
     return schema
 
 
-def _recursively_parse_json_strings(obj: Any) -> Any:
+def _recursively_parse_json_strings(
+    obj: Any,
+    schema: Optional[Dict[str, Any]] = None,
+    parse_json_objects: bool = False,
+) -> Any:
     """
     Recursively parse JSON strings in nested data structures.
 
     Antigravity sometimes returns tool arguments with JSON-stringified values:
     {"files": "[{...}]"} instead of {"files": [{...}]}.
 
+    Args:
+        obj: The object to process
+        schema: Optional JSON schema for the current level (used for schema-aware parsing)
+        parse_json_objects: If False (default), don't parse JSON-looking strings into objects.
+                           This prevents corrupting string content like write tool's "content" field.
+                           If True, parse strings that look like JSON objects/arrays.
+
     Additionally handles:
-    - Malformed double-encoded JSON (extra trailing '}' or ']')
-    - Escaped string content (\n, \t, \", etc.)
+    - Malformed double-encoded JSON (extra trailing '}' or ']') - only when parse_json_objects=True
+    - Escaped string content (\n, \t, etc.) - always processed
     """
     if isinstance(obj, dict):
-        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
+        # Get properties schema for looking up field types
+        properties_schema = schema.get("properties", {}) if schema else {}
+        return {
+            k: _recursively_parse_json_strings(
+                v,
+                properties_schema.get(k),
+                parse_json_objects,
+            )
+            for k, v in obj.items()
+        }
     elif isinstance(obj, list):
-        return [_recursively_parse_json_strings(item) for item in obj]
+        # Get items schema for array elements
+        items_schema = schema.get("items") if schema else None
+        return [
+            _recursively_parse_json_strings(item, items_schema, parse_json_objects)
+            for item in obj
+        ]
     elif isinstance(obj, str):
         stripped = obj.strip()
 
@@ -321,6 +371,20 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                 # If unescaping fails, continue with original processing
                 pass
 
+        # Only parse JSON strings if explicitly enabled
+        if not parse_json_objects:
+            return obj
+
+        # Schema-aware parsing: only parse if schema expects object/array, not string
+        if schema:
+            schema_type = schema.get("type")
+            if schema_type == "string":
+                # Schema says this should be a string - don't parse it
+                return obj
+            # Only parse if schema expects object or array
+            if schema_type not in ("object", "array", None):
+                return obj
+
         # Check if it looks like JSON (starts with { or [)
         if stripped and stripped[0] in ("{", "["):
             # Try standard parsing first
@@ -329,7 +393,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
             ):
                 try:
                     parsed = json.loads(obj)
-                    return _recursively_parse_json_strings(parsed)
+                    return _recursively_parse_json_strings(
+                        parsed, schema, parse_json_objects
+                    )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -346,7 +412,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -362,7 +430,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
     return obj
@@ -395,7 +465,7 @@ def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
     return resolve(schema)
 
 
-def _clean_claude_schema(schema: Any) -> Any:
+def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
 
@@ -403,9 +473,10 @@ def _clean_claude_schema(schema: Any) -> Any:
     - Removes unsupported validation keywords at schema-definition level
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
-    - Preserves additionalProperties when permissive (true or {}) for pass-through objects
-    - Converts 'const' to 'enum' with single value (supported equivalent)
-    - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
+    - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
+    - For Claude: strips validation keywords, converts anyOf/oneOf to first option, const to enum
+    - For Gemini: passes through additionalProperties as-is
+    - For Claude: normalizes permissive additionalProperties to true
     """
     if not isinstance(schema, dict):
         return schema
@@ -413,12 +484,10 @@ def _clean_claude_schema(schema: Any) -> Any:
     # Meta/structural keywords - always remove regardless of context
     # These are JSON Schema infrastructure, never valid property names
     meta_keywords = {
-        "$schema",
         "$id",
         "$ref",
         "$defs",
         "definitions",
-        # Note: additionalProperties is handled specially below - preserved when permissive
     }
 
     # Validation keywords - only remove at schema-definition level,
@@ -429,22 +498,25 @@ def _clean_claude_schema(schema: Any) -> Any:
     # - "default" (config tools)
     # - "title" (document tools)
     # - "minimum"/"maximum" (range tools)
-    validation_keywords = {
+    #
+    # Keywords to strip for Claude only (Gemini accepts these):
+    # Claude rejects most JSON Schema validation keywords
+    validation_keywords_claude_only = {
+        "$schema",
         "minItems",
         "maxItems",
+        "uniqueItems",
         "pattern",
         "minLength",
         "maxLength",
         "minimum",
         "maximum",
-        "default",
         "exclusiveMinimum",
         "exclusiveMaximum",
         "multipleOf",
         "format",
         "minProperties",
         "maxProperties",
-        "uniqueItems",
         "contentEncoding",
         "contentMediaType",
         "contentSchema",
@@ -453,45 +525,66 @@ def _clean_claude_schema(schema: Any) -> Any:
         "writeOnly",
         "examples",
         "title",
+        "default",
     }
 
     # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-        first_option = _clean_claude_schema(schema["anyOf"][0])
-        if isinstance(first_option, dict):
-            return first_option
+    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    if not for_gemini:
+        if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
+            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
+            if isinstance(first_option, dict):
+                return first_option
 
-    # Handle 'oneOf' similarly
-    if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-        first_option = _clean_claude_schema(schema["oneOf"][0])
-        if isinstance(first_option, dict):
-            return first_option
+        # Handle 'oneOf' similarly
+        if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
+            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
+            if isinstance(first_option, dict):
+                return first_option
 
     cleaned = {}
-    # Handle 'const' by converting to 'enum' with single value
-    if "const" in schema:
+    # Handle 'const' by converting to 'enum' with single value (Claude only)
+    # Gemini supports const, so pass through for Gemini
+    if "const" in schema and not for_gemini:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
 
     for key, value in schema.items():
-        # Always skip meta keywords and "const" (already handled above)
-        if key in meta_keywords or key == "const":
+        # Always skip meta keywords
+        if key in meta_keywords:
+            continue
+
+        # Skip "const" for Claude (already converted to enum above)
+        if key == "const" and not for_gemini:
+            continue
+
+        # Strip Claude-only keywords when not targeting Gemini
+        if key in validation_keywords_claude_only:
+            if for_gemini:
+                # Gemini accepts these - preserve them
+                cleaned[key] = value
+            # For Claude: skip - not supported
             continue
 
         # Special handling for additionalProperties:
-        # - Normalize permissive values ({} or true) to true
-        # - Pass through false as-is
-        # - Skip complex schema values (not supported by Antigravity's proto-based API)
+        # For Gemini: pass through as-is (Gemini accepts {}, true, false, typed schemas)
+        # For Claude: normalize permissive values ({} or true) to true
         if key == "additionalProperties":
-            if value is True or value == {} or (isinstance(value, dict) and not value):
-                cleaned["additionalProperties"] = True  # Normalize {} to true
-            elif value is False:
-                cleaned["additionalProperties"] = False  # Pass through explicit false
-            # Skip complex schema values (e.g., {"type": "string"})
-            continue
-
-        # Skip validation keywords at schema level (these are constraints, not data)
-        if key in validation_keywords:
+            if for_gemini:
+                # Pass through additionalProperties as-is for Gemini
+                # Gemini accepts: true, false, {}, {"type": "string"}, etc.
+                cleaned["additionalProperties"] = value
+            else:
+                # Claude handling: normalize permissive values to true
+                if (
+                    value is True
+                    or value == {}
+                    or (isinstance(value, dict) and not value)
+                ):
+                    cleaned["additionalProperties"] = True  # Normalize {} to true
+                elif value is False:
+                    cleaned["additionalProperties"] = False
+                # Skip complex schema values for Claude (e.g., {"type": "string"})
             continue
 
         # Special handling for "properties" - preserve property NAMES
@@ -502,17 +595,19 @@ def _clean_claude_schema(schema: Any) -> Any:
             for prop_name, prop_schema in value.items():
                 # Log warning if property name matches a validation keyword
                 # This helps debug potential issues where the old code would have dropped it
-                if prop_name in validation_keywords:
+                if prop_name in validation_keywords_claude_only:
                     lib_logger.debug(
                         f"[Schema] Preserving property '{prop_name}' (matches validation keyword name)"
                     )
-                cleaned_props[prop_name] = _clean_claude_schema(prop_schema)
+                cleaned_props[prop_name] = _clean_claude_schema(prop_schema, for_gemini)
             cleaned[key] = cleaned_props
         elif isinstance(value, dict):
-            cleaned[key] = _clean_claude_schema(value)
+            cleaned[key] = _clean_claude_schema(value, for_gemini)
         elif isinstance(value, list):
             cleaned[key] = [
-                _clean_claude_schema(item) if isinstance(item, dict) else item
+                _clean_claude_schema(item, for_gemini)
+                if isinstance(item, dict)
+                else item
                 for item in value
             ]
         else:
@@ -600,7 +695,7 @@ class AntigravityProvider(
 
     Supports:
     - Gemini 2.5 (Pro/Flash) with thinkingBudget
-    - Gemini 3 (Pro/Image) with thinkingLevel
+    - Gemini 3 (Pro/Flash/Image) with thinkingLevel
     - Claude Sonnet 4.5 via Antigravity proxy
     - Claude Opus 4.5 via Antigravity proxy
 
@@ -676,6 +771,10 @@ class AntigravityProvider(
             "gemini-3-pro-high",
             "gemini-3-pro-low",
             "gemini-3-pro-preview",
+        ],
+        # Gemini 3 Flash (standalone, may share with 2.5 Flash - needs verification)
+        "gemini-3-flash": [
+            "gemini-3-flash",
         ],
         # Gemini 2.5 Flash variants share quota
         "gemini-2.5-flash": [
@@ -942,6 +1041,12 @@ class AntigravityProvider(
         self._gemini3_enforce_strict_schema = _env_bool(
             "ANTIGRAVITY_GEMINI3_STRICT_SCHEMA", True
         )
+        # Toggle for JSON string parsing in tool call arguments
+        # NOTE: This is possibly redundant - modern Gemini models may not need this fix.
+        # Disabled by default. Enable if you see JSON-stringified values in tool args.
+        self._enable_json_string_parsing = _env_bool(
+            "ANTIGRAVITY_ENABLE_JSON_STRING_PARSING", False
+        )
         self._gemini3_system_instruction = os.getenv(
             "ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION", DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
         )
@@ -980,6 +1085,10 @@ class AntigravityProvider(
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
             f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
+
+    def _get_antigravity_headers(self) -> Dict[str, str]:
+        """Return the Antigravity API headers. Used by quota tracker mixin."""
+        return ANTIGRAVITY_HEADERS
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
         """
@@ -1946,20 +2055,35 @@ class AntigravityProvider(
         Map reasoning_effort to thinking configuration.
 
         - Gemini 2.5 & Claude: thinkingBudget (integer tokens)
-        - Gemini 3: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
         """
         internal = self._alias_to_internal(model)
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal.startswith("gemini-3-")
+        is_gemini_3_flash = "gemini-3-flash" in model or "gemini-3-flash" in internal
         is_claude = self._is_claude(model)
 
         if not (is_gemini_25 or is_gemini_3 or is_claude):
             return None
 
-        # Gemini 3: String-based thinkingLevel
+        # Gemini 3 Flash: Supports minimal/low/medium/high thinkingLevel
+        if is_gemini_3_flash:
+            if reasoning_effort == "disable":
+                # "minimal" matches "no thinking" for most queries
+                return {"thinkingLevel": "minimal", "include_thoughts": True}
+            elif reasoning_effort == "low":
+                return {"thinkingLevel": "low", "include_thoughts": True}
+            elif reasoning_effort == "medium":
+                return {"thinkingLevel": "medium", "include_thoughts": True}
+            # Default to high for Flash
+            return {"thinkingLevel": "high", "include_thoughts": True}
+
+        # Gemini 3 Pro: Only supports low/high thinkingLevel
         if is_gemini_3:
             if reasoning_effort == "low":
                 return {"thinkingLevel": "low", "include_thoughts": True}
+            # medium maps to high for Pro (not supported)
             return {"thinkingLevel": "high", "include_thoughts": True}
 
         # Gemini 2.5 & Claude: Integer thinkingBudget
@@ -2179,8 +2303,9 @@ class AntigravityProvider(
             #    f"id={tool_id}, name={func_name}"
             # )
 
-            # Add prefix for Gemini 3
+            # Add prefix for Gemini 3 (and rename problematic tools)
             if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
                 func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
             func_part = {
@@ -2271,8 +2396,9 @@ class AntigravityProvider(
         # else:
         # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
-        # Add prefix for Gemini 3
+        # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+            func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
         try:
@@ -2522,7 +2648,12 @@ class AntigravityProvider(
     def _apply_gemini3_namespace(
         self, tools: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Add namespace prefix to tool names for Gemini 3."""
+        """
+        Add namespace prefix to tool names for Gemini 3.
+
+        Also renames certain tools that conflict with Gemini's internal behavior
+        (e.g., "batch" triggers MALFORMED_FUNCTION_CALL errors).
+        """
         if not tools:
             return tools
 
@@ -2531,6 +2662,9 @@ class AntigravityProvider(
             for func_decl in tool.get("functionDeclarations", []):
                 name = func_decl.get("name", "")
                 if name:
+                    # Rename problematic tools first
+                    name = GEMINI3_TOOL_RENAMES.get(name, name)
+                    # Then add prefix
                     func_decl["name"] = f"{self._gemini3_tool_prefix}{name}"
 
         return modified
@@ -2541,12 +2675,13 @@ class AntigravityProvider(
         """
         Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
 
-        Adds 'additionalProperties: false' to object schemas that don't already have it set,
+        Adds 'additionalProperties: false' to object schemas with 'properties',
         which tells the model it CANNOT add properties not in the schema.
 
-        Exceptions (leaves schema unchanged):
-        - Objects that already have 'additionalProperties' set (true or false)
-        - Objects with empty 'properties: {}' (pass-through objects like batch tool's parameters)
+        IMPORTANT: Preserves 'additionalProperties: true' (or {}) when explicitly
+        set in the original schema. This is critical for "freeform" parameter objects
+        like batch/multi_tool's nested parameters which need to accept arbitrary
+        tool parameters that aren't pre-defined in the schema.
         """
         if not tools:
             return tools
@@ -2556,7 +2691,17 @@ class AntigravityProvider(
                 return schema
 
             result = {}
+            preserved_additional_props = None
+
             for key, value in schema.items():
+                # Preserve additionalProperties as-is if it's truthy
+                # This is critical for "freeform" parameter objects like batch's
+                # nested parameters which need to accept arbitrary tool parameters
+                if key == "additionalProperties":
+                    if value is not False:
+                        # Preserve the original value (true, {}, {"type": "string"}, etc.)
+                        preserved_additional_props = value
+                    continue
                 if isinstance(value, dict):
                     result[key] = enforce_strict(value)
                 elif isinstance(value, list):
@@ -2567,16 +2712,12 @@ class AntigravityProvider(
                 else:
                     result[key] = value
 
-            # Add additionalProperties: false to object schemas, with exceptions:
-            # 1. Skip if already set (respect explicit true or false from client)
-            # 2. Skip if properties is empty {} (dynamic/pass-through object)
+            # Add additionalProperties: false to object schemas with properties,
+            # BUT only if we didn't preserve a value from the original schema
             if result.get("type") == "object" and "properties" in result:
-                if "additionalProperties" in result:
-                    pass  # Already set - respect client's choice
-                elif not result.get("properties"):
-                    pass  # Empty properties - leave permissive for dynamic objects
+                if preserved_additional_props is not None:
+                    result["additionalProperties"] = preserved_additional_props
                 else:
-                    # Has defined properties and no explicit setting - enforce strict
                     result["additionalProperties"] = False
 
             return result
@@ -2686,9 +2827,15 @@ class AntigravityProvider(
         return type_hint
 
     def _strip_gemini3_prefix(self, name: str) -> str:
-        """Strip the Gemini 3 namespace prefix from a tool name."""
+        """
+        Strip the Gemini 3 namespace prefix from a tool name.
+
+        Also reverses any tool renames that were applied to avoid Gemini conflicts.
+        """
         if name and name.startswith(self._gemini3_tool_prefix):
-            return name[len(self._gemini3_tool_prefix) :]
+            stripped = name[len(self._gemini3_tool_prefix) :]
+            # Reverse any renames
+            return GEMINI3_TOOL_RENAMES_REVERSE.get(stripped, stripped)
         return name
 
     def _translate_tool_choice(
@@ -2715,8 +2862,11 @@ class AntigravityProvider(
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             function_name = tool_choice.get("function", {}).get("name")
             if function_name:
-                # Add Gemini 3 prefix if needed
+                # Add Gemini 3 prefix if needed (and rename problematic tools)
                 if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = GEMINI3_TOOL_RENAMES.get(
+                        function_name, function_name
+                    )
                     function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
                 mode = "ANY"  # Force a call, but only to this function
@@ -2734,13 +2884,18 @@ class AntigravityProvider(
     # =========================================================================
 
     def _build_tools_payload(
-        self, tools: Optional[List[Dict[str, Any]]], _model: str
+        self, tools: Optional[List[Dict[str, Any]]], model: str
     ) -> Optional[List[Dict[str, Any]]]:
-        """Build Gemini-format tools from OpenAI tools."""
+        """Build Gemini-format tools from OpenAI tools.
+
+        For Gemini models, all tools are placed in a SINGLE functionDeclarations array.
+        This matches the format expected by Gemini CLI and prevents MALFORMED_FUNCTION_CALL errors.
+        """
         if not tools:
             return None
 
-        gemini_tools = []
+        function_declarations = []
+
         for tool in tools:
             if tool.get("type") != "function":
                 continue
@@ -2758,7 +2913,11 @@ class AntigravityProvider(
                 schema.pop("strict", None)
                 # Inline $ref definitions, then strip unsupported keywords
                 schema = _inline_schema_refs(schema)
-                schema = _clean_claude_schema(schema)
+                # For Gemini models, use for_gemini=True to:
+                # - Preserve truthy additionalProperties (for freeform param objects)
+                # - Strip false values (let _enforce_strict_schema add them)
+                is_gemini = not self._is_claude(model)
+                schema = _clean_claude_schema(schema, for_gemini=is_gemini)
                 schema = _normalize_type_arrays(schema)
 
                 # Workaround: Antigravity/Gemini fails to emit functionCall
@@ -2791,9 +2950,14 @@ class AntigravityProvider(
                     "required": ["_confirm"],
                 }
 
-            gemini_tools.append({"functionDeclarations": [func_decl]})
+            function_declarations.append(func_decl)
 
-        return gemini_tools or None
+        if not function_declarations:
+            return None
+
+        # Return all tools in a SINGLE functionDeclarations array
+        # This is the format Gemini CLI uses and prevents MALFORMED_FUNCTION_CALL errors
+        return [{"functionDeclarations": function_declarations}]
 
     def _transform_to_antigravity_format(
         self,
@@ -3051,7 +3215,9 @@ class AntigravityProvider(
         return response
 
     def _gemini_to_openai_non_streaming(
-        self, response: Dict[str, Any], model: str
+        self,
+        response: Dict[str, Any],
+        model: str,
     ) -> Dict[str, Any]:
         """Convert Gemini response to OpenAI non-streaming format."""
         candidates = response.get("candidates", [])
@@ -3161,7 +3327,13 @@ class AntigravityProvider(
             tool_name = self._strip_gemini3_prefix(tool_name)
 
         raw_args = func_call.get("args", {})
-        parsed_args = _recursively_parse_json_strings(raw_args)
+
+        # Optionally parse JSON strings (handles escaped control chars, malformed JSON)
+        # NOTE: This is possibly very redundant
+        if self._enable_json_string_parsing:
+            parsed_args = _recursively_parse_json_strings(raw_args)
+        else:
+            parsed_args = raw_args
 
         # Strip the injected _confirm parameter ONLY if it's the sole parameter
         # This ensures we only strip our injection, not legitimate user params
@@ -3274,6 +3446,7 @@ class AntigravityProvider(
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                **ANTIGRAVITY_HEADERS,
             }
             payload = {
                 "project": _generate_project_id(),
@@ -3414,6 +3587,7 @@ class AntigravityProvider(
 
         # Add tools
         gemini_tools = self._build_tools_payload(tools, model)
+
         if gemini_tools:
             gemini_payload["tools"] = gemini_tools
 
@@ -3423,6 +3597,7 @@ class AntigravityProvider(
                 gemini_payload["tools"] = self._apply_gemini3_namespace(
                     gemini_payload["tools"]
                 )
+
                 if self._gemini3_enforce_strict_schema:
                     gemini_payload["tools"] = self._enforce_strict_schema(
                         gemini_payload["tools"]
@@ -3459,17 +3634,13 @@ class AntigravityProvider(
         if stream:
             url = f"{url}?alt=sse"
 
-        parsed = urlparse(base_url)
-        host = parsed.netloc or base_url.replace("https://", "").replace(
-            "http://", ""
-        ).rstrip("/")
-
+        # These headers are REQUIRED for gemini-3-pro-high/low to work
+        # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "Host": host,
-            "User-Agent": "antigravity/1.11.9 windows/amd64",
             "Accept": "text/event-stream" if stream else "application/json",
+            **ANTIGRAVITY_HEADERS,
         }
 
         # URL fallback loop - handles HTTP errors (except 429) and network errors
@@ -3480,7 +3651,12 @@ class AntigravityProvider(
                 if stream:
                     # Streaming: _streaming_with_retry handles empty response retries internally
                     return self._streaming_with_retry(
-                        client, url, headers, payload, model, file_logger
+                        client,
+                        url,
+                        headers,
+                        payload,
+                        model,
+                        file_logger,
                     )
                 else:
                     # Non-streaming: empty response and bare 429 retry loop
@@ -3496,7 +3672,12 @@ class AntigravityProvider(
                     for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
                         try:
                             result = await self._handle_non_streaming(
-                                client, url, headers, payload, model, file_logger
+                                client,
+                                url,
+                                headers,
+                                payload,
+                                model,
+                                file_logger,
                             )
 
                             # Check if we got anything - empty dict means no candidates
@@ -3771,7 +3952,12 @@ class AntigravityProvider(
 
             try:
                 async for chunk in self._handle_streaming(
-                    client, url, headers, payload, model, file_logger
+                    client,
+                    url,
+                    headers,
+                    payload,
+                    model,
+                    file_logger,
                 ):
                     chunk_count += 1
                     yield chunk  # Stream immediately - true streaming preserved
