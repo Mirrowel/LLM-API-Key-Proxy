@@ -1045,7 +1045,7 @@ class AntigravityProvider(
         # NOTE: This is possibly redundant - modern Gemini models may not need this fix.
         # Disabled by default. Enable if you see JSON-stringified values in tool args.
         self._enable_json_string_parsing = _env_bool(
-            "ANTIGRAVITY_ENABLE_JSON_STRING_PARSING", False
+            "ANTIGRAVITY_ENABLE_JSON_STRING_PARSING", True
         )
         self._gemini3_system_instruction = os.getenv(
             "ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION", DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
@@ -3162,7 +3162,11 @@ class AntigravityProvider(
                         accumulator["text_content"] += text
 
             if has_func:
-                tool_call = self._extract_tool_call(part, model, tool_idx, accumulator)
+                # Get tool_schemas from accumulator for schema-aware parsing
+                tool_schemas = accumulator.get("tool_schemas") if accumulator else None
+                tool_call = self._extract_tool_call(
+                    part, model, tool_idx, accumulator, tool_schemas
+                )
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
@@ -3218,6 +3222,7 @@ class AntigravityProvider(
         self,
         response: Dict[str, Any],
         model: str,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Convert Gemini response to OpenAI non-streaming format."""
         candidates = response.get("candidates", [])
@@ -3254,7 +3259,9 @@ class AntigravityProvider(
                     text_content += part["text"]
 
             if has_func:
-                tool_call = self._extract_tool_call(part, model, len(tool_calls))
+                tool_call = self._extract_tool_call(
+                    part, model, len(tool_calls), tool_schemas=tool_schemas
+                )
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
@@ -3309,12 +3316,38 @@ class AntigravityProvider(
 
         return result
 
+    def _build_tool_schema_map(
+        self, tools: Optional[List[Dict[str, Any]]], model: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Build a mapping of tool name -> parameter schema from tools payload.
+
+        Used for schema-aware JSON string parsing to avoid corrupting
+        string content that looks like JSON (e.g., write tool's content field).
+        """
+        if not tools:
+            return {}
+
+        schema_map = {}
+        for tool in tools:
+            for func_decl in tool.get("functionDeclarations", []):
+                name = func_decl.get("name", "")
+                # Strip gemini3 prefix if applicable
+                if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                    name = self._strip_gemini3_prefix(name)
+                schema = func_decl.get("parametersJsonSchema", {})
+                if name and schema:
+                    schema_map[name] = schema
+
+        return schema_map
+
     def _extract_tool_call(
         self,
         part: Dict[str, Any],
         model: str,
         index: int,
         accumulator: Optional[Dict[str, Any]] = None,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Extract and format a tool call from a response part."""
         func_call = part["functionCall"]
@@ -3329,9 +3362,15 @@ class AntigravityProvider(
         raw_args = func_call.get("args", {})
 
         # Optionally parse JSON strings (handles escaped control chars, malformed JSON)
-        # NOTE: This is possibly very redundant
+        # NOTE: Gemini 3 sometimes returns stringified arrays for array parameters
+        # (e.g., batch, todowrite). Schema-aware parsing prevents corrupting string
+        # content that looks like JSON (e.g., write tool's content field).
         if self._enable_json_string_parsing:
-            parsed_args = _recursively_parse_json_strings(raw_args)
+            # Get schema for this tool if available
+            tool_schema = tool_schemas.get(tool_name) if tool_schemas else None
+            parsed_args = _recursively_parse_json_strings(
+                raw_args, schema=tool_schema, parse_json_objects=True
+            )
         else:
             parsed_args = raw_args
 
@@ -3823,7 +3862,12 @@ class AntigravityProvider(
             file_logger.log_final_response(data)
 
         gemini_response = self._unwrap_response(data)
-        openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
+
+        # Build tool schema map for schema-aware JSON parsing
+        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+        openai_response = self._gemini_to_openai_non_streaming(
+            gemini_response, model, tool_schemas
+        )
 
         return litellm.ModelResponse(**openai_response)
 
@@ -3837,6 +3881,9 @@ class AntigravityProvider(
         file_logger: Optional[AntigravityFileLogger] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion."""
+        # Build tool schema map for schema-aware JSON parsing
+        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+
         # Accumulator tracks state across chunks for caching and tool indexing
         accumulator = {
             "reasoning_content": "",
@@ -3847,6 +3894,7 @@ class AntigravityProvider(
             "is_complete": False,  # Track if we received usageMetadata
             "last_usage": None,  # Track last received usage for final chunk
             "yielded_any": False,  # Track if we yielded any real chunks
+            "tool_schemas": tool_schemas,  # For schema-aware JSON string parsing
         }
 
         async with client.stream(
