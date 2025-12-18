@@ -56,6 +56,25 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# INTERNAL EXCEPTIONS
+# =============================================================================
+
+
+class _MalformedFunctionCallDetected(Exception):
+    """
+    Internal exception raised when MALFORMED_FUNCTION_CALL is detected.
+
+    Signals the retry logic to inject corrective messages and retry.
+    Not intended to be raised to callers.
+    """
+
+    def __init__(self, finish_message: str, raw_response: Dict[str, Any]):
+        self.finish_message = finish_message
+        self.raw_response = raw_response
+        super().__init__(finish_message)
+
+
+# =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
@@ -114,6 +133,12 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 # automatically retry up to this many attempts before giving up (minimum 1)
 EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 6))
 EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3)
+
+# Malformed function call retry configuration
+# When Gemini 3 returns MALFORMED_FUNCTION_CALL (invalid JSON syntax in tool args),
+# inject corrective messages and retry up to this many times
+MALFORMED_CALL_MAX_RETRIES = max(1, _env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
+MALFORMED_CALL_RETRY_DELAY = _env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
@@ -215,6 +240,10 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
    d. For arrays, verify you're providing the correct item structure
    e. Do NOT add parameters that don't exist in the schema
 
+7. **JSON SYNTAX**: Function call arguments must be valid JSON.
+   - All keys MUST be double-quoted: {"key":"value"} not {key:"value"}
+   - Use double quotes for strings, not single quotes
+
 ## COMMON FAILURE PATTERNS TO AVOID
 
 - Using 'path' when schema says 'filePath' (or vice versa)
@@ -223,6 +252,9 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 - Omitting required nested fields in array items
 - Adding 'additionalProperties' that the schema doesn't define
 - Guessing parameter names from similar tools you know from training
+- Using unquoted keys: {key:"value"} instead of {"key":"value"}
+- Writing JSON as text in your response instead of making an actual function call
+- Using single quotes instead of double quotes for strings
 
 ## REMEMBER
 Your training data about function calling is OUTDATED for this environment.
@@ -659,9 +691,33 @@ class AntigravityFileLogger:
             "error.log", f"[{datetime.utcnow().isoformat()}] {error_message}"
         )
 
+    def log_malformed_retry_request(
+        self, retry_num: int, payload: Dict[str, Any]
+    ) -> None:
+        """Log a malformed call retry request payload in the same folder."""
+        self._write_json(f"malformed_retry_{retry_num}_request.json", payload)
+
+    def log_malformed_retry_response(self, retry_num: int, chunk: str) -> None:
+        """Append a chunk to the malformed retry response log."""
+        self._append_text(f"malformed_retry_{retry_num}_response.log", chunk)
+
     def log_final_response(self, response: Dict[str, Any]) -> None:
         """Log the final response."""
         self._write_json("final_response.json", response)
+
+    def log_malformed_autofix(
+        self, tool_name: str, raw_args: str, fixed_json: str
+    ) -> None:
+        """Log details of an auto-fixed malformed function call."""
+        self._write_json(
+            "malformed_autofix.json",
+            {
+                "tool_name": tool_name,
+                "raw_args": raw_args,
+                "fixed_json": fixed_json,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
 
     def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
         if not self.enabled or not self.log_dir:
@@ -2838,6 +2894,387 @@ class AntigravityProvider(
             return GEMINI3_TOOL_RENAMES_REVERSE.get(stripped, stripped)
         return name
 
+    # =========================================================================
+    # MALFORMED FUNCTION CALL HANDLING
+    # =========================================================================
+
+    def _check_for_malformed_call(self, response: Dict[str, Any]) -> Optional[str]:
+        """
+        Check if response contains MALFORMED_FUNCTION_CALL.
+
+        Returns finishMessage if malformed, None otherwise.
+        """
+        candidates = response.get("candidates", [])
+        if not candidates:
+            return None
+
+        candidate = candidates[0]
+        if candidate.get("finishReason") == "MALFORMED_FUNCTION_CALL":
+            return candidate.get("finishMessage", "Unknown malformed call error")
+
+        return None
+
+    def _parse_malformed_call_message(
+        self, finish_message: str, model: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse MALFORMED_FUNCTION_CALL finishMessage to extract tool info.
+
+        Input format: "Malformed function call: call:namespace:tool_name{raw_args}"
+
+        Returns:
+            {"tool_name": "read", "prefixed_name": "gemini3_read",
+             "raw_args": "{filePath: \"...\"}"}
+            or None if unparseable
+        """
+        import re
+
+        # Pattern: "Malformed function call: call:namespace:tool_name{args}"
+        pattern = r"Malformed function call:\s*call:[^:]+:([^{]+)(\{.+\})$"
+        match = re.match(pattern, finish_message, re.DOTALL)
+
+        if not match:
+            lib_logger.warning(
+                f"[Antigravity] Could not parse MALFORMED_FUNCTION_CALL: {finish_message[:100]}"
+            )
+            return None
+
+        prefixed_name = match.group(1).strip()  # "gemini3_read"
+        raw_args = match.group(2)  # "{filePath: \"...\"}"
+
+        # Strip our prefix to get original tool name
+        tool_name = self._strip_gemini3_prefix(prefixed_name)
+
+        return {
+            "tool_name": tool_name,
+            "prefixed_name": prefixed_name,
+            "raw_args": raw_args,
+        }
+
+    def _analyze_json_error(self, raw_args: str) -> Dict[str, Any]:
+        """
+        Analyze malformed JSON to detect specific errors and attempt to fix it.
+
+        Combines json.JSONDecodeError with heuristic pattern detection
+        to provide actionable error information.
+
+        Returns:
+            {
+                "json_error": str or None,  # Python's JSON error message
+                "json_position": int or None,  # Position of error
+                "issues": List[str],  # Human-readable issues detected
+                "unquoted_keys": List[str],  # Specific unquoted key names
+                "fixed_json": str or None,  # Corrected JSON if we could fix it
+            }
+        """
+        import re as re_module
+
+        result = {
+            "json_error": None,
+            "json_position": None,
+            "issues": [],
+            "unquoted_keys": [],
+            "fixed_json": None,
+        }
+
+        # Option 1: Try json.loads to get exact error
+        try:
+            json.loads(raw_args)
+            return result  # Valid JSON, no errors
+        except json.JSONDecodeError as e:
+            result["json_error"] = e.msg
+            result["json_position"] = e.pos
+
+        # Option 2: Heuristic pattern detection for specific issues
+        # Detect unquoted keys: {word: or ,word:
+        unquoted_key_pattern = r"[{,]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:"
+        unquoted_keys = re_module.findall(unquoted_key_pattern, raw_args)
+        if unquoted_keys:
+            result["unquoted_keys"] = unquoted_keys
+            if len(unquoted_keys) == 1:
+                result["issues"].append(f"Unquoted key: '{unquoted_keys[0]}'")
+            else:
+                result["issues"].append(
+                    f"Unquoted keys: {', '.join(repr(k) for k in unquoted_keys)}"
+                )
+
+        # Detect single quotes
+        if "'" in raw_args:
+            result["issues"].append("Single quotes used instead of double quotes")
+
+        # Detect trailing comma
+        if re_module.search(r",\s*[}\]]", raw_args):
+            result["issues"].append("Trailing comma before closing bracket")
+
+        # Option 3: Try to fix the JSON and validate
+        fixed = raw_args
+        # Add quotes around unquoted keys
+        fixed = re_module.sub(
+            r"([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:",
+            r'\1"\2":',
+            fixed,
+        )
+        # Replace single quotes with double quotes
+        fixed = fixed.replace("'", '"')
+        # Remove trailing commas
+        fixed = re_module.sub(r",(\s*[}\]])", r"\1", fixed)
+
+        try:
+            # Validate the fix works
+            parsed = json.loads(fixed)
+            # Use compact JSON format (matches what model should produce)
+            result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+        except json.JSONDecodeError:
+            # First fix didn't work - try more aggressive cleanup
+            pass
+
+        # Option 4: If first attempt failed, try more aggressive fixes
+        if result["fixed_json"] is None:
+            try:
+                # Normalize all whitespace (collapse newlines/multiple spaces)
+                aggressive_fix = re_module.sub(r"\s+", " ", fixed)
+                # Try parsing again
+                parsed = json.loads(aggressive_fix)
+                result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+                lib_logger.debug(
+                    "[Antigravity] Fixed malformed JSON with aggressive whitespace normalization"
+                )
+            except json.JSONDecodeError:
+                pass
+
+        # Option 5: If still failing, try fixing unquoted string values
+        if result["fixed_json"] is None:
+            try:
+                # Some models produce unquoted string values like {key: value}
+                # Try to quote values that look like unquoted strings
+                # Match : followed by unquoted word (not a number, bool, null, or object/array)
+                aggressive_fix = re_module.sub(
+                    r":\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}\]])",
+                    r': "\1"\2',
+                    fixed,
+                )
+                parsed = json.loads(aggressive_fix)
+                result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+                lib_logger.debug(
+                    "[Antigravity] Fixed malformed JSON by quoting unquoted string values"
+                )
+            except json.JSONDecodeError:
+                # All fixes failed, leave as None
+                pass
+
+        return result
+
+    def _build_malformed_call_retry_messages(
+        self,
+        parsed_call: Dict[str, Any],
+        tool_schema: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Build synthetic Gemini-format messages for malformed call retry.
+
+        Returns: (assistant_message, user_message) in Gemini format
+        """
+        tool_name = parsed_call["tool_name"]
+        raw_args = parsed_call["raw_args"]
+
+        # Analyze the JSON error and try to fix it
+        error_info = self._analyze_json_error(raw_args)
+
+        # Assistant message: Show what it tried to do
+        assistant_msg = {
+            "role": "model",
+            "parts": [{"text": f"I'll call the '{tool_name}' function."}],
+        }
+
+        # Build a concise error message
+        if error_info["fixed_json"]:
+            # We successfully fixed the JSON - show the corrected version
+            error_text = f"""[FUNCTION CALL ERROR - INVALID JSON]
+
+Your call to '{tool_name}' failed. All JSON keys must be double-quoted.
+
+INVALID: {raw_args}
+
+CORRECTED: {error_info["fixed_json"]}
+
+Retry the function call now using the corrected JSON above. Output ONLY the tool call, no text."""
+        else:
+            # Couldn't auto-fix - give hints
+            error_text = f"""[FUNCTION CALL ERROR - INVALID JSON]
+
+Your call to '{tool_name}' failed due to malformed JSON.
+
+You provided: {raw_args}
+
+Fix: All JSON keys must be double-quoted. Example: {{"key":"value"}} not {{key:"value"}}
+
+Analyze what you did wrong, correct it, and retry the function call. Output ONLY the tool call, no text."""
+
+        # Add schema if available (strip $schema reference)
+        if tool_schema:
+            clean_schema = {k: v for k, v in tool_schema.items() if k != "$schema"}
+            schema_str = json.dumps(clean_schema, separators=(",", ":"))
+            error_text += f"\n\nSchema: {schema_str}"
+
+        user_msg = {"role": "user", "parts": [{"text": error_text}]}
+
+        return assistant_msg, user_msg
+
+    def _build_malformed_fallback_response(
+        self, model: str, error_details: str
+    ) -> litellm.ModelResponse:
+        """
+        Build error response when malformed call retries are exhausted.
+
+        Uses finish_reason=None to indicate the response didn't complete normally,
+        allowing clients to detect the incomplete state and potentially retry.
+        """
+        return litellm.ModelResponse(
+            **{
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "[TOOL CALL ERROR] I attempted to call a function but "
+                                "repeatedly produced malformed syntax. This may be a model issue.\n\n"
+                                f"Last error: {error_details}\n\n"
+                                "Please try rephrasing your request or try a different approach."
+                            ),
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    def _build_fixed_tool_call_response(
+        self,
+        model: str,
+        parsed_call: Dict[str, Any],
+        error_info: Dict[str, Any],
+    ) -> Optional[litellm.ModelResponse]:
+        """
+        Build a synthetic valid tool call response from auto-fixed malformed JSON.
+
+        When Gemini 3 produces malformed JSON (e.g., unquoted keys), this method
+        takes the auto-corrected JSON from _analyze_json_error() and builds a
+        proper OpenAI-format tool call response.
+
+        Returns None if the JSON couldn't be fixed.
+        """
+        fixed_json = error_info.get("fixed_json")
+        if not fixed_json:
+            return None
+
+        # Validate the fixed JSON is actually valid
+        try:
+            json.loads(fixed_json)
+        except json.JSONDecodeError:
+            return None
+
+        tool_name = parsed_call["tool_name"]
+        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
+        return litellm.ModelResponse(
+            **{
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": fixed_json,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+        )
+
+    def _build_fixed_tool_call_chunk(
+        self,
+        model: str,
+        parsed_call: Dict[str, Any],
+        error_info: Dict[str, Any],
+        response_id: Optional[str] = None,
+    ) -> Optional[litellm.ModelResponse]:
+        """
+        Build a streaming chunk with the auto-fixed tool call.
+
+        Similar to _build_fixed_tool_call_response but uses streaming format:
+        - object: "chat.completion.chunk" instead of "chat.completion"
+        - delta: {...} instead of message: {...}
+        - tool_calls items include "index" field
+
+        Args:
+            response_id: Optional original response ID to maintain stream continuity
+
+        Returns None if the JSON couldn't be fixed.
+        """
+        fixed_json = error_info.get("fixed_json")
+        if not fixed_json:
+            return None
+
+        # Validate the fixed JSON is actually valid
+        try:
+            json.loads(fixed_json)
+        except json.JSONDecodeError:
+            return None
+
+        tool_name = parsed_call["tool_name"]
+        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+        # Use original response ID if provided, otherwise generate new one
+        chunk_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        return litellm.ModelResponse(
+            **{
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": fixed_json,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+        )
+
     def _translate_tool_choice(
         self, tool_choice: Union[str, Dict[str, Any]], model: str = ""
     ) -> Optional[Dict[str, Any]]:
@@ -3665,6 +4102,10 @@ class AntigravityProvider(
         )
         file_logger.log_request(payload)
 
+        # Pre-build tool schema map for malformed call handling
+        # This maps original tool names (without prefix) to their schemas
+        tool_schemas = self._build_tool_schema_map(gemini_payload.get("tools"), model)
+
         # Make API call
         base_url = self._get_base_url()
         endpoint = ":streamGenerateContent" if stream else ":generateContent"
@@ -3682,6 +4123,11 @@ class AntigravityProvider(
             **ANTIGRAVITY_HEADERS,
         }
 
+        # Track malformed call retries (separate from empty response retries)
+        malformed_retry_count = 0
+        # Keep a mutable reference to gemini_contents for retry injection
+        current_gemini_contents = gemini_contents
+
         # URL fallback loop - handles HTTP errors (except 429) and network errors
         # by switching to fallback URLs. Empty response retry is handled separately
         # inside _streaming_with_retry (streaming) or the inner loop (non-streaming).
@@ -3696,9 +4142,16 @@ class AntigravityProvider(
                         payload,
                         model,
                         file_logger,
+                        tool_schemas,
+                        current_gemini_contents,
+                        gemini_payload,
+                        project_id,
+                        max_tokens,
+                        reasoning_effort,
+                        tool_choice,
                     )
                 else:
-                    # Non-streaming: empty response and bare 429 retry loop
+                    # Non-streaming: empty response, bare 429, and malformed call retry
                     empty_error_msg = (
                         "The model returned an empty response after multiple attempts. "
                         "This may indicate a temporary service issue. Please try again."
@@ -3746,6 +4199,101 @@ class AntigravityProvider(
 
                             return result
 
+                        except _MalformedFunctionCallDetected as e:
+                            # Handle MALFORMED_FUNCTION_CALL - try auto-fix first
+                            parsed = self._parse_malformed_call_message(
+                                e.finish_message, model
+                            )
+
+                            if parsed:
+                                # Try to auto-fix the malformed JSON
+                                error_info = self._analyze_json_error(
+                                    parsed["raw_args"]
+                                )
+
+                                if error_info.get("fixed_json"):
+                                    # Auto-fix successful - build synthetic response
+                                    lib_logger.info(
+                                        f"[Antigravity] Auto-fixed malformed function call for "
+                                        f"'{parsed['tool_name']}' from {model}"
+                                    )
+
+                                    # Log the auto-fix details
+                                    if file_logger:
+                                        file_logger.log_malformed_autofix(
+                                            parsed["tool_name"],
+                                            parsed["raw_args"],
+                                            error_info["fixed_json"],
+                                        )
+
+                                    fixed_response = (
+                                        self._build_fixed_tool_call_response(
+                                            model, parsed, error_info
+                                        )
+                                    )
+                                    if fixed_response:
+                                        return fixed_response
+
+                            # Auto-fix failed - retry by asking model to fix its JSON
+                            # Each retry response will also attempt auto-fix first
+                            if malformed_retry_count < MALFORMED_CALL_MAX_RETRIES:
+                                malformed_retry_count += 1
+                                lib_logger.warning(
+                                    f"[Antigravity] MALFORMED_FUNCTION_CALL from {model}, "
+                                    f"retry {malformed_retry_count}/{MALFORMED_CALL_MAX_RETRIES}: "
+                                    f"{e.finish_message[:100]}..."
+                                )
+
+                                if parsed:
+                                    # Get schema for the failed tool
+                                    tool_schema = tool_schemas.get(parsed["tool_name"])
+
+                                    # Build corrective messages
+                                    assistant_msg, user_msg = (
+                                        self._build_malformed_call_retry_messages(
+                                            parsed, tool_schema
+                                        )
+                                    )
+
+                                    # Inject into conversation
+                                    current_gemini_contents = list(
+                                        current_gemini_contents
+                                    )
+                                    current_gemini_contents.append(assistant_msg)
+                                    current_gemini_contents.append(user_msg)
+
+                                    # Rebuild payload with modified contents
+                                    gemini_payload_copy = copy.deepcopy(gemini_payload)
+                                    gemini_payload_copy["contents"] = (
+                                        current_gemini_contents
+                                    )
+                                    payload = self._transform_to_antigravity_format(
+                                        gemini_payload_copy,
+                                        model,
+                                        project_id,
+                                        max_tokens,
+                                        reasoning_effort,
+                                        tool_choice,
+                                    )
+
+                                    # Log the retry request in the same folder
+                                    if file_logger:
+                                        file_logger.log_malformed_retry_request(
+                                            malformed_retry_count, payload
+                                        )
+
+                                await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
+                                break  # Break inner loop to retry with modified payload
+                            else:
+                                # Auto-fix failed and retries disabled/exceeded - return fallback
+                                lib_logger.warning(
+                                    f"[Antigravity] MALFORMED_FUNCTION_CALL could not be auto-fixed "
+                                    f"for {model}: {e.finish_message[:100]}..."
+                                )
+                                return self._build_malformed_fallback_response(
+                                    model, e.finish_message
+                                )
+
                         except httpx.HTTPStatusError as e:
                             if e.response.status_code == 429:
                                 # Check if this is a bare 429 (no retry info) vs real quota exhaustion
@@ -3772,16 +4320,19 @@ class AntigravityProvider(
                                 )
                             # Re-raise all HTTP errors (429 with retry info, or other errors)
                             raise
-
-                    # Should not reach here, but just in case
-                    lib_logger.error(
-                        f"[Antigravity] Unexpected exit from retry loop for {model}"
-                    )
-                    raise EmptyResponseError(
-                        provider="antigravity",
-                        model=model,
-                        message=empty_error_msg,
-                    )
+                    else:
+                        # For loop completed normally (no break) - should not happen
+                        # This means we exhausted EMPTY_RESPONSE_MAX_ATTEMPTS without success
+                        lib_logger.error(
+                            f"[Antigravity] Unexpected exit from retry loop for {model}"
+                        )
+                        raise EmptyResponseError(
+                            provider="antigravity",
+                            model=model,
+                            message=empty_error_msg,
+                        )
+                    # If we broke out of the for loop (malformed retry), continue while loop
+                    continue
 
             except httpx.HTTPStatusError as e:
                 # 429 = Rate limit/quota exhausted - tied to credential, not URL
@@ -3863,6 +4414,11 @@ class AntigravityProvider(
 
         gemini_response = self._unwrap_response(data)
 
+        # Check for MALFORMED_FUNCTION_CALL before conversion
+        malformed_msg = self._check_for_malformed_call(gemini_response)
+        if malformed_msg:
+            raise _MalformedFunctionCallDetected(malformed_msg, gemini_response)
+
         # Build tool schema map for schema-aware JSON parsing
         tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
         openai_response = self._gemini_to_openai_non_streaming(
@@ -3879,8 +4435,14 @@ class AntigravityProvider(
         payload: Dict[str, Any],
         model: str,
         file_logger: Optional[AntigravityFileLogger] = None,
+        malformed_retry_num: Optional[int] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
-        """Handle streaming completion."""
+        """Handle streaming completion.
+
+        Args:
+            malformed_retry_num: If set, log response chunks to malformed_retry_N_response.log
+                                 instead of the main response_stream.log
+        """
         # Build tool schema map for schema-aware JSON parsing
         tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
 
@@ -3895,6 +4457,8 @@ class AntigravityProvider(
             "last_usage": None,  # Track last received usage for final chunk
             "yielded_any": False,  # Track if we yielded any real chunks
             "tool_schemas": tool_schemas,  # For schema-aware JSON string parsing
+            "malformed_call": None,  # Track MALFORMED_FUNCTION_CALL if detected
+            "response_id": None,  # Track original response ID for synthetic chunks
         }
 
         async with client.stream(
@@ -3919,7 +4483,12 @@ class AntigravityProvider(
 
             async for line in response.aiter_lines():
                 if file_logger:
-                    file_logger.log_response_chunk(line)
+                    if malformed_retry_num is not None:
+                        file_logger.log_malformed_retry_response(
+                            malformed_retry_num, line
+                        )
+                    else:
+                        file_logger.log_response_chunk(line)
 
                 if line.startswith("data: "):
                     data_str = line[6:]
@@ -3929,6 +4498,18 @@ class AntigravityProvider(
                     try:
                         chunk = json.loads(data_str)
                         gemini_chunk = self._unwrap_response(chunk)
+
+                        # Capture response ID from first chunk for synthetic responses
+                        if not accumulator.get("response_id"):
+                            accumulator["response_id"] = gemini_chunk.get("responseId")
+
+                        # Check for MALFORMED_FUNCTION_CALL
+                        malformed_msg = self._check_for_malformed_call(gemini_chunk)
+                        if malformed_msg:
+                            # Store for retry handler, don't yield anything more
+                            accumulator["malformed_call"] = malformed_msg
+                            break
+
                         openai_chunk = self._gemini_to_openai_chunk(
                             gemini_chunk, model, accumulator
                         )
@@ -3939,6 +4520,13 @@ class AntigravityProvider(
                         if file_logger:
                             file_logger.log_error(f"Parse error: {data_str[:100]}")
                         continue
+
+        # Check if we detected a malformed call - raise exception for retry handler
+        if accumulator.get("malformed_call"):
+            raise _MalformedFunctionCallDetected(
+                accumulator["malformed_call"],
+                {"accumulator": accumulator},
+            )
 
         # Only emit synthetic final chunk if we actually received real data
         # If no data was received, the caller will detect zero chunks and retry
@@ -3978,13 +4566,24 @@ class AntigravityProvider(
         payload: Dict[str, Any],
         model: str,
         file_logger: Optional[AntigravityFileLogger] = None,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
+        gemini_contents: Optional[List[Dict[str, Any]]] = None,
+        gemini_payload: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _handle_streaming that retries on empty responses and bare 429s.
+        Wrapper around _handle_streaming that retries on empty responses, bare 429s,
+        and MALFORMED_FUNCTION_CALL errors.
 
         If the stream yields zero chunks (Antigravity returned nothing) or encounters
         a bare 429 (no retry info), retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times
         before giving up.
+
+        If MALFORMED_FUNCTION_CALL is detected, inject corrective messages and retry
+        up to MALFORMED_CALL_MAX_RETRIES times.
         """
         empty_error_msg = (
             "The model returned an empty response after multiple attempts. "
@@ -3995,17 +4594,25 @@ class AntigravityProvider(
             "This may indicate a temporary service issue. Please try again."
         )
 
+        # Track malformed call retries (separate from empty response retries)
+        malformed_retry_count = 0
+        current_gemini_contents = gemini_contents
+        current_payload = payload
+
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
             try:
+                # Pass malformed_retry_count to log response to separate file
+                retry_num = malformed_retry_count if malformed_retry_count > 0 else None
                 async for chunk in self._handle_streaming(
                     client,
                     url,
                     headers,
-                    payload,
+                    current_payload,
                     model,
                     file_logger,
+                    malformed_retry_num=retry_num,
                 ):
                     chunk_count += 1
                     yield chunk  # Stream immediately - true streaming preserved
@@ -4029,6 +4636,105 @@ class AntigravityProvider(
                         model=model,
                         message=empty_error_msg,
                     )
+
+            except _MalformedFunctionCallDetected as e:
+                # Handle MALFORMED_FUNCTION_CALL - try auto-fix first
+                parsed = self._parse_malformed_call_message(e.finish_message, model)
+
+                if parsed:
+                    # Try to auto-fix the malformed JSON
+                    error_info = self._analyze_json_error(parsed["raw_args"])
+
+                    if error_info.get("fixed_json"):
+                        # Auto-fix successful - build synthetic response
+                        lib_logger.info(
+                            f"[Antigravity] Auto-fixed malformed function call for "
+                            f"'{parsed['tool_name']}' from {model} (streaming)"
+                        )
+
+                        # Log the auto-fix details
+                        if file_logger:
+                            file_logger.log_malformed_autofix(
+                                parsed["tool_name"],
+                                parsed["raw_args"],
+                                error_info["fixed_json"],
+                            )
+
+                        # Extract response_id from accumulator in exception
+                        response_id = None
+                        if e.raw_response and isinstance(e.raw_response, dict):
+                            acc = e.raw_response.get("accumulator", {})
+                            response_id = acc.get("response_id")
+
+                        # Use chunk format for streaming with original response ID
+                        fixed_chunk = self._build_fixed_tool_call_chunk(
+                            model, parsed, error_info, response_id=response_id
+                        )
+                        if fixed_chunk:
+                            yield fixed_chunk
+                            return
+
+                # Auto-fix failed - retry by asking model to fix its JSON
+                # Each retry response will also attempt auto-fix first
+                if malformed_retry_count < MALFORMED_CALL_MAX_RETRIES:
+                    malformed_retry_count += 1
+                    lib_logger.warning(
+                        f"[Antigravity] MALFORMED_FUNCTION_CALL from {model} (streaming), "
+                        f"retry {malformed_retry_count}/{MALFORMED_CALL_MAX_RETRIES}: "
+                        f"{e.finish_message[:100]}..."
+                    )
+
+                    if parsed and gemini_payload is not None:
+                        # Get schema for the failed tool
+                        tool_schema = (
+                            tool_schemas.get(parsed["tool_name"])
+                            if tool_schemas
+                            else None
+                        )
+
+                        # Build corrective messages
+                        assistant_msg, user_msg = (
+                            self._build_malformed_call_retry_messages(
+                                parsed, tool_schema
+                            )
+                        )
+
+                        # Inject into conversation
+                        current_gemini_contents = list(current_gemini_contents or [])
+                        current_gemini_contents.append(assistant_msg)
+                        current_gemini_contents.append(user_msg)
+
+                        # Rebuild payload with modified contents
+                        gemini_payload_copy = copy.deepcopy(gemini_payload)
+                        gemini_payload_copy["contents"] = current_gemini_contents
+                        current_payload = self._transform_to_antigravity_format(
+                            gemini_payload_copy,
+                            model,
+                            project_id or "",
+                            max_tokens,
+                            reasoning_effort,
+                            tool_choice,
+                        )
+
+                        # Log the retry request in the same folder
+                        if file_logger:
+                            file_logger.log_malformed_retry_request(
+                                malformed_retry_count, current_payload
+                            )
+
+                    await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
+                    continue  # Retry with modified payload
+                else:
+                    # Auto-fix failed and retries disabled/exceeded - yield fallback response
+                    lib_logger.warning(
+                        f"[Antigravity] MALFORMED_FUNCTION_CALL could not be auto-fixed "
+                        f"for {model} (streaming): {e.finish_message[:100]}..."
+                    )
+                    fallback = self._build_malformed_fallback_response(
+                        model, e.finish_message
+                    )
+                    yield fallback
+                    return
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:
