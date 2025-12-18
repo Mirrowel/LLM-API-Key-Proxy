@@ -3153,6 +3153,55 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             }
         )
 
+    def _build_malformed_fallback_chunk(
+        self,
+        model: str,
+        error_details: str,
+        response_id: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> litellm.ModelResponse:
+        """
+        Build streaming chunk error response when malformed call retries are exhausted.
+
+        Uses streaming format (delta instead of message) for consistency with streaming responses.
+        Includes usage with completion_tokens > 0 so client.py recognizes it as a final chunk.
+        """
+        chunk_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        # Ensure usage has completion_tokens > 0 for client to recognize as final chunk
+        if not usage or usage.get("completion_tokens", 0) <= 0:
+            prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,
+                "total_tokens": prompt_tokens + 1,
+            }
+
+        return litellm.ModelResponse(
+            **{
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": (
+                                "[TOOL CALL ERROR] I attempted to call a function but "
+                                "repeatedly produced malformed syntax. This may be a model issue.\n\n"
+                                f"Last error: {error_details}\n\n"
+                                "Please try rephrasing your request or try a different approach."
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
+
     def _build_fixed_tool_call_response(
         self,
         model: str,
@@ -3216,6 +3265,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         parsed_call: Dict[str, Any],
         error_info: Dict[str, Any],
         response_id: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
     ) -> Optional[litellm.ModelResponse]:
         """
         Build a streaming chunk with the auto-fixed tool call.
@@ -3227,6 +3277,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         Args:
             response_id: Optional original response ID to maintain stream continuity
+            usage: Optional usage from previous chunks. Must include completion_tokens > 0
+                   for client to recognize this as a final chunk.
 
         Returns None if the JSON couldn't be fixed.
         """
@@ -3244,6 +3296,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         tool_id = f"call_{uuid.uuid4().hex[:24]}"
         # Use original response ID if provided, otherwise generate new one
         chunk_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        # Ensure usage has completion_tokens > 0 for client to recognize as final chunk
+        # Client.py's _safe_streaming_wrapper uses completion_tokens > 0 to detect final chunks
+        if not usage or usage.get("completion_tokens", 0) <= 0:
+            prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,  # Minimum to signal final chunk
+                "total_tokens": prompt_tokens + 1,
+            }
 
         return litellm.ModelResponse(
             **{
@@ -3272,6 +3334,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         "finish_reason": "tool_calls",
                     }
                 ],
+                "usage": usage,
             }
         )
 
@@ -4641,6 +4704,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 # Handle MALFORMED_FUNCTION_CALL - try auto-fix first
                 parsed = self._parse_malformed_call_message(e.finish_message, model)
 
+                # Extract response_id and last_usage from accumulator for all paths
+                response_id = None
+                last_usage = None
+                if e.raw_response and isinstance(e.raw_response, dict):
+                    acc = e.raw_response.get("accumulator", {})
+                    response_id = acc.get("response_id")
+                    last_usage = acc.get("last_usage")
+
                 if parsed:
                     # Try to auto-fix the malformed JSON
                     error_info = self._analyze_json_error(parsed["raw_args"])
@@ -4660,15 +4731,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 error_info["fixed_json"],
                             )
 
-                        # Extract response_id from accumulator in exception
-                        response_id = None
-                        if e.raw_response and isinstance(e.raw_response, dict):
-                            acc = e.raw_response.get("accumulator", {})
-                            response_id = acc.get("response_id")
-
-                        # Use chunk format for streaming with original response ID
+                        # Use chunk format for streaming with original response ID and usage
                         fixed_chunk = self._build_fixed_tool_call_chunk(
-                            model, parsed, error_info, response_id=response_id
+                            model,
+                            parsed,
+                            error_info,
+                            response_id=response_id,
+                            usage=last_usage,
                         )
                         if fixed_chunk:
                             yield fixed_chunk
@@ -4730,8 +4799,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         f"[Antigravity] MALFORMED_FUNCTION_CALL could not be auto-fixed "
                         f"for {model} (streaming): {e.finish_message[:100]}..."
                     )
-                    fallback = self._build_malformed_fallback_response(
-                        model, e.finish_message
+                    fallback = self._build_malformed_fallback_chunk(
+                        model,
+                        e.finish_message,
+                        response_id=response_id,
+                        usage=last_usage,
                     )
                     yield fallback
                     return
