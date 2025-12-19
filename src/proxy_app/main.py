@@ -1708,16 +1708,15 @@ async def anthropic_messages(
             openai_request["tool_choice"] = openai_tool_choice
 
         # Handle Anthropic thinking config -> reasoning_effort translation
-        thinking_budget_requested = None
         if body.thinking:
             if body.thinking.type == "enabled":
                 # Map budget_tokens to reasoning_effort level
-                # Always set custom_reasoning_budget=True when client explicitly requests thinking
-                # This prevents the ÷4 reduction in Antigravity provider
+                # Default to "medium" if enabled but budget not specified
                 budget = body.thinking.budget_tokens or 10000
-                thinking_budget_requested = budget
-                openai_request["custom_reasoning_budget"] = True
-                if budget >= 10000:
+                if budget >= 32000:
+                    openai_request["reasoning_effort"] = "high"
+                    openai_request["custom_reasoning_budget"] = True
+                elif budget >= 10000:
                     openai_request["reasoning_effort"] = "high"
                 elif budget >= 5000:
                     openai_request["reasoning_effort"] = "medium"
@@ -1725,21 +1724,12 @@ async def anthropic_messages(
                     openai_request["reasoning_effort"] = "low"
             elif body.thinking.type == "disabled":
                 openai_request["reasoning_effort"] = "disable"
-                thinking_budget_requested = 0
         elif "opus" in body.model.lower():
             # Force high thinking for Opus models when no thinking config is provided
             # Opus 4.5 always uses the -thinking variant, so we want maximum thinking budget
+            # Without this, the backend defaults to thinkingBudget: -1 (auto) instead of high
             openai_request["reasoning_effort"] = "high"
             openai_request["custom_reasoning_budget"] = True
-            thinking_budget_requested = "auto (high)"
-
-        # Log thinking config for debugging
-        if thinking_budget_requested is not None:
-            logging.info(
-                f"🧠 Thinking: requested={thinking_budget_requested}, "
-                f"effort={openai_request.get('reasoning_effort', 'none')}, "
-                f"custom_budget={openai_request.get('custom_reasoning_budget', False)}"
-            )
 
         log_request_to_console(
             url=str(request.url),
