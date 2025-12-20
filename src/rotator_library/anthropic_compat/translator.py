@@ -336,28 +336,73 @@ def translate_anthropic_request(request: AnthropicMessagesRequest) -> Dict[str, 
     if openai_tool_choice:
         openai_request["tool_choice"] = openai_tool_choice
 
+    # Note: request.metadata is intentionally not mapped.
+    # OpenAI's API doesn't have an equivalent field for client-side metadata.
+    # The metadata is typically used by Anthropic clients for tracking purposes
+    # and doesn't affect the model's behavior.
+
     # Handle Anthropic thinking config -> reasoning_effort translation
+    # The provider (antigravity_provider.py) applies a // 4 reduction to thinking budget
+    # unless custom_reasoning_budget is True. This conserves thinking tokens.
+    #
+    # Reasoning budget thresholds map to provider budgets:
+    # - Claude "high" = 32768 tokens (but // 4 = 8192 unless custom_reasoning_budget)
+    # - Claude "medium" = 16384 tokens (// 4 = 4096)
+    # - Claude "low" = 8192 tokens (// 4 = 2048)
+    #
+    # We only set custom_reasoning_budget=True when user explicitly requests
+    # a large budget (32000+), indicating they want full thinking capacity.
     if request.thinking:
         if request.thinking.type == "enabled":
-            # Map budget_tokens to reasoning_effort level
-            # Default to "medium" if enabled but budget not specified
             budget = request.thinking.budget_tokens or 10000
             if budget >= 32000:
+                # User explicitly wants full thinking capacity
                 openai_request["reasoning_effort"] = "high"
                 openai_request["custom_reasoning_budget"] = True
             elif budget >= 10000:
                 openai_request["reasoning_effort"] = "high"
+                # custom_reasoning_budget defaults to False, so // 4 applies
             elif budget >= 5000:
                 openai_request["reasoning_effort"] = "medium"
             else:
                 openai_request["reasoning_effort"] = "low"
         elif request.thinking.type == "disabled":
             openai_request["reasoning_effort"] = "disable"
-    elif "opus" in request.model.lower():
-        # Force high thinking for Opus models when no thinking config is provided
-        # Opus 4.5 always uses the -thinking variant, so we want maximum thinking budget
-        # Without this, the backend defaults to thinkingBudget: -1 (auto) instead of high
+    elif _is_opus_model(request.model):
+        # Enable thinking for Opus models when no thinking config is provided
+        # Use "high" effort but NOT custom_reasoning_budget, so // 4 applies
+        # This gives 8192 thinking tokens (32768 // 4) which is reasonable for most tasks
+        # Users who want full capacity can explicitly set thinking.budget_tokens >= 32000
         openai_request["reasoning_effort"] = "high"
-        openai_request["custom_reasoning_budget"] = True
+        # Note: NOT setting custom_reasoning_budget here to conserve tokens
 
     return openai_request
+
+
+def _is_opus_model(model_name: str) -> bool:
+    """
+    Check if a model name refers to a Claude Opus model.
+
+    Uses specific pattern matching to avoid false positives with model names
+    that might contain "opus" as part of another word.
+
+    Args:
+        model_name: The model name to check
+
+    Returns:
+        True if the model is a Claude Opus model, False otherwise
+    """
+    import re
+
+    model_lower = model_name.lower()
+    # Match Claude Opus models specifically:
+    # - "claude-opus-4-5", "claude-4-opus", "claude_opus"
+    # - "opus-4", "opus-4.5", "opus4" (standalone with version)
+    # - "antigravity/claude-opus-4-5"
+    # Avoid matching things like "magnum-opus" or other non-Claude models
+    opus_patterns = [
+        r'claude[-_]?opus',        # "claude-opus", "claude_opus", "claudeopus"
+        r'opus[-_]?\d',            # "opus-4", "opus_4", "opus4" (with version number)
+        r'\d[-_]?opus(?:[-_]|$)',  # "4-opus", "4_opus" at word boundary
+    ]
+    return any(re.search(pattern, model_lower) for pattern in opus_patterns)
