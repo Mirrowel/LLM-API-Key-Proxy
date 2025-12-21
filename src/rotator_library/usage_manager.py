@@ -411,6 +411,38 @@ class UsageManager:
 
         return bool(max_requests and request_count >= max_requests)
 
+    def _set_quota_reset_and_cooldown(
+        self,
+        key_data: dict,
+        model_data: dict,
+        model: str,
+        quota_reset_ts: Optional[float],
+        now_ts: float,
+        remaining_fraction: float,
+    ) -> None:
+        """
+        Set quota reset timestamp and model cooldown if quota is exhausted.
+
+        Args:
+            key_data: The credential's data dictionary
+            model_data: The model-specific quota data dictionary
+            model: The model name to set cooldown for
+            quota_reset_ts: When quota resets (Unix timestamp), or None
+            now_ts: Current time (Unix timestamp)
+            remaining_fraction: Remaining quota as fraction (0.0 to 1.0)
+        """
+        if not quota_reset_ts:
+            return
+
+        model_data["quota_reset_ts"] = quota_reset_ts
+
+        # 0.1% threshold - treat as exhausted when quota is practically zero
+        # (this is NOT a floating-point precision guard, it's an intentional
+        # threshold meaning the quota is effectively depleted)
+        if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
+            model_cooldowns[model] = quota_reset_ts
+
     def _get_quota_display(self, key: str, model: str) -> str:
         """
         Get a formatted quota display string for logging.
@@ -2145,13 +2177,10 @@ class UsageManager:
             model_data["baseline_remaining_fraction"] = remaining_fraction
             model_data["baseline_fetched_at"] = now_ts
 
-            # Update reset timestamp if provided
-            if quota_reset_ts:
-                model_data["quota_reset_ts"] = quota_reset_ts
-                # Also set as model cooldown if it's in the future and quota is low
-                if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
-                    model_cooldowns = key_data.setdefault("model_cooldowns", {})
-                    model_cooldowns[model] = quota_reset_ts
+            # Update reset timestamp and set cooldown if quota exhausted
+            self._set_quota_reset_and_cooldown(
+                key_data, model_data, model, quota_reset_ts, now_ts, remaining_fraction
+            )
 
             # Update max_requests and quota_display
             if max_requests is not None:
@@ -2178,14 +2207,14 @@ class UsageManager:
                             },
                         )
                         other_model_data["request_count"] = used_requests
-                        if quota_reset_ts:
-                            other_model_data["quota_reset_ts"] = quota_reset_ts
-                            # Also set as model cooldown if it's in the future and quota is low
-                            if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
-                                model_cooldowns = key_data.setdefault(
-                                    "model_cooldowns", {}
-                                )
-                                model_cooldowns[grouped_model] = quota_reset_ts
+                        self._set_quota_reset_and_cooldown(
+                            key_data,
+                            other_model_data,
+                            grouped_model,
+                            quota_reset_ts,
+                            now_ts,
+                            remaining_fraction,
+                        )
 
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
