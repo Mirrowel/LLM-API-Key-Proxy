@@ -98,20 +98,88 @@ def anthropic_to_openai_messages(
                         )
                     elif block_type == "tool_result":
                         # Tool results become separate messages in OpenAI format
+                        # Content can be string, or list of text/image blocks
                         tool_content = block.get("content", "")
-                        if isinstance(tool_content, list):
-                            tool_content = " ".join(
-                                b.get("text", "")
-                                for b in tool_content
-                                if isinstance(b, dict) and b.get("type") == "text"
+                        if isinstance(tool_content, str):
+                            # Simple string content
+                            openai_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": block.get("tool_use_id", ""),
+                                    "content": tool_content,
+                                }
                             )
-                        openai_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": block.get("tool_use_id", ""),
-                                "content": str(tool_content),
-                            }
-                        )
+                        elif isinstance(tool_content, list):
+                            # List of content blocks - may include text and images
+                            tool_content_parts = []
+                            for b in tool_content:
+                                if not isinstance(b, dict):
+                                    continue
+                                b_type = b.get("type", "")
+                                if b_type == "text":
+                                    tool_content_parts.append(
+                                        {"type": "text", "text": b.get("text", "")}
+                                    )
+                                elif b_type == "image":
+                                    # Convert Anthropic image format to OpenAI format
+                                    source = b.get("source", {})
+                                    if source.get("type") == "base64":
+                                        tool_content_parts.append(
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                                                },
+                                            }
+                                        )
+                                    elif source.get("type") == "url":
+                                        tool_content_parts.append(
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {"url": source.get("url", "")},
+                                            }
+                                        )
+
+                            # If we only have text parts, join them as a string for compatibility
+                            # Otherwise use the array format for multimodal content
+                            if all(p.get("type") == "text" for p in tool_content_parts):
+                                combined_text = " ".join(
+                                    p.get("text", "") for p in tool_content_parts
+                                )
+                                openai_messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": block.get("tool_use_id", ""),
+                                        "content": combined_text,
+                                    }
+                                )
+                            elif tool_content_parts:
+                                # Multimodal content (includes images)
+                                openai_messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": block.get("tool_use_id", ""),
+                                        "content": tool_content_parts,
+                                    }
+                                )
+                            else:
+                                # Empty content
+                                openai_messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": block.get("tool_use_id", ""),
+                                        "content": "",
+                                    }
+                                )
+                        else:
+                            # Fallback for unexpected content type
+                            openai_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": block.get("tool_use_id", ""),
+                                    "content": str(tool_content) if tool_content else "",
+                                }
+                            )
                         continue  # Don't add to current message
 
             # Build the message

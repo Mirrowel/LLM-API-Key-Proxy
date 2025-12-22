@@ -2438,7 +2438,12 @@ class AntigravityProvider(
     def _transform_tool_message(
         self, msg: Dict[str, Any], model: str, tool_id_to_name: Dict[str, str]
     ) -> List[Dict[str, Any]]:
-        """Transform tool response message."""
+        """Transform tool response message.
+
+        Handles both text-only and multimodal (text + images) tool responses.
+        For multimodal responses, images are converted to inlineData format
+        and returned as separate parts alongside the functionResponse.
+        """
         tool_id = msg.get("tool_call_id", "")
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
@@ -2449,14 +2454,60 @@ class AntigravityProvider(
                 f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
                 f"Available IDs: {list(tool_id_to_name.keys())}"
             )
-        # else:
-        # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
         # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
+        # Handle multimodal content (array with text and images)
+        if isinstance(content, list):
+            text_parts = []
+            image_parts = []
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+
+                if item_type == "text":
+                    text_parts.append(item.get("text", ""))
+                elif item_type == "image_url":
+                    # Convert OpenAI image_url format to Gemini inlineData
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:"):
+                        try:
+                            # Parse: data:image/png;base64,iVBORw0KG...
+                            header, data = image_url.split(",", 1)
+                            mime_type = header.split(":")[1].split(";")[0]
+                            image_parts.append({
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": data,
+                                }
+                            })
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to parse image data URL in tool response: {e}")
+
+            # Build the result parts
+            parts = []
+
+            # Add function response with text content
+            text_result = " ".join(text_parts) if text_parts else ""
+            parts.append({
+                "functionResponse": {
+                    "name": func_name,
+                    "response": {"result": text_result if text_result else "Image content provided"},
+                    "id": tool_id,
+                }
+            })
+
+            # Add image parts separately (Gemini handles these as additional parts)
+            parts.extend(image_parts)
+
+            return parts
+
+        # Handle string content (text-only)
         try:
             parsed_content = json.loads(content)
         except (json.JSONDecodeError, TypeError):
