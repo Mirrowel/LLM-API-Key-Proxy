@@ -49,6 +49,7 @@ async def anthropic_streaming_wrapper(
     message_started = False
     content_block_started = False
     thinking_block_started = False
+    thinking_signature = ""  # Store signature for thinking block
     current_block_index = 0
     tool_calls_by_index = {}  # Track tool calls by their index
     tool_block_indices = {}  # Track which block index each tool call uses
@@ -87,9 +88,18 @@ async def anthropic_streaming_wrapper(
 
                 # Close any open thinking block
                 if thinking_block_started:
+                    # Send signature_delta if we have a signature
+                    if thinking_signature:
+                        sig_delta = {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "signature_delta", "signature": thinking_signature},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(sig_delta)}\n\n"
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
                     current_block_index += 1
                     thinking_block_started = False
+                    thinking_signature = ""
 
                 # Close any open text block
                 if content_block_started:
@@ -148,8 +158,25 @@ async def anthropic_streaming_wrapper(
 
             # Handle reasoning/thinking content (from OpenAI-style reasoning_content)
             reasoning_content = delta.get("reasoning_content")
+            thought_sig_from_delta = delta.get("thought_signature", "")
+
+            # Always capture signature if available (may come in later deltas)
+            if thought_sig_from_delta and not thinking_signature:
+                thinking_signature = thought_sig_from_delta
+
             if reasoning_content:
+                import logging
+                logging.getLogger("rotator_library").debug(
+                    f"[Anthropic Stream] Sending thinking ({len(reasoning_content)} chars), sig={bool(thinking_signature)}"
+                )
                 if not thinking_block_started:
+                    # Close any open text block before starting a new thinking block
+                    # This enables interleaved thinking (thinking after tool results)
+                    if content_block_started:
+                        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                        current_block_index += 1
+                        content_block_started = False
+
                     # Start a thinking content block
                     block_start = {
                         "type": "content_block_start",
@@ -172,9 +199,18 @@ async def anthropic_streaming_wrapper(
             if content:
                 # If we were in a thinking block, close it first
                 if thinking_block_started and not content_block_started:
+                    # Send signature_delta if we have a signature
+                    if thinking_signature:
+                        sig_delta = {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "signature_delta", "signature": thinking_signature},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(sig_delta)}\n\n"
                     yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
                     current_block_index += 1
                     thinking_block_started = False
+                    thinking_signature = ""
 
                 if not content_block_started:
                     # Start a text content block
@@ -202,9 +238,18 @@ async def anthropic_streaming_wrapper(
                 if tc_index not in tool_calls_by_index:
                     # Close previous thinking block if open
                     if thinking_block_started:
+                        # Send signature_delta if we have a signature
+                        if thinking_signature:
+                            sig_delta = {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {"type": "signature_delta", "signature": thinking_signature},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(sig_delta)}\n\n"
                         yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
                         current_block_index += 1
                         thinking_block_started = False
+                        thinking_signature = ""
 
                     # Close previous text block if open
                     if content_block_started:

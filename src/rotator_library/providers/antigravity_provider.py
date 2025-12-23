@@ -1448,22 +1448,25 @@ class AntigravityProvider(
         """
         Generate stable cache key from response content for Claude thinking preservation.
 
-        Uses composite key:
-        - Tool call IDs (most stable)
-        - Text hash (for text-only responses)
-        """
-        key_parts = []
+        Priority order (most stable first):
+        1. Tool call ID (most stable - Claude Code preserves these)
+        2. Text hash (fallback for text-only responses)
 
+        Note: We use ONLY tool_id when available, not a composite, because
+        Claude Code may modify text content but preserves tool_call_ids.
+        """
+        # Prefer tool_call_id as the most stable identifier
         if tool_calls:
             first_id = tool_calls[0].get("id", "")
             if first_id:
-                key_parts.append(f"tool_{first_id.replace('call_', '')}")
+                return f"thinking_tool_{first_id.replace('call_', '')}"
 
+        # Fallback to text hash for text-only responses
         if text_content:
             text_hash = hashlib.md5(text_content[:200].encode()).hexdigest()[:16]
-            key_parts.append(f"text_{text_hash}")
+            return f"thinking_text_{text_hash}"
 
-        return "thinking_" + "_".join(key_parts) if key_parts else None
+        return None
 
     # NOTE: _discover_project_id() and _persist_project_metadata() are inherited from AntigravityAuthBase
 
@@ -1778,10 +1781,30 @@ class AntigravityProvider(
                             "New response will include thinking naturally."
                         )
 
-            # Strip thinking from old turns, let new response add thinking naturally
-            return self._strip_old_turn_thinking(
+            # Strip thinking from old turns, preserving last message
+            sanitized = self._strip_old_turn_thinking(
                 messages, state["last_assistant_idx"]
-            ), False
+            )
+
+            # FINAL CHECK: Verify the last assistant message actually has thinking
+            # If we stripped thinking due to missing signature, we need to handle it
+            if state["last_assistant_idx"] >= 0:
+                last_msg = sanitized[state["last_assistant_idx"]]
+                parts = last_msg.get("parts", [])
+                has_thinking = any(
+                    isinstance(p, dict) and p.get("thought") is True for p in parts
+                )
+                if not has_thinking:
+                    # Last assistant message has no thinking but thinking is enabled
+                    # This will cause Claude to reject. Close the loop with synthetic.
+                    synthetic_user = {
+                        "role": "user",
+                        "parts": [{"text": "[Continue]"}],
+                    }
+                    sanitized.append(synthetic_user)
+                    return self._strip_all_thinking_blocks(sanitized), False
+
+            return sanitized, False
 
     def _strip_all_thinking_blocks(
         self, messages: List[Dict[str, Any]]
@@ -1987,13 +2010,14 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             signature = thinking_data.get("thought_signature", "")
 
-            if not thinking_text or not signature:
-                lib_logger.debug(
-                    "[Thinking Sanitization] Cached thinking missing text or signature"
-                )
+            if not thinking_text:
                 return False
 
-            # Inject the recovered thinking part at the beginning (Gemini format)
+            # Only inject thinking if we have a valid signature
+            # Claude's API rejects invalid/fake signatures
+            if not signature:
+                return False
+
             thinking_part = {
                 "text": thinking_text,
                 "thought": True,
@@ -2290,49 +2314,43 @@ class AntigravityProvider(
         content = msg.get("content")
         tool_calls = msg.get("tool_calls", [])
         reasoning_content = msg.get("reasoning_content")
+        thought_signature = msg.get("thought_signature") or msg.get("thoughtSignature")
 
         # Handle reasoning_content if present (from original Claude response with thinking)
         if reasoning_content and self._is_claude(model):
-            # Add thinking part with cached signature
-            thinking_part = {
-                "text": reasoning_content,
-                "thought": True,
-            }
-            # Try to get signature from cache
-            cache_key = self._generate_thinking_cache_key(
-                content if isinstance(content, str) else "", tool_calls
-            )
-            cached_sig = None
-            if cache_key:
-                cached_json = self._thinking_cache.retrieve(cache_key)
-                if cached_json:
-                    try:
-                        cached_data = json.loads(cached_json)
-                        cached_sig = cached_data.get("thought_signature", "")
-                    except json.JSONDecodeError:
-                        pass
+            signature = thought_signature
+            if not signature:
+                # Try to get signature from cache
+                cache_key = self._generate_thinking_cache_key(
+                    content if isinstance(content, str) else "", tool_calls
+                )
+                if cache_key:
+                    cached_json = self._thinking_cache.retrieve(cache_key)
+                    if cached_json:
+                        try:
+                            cached_data = json.loads(cached_json)
+                            signature = cached_data.get("thought_signature", "")
+                        except json.JSONDecodeError:
+                            signature = ""
 
-            if cached_sig:
-                thinking_part["thoughtSignature"] = cached_sig
+            if signature:
+                # Only add thinking part if we have a valid signature
+                # Claude's API rejects invalid/fake signatures
+                thinking_part = {
+                    "text": reasoning_content,
+                    "thought": True,
+                    "thoughtSignature": signature,
+                }
                 parts.append(thinking_part)
-                lib_logger.debug(
-                    f"Added reasoning_content with cached signature ({len(reasoning_content)} chars)"
-                )
-            else:
-                # No cached signature - skip the thinking block
-                # This can happen if context was compressed and signature was lost
-                lib_logger.warning(
-                    f"Skipping reasoning_content - no valid signature found. "
-                    f"This may cause issues if thinking is enabled."
-                )
-        elif (
-            self._is_claude(model)
-            and self._enable_signature_cache
-            and not reasoning_content
-        ):
-            # Fallback: Try to inject cached thinking for Claude (original behavior)
+            # else: No valid signature - skip thinking entirely
+            # Claude will generate fresh thinking in the new response
+        elif self._is_claude(model) and not reasoning_content:
+            # Fallback: Try to inject cached thinking for Claude
             thinking_parts = self._get_cached_thinking(content, tool_calls)
-            parts.extend(thinking_parts)
+            if thinking_parts:
+                parts.extend(thinking_parts)
+            # If cache miss, don't inject synthetic thinking - Claude needs valid signatures
+            # The model will generate fresh thinking in its response
 
         # Add regular content
         if isinstance(content, str) and content:
@@ -2405,7 +2423,11 @@ class AntigravityProvider(
     def _get_cached_thinking(
         self, content: Any, tool_calls: List[Dict]
     ) -> List[Dict[str, Any]]:
-        """Retrieve and format cached thinking content for Claude."""
+        """Retrieve and format cached thinking content for Claude.
+
+        Only returns thinking parts if we have a valid signature.
+        Claude's API rejects invalid/fake signatures.
+        """
         parts = []
         msg_text = content if isinstance(content, str) else ""
         cache_key = self._generate_thinking_cache_key(msg_text, tool_calls)
@@ -2422,14 +2444,14 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             sig = thinking_data.get("thought_signature", "")
 
-            if thinking_text:
+            # Only inject thinking if we have BOTH text AND a valid signature
+            if thinking_text and sig:
                 thinking_part = {
                     "text": thinking_text,
                     "thought": True,
-                    "thoughtSignature": sig or "skip_thought_signature_validator",
+                    "thoughtSignature": sig,
                 }
                 parts.append(thinking_part)
-                lib_logger.debug(f"Injected {len(thinking_text)} chars of thinking")
         except json.JSONDecodeError:
             lib_logger.warning(f"Failed to parse cached thinking: {cache_key}")
 
@@ -3754,6 +3776,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             delta["content"] = text_content
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
+            # Include thought_signature if available (from accumulator)
+            if accumulator and accumulator.get("thought_signature"):
+                delta["thought_signature"] = accumulator["thought_signature"]
         if tool_calls:
             delta["tool_calls"] = tool_calls
             delta["role"] = "assistant"

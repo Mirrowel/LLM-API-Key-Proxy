@@ -7,10 +7,13 @@ This enables any OpenAI-compatible provider to work with Anthropic clients.
 """
 
 import json
+import logging
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from .models import AnthropicMessagesRequest
+
+lib_logger = logging.getLogger("rotator_library")
 
 
 def anthropic_to_openai_messages(
@@ -56,12 +59,35 @@ def anthropic_to_openai_messages(
             # Handle content blocks
             openai_content = []
             tool_calls = []
+            reasoning_content = ""
+            thought_signature = None
 
             for block in content:
                 if isinstance(block, dict):
                     block_type = block.get("type", "text")
 
-                    if block_type == "text":
+                    if block_type in ("thinking", "redacted_thinking"):
+                        if role != "assistant":
+                            continue
+                        if reasoning_content:
+                            reasoning_content += "\n"
+                        thinking_text = ""
+                        if block_type == "redacted_thinking":
+                            reasoning_content += "[redacted]"
+                            thinking_text = "[redacted]"
+                        else:
+                            thinking_text = block.get("thinking", "")
+                            if thinking_text:
+                                reasoning_content += thinking_text
+                        signature = block.get("signature")
+                        if signature:
+                            thought_signature = signature
+                        lib_logger.debug(
+                            f"[Translator] Found {block_type} block: "
+                            f"has_thinking={bool(thinking_text)}, "
+                            f"has_signature={bool(signature)}"
+                        )
+                    elif block_type == "text":
                         openai_content.append(
                             {"type": "text", "text": block.get("text", "")}
                         )
@@ -197,15 +223,42 @@ def anthropic_to_openai_messages(
                 else:
                     msg_dict["content"] = None
                 msg_dict["tool_calls"] = tool_calls
+                if reasoning_content:
+                    msg_dict["reasoning_content"] = reasoning_content
+                    if thought_signature:
+                        msg_dict["thought_signature"] = thought_signature
+                    lib_logger.debug(
+                        f"[Translator] Assistant msg with tool_calls: "
+                        f"reasoning={len(reasoning_content)} chars, has_sig={bool(thought_signature)}"
+                    )
                 openai_messages.append(msg_dict)
             elif openai_content:
                 # Check if it's just text or mixed content
                 if len(openai_content) == 1 and openai_content[0].get("type") == "text":
-                    openai_messages.append(
-                        {"role": role, "content": openai_content[0].get("text", "")}
-                    )
+                    msg_dict = {
+                        "role": role,
+                        "content": openai_content[0].get("text", ""),
+                    }
                 else:
-                    openai_messages.append({"role": role, "content": openai_content})
+                    msg_dict = {"role": role, "content": openai_content}
+                if reasoning_content:
+                    msg_dict["reasoning_content"] = reasoning_content
+                    if thought_signature:
+                        msg_dict["thought_signature"] = thought_signature
+                    lib_logger.debug(
+                        f"[Translator] Assistant msg with text: "
+                        f"reasoning={len(reasoning_content)} chars, has_sig={bool(thought_signature)}"
+                    )
+                openai_messages.append(msg_dict)
+            elif reasoning_content:
+                msg_dict = {"role": role, "content": "", "reasoning_content": reasoning_content}
+                if thought_signature:
+                    msg_dict["thought_signature"] = thought_signature
+                lib_logger.debug(
+                    f"[Translator] Assistant msg (reasoning only): "
+                    f"reasoning={len(reasoning_content)} chars, has_sig={bool(thought_signature)}"
+                )
+                openai_messages.append(msg_dict)
 
     return openai_messages
 
