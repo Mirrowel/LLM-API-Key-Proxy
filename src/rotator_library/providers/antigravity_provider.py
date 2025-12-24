@@ -404,6 +404,7 @@ def _clean_claude_schema(schema: Any) -> Any:
         "format",
         "minProperties",
         "maxProperties",
+        "propertyNames",
         "uniqueItems",
         "contentEncoding",
         "contentMediaType",
