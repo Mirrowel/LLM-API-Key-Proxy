@@ -4,7 +4,7 @@ Antigravity Provider - Refactored Implementation
 
 A clean, well-structured provider for Google's Antigravity API, supporting:
 - Gemini 2.5 (Pro/Flash) with thinkingBudget
-- Gemini 3 (Pro/Image) with thinkingLevel
+- Gemini 3 (Pro/Flash/Image) with thinkingLevel
 - Claude (Sonnet 4.5) via Antigravity proxy
 - Claude (Opus 4.5) via Antigravity proxy
 
@@ -26,10 +26,18 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+)
 
 import httpx
 import litellm
@@ -37,10 +45,33 @@ import litellm
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
+from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError
+from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
+
+if TYPE_CHECKING:
+    from ..usage_manager import UsageManager
+
+
+# =============================================================================
+# INTERNAL EXCEPTIONS
+# =============================================================================
+
+
+class _MalformedFunctionCallDetected(Exception):
+    """
+    Internal exception raised when MALFORMED_FUNCTION_CALL is detected.
+
+    Signals the retry logic to inject corrective messages and retry.
+    Not intended to be raised to callers.
+    """
+
+    def __init__(self, finish_message: str, raw_response: Dict[str, Any]):
+        self.finish_message = finish_message
+        self.raw_response = raw_response
+        super().__init__(finish_message)
 
 
 # =============================================================================
@@ -68,16 +99,30 @@ BASE_URLS = [
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
 
+# Required headers for Antigravity API calls
+# These headers are CRITICAL for gemini-3-pro-high/low to work
+# Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
+ANTIGRAVITY_HEADERS = {
+    "User-Agent": "antigravity/1.12.4 windows/amd64",
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+}
+
 # Available models via Antigravity
 AVAILABLE_MODELS = [
+    # Gemini models
     # "gemini-2.5-pro",
-    # "gemini-2.5-flash",
-    # "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",  # Uses -thinking variant when reasoning_effort provided
+    "gemini-2.5-flash-lite",  # Thinking budget configurable, no name change
     "gemini-3-pro-preview",  # Internally mapped to -low/-high variant based on thinkingLevel
-    # "gemini-3-pro-image-preview",
+    "gemini-3-flash",  # New Gemini 3 Flash model (supports thinking with minBudget=32)
+    # "gemini-3-pro-image",  # Image generation model
     # "gemini-2.5-computer-use-preview-10-2025",
-    "claude-sonnet-4-5",  # Internally mapped to -thinking variant when reasoning_effort is provided
+    # Claude models
+    "claude-sonnet-4-5",  # Uses -thinking variant when reasoning_effort provided
     "claude-opus-4-5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
+    # Other models
+    "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
@@ -86,8 +131,14 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
-EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 4))
-EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 2)
+EMPTY_RESPONSE_MAX_ATTEMPTS = max(1, _env_int("ANTIGRAVITY_EMPTY_RESPONSE_ATTEMPTS", 6))
+EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3)
+
+# Malformed function call retry configuration
+# When Gemini 3 returns MALFORMED_FUNCTION_CALL (invalid JSON syntax in tool args),
+# inject corrective messages and retry up to this many times
+MALFORMED_CALL_MAX_RETRIES = max(1, _env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
+MALFORMED_CALL_RETRY_DELAY = _env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 
 # Model alias mappings (internal ↔ public)
 MODEL_ALIAS_MAP = {
@@ -114,6 +165,13 @@ FINISH_REASON_MAP = {
     "RECITATION": "content_filter",
     "OTHER": "stop",
 }
+
+# Gemini 3 tool name remapping
+# Turned out not useful - saved for later to unfuck if needed
+GEMINI3_TOOL_RENAMES = {
+    # "batch": "multi_tool",  # "batch" triggers internal format: call:default_api:...
+}
+GEMINI3_TOOL_RENAMES_REVERSE = {v: k for k, v in GEMINI3_TOOL_RENAMES.items()}
 
 # Default safety settings - disable content filtering for all categories
 # Per CLIProxyAPI: these are attached to prevent safety blocks during API calls
@@ -182,6 +240,10 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
    d. For arrays, verify you're providing the correct item structure
    e. Do NOT add parameters that don't exist in the schema
 
+7. **JSON SYNTAX**: Function call arguments must be valid JSON.
+   - All keys MUST be double-quoted: {"key":"value"} not {key:"value"}
+   - Use double quotes for strings, not single quotes
+
 ## COMMON FAILURE PATTERNS TO AVOID
 
 - Using 'path' when schema says 'filePath' (or vice versa)
@@ -190,6 +252,9 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 - Omitting required nested fields in array items
 - Adding 'additionalProperties' that the schema doesn't define
 - Guessing parameter names from similar tools you know from training
+- Using unquoted keys: {key:"value"} instead of {"key":"value"}
+- Writing JSON as text in your response instead of making an actual function call
+- Using single quotes instead of double quotes for strings
 
 ## REMEMBER
 Your training data about function calling is OUTDATED for this environment.
@@ -212,6 +277,9 @@ You MUST follow these rules strictly:
 
 If you are unsure about a tool's parameters, YOU MUST read the schema definition carefully.
 """
+
+# Parallel tool usage encouragement instruction
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
 
 
 # =============================================================================
@@ -240,14 +308,23 @@ def _generate_project_id() -> str:
 def _normalize_type_arrays(schema: Any) -> Any:
     """
     Normalize type arrays in JSON Schema for Proto-based Antigravity API.
-    Converts `"type": ["string", "null"]` → `"type": "string"`.
+    Converts `"type": ["string", "null"]` → `"type": "string", "nullable": true`.
     """
     if isinstance(schema, dict):
         normalized = {}
         for key, value in schema.items():
             if key == "type" and isinstance(value, list):
-                non_null = [t for t in value if t != "null"]
-                normalized[key] = non_null[0] if non_null else value[0]
+                types = value
+                if "null" in types:
+                    normalized["nullable"] = True
+                    remaining_types = [t for t in types if t != "null"]
+                    if len(remaining_types) == 1:
+                        normalized[key] = remaining_types[0]
+                    elif len(remaining_types) > 1:
+                        normalized[key] = remaining_types
+                    # If no types remain, don't add "type" key
+                else:
+                    normalized[key] = value[0] if len(value) == 1 else value
             else:
                 normalized[key] = _normalize_type_arrays(value)
         return normalized
@@ -256,21 +333,46 @@ def _normalize_type_arrays(schema: Any) -> Any:
     return schema
 
 
-def _recursively_parse_json_strings(obj: Any) -> Any:
+def _recursively_parse_json_strings(
+    obj: Any,
+    schema: Optional[Dict[str, Any]] = None,
+    parse_json_objects: bool = False,
+) -> Any:
     """
     Recursively parse JSON strings in nested data structures.
 
     Antigravity sometimes returns tool arguments with JSON-stringified values:
     {"files": "[{...}]"} instead of {"files": [{...}]}.
 
+    Args:
+        obj: The object to process
+        schema: Optional JSON schema for the current level (used for schema-aware parsing)
+        parse_json_objects: If False (default), don't parse JSON-looking strings into objects.
+                           This prevents corrupting string content like write tool's "content" field.
+                           If True, parse strings that look like JSON objects/arrays.
+
     Additionally handles:
-    - Malformed double-encoded JSON (extra trailing '}' or ']')
-    - Escaped string content (\n, \t, \", etc.)
+    - Malformed double-encoded JSON (extra trailing '}' or ']') - only when parse_json_objects=True
+    - Escaped string content (\n, \t, etc.) - always processed
     """
     if isinstance(obj, dict):
-        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
+        # Get properties schema for looking up field types
+        properties_schema = schema.get("properties", {}) if schema else {}
+        return {
+            k: _recursively_parse_json_strings(
+                v,
+                properties_schema.get(k),
+                parse_json_objects,
+            )
+            for k, v in obj.items()
+        }
     elif isinstance(obj, list):
-        return [_recursively_parse_json_strings(item) for item in obj]
+        # Get items schema for array elements
+        items_schema = schema.get("items") if schema else None
+        return [
+            _recursively_parse_json_strings(item, items_schema, parse_json_objects)
+            for item in obj
+        ]
     elif isinstance(obj, str):
         stripped = obj.strip()
 
@@ -301,6 +403,20 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                 # If unescaping fails, continue with original processing
                 pass
 
+        # Only parse JSON strings if explicitly enabled
+        if not parse_json_objects:
+            return obj
+
+        # Schema-aware parsing: only parse if schema expects object/array, not string
+        if schema:
+            schema_type = schema.get("type")
+            if schema_type == "string":
+                # Schema says this should be a string - don't parse it
+                return obj
+            # Only parse if schema expects object or array
+            if schema_type not in ("object", "array", None):
+                return obj
+
         # Check if it looks like JSON (starts with { or [)
         if stripped and stripped[0] in ("{", "["):
             # Try standard parsing first
@@ -309,7 +425,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
             ):
                 try:
                     parsed = json.loads(obj)
-                    return _recursively_parse_json_strings(parsed)
+                    return _recursively_parse_json_strings(
+                        parsed, schema, parse_json_objects
+                    )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -326,7 +444,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -342,7 +462,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[Antigravity] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
     return obj
@@ -375,29 +497,52 @@ def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
     return resolve(schema)
 
 
-def _clean_claude_schema(schema: Any) -> Any:
+def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
-    - Removes unsupported fields ($schema, additionalProperties, etc.)
-    - Converts 'const' to 'enum' with single value (supported equivalent)
-    - Converts 'anyOf'/'oneOf' to the first option (Claude doesn't support these)
+
+    Context-aware cleaning:
+    - Removes unsupported validation keywords at schema-definition level
+    - Preserves property NAMES even if they match validation keyword names
+      (e.g., a tool parameter named "pattern" is preserved)
+    - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
+    - For Claude: strips validation keywords, converts anyOf/oneOf to first option, const to enum
+    - For Gemini: passes through additionalProperties as-is
+    - For Claude: normalizes permissive additionalProperties to true
     """
     if not isinstance(schema, dict):
         return schema
 
-    # Fields not supported by Antigravity/Google's Proto-based API
-    # Note: Claude via Antigravity rejects JSON Schema draft 2020-12 validation keywords
-    incompatible = {
+    # Meta/structural keywords - always remove regardless of context
+    # These are JSON Schema infrastructure, never valid property names
+    meta_keywords = {
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+    }
+
+    # Validation keywords - only remove at schema-definition level,
+    # NOT when they appear as property names under "properties"
+    # Note: These are common property names that could be used by tools:
+    # - "pattern" (glob, grep, regex tools)
+    # - "format" (export, date/time tools)
+    # - "default" (config tools)
+    # - "title" (document tools)
+    # - "minimum"/"maximum" (range tools)
+    #
+    # Keywords to strip for Claude only (Gemini accepts these):
+    # Claude rejects most JSON Schema validation keywords
+    validation_keywords_claude_only = {
         "$schema",
-        "additionalProperties",
         "minItems",
         "maxItems",
+        "uniqueItems",
         "pattern",
         "minLength",
         "maxLength",
         "minimum",
         "maximum",
-        "default",
         "exclusiveMinimum",
         "exclusiveMaximum",
         "multipleOf",
@@ -405,7 +550,6 @@ def _clean_claude_schema(schema: Any) -> Any:
         "minProperties",
         "maxProperties",
         "propertyNames",
-        "uniqueItems",
         "contentEncoding",
         "contentMediaType",
         "contentSchema",
@@ -413,39 +557,90 @@ def _clean_claude_schema(schema: Any) -> Any:
         "readOnly",
         "writeOnly",
         "examples",
-        "$id",
-        "$ref",
-        "$defs",
-        "definitions",
         "title",
+        "default",
     }
 
     # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-        first_option = _clean_claude_schema(schema["anyOf"][0])
-        if isinstance(first_option, dict):
-            return first_option
+    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    if not for_gemini:
+        if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
+            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
+            if isinstance(first_option, dict):
+                return first_option
 
-    # Handle 'oneOf' similarly
-    if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-        first_option = _clean_claude_schema(schema["oneOf"][0])
-        if isinstance(first_option, dict):
-            return first_option
+        # Handle 'oneOf' similarly
+        if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
+            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
+            if isinstance(first_option, dict):
+                return first_option
 
     cleaned = {}
-    # Handle 'const' by converting to 'enum' with single value
-    if "const" in schema:
+    # Handle 'const' by converting to 'enum' with single value (Claude only)
+    # Gemini supports const, so pass through for Gemini
+    if "const" in schema and not for_gemini:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
 
     for key, value in schema.items():
-        if key in incompatible or key == "const":
+        # Always skip meta keywords
+        if key in meta_keywords:
             continue
-        if isinstance(value, dict):
-            cleaned[key] = _clean_claude_schema(value)
+
+        # Skip "const" for Claude (already converted to enum above)
+        if key == "const" and not for_gemini:
+            continue
+
+        # Strip Claude-only keywords when not targeting Gemini
+        if key in validation_keywords_claude_only:
+            if for_gemini:
+                # Gemini accepts these - preserve them
+                cleaned[key] = value
+            # For Claude: skip - not supported
+            continue
+
+        # Special handling for additionalProperties:
+        # For Gemini: pass through as-is (Gemini accepts {}, true, false, typed schemas)
+        # For Claude: normalize permissive values ({} or true) to true
+        if key == "additionalProperties":
+            if for_gemini:
+                # Pass through additionalProperties as-is for Gemini
+                # Gemini accepts: true, false, {}, {"type": "string"}, etc.
+                cleaned["additionalProperties"] = value
+            else:
+                # Claude handling: normalize permissive values to true
+                if (
+                    value is True
+                    or value == {}
+                    or (isinstance(value, dict) and not value)
+                ):
+                    cleaned["additionalProperties"] = True  # Normalize {} to true
+                elif value is False:
+                    cleaned["additionalProperties"] = False
+                # Skip complex schema values for Claude (e.g., {"type": "string"})
+            continue
+
+        # Special handling for "properties" - preserve property NAMES
+        # The keys inside "properties" are user-defined property names, not schema keywords
+        # We must preserve them even if they match validation keyword names
+        if key == "properties" and isinstance(value, dict):
+            cleaned_props = {}
+            for prop_name, prop_schema in value.items():
+                # Log warning if property name matches a validation keyword
+                # This helps debug potential issues where the old code would have dropped it
+                if prop_name in validation_keywords_claude_only:
+                    lib_logger.debug(
+                        f"[Schema] Preserving property '{prop_name}' (matches validation keyword name)"
+                    )
+                cleaned_props[prop_name] = _clean_claude_schema(prop_schema, for_gemini)
+            cleaned[key] = cleaned_props
+        elif isinstance(value, dict):
+            cleaned[key] = _clean_claude_schema(value, for_gemini)
         elif isinstance(value, list):
             cleaned[key] = [
-                _clean_claude_schema(item) if isinstance(item, dict) else item
+                _clean_claude_schema(item, for_gemini)
+                if isinstance(item, dict)
+                else item
                 for item in value
             ]
         else:
@@ -497,9 +692,33 @@ class AntigravityFileLogger:
             "error.log", f"[{datetime.utcnow().isoformat()}] {error_message}"
         )
 
+    def log_malformed_retry_request(
+        self, retry_num: int, payload: Dict[str, Any]
+    ) -> None:
+        """Log a malformed call retry request payload in the same folder."""
+        self._write_json(f"malformed_retry_{retry_num}_request.json", payload)
+
+    def log_malformed_retry_response(self, retry_num: int, chunk: str) -> None:
+        """Append a chunk to the malformed retry response log."""
+        self._append_text(f"malformed_retry_{retry_num}_response.log", chunk)
+
     def log_final_response(self, response: Dict[str, Any]) -> None:
         """Log the final response."""
         self._write_json("final_response.json", response)
+
+    def log_malformed_autofix(
+        self, tool_name: str, raw_args: str, fixed_json: str
+    ) -> None:
+        """Log details of an auto-fixed malformed function call."""
+        self._write_json(
+            "malformed_autofix.json",
+            {
+                "tool_name": tool_name,
+                "raw_args": raw_args,
+                "fixed_json": fixed_json,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
 
     def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
         if not self.enabled or not self.log_dir:
@@ -525,13 +744,15 @@ class AntigravityFileLogger:
 # =============================================================================
 
 
-class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
+class AntigravityProvider(
+    AntigravityAuthBase, ProviderInterface, AntigravityQuotaTracker
+):
     """
     Antigravity provider for Gemini and Claude models via Google's internal API.
 
     Supports:
     - Gemini 2.5 (Pro/Flash) with thinkingBudget
-    - Gemini 3 (Pro/Image) with thinkingLevel
+    - Gemini 3 (Pro/Flash/Image) with thinkingLevel
     - Claude Sonnet 4.5 via Antigravity proxy
     - Claude Opus 4.5 via Antigravity proxy
 
@@ -590,16 +811,40 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     # Models in the same group share quota - when one is exhausted, all are
+    # Based on empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
+    # Note: -thinking variants are included since they share the same quota pool
+    # (users call non-thinking names, proxy maps to -thinking internally)
     model_quota_groups: QuotaGroupMap = {
-        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"],
+        # Claude and GPT-OSS share the same quota pool
+        "claude": [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking",
+            "gpt-oss-120b-medium",
+        ],
+        # Gemini 3 Pro variants share quota
+        "gemini-3-pro": [
+            "gemini-3-pro-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-preview",
+        ],
+        # Gemini 3 Flash (standalone, may share with 2.5 Flash - needs verification)
+        "gemini-3-flash": [
+            "gemini-3-flash",
+        ],
+        # Gemini 2.5 Flash variants share quota
+        "gemini-2.5-flash": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-flash-lite",
+        ],
     }
 
     # Model usage weights for grouped usage calculation
     # Opus consumes more quota per request, so its usage counts 2x when
     # comparing credentials for selection
-    model_usage_weights = {
-        "claude-opus-4-5": 2,
-    }
+    model_usage_weights = {}
 
     # Priority-based concurrency multipliers
     # Higher priority credentials (lower number) get higher multipliers
@@ -657,28 +902,53 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         import re as regex_module
 
         def parse_duration(duration_str: str) -> Optional[int]:
-            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds."""
+            """Parse duration strings like '143h4m52.73s' or '515092.73s' to seconds.
+
+            Also handles millisecond format: '290.979975ms' -> 0 seconds (rounded).
+            Returns 0 for sub-second durations (not None), as 0 is a valid value.
+            """
             if not duration_str:
                 return None
 
-            # Handle pure seconds format: "515092.730699158s"
+            # Handle pure milliseconds format: "290.979975ms"
+            # MUST check this BEFORE checking 'm' for minutes to avoid misinterpreting 'ms'
+            ms_match = regex_module.match(r"^([\d.]+)ms$", duration_str)
+            if ms_match:
+                ms_value = float(ms_match.group(1))
+                # Convert milliseconds to seconds, round up to at least 1 if > 0
+                seconds = ms_value / 1000.0
+                return max(1, int(seconds)) if seconds > 0 else 0
+
+            # Handle pure seconds format: "515092.730699158s" or "0.290979975s"
             pure_seconds_match = regex_module.match(r"^([\d.]+)s$", duration_str)
             if pure_seconds_match:
-                return int(float(pure_seconds_match.group(1)))
+                seconds = float(pure_seconds_match.group(1))
+                # For sub-second values, round up to 1 to avoid immediate retry floods
+                return max(1, int(seconds)) if seconds > 0 else 0
 
             # Handle compound format: "143h4m52.730699158s"
-            total_seconds = 0
+            # Note: 'm' here means minutes, not milliseconds (ms is handled above)
+            total_seconds = 0.0
             patterns = [
                 (r"(\d+)h", 3600),  # hours
-                (r"(\d+)m", 60),  # minutes
-                (r"([\d.]+)s", 1),  # seconds
+                (
+                    r"(\d+)m(?!s)",
+                    60,
+                ),  # minutes - negative lookahead to avoid matching 'ms'
+                (
+                    r"([\d.]+)s$",
+                    1,
+                ),  # seconds - anchor to end to avoid matching 's' in 'ms'
             ]
             for pattern, multiplier in patterns:
                 match = regex_module.search(pattern, duration_str)
                 if match:
                     total_seconds += float(match.group(1)) * multiplier
 
-            return int(total_seconds) if total_seconds > 0 else None
+            # Return 0 explicitly for very small values (it's valid, not "no value")
+            if total_seconds > 0:
+                return max(1, int(total_seconds))
+            return None
 
         # Get error body from exception if not provided
         body = error_body
@@ -723,7 +993,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 retry_delay = detail.get("retryDelay")
                 if retry_delay:
                     parsed = parse_duration(retry_delay)
-                    if parsed:
+                    if parsed is not None:  # 0 is valid, only None means "no value"
                         result["retry_after"] = parsed
 
             # Parse ErrorInfo - contains reason and quota reset metadata
@@ -732,11 +1002,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 metadata = detail.get("metadata", {})
 
                 # Get quotaResetDelay as fallback if RetryInfo not present
-                if not result["retry_after"]:
+                if result["retry_after"] is None:
                     quota_delay = metadata.get("quotaResetDelay")
                     if quota_delay:
                         parsed = parse_duration(quota_delay)
-                        if parsed:
+                        if parsed is not None:  # 0 is valid, only None means "no value"
                             result["retry_after"] = parsed
 
                 # Capture reset timestamp for logging and authoritative reset time
@@ -757,16 +1027,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         )
 
         # Return None if we couldn't extract retry_after
-        if not result["retry_after"]:
-            # Handle bare RESOURCE_EXHAUSTED without timing details
-            error_status = error_obj.get("status", "")
-            error_code = error_obj.get("code")
-
-            if error_status == "RESOURCE_EXHAUSTED" or error_code == 429:
-                result["retry_after"] = 60  # Default fallback
-                result["reason"] = result.get("reason") or "RESOURCE_EXHAUSTED"
-                return result
-
+        if result["retry_after"] is None:
+            # Bare RESOURCE_EXHAUSTED without timing details
+            # Return None to signal transient error (caller will retry internally)
             return None
 
         return result
@@ -798,6 +1061,16 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             env_prefix="ANTIGRAVITY_THINKING",
         )
 
+        # Quota tracking state
+        self._learned_costs: Dict[str, Dict[str, float]] = {}  # tier -> model -> cost
+        self._learned_costs_loaded: bool = False
+        self._quota_refresh_interval = _env_int(
+            "ANTIGRAVITY_QUOTA_REFRESH_INTERVAL", 300
+        )  # 5 min
+        self._initial_quota_fetch_done: bool = (
+            False  # Track if initial full fetch completed
+        )
+
         # Feature flags
         self._preserve_signatures_in_client = _env_bool(
             "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES", True
@@ -809,7 +1082,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS", False
         )
         self._enable_gemini3_tool_fix = _env_bool("ANTIGRAVITY_GEMINI3_TOOL_FIX", True)
-        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", True)
+        self._enable_claude_tool_fix = _env_bool("ANTIGRAVITY_CLAUDE_TOOL_FIX", False)
         self._enable_thinking_sanitization = _env_bool(
             "ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION", True
         )
@@ -825,6 +1098,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         self._gemini3_enforce_strict_schema = _env_bool(
             "ANTIGRAVITY_GEMINI3_STRICT_SCHEMA", True
         )
+        # Toggle for JSON string parsing in tool call arguments
+        # NOTE: This is possibly redundant - modern Gemini models may not need this fix.
+        # Disabled by default. Enable if you see JSON-stringified values in tool args.
+        self._enable_json_string_parsing = _env_bool(
+            "ANTIGRAVITY_ENABLE_JSON_STRING_PARSING", True
+        )
         self._gemini3_system_instruction = os.getenv(
             "ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION", DEFAULT_GEMINI3_SYSTEM_INSTRUCTION
         )
@@ -837,6 +1116,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "ANTIGRAVITY_CLAUDE_SYSTEM_INSTRUCTION", DEFAULT_CLAUDE_SYSTEM_INSTRUCTION
         )
 
+        # Parallel tool usage instruction configuration
+        self._enable_parallel_tool_instruction_claude = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE",
+            True,  # ON for Claude
+        )
+        self._enable_parallel_tool_instruction_gemini3 = _env_bool(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3",
+            False,  # OFF for Gemini 3
+        )
+        self._parallel_tool_instruction = os.getenv(
+            "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION", DEFAULT_PARALLEL_TOOL_INSTRUCTION
+        )
+
         # Log configuration
         self._log_config()
 
@@ -846,8 +1138,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             f"Antigravity config: signatures_in_client={self._preserve_signatures_in_client}, "
             f"cache={self._enable_signature_cache}, dynamic_models={self._enable_dynamic_models}, "
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
-            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}"
+            f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
+            f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
+            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
+
+    def _get_antigravity_headers(self) -> Dict[str, str]:
+        """Return the Antigravity API headers. Used by quota tracker mixin."""
+        return ANTIGRAVITY_HEADERS
 
     def _load_tier_from_file(self, credential_path: str) -> Optional[str]:
         """
@@ -964,6 +1262,63 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     f"Credential will use default priority."
                 )
 
+    # =========================================================================
+    # BACKGROUND JOB INTERFACE
+    # =========================================================================
+
+    def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Return background job configuration for quota baseline refresh.
+
+        The quota baseline refresh fetches current quota status from the API
+        and stores it in UsageManager for accurate quota estimation.
+        """
+        return {
+            "interval": self._quota_refresh_interval,  # default 300s (5 min)
+            "name": "quota_baseline_refresh",
+            "run_on_start": True,  # fetch baselines immediately at startup
+        }
+
+    async def run_background_job(
+        self,
+        usage_manager: "UsageManager",
+        credentials: List[str],
+    ) -> None:
+        """
+        Refresh quota baselines for credentials.
+
+        On first run (startup): Fetches quota for ALL credentials to establish baselines.
+        On subsequent runs: Only fetches for credentials used since last refresh.
+
+        Fetches current quota status from the Antigravity API and stores
+        the baselines in UsageManager for accurate quota estimation.
+        """
+        if not self._initial_quota_fetch_done:
+            # First run: fetch ALL credentials to establish baselines
+            lib_logger.info(
+                f"Antigravity: Fetching initial quota baselines for {len(credentials)} credentials..."
+            )
+            quota_results = await self.fetch_initial_baselines(credentials)
+            self._initial_quota_fetch_done = True
+        else:
+            # Subsequent runs: only recently used credentials (incremental updates)
+            usage_data = await usage_manager._get_usage_data_snapshot()
+            quota_results = await self.refresh_active_quota_baselines(
+                credentials, usage_data
+            )
+
+        if not quota_results:
+            return
+
+        # Store new baselines in UsageManager
+        stored = await self._store_baselines_to_usage_manager(
+            quota_results, usage_manager
+        )
+        if stored > 0:
+            lib_logger.debug(
+                f"Antigravity quota refresh: updated {stored} model baselines"
+            )
+
     async def _load_persisted_tiers(
         self, credential_paths: List[str]
     ) -> Dict[str, str]:
@@ -1057,6 +1412,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _get_base_url(self) -> str:
         """Get current base URL."""
         return self._current_base_url
+
+    def _get_available_models(self) -> List[str]:
+        """
+        Get list of user-facing model names available via this provider.
+
+        Used by quota tracker to filter which models to store baselines for.
+        Only models in this list will have quota baselines tracked.
+
+        Returns:
+            List of user-facing model names (e.g., ["claude-sonnet-4-5", "claude-opus-4-5"])
+        """
+        return AVAILABLE_MODELS
 
     def _try_next_base_url(self) -> bool:
         """Switch to next base URL in fallback list. Returns True if successful."""
@@ -1745,20 +2112,35 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         Map reasoning_effort to thinking configuration.
 
         - Gemini 2.5 & Claude: thinkingBudget (integer tokens)
-        - Gemini 3: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
         """
         internal = self._alias_to_internal(model)
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal.startswith("gemini-3-")
+        is_gemini_3_flash = "gemini-3-flash" in model or "gemini-3-flash" in internal
         is_claude = self._is_claude(model)
 
         if not (is_gemini_25 or is_gemini_3 or is_claude):
             return None
 
-        # Gemini 3: String-based thinkingLevel
+        # Gemini 3 Flash: Supports minimal/low/medium/high thinkingLevel
+        if is_gemini_3_flash:
+            if reasoning_effort == "disable":
+                # "minimal" matches "no thinking" for most queries
+                return {"thinkingLevel": "minimal", "include_thoughts": True}
+            elif reasoning_effort == "low":
+                return {"thinkingLevel": "low", "include_thoughts": True}
+            elif reasoning_effort == "medium":
+                return {"thinkingLevel": "medium", "include_thoughts": True}
+            # Default to high for Flash
+            return {"thinkingLevel": "high", "include_thoughts": True}
+
+        # Gemini 3 Pro: Only supports low/high thinkingLevel
         if is_gemini_3:
             if reasoning_effort == "low":
                 return {"thinkingLevel": "low", "include_thoughts": True}
+            # medium maps to high for Pro (not supported)
             return {"thinkingLevel": "high", "include_thoughts": True}
 
         # Gemini 2.5 & Claude: Integer thinkingBudget
@@ -1978,8 +2360,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             #    f"id={tool_id}, name={func_name}"
             # )
 
-            # Add prefix for Gemini 3
+            # Add prefix for Gemini 3 (and rename problematic tools)
             if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
                 func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
             func_part = {
@@ -2070,8 +2453,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         # else:
         # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
-        # Add prefix for Gemini 3
+        # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+            func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
         try:
@@ -2321,7 +2705,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     def _apply_gemini3_namespace(
         self, tools: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Add namespace prefix to tool names for Gemini 3."""
+        """
+        Add namespace prefix to tool names for Gemini 3.
+
+        Also renames certain tools that conflict with Gemini's internal behavior
+        (e.g., "batch" triggers MALFORMED_FUNCTION_CALL errors).
+        """
         if not tools:
             return tools
 
@@ -2330,6 +2719,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             for func_decl in tool.get("functionDeclarations", []):
                 name = func_decl.get("name", "")
                 if name:
+                    # Rename problematic tools first
+                    name = GEMINI3_TOOL_RENAMES.get(name, name)
+                    # Then add prefix
                     func_decl["name"] = f"{self._gemini3_tool_prefix}{name}"
 
         return modified
@@ -2340,8 +2732,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         """
         Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
 
-        Adds 'additionalProperties: false' recursively to all object schemas,
+        Adds 'additionalProperties: false' to object schemas with 'properties',
         which tells the model it CANNOT add properties not in the schema.
+
+        IMPORTANT: Preserves 'additionalProperties: true' (or {}) when explicitly
+        set in the original schema. This is critical for "freeform" parameter objects
+        like batch/multi_tool's nested parameters which need to accept arbitrary
+        tool parameters that aren't pre-defined in the schema.
         """
         if not tools:
             return tools
@@ -2351,7 +2748,17 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 return schema
 
             result = {}
+            preserved_additional_props = None
+
             for key, value in schema.items():
+                # Preserve additionalProperties as-is if it's truthy
+                # This is critical for "freeform" parameter objects like batch's
+                # nested parameters which need to accept arbitrary tool parameters
+                if key == "additionalProperties":
+                    if value is not False:
+                        # Preserve the original value (true, {}, {"type": "string"}, etc.)
+                        preserved_additional_props = value
+                    continue
                 if isinstance(value, dict):
                     result[key] = enforce_strict(value)
                 elif isinstance(value, list):
@@ -2362,9 +2769,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 else:
                     result[key] = value
 
-            # Add additionalProperties: false to object schemas
+            # Add additionalProperties: false to object schemas with properties,
+            # BUT only if we didn't preserve a value from the original schema
             if result.get("type") == "object" and "properties" in result:
-                result["additionalProperties"] = False
+                if preserved_additional_props is not None:
+                    result["additionalProperties"] = preserved_additional_props
+                else:
+                    result["additionalProperties"] = False
 
             return result
 
@@ -2473,10 +2884,460 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         return type_hint
 
     def _strip_gemini3_prefix(self, name: str) -> str:
-        """Strip the Gemini 3 namespace prefix from a tool name."""
+        """
+        Strip the Gemini 3 namespace prefix from a tool name.
+
+        Also reverses any tool renames that were applied to avoid Gemini conflicts.
+        """
         if name and name.startswith(self._gemini3_tool_prefix):
-            return name[len(self._gemini3_tool_prefix) :]
+            stripped = name[len(self._gemini3_tool_prefix) :]
+            # Reverse any renames
+            return GEMINI3_TOOL_RENAMES_REVERSE.get(stripped, stripped)
         return name
+
+    # =========================================================================
+    # MALFORMED FUNCTION CALL HANDLING
+    # =========================================================================
+
+    def _check_for_malformed_call(self, response: Dict[str, Any]) -> Optional[str]:
+        """
+        Check if response contains MALFORMED_FUNCTION_CALL.
+
+        Returns finishMessage if malformed, None otherwise.
+        """
+        candidates = response.get("candidates", [])
+        if not candidates:
+            return None
+
+        candidate = candidates[0]
+        if candidate.get("finishReason") == "MALFORMED_FUNCTION_CALL":
+            return candidate.get("finishMessage", "Unknown malformed call error")
+
+        return None
+
+    def _parse_malformed_call_message(
+        self, finish_message: str, model: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse MALFORMED_FUNCTION_CALL finishMessage to extract tool info.
+
+        Input format: "Malformed function call: call:namespace:tool_name{raw_args}"
+
+        Returns:
+            {"tool_name": "read", "prefixed_name": "gemini3_read",
+             "raw_args": "{filePath: \"...\"}"}
+            or None if unparseable
+        """
+        import re
+
+        # Pattern: "Malformed function call: call:namespace:tool_name{args}"
+        pattern = r"Malformed function call:\s*call:[^:]+:([^{]+)(\{.+\})$"
+        match = re.match(pattern, finish_message, re.DOTALL)
+
+        if not match:
+            lib_logger.warning(
+                f"[Antigravity] Could not parse MALFORMED_FUNCTION_CALL: {finish_message[:100]}"
+            )
+            return None
+
+        prefixed_name = match.group(1).strip()  # "gemini3_read"
+        raw_args = match.group(2)  # "{filePath: \"...\"}"
+
+        # Strip our prefix to get original tool name
+        tool_name = self._strip_gemini3_prefix(prefixed_name)
+
+        return {
+            "tool_name": tool_name,
+            "prefixed_name": prefixed_name,
+            "raw_args": raw_args,
+        }
+
+    def _analyze_json_error(self, raw_args: str) -> Dict[str, Any]:
+        """
+        Analyze malformed JSON to detect specific errors and attempt to fix it.
+
+        Combines json.JSONDecodeError with heuristic pattern detection
+        to provide actionable error information.
+
+        Returns:
+            {
+                "json_error": str or None,  # Python's JSON error message
+                "json_position": int or None,  # Position of error
+                "issues": List[str],  # Human-readable issues detected
+                "unquoted_keys": List[str],  # Specific unquoted key names
+                "fixed_json": str or None,  # Corrected JSON if we could fix it
+            }
+        """
+        import re as re_module
+
+        result = {
+            "json_error": None,
+            "json_position": None,
+            "issues": [],
+            "unquoted_keys": [],
+            "fixed_json": None,
+        }
+
+        # Option 1: Try json.loads to get exact error
+        try:
+            json.loads(raw_args)
+            return result  # Valid JSON, no errors
+        except json.JSONDecodeError as e:
+            result["json_error"] = e.msg
+            result["json_position"] = e.pos
+
+        # Option 2: Heuristic pattern detection for specific issues
+        # Detect unquoted keys: {word: or ,word:
+        unquoted_key_pattern = r"[{,]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:"
+        unquoted_keys = re_module.findall(unquoted_key_pattern, raw_args)
+        if unquoted_keys:
+            result["unquoted_keys"] = unquoted_keys
+            if len(unquoted_keys) == 1:
+                result["issues"].append(f"Unquoted key: '{unquoted_keys[0]}'")
+            else:
+                result["issues"].append(
+                    f"Unquoted keys: {', '.join(repr(k) for k in unquoted_keys)}"
+                )
+
+        # Detect single quotes
+        if "'" in raw_args:
+            result["issues"].append("Single quotes used instead of double quotes")
+
+        # Detect trailing comma
+        if re_module.search(r",\s*[}\]]", raw_args):
+            result["issues"].append("Trailing comma before closing bracket")
+
+        # Option 3: Try to fix the JSON and validate
+        fixed = raw_args
+        # Add quotes around unquoted keys
+        fixed = re_module.sub(
+            r"([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:",
+            r'\1"\2":',
+            fixed,
+        )
+        # Replace single quotes with double quotes
+        fixed = fixed.replace("'", '"')
+        # Remove trailing commas
+        fixed = re_module.sub(r",(\s*[}\]])", r"\1", fixed)
+
+        try:
+            # Validate the fix works
+            parsed = json.loads(fixed)
+            # Use compact JSON format (matches what model should produce)
+            result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+        except json.JSONDecodeError:
+            # First fix didn't work - try more aggressive cleanup
+            pass
+
+        # Option 4: If first attempt failed, try more aggressive fixes
+        if result["fixed_json"] is None:
+            try:
+                # Normalize all whitespace (collapse newlines/multiple spaces)
+                aggressive_fix = re_module.sub(r"\s+", " ", fixed)
+                # Try parsing again
+                parsed = json.loads(aggressive_fix)
+                result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+                lib_logger.debug(
+                    "[Antigravity] Fixed malformed JSON with aggressive whitespace normalization"
+                )
+            except json.JSONDecodeError:
+                pass
+
+        # Option 5: If still failing, try fixing unquoted string values
+        if result["fixed_json"] is None:
+            try:
+                # Some models produce unquoted string values like {key: value}
+                # Try to quote values that look like unquoted strings
+                # Match : followed by unquoted word (not a number, bool, null, or object/array)
+                aggressive_fix = re_module.sub(
+                    r":\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}\]])",
+                    r': "\1"\2',
+                    fixed,
+                )
+                parsed = json.loads(aggressive_fix)
+                result["fixed_json"] = json.dumps(parsed, separators=(",", ":"))
+                lib_logger.debug(
+                    "[Antigravity] Fixed malformed JSON by quoting unquoted string values"
+                )
+            except json.JSONDecodeError:
+                # All fixes failed, leave as None
+                pass
+
+        return result
+
+    def _build_malformed_call_retry_messages(
+        self,
+        parsed_call: Dict[str, Any],
+        tool_schema: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Build synthetic Gemini-format messages for malformed call retry.
+
+        Returns: (assistant_message, user_message) in Gemini format
+        """
+        tool_name = parsed_call["tool_name"]
+        raw_args = parsed_call["raw_args"]
+
+        # Analyze the JSON error and try to fix it
+        error_info = self._analyze_json_error(raw_args)
+
+        # Assistant message: Show what it tried to do
+        assistant_msg = {
+            "role": "model",
+            "parts": [{"text": f"I'll call the '{tool_name}' function."}],
+        }
+
+        # Build a concise error message
+        if error_info["fixed_json"]:
+            # We successfully fixed the JSON - show the corrected version
+            error_text = f"""[FUNCTION CALL ERROR - INVALID JSON]
+
+Your call to '{tool_name}' failed. All JSON keys must be double-quoted.
+
+INVALID: {raw_args}
+
+CORRECTED: {error_info["fixed_json"]}
+
+Retry the function call now using the corrected JSON above. Output ONLY the tool call, no text."""
+        else:
+            # Couldn't auto-fix - give hints
+            error_text = f"""[FUNCTION CALL ERROR - INVALID JSON]
+
+Your call to '{tool_name}' failed due to malformed JSON.
+
+You provided: {raw_args}
+
+Fix: All JSON keys must be double-quoted. Example: {{"key":"value"}} not {{key:"value"}}
+
+Analyze what you did wrong, correct it, and retry the function call. Output ONLY the tool call, no text."""
+
+        # Add schema if available (strip $schema reference)
+        if tool_schema:
+            clean_schema = {k: v for k, v in tool_schema.items() if k != "$schema"}
+            schema_str = json.dumps(clean_schema, separators=(",", ":"))
+            error_text += f"\n\nSchema: {schema_str}"
+
+        user_msg = {"role": "user", "parts": [{"text": error_text}]}
+
+        return assistant_msg, user_msg
+
+    def _build_malformed_fallback_response(
+        self, model: str, error_details: str
+    ) -> litellm.ModelResponse:
+        """
+        Build error response when malformed call retries are exhausted.
+
+        Uses finish_reason=None to indicate the response didn't complete normally,
+        allowing clients to detect the incomplete state and potentially retry.
+        """
+        return litellm.ModelResponse(
+            **{
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "[TOOL CALL ERROR] I attempted to call a function but "
+                                "repeatedly produced malformed syntax. This may be a model issue.\n\n"
+                                f"Last error: {error_details}\n\n"
+                                "Please try rephrasing your request or try a different approach."
+                            ),
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    def _build_malformed_fallback_chunk(
+        self,
+        model: str,
+        error_details: str,
+        response_id: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> litellm.ModelResponse:
+        """
+        Build streaming chunk error response when malformed call retries are exhausted.
+
+        Uses streaming format (delta instead of message) for consistency with streaming responses.
+        Includes usage with completion_tokens > 0 so client.py recognizes it as a final chunk.
+        """
+        chunk_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        # Ensure usage has completion_tokens > 0 for client to recognize as final chunk
+        if not usage or usage.get("completion_tokens", 0) <= 0:
+            prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,
+                "total_tokens": prompt_tokens + 1,
+            }
+
+        return litellm.ModelResponse(
+            **{
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": (
+                                "[TOOL CALL ERROR] I attempted to call a function but "
+                                "repeatedly produced malformed syntax. This may be a model issue.\n\n"
+                                f"Last error: {error_details}\n\n"
+                                "Please try rephrasing your request or try a different approach."
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
+
+    def _build_fixed_tool_call_response(
+        self,
+        model: str,
+        parsed_call: Dict[str, Any],
+        error_info: Dict[str, Any],
+    ) -> Optional[litellm.ModelResponse]:
+        """
+        Build a synthetic valid tool call response from auto-fixed malformed JSON.
+
+        When Gemini 3 produces malformed JSON (e.g., unquoted keys), this method
+        takes the auto-corrected JSON from _analyze_json_error() and builds a
+        proper OpenAI-format tool call response.
+
+        Returns None if the JSON couldn't be fixed.
+        """
+        fixed_json = error_info.get("fixed_json")
+        if not fixed_json:
+            return None
+
+        # Validate the fixed JSON is actually valid
+        try:
+            json.loads(fixed_json)
+        except json.JSONDecodeError:
+            return None
+
+        tool_name = parsed_call["tool_name"]
+        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
+        return litellm.ModelResponse(
+            **{
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": fixed_json,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+        )
+
+    def _build_fixed_tool_call_chunk(
+        self,
+        model: str,
+        parsed_call: Dict[str, Any],
+        error_info: Dict[str, Any],
+        response_id: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> Optional[litellm.ModelResponse]:
+        """
+        Build a streaming chunk with the auto-fixed tool call.
+
+        Similar to _build_fixed_tool_call_response but uses streaming format:
+        - object: "chat.completion.chunk" instead of "chat.completion"
+        - delta: {...} instead of message: {...}
+        - tool_calls items include "index" field
+
+        Args:
+            response_id: Optional original response ID to maintain stream continuity
+            usage: Optional usage from previous chunks. Must include completion_tokens > 0
+                   for client to recognize this as a final chunk.
+
+        Returns None if the JSON couldn't be fixed.
+        """
+        fixed_json = error_info.get("fixed_json")
+        if not fixed_json:
+            return None
+
+        # Validate the fixed JSON is actually valid
+        try:
+            json.loads(fixed_json)
+        except json.JSONDecodeError:
+            return None
+
+        tool_name = parsed_call["tool_name"]
+        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+        # Use original response ID if provided, otherwise generate new one
+        chunk_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        # Ensure usage has completion_tokens > 0 for client to recognize as final chunk
+        # Client.py's _safe_streaming_wrapper uses completion_tokens > 0 to detect final chunks
+        if not usage or usage.get("completion_tokens", 0) <= 0:
+            prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,  # Minimum to signal final chunk
+                "total_tokens": prompt_tokens + 1,
+            }
+
+        return litellm.ModelResponse(
+            **{
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": tool_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": fixed_json,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
 
     def _translate_tool_choice(
         self, tool_choice: Union[str, Dict[str, Any]], model: str = ""
@@ -2502,8 +3363,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             function_name = tool_choice.get("function", {}).get("name")
             if function_name:
-                # Add Gemini 3 prefix if needed
+                # Add Gemini 3 prefix if needed (and rename problematic tools)
                 if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = GEMINI3_TOOL_RENAMES.get(
+                        function_name, function_name
+                    )
                     function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
                 mode = "ANY"  # Force a call, but only to this function
@@ -2521,13 +3385,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
     # =========================================================================
 
     def _build_tools_payload(
-        self, tools: Optional[List[Dict[str, Any]]], _model: str
+        self, tools: Optional[List[Dict[str, Any]]], model: str
     ) -> Optional[List[Dict[str, Any]]]:
-        """Build Gemini-format tools from OpenAI tools."""
+        """Build Gemini-format tools from OpenAI tools.
+
+        For Gemini models, all tools are placed in a SINGLE functionDeclarations array.
+        This matches the format expected by Gemini CLI and prevents MALFORMED_FUNCTION_CALL errors.
+        """
         if not tools:
             return None
 
-        gemini_tools = []
+        function_declarations = []
+
         for tool in tools:
             if tool.get("type") != "function":
                 continue
@@ -2545,7 +3414,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 schema.pop("strict", None)
                 # Inline $ref definitions, then strip unsupported keywords
                 schema = _inline_schema_refs(schema)
-                schema = _clean_claude_schema(schema)
+                # For Gemini models, use for_gemini=True to:
+                # - Preserve truthy additionalProperties (for freeform param objects)
+                # - Strip false values (let _enforce_strict_schema add them)
+                is_gemini = not self._is_claude(model)
+                schema = _clean_claude_schema(schema, for_gemini=is_gemini)
                 schema = _normalize_type_arrays(schema)
 
                 # Workaround: Antigravity/Gemini fails to emit functionCall
@@ -2578,9 +3451,14 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     "required": ["_confirm"],
                 }
 
-            gemini_tools.append({"functionDeclarations": [func_decl]})
+            function_declarations.append(func_decl)
 
-        return gemini_tools or None
+        if not function_declarations:
+            return None
+
+        # Return all tools in a SINGLE functionDeclarations array
+        # This is the format Gemini CLI uses and prevents MALFORMED_FUNCTION_CALL errors
+        return [{"functionDeclarations": function_declarations}]
 
     def _transform_to_antigravity_format(
         self,
@@ -2612,6 +3490,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             elif internal_model == "claude-sonnet-4-5" and reasoning_effort:
                 # Sonnet 4.5 uses -thinking only when reasoning_effort is provided
                 internal_model = "claude-sonnet-4-5-thinking"
+
+        # Map gemini-2.5-flash to -thinking variant when reasoning_effort is provided
+        if internal_model == "gemini-2.5-flash" and reasoning_effort:
+            internal_model = "gemini-2.5-flash-thinking"
 
         # Map gemini-3-pro-preview to -low/-high variant based on thinking config
         if model == "gemini-3-pro-preview" or internal_model == "gemini-3-pro-preview":
@@ -2781,7 +3663,11 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         accumulator["text_content"] += text
 
             if has_func:
-                tool_call = self._extract_tool_call(part, model, tool_idx, accumulator)
+                # Get tool_schemas from accumulator for schema-aware parsing
+                tool_schemas = accumulator.get("tool_schemas") if accumulator else None
+                tool_call = self._extract_tool_call(
+                    part, model, tool_idx, accumulator, tool_schemas
+                )
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
@@ -2834,7 +3720,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         return response
 
     def _gemini_to_openai_non_streaming(
-        self, response: Dict[str, Any], model: str
+        self,
+        response: Dict[str, Any],
+        model: str,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Convert Gemini response to OpenAI non-streaming format."""
         candidates = response.get("candidates", [])
@@ -2871,7 +3760,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     text_content += part["text"]
 
             if has_func:
-                tool_call = self._extract_tool_call(part, model, len(tool_calls))
+                tool_call = self._extract_tool_call(
+                    part, model, len(tool_calls), tool_schemas=tool_schemas
+                )
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
@@ -2926,12 +3817,38 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         return result
 
+    def _build_tool_schema_map(
+        self, tools: Optional[List[Dict[str, Any]]], model: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Build a mapping of tool name -> parameter schema from tools payload.
+
+        Used for schema-aware JSON string parsing to avoid corrupting
+        string content that looks like JSON (e.g., write tool's content field).
+        """
+        if not tools:
+            return {}
+
+        schema_map = {}
+        for tool in tools:
+            for func_decl in tool.get("functionDeclarations", []):
+                name = func_decl.get("name", "")
+                # Strip gemini3 prefix if applicable
+                if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
+                    name = self._strip_gemini3_prefix(name)
+                schema = func_decl.get("parametersJsonSchema", {})
+                if name and schema:
+                    schema_map[name] = schema
+
+        return schema_map
+
     def _extract_tool_call(
         self,
         part: Dict[str, Any],
         model: str,
         index: int,
         accumulator: Optional[Dict[str, Any]] = None,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Extract and format a tool call from a response part."""
         func_call = part["functionCall"]
@@ -2944,7 +3861,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             tool_name = self._strip_gemini3_prefix(tool_name)
 
         raw_args = func_call.get("args", {})
-        parsed_args = _recursively_parse_json_strings(raw_args)
+
+        # Optionally parse JSON strings (handles escaped control chars, malformed JSON)
+        # NOTE: Gemini 3 sometimes returns stringified arrays for array parameters
+        # (e.g., batch, todowrite). Schema-aware parsing prevents corrupting string
+        # content that looks like JSON (e.g., write tool's content field).
+        if self._enable_json_string_parsing:
+            # Get schema for this tool if available
+            tool_schema = tool_schemas.get(tool_name) if tool_schemas else None
+            parsed_args = _recursively_parse_json_strings(
+                raw_args, schema=tool_schema, parse_json_objects=True
+            )
+        else:
+            parsed_args = raw_args
 
         # Strip the injected _confirm parameter ONLY if it's the sole parameter
         # This ensures we only strip our injection, not legitimate user params
@@ -3057,6 +3986,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                **ANTIGRAVITY_HEADERS,
             }
             payload = {
                 "project": _generate_project_id(),
@@ -3161,6 +4091,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     gemini_payload, self._claude_system_instruction
                 )
 
+            # Inject parallel tool usage encouragement (independent of tool hardening)
+            if self._is_claude(model) and self._enable_parallel_tool_instruction_claude:
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
+                )
+            elif (
+                self._is_gemini_3(model)
+                and self._enable_parallel_tool_instruction_gemini3
+            ):
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, self._parallel_tool_instruction
+                )
+
         # Add generation config
         gen_config = {}
         if top_p is not None:
@@ -3184,6 +4127,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
         # Add tools
         gemini_tools = self._build_tools_payload(tools, model)
+
         if gemini_tools:
             gemini_payload["tools"] = gemini_tools
 
@@ -3193,6 +4137,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 gemini_payload["tools"] = self._apply_gemini3_namespace(
                     gemini_payload["tools"]
                 )
+
                 if self._gemini3_enforce_strict_schema:
                     gemini_payload["tools"] = self._enforce_strict_schema(
                         gemini_payload["tools"]
@@ -3221,6 +4166,10 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         )
         file_logger.log_request(payload)
 
+        # Pre-build tool schema map for malformed call handling
+        # This maps original tool names (without prefix) to their schemas
+        tool_schemas = self._build_tool_schema_map(gemini_payload.get("tools"), model)
+
         # Make API call
         base_url = self._get_base_url()
         endpoint = ":streamGenerateContent" if stream else ":generateContent"
@@ -3229,18 +4178,19 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         if stream:
             url = f"{url}?alt=sse"
 
-        parsed = urlparse(base_url)
-        host = parsed.netloc or base_url.replace("https://", "").replace(
-            "http://", ""
-        ).rstrip("/")
-
+        # These headers are REQUIRED for gemini-3-pro-high/low to work
+        # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "Host": host,
-            "User-Agent": "antigravity/1.11.9 windows/amd64",
             "Accept": "text/event-stream" if stream else "application/json",
+            **ANTIGRAVITY_HEADERS,
         }
+
+        # Track malformed call retries (separate from empty response retries)
+        malformed_retry_count = 0
+        # Keep a mutable reference to gemini_contents for retry injection
+        current_gemini_contents = gemini_contents
 
         # URL fallback loop - handles HTTP errors (except 429) and network errors
         # by switching to fallback URLs. Empty response retry is handled separately
@@ -3250,56 +4200,203 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                 if stream:
                     # Streaming: _streaming_with_retry handles empty response retries internally
                     return self._streaming_with_retry(
-                        client, url, headers, payload, model, file_logger
+                        client,
+                        url,
+                        headers,
+                        payload,
+                        model,
+                        file_logger,
+                        tool_schemas,
+                        current_gemini_contents,
+                        gemini_payload,
+                        project_id,
+                        max_tokens,
+                        reasoning_effort,
+                        tool_choice,
                     )
                 else:
-                    # Non-streaming: empty response retry loop
-                    error_msg = (
+                    # Non-streaming: empty response, bare 429, and malformed call retry
+                    empty_error_msg = (
                         "The model returned an empty response after multiple attempts. "
+                        "This may indicate a temporary service issue. Please try again."
+                    )
+                    transient_429_msg = (
+                        "The model returned transient 429 errors after multiple attempts. "
                         "This may indicate a temporary service issue. Please try again."
                     )
 
                     for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
-                        result = await self._handle_non_streaming(
-                            client, url, headers, payload, model, file_logger
-                        )
+                        try:
+                            result = await self._handle_non_streaming(
+                                client,
+                                url,
+                                headers,
+                                payload,
+                                model,
+                                file_logger,
+                            )
 
-                        # Check if we got anything - empty dict means no candidates
-                        result_dict = (
-                            result.model_dump()
-                            if hasattr(result, "model_dump")
-                            else dict(result)
-                        )
-                        got_response = bool(result_dict.get("choices"))
+                            # Check if we got anything - empty dict means no candidates
+                            result_dict = (
+                                result.model_dump()
+                                if hasattr(result, "model_dump")
+                                else dict(result)
+                            )
+                            got_response = bool(result_dict.get("choices"))
 
-                        if not got_response:
-                            if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                            if not got_response:
+                                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                    lib_logger.warning(
+                                        f"[Antigravity] Empty response from {model}, "
+                                        f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                    )
+                                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                    continue
+                                else:
+                                    # Last attempt failed - raise without extra logging
+                                    # (caller will log the error)
+                                    raise EmptyResponseError(
+                                        provider="antigravity",
+                                        model=model,
+                                        message=empty_error_msg,
+                                    )
+
+                            return result
+
+                        except _MalformedFunctionCallDetected as e:
+                            # Handle MALFORMED_FUNCTION_CALL - try auto-fix first
+                            parsed = self._parse_malformed_call_message(
+                                e.finish_message, model
+                            )
+
+                            if parsed:
+                                # Try to auto-fix the malformed JSON
+                                error_info = self._analyze_json_error(
+                                    parsed["raw_args"]
+                                )
+
+                                if error_info.get("fixed_json"):
+                                    # Auto-fix successful - build synthetic response
+                                    lib_logger.info(
+                                        f"[Antigravity] Auto-fixed malformed function call for "
+                                        f"'{parsed['tool_name']}' from {model}"
+                                    )
+
+                                    # Log the auto-fix details
+                                    if file_logger:
+                                        file_logger.log_malformed_autofix(
+                                            parsed["tool_name"],
+                                            parsed["raw_args"],
+                                            error_info["fixed_json"],
+                                        )
+
+                                    fixed_response = (
+                                        self._build_fixed_tool_call_response(
+                                            model, parsed, error_info
+                                        )
+                                    )
+                                    if fixed_response:
+                                        return fixed_response
+
+                            # Auto-fix failed - retry by asking model to fix its JSON
+                            # Each retry response will also attempt auto-fix first
+                            if malformed_retry_count < MALFORMED_CALL_MAX_RETRIES:
+                                malformed_retry_count += 1
                                 lib_logger.warning(
-                                    f"[Antigravity] Empty response from {model}, "
-                                    f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                    f"[Antigravity] MALFORMED_FUNCTION_CALL from {model}, "
+                                    f"retry {malformed_retry_count}/{MALFORMED_CALL_MAX_RETRIES}: "
+                                    f"{e.finish_message[:100]}..."
                                 )
-                                await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
-                                continue
+
+                                if parsed:
+                                    # Get schema for the failed tool
+                                    tool_schema = tool_schemas.get(parsed["tool_name"])
+
+                                    # Build corrective messages
+                                    assistant_msg, user_msg = (
+                                        self._build_malformed_call_retry_messages(
+                                            parsed, tool_schema
+                                        )
+                                    )
+
+                                    # Inject into conversation
+                                    current_gemini_contents = list(
+                                        current_gemini_contents
+                                    )
+                                    current_gemini_contents.append(assistant_msg)
+                                    current_gemini_contents.append(user_msg)
+
+                                    # Rebuild payload with modified contents
+                                    gemini_payload_copy = copy.deepcopy(gemini_payload)
+                                    gemini_payload_copy["contents"] = (
+                                        current_gemini_contents
+                                    )
+                                    payload = self._transform_to_antigravity_format(
+                                        gemini_payload_copy,
+                                        model,
+                                        project_id,
+                                        max_tokens,
+                                        reasoning_effort,
+                                        tool_choice,
+                                    )
+
+                                    # Log the retry request in the same folder
+                                    if file_logger:
+                                        file_logger.log_malformed_retry_request(
+                                            malformed_retry_count, payload
+                                        )
+
+                                await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
+                                break  # Break inner loop to retry with modified payload
                             else:
-                                # Last attempt failed - raise without extra logging
-                                # (caller will log the error)
-                                raise EmptyResponseError(
-                                    provider="antigravity",
-                                    model=model,
-                                    message=error_msg,
+                                # Auto-fix failed and retries disabled/exceeded - return fallback
+                                lib_logger.warning(
+                                    f"[Antigravity] MALFORMED_FUNCTION_CALL could not be auto-fixed "
+                                    f"for {model}: {e.finish_message[:100]}..."
+                                )
+                                return self._build_malformed_fallback_response(
+                                    model, e.finish_message
                                 )
 
-                        return result
-
-                    # Should not reach here, but just in case
-                    lib_logger.error(
-                        f"[Antigravity] Unexpected exit from retry loop for {model}"
-                    )
-                    raise EmptyResponseError(
-                        provider="antigravity",
-                        model=model,
-                        message=error_msg,
-                    )
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 429:
+                                # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                                quota_info = self.parse_quota_error(e)
+                                if quota_info is None:
+                                    # Bare 429 - retry like empty response
+                                    if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                                        lib_logger.warning(
+                                            f"[Antigravity] Bare 429 from {model}, "
+                                            f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                                        )
+                                        await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                                        continue
+                                    else:
+                                        # Last attempt failed - raise TransientQuotaError to rotate
+                                        raise TransientQuotaError(
+                                            provider="antigravity",
+                                            model=model,
+                                            message=transient_429_msg,
+                                        )
+                                # Has retry info - real quota exhaustion, propagate for cooldown
+                                lib_logger.debug(
+                                    f"429 with retry info - propagating for cooldown: {e}"
+                                )
+                            # Re-raise all HTTP errors (429 with retry info, or other errors)
+                            raise
+                    else:
+                        # For loop completed normally (no break) - should not happen
+                        # This means we exhausted EMPTY_RESPONSE_MAX_ATTEMPTS without success
+                        lib_logger.error(
+                            f"[Antigravity] Unexpected exit from retry loop for {model}"
+                        )
+                        raise EmptyResponseError(
+                            provider="antigravity",
+                            model=model,
+                            message=empty_error_msg,
+                        )
+                    # If we broke out of the for loop (malformed retry), continue while loop
+                    continue
 
             except httpx.HTTPStatusError as e:
                 # 429 = Rate limit/quota exhausted - tied to credential, not URL
@@ -3319,8 +4416,8 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     continue  # Retry with new URL
                 raise  # No more fallback URLs
 
-            except EmptyResponseError:
-                # Empty response already retried internally - don't catch, propagate
+            except (EmptyResponseError, TransientQuotaError):
+                # Already retried internally - don't catch, propagate for credential rotation
                 raise
 
             except Exception as e:
@@ -3380,7 +4477,17 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             file_logger.log_final_response(data)
 
         gemini_response = self._unwrap_response(data)
-        openai_response = self._gemini_to_openai_non_streaming(gemini_response, model)
+
+        # Check for MALFORMED_FUNCTION_CALL before conversion
+        malformed_msg = self._check_for_malformed_call(gemini_response)
+        if malformed_msg:
+            raise _MalformedFunctionCallDetected(malformed_msg, gemini_response)
+
+        # Build tool schema map for schema-aware JSON parsing
+        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+        openai_response = self._gemini_to_openai_non_streaming(
+            gemini_response, model, tool_schemas
+        )
 
         return litellm.ModelResponse(**openai_response)
 
@@ -3392,8 +4499,17 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         payload: Dict[str, Any],
         model: str,
         file_logger: Optional[AntigravityFileLogger] = None,
+        malformed_retry_num: Optional[int] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
-        """Handle streaming completion."""
+        """Handle streaming completion.
+
+        Args:
+            malformed_retry_num: If set, log response chunks to malformed_retry_N_response.log
+                                 instead of the main response_stream.log
+        """
+        # Build tool schema map for schema-aware JSON parsing
+        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+
         # Accumulator tracks state across chunks for caching and tool indexing
         accumulator = {
             "reasoning_content": "",
@@ -3404,6 +4520,9 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
             "is_complete": False,  # Track if we received usageMetadata
             "last_usage": None,  # Track last received usage for final chunk
             "yielded_any": False,  # Track if we yielded any real chunks
+            "tool_schemas": tool_schemas,  # For schema-aware JSON string parsing
+            "malformed_call": None,  # Track MALFORMED_FUNCTION_CALL if detected
+            "response_id": None,  # Track original response ID for synthetic chunks
         }
 
         async with client.stream(
@@ -3428,7 +4547,12 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
 
             async for line in response.aiter_lines():
                 if file_logger:
-                    file_logger.log_response_chunk(line)
+                    if malformed_retry_num is not None:
+                        file_logger.log_malformed_retry_response(
+                            malformed_retry_num, line
+                        )
+                    else:
+                        file_logger.log_response_chunk(line)
 
                 if line.startswith("data: "):
                     data_str = line[6:]
@@ -3438,6 +4562,18 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     try:
                         chunk = json.loads(data_str)
                         gemini_chunk = self._unwrap_response(chunk)
+
+                        # Capture response ID from first chunk for synthetic responses
+                        if not accumulator.get("response_id"):
+                            accumulator["response_id"] = gemini_chunk.get("responseId")
+
+                        # Check for MALFORMED_FUNCTION_CALL
+                        malformed_msg = self._check_for_malformed_call(gemini_chunk)
+                        if malformed_msg:
+                            # Store for retry handler, don't yield anything more
+                            accumulator["malformed_call"] = malformed_msg
+                            break
+
                         openai_chunk = self._gemini_to_openai_chunk(
                             gemini_chunk, model, accumulator
                         )
@@ -3448,6 +4584,13 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                         if file_logger:
                             file_logger.log_error(f"Parse error: {data_str[:100]}")
                         continue
+
+        # Check if we detected a malformed call - raise exception for retry handler
+        if accumulator.get("malformed_call"):
+            raise _MalformedFunctionCallDetected(
+                accumulator["malformed_call"],
+                {"accumulator": accumulator},
+            )
 
         # Only emit synthetic final chunk if we actually received real data
         # If no data was received, the caller will detect zero chunks and retry
@@ -3487,24 +4630,53 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         payload: Dict[str, Any],
         model: str,
         file_logger: Optional[AntigravityFileLogger] = None,
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
+        gemini_contents: Optional[List[Dict[str, Any]]] = None,
+        gemini_payload: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
-        Wrapper around _handle_streaming that retries on empty responses.
+        Wrapper around _handle_streaming that retries on empty responses, bare 429s,
+        and MALFORMED_FUNCTION_CALL errors.
 
-        If the stream yields zero chunks (Antigravity returned nothing),
-        retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times before giving up.
+        If the stream yields zero chunks (Antigravity returned nothing) or encounters
+        a bare 429 (no retry info), retry up to EMPTY_RESPONSE_MAX_ATTEMPTS times
+        before giving up.
+
+        If MALFORMED_FUNCTION_CALL is detected, inject corrective messages and retry
+        up to MALFORMED_CALL_MAX_RETRIES times.
         """
-        error_msg = (
+        empty_error_msg = (
             "The model returned an empty response after multiple attempts. "
             "This may indicate a temporary service issue. Please try again."
         )
+        transient_429_msg = (
+            "The model returned transient 429 errors after multiple attempts. "
+            "This may indicate a temporary service issue. Please try again."
+        )
+
+        # Track malformed call retries (separate from empty response retries)
+        malformed_retry_count = 0
+        current_gemini_contents = gemini_contents
+        current_payload = payload
 
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
             try:
+                # Pass malformed_retry_count to log response to separate file
+                retry_num = malformed_retry_count if malformed_retry_count > 0 else None
                 async for chunk in self._handle_streaming(
-                    client, url, headers, payload, model, file_logger
+                    client,
+                    url,
+                    headers,
+                    current_payload,
+                    model,
+                    file_logger,
+                    malformed_retry_num=retry_num,
                 ):
                     chunk_count += 1
                     yield chunk  # Stream immediately - true streaming preserved
@@ -3526,13 +4698,141 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
                     raise EmptyResponseError(
                         provider="antigravity",
                         model=model,
-                        message=error_msg,
+                        message=empty_error_msg,
                     )
 
+            except _MalformedFunctionCallDetected as e:
+                # Handle MALFORMED_FUNCTION_CALL - try auto-fix first
+                parsed = self._parse_malformed_call_message(e.finish_message, model)
+
+                # Extract response_id and last_usage from accumulator for all paths
+                response_id = None
+                last_usage = None
+                if e.raw_response and isinstance(e.raw_response, dict):
+                    acc = e.raw_response.get("accumulator", {})
+                    response_id = acc.get("response_id")
+                    last_usage = acc.get("last_usage")
+
+                if parsed:
+                    # Try to auto-fix the malformed JSON
+                    error_info = self._analyze_json_error(parsed["raw_args"])
+
+                    if error_info.get("fixed_json"):
+                        # Auto-fix successful - build synthetic response
+                        lib_logger.info(
+                            f"[Antigravity] Auto-fixed malformed function call for "
+                            f"'{parsed['tool_name']}' from {model} (streaming)"
+                        )
+
+                        # Log the auto-fix details
+                        if file_logger:
+                            file_logger.log_malformed_autofix(
+                                parsed["tool_name"],
+                                parsed["raw_args"],
+                                error_info["fixed_json"],
+                            )
+
+                        # Use chunk format for streaming with original response ID and usage
+                        fixed_chunk = self._build_fixed_tool_call_chunk(
+                            model,
+                            parsed,
+                            error_info,
+                            response_id=response_id,
+                            usage=last_usage,
+                        )
+                        if fixed_chunk:
+                            yield fixed_chunk
+                            return
+
+                # Auto-fix failed - retry by asking model to fix its JSON
+                # Each retry response will also attempt auto-fix first
+                if malformed_retry_count < MALFORMED_CALL_MAX_RETRIES:
+                    malformed_retry_count += 1
+                    lib_logger.warning(
+                        f"[Antigravity] MALFORMED_FUNCTION_CALL from {model} (streaming), "
+                        f"retry {malformed_retry_count}/{MALFORMED_CALL_MAX_RETRIES}: "
+                        f"{e.finish_message[:100]}..."
+                    )
+
+                    if parsed and gemini_payload is not None:
+                        # Get schema for the failed tool
+                        tool_schema = (
+                            tool_schemas.get(parsed["tool_name"])
+                            if tool_schemas
+                            else None
+                        )
+
+                        # Build corrective messages
+                        assistant_msg, user_msg = (
+                            self._build_malformed_call_retry_messages(
+                                parsed, tool_schema
+                            )
+                        )
+
+                        # Inject into conversation
+                        current_gemini_contents = list(current_gemini_contents or [])
+                        current_gemini_contents.append(assistant_msg)
+                        current_gemini_contents.append(user_msg)
+
+                        # Rebuild payload with modified contents
+                        gemini_payload_copy = copy.deepcopy(gemini_payload)
+                        gemini_payload_copy["contents"] = current_gemini_contents
+                        current_payload = self._transform_to_antigravity_format(
+                            gemini_payload_copy,
+                            model,
+                            project_id or "",
+                            max_tokens,
+                            reasoning_effort,
+                            tool_choice,
+                        )
+
+                        # Log the retry request in the same folder
+                        if file_logger:
+                            file_logger.log_malformed_retry_request(
+                                malformed_retry_count, current_payload
+                            )
+
+                    await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
+                    continue  # Retry with modified payload
+                else:
+                    # Auto-fix failed and retries disabled/exceeded - yield fallback response
+                    lib_logger.warning(
+                        f"[Antigravity] MALFORMED_FUNCTION_CALL could not be auto-fixed "
+                        f"for {model} (streaming): {e.finish_message[:100]}..."
+                    )
+                    fallback = self._build_malformed_fallback_chunk(
+                        model,
+                        e.finish_message,
+                        response_id=response_id,
+                        usage=last_usage,
+                    )
+                    yield fallback
+                    return
+
             except httpx.HTTPStatusError as e:
-                # 429 = Rate limit/quota exhausted - don't retry
                 if e.response.status_code == 429:
-                    lib_logger.debug(f"429 quota error - not retrying: {e}")
+                    # Check if this is a bare 429 (no retry info) vs real quota exhaustion
+                    quota_info = self.parse_quota_error(e)
+                    if quota_info is None:
+                        # Bare 429 - retry like empty response
+                        if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                            lib_logger.warning(
+                                f"[Antigravity] Bare 429 from {model}, "
+                                f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                            continue
+                        else:
+                            # Last attempt failed - raise TransientQuotaError to rotate
+                            raise TransientQuotaError(
+                                provider="antigravity",
+                                model=model,
+                                message=transient_429_msg,
+                            )
+                    # Has retry info - real quota exhaustion, propagate for cooldown
+                    lib_logger.debug(
+                        f"429 with retry info - propagating for cooldown: {e}"
+                    )
                     raise
                 # Other HTTP errors - raise immediately (let caller handle)
                 raise
@@ -3548,7 +4848,7 @@ class AntigravityProvider(AntigravityAuthBase, ProviderInterface):
         raise EmptyResponseError(
             provider="antigravity",
             model=model,
-            message=error_msg,
+            message=empty_error_msg,
         )
 
     async def count_tokens(

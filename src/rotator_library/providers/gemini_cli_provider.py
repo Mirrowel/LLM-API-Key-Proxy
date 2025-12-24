@@ -10,6 +10,7 @@ from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
+from .antigravity_provider import GEMINI3_TOOL_RENAMES, GEMINI3_TOOL_RENAMES_REVERSE
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..utils.paths import get_logs_dir, get_cache_dir
@@ -116,6 +117,7 @@ HARDCODED_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
 ]
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
@@ -183,21 +185,46 @@ FINISH_REASON_MAP = {
 }
 
 
-def _recursively_parse_json_strings(obj: Any) -> Any:
+def _recursively_parse_json_strings(
+    obj: Any,
+    schema: Optional[Dict[str, Any]] = None,
+    parse_json_objects: bool = False,
+) -> Any:
     """
     Recursively parse JSON strings in nested data structures.
 
     Gemini sometimes returns tool arguments with JSON-stringified values:
     {"files": "[{...}]"} instead of {"files": [{...}]}.
 
+    Args:
+        obj: The object to process
+        schema: Optional JSON schema for the current level (used for schema-aware parsing)
+        parse_json_objects: If False (default), don't parse JSON-looking strings into objects.
+                           This prevents corrupting string content like write tool's "content" field.
+                           If True, parse strings that look like JSON objects/arrays.
+
     Additionally handles:
-    - Malformed double-encoded JSON (extra trailing '}' or ']')
-    - Escaped string content (\n, \t, etc.)
+    - Malformed double-encoded JSON (extra trailing '}' or ']') - only when parse_json_objects=True
+    - Escaped string content (\n, \t, etc.) - always processed
     """
     if isinstance(obj, dict):
-        return {k: _recursively_parse_json_strings(v) for k, v in obj.items()}
+        # Get properties schema for looking up field types
+        properties_schema = schema.get("properties", {}) if schema else {}
+        return {
+            k: _recursively_parse_json_strings(
+                v,
+                properties_schema.get(k),
+                parse_json_objects,
+            )
+            for k, v in obj.items()
+        }
     elif isinstance(obj, list):
-        return [_recursively_parse_json_strings(item) for item in obj]
+        # Get items schema for array elements
+        items_schema = schema.get("items") if schema else None
+        return [
+            _recursively_parse_json_strings(item, items_schema, parse_json_objects)
+            for item in obj
+        ]
     elif isinstance(obj, str):
         stripped = obj.strip()
 
@@ -228,6 +255,20 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                 # If unescaping fails, continue with original processing
                 pass
 
+        # Only parse JSON strings if explicitly enabled
+        if not parse_json_objects:
+            return obj
+
+        # Schema-aware parsing: only parse if schema expects object/array, not string
+        if schema:
+            schema_type = schema.get("type")
+            if schema_type == "string":
+                # Schema says this should be a string - don't parse it
+                return obj
+            # Only parse if schema expects object or array
+            if schema_type not in ("object", "array", None):
+                return obj
+
         # Check if it looks like JSON (starts with { or [)
         if stripped and stripped[0] in ("{", "["):
             # Try standard parsing first
@@ -236,7 +277,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
             ):
                 try:
                     parsed = json.loads(obj)
-                    return _recursively_parse_json_strings(parsed)
+                    return _recursively_parse_json_strings(
+                        parsed, schema, parse_json_objects
+                    )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -253,7 +296,9 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[GeminiCli] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -269,10 +314,39 @@ def _recursively_parse_json_strings(obj: Any) -> Any:
                             f"[GeminiCli] Auto-corrected malformed JSON string: "
                             f"truncated {len(stripped) - len(cleaned)} extra chars"
                         )
-                        return _recursively_parse_json_strings(parsed)
+                        return _recursively_parse_json_strings(
+                            parsed, schema, parse_json_objects
+                        )
                 except (json.JSONDecodeError, ValueError):
                     pass
     return obj
+
+
+def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Inline local $ref definitions before sanitization."""
+    if not isinstance(schema, dict):
+        return schema
+
+    defs = schema.get("$defs", schema.get("definitions", {}))
+    if not defs:
+        return schema
+
+    def resolve(node, seen=()):
+        if not isinstance(node, dict):
+            return [resolve(x, seen) for x in node] if isinstance(node, list) else node
+        if "$ref" in node:
+            ref = node["$ref"]
+            if ref in seen:  # Circular - drop it
+                return {k: resolve(v, seen) for k, v in node.items() if k != "$ref"}
+            for prefix in ("#/$defs/", "#/definitions/"):
+                if isinstance(ref, str) and ref.startswith(prefix):
+                    name = ref[len(prefix) :]
+                    if name in defs:
+                        return resolve(copy.deepcopy(defs[name]), seen + (ref,))
+            return {k: resolve(v, seen) for k, v in node.items() if k != "$ref"}
+        return {k: resolve(v, seen) for k, v in node.items()}
+
+    return resolve(schema)
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -510,6 +584,12 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         self._gemini3_enforce_strict_schema = _env_bool(
             "GEMINI_CLI_GEMINI3_STRICT_SCHEMA", True
         )
+        # Toggle for JSON string parsing in tool call arguments
+        # NOTE: This is possibly redundant - modern Gemini models may not need this fix.
+        # Disabled by default. Enable if you see JSON-stringified values in tool args.
+        self._enable_json_string_parsing = _env_bool(
+            "GEMINI_CLI_ENABLE_JSON_STRING_PARSING", False
+        )
 
         # Gemini 3 tool fix configuration
         self._gemini3_tool_prefix = os.getenv(
@@ -728,9 +808,15 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         return model_name.startswith("gemini-3-")
 
     def _strip_gemini3_prefix(self, name: str) -> str:
-        """Strip the Gemini 3 namespace prefix from a tool name."""
+        """
+        Strip the Gemini 3 namespace prefix from a tool name.
+
+        Also reverses any tool renames that were applied to avoid Gemini conflicts.
+        """
         if name and name.startswith(self._gemini3_tool_prefix):
-            return name[len(self._gemini3_tool_prefix) :]
+            stripped = name[len(self._gemini3_tool_prefix) :]
+            # Reverse any renames
+            return GEMINI3_TOOL_RENAMES_REVERSE.get(stripped, stripped)
         return name
 
     # NOTE: _discover_project_id() and _persist_project_metadata() are inherited from GeminiAuthBase
@@ -893,8 +979,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                             tool_id = tool_call.get("id", "")
                             func_name = tool_call["function"]["name"]
 
-                            # Add prefix for Gemini 3
+                            # Add prefix for Gemini 3 (and rename problematic tools)
                             if is_gemini_3 and self._enable_gemini3_tool_fix:
+                                func_name = GEMINI3_TOOL_RENAMES.get(
+                                    func_name, func_name
+                                )
                                 func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
                             func_part = {
@@ -941,8 +1030,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     )
                     function_name = "unknown_function"
 
-                # Add prefix for Gemini 3
+                # Add prefix for Gemini 3 (and rename problematic tools)
                 if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = GEMINI3_TOOL_RENAMES.get(
+                        function_name, function_name
+                    )
                     function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
                 # Try to parse content as JSON first, fall back to string
@@ -1197,7 +1289,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         Map reasoning_effort to thinking configuration.
 
         - Gemini 2.5: thinkingBudget (integer tokens)
-        - Gemini 3: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
+        - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
         """
         custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
         reasoning_effort = payload.get("reasoning_effort")
@@ -1207,6 +1300,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = self._is_gemini_3(model)
+        is_gemini_3_flash = "gemini-3-flash" in model
 
         # Only apply reasoning logic to supported models
         if not (is_gemini_25 or is_gemini_3):
@@ -1214,7 +1308,23 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             payload.pop("custom_reasoning_budget", None)
             return None
 
-        # Gemini 3: String-based thinkingLevel
+        # Gemini 3 Flash: Supports minimal/low/medium/high thinkingLevel
+        if is_gemini_3_flash:
+            # Clean up the original payload
+            payload.pop("reasoning_effort", None)
+            payload.pop("custom_reasoning_budget", None)
+
+            if reasoning_effort == "disable":
+                # "minimal" matches "no thinking" for most queries
+                return {"thinkingLevel": "minimal", "include_thoughts": True}
+            elif reasoning_effort == "low":
+                return {"thinkingLevel": "low", "include_thoughts": True}
+            elif reasoning_effort == "medium":
+                return {"thinkingLevel": "medium", "include_thoughts": True}
+            # Default to high for Flash
+            return {"thinkingLevel": "high", "include_thoughts": True}
+
+        # Gemini 3 Pro: Only supports low/high thinkingLevel
         if is_gemini_3:
             # Clean up the original payload
             payload.pop("reasoning_effort", None)
@@ -1222,6 +1332,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
             if reasoning_effort == "low":
                 return {"thinkingLevel": "low", "include_thoughts": True}
+            # medium maps to high for Pro (not supported)
             return {"thinkingLevel": "high", "include_thoughts": True}
 
         # Gemini 2.5: Integer thinkingBudget
@@ -1309,9 +1420,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                 # Get current tool index from accumulator (default 0) and increment
                 current_tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
 
-                # Get args, recursively parse any JSON strings, and strip _confirm if sole param
+                # Optionally parse JSON strings in tool args
+                # NOTE: This is very possibly redundant
                 raw_args = function_call.get("args", {})
-                tool_args = _recursively_parse_json_strings(raw_args)
+                if self._enable_json_string_parsing:
+                    tool_args = _recursively_parse_json_strings(raw_args)
+                else:
+                    tool_args = raw_args
 
                 # Strip _confirm ONLY if it's the sole parameter
                 # This ensures we only strip our injection, not legitimate user params
@@ -1542,7 +1657,8 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         """
         Recursively transforms a JSON schema to be compatible with the Gemini CLI endpoint.
         - Converts `type: ["type", "null"]` to `type: "type", nullable: true`
-        - Removes unsupported properties like `strict` and `additionalProperties`.
+        - Removes unsupported properties like `strict`.
+        - Preserves `additionalProperties` for _enforce_strict_schema to handle.
         """
         if not isinstance(schema, dict):
             return schema
@@ -1573,7 +1689,7 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
         # Clean up unsupported properties
         schema.pop("strict", None)
-        schema.pop("additionalProperties", None)
+        # Note: additionalProperties is preserved for _enforce_strict_schema to handle
 
         return schema
 
@@ -1581,14 +1697,29 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         """
         Enforce strict JSON schema for Gemini 3 to prevent hallucinated parameters.
 
-        Adds 'additionalProperties: false' recursively to all object schemas,
+        Adds 'additionalProperties: false' to object schemas with 'properties',
         which tells the model it CANNOT add properties not in the schema.
+
+        IMPORTANT: Preserves 'additionalProperties: true' (or {}) when explicitly
+        set in the original schema. This is critical for "freeform" parameter objects
+        like batch/multi_tool's nested parameters which need to accept arbitrary
+        tool parameters that aren't pre-defined in the schema.
         """
         if not isinstance(schema, dict):
             return schema
 
         result = {}
+        preserved_additional_props = None
+
         for key, value in schema.items():
+            # Preserve additionalProperties as-is if it's truthy
+            # This is critical for "freeform" parameter objects like batch's
+            # nested parameters which need to accept arbitrary tool parameters
+            if key == "additionalProperties":
+                if value is not False:
+                    # Preserve the original value (true, {}, {"type": "string"}, etc.)
+                    preserved_additional_props = value
+                continue
             if isinstance(value, dict):
                 result[key] = self._enforce_strict_schema(value)
             elif isinstance(value, list):
@@ -1601,9 +1732,13 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
             else:
                 result[key] = value
 
-        # Add additionalProperties: false to object schemas
+        # Add additionalProperties: false to object schemas with properties,
+        # BUT only if we didn't preserve a value from the original schema
         if result.get("type") == "object" and "properties" in result:
-            result["additionalProperties"] = False
+            if preserved_additional_props is not None:
+                result["additionalProperties"] = preserved_additional_props
+            else:
+                result["additionalProperties"] = False
 
         return result
 
@@ -1631,9 +1766,9 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
                 # Gemini CLI expects 'parametersJsonSchema' instead of 'parameters'
                 if "parameters" in new_function:
-                    schema = self._gemini_cli_transform_schema(
-                        new_function["parameters"]
-                    )
+                    # Inline $ref definitions first
+                    schema = _inline_schema_refs(new_function["parameters"])
+                    schema = self._gemini_cli_transform_schema(schema)
                     # Workaround: Gemini fails to emit functionCall for tools
                     # with empty properties {}. Inject a required confirmation param.
                     # Using a required parameter forces the model to commit to
@@ -1664,9 +1799,10 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
 
                 # Gemini 3 specific transformations
                 if is_gemini_3 and self._enable_gemini3_tool_fix:
-                    # Add namespace prefix to tool names
+                    # Add namespace prefix to tool names (and rename problematic tools)
                     name = new_function.get("name", "")
                     if name:
+                        name = GEMINI3_TOOL_RENAMES.get(name, name)
                         new_function["name"] = f"{self._gemini3_tool_prefix}{name}"
 
                     # Enforce strict schema (additionalProperties: false)
@@ -1823,8 +1959,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             function_name = tool_choice.get("function", {}).get("name")
             if function_name:
-                # Add Gemini 3 prefix if needed
+                # Add Gemini 3 prefix if needed (and rename problematic tools)
                 if is_gemini_3 and self._enable_gemini3_tool_fix:
+                    function_name = GEMINI3_TOOL_RENAMES.get(
+                        function_name, function_name
+                    )
                     function_name = f"{self._gemini3_tool_prefix}{function_name}"
 
                 mode = "ANY"  # Force a call, but only to this function
