@@ -1015,6 +1015,13 @@ async def anthropic_messages(
     # Initialize logger if enabled
     logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
 
+    # Log if client is requesting interleaved thinking (informational)
+    anthropic_beta = request.headers.get("anthropic-beta", "")
+    if "interleaved-thinking" in anthropic_beta:
+        logging.getLogger("rotator_library").debug(
+            f"[Anthropic API] Client requested interleaved thinking: {anthropic_beta}"
+        )
+
     try:
         # Log the request to console
         log_request_to_console(

@@ -163,11 +163,26 @@ async def anthropic_streaming_wrapper(
             # Always capture signature if available (may come in later deltas)
             if thought_sig_from_delta and not thinking_signature:
                 thinking_signature = thought_sig_from_delta
+                logger.debug(
+                    f"[SIGNATURE] Streaming wrapper captured signature: "
+                    f"{thought_sig_from_delta[:50]}..."
+                )
 
             if reasoning_content:
-                import logging
-                logging.getLogger("rotator_library").debug(
-                    f"[Anthropic Stream] Sending thinking ({len(reasoning_content)} chars), sig={bool(thinking_signature)}"
+                # Enhanced DEBUG logging for interleaved thinking verification
+                context = "initial" if current_block_index == 0 else "interleaved"
+                prev_block = "none"
+                if thinking_block_started:
+                    prev_block = "thinking"
+                elif content_block_started:
+                    prev_block = "text"
+                elif tool_calls_by_index:
+                    prev_block = "tool_use"
+
+                logger.debug(
+                    f"[INTERLEAVED] Anthropic stream: block #{current_block_index}, "
+                    f"context={context}, prev={prev_block}, "
+                    f"chars={len(reasoning_content)}, sig={bool(thinking_signature)}"
                 )
                 if not thinking_block_started:
                     # Close any open text block before starting a new thinking block
@@ -199,6 +214,10 @@ async def anthropic_streaming_wrapper(
             if content:
                 # If we were in a thinking block, close it first
                 if thinking_block_started and not content_block_started:
+                    logger.debug(
+                        f"[INTERLEAVED] Closing thinking block (idx={current_block_index}) for text, "
+                        f"has_sig={bool(thinking_signature)}"
+                    )
                     # Send signature_delta if we have a signature
                     if thinking_signature:
                         sig_delta = {
@@ -238,6 +257,9 @@ async def anthropic_streaming_wrapper(
                 if tc_index not in tool_calls_by_index:
                     # Close previous thinking block if open
                     if thinking_block_started:
+                        logger.debug(
+                            f"[INTERLEAVED] Closing thinking block (idx={current_block_index}) for tool_use"
+                        )
                         # Send signature_delta if we have a signature
                         if thinking_signature:
                             sig_delta = {

@@ -3741,9 +3741,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             if has_sig and is_thought and accumulator is not None:
                 accumulator["thought_signature"] = part["thoughtSignature"]
 
-            # Skip standalone signature parts
+            # Handle standalone signature parts - send them as a delta with just the signature
+            # This is critical for Claude Code to receive the signature for thinking blocks
             if has_sig and not has_func and (not has_text or not part.get("text")):
-                continue
+                # Don't skip! Instead, we'll send a minimal delta with the signature below
+                # The signature will be included via the accumulator
+                pass  # Continue to build delta below
 
             if has_text:
                 text = part["text"]
@@ -3751,10 +3754,23 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     reasoning_content += text
                     if accumulator is not None:
                         accumulator["reasoning_content"] += text
+                        # Track interleaved thinking for DEBUG logging
+                        last_type = accumulator.get("last_content_type")
+                        if last_type and last_type != "thinking":
+                            accumulator["thinking_block_count"] = (
+                                accumulator.get("thinking_block_count", 0) + 1
+                            )
+                            lib_logger.debug(
+                                f"[INTERLEAVED] Thinking block "
+                                f"#{accumulator['thinking_block_count']}: "
+                                f"after={last_type}, chars={len(text)}"
+                            )
+                        accumulator["last_content_type"] = "thinking"
                 else:
                     text_content += text
                     if accumulator is not None:
                         accumulator["text_content"] += text
+                        accumulator["last_content_type"] = "text"
 
             if has_func:
                 # Get tool_schemas from accumulator for schema-aware parsing
@@ -3769,6 +3785,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
                 tool_calls.append(tool_call)
                 tool_idx += 1
+                # Track tool call for interleaved thinking detection
+                if accumulator is not None:
+                    accumulator["last_content_type"] = "tool_call"
 
         # Build delta
         delta = {}
@@ -3777,8 +3796,19 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
             # Include thought_signature if available (from accumulator)
+            # The signature arrives at the END of thinking, so we include it
+            # with EVERY reasoning delta once captured - streaming wrapper
+            # will capture it and use it when closing the thinking block
             if accumulator and accumulator.get("thought_signature"):
                 delta["thought_signature"] = accumulator["thought_signature"]
+        # Send signature-only delta when signature arrives without content
+        # This ensures the streaming wrapper receives the signature
+        elif accumulator and accumulator.get("thought_signature"):
+            # Check if we just captured a new signature (standalone signature part)
+            sig = accumulator.get("thought_signature")
+            if sig and not text_content and not tool_calls:
+                delta["thought_signature"] = sig
+                delta["role"] = "assistant"
         if tool_calls:
             delta["tool_calls"] = tool_calls
             delta["role"] = "assistant"
@@ -4284,6 +4314,20 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             **ANTIGRAVITY_HEADERS,
         }
 
+        # Add interleaved thinking header for Claude thinking models
+        # This enables thinking between tool calls for agentic workflows
+        if self._is_claude(model) and reasoning_effort and reasoning_effort != "disable":
+            interleaved_header = "interleaved-thinking-2025-05-14"
+            existing_beta = headers.get("anthropic-beta", "")
+            if existing_beta:
+                if interleaved_header not in existing_beta:
+                    headers["anthropic-beta"] = f"{existing_beta},{interleaved_header}"
+            else:
+                headers["anthropic-beta"] = interleaved_header
+            lib_logger.debug(
+                f"[Antigravity] Added interleaved thinking header for {model}"
+            )
+
         # Track malformed call retries (separate from empty response retries)
         malformed_retry_count = 0
         # Keep a mutable reference to gemini_contents for retry injection
@@ -4620,6 +4664,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "tool_schemas": tool_schemas,  # For schema-aware JSON string parsing
             "malformed_call": None,  # Track MALFORMED_FUNCTION_CALL if detected
             "response_id": None,  # Track original response ID for synthetic chunks
+            # Interleaved thinking tracking for DEBUG logging
+            "thinking_block_count": 0,  # Count of thinking block transitions
+            "last_content_type": None,  # Track: "thinking", "text", "tool_call"
         }
 
         async with client.stream(
@@ -4705,6 +4752,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 if accumulator.get("last_usage"):
                     final_chunk["usage"] = accumulator["last_usage"]
                 yield litellm.ModelResponse(**final_chunk)
+
+            # Log interleaved thinking summary at stream completion
+            thinking_block_count = accumulator.get("thinking_block_count", 0)
+            if thinking_block_count > 0:
+                lib_logger.info(
+                    f"[Antigravity] Stream completed with {thinking_block_count} "
+                    f"interleaved thinking block(s) for {model}"
+                )
 
             # Cache Claude thinking after stream completes
             if (
