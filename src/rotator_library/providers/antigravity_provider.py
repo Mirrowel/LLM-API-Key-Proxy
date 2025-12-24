@@ -549,6 +549,7 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "format",
         "minProperties",
         "maxProperties",
+        "propertyNames",
         "contentEncoding",
         "contentMediaType",
         "contentSchema",
