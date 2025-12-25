@@ -1449,22 +1449,25 @@ class AntigravityProvider(
         """
         Generate stable cache key from response content for Claude thinking preservation.
 
-        Uses composite key:
-        - Tool call IDs (most stable)
-        - Text hash (for text-only responses)
-        """
-        key_parts = []
+        Priority order (most stable first):
+        1. Tool call ID (most stable - Claude Code preserves these)
+        2. Text hash (fallback for text-only responses)
 
+        Note: We use ONLY tool_id when available, not a composite, because
+        Claude Code may modify text content but preserves tool_call_ids.
+        """
+        # Prefer tool_call_id as the most stable identifier
         if tool_calls:
             first_id = tool_calls[0].get("id", "")
             if first_id:
-                key_parts.append(f"tool_{first_id.replace('call_', '')}")
+                return f"thinking_tool_{first_id.replace('call_', '')}"
 
+        # Fallback to text hash for text-only responses
         if text_content:
             text_hash = hashlib.md5(text_content[:200].encode()).hexdigest()[:16]
-            key_parts.append(f"text_{text_hash}")
+            return f"thinking_text_{text_hash}"
 
-        return "thinking_" + "_".join(key_parts) if key_parts else None
+        return None
 
     # NOTE: _discover_project_id() and _persist_project_metadata() are inherited from AntigravityAuthBase
 
@@ -1779,10 +1782,30 @@ class AntigravityProvider(
                             "New response will include thinking naturally."
                         )
 
-            # Strip thinking from old turns, let new response add thinking naturally
-            return self._strip_old_turn_thinking(
+            # Strip thinking from old turns, preserving last message
+            sanitized = self._strip_old_turn_thinking(
                 messages, state["last_assistant_idx"]
-            ), False
+            )
+
+            # FINAL CHECK: Verify the last assistant message actually has thinking
+            # If we stripped thinking due to missing signature, we need to handle it
+            if state["last_assistant_idx"] >= 0:
+                last_msg = sanitized[state["last_assistant_idx"]]
+                parts = last_msg.get("parts", [])
+                has_thinking = any(
+                    isinstance(p, dict) and p.get("thought") is True for p in parts
+                )
+                if not has_thinking:
+                    # Last assistant message has no thinking but thinking is enabled
+                    # This will cause Claude to reject. Close the loop with synthetic.
+                    synthetic_user = {
+                        "role": "user",
+                        "parts": [{"text": "[Continue]"}],
+                    }
+                    sanitized.append(synthetic_user)
+                    return self._strip_all_thinking_blocks(sanitized), False
+
+            return sanitized, False
 
     def _strip_all_thinking_blocks(
         self, messages: List[Dict[str, Any]]
@@ -1988,13 +2011,14 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             signature = thinking_data.get("thought_signature", "")
 
-            if not thinking_text or not signature:
-                lib_logger.debug(
-                    "[Thinking Sanitization] Cached thinking missing text or signature"
-                )
+            if not thinking_text:
                 return False
 
-            # Inject the recovered thinking part at the beginning (Gemini format)
+            # Only inject thinking if we have a valid signature
+            # Claude's API rejects invalid/fake signatures
+            if not signature:
+                return False
+
             thinking_part = {
                 "text": thinking_text,
                 "thought": True,
@@ -2291,49 +2315,43 @@ class AntigravityProvider(
         content = msg.get("content")
         tool_calls = msg.get("tool_calls", [])
         reasoning_content = msg.get("reasoning_content")
+        thought_signature = msg.get("thought_signature") or msg.get("thoughtSignature")
 
         # Handle reasoning_content if present (from original Claude response with thinking)
         if reasoning_content and self._is_claude(model):
-            # Add thinking part with cached signature
-            thinking_part = {
-                "text": reasoning_content,
-                "thought": True,
-            }
-            # Try to get signature from cache
-            cache_key = self._generate_thinking_cache_key(
-                content if isinstance(content, str) else "", tool_calls
-            )
-            cached_sig = None
-            if cache_key:
-                cached_json = self._thinking_cache.retrieve(cache_key)
-                if cached_json:
-                    try:
-                        cached_data = json.loads(cached_json)
-                        cached_sig = cached_data.get("thought_signature", "")
-                    except json.JSONDecodeError:
-                        pass
+            signature = thought_signature
+            if not signature:
+                # Try to get signature from cache
+                cache_key = self._generate_thinking_cache_key(
+                    content if isinstance(content, str) else "", tool_calls
+                )
+                if cache_key:
+                    cached_json = self._thinking_cache.retrieve(cache_key)
+                    if cached_json:
+                        try:
+                            cached_data = json.loads(cached_json)
+                            signature = cached_data.get("thought_signature", "")
+                        except json.JSONDecodeError:
+                            signature = ""
 
-            if cached_sig:
-                thinking_part["thoughtSignature"] = cached_sig
+            if signature:
+                # Only add thinking part if we have a valid signature
+                # Claude's API rejects invalid/fake signatures
+                thinking_part = {
+                    "text": reasoning_content,
+                    "thought": True,
+                    "thoughtSignature": signature,
+                }
                 parts.append(thinking_part)
-                lib_logger.debug(
-                    f"Added reasoning_content with cached signature ({len(reasoning_content)} chars)"
-                )
-            else:
-                # No cached signature - skip the thinking block
-                # This can happen if context was compressed and signature was lost
-                lib_logger.warning(
-                    f"Skipping reasoning_content - no valid signature found. "
-                    f"This may cause issues if thinking is enabled."
-                )
-        elif (
-            self._is_claude(model)
-            and self._enable_signature_cache
-            and not reasoning_content
-        ):
-            # Fallback: Try to inject cached thinking for Claude (original behavior)
+            # else: No valid signature - skip thinking entirely
+            # Claude will generate fresh thinking in the new response
+        elif self._is_claude(model) and not reasoning_content:
+            # Fallback: Try to inject cached thinking for Claude
             thinking_parts = self._get_cached_thinking(content, tool_calls)
-            parts.extend(thinking_parts)
+            if thinking_parts:
+                parts.extend(thinking_parts)
+            # If cache miss, don't inject synthetic thinking - Claude needs valid signatures
+            # The model will generate fresh thinking in its response
 
         # Add regular content
         if isinstance(content, str) and content:
@@ -2406,7 +2424,11 @@ class AntigravityProvider(
     def _get_cached_thinking(
         self, content: Any, tool_calls: List[Dict]
     ) -> List[Dict[str, Any]]:
-        """Retrieve and format cached thinking content for Claude."""
+        """Retrieve and format cached thinking content for Claude.
+
+        Only returns thinking parts if we have a valid signature.
+        Claude's API rejects invalid/fake signatures.
+        """
         parts = []
         msg_text = content if isinstance(content, str) else ""
         cache_key = self._generate_thinking_cache_key(msg_text, tool_calls)
@@ -2423,14 +2445,14 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             sig = thinking_data.get("thought_signature", "")
 
-            if thinking_text:
+            # Only inject thinking if we have BOTH text AND a valid signature
+            if thinking_text and sig:
                 thinking_part = {
                     "text": thinking_text,
                     "thought": True,
-                    "thoughtSignature": sig or "skip_thought_signature_validator",
+                    "thoughtSignature": sig,
                 }
                 parts.append(thinking_part)
-                lib_logger.debug(f"Injected {len(thinking_text)} chars of thinking")
         except json.JSONDecodeError:
             lib_logger.warning(f"Failed to parse cached thinking: {cache_key}")
 
@@ -2439,7 +2461,12 @@ class AntigravityProvider(
     def _transform_tool_message(
         self, msg: Dict[str, Any], model: str, tool_id_to_name: Dict[str, str]
     ) -> List[Dict[str, Any]]:
-        """Transform tool response message."""
+        """Transform tool response message.
+
+        Handles both text-only and multimodal (text + images) tool responses.
+        For multimodal responses, images are converted to inlineData format
+        and returned as separate parts alongside the functionResponse.
+        """
         tool_id = msg.get("tool_call_id", "")
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
@@ -2450,14 +2477,60 @@ class AntigravityProvider(
                 f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
                 f"Available IDs: {list(tool_id_to_name.keys())}"
             )
-        # else:
-        # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
         # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
+        # Handle multimodal content (array with text and images)
+        if isinstance(content, list):
+            text_parts = []
+            image_parts = []
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+
+                if item_type == "text":
+                    text_parts.append(item.get("text", ""))
+                elif item_type == "image_url":
+                    # Convert OpenAI image_url format to Gemini inlineData
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:"):
+                        try:
+                            # Parse: data:image/png;base64,iVBORw0KG...
+                            header, data = image_url.split(",", 1)
+                            mime_type = header.split(":")[1].split(";")[0]
+                            image_parts.append({
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": data,
+                                }
+                            })
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to parse image data URL in tool response: {e}")
+
+            # Build the result parts
+            parts = []
+
+            # Add function response with text content
+            text_result = " ".join(text_parts) if text_parts else ""
+            parts.append({
+                "functionResponse": {
+                    "name": func_name,
+                    "response": {"result": text_result if text_result else "Image content provided"},
+                    "id": tool_id,
+                }
+            })
+
+            # Add image parts separately (Gemini handles these as additional parts)
+            parts.extend(image_parts)
+
+            return parts
+
+        # Handle string content (text-only)
         try:
             parsed_content = json.loads(content)
         except (json.JSONDecodeError, TypeError):
@@ -3538,6 +3611,28 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             gen_config["maxOutputTokens"] = DEFAULT_MAX_OUTPUT_TOKENS
         # For non-Claude models without explicit max_tokens, don't set it
 
+        # CRITICAL: For Claude with extended thinking, max_tokens MUST be > thinking.budget_tokens
+        # Per Claude docs: https://docs.claude.com/en/docs/build-with-claude/extended-thinking
+        # If this constraint is violated, the API returns 400 INVALID_ARGUMENT
+        thinking_config = gen_config.get("thinkingConfig", {})
+        thinking_budget = thinking_config.get("thinkingBudget", 0)
+        current_max_tokens = gen_config.get("maxOutputTokens")
+
+        if (
+            is_claude
+            and thinking_budget
+            and thinking_budget > 0
+            and current_max_tokens is not None
+        ):
+            # Ensure max_tokens > thinkingBudget (add buffer for actual response content)
+            min_required_tokens = thinking_budget + 1024  # 1024 buffer for response
+            if current_max_tokens <= thinking_budget:
+                lib_logger.warning(
+                    f"max_tokens ({current_max_tokens}) must be > thinkingBudget ({thinking_budget}). "
+                    f"Adjusting to {min_required_tokens}"
+                )
+                gen_config["maxOutputTokens"] = min_required_tokens
+
         antigravity_payload["request"]["generationConfig"] = gen_config
 
         # Set toolConfig based on tool_choice parameter
@@ -3647,9 +3742,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             if has_sig and is_thought and accumulator is not None:
                 accumulator["thought_signature"] = part["thoughtSignature"]
 
-            # Skip standalone signature parts
+            # Handle standalone signature parts - send them as a delta with just the signature
+            # This is critical for Claude Code to receive the signature for thinking blocks
             if has_sig and not has_func and (not has_text or not part.get("text")):
-                continue
+                # Don't skip! Instead, we'll send a minimal delta with the signature below
+                # The signature will be included via the accumulator
+                pass  # Continue to build delta below
 
             if has_text:
                 text = part["text"]
@@ -3657,10 +3755,23 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     reasoning_content += text
                     if accumulator is not None:
                         accumulator["reasoning_content"] += text
+                        # Track interleaved thinking for DEBUG logging
+                        last_type = accumulator.get("last_content_type")
+                        if last_type and last_type != "thinking":
+                            accumulator["thinking_block_count"] = (
+                                accumulator.get("thinking_block_count", 0) + 1
+                            )
+                            lib_logger.debug(
+                                f"[INTERLEAVED] Thinking block "
+                                f"#{accumulator['thinking_block_count']}: "
+                                f"after={last_type}, chars={len(text)}"
+                            )
+                        accumulator["last_content_type"] = "thinking"
                 else:
                     text_content += text
                     if accumulator is not None:
                         accumulator["text_content"] += text
+                        accumulator["last_content_type"] = "text"
 
             if has_func:
                 # Get tool_schemas from accumulator for schema-aware parsing
@@ -3675,6 +3786,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
                 tool_calls.append(tool_call)
                 tool_idx += 1
+                # Track tool call for interleaved thinking detection
+                if accumulator is not None:
+                    accumulator["last_content_type"] = "tool_call"
 
         # Build delta
         delta = {}
@@ -3682,6 +3796,20 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             delta["content"] = text_content
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
+            # Include thought_signature if available (from accumulator)
+            # The signature arrives at the END of thinking, so we include it
+            # with EVERY reasoning delta once captured - streaming wrapper
+            # will capture it and use it when closing the thinking block
+            if accumulator and accumulator.get("thought_signature"):
+                delta["thought_signature"] = accumulator["thought_signature"]
+        # Send signature-only delta when signature arrives without content
+        # This ensures the streaming wrapper receives the signature
+        elif accumulator and accumulator.get("thought_signature"):
+            # Check if we just captured a new signature (standalone signature part)
+            sig = accumulator.get("thought_signature")
+            if sig and not text_content and not tool_calls:
+                delta["thought_signature"] = sig
+                delta["role"] = "assistant"
         if tool_calls:
             delta["tool_calls"] = tool_calls
             delta["role"] = "assistant"
@@ -4187,6 +4315,20 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             **ANTIGRAVITY_HEADERS,
         }
 
+        # Add interleaved thinking header for Claude thinking models
+        # This enables thinking between tool calls for agentic workflows
+        if self._is_claude(model) and reasoning_effort and reasoning_effort != "disable":
+            interleaved_header = "interleaved-thinking-2025-05-14"
+            existing_beta = headers.get("anthropic-beta", "")
+            if existing_beta:
+                if interleaved_header not in existing_beta:
+                    headers["anthropic-beta"] = f"{existing_beta},{interleaved_header}"
+            else:
+                headers["anthropic-beta"] = interleaved_header
+            lib_logger.debug(
+                f"[Antigravity] Added interleaved thinking header for {model}"
+            )
+
         # Track malformed call retries (separate from empty response retries)
         malformed_retry_count = 0
         # Keep a mutable reference to gemini_contents for retry injection
@@ -4523,6 +4665,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "tool_schemas": tool_schemas,  # For schema-aware JSON string parsing
             "malformed_call": None,  # Track MALFORMED_FUNCTION_CALL if detected
             "response_id": None,  # Track original response ID for synthetic chunks
+            # Interleaved thinking tracking for DEBUG logging
+            "thinking_block_count": 0,  # Count of thinking block transitions
+            "last_content_type": None,  # Track: "thinking", "text", "tool_call"
         }
 
         async with client.stream(
@@ -4608,6 +4753,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 if accumulator.get("last_usage"):
                     final_chunk["usage"] = accumulator["last_usage"]
                 yield litellm.ModelResponse(**final_chunk)
+
+            # Log interleaved thinking summary at stream completion
+            thinking_block_count = accumulator.get("thinking_block_count", 0)
+            if thinking_block_count > 0:
+                lib_logger.info(
+                    f"[Antigravity] Stream completed with {thinking_block_count} "
+                    f"interleaved thinking block(s) for {model}"
+                )
 
             # Cache Claude thinking after stream completes
             if (
