@@ -1,4 +1,5 @@
 import time
+import uuid
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
@@ -99,7 +100,7 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
@@ -124,6 +125,18 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
+    from rotator_library.anthropic_compat import (
+        AnthropicMessagesRequest,
+        AnthropicMessagesResponse,
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+        anthropic_streaming_wrapper,
+        anthropic_to_openai_messages,
+        anthropic_to_openai_tools,
+        anthropic_to_openai_tool_choice,
+        openai_to_anthropic_response,
+        translate_anthropic_request,
+    )
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import DetailedLogger
@@ -212,6 +225,9 @@ class EnrichedModelList(BaseModel):
 
     object: str = "list"
     data: List[EnrichedModelCard]
+
+
+# Anthropic API Models are imported from rotator_library.anthropic_compat
 
 
 # Calculate total loading time
@@ -665,6 +681,33 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
     return auth
 
 
+# --- Anthropic API Key Header ---
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+async def verify_anthropic_api_key(
+    x_api_key: str = Depends(anthropic_api_key_header),
+    auth: str = Depends(api_key_header),
+):
+    """
+    Dependency to verify API key for Anthropic endpoints.
+    Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
+    """
+    # If PROXY_API_KEY is not set or empty, skip verification (open access)
+    if not PROXY_API_KEY:
+        return auth or x_api_key
+    # Check x-api-key first (Anthropic style)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return x_api_key
+    # Fall back to Bearer token (OpenAI style)
+    if auth and auth == f"Bearer {PROXY_API_KEY}":
+        return auth
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+
+# Format translation functions are now in rotator_library.anthropic_compat
+
+
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
@@ -965,6 +1008,259 @@ async def chat_completions(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Anthropic Messages API Endpoint ---
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    body: AnthropicMessagesRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible Messages API endpoint.
+
+    Accepts requests in Anthropic's format and returns responses in Anthropic's format.
+    Internally translates to OpenAI format for processing via LiteLLM.
+
+    This endpoint is compatible with Claude Code and other Anthropic API clients.
+    """
+    request_id = f"msg_{uuid.uuid4().hex[:24]}"
+    original_model = body.model
+
+    # Initialize logger if enabled
+    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
+
+    try:
+        # Convert Anthropic request to OpenAI format
+        anthropic_request = body.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        openai_tools = anthropic_to_openai_tools(anthropic_request.get("tools"))
+        openai_tool_choice = anthropic_to_openai_tool_choice(
+            anthropic_request.get("tool_choice")
+        )
+
+        # Build OpenAI-compatible request
+        openai_request = {
+            "model": body.model,
+            "messages": openai_messages,
+            "max_tokens": body.max_tokens,
+            "stream": body.stream or False,
+        }
+
+        if body.temperature is not None:
+            openai_request["temperature"] = body.temperature
+        if body.top_p is not None:
+            openai_request["top_p"] = body.top_p
+        if body.stop_sequences:
+            openai_request["stop"] = body.stop_sequences
+        if openai_tools:
+            openai_request["tools"] = openai_tools
+        if openai_tool_choice:
+            openai_request["tool_choice"] = openai_tool_choice
+
+        # Handle Anthropic thinking config -> reasoning_effort translation
+        if body.thinking:
+            if body.thinking.type == "enabled":
+                # Map budget_tokens to reasoning_effort level
+                # Default to "medium" if enabled but budget not specified
+                budget = body.thinking.budget_tokens or 10000
+                if budget >= 32000:
+                    openai_request["reasoning_effort"] = "high"
+                    openai_request["custom_reasoning_budget"] = True
+                elif budget >= 10000:
+                    openai_request["reasoning_effort"] = "high"
+                elif budget >= 5000:
+                    openai_request["reasoning_effort"] = "medium"
+                else:
+                    openai_request["reasoning_effort"] = "low"
+            elif body.thinking.type == "disabled":
+                openai_request["reasoning_effort"] = "disable"
+        elif "opus" in body.model.lower():
+            # Force high thinking for Opus models when no thinking config is provided
+            # Opus 4.5 always uses the -thinking variant, so we want maximum thinking budget
+            # Without this, the backend defaults to thinkingBudget: -1 (auto) instead of high
+            openai_request["reasoning_effort"] = "high"
+            openai_request["custom_reasoning_budget"] = True
+
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(
+                request.client.host if request.client else "unknown",
+                request.client.port if request.client else 0,
+            ),
+            request_data=openai_request,
+        )
+
+        if body.stream:
+            # Streaming response - acompletion returns a generator for streaming
+            response_generator = client.acompletion(request=request, **openai_request)
+
+            return StreamingResponse(
+                anthropic_streaming_wrapper(
+                    request, response_generator, original_model, request_id
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            # Non-streaming response
+            response = await client.acompletion(request=request, **openai_request)
+
+            # Convert OpenAI response to Anthropic format
+            openai_response = (
+                response.model_dump()
+                if hasattr(response, "model_dump")
+                else dict(response)
+            )
+            anthropic_response = openai_to_anthropic_response(
+                openai_response, original_model
+            )
+
+            # Override the ID with our request ID
+            anthropic_response["id"] = request_id
+
+            if logger:
+                logger.log_final_response(
+                    status_code=200,
+                    headers=None,
+                    body=anthropic_response,
+                )
+
+            return JSONResponse(content=anthropic_response)
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=400, detail=error_response)
+    except litellm.AuthenticationError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=401, detail=error_response)
+    except litellm.RateLimitError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=429, detail=error_response)
+    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=503, detail=error_response)
+    except litellm.Timeout as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": f"Request timed out: {str(e)}"},
+        }
+        raise HTTPException(status_code=504, detail=error_response)
+    except Exception as e:
+        logging.error(f"Anthropic messages endpoint error: {e}")
+        if logger:
+            logger.log_final_response(
+                status_code=500,
+                headers=None,
+                body={"error": str(e)},
+            )
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=500, detail=error_response)
+
+
+# --- Anthropic Count Tokens Endpoint ---
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request,
+    body: AnthropicCountTokensRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible count_tokens endpoint.
+
+    Counts the number of tokens that would be used by a Messages API request.
+    This is useful for estimating costs and managing context windows.
+
+    Accepts requests in Anthropic's format and returns token count in Anthropic's format.
+    """
+    try:
+        # Convert Anthropic request to OpenAI format for token counting
+        anthropic_request = body.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        # Count tokens for messages
+        message_tokens = client.token_count(
+            model=body.model,
+            messages=openai_messages,
+        )
+
+        # Count tokens for tools if present
+        tool_tokens = 0
+        if body.tools:
+            # Tools add tokens based on their definitions
+            # Convert to JSON string and count tokens for tool definitions
+            openai_tools = anthropic_to_openai_tools(
+                [tool.model_dump() for tool in body.tools]
+            )
+            if openai_tools:
+                # Serialize tools to count their token contribution
+                tools_text = json.dumps(openai_tools)
+                tool_tokens = client.token_count(
+                    model=body.model,
+                    text=tools_text,
+                )
+
+        total_tokens = message_tokens + tool_tokens
+
+        return JSONResponse(content={"input_tokens": total_tokens})
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=400, detail=error_response)
+    except litellm.AuthenticationError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=401, detail=error_response)
+    except Exception as e:
+        logging.error(f"Anthropic count_tokens endpoint error: {e}")
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=500, detail=error_response)
 
 
 @app.post("/v1/embeddings")
