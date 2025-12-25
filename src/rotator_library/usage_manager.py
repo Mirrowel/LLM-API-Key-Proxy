@@ -392,6 +392,57 @@ class UsageManager:
         # Not grouped - return individual model usage (no weight applied)
         return self._get_usage_count(key, model, usage_field)
 
+    def _is_quota_exhausted(self, key: str, model: str) -> bool:
+        """
+        Check if the quota for a specific model on a credential is exhausted.
+        Currently only implemented for request-count based providers (e.g. antigravity).
+        """
+        provider = self._get_provider_from_credential(key)
+        if provider not in self._REQUEST_COUNT_PROVIDERS:
+            return False
+
+        if self._usage_data is None:
+            return False
+
+        key_data = self._usage_data.get(key, {})
+        model_data = key_data.get("models", {}).get(model, {})
+        request_count = model_data.get("request_count", 0)
+        max_requests = model_data.get("quota_max_requests")
+
+        return bool(max_requests and request_count >= max_requests)
+
+    def _set_quota_reset_and_cooldown(
+        self,
+        key_data: dict,
+        model_data: dict,
+        model: str,
+        quota_reset_ts: Optional[float],
+        now_ts: float,
+        remaining_fraction: float,
+    ) -> None:
+        """
+        Set quota reset timestamp and model cooldown if quota is exhausted.
+
+        Args:
+            key_data: The credential's data dictionary
+            model_data: The model-specific quota data dictionary
+            model: The model name to set cooldown for
+            quota_reset_ts: When quota resets (Unix timestamp), or None
+            now_ts: Current time (Unix timestamp)
+            remaining_fraction: Remaining quota as fraction (0.0 to 1.0)
+        """
+        if not quota_reset_ts:
+            return
+
+        model_data["quota_reset_ts"] = quota_reset_ts
+
+        # 0.1% threshold - treat as exhausted when quota is practically zero
+        # (this is NOT a floating-point precision guard, it's an intentional
+        # threshold meaning the quota is effectively depleted)
+        if quota_reset_ts > now_ts and remaining_fraction <= 0.001:
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
+            model_cooldowns[model] = quota_reset_ts
+
     def _get_quota_display(self, key: str, model: str) -> str:
         """
         Get a formatted quota display string for logging.
@@ -704,6 +755,10 @@ class UsageManager:
 
                 # Skip if model-specific cooldown is active
                 if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                    continue
+
+                # Skip if quota is exhausted
+                if self._is_quota_exhausted(key, model):
                     continue
 
                 available.append(key)
@@ -1239,6 +1294,10 @@ class UsageManager:
                         ) > now:
                             continue
 
+                        # Skip if quota is exhausted
+                        if self._is_quota_exhausted(key, model):
+                            continue
+
                         # Get priority for this key (default to 999 if not specified)
                         priority = credential_priorities.get(key, 999)
 
@@ -1402,6 +1461,10 @@ class UsageManager:
                         if (key_data.get("key_cooldown_until") or 0) > now or (
                             key_data.get("model_cooldowns", {}).get(model) or 0
                         ) > now:
+                            continue
+
+                        # Skip if quota is exhausted
+                        if self._is_quota_exhausted(key, model):
                             continue
 
                         # Prioritize keys based on their current usage to ensure load balancing.
@@ -2027,6 +2090,7 @@ class UsageManager:
         model: str,
         remaining_fraction: float,
         max_requests: Optional[int] = None,
+        quota_reset_ts: Optional[float] = None,
     ) -> None:
         """
         Update quota baseline data for a credential/model after fetching from API.
@@ -2039,6 +2103,7 @@ class UsageManager:
             model: Model name (with or without provider prefix)
             remaining_fraction: Current remaining quota as fraction (0.0 to 1.0)
             max_requests: Maximum requests allowed per quota period (e.g., 250 for Claude)
+            quota_reset_ts: Optional Unix timestamp when quota resets
         """
         await self._lazy_init()
         async with self._data_lock:
@@ -2112,6 +2177,11 @@ class UsageManager:
             model_data["baseline_remaining_fraction"] = remaining_fraction
             model_data["baseline_fetched_at"] = now_ts
 
+            # Update reset timestamp and set cooldown if quota exhausted
+            self._set_quota_reset_and_cooldown(
+                key_data, model_data, model, quota_reset_ts, now_ts, remaining_fraction
+            )
+
             # Update max_requests and quota_display
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
@@ -2137,6 +2207,15 @@ class UsageManager:
                             },
                         )
                         other_model_data["request_count"] = used_requests
+                        self._set_quota_reset_and_cooldown(
+                            key_data,
+                            other_model_data,
+                            grouped_model,
+                            quota_reset_ts,
+                            now_ts,
+                            remaining_fraction,
+                        )
+
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
