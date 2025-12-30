@@ -53,16 +53,18 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
     "standard-tier": {
-        # Claude/GPT-OSS group (0.40% per request, 250 requests total)
-        "claude-sonnet-4-5": 0.4,
-        "claude-sonnet-4-5-thinking": 0.4,
-        "claude-opus-4-5": 0.4,
-        "claude-opus-4-5-thinking": 0.4,
-        "gpt-oss-120b-medium": 0.4,
-        # Gemini 3 Pro group (0.25% per request, 400 requests total)
-        "gemini-3-pro-high": 0.25,
-        "gemini-3-pro-low": 0.25,
-        "gemini-3-pro-preview": 0.25,
+        # Claude/GPT-OSS group (0.67% per request, ~150 requests total)
+        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
+        "claude-sonnet-4-5": 0.67,
+        "claude-sonnet-4-5-thinking": 0.67,
+        "claude-opus-4-5": 0.67,
+        "claude-opus-4-5-thinking": 0.67,
+        "gpt-oss-120b-medium": 0.67,
+        # Gemini 3 Pro group (0.42% per request, ~240 requests total)
+        # Updated 2025-12-30: was 0.25% (400 req), now 0.42% (~240 req)
+        "gemini-3-pro-high": 0.42,
+        "gemini-3-pro-low": 0.42,
+        "gemini-3-pro-preview": 0.42,
         # Gemini 3 Flash (0.25% per request, 400 requests total - separate quota pool)
         "gemini-3-flash": 0.25,
         # Gemini 2.5 Flash group (0.0333% per request, ~3000 requests)
@@ -73,17 +75,19 @@ DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
         "gemini-2.5-pro": 0.1,
     },
     "free-tier": {
-        # Claude/GPT-OSS group (1.333% per request, 75 requests total)
-        "claude-sonnet-4-5": 1.333,
-        "claude-sonnet-4-5-thinking": 1.333,
-        "claude-opus-4-5": 1.333,
-        "claude-opus-4-5-thinking": 1.333,
-        "gpt-oss-120b-medium": 1.333,
-        # Gemini 3 Pro group (0.40% per request, 250 requests total)
-        "gemini-3-pro-high": 0.4,
-        "gemini-3-pro-low": 0.4,
-        "gemini-3-pro-preview": 0.4,
-        # Gemini 3 Flash (0.20% per request, 400 requests total - separate quota pool)
+        # Claude/GPT-OSS group (2.0% per request, 50 requests total)
+        # Updated 2025-12-30: was 1.333% (75 req), now 2.0% (50 req)
+        "claude-sonnet-4-5": 2.0,
+        "claude-sonnet-4-5-thinking": 2.0,
+        "claude-opus-4-5": 2.0,
+        "claude-opus-4-5-thinking": 2.0,
+        "gpt-oss-120b-medium": 2.0,
+        # Gemini 3 Pro group (0.67% per request, ~150 requests total)
+        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
+        "gemini-3-pro-high": 0.67,
+        "gemini-3-pro-low": 0.67,
+        "gemini-3-pro-preview": 0.67,
+        # Gemini 3 Flash (0.20% per request, 500 requests total - separate quota pool)
         "gemini-3-flash": 0.20,
         # Gemini 2.5 Flash group (same as standard-tier)
         "gemini-2.5-flash": 0.0333,
