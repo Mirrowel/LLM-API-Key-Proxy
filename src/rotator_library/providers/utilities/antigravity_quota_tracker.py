@@ -930,10 +930,13 @@ class AntigravityQuotaTracker:
                 # Calculate max_requests for this model/tier
                 max_requests = self.get_max_requests_for_model(user_model, tier)
 
+                # Get reset timestamp if available
+                reset_ts = model_info.get("reset_timestamp")
+
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
                 await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests
+                    cred_path, prefixed_model, remaining, max_requests, reset_ts
                 )
                 stored_for_cred.add(user_model)
                 stored_count += 1
