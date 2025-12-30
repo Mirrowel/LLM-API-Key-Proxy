@@ -184,6 +184,7 @@ class UsageManager:
         Extract provider name from credential path or identifier.
 
         Supports multiple credential formats:
+        - Env-based OAuth: "env://antigravity/1" -> "antigravity"
         - OAuth: "oauth_creds/antigravity_oauth_15.json" -> "antigravity"
         - OAuth: "C:\\...\\oauth_creds\\gemini_cli_oauth_1.json" -> "gemini_cli"
         - OAuth filename only: "antigravity_oauth_1.json" -> "antigravity"
@@ -196,6 +197,13 @@ class UsageManager:
             Provider name string or None if cannot be determined
         """
         import re
+
+        # Pattern: env-based OAuth credentials "env://provider/index"
+        if credential.startswith("env://"):
+            # Extract provider from env://provider/index format
+            match = re.match(r"env://([a-z_]+)/\d+$", credential, re.IGNORECASE)
+            if match:
+                return match.group(1).lower()
 
         # Normalize path separators
         normalized = credential.replace("\\", "/")
