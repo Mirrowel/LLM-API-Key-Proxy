@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from .models import AnthropicMessagesRequest
 
+MIN_THINKING_SIGNATURE_LENGTH = 100
+
 
 def anthropic_to_openai_messages(
     anthropic_messages: List[dict], system: Optional[Union[str, List[dict]]] = None
@@ -56,6 +58,8 @@ def anthropic_to_openai_messages(
             # Handle content blocks
             openai_content = []
             tool_calls = []
+            reasoning_content = ""
+            thinking_signature = ""
 
             for block in content:
                 if isinstance(block, dict):
@@ -84,6 +88,17 @@ def anthropic_to_openai_messages(
                                     "image_url": {"url": source.get("url", "")},
                                 }
                             )
+                    elif block_type == "thinking":
+                        signature = block.get("signature", "")
+                        if signature and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH:
+                            thinking_text = block.get("thinking", "")
+                            if thinking_text:
+                                reasoning_content += thinking_text
+                            thinking_signature = signature
+                    elif block_type == "redacted_thinking":
+                        signature = block.get("signature", "")
+                        if signature and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH:
+                            thinking_signature = signature
                     elif block_type == "tool_use":
                         # Anthropic tool_use -> OpenAI tool_calls
                         tool_calls.append(
@@ -196,16 +211,37 @@ def anthropic_to_openai_messages(
                     msg_dict["content"] = " ".join(text_parts) if text_parts else None
                 else:
                     msg_dict["content"] = None
+                if reasoning_content:
+                    msg_dict["reasoning_content"] = reasoning_content
+                if thinking_signature:
+                    msg_dict["thinking_signature"] = thinking_signature
                 msg_dict["tool_calls"] = tool_calls
                 openai_messages.append(msg_dict)
             elif openai_content:
                 # Check if it's just text or mixed content
                 if len(openai_content) == 1 and openai_content[0].get("type") == "text":
-                    openai_messages.append(
-                        {"role": role, "content": openai_content[0].get("text", "")}
-                    )
+                    msg_dict = {
+                        "role": role,
+                        "content": openai_content[0].get("text", ""),
+                    }
+                    if reasoning_content:
+                        msg_dict["reasoning_content"] = reasoning_content
+                    if thinking_signature:
+                        msg_dict["thinking_signature"] = thinking_signature
+                    openai_messages.append(msg_dict)
                 else:
-                    openai_messages.append({"role": role, "content": openai_content})
+                    msg_dict = {"role": role, "content": openai_content}
+                    if reasoning_content:
+                        msg_dict["reasoning_content"] = reasoning_content
+                    if thinking_signature:
+                        msg_dict["thinking_signature"] = thinking_signature
+                    openai_messages.append(msg_dict)
+            elif reasoning_content:
+                msg_dict = {"role": role, "content": ""}
+                msg_dict["reasoning_content"] = reasoning_content
+                if thinking_signature:
+                    msg_dict["thinking_signature"] = thinking_signature
+                openai_messages.append(msg_dict)
 
     return openai_messages
 
@@ -293,11 +329,18 @@ def openai_to_anthropic_response(openai_response: dict, original_model: str) -> 
     # Add thinking content block if reasoning_content is present
     reasoning_content = message.get("reasoning_content")
     if reasoning_content:
+        thinking_signature = message.get("thinking_signature", "")
+        signature = (
+            thinking_signature
+            if thinking_signature
+            and len(thinking_signature) >= MIN_THINKING_SIGNATURE_LENGTH
+            else ""
+        )
         content_blocks.append(
             {
                 "type": "thinking",
                 "thinking": reasoning_content,
-                "signature": "",  # Signature is typically empty for proxied responses
+                "signature": signature,
             }
         )
 
