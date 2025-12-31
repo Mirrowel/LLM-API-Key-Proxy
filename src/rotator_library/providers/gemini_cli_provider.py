@@ -10,6 +10,7 @@ from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
+from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
 from .antigravity_provider import GEMINI3_TOOL_RENAMES, GEMINI3_TOOL_RENAMES_REVERSE
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
@@ -359,7 +360,7 @@ def _env_int(key: str, default: int) -> int:
     return int(os.getenv(key, str(default)))
 
 
-class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
+class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface):
     skip_cost_calculation = True
 
     # Sequential mode - stick with one credential until it gets a 429, then switch
@@ -560,6 +561,11 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
         super().__init__()
         self.model_definitions = ModelDefinitions()
         # NOTE: project_id_cache and project_tier_cache are inherited from GeminiAuthBase
+
+        # Quota refresh interval (mirrors Antigravity pattern)
+        self._quota_refresh_interval = _env_int(
+            "GEMINI_CLI_QUOTA_REFRESH_INTERVAL", 300
+        )
 
         # Gemini 3 configuration from environment
         memory_ttl = _env_int("GEMINI_CLI_SIGNATURE_CACHE_TTL", 3600)
