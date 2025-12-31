@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -76,8 +76,7 @@ class GeminiCliQuotaTracker:
     Mixin class providing quota tracking functionality for Gemini CLI provider.
 
     This mixin adds the following capabilities:
-    - Fetch quota info from the Gemini CLI retrieveUserQuota API
-    - Track requests locally to estimate remaining quota
+    - Fetch real-time quota info from the Gemini CLI retrieveUserQuota API
     - Discover all credentials (file-based and env-based)
     - Get structured quota info for all credentials
 
@@ -220,6 +219,7 @@ class GeminiCliQuotaTracker:
                         )
                         reset_timestamp = reset_dt.timestamp()
                     except (ValueError, AttributeError):
+                        # Reset time parsing failed; leave reset_timestamp as None
                         pass
 
                 buckets_data.append(
@@ -251,6 +251,7 @@ class GeminiCliQuotaTracker:
                 if error_body:
                     error_msg = f"{error_msg}: {error_body[:200]}"
             except Exception:
+                # Best-effort extraction of HTTP error body; fall back to status-only message
                 pass
             lib_logger.warning(f"Failed to fetch quota for {identifier}: {error_msg}")
             return {
@@ -388,7 +389,10 @@ class GeminiCliQuotaTracker:
                         creds = json.load(f)
                     email = creds.get("_proxy_metadata", {}).get("email")
                 except (IOError, json.JSONDecodeError):
-                    pass
+                    # Failed to read credential metadata; email will remain None
+                    lib_logger.debug(
+                        f"Could not read email from credential file: {cred_path}"
+                    )
 
             # Build model quotas from buckets
             model_quotas = {}
