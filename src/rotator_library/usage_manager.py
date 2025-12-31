@@ -197,6 +197,12 @@ class UsageManager:
         """
         import re
 
+        # Pattern: env:// URI format (e.g., "env://antigravity/1" -> "antigravity")
+        if credential.startswith("env://"):
+            parts = credential[6:].split("/")  # Remove "env://" prefix
+            if parts:
+                return parts[0].lower()
+
         # Normalize path separators
         normalized = credential.replace("\\", "/")
 
