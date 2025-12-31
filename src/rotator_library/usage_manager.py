@@ -197,6 +197,15 @@ class UsageManager:
         """
         import re
 
+        # Pattern: env:// URI format (e.g., "env://antigravity/1" -> "antigravity")
+        if credential.startswith("env://"):
+            parts = credential[6:].split("/")  # Remove "env://" prefix
+            if parts and parts[0]:
+                return parts[0].lower()
+            # Malformed env:// URI (empty provider name)
+            lib_logger.warning(f"Malformed env:// credential URI: {credential}")
+            return None
+
         # Normalize path separators
         normalized = credential.replace("\\", "/")
 
