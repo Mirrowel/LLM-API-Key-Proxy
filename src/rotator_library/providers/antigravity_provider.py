@@ -2424,6 +2424,7 @@ class AntigravityProvider(
         """Parse image URL into Gemini inlineData format."""
         url = image_url.get("url", "")
         if not url.startswith("data:"):
+            lib_logger.debug(f"Skipping non-data URL image: {url[:100]}...")
             return None
 
         try:
