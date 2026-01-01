@@ -2305,8 +2305,8 @@ class AntigravityProvider(
                 "include_thoughts": True,
             }
 
-        # Model-specific budgets
-        if "gemini-2.5-pro" in model or is_claude:
+        # Model-specific budgets (Claude already returned above)
+        if "gemini-2.5-pro" in model:
             budgets = {"low": 8192, "medium": 16384, "high": 32768}
         elif "gemini-2.5-flash" in model:
             budgets = {"low": 6144, "medium": 12288, "high": 24576}
