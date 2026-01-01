@@ -1869,6 +1869,26 @@ class AntigravityProvider(
                             "This is likely from context compression or non-thinking model. "
                             "New response will include thinking naturally."
                         )
+                elif not state["turn_has_thinking"]:
+                    # CASE: Last assistant message has NO tool calls AND NO thinking
+                    # This happens when:
+                    # 1. Previous turn was made without thinking enabled
+                    # 2. A simple text response without any tool use
+                    #
+                    # Per Claude docs: "the final assistant message must start with a thinking block"
+                    # If we're enabling thinking now, we MUST close the turn and start fresh,
+                    # otherwise Claude API rejects with:
+                    # "Expected `thinking` or `redacted_thinking`, but found `text`"
+                    lib_logger.info(
+                        "[Thinking Sanitization] Last model message has no thinking and no tool calls. "
+                        "Adding synthetic user message to start fresh thinking turn."
+                    )
+                    synthetic_user = {
+                        "role": "user",
+                        "parts": [{"text": "[Continue]"}],
+                    }
+                    messages.append(synthetic_user)
+                    return self._strip_all_thinking_blocks(messages), False
 
             # Strip thinking from old turns, let new response add thinking naturally
             return self._strip_old_turn_thinking(
