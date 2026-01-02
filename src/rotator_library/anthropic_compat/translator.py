@@ -15,6 +15,57 @@ from .models import AnthropicMessagesRequest
 MIN_THINKING_SIGNATURE_LENGTH = 100
 
 
+def _reorder_assistant_content(content: List[dict]) -> List[dict]:
+    """
+    Reorder assistant message content blocks to ensure correct order:
+    1. Thinking blocks come first (required when thinking is enabled)
+    2. Text blocks come in the middle (filtering out empty ones)
+    3. Tool_use blocks come at the end (required before tool_result)
+
+    This matches Anthropic's expected ordering and prevents API errors.
+    """
+    if not isinstance(content, list) or len(content) <= 1:
+        return content
+
+    thinking_blocks = []
+    text_blocks = []
+    tool_use_blocks = []
+    other_blocks = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            other_blocks.append(block)
+            continue
+
+        block_type = block.get("type", "")
+
+        if block_type in ("thinking", "redacted_thinking"):
+            # Sanitize thinking blocks - remove cache_control and other extra fields
+            sanitized = {
+                "type": block_type,
+                "thinking": block.get("thinking", ""),
+            }
+            if block.get("signature"):
+                sanitized["signature"] = block["signature"]
+            thinking_blocks.append(sanitized)
+
+        elif block_type == "tool_use":
+            tool_use_blocks.append(block)
+
+        elif block_type == "text":
+            # Only keep text blocks with meaningful content
+            text = block.get("text", "")
+            if text and text.strip():
+                text_blocks.append(block)
+
+        else:
+            # Other block types (images, documents, etc.) go in the text position
+            other_blocks.append(block)
+
+    # Reorder: thinking → other → text → tool_use
+    return thinking_blocks + other_blocks + text_blocks + tool_use_blocks
+
+
 def anthropic_to_openai_messages(
     anthropic_messages: List[dict], system: Optional[Union[str, List[dict]]] = None
 ) -> List[dict]:
@@ -55,6 +106,11 @@ def anthropic_to_openai_messages(
         if isinstance(content, str):
             openai_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
+            # Reorder assistant content blocks to ensure correct order:
+            # thinking → text → tool_use
+            if role == "assistant":
+                content = _reorder_assistant_content(content)
+
             # Handle content blocks
             openai_content = []
             tool_calls = []
@@ -78,6 +134,26 @@ def anthropic_to_openai_messages(
                                     "type": "image_url",
                                     "image_url": {
                                         "url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                                    },
+                                }
+                            )
+                        elif source.get("type") == "url":
+                            openai_content.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": source.get("url", "")},
+                                }
+                            )
+                    elif block_type == "document":
+                        # Convert Anthropic document format (e.g. PDF) to OpenAI
+                        # Documents are treated similarly to images with appropriate mime type
+                        source = block.get("source", {})
+                        if source.get("type") == "base64":
+                            openai_content.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{source.get('media_type', 'application/pdf')};base64,{source.get('data', '')}"
                                     },
                                 }
                             )

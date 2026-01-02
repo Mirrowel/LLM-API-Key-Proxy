@@ -128,6 +128,10 @@ AVAILABLE_MODELS = [
 # Default max output tokens (including thinking) - can be overridden per request
 DEFAULT_MAX_OUTPUT_TOKENS = 64000
 
+# Gemini max output tokens cap - Gemini models have a 16K output limit
+# See: https://ai.google.dev/gemini-api/docs/models
+GEMINI_MAX_OUTPUT_TOKENS = 16384
+
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
@@ -303,10 +307,116 @@ def _generate_request_id() -> str:
     return f"agent-{uuid.uuid4()}"
 
 
+def _derive_session_id(messages: List[Dict[str, Any]]) -> str:
+    """
+    Derive a stable session ID from the first user message in the conversation.
+
+    This ensures the same conversation uses the same session ID across turns,
+    enabling prompt caching (cache is scoped to session + organization).
+
+    Args:
+        messages: List of Anthropic-format messages
+
+    Returns:
+        A stable session ID (32 hex characters) derived from first user message,
+        or a random fallback if no user message found.
+    """
+    import hashlib
+
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+
+            # Handle string content
+            if isinstance(content, str):
+                text_content = content
+            # Handle array content (extract text blocks)
+            elif isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text:
+                            text_parts.append(text)
+                text_content = "\n".join(text_parts)
+            else:
+                text_content = ""
+
+            if text_content:
+                # Hash the content with SHA256, return first 32 hex chars
+                hash_digest = hashlib.sha256(text_content.encode()).hexdigest()
+                return hash_digest[:32]
+
+    # Fallback to random ID if no user message found
+    return f"-{random.randint(1_000_000_000_000_000_000, 9_999_999_999_999_999_999)}"
+
+
 def _generate_session_id() -> str:
-    """Generate Antigravity session ID: -{random_number}"""
+    """Generate Antigravity session ID: -{random_number} (legacy fallback)"""
     n = random.randint(1_000_000_000_000_000_000, 9_999_999_999_999_999_999)
     return f"-{n}"
+
+
+def _reorder_assistant_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reorder assistant message content blocks to ensure correct order:
+    1. Thinking blocks come first (required when thinking is enabled)
+    2. Text blocks come in the middle (filtering out empty ones)
+    3. Tool_use blocks come at the end (required before tool_result)
+
+    This matches Anthropic's expected ordering and prevents API errors.
+
+    Args:
+        content: List of content blocks from an assistant message
+
+    Returns:
+        Reordered content blocks
+    """
+    if not isinstance(content, list):
+        return content
+
+    # Single element - just return as-is (but could sanitize thinking if needed)
+    if len(content) <= 1:
+        return content
+
+    thinking_blocks = []
+    text_blocks = []
+    tool_use_blocks = []
+    other_blocks = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            other_blocks.append(block)
+            continue
+
+        block_type = block.get("type", "")
+
+        if block_type in ("thinking", "redacted_thinking"):
+            # Sanitize thinking blocks - remove cache_control and other extra fields
+            sanitized = {
+                "type": block_type,
+                "thinking": block.get("thinking", ""),
+            }
+            # Preserve signature if present
+            if block.get("signature"):
+                sanitized["signature"] = block["signature"]
+            thinking_blocks.append(sanitized)
+
+        elif block_type == "tool_use":
+            tool_use_blocks.append(block)
+
+        elif block_type == "text":
+            # Only keep text blocks with meaningful content
+            text = block.get("text", "")
+            if text and text.strip():
+                text_blocks.append(block)
+
+        else:
+            # Other block types (images, etc.) go in the text position
+            other_blocks.append(block)
+
+    # Reorder: thinking → other → text → tool_use
+    return thinking_blocks + other_blocks + text_blocks + tool_use_blocks
 
 
 def _generate_project_id() -> str:
@@ -508,6 +618,115 @@ def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
     return resolve(schema)
 
 
+def _score_schema_option(schema: dict) -> int:
+    """
+    Score a schema option for anyOf/oneOf selection.
+    Higher scores = more preferred schemas.
+
+    Returns:
+        Score (0-3): object with properties=3, array=2, other non-null type=1, null/no type=0
+    """
+    if not isinstance(schema, dict):
+        return 0
+
+    # Score 3: Object types with properties (most informative)
+    if schema.get("type") == "object" or "properties" in schema:
+        return 3
+
+    # Score 2: Array types with items
+    if schema.get("type") == "array" or "items" in schema:
+        return 2
+
+    # Score 1: Any other non-null type
+    if schema.get("type") and schema.get("type") != "null":
+        return 1
+
+    # Score 0: Null or no type
+    return 0
+
+
+def _merge_all_of(schema: Any) -> Any:
+    """
+    Merge all schemas in an allOf array into a single schema.
+    Properties and required arrays are merged; other fields use first occurrence.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    # Process allOf if present
+    if "allOf" in schema and isinstance(schema["allOf"], list) and schema["allOf"]:
+        merged_properties = {}
+        merged_required = set()
+        other_fields = {}
+
+        for sub_schema in schema["allOf"]:
+            if not isinstance(sub_schema, dict):
+                continue
+
+            # Recursively merge nested allOf first
+            sub_schema = _merge_all_of(sub_schema)
+
+            # Merge properties (later overrides earlier)
+            if "properties" in sub_schema and isinstance(sub_schema["properties"], dict):
+                for key, value in sub_schema["properties"].items():
+                    merged_properties[key] = value
+
+            # Union required arrays
+            if "required" in sub_schema and isinstance(sub_schema["required"], list):
+                for req in sub_schema["required"]:
+                    merged_required.add(req)
+
+            # Copy other fields (first occurrence wins)
+            for key, value in sub_schema.items():
+                if key not in ("properties", "required", "allOf") and key not in other_fields:
+                    other_fields[key] = value
+
+        # Build result without allOf
+        result = {}
+
+        # Apply other fields first
+        for key, value in other_fields.items():
+            if key not in schema or key == "allOf":
+                result[key] = value
+
+        # Copy non-allOf fields from parent schema (parent takes precedence)
+        for key, value in schema.items():
+            if key != "allOf":
+                if key == "properties" and isinstance(value, dict):
+                    # Merge parent properties with allOf properties
+                    result["properties"] = {**merged_properties, **value}
+                elif key == "required" and isinstance(value, list):
+                    # Merge parent required with allOf required
+                    result["required"] = list(merged_required.union(value))
+                else:
+                    result[key] = value
+
+        # Add merged properties if not already present
+        if merged_properties and "properties" not in result:
+            result["properties"] = merged_properties
+
+        # Add merged required if not already present
+        if merged_required and "required" not in result:
+            result["required"] = list(merged_required)
+
+        schema = result
+
+    # Recursively process properties
+    if "properties" in schema and isinstance(schema["properties"], dict):
+        schema["properties"] = {
+            key: _merge_all_of(value) for key, value in schema["properties"].items()
+        }
+
+    # Recursively process items
+    if "items" in schema:
+        if isinstance(schema["items"], list):
+            schema["items"] = [_merge_all_of(item) for item in schema["items"]]
+        elif isinstance(schema["items"], dict):
+            schema["items"] = _merge_all_of(schema["items"])
+
+    return schema
+
+
 def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
@@ -571,19 +790,76 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "default",
     }
 
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    # Handle 'anyOf' by selecting the best option based on scoring
+    # Claude doesn't support anyOf, Gemini does - so only flatten for Claude
     if not for_gemini:
         if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+            options = schema["anyOf"]
+            # Find the best option using scoring
+            best_option = None
+            best_score = -1
+            type_names = []
 
-        # Handle 'oneOf' similarly
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                # Collect type names for hint
+                type_name = option.get("type") or ("object" if "properties" in option else None)
+                if type_name and type_name != "null":
+                    type_names.append(type_name)
+                # Score and track best
+                score = _score_schema_option(option)
+                if score > best_score:
+                    best_score = score
+                    best_option = option
+
+            if best_option:
+                cleaned_option = _clean_claude_schema(best_option, for_gemini)
+                if isinstance(cleaned_option, dict):
+                    # Add hint if multiple types existed
+                    if len(type_names) > 1:
+                        hint = f"one of: {', '.join(type_names)}"
+                        if "description" in cleaned_option:
+                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                        else:
+                            cleaned_option["description"] = hint
+                    return cleaned_option
+
+        # Handle 'oneOf' similarly with scoring
         if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+            options = schema["oneOf"]
+            best_option = None
+            best_score = -1
+            type_names = []
+
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                type_name = option.get("type") or ("object" if "properties" in option else None)
+                if type_name and type_name != "null":
+                    type_names.append(type_name)
+                score = _score_schema_option(option)
+                if score > best_score:
+                    best_score = score
+                    best_option = option
+
+            if best_option:
+                cleaned_option = _clean_claude_schema(best_option, for_gemini)
+                if isinstance(cleaned_option, dict):
+                    if len(type_names) > 1:
+                        hint = f"one of: {', '.join(type_names)}"
+                        if "description" in cleaned_option:
+                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                        else:
+                            cleaned_option["description"] = hint
+                    return cleaned_option
+
+        # Handle 'allOf' by merging all schemas together using the helper function
+        if "allOf" in schema and isinstance(schema["allOf"], list) and schema["allOf"]:
+            # Use the dedicated merge function
+            merged_schema = _merge_all_of(schema)
+            # Then clean the merged result
+            return _clean_claude_schema(merged_schema, for_gemini)
 
     cleaned = {}
     # Handle 'const' by converting to 'enum' with single value (Claude only)
@@ -3683,6 +3959,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        original_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Transform Gemini CLI payload to complete Antigravity format.
@@ -3692,6 +3969,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             model: Model name (public alias)
             max_tokens: Max output tokens (including thinking)
             reasoning_effort: Reasoning effort level (determines -thinking variant for Claude)
+            original_messages: Original Anthropic-format messages for session ID derivation
         """
         internal_model = self._alias_to_internal(model)
 
@@ -3731,8 +4009,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "request": copy.deepcopy(gemini_payload),
         }
 
-        # Add session ID
-        antigravity_payload["request"]["sessionId"] = _generate_session_id()
+        # Add session ID - derive from first user message for prompt caching continuity
+        if original_messages:
+            antigravity_payload["request"]["sessionId"] = _derive_session_id(
+                original_messages
+            )
+        else:
+            antigravity_payload["request"]["sessionId"] = _generate_session_id()
 
         # Add default safety settings to prevent content filtering
         # Only add if not already present in the payload
@@ -3776,6 +4059,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     f"Adjusting to {min_required_tokens}"
                 )
                 gen_config["maxOutputTokens"] = min_required_tokens
+
+        # Cap maxOutputTokens for Gemini models to their limit (16K)
+        # Gemini models have a lower output limit than Claude
+        if not is_claude and gen_config.get("maxOutputTokens"):
+            current_max = gen_config["maxOutputTokens"]
+            if current_max > GEMINI_MAX_OUTPUT_TOKENS:
+                lib_logger.debug(
+                    f"Capping maxOutputTokens from {current_max} to {GEMINI_MAX_OUTPUT_TOKENS} for Gemini model"
+                )
+                gen_config["maxOutputTokens"] = GEMINI_MAX_OUTPUT_TOKENS
 
         antigravity_payload["request"]["generationConfig"] = gen_config
 
@@ -4539,7 +4832,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         # Transform to Antigravity format with real project ID
         payload = self._transform_to_antigravity_format(
-            gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice
+            gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice,
+            original_messages=messages
         )
         file_logger.log_request(payload)
 
@@ -4599,6 +4893,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         max_tokens,
                         reasoning_effort,
                         tool_choice,
+                        original_messages=messages,
                     )
                 else:
                     # Non-streaming: empty response, bare 429, and malformed call retry
@@ -4724,6 +5019,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                         max_tokens,
                                         reasoning_effort,
                                         tool_choice,
+                                        original_messages=messages,
                                     )
 
                                     # Log the retry request in the same folder
@@ -5050,6 +5346,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        original_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
         Wrapper around _handle_streaming that retries on empty responses, bare 429s,
@@ -5197,6 +5494,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             max_tokens,
                             reasoning_effort,
                             tool_choice,
+                            original_messages=original_messages,
                         )
 
                         # Log the retry request in the same folder
