@@ -294,7 +294,10 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
 
 # Claude interleaved thinking hint (encourages thinking after tool results)
-DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """Interleaved thinking is enabled. Always emit a thinking block before each tool call and after each tool result, even if brief, before deciding the next action or final answer."""
+DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """CRITICAL: Interleaved thinking is required. Emit a thinking block:
+- Before every tool call (to reason about what you're doing)
+- After every tool result (to analyze the result before proceeding)
+Never skip thinking, even for simple or sequential tool calls."""
 
 
 # =============================================================================
