@@ -128,6 +128,10 @@ AVAILABLE_MODELS = [
 # Default max output tokens (including thinking) - can be overridden per request
 DEFAULT_MAX_OUTPUT_TOKENS = 64000
 
+# Gemini max output tokens cap - Gemini models have a 16K output limit
+# See: https://ai.google.dev/gemini-api/docs/models
+GEMINI_MAX_OUTPUT_TOKENS = 16384
+
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
@@ -138,6 +142,14 @@ EMPTY_RESPONSE_RETRY_DELAY = _env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 
 # When Gemini 3 returns MALFORMED_FUNCTION_CALL (invalid JSON syntax in tool args),
 # inject corrective messages and retry up to this many times
 MALFORMED_CALL_MAX_RETRIES = max(1, _env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
+
+# Claude thinking signatures must be long enough to be valid
+MIN_THINKING_SIGNATURE_LENGTH = 100
+CLAUDE_FORCED_THINKING_BUDGET = 31999
+
+
+def _is_valid_thinking_signature(signature):
+    return isinstance(signature, str) and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH
 MALFORMED_CALL_RETRY_DELAY = _env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 
 # Model alias mappings (internal ↔ public)
@@ -281,6 +293,9 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 # Parallel tool usage encouragement instruction
 DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
 
+# Claude interleaved thinking hint (encourages thinking after tool results)
+DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """Interleaved thinking is enabled. Always emit a thinking block before each tool call and after each tool result, even if brief, before deciding the next action or final answer."""
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -292,10 +307,116 @@ def _generate_request_id() -> str:
     return f"agent-{uuid.uuid4()}"
 
 
+def _derive_session_id(messages: List[Dict[str, Any]]) -> str:
+    """
+    Derive a stable session ID from the first user message in the conversation.
+
+    This ensures the same conversation uses the same session ID across turns,
+    enabling prompt caching (cache is scoped to session + organization).
+
+    Args:
+        messages: List of Anthropic-format messages
+
+    Returns:
+        A stable session ID (32 hex characters) derived from first user message,
+        or a random fallback if no user message found.
+    """
+    import hashlib
+
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+
+            # Handle string content
+            if isinstance(content, str):
+                text_content = content
+            # Handle array content (extract text blocks)
+            elif isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text:
+                            text_parts.append(text)
+                text_content = "\n".join(text_parts)
+            else:
+                text_content = ""
+
+            if text_content:
+                # Hash the content with SHA256, return first 32 hex chars
+                hash_digest = hashlib.sha256(text_content.encode()).hexdigest()
+                return hash_digest[:32]
+
+    # Fallback to random ID if no user message found
+    return f"-{random.randint(1_000_000_000_000_000_000, 9_999_999_999_999_999_999)}"
+
+
 def _generate_session_id() -> str:
-    """Generate Antigravity session ID: -{random_number}"""
+    """Generate Antigravity session ID: -{random_number} (legacy fallback)"""
     n = random.randint(1_000_000_000_000_000_000, 9_999_999_999_999_999_999)
     return f"-{n}"
+
+
+def _reorder_assistant_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reorder assistant message content blocks to ensure correct order:
+    1. Thinking blocks come first (required when thinking is enabled)
+    2. Text blocks come in the middle (filtering out empty ones)
+    3. Tool_use blocks come at the end (required before tool_result)
+
+    This matches Anthropic's expected ordering and prevents API errors.
+
+    Args:
+        content: List of content blocks from an assistant message
+
+    Returns:
+        Reordered content blocks
+    """
+    if not isinstance(content, list):
+        return content
+
+    # Single element - just return as-is (but could sanitize thinking if needed)
+    if len(content) <= 1:
+        return content
+
+    thinking_blocks = []
+    text_blocks = []
+    tool_use_blocks = []
+    other_blocks = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            other_blocks.append(block)
+            continue
+
+        block_type = block.get("type", "")
+
+        if block_type in ("thinking", "redacted_thinking"):
+            # Sanitize thinking blocks - remove cache_control and other extra fields
+            sanitized = {
+                "type": block_type,
+                "thinking": block.get("thinking", ""),
+            }
+            # Preserve signature if present
+            if block.get("signature"):
+                sanitized["signature"] = block["signature"]
+            thinking_blocks.append(sanitized)
+
+        elif block_type == "tool_use":
+            tool_use_blocks.append(block)
+
+        elif block_type == "text":
+            # Only keep text blocks with meaningful content
+            text = block.get("text", "")
+            if text and text.strip():
+                text_blocks.append(block)
+
+        else:
+            # Other block types (images, etc.) go in the text position
+            other_blocks.append(block)
+
+    # Reorder: thinking → other → text → tool_use
+    return thinking_blocks + other_blocks + text_blocks + tool_use_blocks
 
 
 def _generate_project_id() -> str:
@@ -497,6 +618,115 @@ def _inline_schema_refs(schema: Dict[str, Any]) -> Dict[str, Any]:
     return resolve(schema)
 
 
+def _score_schema_option(schema: dict) -> int:
+    """
+    Score a schema option for anyOf/oneOf selection.
+    Higher scores = more preferred schemas.
+
+    Returns:
+        Score (0-3): object with properties=3, array=2, other non-null type=1, null/no type=0
+    """
+    if not isinstance(schema, dict):
+        return 0
+
+    # Score 3: Object types with properties (most informative)
+    if schema.get("type") == "object" or "properties" in schema:
+        return 3
+
+    # Score 2: Array types with items
+    if schema.get("type") == "array" or "items" in schema:
+        return 2
+
+    # Score 1: Any other non-null type
+    if schema.get("type") and schema.get("type") != "null":
+        return 1
+
+    # Score 0: Null or no type
+    return 0
+
+
+def _merge_all_of(schema: Any) -> Any:
+    """
+    Merge all schemas in an allOf array into a single schema.
+    Properties and required arrays are merged; other fields use first occurrence.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    # Process allOf if present
+    if "allOf" in schema and isinstance(schema["allOf"], list) and schema["allOf"]:
+        merged_properties = {}
+        merged_required = set()
+        other_fields = {}
+
+        for sub_schema in schema["allOf"]:
+            if not isinstance(sub_schema, dict):
+                continue
+
+            # Recursively merge nested allOf first
+            sub_schema = _merge_all_of(sub_schema)
+
+            # Merge properties (later overrides earlier)
+            if "properties" in sub_schema and isinstance(sub_schema["properties"], dict):
+                for key, value in sub_schema["properties"].items():
+                    merged_properties[key] = value
+
+            # Union required arrays
+            if "required" in sub_schema and isinstance(sub_schema["required"], list):
+                for req in sub_schema["required"]:
+                    merged_required.add(req)
+
+            # Copy other fields (first occurrence wins)
+            for key, value in sub_schema.items():
+                if key not in ("properties", "required", "allOf") and key not in other_fields:
+                    other_fields[key] = value
+
+        # Build result without allOf
+        result = {}
+
+        # Apply other fields first
+        for key, value in other_fields.items():
+            if key not in schema or key == "allOf":
+                result[key] = value
+
+        # Copy non-allOf fields from parent schema (parent takes precedence)
+        for key, value in schema.items():
+            if key != "allOf":
+                if key == "properties" and isinstance(value, dict):
+                    # Merge parent properties with allOf properties
+                    result["properties"] = {**merged_properties, **value}
+                elif key == "required" and isinstance(value, list):
+                    # Merge parent required with allOf required
+                    result["required"] = list(merged_required.union(value))
+                else:
+                    result[key] = value
+
+        # Add merged properties if not already present
+        if merged_properties and "properties" not in result:
+            result["properties"] = merged_properties
+
+        # Add merged required if not already present
+        if merged_required and "required" not in result:
+            result["required"] = list(merged_required)
+
+        schema = result
+
+    # Recursively process properties
+    if "properties" in schema and isinstance(schema["properties"], dict):
+        schema["properties"] = {
+            key: _merge_all_of(value) for key, value in schema["properties"].items()
+        }
+
+    # Recursively process items
+    if "items" in schema:
+        if isinstance(schema["items"], list):
+            schema["items"] = [_merge_all_of(item) for item in schema["items"]]
+        elif isinstance(schema["items"], dict):
+            schema["items"] = _merge_all_of(schema["items"])
+
+    return schema
+
+
 def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
@@ -561,19 +791,76 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "default",
     }
 
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    # Handle 'anyOf' by selecting the best option based on scoring
+    # Claude doesn't support anyOf, Gemini does - so only flatten for Claude
     if not for_gemini:
         if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+            options = schema["anyOf"]
+            # Find the best option using scoring
+            best_option = None
+            best_score = -1
+            type_names = []
 
-        # Handle 'oneOf' similarly
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                # Collect type names for hint
+                type_name = option.get("type") or ("object" if "properties" in option else None)
+                if type_name and type_name != "null":
+                    type_names.append(type_name)
+                # Score and track best
+                score = _score_schema_option(option)
+                if score > best_score:
+                    best_score = score
+                    best_option = option
+
+            if best_option:
+                cleaned_option = _clean_claude_schema(best_option, for_gemini)
+                if isinstance(cleaned_option, dict):
+                    # Add hint if multiple types existed
+                    if len(type_names) > 1:
+                        hint = f"one of: {', '.join(type_names)}"
+                        if "description" in cleaned_option:
+                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                        else:
+                            cleaned_option["description"] = hint
+                    return cleaned_option
+
+        # Handle 'oneOf' similarly with scoring
         if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+            options = schema["oneOf"]
+            best_option = None
+            best_score = -1
+            type_names = []
+
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                type_name = option.get("type") or ("object" if "properties" in option else None)
+                if type_name and type_name != "null":
+                    type_names.append(type_name)
+                score = _score_schema_option(option)
+                if score > best_score:
+                    best_score = score
+                    best_option = option
+
+            if best_option:
+                cleaned_option = _clean_claude_schema(best_option, for_gemini)
+                if isinstance(cleaned_option, dict):
+                    if len(type_names) > 1:
+                        hint = f"one of: {', '.join(type_names)}"
+                        if "description" in cleaned_option:
+                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                        else:
+                            cleaned_option["description"] = hint
+                    return cleaned_option
+
+        # Handle 'allOf' by merging all schemas together using the helper function
+        if "allOf" in schema and isinstance(schema["allOf"], list) and schema["allOf"]:
+            # Use the dedicated merge function
+            merged_schema = _merge_all_of(schema)
+            # Then clean the merged result
+            return _clean_claude_schema(merged_schema, for_gemini)
 
     cleaned = {}
     # Handle 'const' by converting to 'enum' with single value (Claude only)
@@ -686,6 +973,10 @@ class AntigravityFileLogger:
         """Append a raw chunk to the response stream log."""
         self._append_text("response_stream.log", chunk)
 
+    def log_unwrapped_stream_chunk(self, chunk: Dict[str, Any]) -> None:
+        """Append an unwrapped response chunk as JSON."""
+        self._append_text("response_stream_unwrapped.log", json.dumps(chunk))
+
     def log_error(self, error_message: str) -> None:
         """Log an error message."""
         self._append_text(
@@ -705,6 +996,17 @@ class AntigravityFileLogger:
     def log_final_response(self, response: Dict[str, Any]) -> None:
         """Log the final response."""
         self._write_json("final_response.json", response)
+
+    def log_request_headers(self, headers: Dict[str, str]) -> None:
+        """Log sanitized request headers (no auth tokens)."""
+        sanitized = dict(headers or {})
+        if "Authorization" in sanitized:
+            sanitized["Authorization"] = "***"
+        self._write_json("request_headers.json", sanitized)
+
+    def log_raw_response(self, response: Dict[str, Any], filename: str) -> None:
+        """Log raw response payload."""
+        self._write_json(filename, response)
 
     def log_malformed_autofix(
         self, tool_name: str, raw_args: str, fixed_json: str
@@ -1115,6 +1417,13 @@ class AntigravityProvider(
         self._claude_system_instruction = os.getenv(
             "ANTIGRAVITY_CLAUDE_SYSTEM_INSTRUCTION", DEFAULT_CLAUDE_SYSTEM_INSTRUCTION
         )
+        self._enable_claude_interleaved_hint = _env_bool(
+            "ANTIGRAVITY_ENABLE_CLAUDE_INTERLEAVED_HINT", True
+        )
+        self._claude_interleaved_hint = os.getenv(
+            "ANTIGRAVITY_CLAUDE_INTERLEAVED_HINT",
+            DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT,
+        )
 
         # Parallel tool usage instruction configuration
         self._enable_parallel_tool_instruction_claude = _env_bool(
@@ -1140,7 +1449,8 @@ class AntigravityProvider(
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
-            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
+            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}, "
+            f"claude_interleaved_hint={self._enable_claude_interleaved_hint}"
         )
 
     def _get_antigravity_headers(self) -> Dict[str, str]:
@@ -1587,7 +1897,18 @@ class AntigravityProvider(
         """
         parts = msg.get("parts", [])
         for part in parts:
-            if isinstance(part, dict) and part.get("thought") is True:
+            if not isinstance(part, dict):
+                continue
+
+            is_thought = part.get("thought") is True or part.get("type") in (
+                "thinking",
+                "redacted_thinking",
+            )
+            if not is_thought:
+                continue
+
+            signature = part.get("thoughtSignature") or part.get("signature")
+            if _is_valid_thinking_signature(signature):
                 return True
         return False
 
@@ -1595,6 +1916,52 @@ class AntigravityProvider(
         """Check if a message contains tool calls (Gemini format)."""
         parts = msg.get("parts", [])
         return any(isinstance(p, dict) and "functionCall" in p for p in parts)
+
+    def _filter_unsigned_thinking_blocks(self, messages):
+        """
+        Drop thinking parts without valid signatures to avoid Claude rejections.
+
+        Handles GEMINI format: role "model", "parts" with thought/thoughtSignature.
+        """
+        for msg in messages:
+            if msg.get("role") != "model":
+                continue
+
+            parts = msg.get("parts", [])
+            if not parts:
+                continue
+
+            filtered = []
+            removed = False
+            for part in parts:
+                if not isinstance(part, dict):
+                    filtered.append(part)
+                    continue
+
+                is_thought = part.get("thought") is True or part.get("type") in (
+                    "thinking",
+                    "redacted_thinking",
+                )
+                if is_thought:
+                    signature = part.get("thoughtSignature") or part.get("signature")
+                    if _is_valid_thinking_signature(signature):
+                        filtered.append(part)
+                    else:
+                        removed = True
+                    continue
+
+                filtered.append(part)
+
+            if removed:
+                has_function_calls = any(
+                    isinstance(p, dict) and "functionCall" in p for p in filtered
+                )
+                if not filtered:
+                    msg["parts"] = [{"text": ""}] if not has_function_calls else []
+                else:
+                    msg["parts"] = filtered
+
+        return messages
 
     def _sanitize_thinking_for_claude(
         self, messages: List[Dict[str, Any]], thinking_enabled: bool
@@ -1625,6 +1992,7 @@ class AntigravityProvider(
             - force_disable_thinking: If True, thinking must be disabled for this request
         """
         messages = copy.deepcopy(messages)
+        messages = self._filter_unsigned_thinking_blocks(messages)
         state = self._analyze_conversation_state(messages)
 
         lib_logger.debug(
@@ -1778,6 +2146,26 @@ class AntigravityProvider(
                             "This is likely from context compression or non-thinking model. "
                             "New response will include thinking naturally."
                         )
+                elif not state["turn_has_thinking"]:
+                    # CASE: Last assistant message has NO tool calls AND NO thinking
+                    # This happens when:
+                    # 1. Previous turn was made without thinking enabled
+                    # 2. A simple text response without any tool use
+                    #
+                    # Per Claude docs: "the final assistant message must start with a thinking block"
+                    # If we're enabling thinking now, we MUST close the turn and start fresh,
+                    # otherwise Claude API rejects with:
+                    # "Expected `thinking` or `redacted_thinking`, but found `text`"
+                    lib_logger.info(
+                        "[Thinking Sanitization] Last model message has no thinking and no tool calls. "
+                        "Adding synthetic user message to start fresh thinking turn."
+                    )
+                    synthetic_user = {
+                        "role": "user",
+                        "parts": [{"text": "[Continue]"}],
+                    }
+                    messages.append(synthetic_user)
+                    return self._strip_all_thinking_blocks(messages), False
 
             # Strip thinking from old turns, let new response add thinking naturally
             return self._strip_old_turn_thinking(
@@ -1802,7 +2190,13 @@ class AntigravityProvider(
                     filtered = [
                         p
                         for p in parts
-                        if not (isinstance(p, dict) and p.get("thought") is True)
+                        if not (
+                            isinstance(p, dict)
+                            and (
+                                p.get("thought") is True
+                                or p.get("type") in ("thinking", "redacted_thinking")
+                            )
+                        )
                     ]
 
                     # Check if there are still functionCalls remaining
@@ -1839,7 +2233,13 @@ class AntigravityProvider(
                     filtered = [
                         p
                         for p in parts
-                        if not (isinstance(p, dict) and p.get("thought") is True)
+                        if not (
+                            isinstance(p, dict)
+                            and (
+                                p.get("thought") is True
+                                or p.get("type") in ("thinking", "redacted_thinking")
+                            )
+                        )
                     ]
 
                     has_function_calls = any(
@@ -1882,7 +2282,13 @@ class AntigravityProvider(
                     filtered = [
                         p
                         for p in parts
-                        if not (isinstance(p, dict) and p.get("thought") is True)
+                        if not (
+                            isinstance(p, dict)
+                            and (
+                                p.get("thought") is True
+                                or p.get("type") in ("thinking", "redacted_thinking")
+                            )
+                        )
                     ]
 
                     has_function_calls = any(
@@ -1923,6 +2329,7 @@ class AntigravityProvider(
             and "text" in p
             and p.get("text", "").strip()
             and not p.get("thought")  # Exclude thinking text
+            and p.get("type") not in ("thinking", "redacted_thinking")
             for p in parts
         )
 
@@ -1988,7 +2395,7 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             signature = thinking_data.get("thought_signature", "")
 
-            if not thinking_text or not signature:
+            if not thinking_text or not _is_valid_thinking_signature(signature):
                 lib_logger.debug(
                     "[Thinking Sanitization] Cached thinking missing text or signature"
                 )
@@ -2106,7 +2513,11 @@ class AntigravityProvider(
     # =========================================================================
 
     def _get_thinking_config(
-        self, reasoning_effort: Optional[str], model: str, custom_budget: bool = False
+        self,
+        reasoning_effort: Optional[str],
+        model: str,
+        custom_budget: bool = False,
+        thinking_budget: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -2114,6 +2525,12 @@ class AntigravityProvider(
         - Gemini 2.5 & Claude: thinkingBudget (integer tokens)
         - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
         - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
+
+        Args:
+            reasoning_effort: The reasoning effort level (low/medium/high/disable)
+            model: The model name
+            custom_budget: Whether to use the full budget without reduction
+            thinking_budget: Exact thinking budget from client (takes precedence for Claude)
         """
         internal = self._alias_to_internal(model)
         is_gemini_25 = "gemini-2.5" in model
@@ -2145,13 +2562,28 @@ class AntigravityProvider(
 
         # Gemini 2.5 & Claude: Integer thinkingBudget
         if not reasoning_effort:
+            if is_claude:
+                # Use client-provided budget if available, otherwise use default
+                budget = thinking_budget if thinking_budget else CLAUDE_FORCED_THINKING_BUDGET
+                return {
+                    "thinkingBudget": budget,
+                    "include_thoughts": True,
+                }
             return {"thinkingBudget": -1, "include_thoughts": True}  # Auto
 
         if reasoning_effort == "disable":
             return {"thinkingBudget": 0, "include_thoughts": False}
 
-        # Model-specific budgets
-        if "gemini-2.5-pro" in model or is_claude:
+        if is_claude:
+            # Use client-provided budget if available, otherwise use default
+            budget = thinking_budget if thinking_budget else CLAUDE_FORCED_THINKING_BUDGET
+            return {
+                "thinkingBudget": budget,
+                "include_thoughts": True,
+            }
+
+        # Model-specific budgets (Claude already returned above)
+        if "gemini-2.5-pro" in model:
             budgets = {"low": 8192, "medium": 16384, "high": 32768}
         elif "gemini-2.5-flash" in model:
             budgets = {"low": 6144, "medium": 12288, "high": 24576}
@@ -2269,6 +2701,7 @@ class AntigravityProvider(
         """Parse image URL into Gemini inlineData format."""
         url = image_url.get("url", "")
         if not url.startswith("data:"):
+            lib_logger.debug(f"Skipping non-data URL image: {url[:100]}...")
             return None
 
         try:
@@ -2299,12 +2732,16 @@ class AntigravityProvider(
                 "text": reasoning_content,
                 "thought": True,
             }
-            # Try to get signature from cache
+            # Prefer signature provided by the message, fall back to cache
+            cached_sig = msg.get("thinking_signature") or msg.get("thought_signature")
+            if cached_sig and not _is_valid_thinking_signature(cached_sig):
+                cached_sig = None
+
+            # Try to get signature from cache if not provided
             cache_key = self._generate_thinking_cache_key(
                 content if isinstance(content, str) else "", tool_calls
             )
-            cached_sig = None
-            if cache_key:
+            if not cached_sig and cache_key:
                 cached_json = self._thinking_cache.retrieve(cache_key)
                 if cached_json:
                     try:
@@ -2313,7 +2750,7 @@ class AntigravityProvider(
                     except json.JSONDecodeError:
                         pass
 
-            if cached_sig:
+            if cached_sig and _is_valid_thinking_signature(cached_sig):
                 thinking_part["thoughtSignature"] = cached_sig
                 parts.append(thinking_part)
                 lib_logger.debug(
@@ -2423,14 +2860,18 @@ class AntigravityProvider(
             thinking_text = thinking_data.get("thinking_text", "")
             sig = thinking_data.get("thought_signature", "")
 
-            if thinking_text:
+            if thinking_text and _is_valid_thinking_signature(sig):
                 thinking_part = {
                     "text": thinking_text,
                     "thought": True,
-                    "thoughtSignature": sig or "skip_thought_signature_validator",
+                    "thoughtSignature": sig,
                 }
                 parts.append(thinking_part)
                 lib_logger.debug(f"Injected {len(thinking_text)} chars of thinking")
+            elif thinking_text:
+                lib_logger.debug(
+                    "[Thinking Cache] Dropping cached thinking with invalid signature"
+                )
         except json.JSONDecodeError:
             lib_logger.warning(f"Failed to parse cached thinking: {cache_key}")
 
@@ -2439,7 +2880,12 @@ class AntigravityProvider(
     def _transform_tool_message(
         self, msg: Dict[str, Any], model: str, tool_id_to_name: Dict[str, str]
     ) -> List[Dict[str, Any]]:
-        """Transform tool response message."""
+        """Transform tool response message.
+
+        Handles both text-only and multimodal (text + images) tool responses.
+        For multimodal responses, images are converted to inlineData format
+        and returned as separate parts alongside the functionResponse.
+        """
         tool_id = msg.get("tool_call_id", "")
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
@@ -2450,14 +2896,60 @@ class AntigravityProvider(
                 f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
                 f"Available IDs: {list(tool_id_to_name.keys())}"
             )
-        # else:
-        # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
         # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
+        # Handle multimodal content (array with text and images)
+        if isinstance(content, list):
+            text_parts = []
+            image_parts = []
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+
+                if item_type == "text":
+                    text_parts.append(item.get("text", ""))
+                elif item_type == "image_url":
+                    # Convert OpenAI image_url format to Gemini inlineData
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:"):
+                        try:
+                            # Parse: data:image/png;base64,iVBORw0KG...
+                            header, data = image_url.split(",", 1)
+                            mime_type = header.split(":")[1].split(";")[0]
+                            image_parts.append({
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": data,
+                                }
+                            })
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to parse image data URL in tool response: {e}")
+
+            # Build the result parts
+            parts = []
+
+            # Add function response with text content
+            text_result = " ".join(text_parts) if text_parts else ""
+            parts.append({
+                "functionResponse": {
+                    "name": func_name,
+                    "response": {"result": text_result if text_result else "Image content provided"},
+                    "id": tool_id,
+                }
+            })
+
+            # Add image parts separately (Gemini handles these as additional parts)
+            parts.extend(image_parts)
+
+            return parts
+
+        # Handle string content (text-only)
         try:
             parsed_content = json.loads(content)
         except (json.JSONDecodeError, TypeError):
@@ -3468,6 +3960,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        original_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Transform Gemini CLI payload to complete Antigravity format.
@@ -3477,6 +3970,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             model: Model name (public alias)
             max_tokens: Max output tokens (including thinking)
             reasoning_effort: Reasoning effort level (determines -thinking variant for Claude)
+            original_messages: Original Anthropic-format messages for session ID derivation
         """
         internal_model = self._alias_to_internal(model)
 
@@ -3516,8 +4010,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "request": copy.deepcopy(gemini_payload),
         }
 
-        # Add session ID
-        antigravity_payload["request"]["sessionId"] = _generate_session_id()
+        # Add session ID - derive from first user message for prompt caching continuity
+        if original_messages:
+            antigravity_payload["request"]["sessionId"] = _derive_session_id(
+                original_messages
+            )
+        else:
+            antigravity_payload["request"]["sessionId"] = _generate_session_id()
 
         # Add default safety settings to prevent content filtering
         # Only add if not already present in the payload
@@ -3538,6 +4037,40 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             gen_config["maxOutputTokens"] = DEFAULT_MAX_OUTPUT_TOKENS
         # For non-Claude models without explicit max_tokens, don't set it
 
+        # CRITICAL: For Claude with extended thinking, max_tokens MUST be > thinking.budget_tokens
+        # Per Claude docs: https://docs.claude.com/en/docs/build-with-claude/extended-thinking
+        # If this constraint is violated, the API returns 400 INVALID_ARGUMENT
+        thinking_config = gen_config.get("thinkingConfig", {})
+        thinking_budget = thinking_config.get(
+            "thinkingBudget", thinking_config.get("thinking_budget", 0)
+        )
+        current_max_tokens = gen_config.get("maxOutputTokens")
+
+        if (
+            is_claude
+            and thinking_budget
+            and thinking_budget > 0
+            and current_max_tokens is not None
+        ):
+            # Ensure max_tokens > thinkingBudget (add buffer for actual response content)
+            min_required_tokens = thinking_budget + 1024  # 1024 buffer for response
+            if current_max_tokens <= thinking_budget:
+                lib_logger.warning(
+                    f"max_tokens ({current_max_tokens}) must be > thinkingBudget ({thinking_budget}). "
+                    f"Adjusting to {min_required_tokens}"
+                )
+                gen_config["maxOutputTokens"] = min_required_tokens
+
+        # Cap maxOutputTokens for Gemini models to their limit (16K)
+        # Gemini models have a lower output limit than Claude
+        if not is_claude and gen_config.get("maxOutputTokens"):
+            current_max = gen_config["maxOutputTokens"]
+            if current_max > GEMINI_MAX_OUTPUT_TOKENS:
+                lib_logger.debug(
+                    f"Capping maxOutputTokens from {current_max} to {GEMINI_MAX_OUTPUT_TOKENS} for Gemini model"
+                )
+                gen_config["maxOutputTokens"] = GEMINI_MAX_OUTPUT_TOKENS
+
         antigravity_payload["request"]["generationConfig"] = gen_config
 
         # Set toolConfig based on tool_choice parameter
@@ -3556,6 +4089,21 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             if "thinkingLevel" in thinking_config:
                 del thinking_config["thinkingLevel"]
                 thinking_config["thinkingBudget"] = -1
+
+        # Claude expects snake_case thinkingConfig fields
+        if is_claude:
+            thinking_config = gen_config.get("thinkingConfig", {})
+            if thinking_config:
+                if "includeThoughts" in thinking_config and "include_thoughts" not in thinking_config:
+                    thinking_config["include_thoughts"] = thinking_config.pop("includeThoughts")
+
+                if "thinkingBudget" in thinking_config:
+                    budget = thinking_config.pop("thinkingBudget")
+                    if budget != -1:
+                        thinking_config["thinking_budget"] = budget
+
+                if thinking_config.get("thinking_budget") == -1:
+                    thinking_config.pop("thinking_budget", None)
 
         # Ensure first function call in each model message has a thoughtSignature for Gemini 3
         # Per Gemini docs: Only the FIRST parallel function call gets a signature
@@ -3607,6 +4155,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         """Extract Gemini response from Antigravity envelope."""
         return response.get("response", response)
 
+    def _get_candidate_parts(self, candidate):
+        content = candidate.get("content", {})
+        if isinstance(content, dict):
+            parts = content.get("parts", [])
+            if isinstance(parts, list):
+                return parts
+        if isinstance(content, list):
+            return content
+        return []
+
     def _gemini_to_openai_chunk(
         self,
         chunk: Dict[str, Any],
@@ -3626,7 +4184,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             return {}
 
         candidate = candidates[0]
-        content_parts = candidate.get("content", {}).get("parts", [])
+        content_parts = self._get_candidate_parts(candidate)
 
         text_content = ""
         reasoning_content = ""
@@ -3635,32 +4193,53 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         tool_idx = accumulator.get("tool_idx", 0) if accumulator else 0
 
         for part in content_parts:
-            has_func = "functionCall" in part
-            has_text = "text" in part
-            has_sig = bool(part.get("thoughtSignature"))
+            if not isinstance(part, dict):
+                continue
+
+            part_type = part.get("type")
+            signature = part.get("thoughtSignature") or part.get("signature")
+            has_sig = bool(signature)
             is_thought = (
                 part.get("thought") is True
                 or str(part.get("thought")).lower() == "true"
+                or part_type in ("thinking", "redacted_thinking")
             )
+
+            text_value = None
+            if "text" in part:
+                text_value = part.get("text", "")
+            elif part_type == "thinking":
+                text_value = part.get("thinking", "")
+            elif part_type == "text":
+                text_value = part.get("text", "")
+
+            has_func = "functionCall" in part
+            is_tool_use = part_type == "tool_use"
 
             # Accumulate signature for Claude caching
             if has_sig and is_thought and accumulator is not None:
-                accumulator["thought_signature"] = part["thoughtSignature"]
+                if not self._is_claude(model) or _is_valid_thinking_signature(signature):
+                    accumulator["thought_signature"] = signature
 
             # Skip standalone signature parts
-            if has_sig and not has_func and (not has_text or not part.get("text")):
+            if (
+                has_sig
+                and not has_func
+                and not is_tool_use
+                and not text_value
+                and not is_thought
+            ):
                 continue
 
-            if has_text:
-                text = part["text"]
+            if text_value is not None:
                 if is_thought:
-                    reasoning_content += text
+                    reasoning_content += text_value
                     if accumulator is not None:
-                        accumulator["reasoning_content"] += text
+                        accumulator["reasoning_content"] += text_value
                 else:
-                    text_content += text
+                    text_content += text_value
                     if accumulator is not None:
-                        accumulator["text_content"] += text
+                        accumulator["text_content"] += text_value
 
             if has_func:
                 # Get tool_schemas from accumulator for schema-aware parsing
@@ -3671,8 +4250,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
-                    self._handle_tool_signature(tool_call, part["thoughtSignature"])
+                    self._handle_tool_signature(tool_call, signature)
 
+                tool_calls.append(tool_call)
+                tool_idx += 1
+            elif is_tool_use:
+                tool_call = self._extract_tool_use(part, tool_idx, accumulator)
                 tool_calls.append(tool_call)
                 tool_idx += 1
 
@@ -3731,7 +4314,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             return {}
 
         candidate = candidates[0]
-        content_parts = candidate.get("content", {}).get("parts", [])
+        content_parts = self._get_candidate_parts(candidate)
 
         text_content = ""
         reasoning_content = ""
@@ -3739,25 +4322,47 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         thought_sig = ""
 
         for part in content_parts:
-            has_func = "functionCall" in part
-            has_text = "text" in part
-            has_sig = bool(part.get("thoughtSignature"))
+            if not isinstance(part, dict):
+                continue
+
+            part_type = part.get("type")
+            signature = part.get("thoughtSignature") or part.get("signature")
+            has_sig = bool(signature)
             is_thought = (
                 part.get("thought") is True
                 or str(part.get("thought")).lower() == "true"
+                or part_type in ("thinking", "redacted_thinking")
             )
 
             if has_sig and is_thought:
-                thought_sig = part["thoughtSignature"]
+                if not self._is_claude(model) or _is_valid_thinking_signature(signature):
+                    thought_sig = signature
 
-            if has_sig and not has_func and (not has_text or not part.get("text")):
+            text_value = None
+            if "text" in part:
+                text_value = part.get("text", "")
+            elif part_type == "thinking":
+                text_value = part.get("thinking", "")
+            elif part_type == "text":
+                text_value = part.get("text", "")
+
+            has_func = "functionCall" in part
+            is_tool_use = part_type == "tool_use"
+
+            if (
+                has_sig
+                and not has_func
+                and not is_tool_use
+                and not text_value
+                and not is_thought
+            ):
                 continue
 
-            if has_text:
+            if text_value is not None:
                 if is_thought:
-                    reasoning_content += part["text"]
+                    reasoning_content += text_value
                 else:
-                    text_content += part["text"]
+                    text_content += text_value
 
             if has_func:
                 tool_call = self._extract_tool_call(
@@ -3766,8 +4371,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
                 # Store signature for each tool call (needed for parallel tool calls)
                 if has_sig:
-                    self._handle_tool_signature(tool_call, part["thoughtSignature"])
+                    self._handle_tool_signature(tool_call, signature)
 
+                tool_calls.append(tool_call)
+            elif is_tool_use:
+                tool_call = self._extract_tool_use(part, len(tool_calls))
                 tool_calls.append(tool_call)
 
         # Cache Claude thinking
@@ -3788,6 +4396,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             message["content"] = ""
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
+        if thought_sig and _is_valid_thinking_signature(thought_sig):
+            message["thinking_signature"] = thought_sig
         if tool_calls:
             message["tool_calls"] = tool_calls
             message.pop("content", None)
@@ -3841,6 +4451,28 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     schema_map[name] = schema
 
         return schema_map
+
+    def _extract_tool_use(self, part, index, accumulator=None):
+        tool_id = part.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        tool_name = part.get("name", "")
+        tool_input = part.get("input", {})
+
+        try:
+            args = json.dumps(tool_input)
+        except TypeError:
+            args = json.dumps({})
+
+        tool_call = {
+            "id": tool_id,
+            "type": "function",
+            "index": index,
+            "function": {"name": tool_name, "arguments": args},
+        }
+
+        if accumulator is not None:
+            accumulator["tool_calls"].append(tool_call)
+
+        return tool_call
 
     def _extract_tool_call(
         self,
@@ -3915,19 +4547,36 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         return "tool_calls" if has_tool_calls else reason
 
     def _build_usage(self, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Build usage dict from Gemini usage metadata."""
+        """Build usage dict from Gemini usage metadata.
+
+        Note: Google's promptTokenCount INCLUDES cached tokens, but Anthropic's
+        input_tokens EXCLUDES cached tokens. We pass cached tokens through in
+        OpenAI format (prompt_tokens_details.cached_tokens) so the translator
+        can correctly subtract them when converting to Anthropic format.
+        """
         if not metadata:
             return None
 
         prompt = metadata.get("promptTokenCount", 0)
         thoughts = metadata.get("thoughtsTokenCount", 0)
         completion = metadata.get("candidatesTokenCount", 0)
+        cached = metadata.get("cachedContentTokenCount", 0)
 
         usage = {
             "prompt_tokens": prompt + thoughts,
             "completion_tokens": completion,
             "total_tokens": metadata.get("totalTokenCount", 0),
         }
+
+        # Build prompt_tokens_details for cached and reasoning tokens
+        prompt_details = {}
+        if cached > 0:
+            prompt_details["cached_tokens"] = cached
+        if thoughts > 0:
+            prompt_details["reasoning_tokens"] = thoughts
+
+        if prompt_details:
+            usage["prompt_tokens_details"] = prompt_details
 
         if thoughts > 0:
             usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}
@@ -3938,6 +4587,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         self, reasoning: str, signature: str, text: str, tool_calls: List[Dict]
     ) -> None:
         """Cache Claude thinking content."""
+        if not _is_valid_thinking_signature(signature):
+            lib_logger.debug(
+                "[Thinking Cache] Skipping cache due to invalid signature"
+            )
+            return
+
         cache_key = self._generate_thinking_cache_key(text, tool_calls)
         if not cache_key:
             return
@@ -4040,6 +4695,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         custom_budget = kwargs.get("custom_reasoning_budget", False)
+        thinking_budget = kwargs.get("thinking_budget")  # Exact budget from client
         enable_logging = kwargs.pop("enable_request_logging", False)
 
         # Create logger
@@ -4049,10 +4705,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         # Thinking is enabled if reasoning_effort is set (and not "disable") for Claude
         thinking_enabled = False
         if self._is_claude(model):
-            # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"
-            thinking_enabled = (
-                reasoning_effort is not None and reasoning_effort != "disable"
-            )
+            if reasoning_effort is not None:
+                # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"
+                thinking_enabled = reasoning_effort != "disable"
+            else:
+                # Opus always thinks, and -thinking variants should be treated as enabled
+                thinking_enabled = model.startswith("claude-opus-") or model.endswith(
+                    "-thinking"
+                )
 
         # Transform messages to Gemini format FIRST
         # This restores thinking from cache if reasoning_content was stripped by client
@@ -4104,6 +4764,17 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     gemini_payload, self._parallel_tool_instruction
                 )
 
+        # Add interleaved thinking hint for Claude thinking models with tools
+        if (
+            tools
+            and self._is_claude(model)
+            and thinking_enabled
+            and self._enable_claude_interleaved_hint
+        ):
+            self._append_system_instruction(
+                gemini_payload, self._claude_interleaved_hint
+            )
+
         # Add generation config
         gen_config = {}
         if top_p is not None:
@@ -4117,7 +4788,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             gen_config["temperature"] = 1.0
 
         thinking_config = self._get_thinking_config(
-            reasoning_effort, model, custom_budget
+            reasoning_effort, model, custom_budget, thinking_budget
         )
         if thinking_config:
             gen_config.setdefault("thinkingConfig", {}).update(thinking_config)
@@ -4162,7 +4833,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         # Transform to Antigravity format with real project ID
         payload = self._transform_to_antigravity_format(
-            gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice
+            gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice,
+            original_messages=messages
         )
         file_logger.log_request(payload)
 
@@ -4186,6 +4858,15 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "Accept": "text/event-stream" if stream else "application/json",
             **ANTIGRAVITY_HEADERS,
         }
+
+        if self._is_claude(model) and thinking_enabled:
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
+            lib_logger.debug(
+                f"[Antigravity] Added anthropic-beta header for Claude thinking model: {payload.get('model')}"
+            )
+
+        if file_logger:
+            file_logger.log_request_headers(headers)
 
         # Track malformed call retries (separate from empty response retries)
         malformed_retry_count = 0
@@ -4213,6 +4894,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         max_tokens,
                         reasoning_effort,
                         tool_choice,
+                        original_messages=messages,
                     )
                 else:
                     # Non-streaming: empty response, bare 429, and malformed call retry
@@ -4338,6 +5020,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                         max_tokens,
                                         reasoning_effort,
                                         tool_choice,
+                                        original_messages=messages,
                                     )
 
                                     # Log the retry request in the same folder
@@ -4454,6 +5137,28 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 "parts": [instruction_part],
             }
 
+    def _append_system_instruction(self, payload, instruction_text):
+        """Append a system instruction without reordering earlier instructions."""
+        if not instruction_text:
+            return
+
+        instruction_part = {"text": instruction_text}
+
+        if "system_instruction" in payload:
+            existing = payload["system_instruction"]
+            if isinstance(existing, dict) and "parts" in existing:
+                existing["parts"].append(instruction_part)
+            else:
+                payload["system_instruction"] = {
+                    "role": "user",
+                    "parts": [{"text": str(existing)}, instruction_part],
+                }
+        else:
+            payload["system_instruction"] = {
+                "role": "user",
+                "parts": [instruction_part],
+            }
+
     async def _handle_non_streaming(
         self,
         client: httpx.AsyncClient,
@@ -4475,6 +5180,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         data = response.json()
         if file_logger:
             file_logger.log_final_response(data)
+            if self._is_claude(model):
+                file_logger.log_raw_response(data, "claude_raw_response.json")
 
         gemini_response = self._unwrap_response(data)
 
@@ -4567,6 +5274,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         if not accumulator.get("response_id"):
                             accumulator["response_id"] = gemini_chunk.get("responseId")
 
+                        if file_logger and self._is_claude(model):
+                            file_logger.log_unwrapped_stream_chunk(gemini_chunk)
+
                         # Check for MALFORMED_FUNCTION_CALL
                         malformed_msg = self._check_for_malformed_call(gemini_chunk)
                         if malformed_msg:
@@ -4637,6 +5347,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        original_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
         Wrapper around _handle_streaming that retries on empty responses, bare 429s,
@@ -4784,6 +5495,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             max_tokens,
                             reasoning_effort,
                             tool_choice,
+                            original_messages=original_messages,
                         )
 
                         # Log the retry request in the same folder

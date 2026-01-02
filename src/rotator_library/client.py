@@ -3017,3 +3017,133 @@ class RotatingClient:
 
         result["duration_ms"] = int((time.time() - start_time) * 1000)
         return result
+
+    # --- Anthropic API Compatibility Methods ---
+
+    async def anthropic_messages(
+        self,
+        request: "AnthropicMessagesRequest",
+        raw_request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+    ) -> Any:
+        """
+        Handle Anthropic Messages API requests.
+
+        This method accepts requests in Anthropic's format, translates them to
+        OpenAI format internally, processes them through the existing acompletion
+        method, and returns responses in Anthropic's format.
+
+        Args:
+            request: An AnthropicMessagesRequest object
+            raw_request: Optional raw request object for disconnect checks
+            pre_request_callback: Optional async callback before each API request
+
+        Returns:
+            For non-streaming: dict in Anthropic Messages format
+            For streaming: AsyncGenerator yielding Anthropic SSE format strings
+        """
+        from .anthropic_compat import (
+            translate_anthropic_request,
+            openai_to_anthropic_response,
+            anthropic_streaming_wrapper,
+        )
+        import uuid
+
+        request_id = f"msg_{uuid.uuid4().hex[:24]}"
+        original_model = request.model
+
+        # Translate Anthropic request to OpenAI format
+        openai_request = translate_anthropic_request(request)
+
+        if request.stream:
+            # Streaming response
+            response_generator = self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Create disconnect checker if raw_request provided
+            is_disconnected = None
+            if raw_request is not None and hasattr(raw_request, "is_disconnected"):
+                is_disconnected = raw_request.is_disconnected
+
+            # Return the streaming wrapper
+            return anthropic_streaming_wrapper(
+                openai_stream=response_generator,
+                original_model=original_model,
+                request_id=request_id,
+                is_disconnected=is_disconnected,
+            )
+        else:
+            # Non-streaming response
+            response = await self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Convert OpenAI response to Anthropic format
+            openai_response = (
+                response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            )
+            anthropic_response = openai_to_anthropic_response(openai_response, original_model)
+
+            # Override the ID with our request ID
+            anthropic_response["id"] = request_id
+
+            return anthropic_response
+
+    async def anthropic_count_tokens(
+        self,
+        request: "AnthropicCountTokensRequest",
+    ) -> dict:
+        """
+        Handle Anthropic count_tokens API requests.
+
+        Counts the number of tokens that would be used by a Messages API request.
+        This is useful for estimating costs and managing context windows.
+
+        Args:
+            request: An AnthropicCountTokensRequest object
+
+        Returns:
+            Dict with input_tokens count in Anthropic format
+        """
+        from .anthropic_compat import (
+            anthropic_to_openai_messages,
+            anthropic_to_openai_tools,
+        )
+        import json
+
+        anthropic_request = request.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        # Count tokens for messages
+        message_tokens = self.token_count(
+            model=request.model,
+            messages=openai_messages,
+        )
+
+        # Count tokens for tools if present
+        tool_tokens = 0
+        if request.tools:
+            # Tools add tokens based on their definitions
+            # Convert to JSON string and count tokens for tool definitions
+            openai_tools = anthropic_to_openai_tools(
+                [tool.model_dump() for tool in request.tools]
+            )
+            if openai_tools:
+                # Serialize tools to count their token contribution
+                tools_text = json.dumps(openai_tools)
+                tool_tokens = self.token_count(
+                    model=request.model,
+                    text=tools_text,
+                )
+
+        total_tokens = message_tokens + tool_tokens
+
+        return {"input_tokens": total_tokens}
