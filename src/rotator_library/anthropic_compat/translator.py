@@ -379,16 +379,25 @@ def openai_to_anthropic_response(openai_response: dict, original_model: str) -> 
     stop_reason = stop_reason_map.get(finish_reason, "end_turn")
 
     # Build usage
+    # Note: Google's promptTokenCount INCLUDES cached tokens, but Anthropic's
+    # input_tokens EXCLUDES cached tokens. We need to subtract cached tokens.
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    cached_tokens = 0
+
+    # Extract cached tokens if present
+    if usage.get("prompt_tokens_details"):
+        details = usage["prompt_tokens_details"]
+        cached_tokens = details.get("cached_tokens", 0)
+
     anthropic_usage = {
-        "input_tokens": usage.get("prompt_tokens", 0),
+        "input_tokens": prompt_tokens - cached_tokens,  # Subtract cached tokens
         "output_tokens": usage.get("completion_tokens", 0),
     }
 
     # Add cache tokens if present
-    if usage.get("prompt_tokens_details"):
-        details = usage["prompt_tokens_details"]
-        if details.get("cached_tokens"):
-            anthropic_usage["cache_read_input_tokens"] = details["cached_tokens"]
+    if cached_tokens > 0:
+        anthropic_usage["cache_read_input_tokens"] = cached_tokens
+        anthropic_usage["cache_creation_input_tokens"] = 0
 
     return {
         "id": openai_response.get("id", f"msg_{uuid.uuid4().hex[:24]}"),

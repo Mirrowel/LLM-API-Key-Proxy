@@ -4253,19 +4253,36 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         return "tool_calls" if has_tool_calls else reason
 
     def _build_usage(self, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Build usage dict from Gemini usage metadata."""
+        """Build usage dict from Gemini usage metadata.
+
+        Note: Google's promptTokenCount INCLUDES cached tokens, but Anthropic's
+        input_tokens EXCLUDES cached tokens. We pass cached tokens through in
+        OpenAI format (prompt_tokens_details.cached_tokens) so the translator
+        can correctly subtract them when converting to Anthropic format.
+        """
         if not metadata:
             return None
 
         prompt = metadata.get("promptTokenCount", 0)
         thoughts = metadata.get("thoughtsTokenCount", 0)
         completion = metadata.get("candidatesTokenCount", 0)
+        cached = metadata.get("cachedContentTokenCount", 0)
 
         usage = {
             "prompt_tokens": prompt + thoughts,
             "completion_tokens": completion,
             "total_tokens": metadata.get("totalTokenCount", 0),
         }
+
+        # Build prompt_tokens_details for cached and reasoning tokens
+        prompt_details = {}
+        if cached > 0:
+            prompt_details["cached_tokens"] = cached
+        if thoughts > 0:
+            prompt_details["reasoning_tokens"] = thoughts
+
+        if prompt_details:
+            usage["prompt_tokens_details"] = prompt_details
 
         if thoughts > 0:
             usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}

@@ -54,6 +54,7 @@ async def anthropic_streaming_wrapper(
     tool_block_indices = {}  # Track which block index each tool call uses
     input_tokens = 0
     output_tokens = 0
+    cached_tokens = 0  # Track cached tokens for proper Anthropic format
 
     try:
         async for chunk_str in openai_stream:
@@ -69,6 +70,12 @@ async def anthropic_streaming_wrapper(
                 # CRITICAL: Send message_start if we haven't yet (e.g., empty response)
                 # Claude Code and other clients require message_start before message_stop
                 if not message_started:
+                    # Build usage with cached tokens properly handled
+                    usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+                    if cached_tokens > 0:
+                        usage_dict["cache_read_input_tokens"] = cached_tokens
+                        usage_dict["cache_creation_input_tokens"] = 0
+
                     message_start = {
                         "type": "message_start",
                         "message": {
@@ -79,7 +86,7 @@ async def anthropic_streaming_wrapper(
                             "model": original_model,
                             "stop_reason": None,
                             "stop_sequence": None,
-                            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                            "usage": usage_dict,
                         },
                     }
                     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
@@ -105,8 +112,14 @@ async def anthropic_streaming_wrapper(
                 # Determine stop_reason based on whether we had tool calls
                 stop_reason = "tool_use" if tool_calls_by_index else "end_turn"
 
+                # Build final usage dict with cached tokens
+                final_usage = {"output_tokens": output_tokens}
+                if cached_tokens > 0:
+                    final_usage["cache_read_input_tokens"] = cached_tokens
+                    final_usage["cache_creation_input_tokens"] = 0
+
                 # Send message_delta with final info
-                yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "{stop_reason}", "stop_sequence": null}}, "usage": {{"output_tokens": {output_tokens}}}}}\n\n'
+                yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "{stop_reason}", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n'
 
                 # Send message_stop
                 yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
@@ -118,12 +131,24 @@ async def anthropic_streaming_wrapper(
                 continue
 
             # Extract usage if present
+            # Note: Google's promptTokenCount INCLUDES cached tokens, but Anthropic's
+            # input_tokens EXCLUDES cached tokens. We extract cached tokens and subtract.
             if "usage" in chunk and chunk["usage"]:
-                input_tokens = chunk["usage"].get("prompt_tokens", input_tokens)
-                output_tokens = chunk["usage"].get("completion_tokens", output_tokens)
+                usage = chunk["usage"]
+                input_tokens = usage.get("prompt_tokens", input_tokens)
+                output_tokens = usage.get("completion_tokens", output_tokens)
+                # Extract cached tokens from prompt_tokens_details
+                if usage.get("prompt_tokens_details"):
+                    cached_tokens = usage["prompt_tokens_details"].get("cached_tokens", cached_tokens)
 
             # Send message_start on first chunk
             if not message_started:
+                # Build usage with cached tokens properly handled for Anthropic format
+                usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+                if cached_tokens > 0:
+                    usage_dict["cache_read_input_tokens"] = cached_tokens
+                    usage_dict["cache_creation_input_tokens"] = 0
+
                 message_start = {
                     "type": "message_start",
                     "message": {
@@ -134,7 +159,7 @@ async def anthropic_streaming_wrapper(
                         "model": original_model,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                        "usage": usage_dict,
                     },
                 }
                 yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
@@ -263,6 +288,12 @@ async def anthropic_streaming_wrapper(
         # If we haven't sent message_start yet, send it now so the client can display the error
         # Claude Code and other clients may ignore events that come before message_start
         if not message_started:
+            # Build usage with cached tokens properly handled
+            usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+            if cached_tokens > 0:
+                usage_dict["cache_read_input_tokens"] = cached_tokens
+                usage_dict["cache_creation_input_tokens"] = 0
+
             message_start = {
                 "type": "message_start",
                 "message": {
@@ -273,7 +304,7 @@ async def anthropic_streaming_wrapper(
                     "model": original_model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": usage_dict,
                 },
             }
             yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
@@ -296,8 +327,14 @@ async def anthropic_streaming_wrapper(
 
         yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
 
+        # Build final usage with cached tokens
+        final_usage = {"output_tokens": 0}
+        if cached_tokens > 0:
+            final_usage["cache_read_input_tokens"] = cached_tokens
+            final_usage["cache_creation_input_tokens"] = 0
+
         # Send message_delta and message_stop to properly close the stream
-        yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "end_turn", "stop_sequence": null}}, "usage": {{"output_tokens": 0}}}}\n\n'
+        yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "end_turn", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n'
         yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
 
         # Also send the formal error event for clients that handle it
