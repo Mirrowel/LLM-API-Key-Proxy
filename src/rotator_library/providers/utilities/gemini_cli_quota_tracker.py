@@ -76,22 +76,24 @@ _USER_TO_API_MODEL_MAP: Dict[str, str] = {
 
 DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
     "standard-tier": {
-        # Standard tier has higher daily limits (~1500-2000 requests/day)
-        "gemini-2.0-flash": 0.05,  # ~2000 requests
-        "gemini-2.5-pro": 0.1,  # ~1000 requests
-        "gemini-2.5-flash": 0.05,  # ~2000 requests
-        "gemini-2.5-flash-lite": 0.05,  # ~2000 requests
-        "gemini-3-pro-preview": 0.1,  # ~1000 requests
-        "gemini-3-flash-preview": 0.1,  # ~1000 requests
+        # Costs discovered via discover_quota_costs() on 2026-01-04
+        # Pro models: 0.4% per request (~250 requests per 100%)
+        # Flash models: 0.0667% per request (~1500 requests per 100%)
+        "gemini-2.0-flash": 0.0667,  # ~1500 requests
+        "gemini-2.5-pro": 0.4,  # ~250 requests
+        "gemini-2.5-flash": 0.0667,  # ~1500 requests
+        "gemini-2.5-flash-lite": 0.0667,  # ~1500 requests
+        "gemini-3-pro-preview": 0.4,  # ~250 requests
+        "gemini-3-flash-preview": 0.0667,  # ~1500 requests
     },
     "free-tier": {
-        # Free tier has lower daily limits (~1000 requests/day)
-        "gemini-2.0-flash": 0.1,  # ~1000 requests
-        "gemini-2.5-pro": 0.2,  # ~500 requests
-        "gemini-2.5-flash": 0.1,  # ~1000 requests
-        "gemini-2.5-flash-lite": 0.1,  # ~1000 requests
-        "gemini-3-pro-preview": 0.2,  # ~500 requests
-        "gemini-3-flash-preview": 0.2,  # ~500 requests
+        # Free tier assumed to be ~2x more expensive than standard
+        "gemini-2.0-flash": 0.1333,  # ~750 requests
+        "gemini-2.5-pro": 0.8,  # ~125 requests
+        "gemini-2.5-flash": 0.1333,  # ~750 requests
+        "gemini-2.5-flash-lite": 0.1333,  # ~750 requests
+        "gemini-3-pro-preview": 0.8,  # ~125 requests
+        "gemini-3-flash-preview": 0.1333,  # ~750 requests
     },
 }
 
