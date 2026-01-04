@@ -567,6 +567,9 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
             "GEMINI_CLI_QUOTA_REFRESH_INTERVAL", 300
         )
 
+        # Track whether initial quota fetch has been done (for background job)
+        self._initial_quota_fetch_done = False
+
         # Gemini 3 configuration from environment
         memory_ttl = _env_int("GEMINI_CLI_SIGNATURE_CACHE_TTL", 3600)
         disk_ttl = _env_int("GEMINI_CLI_SIGNATURE_DISK_TTL", 86400)
@@ -614,6 +617,10 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
             f"cache={self._enable_signature_cache}, gemini3_fix={self._enable_gemini3_tool_fix}, "
             f"gemini3_strict_schema={self._gemini3_enforce_strict_schema}"
         )
+
+        # Quota tracking instance variables (required by GeminiCliQuotaTracker mixin)
+        self._learned_costs: Dict[str, Dict[str, float]] = {}
+        self._learned_costs_loaded: bool = False
 
     # =========================================================================
     # CREDENTIAL TIER LOOKUP (Provider-specific - uses cache)
@@ -801,6 +808,73 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
             )
 
         return loaded
+
+    # =========================================================================
+    # BACKGROUND JOB INTERFACE (Quota Baseline Refresh)
+    # =========================================================================
+
+    def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Return background job configuration for quota baseline refresh.
+
+        The quota baseline refresh fetches current quota status from the
+        Google Code Assist API and stores it in UsageManager for accurate
+        quota display in the viewer.
+
+        Returns:
+            Dict with job configuration, or None to disable background jobs.
+        """
+        return {
+            "interval": self._quota_refresh_interval,  # default 300s (5 min)
+            "name": "gemini_cli_quota_refresh",
+            "run_on_start": True,  # fetch baselines immediately at startup
+        }
+
+    async def run_background_job(
+        self,
+        usage_manager: "UsageManager",
+        credentials: List[str],
+    ) -> None:
+        """
+        Refresh quota baselines for credentials.
+
+        On first run (startup): Fetches quota for ALL credentials to establish baselines.
+        On subsequent runs: Only fetches for credentials used since last refresh.
+
+        Handles both file paths and env:// credential formats.
+
+        Args:
+            usage_manager: UsageManager instance to store baselines
+            credentials: List of credential paths (file paths or env:// URIs)
+        """
+        if not credentials:
+            return
+
+        if not self._initial_quota_fetch_done:
+            # First run: fetch ALL credentials to establish baselines
+            lib_logger.info(
+                f"GeminiCli: Fetching initial quota baselines for {len(credentials)} credentials..."
+            )
+            quota_results = await self.fetch_initial_baselines(credentials)
+            self._initial_quota_fetch_done = True
+        else:
+            # Subsequent runs: only recently used credentials (incremental updates)
+            usage_data = await usage_manager._get_usage_data_snapshot()
+            quota_results = await self.refresh_active_quota_baselines(
+                credentials, usage_data
+            )
+
+        if not quota_results:
+            return
+
+        # Store new baselines in UsageManager
+        stored = await self._store_baselines_to_usage_manager(
+            quota_results, usage_manager
+        )
+        if stored > 0:
+            lib_logger.debug(
+                f"GeminiCli quota refresh: updated {stored} model baselines"
+            )
 
     # NOTE: _post_auth_discovery() is inherited from GeminiAuthBase
 

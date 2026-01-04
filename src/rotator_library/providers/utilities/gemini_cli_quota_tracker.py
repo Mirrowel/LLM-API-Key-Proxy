@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -46,6 +46,7 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
 # Models exposed by Gemini CLI
 GEMINI_CLI_MODELS = [
+    "gemini-2.0-flash",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -64,6 +65,42 @@ _API_TO_USER_MODEL_MAP: Dict[str, str] = {
 _USER_TO_API_MODEL_MAP: Dict[str, str] = {
     v: k for k, v in _API_TO_USER_MODEL_MAP.items()
 }
+
+# =============================================================================
+# QUOTA COST CONSTANTS (in PERCENTAGE format)
+# =============================================================================
+# Quota costs per request as PERCENTAGE of 100% quota.
+# E.g., 0.1 means 0.1% per request = 1000 requests total (100 / 0.1 = 1000)
+# These are initial estimates based on observed quota bucket behavior.
+# Learned costs override these if available.
+
+DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
+    "standard-tier": {
+        # Standard tier has higher daily limits (~1500-2000 requests/day)
+        "gemini-2.0-flash": 0.05,  # ~2000 requests
+        "gemini-2.5-pro": 0.1,  # ~1000 requests
+        "gemini-2.5-flash": 0.05,  # ~2000 requests
+        "gemini-2.5-flash-lite": 0.05,  # ~2000 requests
+        "gemini-3-pro-preview": 0.1,  # ~1000 requests
+        "gemini-3-flash-preview": 0.1,  # ~1000 requests
+    },
+    "free-tier": {
+        # Free tier has lower daily limits (~1000 requests/day)
+        "gemini-2.0-flash": 0.1,  # ~1000 requests
+        "gemini-2.5-pro": 0.2,  # ~500 requests
+        "gemini-2.5-flash": 0.1,  # ~1000 requests
+        "gemini-2.5-flash-lite": 0.1,  # ~1000 requests
+        "gemini-3-pro-preview": 0.2,  # ~500 requests
+        "gemini-3-flash-preview": 0.2,  # ~500 requests
+    },
+}
+
+# Default quota cost for unknown models (0.1% = 1000 requests max)
+DEFAULT_QUOTA_COST_UNKNOWN = 0.1
+
+# Delay before fetching quota after a request (API needs time to update)
+# Used for manual cost discovery
+QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
 
 
 def _get_gemini_cli_cache_dir() -> Path:
@@ -92,6 +129,156 @@ class GeminiCliQuotaTracker:
     _quota_refresh_interval: int
     project_tier_cache: Dict[str, str]
     project_id_cache: Dict[str, str]
+
+    # Learned costs storage (instance variables initialized lazily)
+    _learned_costs: Dict[str, Dict[str, float]]
+    _learned_costs_loaded: bool
+
+    # =========================================================================
+    # QUOTA COST METHODS
+    # =========================================================================
+
+    def _get_learned_costs_file(self) -> Path:
+        """Get the file path for storing learned quota costs."""
+        return _get_gemini_cli_cache_dir() / "learned_quota_costs.json"
+
+    def _load_learned_costs(self) -> None:
+        """
+        Load learned quota costs from cache file.
+
+        Learned costs override the default estimates when available.
+        They are populated through manual cost discovery or observation.
+        """
+        # Initialize if not present
+        if not hasattr(self, "_learned_costs"):
+            self._learned_costs = {}
+        if not hasattr(self, "_learned_costs_loaded"):
+            self._learned_costs_loaded = False
+
+        if self._learned_costs_loaded:
+            return
+
+        costs_file = self._get_learned_costs_file()
+        if costs_file.exists():
+            try:
+                with open(costs_file, "r") as f:
+                    data = json.load(f)
+                    # Validate schema
+                    if data.get("schema_version") == 1:
+                        self._learned_costs = data.get("costs", {})
+                        lib_logger.debug(
+                            f"Loaded {sum(len(v) for v in self._learned_costs.values())} "
+                            f"learned Gemini CLI quota costs"
+                        )
+            except Exception as e:
+                # Failed to load learned costs; use defaults
+                lib_logger.warning(f"Failed to load learned quota costs: {e}")
+
+        self._learned_costs_loaded = True
+
+    def _save_learned_costs(self) -> None:
+        """Save learned quota costs to cache file."""
+        if not hasattr(self, "_learned_costs") or not self._learned_costs:
+            return
+
+        costs_file = self._get_learned_costs_file()
+        try:
+            costs_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(costs_file, "w") as f:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "costs": self._learned_costs,
+                    },
+                    f,
+                    indent=2,
+                )
+            lib_logger.debug(f"Saved learned Gemini CLI quota costs to {costs_file}")
+        except Exception as e:
+            lib_logger.warning(f"Failed to save learned quota costs: {e}")
+
+    def get_quota_cost(self, model: str, tier: str) -> float:
+        """
+        Get quota cost per request for a model/tier combination.
+
+        Cost is expressed as a PERCENTAGE (0-100 scale).
+        E.g., 0.1 means each request uses 0.1% of quota = 1000 max requests.
+
+        Priority: learned costs > default costs > unknown fallback
+
+        Args:
+            model: Model name (without provider prefix)
+            tier: Tier name (e.g., "standard-tier", "free-tier")
+
+        Returns:
+            Cost per request as percentage (0.1 = 0.1% per request)
+        """
+        self._load_learned_costs()
+
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        # Check learned costs first
+        if tier in self._learned_costs and clean_model in self._learned_costs[tier]:
+            return self._learned_costs[tier][clean_model]
+
+        # Fall back to defaults
+        tier_costs = DEFAULT_QUOTA_COSTS.get(
+            tier, DEFAULT_QUOTA_COSTS.get("standard-tier", {})
+        )
+        return tier_costs.get(clean_model, DEFAULT_QUOTA_COST_UNKNOWN)
+
+    def get_max_requests_for_model(self, model: str, tier: str) -> int:
+        """
+        Calculate the maximum number of requests for a model/tier.
+
+        Based on quota cost: max_requests = 100 / cost_percentage
+
+        Args:
+            model: Model name (without provider prefix)
+            tier: Tier name
+
+        Returns:
+            Maximum number of requests (e.g., 1000 for 0.1% cost)
+        """
+        cost = self.get_quota_cost(model, tier)
+        if cost <= 0:
+            return 0
+        return int(100 / cost)
+
+    def update_learned_cost(self, model: str, tier: str, cost: float) -> None:
+        """
+        Update a learned cost for a model/tier combination.
+
+        This can be called after observing actual quota consumption to
+        refine the cost estimates over time.
+
+        Args:
+            model: Model name (without provider prefix)
+            tier: Tier name
+            cost: New cost value (percentage per request)
+        """
+        self._load_learned_costs()
+
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        if tier not in self._learned_costs:
+            self._learned_costs[tier] = {}
+
+        if cost <= 0:
+            lib_logger.warning(
+                f"Invalid quota cost {cost} for {tier}/{clean_model}; cost must be > 0"
+            )
+            return
+
+        self._learned_costs[tier][clean_model] = cost
+        self._save_learned_costs()
+
+        lib_logger.info(
+            f"Updated learned quota cost: {tier}/{clean_model} = {cost}% "
+            f"(~{int(100 / cost)} requests)"
+        )
 
     def _user_to_api_model(self, model: str) -> str:
         """
@@ -571,9 +758,15 @@ class GeminiCliQuotaTracker:
                 user_model = self._api_to_user_model(model_id)
                 prefixed_model = f"gemini_cli/{user_model}"
 
-                # Store baseline (no max_requests for Gemini CLI as it's token-based)
+                # Get tier for this credential (handles both path and env://)
+                tier = self.project_tier_cache.get(cred_path, "standard-tier")
+
+                # Calculate max_requests from tier-based cost
+                max_requests = self.get_max_requests_for_model(user_model, tier)
+
+                # Store baseline with calculated max_requests
                 await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests=None
+                    cred_path, prefixed_model, remaining, max_requests=max_requests
                 )
                 stored_count += 1
 
@@ -583,19 +776,20 @@ class GeminiCliQuotaTracker:
         """
         Get quota groups for Gemini CLI models.
 
-        Unlike Antigravity which has shared pools, Gemini CLI has per-model quotas.
-        We still group by model family for the quota viewer display.
+        Each model has its own separate quota bucket from the API,
+        so we show each as its own line in the quota display.
 
         Returns:
             Dict mapping group name -> list of models in that group
         """
         return {
-            # Gemini 2.5 family
+            # Each model is its own quota bucket (no grouping)
+            "gemini-2.0-flash": ["gemini-2.0-flash"],
             "gemini-2.5-pro": ["gemini-2.5-pro"],
-            "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
-            # Gemini 3 family
-            "gemini-3-pro": ["gemini-3-pro-preview"],
-            "gemini-3-flash": ["gemini-3-flash-preview"],
+            "gemini-2.5-flash": ["gemini-2.5-flash"],
+            "gemini-2.5-flash-lite": ["gemini-2.5-flash-lite"],
+            "gemini-3-pro-preview": ["gemini-3-pro-preview"],
+            "gemini-3-flash-preview": ["gemini-3-flash-preview"],
         }
 
     def _resolve_tier_priority(self, tier: str) -> int:
