@@ -780,16 +780,17 @@ class GeminiCliQuotaTracker:
         so we show each as its own line in the quota display.
 
         Returns:
-            Dict mapping group name -> list of models in that group
+            Dict mapping group name -> list of models in that group.
+            Group names omit "gemini-" prefix since provider is already gemini_cli.
         """
         return {
-            # Each model is its own quota bucket (no grouping)
-            "gemini-2.0-flash": ["gemini-2.0-flash"],
-            "gemini-2.5-pro": ["gemini-2.5-pro"],
-            "gemini-2.5-flash": ["gemini-2.5-flash"],
-            "gemini-2.5-flash-lite": ["gemini-2.5-flash-lite"],
-            "gemini-3-pro-preview": ["gemini-3-pro-preview"],
-            "gemini-3-flash-preview": ["gemini-3-flash-preview"],
+            # Pro models share a quota pool
+            "pro": ["gemini-2.5-pro", "gemini-3-pro-preview"],
+            # 2.5-flash and flash-lite share a quota pool
+            "2.5-flash": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+            # These have independent pools
+            "2.0-flash": ["gemini-2.0-flash"],
+            "3-flash": ["gemini-3-flash-preview"],
         }
 
     def _resolve_tier_priority(self, tier: str) -> int:
