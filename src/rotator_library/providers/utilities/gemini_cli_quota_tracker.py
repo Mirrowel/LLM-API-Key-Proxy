@@ -928,10 +928,11 @@ class GeminiCliQuotaTracker:
                     )
                     continue
 
-                # Find the bucket for this model
+                # Find the bucket for this model (convert to API model name)
+                api_model = self._user_to_api_model(model)
                 before_remaining = None
                 for bucket in before_quota.get("buckets", []):
-                    if bucket.get("model_id") == model:
+                    if bucket.get("model_id") == api_model:
                         before_remaining = bucket.get("remaining_fraction")
                         break
 
@@ -971,10 +972,10 @@ class GeminiCliQuotaTracker:
                     )
                     continue
 
-                # Find the bucket for this model after
+                # Find the bucket for this model after (use same API model name)
                 after_remaining = None
                 for bucket in after_quota.get("buckets", []):
-                    if bucket.get("model_id") == model:
+                    if bucket.get("model_id") == api_model:
                         after_remaining = bucket.get("remaining_fraction")
                         break
 
@@ -1066,10 +1067,12 @@ class GeminiCliQuotaTracker:
             auth_header = await self.get_auth_header(credential_path)
             access_token = auth_header["Authorization"].split(" ")[1]
 
-            # Get project_id
+            # Get project_id (use cache or discover with proper signature)
             project_id = self.project_id_cache.get(credential_path)
             if not project_id:
-                project_id, _ = await self._discover_project_id(credential_path)
+                project_id = await self._discover_project_id(
+                    credential_path, access_token, {}
+                )
 
             # Build minimal request payload for Gemini CLI
             url = f"{CODE_ASSIST_ENDPOINT}:generateContent"
