@@ -811,3 +811,292 @@ class GeminiCliQuotaTracker:
             "free-tier": 3,
         }
         return tier_priorities.get(tier, 10)
+
+    # =========================================================================
+    # QUOTA COST DISCOVERY
+    # =========================================================================
+
+    async def discover_quota_costs(
+        self,
+        credential_path: str,
+        models_to_test: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Discover quota costs by making test requests and measuring before/after.
+
+        MANUAL USE ONLY - This makes actual API requests that consume quota.
+        Use once per new tier to establish baseline costs for unknown tiers.
+
+        The method tests one model per quota group, measures the quota consumption,
+        and stores the discovered costs in the learned_costs.json file.
+
+        Args:
+            credential_path: Credential to test with (file path or env:// URI)
+            models_to_test: Specific models to test (None = one representative per quota group)
+
+        Returns:
+            {
+                "status": "success" | "partial" | "error",
+                "tier": str,
+                "credential": str,
+                "discovered_costs": {"model": cost_percent, ...},
+                "updated_groups": ["group1", "group2", ...],
+                "errors": [...],
+                "message": str,
+            }
+        """
+        identifier = (
+            Path(credential_path).name
+            if not credential_path.startswith("env://")
+            else credential_path
+        )
+
+        result: Dict[str, Any] = {
+            "status": "error",
+            "tier": "unknown",
+            "credential": identifier,
+            "discovered_costs": {},
+            "updated_groups": [],
+            "errors": [],
+            "message": "",
+        }
+
+        # 1. Get tier for this credential
+        tier = self.project_tier_cache.get(credential_path)
+        if not tier:
+            # Try to load from file metadata
+            try:
+                with open(credential_path, "r") as f:
+                    cred_data = json.load(f)
+                    tier = cred_data.get("_proxy_metadata", {}).get("tier")
+            except Exception:
+                pass  # Will try API discovery below
+
+        if not tier or tier == "unknown":
+            # Try to discover tier by making a fetch first
+            try:
+                quota_data = await self.retrieve_user_quota(credential_path)
+                if quota_data.get("status") == "success":
+                    tier = quota_data.get("tier") or self.project_tier_cache.get(
+                        credential_path
+                    )
+            except Exception as e:
+                result["errors"].append(f"Failed to discover tier: {e}")
+
+        if not tier or tier == "unknown":
+            result["errors"].append(
+                "Could not determine tier for credential. "
+                "Make at least one successful request first to discover the tier."
+            )
+            result["message"] = "Failed: unknown tier"
+            return result
+
+        result["tier"] = tier
+
+        # 2. Determine which models to test (one per quota group)
+        if models_to_test is None:
+            groups = self._get_effective_quota_groups()
+            models_to_test = []
+            for group_name, group_models in groups.items():
+                # Pick first model in each group as representative
+                if group_models:
+                    models_to_test.append(group_models[0])
+
+        if not models_to_test:
+            result["errors"].append("No models to test")
+            result["message"] = "Failed: no models to test"
+            return result
+
+        lib_logger.info(
+            f"Starting quota cost discovery for {identifier} (tier={tier}). "
+            f"Testing {len(models_to_test)} models..."
+        )
+
+        # 3. Test each model
+        discovered_costs: Dict[str, float] = {}
+        updated_groups: List[str] = []
+
+        for model in models_to_test:
+            try:
+                # Fetch quota before
+                before_quota = await self.retrieve_user_quota(credential_path)
+                if before_quota.get("status") != "success":
+                    result["errors"].append(
+                        f"{model}: Failed to fetch before quota: {before_quota.get('error')}"
+                    )
+                    continue
+
+                # Find the bucket for this model
+                before_remaining = None
+                for bucket in before_quota.get("buckets", []):
+                    if bucket.get("model_id") == model:
+                        before_remaining = bucket.get("remaining_fraction")
+                        break
+
+                if before_remaining is None:
+                    result["errors"].append(
+                        f"{model}: Model not found in quota response"
+                    )
+                    continue
+
+                if before_remaining <= 0.01:
+                    result["errors"].append(
+                        f"{model}: Quota too low to test safely ({before_remaining:.2%})"
+                    )
+                    continue
+
+                # Make a minimal test request
+                lib_logger.debug(f"Making test request for {model}...")
+                test_result = await self._make_test_request(credential_path, model)
+
+                if not test_result["success"]:
+                    result["errors"].append(
+                        f"{model}: Test request failed: {test_result.get('error')}"
+                    )
+                    continue
+
+                # Wait for API to update quota
+                lib_logger.debug(
+                    f"Waiting {QUOTA_DISCOVERY_DELAY_SECONDS}s for API to update..."
+                )
+                await asyncio.sleep(QUOTA_DISCOVERY_DELAY_SECONDS)
+
+                # Fetch quota after
+                after_quota = await self.retrieve_user_quota(credential_path)
+                if after_quota.get("status") != "success":
+                    result["errors"].append(
+                        f"{model}: Failed to fetch after quota: {after_quota.get('error')}"
+                    )
+                    continue
+
+                # Find the bucket for this model after
+                after_remaining = None
+                for bucket in after_quota.get("buckets", []):
+                    if bucket.get("model_id") == model:
+                        after_remaining = bucket.get("remaining_fraction")
+                        break
+
+                if after_remaining is None:
+                    # Quota exhausted after our request
+                    after_remaining = 0.0
+
+                # Calculate cost
+                delta = before_remaining - after_remaining
+                if delta < 0:
+                    result["errors"].append(
+                        f"{model}: Negative delta (quota reset during test?)"
+                    )
+                    continue
+
+                cost_percent = round(delta * 100.0, 4)
+
+                if cost_percent < 0.001:
+                    result["errors"].append(
+                        f"{model}: Cost too small ({cost_percent}%) - API may not have updated yet"
+                    )
+                    continue
+
+                discovered_costs[model] = cost_percent
+                lib_logger.info(
+                    f"Discovered cost for {model}: {cost_percent}% per request "
+                    f"(~{int(100.0 / cost_percent)} requests per 100%)"
+                )
+
+                # Update all models in the same group
+                quota_group = self._get_quota_group_for_model(model)
+                if quota_group:
+                    groups = self._get_effective_quota_groups()
+                    for group_model in groups.get(quota_group, []):
+                        discovered_costs[group_model] = cost_percent
+                    updated_groups.append(quota_group)
+
+            except Exception as e:
+                result["errors"].append(f"{model}: Exception: {e}")
+                lib_logger.warning(f"Error testing {model}: {e}")
+
+        # 4. Save discovered costs to file
+        if discovered_costs:
+            self._load_learned_costs()
+            if tier not in self._learned_costs:
+                self._learned_costs[tier] = {}
+            self._learned_costs[tier].update(discovered_costs)
+            self._save_learned_costs()
+
+            result["status"] = "success" if not result["errors"] else "partial"
+            result["discovered_costs"] = discovered_costs
+            result["updated_groups"] = updated_groups
+            result["message"] = (
+                f"Discovered costs for {len(discovered_costs)} models in tier '{tier}'. "
+                f"Saved to learned_quota_costs.json"
+            )
+            lib_logger.info(result["message"])
+        else:
+            result["message"] = "No costs discovered"
+
+        return result
+
+    def _get_quota_group_for_model(self, model: str) -> Optional[str]:
+        """Get the quota group name for a model."""
+        clean_model = model.split("/")[-1] if "/" in model else model
+        groups = self._get_effective_quota_groups()
+        for group_name, models in groups.items():
+            if clean_model in models:
+                return group_name
+        return None
+
+    async def _make_test_request(
+        self,
+        credential_path: str,
+        model: str,
+    ) -> Dict[str, Any]:
+        """
+        Make a minimal test request to consume quota.
+
+        Args:
+            credential_path: Credential to use
+            model: Model to test (e.g., "gemini-2.5-pro")
+
+        Returns:
+            {"success": bool, "error": str | None}
+        """
+        try:
+            # Get auth header
+            auth_header = await self.get_auth_header(credential_path)
+            access_token = auth_header["Authorization"].split(" ")[1]
+
+            # Get project_id
+            project_id = self.project_id_cache.get(credential_path)
+            if not project_id:
+                project_id, _ = await self._discover_project_id(credential_path)
+
+            # Build minimal request payload for Gemini CLI
+            url = f"{CODE_ASSIST_ENDPOINT}:generateContent"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "project": project_id,
+                "model": model,
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "Say 'test'"}]}],
+                    "generationConfig": {"maxOutputTokens": 10},
+                },
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url, headers=headers, json=payload, timeout=60
+                )
+
+                if response.status_code == 200:
+                    return {"success": True, "error": None}
+                else:
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                    }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
