@@ -778,12 +778,14 @@ class GeminiCliQuotaTracker:
         """
         Get quota groups for Gemini CLI models.
 
-        Each model has its own separate quota bucket from the API,
-        so we show each as its own line in the quota display.
+        Models within the same group share a quota pool from the API.
+        This was determined through empirical testing - requests to one model
+        in a group consume quota from all models in that group.
 
         Returns:
             Dict mapping group name -> list of models in that group.
-            Group names omit "gemini-" prefix since provider is already gemini_cli.
+            Group names omit "gemini-" prefix since provider is already gemini_cli,
+            and to avoid truncation in the TUI summary view.
         """
         return {
             # Pro models share a quota pool
@@ -866,13 +868,14 @@ class GeminiCliQuotaTracker:
         # 1. Get tier for this credential
         tier = self.project_tier_cache.get(credential_path)
         if not tier:
-            # Try to load from file metadata
-            try:
-                with open(credential_path, "r") as f:
-                    cred_data = json.load(f)
-                    tier = cred_data.get("_proxy_metadata", {}).get("tier")
-            except Exception:
-                pass  # Will try API discovery below
+            # Try to load from file metadata (only for file-based credentials)
+            if not credential_path.startswith("env://"):
+                try:
+                    with open(credential_path, "r") as f:
+                        cred_data = json.load(f)
+                        tier = cred_data.get("_proxy_metadata", {}).get("tier")
+                except Exception:
+                    pass  # Will try API discovery below
 
         if not tier or tier == "unknown":
             # Try to discover tier by making a fetch first
