@@ -132,6 +132,10 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64000
 # See: https://ai.google.dev/gemini-api/docs/models
 GEMINI_MAX_OUTPUT_TOKENS = 16384
 
+# Claude max output tokens cap - Claude models have a 64K output limit
+# See: https://docs.anthropic.com/en/docs/about-claude/models
+CLAUDE_MAX_OUTPUT_TOKENS = 64000
+
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
 # automatically retry up to this many attempts before giving up (minimum 1)
@@ -4072,6 +4076,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     f"Capping maxOutputTokens from {current_max} to {GEMINI_MAX_OUTPUT_TOKENS} for Gemini model"
                 )
                 gen_config["maxOutputTokens"] = GEMINI_MAX_OUTPUT_TOKENS
+
+        # Reject requests that exceed Claude's max_tokens limit (64K)
+        # Let the client see the error so it can adjust its request
+        if is_claude and gen_config.get("maxOutputTokens"):
+            current_max = gen_config["maxOutputTokens"]
+            if current_max > CLAUDE_MAX_OUTPUT_TOKENS:
+                raise ValueError(
+                    f"max_tokens: {current_max} > {CLAUDE_MAX_OUTPUT_TOKENS}, "
+                    f"which is the maximum allowed number of output tokens for {model}"
+                )
 
         antigravity_payload["request"]["generationConfig"] = gen_config
 
