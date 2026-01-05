@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Dict,
@@ -36,20 +37,19 @@ from typing import (
     Optional,
     Tuple,
     Union,
-    TYPE_CHECKING,
 )
 
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
-from .antigravity_auth_base import AntigravityAuthBase
-from .provider_cache import ProviderCache
-from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
+from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError, TransientQuotaError
-from ..utils.paths import get_logs_dir, get_cache_dir
+from ..utils.paths import get_cache_dir, get_logs_dir
+from .antigravity_auth_base import AntigravityAuthBase
+from .provider_cache import ProviderCache
+from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
+from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 
 if TYPE_CHECKING:
     from ..usage_manager import UsageManager
@@ -153,7 +153,11 @@ CLAUDE_FORCED_THINKING_BUDGET = 31999
 
 
 def _is_valid_thinking_signature(signature):
-    return isinstance(signature, str) and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH
+    return (
+        isinstance(signature, str) and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH
+    )
+
+
 MALFORMED_CALL_RETRY_DELAY = _env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 
 # Model alias mappings (internal ↔ public)
@@ -263,7 +267,7 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 ## COMMON FAILURE PATTERNS TO AVOID
 
 - Using 'path' when schema says 'filePath' (or vice versa)
-- Using 'content' when schema says 'text' (or vice versa)  
+- Using 'content' when schema says 'text' (or vice versa)
 - Providing {"file": "..."} when schema wants [{"path": "...", "line_ranges": [...]}]
 - Omitting required nested fields in array items
 - Adding 'additionalProperties' that the schema doesn't define
@@ -298,10 +302,15 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
 
 # Claude interleaved thinking hint (encourages thinking after tool results)
-DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """CRITICAL: Interleaved thinking is required. Emit a thinking block:
+DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """CRITICAL: Interleaved thinking is required and IS UNCOMPROMISINGLY A MUST DO. Emit a thinking block:
 - Before every tool call (to reason about what you're doing)
 - After every tool result (to analyze the result before proceeding)
 Never skip thinking, even for simple or sequential tool calls."""
+
+# Short reminder appended to tool results to reinforce interleaved thinking
+DEFAULT_CLAUDE_TOOL_RESULT_THINKING_REMINDER = """<system-reminder>
+CRITICAL: Interleaved thinking is required. You MUST emit a thinking block NOW to analyze this tool result before proceeding with any response or tool call.
+</system-reminder>"""
 
 
 # =============================================================================
@@ -674,7 +683,9 @@ def _merge_all_of(schema: Any) -> Any:
             sub_schema = _merge_all_of(sub_schema)
 
             # Merge properties (later overrides earlier)
-            if "properties" in sub_schema and isinstance(sub_schema["properties"], dict):
+            if "properties" in sub_schema and isinstance(
+                sub_schema["properties"], dict
+            ):
                 for key, value in sub_schema["properties"].items():
                     merged_properties[key] = value
 
@@ -685,7 +696,10 @@ def _merge_all_of(schema: Any) -> Any:
 
             # Copy other fields (first occurrence wins)
             for key, value in sub_schema.items():
-                if key not in ("properties", "required", "allOf") and key not in other_fields:
+                if (
+                    key not in ("properties", "required", "allOf")
+                    and key not in other_fields
+                ):
                     other_fields[key] = value
 
         # Build result without allOf
@@ -811,7 +825,9 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 if not isinstance(option, dict):
                     continue
                 # Collect type names for hint
-                type_name = option.get("type") or ("object" if "properties" in option else None)
+                type_name = option.get("type") or (
+                    "object" if "properties" in option else None
+                )
                 if type_name and type_name != "null":
                     type_names.append(type_name)
                 # Score and track best
@@ -827,7 +843,9 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                     if len(type_names) > 1:
                         hint = f"one of: {', '.join(type_names)}"
                         if "description" in cleaned_option:
-                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                            cleaned_option["description"] = (
+                                f"{cleaned_option['description']} ({hint})"
+                            )
                         else:
                             cleaned_option["description"] = hint
                     return cleaned_option
@@ -842,7 +860,9 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
             for option in options:
                 if not isinstance(option, dict):
                     continue
-                type_name = option.get("type") or ("object" if "properties" in option else None)
+                type_name = option.get("type") or (
+                    "object" if "properties" in option else None
+                )
                 if type_name and type_name != "null":
                     type_names.append(type_name)
                 score = _score_schema_option(option)
@@ -856,7 +876,9 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                     if len(type_names) > 1:
                         hint = f"one of: {', '.join(type_names)}"
                         if "description" in cleaned_option:
-                            cleaned_option["description"] = f"{cleaned_option['description']} ({hint})"
+                            cleaned_option["description"] = (
+                                f"{cleaned_option['description']} ({hint})"
+                            )
                         else:
                             cleaned_option["description"] = hint
                     return cleaned_option
@@ -1430,6 +1452,13 @@ class AntigravityProvider(
             "ANTIGRAVITY_CLAUDE_INTERLEAVED_HINT",
             DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT,
         )
+        self._enable_claude_tool_result_reminder = _env_bool(
+            "ANTIGRAVITY_ENABLE_CLAUDE_TOOL_RESULT_REMINDER", True
+        )
+        self._claude_tool_result_reminder = os.getenv(
+            "ANTIGRAVITY_CLAUDE_TOOL_RESULT_REMINDER",
+            DEFAULT_CLAUDE_TOOL_RESULT_THINKING_REMINDER,
+        )
 
         # Parallel tool usage instruction configuration
         self._enable_parallel_tool_instruction_claude = _env_bool(
@@ -1456,7 +1485,8 @@ class AntigravityProvider(
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
             f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}, "
-            f"claude_interleaved_hint={self._enable_claude_interleaved_hint}"
+            f"claude_interleaved_hint={self._enable_claude_interleaved_hint}, "
+            f"claude_tool_result_reminder={self._enable_claude_tool_result_reminder}"
         )
 
     def _get_antigravity_headers(self) -> Dict[str, str]:
@@ -2570,7 +2600,11 @@ class AntigravityProvider(
         if not reasoning_effort:
             if is_claude:
                 # Use client-provided budget if available, otherwise use default
-                budget = thinking_budget if thinking_budget else CLAUDE_FORCED_THINKING_BUDGET
+                budget = (
+                    thinking_budget
+                    if thinking_budget
+                    else CLAUDE_FORCED_THINKING_BUDGET
+                )
                 return {
                     "thinkingBudget": budget,
                     "include_thoughts": True,
@@ -2582,7 +2616,9 @@ class AntigravityProvider(
 
         if is_claude:
             # Use client-provided budget if available, otherwise use default
-            budget = thinking_budget if thinking_budget else CLAUDE_FORCED_THINKING_BUDGET
+            budget = (
+                thinking_budget if thinking_budget else CLAUDE_FORCED_THINKING_BUDGET
+            )
             return {
                 "thinkingBudget": budget,
                 "include_thoughts": True,
@@ -2908,6 +2944,13 @@ class AntigravityProvider(
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
+        # Determine if we should add thinking reminder for Claude
+        should_add_reminder = (
+            self._is_claude(model)
+            and self._enable_claude_tool_result_reminder
+            and self._claude_tool_result_reminder
+        )
+
         # Handle multimodal content (array with text and images)
         if isinstance(content, list):
             text_parts = []
@@ -2928,27 +2971,41 @@ class AntigravityProvider(
                             # Parse: data:image/png;base64,iVBORw0KG...
                             header, data = image_url.split(",", 1)
                             mime_type = header.split(":")[1].split(";")[0]
-                            image_parts.append({
-                                "inlineData": {
-                                    "mimeType": mime_type,
-                                    "data": data,
+                            image_parts.append(
+                                {
+                                    "inlineData": {
+                                        "mimeType": mime_type,
+                                        "data": data,
+                                    }
                                 }
-                            })
+                            )
                         except Exception as e:
-                            lib_logger.warning(f"Failed to parse image data URL in tool response: {e}")
+                            lib_logger.warning(
+                                f"Failed to parse image data URL in tool response: {e}"
+                            )
 
             # Build the result parts
             parts = []
 
             # Add function response with text content
             text_result = " ".join(text_parts) if text_parts else ""
-            parts.append({
-                "functionResponse": {
-                    "name": func_name,
-                    "response": {"result": text_result if text_result else "Image content provided"},
-                    "id": tool_id,
+            result_content = (
+                text_result if text_result else "Image content provided"
+            )
+
+            # Append thinking reminder for Claude
+            if should_add_reminder:
+                result_content = f"{result_content}\n\n{self._claude_tool_result_reminder}"
+
+            parts.append(
+                {
+                    "functionResponse": {
+                        "name": func_name,
+                        "response": {"result": result_content},
+                        "id": tool_id,
+                    }
                 }
-            })
+            )
 
             # Add image parts separately (Gemini handles these as additional parts)
             parts.extend(image_parts)
@@ -2960,6 +3017,14 @@ class AntigravityProvider(
             parsed_content = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             parsed_content = content
+
+        # Append thinking reminder for Claude (for string/parsed content)
+        if should_add_reminder:
+            if isinstance(parsed_content, str):
+                parsed_content = f"{parsed_content}\n\n{self._claude_tool_result_reminder}"
+            elif isinstance(parsed_content, dict):
+                # For dict results, add as a separate key
+                parsed_content["_system_reminder"] = self._claude_tool_result_reminder
 
         return [
             {
@@ -4110,8 +4175,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if is_claude:
             thinking_config = gen_config.get("thinkingConfig", {})
             if thinking_config:
-                if "includeThoughts" in thinking_config and "include_thoughts" not in thinking_config:
-                    thinking_config["include_thoughts"] = thinking_config.pop("includeThoughts")
+                if (
+                    "includeThoughts" in thinking_config
+                    and "include_thoughts" not in thinking_config
+                ):
+                    thinking_config["include_thoughts"] = thinking_config.pop(
+                        "includeThoughts"
+                    )
 
                 if "thinkingBudget" in thinking_config:
                     budget = thinking_config.pop("thinkingBudget")
@@ -4234,7 +4304,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
             # Accumulate signature for Claude caching
             if has_sig and is_thought and accumulator is not None:
-                if not self._is_claude(model) or _is_valid_thinking_signature(signature):
+                if not self._is_claude(model) or _is_valid_thinking_signature(
+                    signature
+                ):
                     accumulator["thought_signature"] = signature
 
             # Skip standalone signature parts
@@ -4351,7 +4423,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             )
 
             if has_sig and is_thought:
-                if not self._is_claude(model) or _is_valid_thinking_signature(signature):
+                if not self._is_claude(model) or _is_valid_thinking_signature(
+                    signature
+                ):
                     thought_sig = signature
 
             text_value = None
@@ -4604,9 +4678,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
     ) -> None:
         """Cache Claude thinking content."""
         if not _is_valid_thinking_signature(signature):
-            lib_logger.debug(
-                "[Thinking Cache] Skipping cache due to invalid signature"
-            )
+            lib_logger.debug("[Thinking Cache] Skipping cache due to invalid signature")
             return
 
         cache_key = self._generate_thinking_cache_key(text, tool_calls)
@@ -4781,12 +4853,18 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 )
 
         # Add interleaved thinking hint for Claude thinking models with tools
+        # Prepend at start AND append at end for maximum emphasis
         if (
             tools
             and self._is_claude(model)
             and thinking_enabled
             and self._enable_claude_interleaved_hint
         ):
+            # Prepend at start of system instructions
+            self._inject_tool_hardening_instruction(
+                gemini_payload, self._claude_interleaved_hint
+            )
+            # Also append at end of system instructions
             self._append_system_instruction(
                 gemini_payload, self._claude_interleaved_hint
             )
@@ -4849,8 +4927,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         # Transform to Antigravity format with real project ID
         payload = self._transform_to_antigravity_format(
-            gemini_payload, model, project_id, max_tokens, reasoning_effort, tool_choice,
-            original_messages=messages
+            gemini_payload,
+            model,
+            project_id,
+            max_tokens,
+            reasoning_effort,
+            tool_choice,
+            original_messages=messages,
         )
         file_logger.log_request(payload)
 
