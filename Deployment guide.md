@@ -43,7 +43,6 @@ git clone https://github.com/YOUR-USERNAME/LLM-API-Key-Proxy.git
 cd LLM-API-Key-Proxy
 ```
 
-
 ## Step 3: Assemble Your .env File
 
 The proxy uses a `.env` file to store your API keys securely. We'll create this based on the repo's documentation.
@@ -51,8 +50,8 @@ The proxy uses a `.env` file to store your API keys securely. We'll create this 
 1. In your cloned repo, copy the example: `copy .env.example .env` (Windows) or `cp .env.example .env` (macOS/Linux).
 2. Open `.env` in a text editor (e.g., Notepad or VS Code).
 3. Add your keys following the format from the repo's README and [LiteLLM Providers Documentation](https://docs.litellm.ai/docs/providers):
-    - **PROXY_API_KEY**: Create a strong, unique secret (e.g., "my-super-secret-proxy-key"). This authenticates requests to your proxy.
-    - **Provider Keys**: Add keys for your chosen providers. You can add multiple per provider (e.g., _1, _2) for rotation.
+   - **PROXY_API_KEY**: Create a strong, unique secret (e.g., "my-super-secret-proxy-key"). This authenticates requests to your proxy.
+   - **Provider Keys**: Add keys for your chosen providers. You can add multiple per provider (e.g., \_1, \_2) for rotation.
 
 Example `.env` (customize with your real keys):
 
@@ -71,6 +70,7 @@ OPENROUTER_API_KEY_1="your-openrouter-key"
     - Tip: Start with 1-2 providers to test. Don't share this file publicly!
 
 ### Advanced: Stateless Deployment for OAuth Providers (Gemini CLI, Qwen, iFlow)
+
 If you are using providers that require complex OAuth files (like **Gemini CLI**, **Qwen Code**, or **iFlow**), you don't need to upload the JSON files manually. The proxy includes a tool to "export" these credentials into environment variables.
 
 1.  Run the credential tool locally: `python -m rotator_library.credential_tool`
@@ -79,21 +79,23 @@ If you are using providers that require complex OAuth files (like **Gemini CLI**
 4.  Copy the contents of this file and paste them directly into your `.env` file or Render's "Environment Variables" section.
 5.  The proxy will automatically detect and use these variables—no file upload required!
 
-
 ### Advanced: Antigravity OAuth Provider
 
 The Antigravity provider requires OAuth2 authentication similar to Gemini CLI. It provides access to:
+
 - Gemini 2.5 models (Pro/Flash)
 - Gemini 3 models (Pro/Image-preview) - **requires paid-tier Google Cloud project**
 - Claude Sonnet 4.5 via Google's Antigravity proxy
 
 **Setting up Antigravity locally:**
+
 1. Run the credential tool: `python -m rotator_library.credential_tool`
 2. Select "Add OAuth Credential" and choose "Antigravity"
 3. Complete the OAuth flow in your browser
 4. The credential is saved to `oauth_creds/antigravity_oauth_1.json`
 
 **Exporting for stateless deployment:**
+
 1. Run: `python -m rotator_library.credential_tool`
 2. Select "Export Antigravity to .env"
 3. Copy the generated environment variables to your deployment platform:
@@ -105,13 +107,13 @@ The Antigravity provider requires OAuth2 authentication similar to Gemini CLI. I
    ```
 
 **Important Notes:**
+
 - Antigravity uses Google OAuth with additional scopes for cloud platform access
 - Gemini 3 models require a paid-tier Google Cloud project (free tier will fail)
 - The provider automatically handles thought signature caching for multi-turn conversations
 - Tool hallucination prevention is enabled by default for Gemini 3 models
 
 4. Save the file. (We'll upload it to Render in Step 5.)
-
 
 ## Step 4: Create a New Web Service on Render
 
@@ -120,13 +122,13 @@ The Antigravity provider requires OAuth2 authentication similar to Gemini CLI. I
 3. Choose **Build and deploy from a Git repository** > **Next**.
 4. Connect your GitHub account and select your forked repo.
 5. In the setup form:
-    - **Name**: Something like "llm-api-key-proxy".
-    - **Region**: Choose one close to you (e.g., Oregon for US West).
-    - **Branch**: "main" (or your default).
-    - **Runtime**: Python 3.
-    - **Build Command**: `pip install -r requirements.txt`.
-    - **Start Command**: `uvicorn src.proxy_app.main:app --host 0.0.0.0 --port $PORT`.
-    - **Instance Type**: Free (for testing; upgrade later for always-on service).
+   - **Name**: Something like "llm-api-key-proxy".
+   - **Region**: Choose one close to you (e.g., Oregon for US West).
+   - **Branch**: "main" (or your default).
+   - **Runtime**: Python 3.
+   - **Build Command**: `pip install -r requirements.txt`.
+   - **Start Command**: `uvicorn src.proxy_app.main:app --host 0.0.0.0 --port $PORT`.
+   - **Instance Type**: Free (for testing; upgrade later for always-on service).
 6. Click **Create Web Service**. Render will build and deploy—watch the progress in the Events tab.
 
 ## Step 5: Upload .env as a Secret File
@@ -152,6 +154,7 @@ curl -X POST https://your-service.onrender.com/v1/chat/completions -H "Content-T
 ```
 
     - Expected: A JSON response with the answer (e.g., "Paris").
+
 3. Check logs in Render's Dashboard for startup messages (e.g., "RotatingClient initialized").
 
 ## Step 7: Integrate with JanitorAI
@@ -176,6 +179,205 @@ That is it.
 
 ---
 
+## Appendix: Deploying with Docker
+
+Docker provides a consistent, portable deployment option for any platform. The proxy image is automatically built and published to GitHub Container Registry (GHCR) on every push to `main` or `dev` branches.
+
+### Quick Start with Docker Compose
+
+This is the **fastest way** to deploy the proxy using Docker.
+
+1. **Create your configuration files:**
+
+```bash
+# Clone the repo (or just download docker-compose.yml and .env.example)
+git clone https://github.com/Mirrowel/LLM-API-Key-Proxy.git
+cd LLM-API-Key-Proxy
+
+# Create your .env file
+cp .env.example .env
+nano .env  # Add your PROXY_API_KEY and provider keys
+```
+
+2. **Start the proxy:**
+
+```bash
+docker compose up -d
+```
+
+3. **Verify it's running:**
+
+```bash
+# Check container status
+docker compose ps
+
+# View logs
+docker compose logs -f
+
+# Test the endpoint
+curl http://localhost:8000/
+```
+
+### Manual Docker Run
+
+If you prefer not to use Docker Compose:
+
+```bash
+# Create necessary directories and files
+mkdir -p oauth_creds logs
+touch key_usage.json
+
+# Run the container
+docker run -d \
+  --name llm-api-proxy \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -v $(pwd)/.env:/app/.env:ro \
+  -v $(pwd)/oauth_creds:/app/oauth_creds \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/key_usage.json:/app/key_usage.json \
+  -e SKIP_OAUTH_INIT_CHECK=true \
+  -e PYTHONUNBUFFERED=1 \
+  ghcr.io/mirrowel/llm-api-key-proxy:latest
+```
+
+### Available Image Tags
+
+| Tag                     | Description                                     | Use Case             |
+| ----------------------- | ----------------------------------------------- | -------------------- |
+| `latest`                | Latest stable build from `main` branch          | Production           |
+| `dev-latest`            | Latest build from `dev` branch                  | Testing new features |
+| `YYYYMMDD-HHMMSS-<sha>` | Specific version with timestamp and commit hash | Pinned deployments   |
+
+Example using a specific version:
+
+```bash
+docker pull ghcr.io/mirrowel/llm-api-key-proxy:20250106-143022-abc1234
+```
+
+### Volume Mounts Explained
+
+| Host Path          | Container Path        | Purpose                           | Mode              |
+| ------------------ | --------------------- | --------------------------------- | ----------------- |
+| `./.env`           | `/app/.env`           | Configuration and API keys        | Read-only (`:ro`) |
+| `./oauth_creds/`   | `/app/oauth_creds/`   | OAuth credential JSON files       | Read-write        |
+| `./logs/`          | `/app/logs/`          | Request logs and detailed logging | Read-write        |
+| `./key_usage.json` | `/app/key_usage.json` | Usage statistics persistence      | Read-write        |
+
+### Setting Up OAuth Providers with Docker
+
+OAuth providers (Antigravity, Gemini CLI, Qwen Code, iFlow) require interactive browser authentication. Since Docker containers run headless, you must authenticate **outside the container** first.
+
+#### Option 1: Authenticate Locally, Mount Credentials (Recommended)
+
+1. **Set up the project locally:**
+
+```bash
+git clone https://github.com/Mirrowel/LLM-API-Key-Proxy.git
+cd LLM-API-Key-Proxy
+pip install -r requirements.txt
+```
+
+2. **Run the credential tool and complete OAuth flows:**
+
+```bash
+python -m rotator_library.credential_tool
+# Select "Add OAuth Credential" → Choose provider
+# Complete authentication in browser
+```
+
+3. **Deploy with Docker, mounting the oauth_creds directory:**
+
+```bash
+docker compose up -d
+# The oauth_creds/ directory is automatically mounted
+```
+
+#### Option 2: Export Credentials to Environment Variables
+
+For truly stateless deployments (no mounted credential files):
+
+1. **Complete OAuth locally as above**
+
+2. **Export credentials to environment variables:**
+
+```bash
+python -m rotator_library.credential_tool
+# Select "Export [Provider] to .env"
+```
+
+3. **Add the exported variables to your `.env` file:**
+
+```env
+# Example for Antigravity
+ANTIGRAVITY_ACCESS_TOKEN="ya29.a0AfB_byD..."
+ANTIGRAVITY_REFRESH_TOKEN="1//0gL6dK9..."
+ANTIGRAVITY_EXPIRY_DATE="1735901234567"
+ANTIGRAVITY_EMAIL="user@gmail.com"
+ANTIGRAVITY_CLIENT_ID="1071006060591-..."
+ANTIGRAVITY_CLIENT_SECRET="GOCSPX-..."
+```
+
+4. **Deploy with Docker:**
+
+```bash
+docker compose up -d
+# Credentials are loaded from .env, no oauth_creds mount needed
+```
+
+### Development: Building Locally
+
+For development or customization, use the development compose file:
+
+```bash
+# Build and run from local source
+docker compose -f docker-compose.dev.yml up -d --build
+
+# Rebuild after code changes
+docker compose -f docker-compose.dev.yml up -d --build --force-recreate
+```
+
+### Container Management
+
+```bash
+# Stop the proxy
+docker compose down
+
+# Restart the proxy
+docker compose restart
+
+# View real-time logs
+docker compose logs -f
+
+# Check container resource usage
+docker stats llm-api-proxy
+
+# Update to latest image
+docker compose pull
+docker compose up -d
+```
+
+### Docker on Different Platforms
+
+The image is built for both `linux/amd64` and `linux/arm64` architectures, so it works on:
+
+- Linux servers (x86_64, ARM64)
+- macOS (Intel and Apple Silicon)
+- Windows with WSL2/Docker Desktop
+- Raspberry Pi 4+ (ARM64)
+
+### Troubleshooting Docker Deployment
+
+| Issue                         | Solution                                                                                                         |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Container exits immediately   | Check logs: `docker compose logs` — likely missing `.env` or invalid config                                      |
+| Permission denied on volumes  | Ensure directories exist and have correct permissions: `mkdir -p oauth_creds logs && chmod 755 oauth_creds logs` |
+| OAuth credentials not loading | Verify `oauth_creds/` is mounted and contains valid JSON files, or check environment variables are set           |
+| Port already in use           | Change the port mapping: `-p 9000:8000` or edit `docker-compose.yml`                                             |
+| Image not updating            | Force pull: `docker compose pull && docker compose up -d`                                                        |
+
+---
+
 ## Appendix: Deploying to a Custom VPS
 
 If you're deploying the proxy to a **custom VPS** (DigitalOcean, AWS EC2, Linode, etc.) instead of Render.com, you'll encounter special considerations when setting up OAuth providers (Antigravity, Gemini CLI, iFlow). This section covers the professional deployment workflow.
@@ -190,12 +392,12 @@ OAuth providers like Antigravity, Gemini CLI, and iFlow require an interactive a
 
 The callback servers bind to `localhost` on these ports:
 
-| Provider      | Port  | Notes                                      |
-|---------------|-------|--------------------------------------------|
-| **Antigravity**  | 51121 | Google OAuth with extended scopes          |
-| **Gemini CLI**   | 8085  | Google OAuth for Gemini API               |
-| **iFlow**        | 11451 | Authorization Code flow with API key fetch |
-| **Qwen Code**    | N/A   | Uses Device Code flow - works on remote VPS ✅ |
+| Provider        | Port  | Notes                                          |
+| --------------- | ----- | ---------------------------------------------- |
+| **Antigravity** | 51121 | Google OAuth with extended scopes              |
+| **Gemini CLI**  | 8085  | Google OAuth for Gemini API                    |
+| **iFlow**       | 11451 | Authorization Code flow with API key fetch     |
+| **Qwen Code**   | N/A   | Uses Device Code flow - works on remote VPS ✅ |
 
 **The Issue**: When running on a remote VPS, your local browser cannot reach `http://localhost:51121` (or other callback ports) on the remote server, causing authentication to fail with a "connection refused" error.
 
@@ -228,12 +430,14 @@ python -m rotator_library.credential_tool
 ```
 
 Select **"Add OAuth Credential"** and choose your provider:
+
 - Antigravity
-- Gemini CLI  
+- Gemini CLI
 - iFlow
 - Qwen Code (works directly on VPS, but can authenticate locally too)
 
 The tool will:
+
 1. Open your browser automatically
 2. Start a local callback server
 3. Complete the OAuth flow
@@ -242,6 +446,7 @@ The tool will:
 #### Step 3: Export Credentials to Environment Variables
 
 Still in the credential tool, select the export option for each provider:
+
 - **"Export Antigravity to .env"**
 - **"Export Gemini CLI to .env"**
 - **"Export iFlow to .env"**
@@ -350,6 +555,7 @@ python -m rotator_library.credential_tool
 **Step 4: Export to Environment Variables**
 
 Still in the credential tool:
+
 1. Select the export option for each provider
 2. Copy the generated environment variables
 3. Add them to `/path/to/LLM-API-Key-Proxy/.env` on your VPS
@@ -382,6 +588,7 @@ ls -la /path/to/LLM-API-Key-Proxy/oauth_creds/
 ```
 
 Expected files:
+
 - `antigravity_oauth_1.json`
 - `gemini_cli_oauth_1.json`
 - `iflow_oauth_1.json`
@@ -403,14 +610,14 @@ On your VPS, edit `.env`:
 
 ### Environment Variables vs. Credential Files
 
-| Aspect                    | Environment Variables                    | Credential Files                           |
-|---------------------------|------------------------------------------|--------------------------------------------|
-| **Security**              | ✅ More secure (no files on disk)        | ⚠️ Files readable if server compromised   |
-| **Container-Friendly**    | ✅ Perfect for Docker/K8s                | ❌ Requires volume mounts                 |
-| **Ease of Rotation**      | ✅ Update .env and restart               | ⚠️ Need to regenerate JSON files          |
-| **Backup/Version Control**| ✅ Easy to manage with secrets managers  | ❌ Binary files, harder to manage         |
-| **Auto-Refresh**          | ✅ Uses refresh tokens                   | ✅ Uses refresh tokens                    |
-| **Recommended For**       | Production deployments                   | Local development / testing                |
+| Aspect                     | Environment Variables                   | Credential Files                        |
+| -------------------------- | --------------------------------------- | --------------------------------------- |
+| **Security**               | ✅ More secure (no files on disk)       | ⚠️ Files readable if server compromised |
+| **Container-Friendly**     | ✅ Perfect for Docker/K8s               | ❌ Requires volume mounts               |
+| **Ease of Rotation**       | ✅ Update .env and restart              | ⚠️ Need to regenerate JSON files        |
+| **Backup/Version Control** | ✅ Easy to manage with secrets managers | ❌ Binary files, harder to manage       |
+| **Auto-Refresh**           | ✅ Uses refresh tokens                  | ✅ Uses refresh tokens                  |
+| **Recommended For**        | Production deployments                  | Local development / testing             |
 
 **Best Practice**: Always export to environment variables for VPS/cloud deployments.
 
@@ -539,4 +746,3 @@ chown your-username:your-username .env
 7. **Monitor logs** for authentication errors and token refresh issues
 
 This approach ensures secure, production-ready deployment while maintaining the convenience of OAuth authentication.
-

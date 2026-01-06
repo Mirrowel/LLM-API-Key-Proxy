@@ -1,0 +1,30 @@
+services:
+  llm-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-api-proxy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      # Mount .env files for configuration
+      - ./.env:/app/.env:ro
+      # Mount oauth_creds directory for OAuth credentials persistence
+      - ./oauth_creds:/app/oauth_creds
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      # Mount key_usage.json for usage statistics persistence
+      - ./key_usage.json:/app/key_usage.json
+      # Optionally mount additional .env files (e.g., combined credential files)
+      # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
+    environment:
+      # Skip OAuth interactive initialization in container (non-interactive)
+      - SKIP_OAUTH_INIT_CHECK=true
+      # Ensure Python output is not buffered
+      - PYTHONUNBUFFERED=1
