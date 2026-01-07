@@ -544,13 +544,15 @@ class QuotaViewer:
             self.console.print("[yellow]No data available. Press R to reload.[/yellow]")
         else:
             # Build provider table
-            table = Table(box=None, show_header=True, header_style="bold")
-            table.add_column("Provider", style="cyan", min_width=12)
-            table.add_column("Creds", justify="center", min_width=6)
+            table = Table(
+                box=None, show_header=True, header_style="bold", padding=(0, 1)
+            )
+            table.add_column("Provider", style="cyan", min_width=10)
+            table.add_column("Creds", justify="center", min_width=5)
             table.add_column("Quota Status", min_width=28)
-            table.add_column("Requests", justify="right", min_width=9)
-            table.add_column("Tokens (in/out)", min_width=22)
-            table.add_column("Cost", justify="right", min_width=8)
+            table.add_column("Requests", justify="right", min_width=8)
+            table.add_column("Tokens (in/out)", min_width=20)
+            table.add_column("Cost", justify="right", min_width=6)
 
             providers = self.cached_stats.get("providers", {})
             provider_list = list(providers.keys())
@@ -585,8 +587,8 @@ class QuotaViewer:
                 if quota_groups:
                     quota_lines = []
                     for group_name, group_stats in quota_groups.items():
-                        # Use total requests for global view
-                        total_used = group_stats.get("total_requests_used", 0)
+                        # Use remaining requests (not used) so percentage matches displayed value
+                        total_remaining = group_stats.get("total_requests_remaining", 0)
                         total_max = group_stats.get("total_requests_max", 0)
                         total_pct = group_stats.get("total_remaining_pct")
                         tiers = group_stats.get("tiers", {})
@@ -625,15 +627,21 @@ class QuotaViewer:
                             color = "dim"
 
                         bar = create_progress_bar(total_pct)
-                        display_name = group_name[:11]
                         pct_str = f"{total_pct}%" if total_pct is not None else "?"
 
                         # Build status suffix (just tiers now, no outer parens)
                         status = tier_str
 
-                        # Compact format: "claude: 1228/1625 24% ████░░░░░░ (5(15)f/2s)"
+                        # Fixed-width format for aligned bars
+                        # Adjust these to change column spacing:
+                        QUOTA_NAME_WIDTH = 10  # name + colon, left-aligned
+                        QUOTA_USAGE_WIDTH = (
+                            12  # remaining/max ratio, right-aligned (handles 100k+)
+                        )
+                        display_name = group_name[: QUOTA_NAME_WIDTH - 1]
+                        usage_str = f"{total_remaining}/{total_max}"
                         quota_lines.append(
-                            f"[{color}]{display_name}: {total_used}/{total_max} {pct_str} {bar}[/{color}] {status}"
+                            f"[{color}]{display_name + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>4} {bar}[/{color}] {status}"
                         )
 
                     # First line goes in the main row

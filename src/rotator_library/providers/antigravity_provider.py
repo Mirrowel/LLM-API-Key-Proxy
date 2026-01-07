@@ -817,6 +817,7 @@ class AntigravityProvider(
     # Based on empirical testing - see tests/quota_verification/QUOTA_TESTING_GUIDE.md
     # Note: -thinking variants are included since they share the same quota pool
     # (users call non-thinking names, proxy maps to -thinking internally)
+    # Group names are kept short for compact TUI display
     model_quota_groups: QuotaGroupMap = {
         # Claude and GPT-OSS share the same quota pool
         "claude": [
@@ -829,22 +830,22 @@ class AntigravityProvider(
             "gpt-oss-120b-medium",
         ],
         # Gemini 3 Pro variants share quota
-        "gemini-3-pro": [
+        "g3-pro": [
             "gemini-3-pro-high",
             "gemini-3-pro-low",
             "gemini-3-pro-preview",
         ],
         # Gemini 3 Flash (standalone)
-        "gemini-3-flash": [
+        "g3-flash": [
             "gemini-3-flash",
         ],
         # Gemini 2.5 Flash variants share quota (verified 2026-01-07: NOT including Lite)
-        "gemini-2.5-flash": [
+        "g25-flash": [
             "gemini-2.5-flash",
             "gemini-2.5-flash-thinking",
         ],
         # Gemini 2.5 Flash Lite - SEPARATE quota pool (verified 2026-01-07)
-        "gemini-2.5-flash-lite": [
+        "g25-lite": [
             "gemini-2.5-flash-lite",
         ],
     }
