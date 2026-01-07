@@ -7,7 +7,7 @@ import logging
 import time
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
-from .provider_interface import ProviderInterface, QuotaGroupMap
+from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
 from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
@@ -390,8 +390,17 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
     # Default priority for tiers not in the mapping
     default_tier_priority: int = 10
 
-    # Gemini CLI uses default daily reset - no custom usage_reset_configs
-    # (Empty dict means inherited get_usage_reset_config returns None)
+    # Usage reset configs for Gemini CLI
+    # Verified 2026-01-07: 24-hour fixed window from first request for ALL tiers
+    # The reset time is set when the first request is made and does NOT roll forward
+    usage_reset_configs = {
+        "default": UsageResetConfigDef(
+            window_seconds=24 * 60 * 60,  # 24 hours
+            mode="per_model",
+            description="24-hour per-model window (all tiers)",
+            field_name="models",
+        ),
+    }
 
     # Model quota groups - models that share quota/cooldown timing
     # Verified 2026-01-07 via quota verification tests
@@ -410,11 +419,12 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
     # Same structure as Antigravity (by coincidence, tiers share naming)
     # Priority 1 (paid ultra): 5x concurrent requests
     # Priority 2 (standard paid): 3x concurrent requests
-    # Others: 1x (no sequential fallback, uses global default)
+    # Others: Use sequential fallback (2x) or balanced default (1x)
     default_priority_multipliers = {1: 5, 2: 3}
 
-    # No sequential fallback for Gemini CLI (uses balanced mode default)
-    # default_sequential_fallback_multiplier = 1  (inherited from ProviderInterface)
+    # For sequential mode, lower priority tiers still get 2x to maintain stickiness
+    # For balanced mode, this doesn't apply (falls back to 1x)
+    default_sequential_fallback_multiplier = 2
 
     @staticmethod
     def parse_quota_error(
