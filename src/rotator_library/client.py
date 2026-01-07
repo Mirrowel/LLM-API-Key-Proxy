@@ -1090,24 +1090,6 @@ class RotatingClient:
                         self.enable_request_logging
                     )
 
-                    # Check body first for custom_reasoning_budget
-                    if "custom_reasoning_budget" in kwargs:
-                        litellm_kwargs["custom_reasoning_budget"] = kwargs[
-                            "custom_reasoning_budget"
-                        ]
-                    else:
-                        custom_budget_header = None
-                        if request and hasattr(request, "headers"):
-                            custom_budget_header = request.headers.get(
-                                "custom_reasoning_budget"
-                            )
-
-                        if custom_budget_header is not None:
-                            is_budget_enabled = custom_budget_header.lower() == "true"
-                            litellm_kwargs["custom_reasoning_budget"] = (
-                                is_budget_enabled
-                            )
-
                     # Retry loop for custom providers - mirrors streaming path error handling
                     for attempt in range(self.max_retries):
                         try:
@@ -1796,23 +1778,6 @@ class RotatingClient:
                     )
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
-                    # Check body first for custom_reasoning_budget
-                    if "custom_reasoning_budget" in kwargs:
-                        litellm_kwargs["custom_reasoning_budget"] = kwargs[
-                            "custom_reasoning_budget"
-                        ]
-                    else:
-                        custom_budget_header = None
-                        if request and hasattr(request, "headers"):
-                            custom_budget_header = request.headers.get(
-                                "custom_reasoning_budget"
-                            )
-
-                        if custom_budget_header is not None:
-                            is_budget_enabled = custom_budget_header.lower() == "true"
-                            litellm_kwargs["custom_reasoning_budget"] = (
-                                is_budget_enabled
-                            )
 
                     # [NEW] Merge provider-specific params
                     if provider in self.litellm_provider_params:
