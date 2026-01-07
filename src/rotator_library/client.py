@@ -2703,10 +2703,12 @@ class RotatingClient:
                     if group_stats["total_requests_max"] > 0:
                         used = group_stats["total_requests_used"]
                         max_r = group_stats["total_requests_max"]
+                        group_stats["total_requests_remaining"] = max_r - used
                         group_stats["total_remaining_pct"] = max(
                             0, int((1 - used / max_r) * 100)
                         )
                     else:
+                        group_stats["total_requests_remaining"] = 0
                         group_stats["total_remaining_pct"] = None
 
                     prov_stats["quota_groups"][group_name] = group_stats
