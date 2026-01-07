@@ -917,6 +917,10 @@ class AntigravityQuotaTracker:
         # Get user-facing model names we care about
         available_models = set(self._get_available_models())
 
+        # Aggregate cooldown info for consolidated logging
+        # Structure: {short_cred_name: {group_or_model: hours_until_reset}}
+        cooldowns_by_cred: Dict[str, Dict[str, float]] = {}
+
         for cred_path, quota_data in quota_results.items():
             if quota_data.get("status") != "success":
                 continue
@@ -927,6 +931,14 @@ class AntigravityQuotaTracker:
             models = quota_data.get("models", {})
             # Track which user-facing models we've already stored to avoid duplicates
             stored_for_cred: set = set()
+
+            # Short credential name for logging (strip antigravity_ prefix and .json suffix)
+            if cred_path.startswith("env://"):
+                short_cred = cred_path.split("/")[-1]
+            else:
+                short_cred = Path(cred_path).stem
+                if short_cred.startswith("antigravity_"):
+                    short_cred = short_cred[len("antigravity_") :]
 
             for api_model_name, model_info in models.items():
                 remaining = model_info.get("remaining_fraction")
@@ -948,13 +960,38 @@ class AntigravityQuotaTracker:
                 # Calculate max_requests for this model/tier
                 max_requests = self.get_max_requests_for_model(user_model, tier)
 
+                # Extract reset_timestamp (already parsed to float in fetch_quota_from_api)
+                reset_timestamp = model_info.get("reset_timestamp")
+
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
-                await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests
+                cooldown_info = await usage_manager.update_quota_baseline(
+                    cred_path, prefixed_model, remaining, max_requests, reset_timestamp
                 )
+
+                # Aggregate cooldown info if returned
+                if cooldown_info:
+                    group_or_model = cooldown_info["group_or_model"]
+                    hours = cooldown_info["hours_until_reset"]
+                    if short_cred not in cooldowns_by_cred:
+                        cooldowns_by_cred[short_cred] = {}
+                    # Only keep first occurrence per group/model (avoids duplicates)
+                    if group_or_model not in cooldowns_by_cred[short_cred]:
+                        cooldowns_by_cred[short_cred][group_or_model] = hours
+
                 stored_for_cred.add(user_model)
                 stored_count += 1
+
+        # Log consolidated message for all cooldowns
+        if cooldowns_by_cred:
+            # Build message: "oauth_1[claude 3.4h, gemini-3-pro 2.1h], oauth_2[claude 5.2h]"
+            parts = []
+            for cred_name, groups in sorted(cooldowns_by_cred.items()):
+                group_strs = [f"{g} {h:.1f}h" for g, h in sorted(groups.items())]
+                parts.append(f"{cred_name}[{', '.join(group_strs)}]")
+            lib_logger.info(f"Antigravity quota exhausted: {', '.join(parts)}")
+        else:
+            lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
 
         return stored_count
 

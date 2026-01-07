@@ -2036,18 +2036,32 @@ class UsageManager:
         model: str,
         remaining_fraction: float,
         max_requests: Optional[int] = None,
-    ) -> None:
+        reset_timestamp: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline data for a credential/model after fetching from API.
 
         This stores the current quota state as a baseline, which is used to
         estimate remaining quota based on subsequent request counts.
 
+        When quota is exhausted (remaining_fraction <= 0.0) and a valid reset_timestamp
+        is provided, this also sets model_cooldowns to prevent wasted requests.
+
         Args:
             credential: Credential identifier (file path or env:// URI)
             model: Model name (with or without provider prefix)
             remaining_fraction: Current remaining quota as fraction (0.0 to 1.0)
             max_requests: Maximum requests allowed per quota period (e.g., 250 for Claude)
+            reset_timestamp: Unix timestamp when quota resets. Only trusted when
+                remaining_fraction < 1.0 (quota has been used). API returns garbage
+                reset times for unused quota (100%).
+
+        Returns:
+            None if no cooldown was set/updated, otherwise:
+            {
+                "group_or_model": str,  # quota group name or model name if ungrouped
+                "hours_until_reset": float,
+            }
         """
         await self._lazy_init()
         async with self._data_lock:
@@ -2126,7 +2140,42 @@ class UsageManager:
                 model_data["quota_max_requests"] = max_requests
                 model_data["quota_display"] = f"{used_requests}/{max_requests}"
 
-            # Sync request_count and quota_max_requests across quota group
+            # Handle reset_timestamp: only trust it when quota has been used (< 100%)
+            # API returns garbage reset times for unused quota
+            valid_reset_ts = (
+                reset_timestamp is not None
+                and remaining_fraction < 1.0
+                and reset_timestamp > now_ts
+            )
+
+            if valid_reset_ts:
+                model_data["quota_reset_ts"] = reset_timestamp
+
+            # Set cooldowns when quota is exhausted
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
+            is_exhausted = remaining_fraction <= 0.0
+            cooldown_set_info = (
+                None  # Will be returned if cooldown was newly set/updated
+            )
+
+            if is_exhausted and valid_reset_ts:
+                # Only update cooldown if not set or differs by more than 5 minutes
+                existing_cooldown = model_cooldowns.get(model)
+                should_update = (
+                    existing_cooldown is None
+                    or abs(existing_cooldown - reset_timestamp) > 300
+                )
+                if should_update:
+                    model_cooldowns[model] = reset_timestamp
+                    hours_until_reset = (reset_timestamp - now_ts) / 3600
+                    # Determine group or model name for logging
+                    group = self._get_model_quota_group(credential, model)
+                    cooldown_set_info = {
+                        "group_or_model": group if group else model.split("/")[-1],
+                        "hours_until_reset": hours_until_reset,
+                    }
+
+            # Sync baseline fields and quota info across quota group
             group = self._get_model_quota_group(credential, model)
             if group:
                 grouped_models = self._get_grouped_models(credential, group)
@@ -2145,12 +2194,31 @@ class UsageManager:
                                 "approx_cost": 0.0,
                             },
                         )
+                        # Sync request tracking
                         other_model_data["request_count"] = used_requests
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
                                 f"{used_requests}/{max_requests}"
                             )
+                        # Sync baseline fields
+                        other_model_data["baseline_remaining_fraction"] = (
+                            remaining_fraction
+                        )
+                        other_model_data["baseline_fetched_at"] = now_ts
+                        other_model_data["requests_at_baseline"] = used_requests
+                        # Sync reset timestamp if valid
+                        if valid_reset_ts:
+                            other_model_data["quota_reset_ts"] = reset_timestamp
+                        # Sync cooldown if exhausted (with ±5 min check)
+                        if is_exhausted and valid_reset_ts:
+                            existing_grouped = model_cooldowns.get(grouped_model)
+                            should_update_grouped = (
+                                existing_grouped is None
+                                or abs(existing_grouped - reset_timestamp) > 300
+                            )
+                            if should_update_grouped:
+                                model_cooldowns[grouped_model] = reset_timestamp
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
@@ -2158,6 +2226,7 @@ class UsageManager:
             )
 
         await self._save_usage()
+        return cooldown_set_info
 
     async def _check_key_lockout(self, key: str, key_data: Dict):
         """
