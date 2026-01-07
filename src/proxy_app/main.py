@@ -108,7 +108,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import colorlog
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -196,8 +196,7 @@ class EnrichedModelCard(BaseModel):
     _sources: Optional[List[str]] = None
     _match_type: Optional[str] = None
 
-    class Config:
-        extra = "allow"  # Allow extra fields from the service
+    model_config = ConfigDict(extra="allow")  # Allow extra fields from the service
 
 
 class ModelList(BaseModel):
