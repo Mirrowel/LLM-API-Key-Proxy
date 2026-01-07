@@ -811,7 +811,7 @@ class AntigravityProvider(
 
     # Model quota groups (can be overridden via QUOTA_GROUPS_ANTIGRAVITY_CLAUDE)
     # Models in the same group share quota - when one is exhausted, all are
-    # Based on empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
+    # Based on empirical testing - see tests/quota_verification/QUOTA_TESTING_GUIDE.md
     # Note: -thinking variants are included since they share the same quota pool
     # (users call non-thinking names, proxy maps to -thinking internally)
     model_quota_groups: QuotaGroupMap = {
@@ -829,14 +829,17 @@ class AntigravityProvider(
             "gemini-3-pro-low",
             "gemini-3-pro-preview",
         ],
-        # Gemini 3 Flash (standalone, may share with 2.5 Flash - needs verification)
+        # Gemini 3 Flash (standalone)
         "gemini-3-flash": [
             "gemini-3-flash",
         ],
-        # Gemini 2.5 Flash variants share quota
+        # Gemini 2.5 Flash variants share quota (verified 2026-01-07: NOT including Lite)
         "gemini-2.5-flash": [
             "gemini-2.5-flash",
             "gemini-2.5-flash-thinking",
+        ],
+        # Gemini 2.5 Flash Lite - SEPARATE quota pool (verified 2026-01-07)
+        "gemini-2.5-flash-lite": [
             "gemini-2.5-flash-lite",
         ],
     }
@@ -1062,7 +1065,9 @@ class AntigravityProvider(
         )
 
         # Quota tracking state
-        self._learned_costs: Dict[str, Dict[str, float]] = {}  # tier -> model -> cost
+        self._learned_costs: Dict[
+            str, Dict[str, int]
+        ] = {}  # tier -> model -> max_requests
         self._learned_costs_loaded: bool = False
         self._quota_refresh_interval = _env_int(
             "ANTIGRAVITY_QUOTA_REFRESH_INTERVAL", 300

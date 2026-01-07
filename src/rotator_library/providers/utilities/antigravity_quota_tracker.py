@@ -44,62 +44,62 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 # =============================================================================
-# QUOTA COST CONSTANTS (in PERCENTAGE format)
+# QUOTA LIMITS (max requests per 100% quota)
 # =============================================================================
-# Quota costs per request as PERCENTAGE of 100% quota.
-# E.g., 0.4 means 0.4% per request = 250 requests total (100 / 0.4 = 250)
-# Derived from empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
-# These are the default values; learned costs override these if available.
+# Max requests per quota period. This is the SOURCE OF TRUTH.
+# Cost percentage is derived as: 100 / max_requests
+# Using integers avoids floating-point precision issues (e.g., 149 vs 150).
+#
+# Verified empirically 2026-01-07 - see tests/quota_verification/QUOTA_TESTING_GUIDE.md
+# Learned values (from file) override these defaults if available.
 
-DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
+DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
     "standard-tier": {
-        # Claude/GPT-OSS group (0.67% per request, ~150 requests total)
-        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
-        "claude-sonnet-4-5": 0.67,
-        "claude-sonnet-4-5-thinking": 0.67,
-        "claude-opus-4-5": 0.67,
-        "claude-opus-4-5-thinking": 0.67,
-        "gpt-oss-120b-medium": 0.67,
-        # Gemini 3 Pro group (0.42% per request, ~240 requests total)
-        # Updated 2025-12-30: was 0.25% (400 req), now 0.42% (~240 req)
-        "gemini-3-pro-high": 0.42,
-        "gemini-3-pro-low": 0.42,
-        "gemini-3-pro-preview": 0.42,
-        # Gemini 3 Flash (0.25% per request, 400 requests total - separate quota pool)
-        "gemini-3-flash": 0.25,
-        # Gemini 2.5 Flash group (0.0333% per request, ~3000 requests)
-        "gemini-2.5-flash": 0.0333,
-        "gemini-2.5-flash-thinking": 0.0333,
-        "gemini-2.5-flash-lite": 0.0333,
-        # Gemini 2.5 Pro (0.10% per request, ~1000 requests)
-        "gemini-2.5-pro": 0.1,
+        # Claude/GPT-OSS group (verified: 0.6667% per request = 150 requests)
+        "claude-sonnet-4-5": 150,
+        "claude-sonnet-4-5-thinking": 150,
+        "claude-opus-4-5": 150,
+        "claude-opus-4-5-thinking": 150,
+        "gpt-oss-120b-medium": 150,
+        # Gemini 3 Pro group (verified: 0.3125% per request = 320 requests)
+        "gemini-3-pro-high": 320,
+        "gemini-3-pro-low": 320,
+        "gemini-3-pro-preview": 320,
+        # Gemini 3 Flash (verified: 0.25% per request = 400 requests)
+        "gemini-3-flash": 400,
+        # Gemini 2.5 Flash group (verified: 0.0333% per request = 3000 requests)
+        "gemini-2.5-flash": 3000,
+        "gemini-2.5-flash-thinking": 3000,
+        # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
+        "gemini-2.5-flash-lite": 5000,
+        # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
+        "gemini-2.5-pro": 1000,
     },
     "free-tier": {
-        # Claude/GPT-OSS group (2.0% per request, 50 requests total)
-        # Updated 2025-12-30: was 1.333% (75 req), now 2.0% (50 req)
-        "claude-sonnet-4-5": 2.0,
-        "claude-sonnet-4-5-thinking": 2.0,
-        "claude-opus-4-5": 2.0,
-        "claude-opus-4-5-thinking": 2.0,
-        "gpt-oss-120b-medium": 2.0,
-        # Gemini 3 Pro group (0.67% per request, ~150 requests total)
-        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
-        "gemini-3-pro-high": 0.67,
-        "gemini-3-pro-low": 0.67,
-        "gemini-3-pro-preview": 0.67,
-        # Gemini 3 Flash (0.20% per request, 500 requests total - separate quota pool)
-        "gemini-3-flash": 0.20,
-        # Gemini 2.5 Flash group (same as standard-tier)
-        "gemini-2.5-flash": 0.0333,
-        "gemini-2.5-flash-thinking": 0.0333,
-        "gemini-2.5-flash-lite": 0.0333,
-        # Gemini 2.5 Pro (same as standard-tier)
-        "gemini-2.5-pro": 0.1,
+        # Claude/GPT-OSS group (verified: 2.0% per request = 50 requests)
+        "claude-sonnet-4-5": 50,
+        "claude-sonnet-4-5-thinking": 50,
+        "claude-opus-4-5": 50,
+        "claude-opus-4-5-thinking": 50,
+        "gpt-oss-120b-medium": 50,
+        # Gemini 3 Pro group (verified: 0.6667% per request = 150 requests)
+        "gemini-3-pro-high": 150,
+        "gemini-3-pro-low": 150,
+        "gemini-3-pro-preview": 150,
+        # Gemini 3 Flash (verified: 0.2% per request = 500 requests)
+        "gemini-3-flash": 500,
+        # Gemini 2.5 Flash group (verified: 0.0333% per request = 3000 requests)
+        "gemini-2.5-flash": 3000,
+        "gemini-2.5-flash-thinking": 3000,
+        # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
+        "gemini-2.5-flash-lite": 5000,
+        # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
+        "gemini-2.5-pro": 1000,
     },
 }
 
-# Default quota cost for unknown models (1% = 100 requests max)
-DEFAULT_QUOTA_COST_UNKNOWN = 1.0
+# Default max requests for unknown models (1% = 100 requests)
+DEFAULT_MAX_REQUESTS_UNKNOWN = 100
 
 # Delay before fetching quota after a request (API needs time to update)
 # Used by discover_quota_costs() for manual cost discovery
@@ -153,20 +153,20 @@ class AntigravityQuotaTracker:
             ...
 
     The provider class must initialize these instance attributes in __init__:
-        self._learned_costs: Dict[str, Dict[str, float]] = {}
+        self._learned_costs: Dict[str, Dict[str, int]] = {}
         self._learned_costs_loaded: bool = False
         self._quota_refresh_interval: int = 300  # 5 min default
     """
 
     # Type hints for attributes that must exist on the provider
-    _learned_costs: Dict[str, Dict[str, float]]
+    _learned_costs: Dict[str, Dict[str, int]]
     _learned_costs_loaded: bool
     _quota_refresh_interval: int
     project_tier_cache: Dict[str, str]
     project_id_cache: Dict[str, str]
 
     def _load_learned_costs(self) -> None:
-        """Load learned quota costs from persistent file."""
+        """Load learned max_requests values from persistent file."""
         if self._learned_costs_loaded:
             return
 
@@ -179,10 +179,26 @@ class AntigravityQuotaTracker:
             with open(costs_file, "r") as f:
                 data = json.load(f)
 
-            self._learned_costs = data.get("costs", {})
+            # Support both old format (float costs) and new format (int max_requests)
+            raw_costs = data.get("max_requests", data.get("costs", {}))
+
+            # Convert to int if loading old float format
+            self._learned_costs = {}
+            for tier, models in raw_costs.items():
+                self._learned_costs[tier] = {}
+                for model, value in models.items():
+                    if isinstance(value, float) and value < 10:
+                        # Old format: cost percentage -> convert to max_requests
+                        self._learned_costs[tier][model] = (
+                            int(100.0 / value) if value > 0 else 100
+                        )
+                    else:
+                        # New format: already max_requests
+                        self._learned_costs[tier][model] = int(value)
+
             lib_logger.debug(
-                f"Loaded learned quota costs from {costs_file.name}: "
-                f"{sum(len(m) for m in self._learned_costs.values())} model costs"
+                f"Loaded learned quota limits from {costs_file.name}: "
+                f"{sum(len(m) for m in self._learned_costs.values())} model entries"
             )
         except (json.JSONDecodeError, IOError) as e:
             lib_logger.warning(f"Failed to load learned costs: {e}")
@@ -191,20 +207,20 @@ class AntigravityQuotaTracker:
         self._learned_costs_loaded = True
 
     def _save_learned_costs(self) -> None:
-        """Persist learned quota costs to file."""
+        """Persist learned max_requests values to file."""
         costs_file = _get_learned_costs_file()
         costs_file.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
-            "schema_version": 1,
+            "schema_version": 2,
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "costs": self._learned_costs,
+            "max_requests": self._learned_costs,
         }
 
         try:
             with open(costs_file, "w") as f:
                 json.dump(data, f, indent=2)
-            lib_logger.debug(f"Saved learned quota costs to {costs_file.name}")
+            lib_logger.debug(f"Saved learned quota limits to {costs_file.name}")
         except IOError as e:
             lib_logger.warning(f"Failed to save learned costs: {e}")
 
@@ -212,56 +228,58 @@ class AntigravityQuotaTracker:
         """
         Get quota cost per request for a model/tier combination.
 
-        Priority:
-        1. Learned costs (from file, validated by measurement)
-        2. Default costs (from constants)
-        3. Unknown model fallback
+        Cost is DERIVED from max_requests: cost = 100 / max_requests
+        This ensures exact integer results when calculating max_requests back.
 
         Args:
             model: Model name (without provider prefix)
             tier: Account tier ("standard-tier" or "free-tier")
 
         Returns:
-            Cost as fraction (e.g., 0.004 = 0.40% per request)
+            Cost as percentage (e.g., 0.6667 for 0.6667% per request)
         """
-        # Ensure learned costs are loaded
-        self._load_learned_costs()
-
-        # Strip provider prefix if present
-        clean_model = model.split("/")[-1] if "/" in model else model
-
-        # Check learned costs first
-        if tier in self._learned_costs:
-            if clean_model in self._learned_costs[tier]:
-                return self._learned_costs[tier][clean_model]
-
-        # Fall back to defaults
-        if tier in DEFAULT_QUOTA_COSTS:
-            if clean_model in DEFAULT_QUOTA_COSTS[tier]:
-                return DEFAULT_QUOTA_COSTS[tier][clean_model]
-
-        # Unknown model - use conservative estimate
-        lib_logger.debug(
-            f"Unknown quota cost for model={clean_model}, tier={tier}. "
-            f"Using default {DEFAULT_QUOTA_COST_UNKNOWN}"
-        )
-        return DEFAULT_QUOTA_COST_UNKNOWN
+        max_requests = self.get_max_requests_for_model(model, tier)
+        if max_requests <= 0:
+            return 100.0  # Fallback: 1 request max
+        return 100.0 / max_requests
 
     def get_max_requests_for_model(self, model: str, tier: str) -> int:
         """
-        Calculate maximum requests per 100% quota for a model/tier.
+        Get maximum requests per 100% quota for a model/tier.
+
+        This is a direct lookup from DEFAULT_MAX_REQUESTS (source of truth).
+        Learned values override defaults if available.
+        Using integers avoids floating-point precision issues.
 
         Args:
             model: Model name
             tier: Account tier
 
         Returns:
-            Max requests (e.g., 250 for Claude on standard-tier)
+            Max requests (e.g., 150 for Claude on standard-tier)
         """
-        cost_percent = self.get_quota_cost(model, tier)  # Returns percentage
-        if cost_percent <= 0:
-            return 0
-        return int(100.0 / cost_percent)  # 100% / cost_percent
+        # Ensure learned values are loaded
+        self._load_learned_costs()
+
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        # Check learned values first (stored as max_requests integers)
+        if tier in self._learned_costs:
+            if clean_model in self._learned_costs[tier]:
+                return self._learned_costs[tier][clean_model]
+
+        # Fall back to defaults
+        if tier in DEFAULT_MAX_REQUESTS:
+            if clean_model in DEFAULT_MAX_REQUESTS[tier]:
+                return DEFAULT_MAX_REQUESTS[tier][clean_model]
+
+        # Unknown model - use conservative default
+        lib_logger.debug(
+            f"Unknown max requests for model={clean_model}, tier={tier}. "
+            f"Using default {DEFAULT_MAX_REQUESTS_UNKNOWN}"
+        )
+        return DEFAULT_MAX_REQUESTS_UNKNOWN
 
     def _get_quota_group_for_model(self, model: str) -> Optional[str]:
         """Get the quota group name for a model."""
@@ -946,13 +964,13 @@ class AntigravityQuotaTracker:
         models_to_test: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Discover quota costs by making test requests and measuring before/after.
+        Discover quota limits by making test requests and measuring before/after.
 
         MANUAL USE ONLY - This makes actual API requests that consume quota.
-        Use once per new tier to establish baseline costs for unknown tiers.
+        Use once per new tier to establish baseline limits for unknown tiers.
 
         The method tests one model per quota group, measures the quota consumption,
-        and stores the discovered costs in the learned_costs.json file.
+        and stores the discovered max_requests in the learned_quota_costs.json file.
 
         Args:
             credential_path: Credential to test with (file path or env:// URI)
@@ -963,7 +981,7 @@ class AntigravityQuotaTracker:
                 "status": "success" | "partial" | "error",
                 "tier": str,
                 "credential": str,
-                "discovered_costs": {"model": cost_percent, ...},
+                "discovered_max_requests": {"model": max_requests_int, ...},
                 "updated_groups": ["group1", "group2", ...],
                 "errors": [...],
                 "message": str,
@@ -979,7 +997,7 @@ class AntigravityQuotaTracker:
             "status": "error",
             "tier": "unknown",
             "credential": identifier,
-            "discovered_costs": {},
+            "discovered_max_requests": {},
             "updated_groups": [],
             "errors": [],
             "message": "",
@@ -1031,7 +1049,7 @@ class AntigravityQuotaTracker:
         )
 
         # 3. Test each model
-        discovered_costs: Dict[str, float] = {}
+        discovered_max_requests: Dict[str, int] = {}
         updated_groups: List[str] = []
 
         for model in models_to_test:
@@ -1090,7 +1108,7 @@ class AntigravityQuotaTracker:
                     # Quota exhausted after our request
                     after_remaining = 0.0
 
-                # Calculate cost
+                # Calculate max_requests from the delta
                 delta = before_remaining - after_remaining
                 if delta < 0:
                     result["errors"].append(
@@ -1098,7 +1116,7 @@ class AntigravityQuotaTracker:
                     )
                     continue
 
-                cost_percent = round(delta * 100.0, 4)
+                cost_percent = delta * 100.0  # Convert fraction to percentage
 
                 if cost_percent < 0.001:
                     result["errors"].append(
@@ -1106,10 +1124,13 @@ class AntigravityQuotaTracker:
                     )
                     continue
 
-                discovered_costs[model] = cost_percent
+                # Calculate max_requests as integer (source of truth)
+                max_requests = int(round(100.0 / cost_percent))
+
+                discovered_max_requests[model] = max_requests
                 lib_logger.info(
-                    f"Discovered cost for {model}: {cost_percent}% per request "
-                    f"(~{int(100.0 / cost_percent)} requests per 100%)"
+                    f"Discovered max requests for {model}: {max_requests} "
+                    f"({cost_percent:.4f}% per request)"
                 )
 
                 # Update all models in the same group
@@ -1117,31 +1138,31 @@ class AntigravityQuotaTracker:
                 if quota_group:
                     groups = self._get_effective_quota_groups()
                     for group_model in groups.get(quota_group, []):
-                        discovered_costs[group_model] = cost_percent
+                        discovered_max_requests[group_model] = max_requests
                     updated_groups.append(quota_group)
 
             except Exception as e:
                 result["errors"].append(f"{model}: Exception: {e}")
                 lib_logger.warning(f"Error testing {model}: {e}")
 
-        # 4. Save discovered costs to file
-        if discovered_costs:
+        # 4. Save discovered max_requests to file
+        if discovered_max_requests:
             self._load_learned_costs()
             if tier not in self._learned_costs:
                 self._learned_costs[tier] = {}
-            self._learned_costs[tier].update(discovered_costs)
+            self._learned_costs[tier].update(discovered_max_requests)
             self._save_learned_costs()
 
             result["status"] = "success" if not result["errors"] else "partial"
-            result["discovered_costs"] = discovered_costs
+            result["discovered_max_requests"] = discovered_max_requests
             result["updated_groups"] = updated_groups
             result["message"] = (
-                f"Discovered costs for {len(discovered_costs)} models in tier '{tier}'. "
+                f"Discovered max requests for {len(discovered_max_requests)} models in tier '{tier}'. "
                 f"Saved to learned_quota_costs.json"
             )
             lib_logger.info(result["message"])
         else:
-            result["message"] = "No costs discovered"
+            result["message"] = "No max requests discovered"
 
         return result
 
