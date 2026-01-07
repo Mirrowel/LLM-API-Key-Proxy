@@ -155,6 +155,7 @@ class SettingsDetector:
     @staticmethod
     def detect_credentials() -> dict:
         """Detect API keys and OAuth credentials"""
+        import re
         from pathlib import Path
 
         providers = {}
@@ -168,14 +169,49 @@ class SettingsDetector:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["api_keys"] += 1
 
-        # Scan for OAuth credentials
-        oauth_dir = Path("oauth_credentials")
+        # Scan for file-based OAuth credentials
+        oauth_dir = Path("oauth_creds")
         if oauth_dir.exists():
             for file in oauth_dir.glob("*_oauth_*.json"):
                 provider = file.name.split("_oauth_")[0]
                 if provider not in providers:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["oauth"] += 1
+
+        # Scan for env-based OAuth credentials
+        # Maps provider name to the ENV_PREFIX used by the provider
+        # (duplicated from credential_manager to avoid heavy imports)
+        env_oauth_providers = {
+            "gemini_cli": "GEMINI_CLI",
+            "antigravity": "ANTIGRAVITY",
+            "qwen_code": "QWEN_CODE",
+            "iflow": "IFLOW",
+        }
+
+        for provider, env_prefix in env_oauth_providers.items():
+            oauth_count = 0
+
+            # Check numbered credentials (PROVIDER_N_ACCESS_TOKEN pattern)
+            numbered_pattern = re.compile(rf"^{env_prefix}_(\d+)_ACCESS_TOKEN$")
+            for key in env_vars.keys():
+                match = numbered_pattern.match(key)
+                if match:
+                    index = match.group(1)
+                    refresh_key = f"{env_prefix}_{index}_REFRESH_TOKEN"
+                    if refresh_key in env_vars and env_vars[refresh_key]:
+                        oauth_count += 1
+
+            # Check legacy single credential (if no numbered found)
+            if oauth_count == 0:
+                access_key = f"{env_prefix}_ACCESS_TOKEN"
+                refresh_key = f"{env_prefix}_REFRESH_TOKEN"
+                if env_vars.get(access_key) and env_vars.get(refresh_key):
+                    oauth_count = 1
+
+            if oauth_count > 0:
+                if provider not in providers:
+                    providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
+                providers[provider]["oauth"] += oauth_count
 
         # Mark custom providers (have API_BASE set)
         for provider in providers:
