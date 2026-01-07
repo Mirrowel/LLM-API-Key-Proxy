@@ -306,21 +306,39 @@ class UsageManager:
 
     def _get_grouped_models(self, credential: str, group: str) -> List[str]:
         """
-        Get all model names in a quota group (with provider prefix).
+        Get all model names in a quota group (with provider prefix), normalized.
+
+        Returns only public-facing model names, deduplicated. Internal variants
+        (e.g., claude-sonnet-4-5-thinking) are normalized to their public name
+        (e.g., claude-sonnet-4-5).
 
         Args:
             credential: The credential identifier
             group: Group name (e.g., "claude")
 
         Returns:
-            List of full model names (e.g., ["antigravity/claude-opus-4-5", ...])
+            List of normalized, deduplicated model names with provider prefix
+            (e.g., ["antigravity/claude-sonnet-4-5", "antigravity/claude-opus-4-5"])
         """
         provider = self._get_provider_from_credential(credential)
         plugin_instance = self._get_provider_instance(provider)
 
         if plugin_instance and hasattr(plugin_instance, "get_models_in_quota_group"):
             models = plugin_instance.get_models_in_quota_group(group)
-            # Add provider prefix
+
+            # Normalize and deduplicate
+            if hasattr(plugin_instance, "normalize_model_for_tracking"):
+                seen = set()
+                normalized = []
+                for m in models:
+                    prefixed = f"{provider}/{m}"
+                    norm = plugin_instance.normalize_model_for_tracking(prefixed)
+                    if norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+                return normalized
+
+            # Fallback: just add provider prefix
             return [f"{provider}/{m}" for m in models]
 
         return []
@@ -343,6 +361,28 @@ class UsageManager:
             return plugin_instance.get_model_usage_weight(model)
 
         return 1
+
+    def _normalize_model(self, credential: str, model: str) -> str:
+        """
+        Normalize model name using provider's mapping.
+
+        Converts internal model names (e.g., claude-sonnet-4-5-thinking) to
+        public-facing names (e.g., claude-sonnet-4-5) for consistent storage.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Normalized model name (provider prefix preserved if present)
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "normalize_model_for_tracking"):
+            return plugin_instance.normalize_model_for_tracking(model)
+
+        return model
 
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
@@ -1578,6 +1618,10 @@ class UsageManager:
         - credential: Legacy mode with key_data["daily"]["models"]
         """
         await self._lazy_init()
+
+        # Normalize model name to public-facing name for consistent tracking
+        model = self._normalize_model(key, model)
+
         async with self._data_lock:
             now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
@@ -1792,6 +1836,10 @@ class UsageManager:
                 Set to False for provider-level errors that shouldn't count against the key.
         """
         await self._lazy_init()
+
+        # Normalize model name to public-facing name for consistent tracking
+        model = self._normalize_model(key, model)
+
         async with self._data_lock:
             now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()

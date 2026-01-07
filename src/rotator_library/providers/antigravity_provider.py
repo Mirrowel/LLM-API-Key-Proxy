@@ -1410,6 +1410,31 @@ class AntigravityProvider(
         """Strip provider prefix from model name."""
         return model.split("/")[-1] if "/" in model else model
 
+    def normalize_model_for_tracking(self, model: str) -> str:
+        """
+        Normalize internal Antigravity model names to public-facing names.
+
+        Internal variants like 'claude-sonnet-4-5-thinking' are tracked under
+        their public name 'claude-sonnet-4-5'. Uses the _api_to_user_model mapping.
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Normalized public-facing model name (preserves provider prefix if present)
+        """
+        has_prefix = "/" in model
+        if has_prefix:
+            provider, clean_model = model.split("/", 1)
+        else:
+            clean_model = model
+
+        normalized = self._api_to_user_model(clean_model)
+
+        if has_prefix:
+            return f"{provider}/{normalized}"
+        return normalized
+
     # =========================================================================
     # BASE URL MANAGEMENT
     # =========================================================================

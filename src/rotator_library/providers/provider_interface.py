@@ -559,6 +559,25 @@ class ProviderInterface(ABC):
         clean_model = model.split("/")[-1] if "/" in model else model
         return self.model_usage_weights.get(clean_model, 1)
 
+    def normalize_model_for_tracking(self, model: str) -> str:
+        """
+        Normalize internal model names to public-facing names for usage tracking.
+
+        Some providers use internal model variants (e.g., claude-sonnet-4-5-thinking)
+        that should be tracked under their public name (e.g., claude-sonnet-4-5).
+        This ensures key_usage.json only contains public-facing model names.
+
+        Default implementation: returns model unchanged.
+        Providers with internal variants should override this method.
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Normalized public-facing model name (preserves provider prefix if present)
+        """
+        return model
+
     # =========================================================================
     # BACKGROUND JOB INTERFACE - Override in subclass for periodic tasks
     # =========================================================================
