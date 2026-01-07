@@ -122,11 +122,11 @@ AVAILABLE_MODELS = [
     "claude-sonnet-4-5",  # Uses -thinking variant when reasoning_effort provided
     "claude-opus-4-5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
     # Other models
-    "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
+    # "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
 
 # Default max output tokens (including thinking) - can be overridden per request
-DEFAULT_MAX_OUTPUT_TOKENS = 64000
+DEFAULT_MAX_OUTPUT_TOKENS = 32000
 
 # Empty response retry configuration
 # When Antigravity returns an empty response (no content, no tool calls),
@@ -2165,7 +2165,7 @@ class AntigravityProvider(
 
         budget = budgets.get(reasoning_effort, -1)
         if not custom_budget:
-            budget = budget // 4  # Default to 25% of max output tokens
+            budget = budget // 2  # Default to 25% of max output tokens
 
         return {"thinkingBudget": budget, "include_thoughts": True}
 
