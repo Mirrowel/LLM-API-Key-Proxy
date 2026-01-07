@@ -893,12 +893,9 @@ async def chat_completions(
         reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
             "reasoning_effort"
         )
-        custom_reasoning_budget = request_data.get(
-            "custom_reasoning_budget"
-        ) or generation_cfg.get("custom_reasoning_budget", False)
 
         logging.getLogger("rotator_library").debug(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}"
         )
 
         # Log basic request info to console (this is a separate, simpler logger).

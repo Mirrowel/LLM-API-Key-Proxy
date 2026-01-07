@@ -2136,7 +2136,7 @@ class AntigravityProvider(
     # =========================================================================
 
     def _get_thinking_config(
-        self, reasoning_effort: Optional[str], model: str, custom_budget: bool = False
+        self, reasoning_effort: Optional[str], model: str
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -2154,45 +2154,83 @@ class AntigravityProvider(
         if not (is_gemini_25 or is_gemini_3 or is_claude):
             return None
 
-        # Gemini 3 Flash: Supports minimal/low/medium/high thinkingLevel
+        # Normalize and validate upfront
+        if reasoning_effort is None:
+            effort = "auto"
+        elif isinstance(reasoning_effort, str):
+            effort = reasoning_effort.strip().lower() or "auto"
+        else:
+            lib_logger.warning(
+                f"[Antigravity] Invalid reasoning_effort type: {type(reasoning_effort).__name__}, using auto"
+            )
+            effort = "auto"
+
+        valid_efforts = {
+            "auto",
+            "disable",
+            "off",
+            "none",
+            "minimal",
+            "low",
+            "low_medium",
+            "medium",
+            "medium_high",
+            "high",
+        }
+        if effort not in valid_efforts:
+            lib_logger.warning(
+                f"[Antigravity] Unknown reasoning_effort: '{reasoning_effort}', using auto"
+            )
+            effort = "auto"
+
+        # Gemini 3 Flash: minimal/low/medium/high
         if is_gemini_3_flash:
-            if reasoning_effort == "disable":
-                # "minimal" matches "no thinking" for most queries
+            if effort in ("disable", "off", "none"):
                 return {"thinkingLevel": "minimal", "include_thoughts": True}
-            elif reasoning_effort == "low":
+            if effort in ("minimal", "low"):
                 return {"thinkingLevel": "low", "include_thoughts": True}
-            elif reasoning_effort == "medium":
+            if effort in ("low_medium", "medium"):
                 return {"thinkingLevel": "medium", "include_thoughts": True}
-            # Default to high for Flash
+            # auto, medium_high, high → high
             return {"thinkingLevel": "high", "include_thoughts": True}
 
-        # Gemini 3 Pro: Only supports low/high thinkingLevel
+        # Gemini 3 Pro: only low/high
         if is_gemini_3:
-            if reasoning_effort == "low":
+            if effort in ("disable", "off", "none", "minimal", "low", "low_medium"):
                 return {"thinkingLevel": "low", "include_thoughts": True}
-            # medium maps to high for Pro (not supported)
+            # auto, medium, medium_high, high → high
             return {"thinkingLevel": "high", "include_thoughts": True}
 
         # Gemini 2.5 & Claude: Integer thinkingBudget
-        if not reasoning_effort:
-            return {"thinkingBudget": -1, "include_thoughts": True}  # Auto
-
-        if reasoning_effort == "disable":
+        if effort in ("disable", "off", "none"):
             return {"thinkingBudget": 0, "include_thoughts": False}
 
+        if effort == "auto":
+            return {"thinkingBudget": -1, "include_thoughts": True}
+
         # Model-specific budgets
-        if "gemini-2.5-pro" in model or is_claude:
-            budgets = {"low": 8192, "medium": 16384, "high": 32768}
-        elif "gemini-2.5-flash" in model:
-            budgets = {"low": 6144, "medium": 12288, "high": 24576}
+        if "gemini-2.5-flash" in model:
+            budgets = {
+                "minimal": 3072,
+                "low": 6144,
+                "low_medium": 9216,
+                "medium": 12288,
+                "medium_high": 18432,
+                "high": 24576,
+            }
         else:
-            budgets = {"low": 1024, "medium": 2048, "high": 4096}
+            budgets = {
+                "minimal": 4096,
+                "low": 8192,
+                "low_medium": 12288,
+                "medium": 16384,
+                "medium_high": 24576,
+                "high": 32768,
+            }
+            if is_claude:
+                budgets["high"] = 31999  # Claude max budget
 
-        budget = budgets.get(reasoning_effort, -1)
-        if not custom_budget:
-            budget = budget // 2  # Default to 25% of max output tokens
-
-        return {"thinkingBudget": budget, "include_thoughts": True}
+        return {"thinkingBudget": budgets[effort], "include_thoughts": True}
 
     # =========================================================================
     # MESSAGE TRANSFORMATION (OpenAI → Gemini)
@@ -3496,7 +3534,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         model: str,
         project_id: str,
         max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: Optional[Union[str, float, int]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
@@ -3556,17 +3594,56 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 DEFAULT_SAFETY_SETTINGS
             )
 
-        # Handle max_tokens - only apply to Claude, or if explicitly set for others
+        # Handle max_tokens and thinking budget clamping/expansion
+        # For Claude: expand max_tokens to accommodate thinking (default) or clamp thinking to max_tokens
+        # Controlled by ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT env var (default: false = expand)
         gen_config = antigravity_payload["request"].get("generationConfig", {})
         is_claude = self._is_claude(model)
 
+        # Get thinking budget from config (if present)
+        thinking_config = gen_config.get("thinkingConfig", {})
+        thinking_budget = thinking_config.get("thinkingBudget", -1)
+
+        # Determine effective max_tokens
         if max_tokens is not None:
-            # Explicitly set in request - apply to all models
-            gen_config["maxOutputTokens"] = max_tokens
+            effective_max = max_tokens
         elif is_claude:
-            # Claude model without explicit max_tokens - use default
-            gen_config["maxOutputTokens"] = DEFAULT_MAX_OUTPUT_TOKENS
-        # For non-Claude models without explicit max_tokens, don't set it
+            effective_max = DEFAULT_MAX_OUTPUT_TOKENS
+        else:
+            effective_max = None
+
+        # Apply clamping or expansion if thinking budget exceeds max_tokens
+        if (
+            thinking_budget > 0
+            and effective_max is not None
+            and thinking_budget >= effective_max
+        ):
+            clamp_mode = _env_bool("ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT", False)
+
+            if clamp_mode:
+                # CLAMP: Reduce thinking budget to fit within max_tokens
+                clamped_budget = max(0, effective_max - 1)
+                lib_logger.warning(
+                    f"[Antigravity] thinkingBudget ({thinking_budget}) >= maxOutputTokens ({effective_max}). "
+                    f"Clamping thinkingBudget to {clamped_budget}. "
+                    f"Set ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT=false to expand output instead."
+                )
+                thinking_config["thinkingBudget"] = clamped_budget
+                gen_config["thinkingConfig"] = thinking_config
+            else:
+                # EXPAND (default): Increase max_tokens to accommodate thinking
+                # Add buffer for actual response content (1024 tokens)
+                expanded_max = thinking_budget + 1024
+                lib_logger.warning(
+                    f"[Antigravity] thinkingBudget ({thinking_budget}) >= maxOutputTokens ({effective_max}). "
+                    f"Expanding maxOutputTokens to {expanded_max}. "
+                    f"Set ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT=true to clamp thinking instead."
+                )
+                effective_max = expanded_max
+
+        # Set maxOutputTokens
+        if effective_max is not None:
+            gen_config["maxOutputTokens"] = effective_max
 
         antigravity_payload["request"]["generationConfig"] = gen_config
 
@@ -4069,20 +4146,29 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         top_p = kwargs.get("top_p")
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        custom_budget = kwargs.get("custom_reasoning_budget", False)
         enable_logging = kwargs.pop("enable_request_logging", False)
 
         # Create logger
         file_logger = AntigravityFileLogger(model, enable_logging)
 
         # Determine if thinking is enabled for this request
-        # Thinking is enabled if reasoning_effort is set (and not "disable") for Claude
+        # Thinking is enabled if reasoning_effort is set and not explicitly disabled
         thinking_enabled = False
         if self._is_claude(model):
-            # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"
-            thinking_enabled = (
-                reasoning_effort is not None and reasoning_effort != "disable"
-            )
+            # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"/"none"/"off"
+            if reasoning_effort is not None:
+                if isinstance(reasoning_effort, str):
+                    thinking_enabled = reasoning_effort.lower().strip() not in (
+                        "disable",
+                        "none",
+                        "off",
+                        "",
+                    )
+                elif isinstance(reasoning_effort, (int, float)):
+                    # Numeric: enabled if > 0
+                    thinking_enabled = float(reasoning_effort) > 0
+                else:
+                    thinking_enabled = True
 
         # Transform messages to Gemini format FIRST
         # This restores thinking from cache if reasoning_content was stripped by client
@@ -4146,9 +4232,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             # Gemini 3 performs better with temperature=1 for tool use
             gen_config["temperature"] = 1.0
 
-        thinking_config = self._get_thinking_config(
-            reasoning_effort, model, custom_budget
-        )
+        thinking_config = self._get_thinking_config(reasoning_effort, model)
         if thinking_config:
             gen_config.setdefault("thinkingConfig", {}).update(thinking_config)
 

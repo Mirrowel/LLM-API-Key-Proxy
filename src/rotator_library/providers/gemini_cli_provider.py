@@ -1366,14 +1366,13 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
         self, payload: Dict[str, Any], model: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Map reasoning_effort to thinking configuration.
+        Map reasoning_effort to thinking configuration for Gemini models.
 
         - Gemini 2.5: thinkingBudget (integer tokens)
         - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
         - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
         """
-        custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
-        reasoning_effort = payload.get("reasoning_effort")
+        reasoning_effort = payload.pop("reasoning_effort", None)
 
         if "thinkingConfig" in payload.get("generationConfig", {}):
             return None
@@ -1382,68 +1381,84 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
         is_gemini_3 = self._is_gemini_3(model)
         is_gemini_3_flash = "gemini-3-flash" in model
 
-        # Only apply reasoning logic to supported models
         if not (is_gemini_25 or is_gemini_3):
-            payload.pop("reasoning_effort", None)
-            payload.pop("custom_reasoning_budget", None)
             return None
 
-        # Gemini 3 Flash: Supports minimal/low/medium/high thinkingLevel
-        if is_gemini_3_flash:
-            # Clean up the original payload
-            payload.pop("reasoning_effort", None)
-            payload.pop("custom_reasoning_budget", None)
+        # Normalize and validate upfront
+        if reasoning_effort is None:
+            effort = "auto"
+        elif isinstance(reasoning_effort, str):
+            effort = reasoning_effort.strip().lower() or "auto"
+        else:
+            lib_logger.warning(
+                f"[GeminiCLI] Invalid reasoning_effort type: {type(reasoning_effort).__name__}, using auto"
+            )
+            effort = "auto"
 
-            if reasoning_effort == "disable":
-                # "minimal" matches "no thinking" for most queries
+        valid_efforts = {
+            "auto",
+            "disable",
+            "off",
+            "none",
+            "minimal",
+            "low",
+            "low_medium",
+            "medium",
+            "medium_high",
+            "high",
+        }
+        if effort not in valid_efforts:
+            lib_logger.warning(
+                f"[GeminiCLI] Unknown reasoning_effort: '{reasoning_effort}', using auto"
+            )
+            effort = "auto"
+
+        # Gemini 3 Flash: minimal/low/medium/high
+        if is_gemini_3_flash:
+            if effort in ("disable", "off", "none"):
                 return {"thinkingLevel": "minimal", "include_thoughts": True}
-            elif reasoning_effort == "low":
+            if effort in ("minimal", "low"):
                 return {"thinkingLevel": "low", "include_thoughts": True}
-            elif reasoning_effort == "medium":
+            if effort in ("low_medium", "medium"):
                 return {"thinkingLevel": "medium", "include_thoughts": True}
-            # Default to high for Flash
+            # auto, medium_high, high → high
             return {"thinkingLevel": "high", "include_thoughts": True}
 
-        # Gemini 3 Pro: Only supports low/high thinkingLevel
+        # Gemini 3 Pro: only low/high
         if is_gemini_3:
-            # Clean up the original payload
-            payload.pop("reasoning_effort", None)
-            payload.pop("custom_reasoning_budget", None)
-
-            if reasoning_effort == "low":
+            if effort in ("disable", "off", "none", "minimal", "low", "low_medium"):
                 return {"thinkingLevel": "low", "include_thoughts": True}
-            # medium maps to high for Pro (not supported)
+            # auto, medium, medium_high, high → high
             return {"thinkingLevel": "high", "include_thoughts": True}
 
         # Gemini 2.5: Integer thinkingBudget
-        if not reasoning_effort:
-            # Clean up the original payload
-            payload.pop("reasoning_effort", None)
-            payload.pop("custom_reasoning_budget", None)
+        if effort in ("disable", "off", "none"):
+            return {"thinkingBudget": 0, "include_thoughts": False}
+
+        if effort == "auto":
             return {"thinkingBudget": -1, "include_thoughts": True}
 
-        # If reasoning_effort is provided, calculate the budget
-        budget = -1  # Default for 'auto' or invalid values
-        if "gemini-2.5-pro" in model:
-            budgets = {"low": 8192, "medium": 16384, "high": 32768}
-        elif "gemini-2.5-flash" in model:
-            budgets = {"low": 6144, "medium": 12288, "high": 24576}
+        # Model-specific budgets
+        if "gemini-2.5-flash" in model:
+            budgets = {
+                "minimal": 3072,
+                "low": 6144,
+                "low_medium": 9216,
+                "medium": 12288,
+                "medium_high": 18432,
+                "high": 24576,
+            }
         else:
-            # Fallback for other gemini-2.5 models
-            budgets = {"low": 1024, "medium": 2048, "high": 4096}
+            budgets = {
+                "minimal": 4096,
+                "low": 8192,
+                "low_medium": 12288,
+                "medium": 16384,
+                "medium_high": 24576,
+                "high": 32768,
+            }
 
-        budget = budgets.get(reasoning_effort, -1)
-        if reasoning_effort == "disable":
-            budget = 0
-
-        if not custom_reasoning_budget:
-            budget = budget // 4
-
-        # Clean up the original payload
-        payload.pop("reasoning_effort", None)
-        payload.pop("custom_reasoning_budget", None)
-
-        return {"thinkingBudget": budget, "include_thoughts": True}
+        return {"thinkingBudget": budgets[effort], "include_thoughts": True}
 
     def _convert_chunk_to_openai(
         self,
