@@ -7,7 +7,7 @@ import logging
 import time
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, QuotaGroupMap
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
 from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
@@ -393,8 +393,18 @@ class GeminiCliProvider(GeminiAuthBase, GeminiCliQuotaTracker, ProviderInterface
     # Gemini CLI uses default daily reset - no custom usage_reset_configs
     # (Empty dict means inherited get_usage_reset_config returns None)
 
-    # No quota groups defined for Gemini CLI
-    # (Models don't share quotas)
+    # Model quota groups - models that share quota/cooldown timing
+    # Verified 2026-01-07 via quota verification tests
+    # Can be overridden via env: QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"
+    model_quota_groups: QuotaGroupMap = {
+        # Pro models share a quota pool (verified: gemini-2.5-pro and gemini-3-pro-preview)
+        "pro": ["gemini-2.5-pro", "gemini-3-pro-preview"],
+        # All 2.x Flash models share a quota pool (verified: 2.0 shares with 2.5)
+        # Note: contrary to PR #62 which claimed 2.0-flash was standalone
+        "25-flash": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        # Gemini 3 Flash is standalone (verified)
+        "3-flash": ["gemini-3-flash-preview"],
+    }
 
     # Priority-based concurrency multipliers
     # Same structure as Antigravity (by coincidence, tiers share naming)

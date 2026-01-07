@@ -71,29 +71,37 @@ _USER_TO_API_MODEL_MAP: Dict[str, str] = {
 # =============================================================================
 # Quota costs per request as PERCENTAGE of 100% quota.
 # E.g., 0.1 means 0.1% per request = 1000 requests total (100 / 0.1 = 1000)
-# These are initial estimates based on observed quota bucket behavior.
+# Verified 2026-01-07 via quota verification tests (see GEMINI_CLI_QUOTA_REPORT.md)
 # Learned costs override these if available.
 
 DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
     "standard-tier": {
-        # Costs discovered via discover_quota_costs() on 2026-01-04
-        # Pro models: 0.4% per request (~250 requests per 100%)
-        # Flash models: 0.0667% per request (~1500 requests per 100%)
-        "gemini-2.0-flash": 0.0667,  # ~1500 requests
-        "gemini-2.5-pro": 0.4,  # ~250 requests
-        "gemini-2.5-flash": 0.0667,  # ~1500 requests
-        "gemini-2.5-flash-lite": 0.0667,  # ~1500 requests
-        "gemini-3-pro-preview": 0.4,  # ~250 requests
-        "gemini-3-flash-preview": 0.0667,  # ~1500 requests
+        # Pro group: 0.4% per request (~250 requests per 100%)
+        # Verified 2026-01-07
+        "gemini-2.5-pro": 0.4,
+        "gemini-3-pro-preview": 0.4,
+        # Flash group (25-flash): 0.0667% per request (~1500 requests per 100%)
+        # Verified 2026-01-07: gemini-2.0-flash shares quota with 2.5-flash models
+        "gemini-2.0-flash": 0.0667,
+        "gemini-2.5-flash": 0.0667,
+        "gemini-2.5-flash-lite": 0.0667,
+        # 3-Flash group: 0.0667% per request (~1500 requests per 100%)
+        # Verified 2026-01-07
+        "gemini-3-flash-preview": 0.0667,
     },
     "free-tier": {
-        # Free tier assumed to be ~2x more expensive than standard
-        "gemini-2.0-flash": 0.1333,  # ~750 requests
-        "gemini-2.5-pro": 0.8,  # ~125 requests
-        "gemini-2.5-flash": 0.1333,  # ~750 requests
-        "gemini-2.5-flash-lite": 0.1333,  # ~750 requests
-        "gemini-3-pro-preview": 0.8,  # ~125 requests
-        "gemini-3-flash-preview": 0.1333,  # ~750 requests
+        # Pro group: 1.0% per request (~100 requests per 100%)
+        # Verified 2026-01-07
+        "gemini-2.5-pro": 1.0,
+        "gemini-3-pro-preview": 1.0,
+        # Flash group (25-flash): 0.1% per request (~1000 requests per 100%)
+        # Verified 2026-01-07
+        "gemini-2.0-flash": 0.1,
+        "gemini-2.5-flash": 0.1,
+        "gemini-2.5-flash-lite": 0.1,
+        # 3-Flash group: 0.1% per request (~1000 requests per 100%)
+        # Verified 2026-01-07
+        "gemini-3-flash-preview": 0.1,
     },
 }
 
@@ -507,6 +515,9 @@ class GeminiCliQuotaTracker:
         """
         Get quota info for all credentials.
 
+        This method uses the same structure as AntigravityQuotaTracker for
+        consistency in the TUI and quota stats endpoint.
+
         Args:
             credential_paths: Specific paths to fetch (None = discover all)
             oauth_base_dir: Directory for file-based credential discovery
@@ -524,13 +535,17 @@ class GeminiCliQuotaTracker:
                         "project_id": str | None,
                         "status": "success" | "error",
                         "error": str | None,
-                        "model_quotas": {
-                            "model_id": {
+                        "model_groups": {
+                            "group_name": {
                                 "remaining_fraction": float,
                                 "remaining_percent": str,
+                                "is_estimated": bool,
                                 "is_exhausted": bool,
+                                "requests_used": int,
+                                "requests_total": int,
+                                "display": str,
                                 "reset_time_iso": str | None,
-                                "token_type": str | None,
+                                "models": List[str],
                             }
                         }
                     }
@@ -578,29 +593,91 @@ class GeminiCliQuotaTracker:
                         creds = json.load(f)
                     email = creds.get("_proxy_metadata", {}).get("email")
                 except (IOError, json.JSONDecodeError):
-                    # Failed to read credential metadata; email will remain None
                     lib_logger.debug(
                         f"Could not read email from credential file: {cred_path}"
                     )
 
-            # Build model quotas from buckets
-            model_quotas = {}
+            # Build a lookup of model_id -> bucket data for easy access
+            bucket_by_model = {}
             for bucket in quota_data.get("buckets", []):
                 model_id = bucket.get("model_id")
-                if not model_id:
-                    continue
+                if model_id:
+                    user_model = self._api_to_user_model(model_id)
+                    bucket_by_model[user_model] = bucket
 
-                # Convert to user-facing model name
-                user_model = self._api_to_user_model(model_id)
+            # Build model_groups from quota groups (same structure as Antigravity)
+            groups = self._get_effective_quota_groups()
+            model_groups = {}
 
-                remaining = bucket.get("remaining_fraction", 0.0)
-                model_quotas[user_model] = {
-                    "remaining_fraction": remaining,
-                    "remaining_percent": f"{int(remaining * 100)}%",
-                    "is_exhausted": bucket.get("is_exhausted", False),
-                    "reset_time_iso": bucket.get("reset_time_iso"),
-                    "token_type": bucket.get("token_type"),
+            for group_name, group_models in groups.items():
+                # Default values
+                group_info = {
+                    "remaining_fraction": 1.0,
+                    "remaining_percent": "100%",
+                    "is_estimated": False,
+                    "is_exhausted": False,
+                    "requests_used": 0,
+                    "requests_total": self.get_max_requests_for_model(
+                        group_models[0], tier
+                    ),
+                    "display": f"0/{self.get_max_requests_for_model(group_models[0], tier)}",
+                    "reset_time_iso": None,
+                    "models": group_models,
+                    "confidence": "low",
                 }
+
+                # Find quota data from the first model in the group that has data
+                for model in group_models:
+                    bucket = bucket_by_model.get(model)
+                    if bucket:
+                        remaining = bucket.get("remaining_fraction", 1.0)
+                        is_exhausted = bucket.get("is_exhausted", False)
+                        reset_time_iso = bucket.get("reset_time_iso")
+
+                        # Calculate requests used from remaining fraction
+                        max_requests = self.get_max_requests_for_model(model, tier)
+                        requests_used = int((1.0 - remaining) * max_requests)
+
+                        group_info.update(
+                            {
+                                "remaining_fraction": remaining,
+                                "remaining_percent": f"{int(remaining * 100)}%",
+                                "is_estimated": False,  # Real data from API
+                                "is_exhausted": is_exhausted,
+                                "requests_used": requests_used,
+                                "requests_total": max_requests,
+                                "display": f"{requests_used}/{max_requests}",
+                                "reset_time_iso": reset_time_iso,
+                                "confidence": "high",  # Real API data
+                            }
+                        )
+                        break  # Use first model with data (they share quota)
+
+                # Enrich with usage data if available
+                if usage_data and include_estimates and cred_path in usage_data:
+                    cred_usage = usage_data[cred_path]
+                    models_usage = cred_usage.get("models", {})
+
+                    # Get request_count from representative model
+                    representative_model = group_models[0]
+                    prefixed_model = f"gemini_cli/{representative_model}"
+                    model_usage = models_usage.get(prefixed_model) or models_usage.get(
+                        representative_model, {}
+                    )
+
+                    total_requests = model_usage.get("request_count", 0)
+                    baseline_remaining = model_usage.get("baseline_remaining_fraction")
+                    max_requests_from_usage = model_usage.get("quota_max_requests")
+
+                    if total_requests > 0:
+                        # Use tracked request count
+                        max_requests = (
+                            max_requests_from_usage or group_info["requests_total"]
+                        )
+                        group_info["requests_used"] = total_requests
+                        group_info["display"] = f"{total_requests}/{max_requests}"
+
+                model_groups[group_name] = group_info
 
             results[identifier] = {
                 "identifier": identifier,
@@ -610,7 +687,7 @@ class GeminiCliQuotaTracker:
                 "project_id": quota_data.get("project_id"),
                 "status": quota_data.get("status", "error"),
                 "error": quota_data.get("error"),
-                "model_quotas": model_quotas,
+                "model_groups": model_groups,
                 "fetched_at": quota_data.get("fetched_at"),
             }
 
@@ -774,47 +851,12 @@ class GeminiCliQuotaTracker:
 
         return stored_count
 
-    def _get_effective_quota_groups(self) -> Dict[str, List[str]]:
-        """
-        Get quota groups for Gemini CLI models.
+    # NOTE: _get_effective_quota_groups() is inherited from ProviderInterface
+    # The quota groups are defined on GeminiCliProvider.model_quota_groups class attribute
+    # This allows .env overrides via QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"
 
-        Models within the same group share a quota pool from the API.
-        This was determined through empirical testing - requests to one model
-        in a group consume quota from all models in that group.
-
-        Returns:
-            Dict mapping group name -> list of models in that group.
-            Group names omit "gemini-" prefix since provider is already gemini_cli,
-            and to avoid truncation in the TUI summary view.
-        """
-        return {
-            # Pro models share a quota pool
-            "pro": ["gemini-2.5-pro", "gemini-3-pro-preview"],
-            # 2.5-flash and flash-lite share a quota pool
-            "2.5-flash": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
-            # These have independent pools
-            "2.0-flash": ["gemini-2.0-flash"],
-            "3-flash": ["gemini-3-flash-preview"],
-        }
-
-    def _resolve_tier_priority(self, tier: str) -> int:
-        """
-        Get priority value for a tier (lower = higher priority).
-
-        Used by the quota stats display to sort credentials.
-
-        Args:
-            tier: Tier string (e.g., 'standard-tier', 'free-tier')
-
-        Returns:
-            Priority value (lower = better)
-        """
-        tier_priorities = {
-            "standard-tier": 1,
-            "legacy-tier": 2,
-            "free-tier": 3,
-        }
-        return tier_priorities.get(tier, 10)
+    # NOTE: _resolve_tier_priority() is inherited from ProviderInterface
+    # It uses GeminiCliProvider.tier_priorities class attribute
 
     # =========================================================================
     # QUOTA COST DISCOVERY
@@ -1042,13 +1084,14 @@ class GeminiCliQuotaTracker:
         return result
 
     def _get_quota_group_for_model(self, model: str) -> Optional[str]:
-        """Get the quota group name for a model."""
+        """
+        Get the quota group name for a model.
+
+        Uses the inherited _find_model_quota_group from ProviderInterface.
+        """
         clean_model = model.split("/")[-1] if "/" in model else model
-        groups = self._get_effective_quota_groups()
-        for group_name, models in groups.items():
-            if clean_model in models:
-                return group_name
-        return None
+        # Use inherited method from ProviderInterface
+        return self._find_model_quota_group(clean_model)
 
     async def _make_test_request(
         self,
