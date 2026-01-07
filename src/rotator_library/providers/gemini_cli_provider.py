@@ -2013,17 +2013,6 @@ class GeminiCliProvider(GeminiAuthBase, ProviderInterface):
                     credential_path, access_token, kwargs.get("litellm_params", {})
                 )
 
-            # Log paid tier usage visibly on each request
-            credential_tier = self.project_tier_cache.get(credential_path)
-            if credential_tier and credential_tier not in [
-                "free-tier",
-                "legacy-tier",
-                "unknown",
-            ]:
-                lib_logger.info(
-                    f"[PAID TIER] Using Gemini '{credential_tier}' subscription for this request"
-                )
-
             # Handle :thinking suffix
             model_name = attempt_model.split("/")[-1].replace(":thinking", "")
 
