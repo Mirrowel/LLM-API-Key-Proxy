@@ -60,6 +60,8 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "claude-sonnet-4-5-thinking": 150,
         "claude-opus-4-5": 150,
         "claude-opus-4-5-thinking": 150,
+        "claude-sonnet-4.5": 150,
+        "claude-opus-4.5": 150,
         "gpt-oss-120b-medium": 150,
         # Gemini 3 Pro group (verified: 0.3125% per request = 320 requests)
         "gemini-3-pro-high": 320,
@@ -81,6 +83,8 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "claude-sonnet-4-5-thinking": 50,
         "claude-opus-4-5": 50,
         "claude-opus-4-5-thinking": 50,
+        "claude-sonnet-4.5": 50,
+        "claude-opus-4.5": 50,
         "gpt-oss-120b-medium": 50,
         # Gemini 3 Pro group (verified: 0.6667% per request = 150 requests)
         "gemini-3-pro-high": 150,
@@ -113,14 +117,17 @@ QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
 
 # User-facing name → API name (for looking up quota in fetchAvailableModels response)
 _USER_TO_API_MODEL_MAP: Dict[str, str] = {
-    "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API
+    "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (legacy)
+    "claude-opus-4.5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (new format)
     "gemini-3-pro-preview": "gemini-3-pro-high",  # Preview maps to high by default
 }
 
 # API name → User-facing name (for consistency when processing API responses)
 _API_TO_USER_MODEL_MAP: Dict[str, str] = {
-    "claude-opus-4-5-thinking": "claude-opus-4-5",  # Normalize to user-facing name
-    "claude-sonnet-4-5-thinking": "claude-sonnet-4-5",  # Normalize to user-facing name
+    "claude-opus-4-5-thinking": "claude-opus-4.5",  # Normalize to new user-facing name
+    "claude-opus-4-5": "claude-opus-4.5",  # Normalize old format to new
+    "claude-sonnet-4-5-thinking": "claude-sonnet-4.5",  # Normalize to new user-facing name
+    "claude-sonnet-4-5": "claude-sonnet-4.5",  # Normalize old format to new
     "gemini-3-pro-high": "gemini-3-pro-preview",  # Could map to preview (but high is valid too)
     "gemini-3-pro-low": "gemini-3-pro-preview",  # Could map to preview (but low is valid too)
     "gemini-2.5-flash-thinking": "gemini-2.5-flash",  # Normalize to user-facing name

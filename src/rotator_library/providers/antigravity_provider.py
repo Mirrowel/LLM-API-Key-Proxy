@@ -119,8 +119,8 @@ AVAILABLE_MODELS = [
     # "gemini-3-pro-image",  # Image generation model
     # "gemini-2.5-computer-use-preview-10-2025",
     # Claude models
-    "claude-sonnet-4-5",  # Uses -thinking variant when reasoning_effort provided
-    "claude-opus-4-5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
+    "claude-sonnet-4.5",  # Uses -thinking variant when reasoning_effort provided
+    "claude-opus-4.5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
     # Other models
     # "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
@@ -146,6 +146,9 @@ MODEL_ALIAS_MAP = {
     "gemini-3-pro-image": "gemini-3-pro-image-preview",
     "gemini-3-pro-low": "gemini-3-pro-preview",
     "gemini-3-pro-high": "gemini-3-pro-preview",
+    # Claude: API/internal names → public user-facing names
+    "claude-sonnet-4-5": "claude-sonnet-4.5",
+    "claude-opus-4-5": "claude-opus-4.5",
 }
 MODEL_ALIAS_REVERSE = {v: k for k, v in MODEL_ALIAS_MAP.items()}
 
@@ -821,6 +824,8 @@ class AntigravityProvider(
             "claude-sonnet-4-5-thinking",
             "claude-opus-4-5",
             "claude-opus-4-5-thinking",
+            "claude-sonnet-4.5",
+            "claude-opus-4.5",
             "gpt-oss-120b-medium",
         ],
         # Gemini 3 Pro variants share quota
