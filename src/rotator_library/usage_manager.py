@@ -1936,6 +1936,15 @@ class UsageManager:
                     # Track failure for quota estimation (request still consumes quota)
                     model_data["failure_count"] = model_data.get("failure_count", 0) + 1
                     model_data["request_count"] = model_data.get("request_count", 0) + 1
+
+                    # Clamp request_count to quota_max_requests when quota is exhausted
+                    # This prevents display overflow (e.g., 151/150) when requests are
+                    # counted locally before API refresh corrects the value
+                    max_req = model_data.get("quota_max_requests")
+                    if max_req is not None and model_data["request_count"] > max_req:
+                        model_data["request_count"] = max_req
+                        # Update quota_display with clamped value
+                        model_data["quota_display"] = f"{max_req}/{max_req}"
                     new_request_count = model_data["request_count"]
 
                     # Apply to all models in the same quota group
@@ -2250,6 +2259,14 @@ class UsageManager:
                         "hours_until_reset": hours_until_reset,
                     }
 
+                # Defensive clamp: ensure request_count doesn't exceed max when exhausted
+                if (
+                    max_requests is not None
+                    and model_data["request_count"] > max_requests
+                ):
+                    model_data["request_count"] = max_requests
+                    model_data["quota_display"] = f"{max_requests}/{max_requests}"
+
             # Sync baseline fields and quota info across quota group
             group = self._get_model_quota_group(credential, model)
             if group:
@@ -2294,6 +2311,16 @@ class UsageManager:
                             )
                             if should_update_grouped:
                                 model_cooldowns[grouped_model] = reset_timestamp
+
+                            # Defensive clamp for grouped models when exhausted
+                            if (
+                                max_requests is not None
+                                and other_model_data["request_count"] > max_requests
+                            ):
+                                other_model_data["request_count"] = max_requests
+                                other_model_data["quota_display"] = (
+                                    f"{max_requests}/{max_requests}"
+                                )
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
