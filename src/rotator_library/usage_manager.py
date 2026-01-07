@@ -751,8 +751,16 @@ class UsageManager:
                 if (key_data.get("key_cooldown_until") or 0) > now:
                     continue
 
+                # Normalize model name for consistent cooldown lookup
+                # (cooldowns are stored under normalized names by record_failure)
+                # For providers without normalize_model_for_tracking (non-Antigravity),
+                # this returns the model unchanged, so cooldown lookups work as before.
+                normalized_model = self._normalize_model(key, model)
+
                 # Skip if model-specific cooldown is active
-                if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                if (
+                    key_data.get("model_cooldowns", {}).get(normalized_model) or 0
+                ) > now:
                     continue
 
                 available.append(key)
@@ -1270,6 +1278,16 @@ class UsageManager:
         await self._reset_daily_stats_if_needed()
         self._initialize_key_states(available_keys)
 
+        # Normalize model name for consistent cooldown lookup
+        # (cooldowns are stored under normalized names by record_failure)
+        # Use first credential for provider detection; all credentials passed here
+        # are for the same provider (filtered by client.py before calling acquire_key).
+        # For providers without normalize_model_for_tracking (non-Antigravity),
+        # this returns the model unchanged, so cooldown lookups work as before.
+        normalized_model = (
+            self._normalize_model(available_keys[0], model) if available_keys else model
+        )
+
         # This loop continues as long as the global deadline has not been met.
         while time.time() < deadline:
             now = time.time()
@@ -1282,9 +1300,10 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
-                        # Skip keys on cooldown
+                        # Skip keys on cooldown (use normalized model for lookup)
                         if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
+                            key_data.get("model_cooldowns", {}).get(normalized_model)
+                            or 0
                         ) > now:
                             continue
 
@@ -1448,8 +1467,10 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
+                        # Skip keys on cooldown (use normalized model for lookup)
                         if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
+                            key_data.get("model_cooldowns", {}).get(normalized_model)
+                            or 0
                         ) > now:
                             continue
 
