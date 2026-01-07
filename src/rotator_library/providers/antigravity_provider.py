@@ -3943,7 +3943,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 # Strip gemini3 prefix if applicable
                 if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
                     name = self._strip_gemini3_prefix(name)
-                schema = func_decl.get("parametersJsonSchema", {})
+
+                # Check both parametersJsonSchema (Gemini native) and parameters (Claude/OpenAI)
+                schema = func_decl.get("parametersJsonSchema") or func_decl.get(
+                    "parameters", {}
+                )
+
                 if name and schema:
                     schema_map[name] = schema
 
@@ -4598,7 +4603,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             raise _MalformedFunctionCallDetected(malformed_msg, gemini_response)
 
         # Build tool schema map for schema-aware JSON parsing
-        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+        # NOTE: After _transform_to_antigravity_format, tools are at payload["request"]["tools"]
+        tools_for_schema = payload.get("request", {}).get("tools")
+        tool_schemas = self._build_tool_schema_map(tools_for_schema, model)
         openai_response = self._gemini_to_openai_non_streaming(
             gemini_response, model, tool_schemas
         )
@@ -4622,7 +4629,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                  instead of the main response_stream.log
         """
         # Build tool schema map for schema-aware JSON parsing
-        tool_schemas = self._build_tool_schema_map(payload.get("tools"), model)
+        # NOTE: After _transform_to_antigravity_format, tools are at payload["request"]["tools"]
+        tools_for_schema = payload.get("request", {}).get("tools")
+        tool_schemas = self._build_tool_schema_map(tools_for_schema, model)
 
         # Accumulator tracks state across chunks for caching and tool indexing
         accumulator = {
