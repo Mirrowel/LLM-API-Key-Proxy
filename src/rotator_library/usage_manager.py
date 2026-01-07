@@ -310,7 +310,7 @@ class UsageManager:
 
         Returns only public-facing model names, deduplicated. Internal variants
         (e.g., claude-sonnet-4-5-thinking) are normalized to their public name
-        (e.g., claude-sonnet-4-5).
+        (e.g., claude-sonnet-4.5).
 
         Args:
             credential: The credential identifier
@@ -318,7 +318,7 @@ class UsageManager:
 
         Returns:
             List of normalized, deduplicated model names with provider prefix
-            (e.g., ["antigravity/claude-sonnet-4-5", "antigravity/claude-opus-4-5"])
+            (e.g., ["antigravity/claude-sonnet-4.5", "antigravity/claude-opus-4.5"])
         """
         provider = self._get_provider_from_credential(credential)
         plugin_instance = self._get_provider_instance(provider)
@@ -367,7 +367,7 @@ class UsageManager:
         Normalize model name using provider's mapping.
 
         Converts internal model names (e.g., claude-sonnet-4-5-thinking) to
-        public-facing names (e.g., claude-sonnet-4-5) for consistent storage.
+        public-facing names (e.g., claude-sonnet-4.5) for consistent storage.
 
         Args:
             credential: The credential identifier
@@ -469,6 +469,9 @@ class UsageManager:
         if self._usage_data is None:
             return "quota: 0/? [100%]"
 
+        # Normalize model name for consistent lookup (data is stored under normalized names)
+        model = self._normalize_model(key, model)
+
         key_data = self._usage_data.get(key, {})
         model_data = key_data.get("models", {}).get(model, {})
 
@@ -532,6 +535,9 @@ class UsageManager:
         """
         if self._usage_data is None:
             return 0
+
+        # Normalize model name for consistent lookup (data is stored under normalized names)
+        model = self._normalize_model(key, model)
 
         key_data = self._usage_data.get(key, {})
         reset_mode = self._get_reset_mode(key)
