@@ -497,6 +497,26 @@ def openai_to_anthropic_response(openai_response: dict, original_model: str) -> 
     }
 
 
+def _history_supports_thinking(anthropic_messages: List[dict]) -> bool:
+    for msg in anthropic_messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            return False
+        first_block = next((b for b in content if isinstance(b, dict)), None)
+        if not first_block:
+            return False
+        if first_block.get("type") not in ("thinking", "redacted_thinking"):
+            return False
+    return True
+
+
+def _inject_continue_for_fresh_thinking_turn(openai_messages: List[dict]) -> List[dict]:
+    openai_messages.append({"role": "user", "content": "[Continue]"})
+    return openai_messages
+
+
 def translate_anthropic_request(request: AnthropicMessagesRequest) -> Dict[str, Any]:
     """
     Translate a complete Anthropic Messages API request to OpenAI format.
@@ -512,9 +532,11 @@ def translate_anthropic_request(request: AnthropicMessagesRequest) -> Dict[str, 
     """
     anthropic_request = request.model_dump(exclude_none=True)
 
+    messages = anthropic_request.get("messages", [])
     openai_messages = anthropic_to_openai_messages(
-        anthropic_request.get("messages", []), anthropic_request.get("system")
+        messages, anthropic_request.get("system")
     )
+    thinking_compatible = _history_supports_thinking(messages)
 
     openai_tools = anthropic_to_openai_tools(anthropic_request.get("tools"))
     openai_tool_choice = anthropic_to_openai_tool_choice(
@@ -551,11 +573,19 @@ def translate_anthropic_request(request: AnthropicMessagesRequest) -> Dict[str, 
     # Always use max thinking budget (31999) for Claude via Anthropic routes
     if request.thinking:
         if request.thinking.type == "enabled":
+            if not thinking_compatible:
+                openai_messages = _inject_continue_for_fresh_thinking_turn(
+                    openai_messages
+                )
+                openai_request["messages"] = openai_messages
             openai_request["reasoning_effort"] = "high"
             openai_request["thinking_budget"] = 31999
         elif request.thinking.type == "disabled":
             openai_request["reasoning_effort"] = "disable"
     elif _is_opus_model(request.model):
+        if not thinking_compatible:
+            openai_messages = _inject_continue_for_fresh_thinking_turn(openai_messages)
+            openai_request["messages"] = openai_messages
         openai_request["reasoning_effort"] = "high"
         openai_request["thinking_budget"] = 31999
     return openai_request
