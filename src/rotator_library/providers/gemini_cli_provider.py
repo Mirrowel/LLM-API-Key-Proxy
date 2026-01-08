@@ -19,6 +19,7 @@ from .utilities.gemini_shared_utils import (
     GEMINI3_TOOL_RENAMES,
     GEMINI3_TOOL_RENAMES_REVERSE,
     FINISH_REASON_MAP,
+    CODE_ASSIST_ENDPOINT,
 )
 from .utilities.gemini_file_logger import GeminiCliFileLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -51,9 +52,7 @@ def _get_gemini3_signature_cache_file() -> Path:
 # and is imported as GeminiCliFileLogger
 
 
-CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
-
-HARDCODED_MODELS = [
+AVAILABLE_MODELS = [
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -428,7 +427,6 @@ class GeminiCliProvider(
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """
         Returns the minimum priority tier required for a model.
-        Gemini 3 requires paid tier (priority 1).
 
         Args:
             model: The model name (with or without provider prefix)
@@ -436,13 +434,9 @@ class GeminiCliProvider(
         Returns:
             Minimum required priority level or None if no restrictions
         """
-        model_name = model.split("/")[-1].replace(":thinking", "")
-
-        # Gemini 3 requires paid tier
-        if model_name.startswith("gemini-3-"):
-            return 2  # Only priority 2 (paid) credentials
-
-        return None  # All other models have no restrictions
+        # No model-specific priority restrictions
+        # (Gemini 3 is now public and available to all tiers)
+        return None
 
     # NOTE: initialize_credentials() is inherited from GeminiCredentialManager
 
@@ -466,6 +460,18 @@ class GeminiCliProvider(
         """Check if model is Gemini 3 (requires special handling)."""
         model_name = model.split("/")[-1].replace(":thinking", "")
         return model_name.startswith("gemini-3-")
+
+    def _get_available_models(self) -> List[str]:
+        """
+        Get list of user-facing model names available via this provider.
+
+        Used by quota tracker to filter which models to store baselines for.
+        Only models in this list will have quota baselines tracked.
+
+        Returns:
+            List of user-facing model names
+        """
+        return AVAILABLE_MODELS
 
     # NOTE: _strip_gemini3_prefix() is inherited from GeminiToolHandler
 
@@ -1666,8 +1672,8 @@ class GeminiCliProvider(
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:
         """
         Returns a merged list of Gemini CLI models from three sources:
-        1. Environment variable models (via GEMINI_CLI_MODELS) - ALWAYS included, take priority
-        2. Hardcoded models (fallback list) - added only if ID not in env vars
+        1. Environment variable models (via model definitions) - ALWAYS included, take priority
+        2. Available models (AVAILABLE_MODELS fallback list) - added only if ID not in env vars
         3. Dynamic discovery from Gemini API (if supported) - added only if ID not in env vars
 
         Environment variable models always win and are never deduplicated, even if they
@@ -1713,8 +1719,8 @@ class GeminiCliProvider(
                 f"Loaded {len(static_models)} static models for gemini_cli from environment variables"
             )
 
-        # Source 2: Add hardcoded models (only if ID not already in env vars)
-        for model_id in HARDCODED_MODELS:
+        # Source 2: Add available models (only if ID not already in env vars)
+        for model_id in AVAILABLE_MODELS:
             if model_id not in env_var_ids:
                 models.append(f"gemini_cli/{model_id}")
                 env_var_ids.add(model_id)

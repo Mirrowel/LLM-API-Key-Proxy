@@ -154,13 +154,6 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
     user_to_api_model_map = _USER_TO_API_MODEL_MAP
     api_to_user_model_map = _API_TO_USER_MODEL_MAP
 
-    # NOTE: Antigravity uses integer-based DEFAULT_MAX_REQUESTS instead of
-    # float-based DEFAULT_QUOTA_COSTS. We override the relevant methods below.
-    default_quota_costs: Dict[
-        str, Dict[str, float]
-    ] = {}  # Not used - we use max_requests
-    default_quota_cost_unknown = 1.0  # 1% = 100 requests fallback
-
     # Type hints for attributes that must exist on the provider
     _learned_costs: Dict[str, Dict[str, int]]
     _learned_costs_loaded: bool

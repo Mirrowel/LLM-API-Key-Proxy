@@ -10,11 +10,9 @@ from typing import Any, Dict, Optional, List
 import httpx
 
 from .google_oauth_base import GoogleOAuthBase
+from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 lib_logger = logging.getLogger("rotator_library")
-
-# Code Assist endpoint for project discovery
-CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
 
 class GeminiAuthBase(GoogleOAuthBase):

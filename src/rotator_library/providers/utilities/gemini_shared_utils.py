@@ -33,6 +33,14 @@ def env_int(key: str, default: int) -> int:
 
 
 # =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+# Google Code Assist API endpoint (used by Gemini CLI and Antigravity providers)
+CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
+
+
+# =============================================================================
 # GEMINI 3 TOOL RENAMING CONSTANTS
 # =============================================================================
 

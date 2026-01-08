@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import httpx
 
 from .base_quota_tracker import BaseQuotaTracker
+from .gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 if TYPE_CHECKING:
     from ...usage_manager import UsageManager
@@ -40,72 +41,44 @@ if TYPE_CHECKING:
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
 
-# Gemini CLI Code Assist endpoint
-CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
-
-# Models exposed by Gemini CLI
-GEMINI_CLI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3-pro-preview",
-    "gemini-3-flash-preview",
-]
-
-# Model ID mappings for quota buckets
-# The quota API may return different model IDs than what we use
-_API_TO_USER_MODEL_MAP: Dict[str, str] = {
-    # Map API model IDs to user-facing names if they differ
-    "gemini-2.5-pro-preview": "gemini-2.5-pro",
-    "gemini-2.5-flash-preview": "gemini-2.5-flash",
-}
-
-_USER_TO_API_MODEL_MAP: Dict[str, str] = {
-    v: k for k, v in _API_TO_USER_MODEL_MAP.items()
-}
-
 # =============================================================================
-# QUOTA COST CONSTANTS (in PERCENTAGE format)
+# QUOTA LIMITS (max requests per 100% quota)
 # =============================================================================
-# Quota costs per request as PERCENTAGE of 100% quota.
-# E.g., 0.1 means 0.1% per request = 1000 requests total (100 / 0.1 = 1000)
+# Max requests per quota period. This is the SOURCE OF TRUTH.
+# Cost percentage is derived as: 100 / max_requests
+# Using integers avoids floating-point precision issues.
+#
 # Verified 2026-01-07 via quota verification tests (see GEMINI_CLI_QUOTA_REPORT.md)
-# Learned costs override these if available.
+# Learned values (from file) override these defaults if available.
 
-DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
+DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
     "standard-tier": {
-        # Pro group: 0.4% per request (~250 requests per 100%)
-        # Verified 2026-01-07
-        "gemini-2.5-pro": 0.4,
-        "gemini-3-pro-preview": 0.4,
-        # Flash group (25-flash): 0.0667% per request (~1500 requests per 100%)
-        # Verified 2026-01-07: gemini-2.0-flash shares quota with 2.5-flash models
-        "gemini-2.0-flash": 0.0667,
-        "gemini-2.5-flash": 0.0667,
-        "gemini-2.5-flash-lite": 0.0667,
-        # 3-Flash group: 0.0667% per request (~1500 requests per 100%)
-        # Verified 2026-01-07
-        "gemini-3-flash-preview": 0.0667,
+        # Pro group (verified: 0.4% per request = 250 requests)
+        "gemini-2.5-pro": 250,
+        "gemini-3-pro-preview": 250,
+        # Flash group - 2.5 (verified: ~0.0667% per request = 1500 requests)
+        # gemini-2.0-flash shares quota with 2.5-flash models
+        "gemini-2.0-flash": 1500,
+        "gemini-2.5-flash": 1500,
+        "gemini-2.5-flash-lite": 1500,
+        # 3-Flash group (verified: ~0.0667% per request = 1500 requests)
+        "gemini-3-flash-preview": 1500,
     },
     "free-tier": {
-        # Pro group: 1.0% per request (~100 requests per 100%)
-        # Verified 2026-01-07
-        "gemini-2.5-pro": 1.0,
-        "gemini-3-pro-preview": 1.0,
-        # Flash group (25-flash): 0.1% per request (~1000 requests per 100%)
-        # Verified 2026-01-07
-        "gemini-2.0-flash": 0.1,
-        "gemini-2.5-flash": 0.1,
-        "gemini-2.5-flash-lite": 0.1,
-        # 3-Flash group: 0.1% per request (~1000 requests per 100%)
-        # Verified 2026-01-07
-        "gemini-3-flash-preview": 0.1,
+        # Pro group (verified: 1.0% per request = 100 requests)
+        "gemini-2.5-pro": 100,
+        "gemini-3-pro-preview": 100,
+        # Flash group - 2.5 (verified: 0.1% per request = 1000 requests)
+        "gemini-2.0-flash": 1000,
+        "gemini-2.5-flash": 1000,
+        "gemini-2.5-flash-lite": 1000,
+        # 3-Flash group (verified: 0.1% per request = 1000 requests)
+        "gemini-3-flash-preview": 1000,
     },
 }
 
-# Default quota cost for unknown models (0.1% = 1000 requests max)
-DEFAULT_QUOTA_COST_UNKNOWN = 0.1
+# Default max requests for unknown models (1% = 100 requests)
+DEFAULT_MAX_REQUESTS_UNKNOWN = 1000
 
 
 class GeminiCliQuotaTracker(BaseQuotaTracker):
@@ -133,12 +106,14 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
 
     provider_env_prefix = "GEMINI_CLI"
     cache_subdir = "gemini_cli"
-    default_quota_costs = DEFAULT_QUOTA_COSTS
-    default_quota_cost_unknown = DEFAULT_QUOTA_COST_UNKNOWN
-    user_to_api_model_map = _USER_TO_API_MODEL_MAP
-    api_to_user_model_map = _API_TO_USER_MODEL_MAP
+
+    # No model name mappings needed - API names match public names
+    user_to_api_model_map: Dict[str, str] = {}
+    api_to_user_model_map: Dict[str, str] = {}
 
     # Type hints for attributes from provider
+    _learned_costs: Dict[str, Dict[str, int]]
+    _learned_costs_loaded: bool
     _quota_refresh_interval: int
     project_tier_cache: Dict[str, str]
     project_id_cache: Dict[str, str]
@@ -160,6 +135,127 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
     def _get_provider_prefix(self) -> str:
         """Get the provider prefix for model names."""
         return "gemini_cli"
+
+    # =========================================================================
+    # LEARNED COSTS MANAGEMENT (Override for integer max_requests)
+    # =========================================================================
+
+    def _load_learned_costs(self) -> None:
+        """Load learned max_requests values from persistent file."""
+        if self._learned_costs_loaded:
+            return
+
+        costs_file = self._get_learned_costs_file()
+        if not costs_file.exists():
+            self._learned_costs = {}
+            self._learned_costs_loaded = True
+            return
+
+        try:
+            with open(costs_file, "r") as f:
+                data = json.load(f)
+
+            # Support both old format (float costs) and new format (int max_requests)
+            raw_costs = data.get("max_requests", data.get("costs", {}))
+
+            # Convert to int if loading old float format
+            self._learned_costs = {}
+            for tier, models in raw_costs.items():
+                self._learned_costs[tier] = {}
+                for model, value in models.items():
+                    if isinstance(value, float) and value < 10:
+                        # Old format: cost percentage -> convert to max_requests
+                        self._learned_costs[tier][model] = (
+                            int(100.0 / value) if value > 0 else 1000
+                        )
+                    else:
+                        # New format: already max_requests
+                        self._learned_costs[tier][model] = int(value)
+
+            lib_logger.debug(
+                f"Loaded learned quota limits from {costs_file.name}: "
+                f"{sum(len(m) for m in self._learned_costs.values())} model entries"
+            )
+        except (json.JSONDecodeError, IOError) as e:
+            lib_logger.warning(f"Failed to load learned costs: {e}")
+            self._learned_costs = {}
+
+        self._learned_costs_loaded = True
+
+    def _save_learned_costs(self) -> None:
+        """Persist learned max_requests values to file."""
+        costs_file = self._get_learned_costs_file()
+        costs_file.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "schema_version": 2,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "max_requests": self._learned_costs,
+        }
+
+        try:
+            with open(costs_file, "w") as f:
+                json.dump(data, f, indent=2)
+            lib_logger.debug(f"Saved learned quota limits to {costs_file.name}")
+        except IOError as e:
+            lib_logger.warning(f"Failed to save learned costs: {e}")
+
+    def get_quota_cost(self, model: str, tier: str) -> float:
+        """
+        Get quota cost per request for a model/tier combination.
+
+        Cost is DERIVED from max_requests: cost = 100 / max_requests
+        This ensures exact integer results when calculating max_requests back.
+
+        Args:
+            model: Model name (without provider prefix)
+            tier: Account tier ("standard-tier" or "free-tier")
+
+        Returns:
+            Cost as percentage (e.g., 0.4 for 0.4% per request)
+        """
+        max_requests = self.get_max_requests_for_model(model, tier)
+        if max_requests <= 0:
+            return 100.0  # Fallback: 1 request max
+        return 100.0 / max_requests
+
+    def get_max_requests_for_model(self, model: str, tier: str) -> int:
+        """
+        Get maximum requests per 100% quota for a model/tier.
+
+        This is a direct lookup from DEFAULT_MAX_REQUESTS (source of truth).
+        Learned values override defaults if available.
+        Using integers avoids floating-point precision issues.
+
+        Args:
+            model: Model name
+            tier: Account tier
+
+        Returns:
+            Max requests (e.g., 250 for Pro on standard-tier)
+        """
+        # Ensure learned values are loaded
+        self._load_learned_costs()
+
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        # Check learned values first (stored as max_requests integers)
+        if tier in self._learned_costs:
+            if clean_model in self._learned_costs[tier]:
+                return self._learned_costs[tier][clean_model]
+
+        # Fall back to defaults
+        if tier in DEFAULT_MAX_REQUESTS:
+            if clean_model in DEFAULT_MAX_REQUESTS[tier]:
+                return DEFAULT_MAX_REQUESTS[tier][clean_model]
+
+        # Unknown model - use conservative default
+        lib_logger.debug(
+            f"Unknown max requests for model={clean_model}, tier={tier}. "
+            f"Using default {DEFAULT_MAX_REQUESTS_UNKNOWN}"
+        )
+        return DEFAULT_MAX_REQUESTS_UNKNOWN
 
     # =========================================================================
     # BaseQuotaTracker ABSTRACT METHOD IMPLEMENTATIONS
