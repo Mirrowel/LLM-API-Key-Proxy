@@ -1090,24 +1090,6 @@ class RotatingClient:
                         self.enable_request_logging
                     )
 
-                    # Check body first for custom_reasoning_budget
-                    if "custom_reasoning_budget" in kwargs:
-                        litellm_kwargs["custom_reasoning_budget"] = kwargs[
-                            "custom_reasoning_budget"
-                        ]
-                    else:
-                        custom_budget_header = None
-                        if request and hasattr(request, "headers"):
-                            custom_budget_header = request.headers.get(
-                                "custom_reasoning_budget"
-                            )
-
-                        if custom_budget_header is not None:
-                            is_budget_enabled = custom_budget_header.lower() == "true"
-                            litellm_kwargs["custom_reasoning_budget"] = (
-                                is_budget_enabled
-                            )
-
                     # Retry loop for custom providers - mirrors streaming path error handling
                     for attempt in range(self.max_retries):
                         try:
@@ -1796,23 +1778,6 @@ class RotatingClient:
                     )
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
-                    # Check body first for custom_reasoning_budget
-                    if "custom_reasoning_budget" in kwargs:
-                        litellm_kwargs["custom_reasoning_budget"] = kwargs[
-                            "custom_reasoning_budget"
-                        ]
-                    else:
-                        custom_budget_header = None
-                        if request and hasattr(request, "headers"):
-                            custom_budget_header = request.headers.get(
-                                "custom_reasoning_budget"
-                            )
-
-                        if custom_budget_header is not None:
-                            is_budget_enabled = custom_budget_header.lower() == "true"
-                            litellm_kwargs["custom_reasoning_budget"] = (
-                                is_budget_enabled
-                            )
 
                     # [NEW] Merge provider-specific params
                     if provider in self.litellm_provider_params:
@@ -2738,10 +2703,12 @@ class RotatingClient:
                     if group_stats["total_requests_max"] > 0:
                         used = group_stats["total_requests_used"]
                         max_r = group_stats["total_requests_max"]
+                        group_stats["total_requests_remaining"] = max_r - used
                         group_stats["total_remaining_pct"] = max(
                             0, int((1 - used / max_r) * 100)
                         )
                     else:
+                        group_stats["total_requests_remaining"] = 0
                         group_stats["total_remaining_pct"] = None
 
                     prov_stats["quota_groups"][group_name] = group_stats
@@ -2805,13 +2772,17 @@ class RotatingClient:
                                 except (ValueError, OSError):
                                     pass
 
+                            requests_remaining = (
+                                max(0, max_req - req_count) if max_req else 0
+                            )
                             cred["model_groups"][group_name] = {
                                 "remaining_pct": remaining_pct,
                                 "requests_used": req_count,
+                                "requests_remaining": requests_remaining,
                                 "requests_max": max_req,
-                                "display": f"{req_count}/{max_req}"
+                                "display": f"{requests_remaining}/{max_req}"
                                 if max_req
-                                else f"{req_count}/?",
+                                else f"?/?",
                                 "is_exhausted": is_exhausted,
                                 "reset_time_iso": reset_iso,
                                 "models": group_models,

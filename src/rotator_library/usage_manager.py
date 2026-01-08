@@ -197,6 +197,15 @@ class UsageManager:
         """
         import re
 
+        # Pattern: env:// URI format (e.g., "env://antigravity/1" -> "antigravity")
+        if credential.startswith("env://"):
+            parts = credential[6:].split("/")  # Remove "env://" prefix
+            if parts and parts[0]:
+                return parts[0].lower()
+            # Malformed env:// URI (empty provider name)
+            lib_logger.warning(f"Malformed env:// credential URI: {credential}")
+            return None
+
         # Normalize path separators
         normalized = credential.replace("\\", "/")
 
@@ -297,21 +306,39 @@ class UsageManager:
 
     def _get_grouped_models(self, credential: str, group: str) -> List[str]:
         """
-        Get all model names in a quota group (with provider prefix).
+        Get all model names in a quota group (with provider prefix), normalized.
+
+        Returns only public-facing model names, deduplicated. Internal variants
+        (e.g., claude-sonnet-4-5-thinking) are normalized to their public name
+        (e.g., claude-sonnet-4.5).
 
         Args:
             credential: The credential identifier
             group: Group name (e.g., "claude")
 
         Returns:
-            List of full model names (e.g., ["antigravity/claude-opus-4-5", ...])
+            List of normalized, deduplicated model names with provider prefix
+            (e.g., ["antigravity/claude-sonnet-4.5", "antigravity/claude-opus-4.5"])
         """
         provider = self._get_provider_from_credential(credential)
         plugin_instance = self._get_provider_instance(provider)
 
         if plugin_instance and hasattr(plugin_instance, "get_models_in_quota_group"):
             models = plugin_instance.get_models_in_quota_group(group)
-            # Add provider prefix
+
+            # Normalize and deduplicate
+            if hasattr(plugin_instance, "normalize_model_for_tracking"):
+                seen = set()
+                normalized = []
+                for m in models:
+                    prefixed = f"{provider}/{m}"
+                    norm = plugin_instance.normalize_model_for_tracking(prefixed)
+                    if norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+                return normalized
+
+            # Fallback: just add provider prefix
             return [f"{provider}/{m}" for m in models]
 
         return []
@@ -335,9 +362,31 @@ class UsageManager:
 
         return 1
 
+    def _normalize_model(self, credential: str, model: str) -> str:
+        """
+        Normalize model name using provider's mapping.
+
+        Converts internal model names (e.g., claude-sonnet-4-5-thinking) to
+        public-facing names (e.g., claude-sonnet-4.5) for consistent storage.
+
+        Args:
+            credential: The credential identifier
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Normalized model name (provider prefix preserved if present)
+        """
+        provider = self._get_provider_from_credential(credential)
+        plugin_instance = self._get_provider_instance(provider)
+
+        if plugin_instance and hasattr(plugin_instance, "normalize_model_for_tracking"):
+            return plugin_instance.normalize_model_for_tracking(model)
+
+        return model
+
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
-    _REQUEST_COUNT_PROVIDERS = {"antigravity"}
+    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli"}
 
     def _get_grouped_usage_count(self, key: str, model: str) -> int:
         """
@@ -420,6 +469,9 @@ class UsageManager:
         if self._usage_data is None:
             return "quota: 0/? [100%]"
 
+        # Normalize model name for consistent lookup (data is stored under normalized names)
+        model = self._normalize_model(key, model)
+
         key_data = self._usage_data.get(key, {})
         model_data = key_data.get("models", {}).get(model, {})
 
@@ -483,6 +535,9 @@ class UsageManager:
         """
         if self._usage_data is None:
             return 0
+
+        # Normalize model name for consistent lookup (data is stored under normalized names)
+        model = self._normalize_model(key, model)
 
         key_data = self._usage_data.get(key, {})
         reset_mode = self._get_reset_mode(key)
@@ -702,8 +757,16 @@ class UsageManager:
                 if (key_data.get("key_cooldown_until") or 0) > now:
                     continue
 
+                # Normalize model name for consistent cooldown lookup
+                # (cooldowns are stored under normalized names by record_failure)
+                # For providers without normalize_model_for_tracking (non-Antigravity),
+                # this returns the model unchanged, so cooldown lookups work as before.
+                normalized_model = self._normalize_model(key, model)
+
                 # Skip if model-specific cooldown is active
-                if (key_data.get("model_cooldowns", {}).get(model) or 0) > now:
+                if (
+                    key_data.get("model_cooldowns", {}).get(normalized_model) or 0
+                ) > now:
                     continue
 
                 available.append(key)
@@ -1221,6 +1284,16 @@ class UsageManager:
         await self._reset_daily_stats_if_needed()
         self._initialize_key_states(available_keys)
 
+        # Normalize model name for consistent cooldown lookup
+        # (cooldowns are stored under normalized names by record_failure)
+        # Use first credential for provider detection; all credentials passed here
+        # are for the same provider (filtered by client.py before calling acquire_key).
+        # For providers without normalize_model_for_tracking (non-Antigravity),
+        # this returns the model unchanged, so cooldown lookups work as before.
+        normalized_model = (
+            self._normalize_model(available_keys[0], model) if available_keys else model
+        )
+
         # This loop continues as long as the global deadline has not been met.
         while time.time() < deadline:
             now = time.time()
@@ -1233,9 +1306,10 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
-                        # Skip keys on cooldown
+                        # Skip keys on cooldown (use normalized model for lookup)
                         if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
+                            key_data.get("model_cooldowns", {}).get(normalized_model)
+                            or 0
                         ) > now:
                             continue
 
@@ -1399,8 +1473,10 @@ class UsageManager:
                     for key in available_keys:
                         key_data = self._usage_data.get(key, {})
 
+                        # Skip keys on cooldown (use normalized model for lookup)
                         if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(model) or 0
+                            key_data.get("model_cooldowns", {}).get(normalized_model)
+                            or 0
                         ) > now:
                             continue
 
@@ -1569,6 +1645,10 @@ class UsageManager:
         - credential: Legacy mode with key_data["daily"]["models"]
         """
         await self._lazy_init()
+
+        # Normalize model name to public-facing name for consistent tracking
+        model = self._normalize_model(key, model)
+
         async with self._data_lock:
             now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
@@ -1783,6 +1863,10 @@ class UsageManager:
                 Set to False for provider-level errors that shouldn't count against the key.
         """
         await self._lazy_init()
+
+        # Normalize model name to public-facing name for consistent tracking
+        model = self._normalize_model(key, model)
+
         async with self._data_lock:
             now_ts = time.time()
             today_utc_str = datetime.now(timezone.utc).date().isoformat()
@@ -1852,6 +1936,15 @@ class UsageManager:
                     # Track failure for quota estimation (request still consumes quota)
                     model_data["failure_count"] = model_data.get("failure_count", 0) + 1
                     model_data["request_count"] = model_data.get("request_count", 0) + 1
+
+                    # Clamp request_count to quota_max_requests when quota is exhausted
+                    # This prevents display overflow (e.g., 151/150) when requests are
+                    # counted locally before API refresh corrects the value
+                    max_req = model_data.get("quota_max_requests")
+                    if max_req is not None and model_data["request_count"] > max_req:
+                        model_data["request_count"] = max_req
+                        # Update quota_display with clamped value
+                        model_data["quota_display"] = f"{max_req}/{max_req}"
                     new_request_count = model_data["request_count"]
 
                     # Apply to all models in the same quota group
@@ -2027,18 +2120,32 @@ class UsageManager:
         model: str,
         remaining_fraction: float,
         max_requests: Optional[int] = None,
-    ) -> None:
+        reset_timestamp: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline data for a credential/model after fetching from API.
 
         This stores the current quota state as a baseline, which is used to
         estimate remaining quota based on subsequent request counts.
 
+        When quota is exhausted (remaining_fraction <= 0.0) and a valid reset_timestamp
+        is provided, this also sets model_cooldowns to prevent wasted requests.
+
         Args:
             credential: Credential identifier (file path or env:// URI)
             model: Model name (with or without provider prefix)
             remaining_fraction: Current remaining quota as fraction (0.0 to 1.0)
             max_requests: Maximum requests allowed per quota period (e.g., 250 for Claude)
+            reset_timestamp: Unix timestamp when quota resets. Only trusted when
+                remaining_fraction < 1.0 (quota has been used). API returns garbage
+                reset times for unused quota (100%).
+
+        Returns:
+            None if no cooldown was set/updated, otherwise:
+            {
+                "group_or_model": str,  # quota group name or model name if ungrouped
+                "hours_until_reset": float,
+            }
         """
         await self._lazy_init()
         async with self._data_lock:
@@ -2117,7 +2224,50 @@ class UsageManager:
                 model_data["quota_max_requests"] = max_requests
                 model_data["quota_display"] = f"{used_requests}/{max_requests}"
 
-            # Sync request_count and quota_max_requests across quota group
+            # Handle reset_timestamp: only trust it when quota has been used (< 100%)
+            # API returns garbage reset times for unused quota
+            valid_reset_ts = (
+                reset_timestamp is not None
+                and remaining_fraction < 1.0
+                and reset_timestamp > now_ts
+            )
+
+            if valid_reset_ts:
+                model_data["quota_reset_ts"] = reset_timestamp
+
+            # Set cooldowns when quota is exhausted
+            model_cooldowns = key_data.setdefault("model_cooldowns", {})
+            is_exhausted = remaining_fraction <= 0.0
+            cooldown_set_info = (
+                None  # Will be returned if cooldown was newly set/updated
+            )
+
+            if is_exhausted and valid_reset_ts:
+                # Only update cooldown if not set or differs by more than 5 minutes
+                existing_cooldown = model_cooldowns.get(model)
+                should_update = (
+                    existing_cooldown is None
+                    or abs(existing_cooldown - reset_timestamp) > 300
+                )
+                if should_update:
+                    model_cooldowns[model] = reset_timestamp
+                    hours_until_reset = (reset_timestamp - now_ts) / 3600
+                    # Determine group or model name for logging
+                    group = self._get_model_quota_group(credential, model)
+                    cooldown_set_info = {
+                        "group_or_model": group if group else model.split("/")[-1],
+                        "hours_until_reset": hours_until_reset,
+                    }
+
+                # Defensive clamp: ensure request_count doesn't exceed max when exhausted
+                if (
+                    max_requests is not None
+                    and model_data["request_count"] > max_requests
+                ):
+                    model_data["request_count"] = max_requests
+                    model_data["quota_display"] = f"{max_requests}/{max_requests}"
+
+            # Sync baseline fields and quota info across quota group
             group = self._get_model_quota_group(credential, model)
             if group:
                 grouped_models = self._get_grouped_models(credential, group)
@@ -2136,12 +2286,41 @@ class UsageManager:
                                 "approx_cost": 0.0,
                             },
                         )
+                        # Sync request tracking
                         other_model_data["request_count"] = used_requests
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
                                 f"{used_requests}/{max_requests}"
                             )
+                        # Sync baseline fields
+                        other_model_data["baseline_remaining_fraction"] = (
+                            remaining_fraction
+                        )
+                        other_model_data["baseline_fetched_at"] = now_ts
+                        other_model_data["requests_at_baseline"] = used_requests
+                        # Sync reset timestamp if valid
+                        if valid_reset_ts:
+                            other_model_data["quota_reset_ts"] = reset_timestamp
+                        # Sync cooldown if exhausted (with ±5 min check)
+                        if is_exhausted and valid_reset_ts:
+                            existing_grouped = model_cooldowns.get(grouped_model)
+                            should_update_grouped = (
+                                existing_grouped is None
+                                or abs(existing_grouped - reset_timestamp) > 300
+                            )
+                            if should_update_grouped:
+                                model_cooldowns[grouped_model] = reset_timestamp
+
+                            # Defensive clamp for grouped models when exhausted
+                            if (
+                                max_requests is not None
+                                and other_model_data["request_count"] > max_requests
+                            ):
+                                other_model_data["request_count"] = max_requests
+                                other_model_data["quota_display"] = (
+                                    f"{max_requests}/{max_requests}"
+                                )
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
@@ -2149,6 +2328,7 @@ class UsageManager:
             )
 
         await self._save_usage()
+        return cooldown_set_info
 
     async def _check_key_lockout(self, key: str, key_data: Dict):
         """

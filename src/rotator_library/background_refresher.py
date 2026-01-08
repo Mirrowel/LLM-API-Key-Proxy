@@ -155,18 +155,26 @@ class BackgroundRefresher:
 
         for provider, credentials in all_credentials.items():
             if not credentials:
+                lib_logger.debug(f"Skipping {provider} background job: no credentials")
                 continue
 
             provider_plugin = self._client._get_provider_instance(provider)
             if not provider_plugin:
+                lib_logger.debug(
+                    f"Skipping {provider} background job: no provider instance"
+                )
                 continue
 
             # Check if provider has a background job
             if not hasattr(provider_plugin, "get_background_job_config"):
+                lib_logger.debug(
+                    f"Skipping {provider} background job: no get_background_job_config method"
+                )
                 continue
 
             config = provider_plugin.get_background_job_config()
             if not config:
+                lib_logger.debug(f"Skipping {provider} background job: config is None")
                 continue
 
             # Start the provider's background job task

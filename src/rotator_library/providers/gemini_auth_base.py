@@ -10,11 +10,9 @@ from typing import Any, Dict, Optional, List
 import httpx
 
 from .google_oauth_base import GoogleOAuthBase
+from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 lib_logger = logging.getLogger("rotator_library")
-
-# Code Assist endpoint for project discovery
-CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
 
 class GeminiAuthBase(GoogleOAuthBase):
@@ -133,11 +131,10 @@ class GeminiAuthBase(GoogleOAuthBase):
                 f"Found configured project_id override: {configured_project_id}"
             )
 
-        # Load credentials from file to check for persisted project_id and tier
-        # Skip for env:// paths (environment-based credentials don't persist to files)
+        # Load credentials to check for persisted/configured project_id and tier
         credential_index = self._parse_env_credential_path(credential_path)
         if credential_index is None:
-            # Only try to load from file if it's not an env:// path
+            # File-based credentials: load from file
             try:
                 with open(credential_path, "r") as f:
                     creds = json.load(f)
@@ -147,7 +144,7 @@ class GeminiAuthBase(GoogleOAuthBase):
                 persisted_tier = metadata.get("tier")
 
                 if persisted_project_id:
-                    lib_logger.info(
+                    lib_logger.debug(
                         f"Loaded persisted project ID from credential file: {persisted_project_id}"
                     )
                     self.project_id_cache[credential_path] = persisted_project_id
@@ -160,6 +157,29 @@ class GeminiAuthBase(GoogleOAuthBase):
                     return persisted_project_id
             except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
                 lib_logger.debug(f"Could not load persisted project ID from file: {e}")
+        else:
+            # Env-based credentials: load from credentials cache
+            # The credentials were already loaded by _load_from_env() which reads
+            # {PREFIX}_{N}_PROJECT_ID and {PREFIX}_{N}_TIER into _proxy_metadata
+            if credential_path in self._credentials_cache:
+                creds = self._credentials_cache[credential_path]
+                metadata = creds.get("_proxy_metadata", {})
+                env_project_id = metadata.get("project_id")
+                env_tier = metadata.get("tier")
+
+                if env_project_id:
+                    lib_logger.debug(
+                        f"Loaded project ID from env credential metadata: {env_project_id}"
+                    )
+                    self.project_id_cache[credential_path] = env_project_id
+
+                    if env_tier:
+                        self.project_tier_cache[credential_path] = env_tier
+                        lib_logger.debug(
+                            f"Loaded tier from env credential metadata: {env_tier}"
+                        )
+
+                    return env_project_id
 
         lib_logger.debug(
             "No cached or configured project ID found, initiating discovery..."

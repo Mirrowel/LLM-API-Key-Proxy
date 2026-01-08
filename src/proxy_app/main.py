@@ -109,7 +109,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import colorlog
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -197,8 +197,7 @@ class EnrichedModelCard(BaseModel):
     _sources: Optional[List[str]] = None
     _match_type: Optional[str] = None
 
-    class Config:
-        extra = "allow"  # Allow extra fields from the service
+    model_config = ConfigDict(extra="allow")  # Allow extra fields from the service
 
 
 class ModelList(BaseModel):
@@ -922,12 +921,9 @@ async def chat_completions(
         reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
             "reasoning_effort"
         )
-        custom_reasoning_budget = request_data.get(
-            "custom_reasoning_budget"
-        ) or generation_cfg.get("custom_reasoning_budget", False)
 
         logging.getLogger("rotator_library").debug(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}"
         )
 
         # Log basic request info to console (this is a separate, simpler logger).
