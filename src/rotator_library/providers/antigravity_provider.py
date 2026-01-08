@@ -1944,7 +1944,10 @@ class AntigravityProvider(
     # =========================================================================
 
     def _get_thinking_config(
-        self, reasoning_effort: Optional[str], model: str
+        self,
+        reasoning_effort: Optional[str],
+        model: str,
+        explicit_budget: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -1952,12 +1955,27 @@ class AntigravityProvider(
         - Gemini 2.5 & Claude: thinkingBudget (integer tokens)
         - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
         - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
+
+        If explicit_budget is provided (from Anthropic route), it takes precedence
+        over reasoning_effort mapping. For Claude, explicit budget is capped at 31999.
         """
         internal = self._alias_to_internal(model)
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal.startswith("gemini-3-")
         is_gemini_3_flash = "gemini-3-flash" in model or "gemini-3-flash" in internal
         is_claude = self._is_claude(model)
+
+        if not (is_gemini_25 or is_gemini_3 or is_claude):
+            return None
+
+        # Handle explicit budget from Anthropic route (takes precedence)
+        if explicit_budget is not None and (is_gemini_25 or is_claude):
+            if explicit_budget <= 0:
+                return {"thinkingBudget": 0, "include_thoughts": False}
+            # Cap Claude budget at max allowed
+            if is_claude:
+                explicit_budget = min(explicit_budget, CLAUDE_FORCED_THINKING_BUDGET)
+            return {"thinkingBudget": explicit_budget, "include_thoughts": True}
 
         if not (is_gemini_25 or is_gemini_3 or is_claude):
             return None
@@ -3756,7 +3774,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             # Gemini 3 performs better with temperature=1 for tool use
             gen_config["temperature"] = 1.0
 
-        thinking_config = self._get_thinking_config(reasoning_effort, model)
+        explicit_thinking_budget = kwargs.get("thinking_budget")
+        thinking_config = self._get_thinking_config(
+            reasoning_effort, model, explicit_thinking_budget
+        )
         if thinking_config:
             gen_config.setdefault("thinkingConfig", {}).update(thinking_config)
 
