@@ -1020,12 +1020,17 @@ class QuotaViewer:
                 remaining_pct = group_stats.get("remaining_pct")
                 requests_used = group_stats.get("requests_used", 0)
                 requests_max = group_stats.get("requests_max")
+                requests_remaining = group_stats.get("requests_remaining")
                 is_exhausted = group_stats.get("is_exhausted", False)
                 reset_time = format_reset_time(group_stats.get("reset_time_iso"))
                 confidence = group_stats.get("confidence", "low")
 
-                # Format display
-                display = group_stats.get("display", f"{requests_used}/?")
+                # Format display - use requests_remaining/max format
+                if requests_remaining is None and requests_max:
+                    requests_remaining = max(0, requests_max - requests_used)
+                display = group_stats.get(
+                    "display", f"{requests_remaining or 0}/{requests_max or '?'}"
+                )
                 bar = create_progress_bar(remaining_pct)
 
                 # Build status text - always show reset time if available

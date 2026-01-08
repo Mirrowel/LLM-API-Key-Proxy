@@ -2772,13 +2772,17 @@ class RotatingClient:
                                 except (ValueError, OSError):
                                     pass
 
+                            requests_remaining = (
+                                max(0, max_req - req_count) if max_req else 0
+                            )
                             cred["model_groups"][group_name] = {
                                 "remaining_pct": remaining_pct,
                                 "requests_used": req_count,
+                                "requests_remaining": requests_remaining,
                                 "requests_max": max_req,
-                                "display": f"{req_count}/{max_req}"
+                                "display": f"{requests_remaining}/{max_req}"
                                 if max_req
-                                else f"{req_count}/?",
+                                else f"?/?",
                                 "is_exhausted": is_exhausted,
                                 "reset_time_iso": reset_iso,
                                 "models": group_models,

@@ -556,8 +556,9 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                                 "is_estimated": bool,
                                 "is_exhausted": bool,
                                 "requests_used": int,
+                                "requests_remaining": int,
                                 "requests_total": int,
-                                "display": str,
+                                "display": str,  # remaining/max format
                                 "reset_time_iso": str | None,
                                 "models": List[str],
                             }
@@ -625,16 +626,16 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
 
             for group_name, group_models in groups.items():
                 # Default values
+                default_max = self.get_max_requests_for_model(group_models[0], tier)
                 group_info = {
                     "remaining_fraction": 1.0,
                     "remaining_percent": "100%",
                     "is_estimated": False,
                     "is_exhausted": False,
                     "requests_used": 0,
-                    "requests_total": self.get_max_requests_for_model(
-                        group_models[0], tier
-                    ),
-                    "display": f"0/{self.get_max_requests_for_model(group_models[0], tier)}",
+                    "requests_remaining": default_max,
+                    "requests_total": default_max,
+                    "display": f"{default_max}/{default_max}",
                     "reset_time_iso": None,
                     "models": group_models,
                     "confidence": "low",
@@ -651,6 +652,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                         # Calculate requests used from remaining fraction
                         max_requests = self.get_max_requests_for_model(model, tier)
                         requests_used = int((1.0 - remaining) * max_requests)
+                        requests_remaining = max(0, max_requests - requests_used)
 
                         group_info.update(
                             {
@@ -659,8 +661,9 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                                 "is_estimated": False,  # Real data from API
                                 "is_exhausted": is_exhausted,
                                 "requests_used": requests_used,
+                                "requests_remaining": requests_remaining,
                                 "requests_total": max_requests,
-                                "display": f"{requests_used}/{max_requests}",
+                                "display": f"{requests_remaining}/{max_requests}",
                                 "reset_time_iso": reset_time_iso,
                                 "confidence": "high",  # Real API data
                             }
@@ -688,8 +691,10 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                         max_requests = (
                             max_requests_from_usage or group_info["requests_total"]
                         )
+                        requests_remaining = max(0, max_requests - total_requests)
                         group_info["requests_used"] = total_requests
-                        group_info["display"] = f"{total_requests}/{max_requests}"
+                        group_info["requests_remaining"] = requests_remaining
+                        group_info["display"] = f"{requests_remaining}/{max_requests}"
 
                 model_groups[group_name] = group_info
 

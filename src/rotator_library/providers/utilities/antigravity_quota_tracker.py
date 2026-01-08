@@ -620,11 +620,10 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         is_exhausted = estimated_remaining <= 0
         remaining_percent = f"{int(estimated_remaining * 100)}%"
         requests_used = current_request_count
-        display = (
-            f"{requests_used}/{max_requests}"
-            if max_requests > 0
-            else f"{requests_used}/?"
+        requests_remaining = (
+            max(0, max_requests - requests_used) if max_requests > 0 else 0
         )
+        display = f"{requests_remaining}/{max_requests}" if max_requests > 0 else f"?/?"
 
         return {
             "remaining_fraction": estimated_remaining,
@@ -632,6 +631,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             "is_exhausted": is_exhausted,
             "is_estimated": is_estimated,
             "requests_used": requests_used,
+            "requests_remaining": requests_remaining,
             "requests_total": max_requests,
             "display": display,
             "confidence": confidence,
@@ -678,8 +678,9 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                                 "is_estimated": bool,
                                 "is_exhausted": bool,
                                 "requests_used": int,
+                                "requests_remaining": int,
                                 "requests_total": int,
-                                "display": str,
+                                "display": str,  # remaining/max format
                                 "reset_time_iso": str | None,
                                 "models": List[str],
                             }
@@ -816,6 +817,11 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                             is_estimated = False
                             confidence = "low"
 
+                        requests_remaining = (
+                            max(0, max_requests - total_requests)
+                            if max_requests > 0
+                            else 0
+                        )
                         group_info.update(
                             {
                                 "remaining_fraction": estimated_remaining,
@@ -823,8 +829,9 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                                 "is_estimated": is_estimated,
                                 "is_exhausted": estimated_remaining <= 0,
                                 "requests_used": total_requests,
+                                "requests_remaining": requests_remaining,
                                 "requests_total": max_requests,
-                                "display": f"{total_requests}/{max_requests}",
+                                "display": f"{requests_remaining}/{max_requests}",
                                 "reset_time_iso": reset_time_iso,
                                 "confidence": confidence,
                             }
