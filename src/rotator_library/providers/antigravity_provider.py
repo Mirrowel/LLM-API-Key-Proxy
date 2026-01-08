@@ -471,10 +471,10 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 
 class AntigravityProvider(
     AntigravityAuthBase,
-    ProviderInterface,
     AntigravityQuotaTracker,
     GeminiToolHandler,
     GeminiCredentialManager,
+    ProviderInterface,
 ):
     """
     Antigravity provider for Gemini and Claude models via Google's internal API.
@@ -2763,7 +2763,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             and effective_max is not None
             and thinking_budget >= effective_max
         ):
-            clamp_mode = _env_bool("ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT", False)
+            clamp_mode = env_bool("ANTIGRAVITY_CLAMP_THINKING_TO_OUTPUT", False)
 
             if clamp_mode:
                 # CLAMP: Reduce thinking budget to fit within max_tokens
@@ -3126,7 +3126,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if self._enable_json_string_parsing:
             # Get schema for this tool if available
             tool_schema = tool_schemas.get(tool_name) if tool_schemas else None
-            parsed_args = _recursively_parse_json_strings(
+            parsed_args = recursively_parse_json_strings(
                 raw_args, schema=tool_schema, parse_json_objects=True
             )
         else:

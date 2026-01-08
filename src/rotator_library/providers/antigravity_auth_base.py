@@ -151,7 +151,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 persisted_tier = metadata.get("tier")
 
                 if persisted_project_id:
-                    lib_logger.info(
+                    lib_logger.debug(
                         f"Loaded persisted project ID from credential file: {persisted_project_id}"
                     )
                     self.project_id_cache[credential_path] = persisted_project_id
