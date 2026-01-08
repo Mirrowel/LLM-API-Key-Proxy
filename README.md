@@ -403,6 +403,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>` | Concurrency multiplier per priority tier |
 | `QUOTA_GROUPS_<PROVIDER>_<GROUP>` | Models sharing quota limits |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
+| `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
+| `ANTIGRAVITY_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
 </details>
 
@@ -521,14 +523,48 @@ Uses Google OAuth to access internal Gemini endpoints with higher rate limits.
 - Automatic free-tier project onboarding
 - Paid vs free tier detection
 - Smart fallback on rate limits
+- Quota baseline tracking with background refresh (accurate remaining quota estimates)
+- Sequential rotation mode (uses credentials until quota exhausted)
+
+**Quota Groups:** Models that share quota are automatically grouped:
+- **Pro**: `gemini-2.5-pro`, `gemini-3-pro-preview`
+- **2.5-Flash**: `gemini-2.0-flash`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+- **3-Flash**: `gemini-3-flash-preview`
+
+All models in a group deplete the shared quota equally. 24-hour per-model quota windows.
 
 **Environment Variables (for stateless deployment):**
+
+Single credential (legacy):
 ```env
 GEMINI_CLI_ACCESS_TOKEN="ya29.your-access-token"
 GEMINI_CLI_REFRESH_TOKEN="1//your-refresh-token"
 GEMINI_CLI_EXPIRY_DATE="1234567890000"
 GEMINI_CLI_EMAIL="your-email@gmail.com"
 GEMINI_CLI_PROJECT_ID="your-gcp-project-id"  # Optional
+GEMINI_CLI_TIER="standard-tier"  # Optional: standard-tier or free-tier
+```
+
+Multiple credentials (use `_N_` suffix where N is 1, 2, 3...):
+```env
+GEMINI_CLI_1_ACCESS_TOKEN="ya29.first-token"
+GEMINI_CLI_1_REFRESH_TOKEN="1//first-refresh"
+GEMINI_CLI_1_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_1_EMAIL="first@gmail.com"
+GEMINI_CLI_1_PROJECT_ID="project-1"
+GEMINI_CLI_1_TIER="standard-tier"
+
+GEMINI_CLI_2_ACCESS_TOKEN="ya29.second-token"
+GEMINI_CLI_2_REFRESH_TOKEN="1//second-refresh"
+GEMINI_CLI_2_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_2_EMAIL="second@gmail.com"
+GEMINI_CLI_2_PROJECT_ID="project-2"
+GEMINI_CLI_2_TIER="free-tier"
+```
+
+**Feature Toggles:**
+```env
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval in seconds (default: 300 = 5 min)
 ```
 
 </details>
