@@ -2,8 +2,8 @@
 Antigravity Quota Tracking Mixin
 
 Provides quota tracking, estimation, and verification methods for the
-Antigravity provider. This is a mixin class that assumes the provider
-has certain methods and attributes available.
+Antigravity provider. This inherits from BaseQuotaTracker for shared
+functionality and implements Antigravity-specific quota API calls.
 
 Required from provider:
     - self._get_effective_quota_groups() -> Dict[str, List[str]]
@@ -21,26 +21,20 @@ Required from provider:
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
-from ...utils.paths import get_cache_dir
+from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
     from ...usage_manager import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment variable."""
-    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
 
 
 # =============================================================================
@@ -105,24 +99,20 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
 # Default max requests for unknown models (1% = 100 requests)
 DEFAULT_MAX_REQUESTS_UNKNOWN = 100
 
-# Delay before fetching quota after a request (API needs time to update)
-# Used by discover_quota_costs() for manual cost discovery
-QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
-
 # =============================================================================
 # MODEL NAME MAPPINGS
 # =============================================================================
 # Some user-facing model names don't exist in the API response.
 # These mappings convert between user-facing names and API names.
 
-# User-facing name → API name (for looking up quota in fetchAvailableModels response)
+# User-facing name -> API name (for looking up quota in fetchAvailableModels response)
 _USER_TO_API_MODEL_MAP: Dict[str, str] = {
     "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (legacy)
     "claude-opus-4.5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (new format)
     "gemini-3-pro-preview": "gemini-3-pro-high",  # Preview maps to high by default
 }
 
-# API name → User-facing name (for consistency when processing API responses)
+# API name -> User-facing name (for consistency when processing API responses)
 _API_TO_USER_MODEL_MAP: Dict[str, str] = {
     "claude-opus-4-5-thinking": "claude-opus-4.5",  # Normalize to new user-facing name
     "claude-opus-4-5": "claude-opus-4.5",  # Normalize old format to new
@@ -134,17 +124,7 @@ _API_TO_USER_MODEL_MAP: Dict[str, str] = {
 }
 
 
-def _get_antigravity_cache_dir() -> Path:
-    """Get the cache directory for Antigravity files."""
-    return get_cache_dir(subdir="antigravity")
-
-
-def _get_learned_costs_file() -> Path:
-    """Get path to the learned quota costs JSON file."""
-    return _get_antigravity_cache_dir() / "learned_quota_costs.json"
-
-
-class AntigravityQuotaTracker:
+class AntigravityQuotaTracker(BaseQuotaTracker):
     """
     Mixin class providing quota tracking functionality for Antigravity provider.
 
@@ -165,6 +145,15 @@ class AntigravityQuotaTracker:
         self._quota_refresh_interval: int = 300  # 5 min default
     """
 
+    # =========================================================================
+    # CLASS ATTRIBUTES - BaseQuotaTracker configuration
+    # =========================================================================
+
+    provider_env_prefix = "ANTIGRAVITY"
+    cache_subdir = "antigravity"
+    user_to_api_model_map = _USER_TO_API_MODEL_MAP
+    api_to_user_model_map = _API_TO_USER_MODEL_MAP
+
     # Type hints for attributes that must exist on the provider
     _learned_costs: Dict[str, Dict[str, int]]
     _learned_costs_loaded: bool
@@ -172,13 +161,26 @@ class AntigravityQuotaTracker:
     project_tier_cache: Dict[str, str]
     project_id_cache: Dict[str, str]
 
+    # =========================================================================
+    # ANTIGRAVITY-SPECIFIC HELPERS
+    # =========================================================================
+
+    def _get_provider_prefix(self) -> str:
+        """Get the provider prefix for model names."""
+        return "antigravity"
+
+    # =========================================================================
+    # LEARNED COSTS MANAGEMENT (Override for integer max_requests)
+    # =========================================================================
+
     def _load_learned_costs(self) -> None:
         """Load learned max_requests values from persistent file."""
         if self._learned_costs_loaded:
             return
 
-        costs_file = _get_learned_costs_file()
+        costs_file = self._get_learned_costs_file()
         if not costs_file.exists():
+            self._learned_costs = {}
             self._learned_costs_loaded = True
             return
 
@@ -215,7 +217,7 @@ class AntigravityQuotaTracker:
 
     def _save_learned_costs(self) -> None:
         """Persist learned max_requests values to file."""
-        costs_file = _get_learned_costs_file()
+        costs_file = self._get_learned_costs_file()
         costs_file.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
@@ -297,37 +299,128 @@ class AntigravityQuotaTracker:
                 return group_name
         return None
 
-    def _user_to_api_model(self, model: str) -> str:
+    # =========================================================================
+    # BaseQuotaTracker ABSTRACT METHOD IMPLEMENTATIONS
+    # =========================================================================
+
+    async def _fetch_quota_for_credential(
+        self,
+        credential_path: str,
+    ) -> Dict[str, Any]:
         """
-        Convert user-facing model name to API model name for quota lookup.
+        Fetch quota information from the Antigravity fetchAvailableModels API.
+        """
+        return await self.fetch_quota_from_api(credential_path)
 
-        Some models the user requests don't exist in the API response:
-        - claude-opus-4-5 → claude-opus-4-5-thinking (opus only has thinking variant)
-        - gemini-3-pro-preview → gemini-3-pro-high (preview maps to high by default)
-
-        Args:
-            model: User-facing model name (without provider prefix)
+    def _extract_model_quota_from_response(
+        self,
+        quota_data: Dict[str, Any],
+        tier: str,
+    ) -> List[Tuple[str, float, Optional[int]]]:
+        """
+        Extract model quota information from Antigravity models response.
 
         Returns:
-            API model name to look up in fetchAvailableModels response
+            List of tuples: (model_name, remaining_fraction, max_requests)
         """
-        clean_model = model.split("/")[-1] if "/" in model else model
-        return _USER_TO_API_MODEL_MAP.get(clean_model, clean_model)
+        results = []
 
-    def _api_to_user_model(self, model: str) -> str:
+        # Get user-facing model names we care about
+        available_models = set(self._get_available_models())
+
+        # Track which user-facing models we've already added to avoid duplicates
+        added_models: set = set()
+
+        for api_model_name, model_info in quota_data.get("models", {}).items():
+            remaining = model_info.get("remaining_fraction")
+            if remaining is None:
+                continue
+
+            # Convert API name to user-facing name
+            user_model = self._api_to_user_model(api_model_name)
+
+            # Only include if this is a model we expose to users
+            if user_model not in available_models:
+                continue
+
+            # Skip duplicates (e.g., claude-sonnet-4-5 and claude-sonnet-4-5-thinking)
+            if user_model in added_models:
+                continue
+
+            # Calculate max_requests for this model/tier
+            max_requests = self.get_max_requests_for_model(user_model, tier)
+
+            results.append((user_model, remaining, max_requests))
+            added_models.add(user_model)
+
+        return results
+
+    async def _make_test_request(
+        self,
+        credential_path: str,
+        model: str,
+    ) -> Dict[str, Any]:
         """
-        Convert API model name to user-facing model name.
-
-        Normalizes API-specific names (like -thinking variants) to user-facing names
-        for consistent storage and display.
+        Make a minimal test request to consume quota.
 
         Args:
-            model: API model name from fetchAvailableModels response
+            credential_path: Credential to use
+            model: Model to test
 
         Returns:
-            User-facing model name
+            {"success": bool, "error": str | None}
         """
-        return _API_TO_USER_MODEL_MAP.get(model, model)
+        try:
+            # Get auth header
+            auth_header = await self.get_auth_header(credential_path)
+            access_token = auth_header["Authorization"].split(" ")[1]
+
+            # Get project_id
+            project_id = self.project_id_cache.get(credential_path)
+            if not project_id:
+                project_id = await self._discover_project_id(
+                    credential_path, access_token, {}
+                )
+
+            # Map user model to internal model name
+            internal_model = self._user_to_api_model(model)
+
+            # Build minimal request payload
+            url = f"{self._get_base_url()}:generateContent"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                **self._get_antigravity_headers(),
+            }
+
+            payload = {
+                "project": project_id,
+                "model": internal_model,
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "Say 'test'"}]}],
+                    "generationConfig": {"maxOutputTokens": 10},
+                },
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url, headers=headers, json=payload, timeout=60
+                )
+
+                if response.status_code == 200:
+                    return {"success": True, "error": None}
+                else:
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                    }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # ANTIGRAVITY-SPECIFIC QUOTA API
+    # =========================================================================
 
     async def fetch_quota_from_api(
         self,
@@ -448,6 +541,10 @@ class AntigravityQuotaTracker:
                 "fetched_at": time.time(),
             }
 
+    # =========================================================================
+    # QUOTA ESTIMATION (Antigravity-specific)
+    # =========================================================================
+
     def estimate_remaining_quota(
         self,
         credential_path: str,
@@ -543,38 +640,9 @@ class AntigravityQuotaTracker:
             else None,
         }
 
-    def discover_all_credentials(
-        self,
-        oauth_base_dir: Optional[Path] = None,
-    ) -> List[str]:
-        """
-        Discover all Antigravity credentials (file-based and env-based).
-
-        Args:
-            oauth_base_dir: Directory for file-based credentials (default: oauth_creds)
-
-        Returns:
-            List of credential identifiers (file paths or env:// URIs)
-        """
-        credentials = []
-
-        # 1. File-based credentials
-        file_creds = self.list_credentials(oauth_base_dir)
-        credentials.extend([c["file_path"] for c in file_creds])
-
-        # 2. Env-based credentials
-        # Check for ANTIGRAVITY_1_ACCESS_TOKEN, ANTIGRAVITY_2_ACCESS_TOKEN, etc.
-        for i in range(1, 100):  # Reasonable upper limit
-            if os.getenv(f"ANTIGRAVITY_{i}_ACCESS_TOKEN"):
-                credentials.append(f"env://antigravity/{i}")
-            else:
-                break  # Stop at first gap
-
-        # Also check legacy single credential (if no numbered ones found)
-        if not credentials and os.getenv("ANTIGRAVITY_ACCESS_TOKEN"):
-            credentials.append("env://antigravity/0")
-
-        return credentials
+    # =========================================================================
+    # GET ALL QUOTA INFO (uses shared infrastructure)
+    # =========================================================================
 
     async def get_all_quota_info(
         self,
@@ -800,6 +868,10 @@ class AntigravityQuotaTracker:
             },
             "timestamp": time.time(),
         }
+
+    # =========================================================================
+    # BASELINE MANAGEMENT (Override for Antigravity-specific cooldown logging)
+    # =========================================================================
 
     async def refresh_active_quota_baselines(
         self,
@@ -1209,66 +1281,3 @@ class AntigravityQuotaTracker:
             result["message"] = "No max requests discovered"
 
         return result
-
-    async def _make_test_request(
-        self,
-        credential_path: str,
-        model: str,
-    ) -> Dict[str, Any]:
-        """
-        Make a minimal test request to consume quota.
-
-        Args:
-            credential_path: Credential to use
-            model: Model to test
-
-        Returns:
-            {"success": bool, "error": str | None}
-        """
-        try:
-            # Get auth header
-            auth_header = await self.get_auth_header(credential_path)
-            access_token = auth_header["Authorization"].split(" ")[1]
-
-            # Get project_id
-            project_id = self.project_id_cache.get(credential_path)
-            if not project_id:
-                project_id = await self._discover_project_id(
-                    credential_path, access_token, {}
-                )
-
-            # Map user model to internal model name
-            internal_model = self._user_to_api_model(model)
-
-            # Build minimal request payload
-            url = f"{self._get_base_url()}:generateContent"
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
-            }
-
-            payload = {
-                "project": project_id,
-                "model": internal_model,
-                "request": {
-                    "contents": [{"role": "user", "parts": [{"text": "Say 'test'"}]}],
-                    "generationConfig": {"maxOutputTokens": 10},
-                },
-            }
-
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url, headers=headers, json=payload, timeout=60
-                )
-
-                if response.status_code == 200:
-                    return {"success": True, "error": None}
-                else:
-                    return {
-                        "success": False,
-                        "error": f"HTTP {response.status_code}: {response.text[:200]}",
-                    }
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}

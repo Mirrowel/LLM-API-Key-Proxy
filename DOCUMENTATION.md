@@ -193,7 +193,8 @@ async def run_background_job(
 
 | Provider | Job Name | Default Interval | Purpose |
 |----------|----------|------------------|---------|
-| Antigravity | `quota_baseline_refresh` | 300s (5 min) | Fetches quota status from API to update remaining quota estimates |
+| Antigravity | `antigravity_quota_refresh` | 300s (5 min) | Fetches quota status from API to update remaining quota estimates |
+| Gemini CLI | `gemini_cli_quota_refresh` | 300s (5 min) | Fetches quota status from `retrieveUserQuota` API to update remaining quota estimates |
 
 ### 2.6. Credential Management Architecture
 
@@ -233,15 +234,44 @@ The manager supports loading credentials from two sources, with a clear priority
 **Priority 2: Environment Variables** (Stateless Deployment)
 - If no local files are found, the manager checks for provider-specific environment variables
 - This is the key to "Stateless Deployment" for platforms like Railway, Render, Heroku
+- Credentials are referenced internally using `env://` URIs (e.g., `env://gemini_cli/1`)
 
 **Gemini CLI Environment Variables:**
+
+Single credential (legacy format):
 ```
 GEMINI_CLI_ACCESS_TOKEN
 GEMINI_CLI_REFRESH_TOKEN
-GEMINI_CLI_E XPIRY_DATE
+GEMINI_CLI_EXPIRY_DATE
 GEMINI_CLI_EMAIL
 GEMINI_CLI_PROJECT_ID (optional)
-GEMINI_CLI_CLIENT_ID (optional)
+GEMINI_CLI_TIER (optional: standard-tier or free-tier)
+```
+
+Multiple credentials (use `_N_` suffix where N is 1, 2, 3...):
+```
+GEMINI_CLI_1_ACCESS_TOKEN
+GEMINI_CLI_1_REFRESH_TOKEN
+GEMINI_CLI_1_EXPIRY_DATE
+GEMINI_CLI_1_EMAIL
+GEMINI_CLI_1_PROJECT_ID (optional)
+GEMINI_CLI_1_TIER (optional)
+
+GEMINI_CLI_2_ACCESS_TOKEN
+GEMINI_CLI_2_REFRESH_TOKEN
+...
+```
+
+**Antigravity Environment Variables:**
+
+Same pattern as Gemini CLI:
+```
+ANTIGRAVITY_1_ACCESS_TOKEN
+ANTIGRAVITY_1_REFRESH_TOKEN
+ANTIGRAVITY_1_EXPIRY_DATE
+ANTIGRAVITY_1_EMAIL
+ANTIGRAVITY_1_PROJECT_ID (optional)
+ANTIGRAVITY_1_TIER (optional)
 ```
 
 **Qwen Code Environment Variables:**
@@ -262,10 +292,21 @@ IFLOW_API_KEY
 ```
 
 **How it works:**
-- If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
+- If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN` or `GEMINI_CLI_1_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
+- The credential is referenced internally as `env://gemini_cli/0` (legacy) or `env://gemini_cli/1` (numbered)
 - The credential behaves exactly like a file-based credential (automatic refresh, expiry detection, etc.)
 - No physical files are created or needed on the host system
 - Perfect for ephemeral containers or read-only filesystems
+
+**env:// URI Format:**
+```
+env://{provider}/{index}
+
+Examples:
+- env://gemini_cli/1  → GEMINI_CLI_1_ACCESS_TOKEN, etc.
+- env://gemini_cli/0  → GEMINI_CLI_ACCESS_TOKEN (legacy single credential)
+- env://antigravity/1 → ANTIGRAVITY_1_ACCESS_TOKEN, etc.
+```
 
 #### 2.6.3. Credential Tool Integration
 
@@ -567,6 +608,125 @@ for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
 
 **Rationale:**
 Some 429 responses are transient rate limits rather than true quota exhaustion. These occur when the API is temporarily overloaded but the credential still has quota available. Retrying internally before rotating credentials provides better resilience.
+
+### 2.17. Gemini CLI Quota Tracker (`providers/utilities/gemini_cli_quota_tracker.py`)
+
+A mixin class providing quota tracking functionality for the Gemini CLI provider. This mirrors the Antigravity quota tracker (Section 2.15) and enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
+
+#### Core Concepts
+
+**Quota Baseline Tracking:**
+- Periodically fetches quota status from the `retrieveUserQuota` API endpoint
+- Stores the remaining fraction as a baseline in UsageManager
+- Tracks requests since baseline to estimate current remaining quota
+- Syncs local request count with API's authoritative values
+
+**Quota Cost Constants:**
+Based on empirical testing, quota limits are known per model and tier:
+
+| Tier | Model Group | Max Requests per 100% |
+|------|-------------|----------------------|
+| standard-tier | Pro (gemini-2.5-pro, gemini-3-pro-preview) | 250 |
+| standard-tier | 2.5-Flash (gemini-2.0-flash, gemini-2.5-flash, gemini-2.5-flash-lite) | 1500 |
+| standard-tier | 3-Flash (gemini-3-flash-preview) | 1500 |
+| free-tier | Pro | 100 |
+| free-tier | 2.5-Flash | 1000 |
+| free-tier | 3-Flash | 1000 |
+
+**Reset Windows:**
+- All tiers use 24-hour fixed windows from first request (verified 2026-01-07)
+- The reset time is set when the first request is made and does NOT roll forward
+
+**Model Quota Groups:**
+Models that share quota limits are grouped together:
+- `pro`: `gemini-2.5-pro`, `gemini-3-pro-preview`
+- `25-flash`: `gemini-2.0-flash`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+- `3-flash`: `gemini-3-flash-preview`
+
+Groups can be overridden via environment variables: `QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"`
+
+#### Key Methods
+
+**`retrieve_user_quota(credential_path)`:**
+Fetches current quota status from the Gemini CLI `retrieveUserQuota` API. Returns remaining fraction and reset times for all models.
+
+**`get_all_quota_info(credential_paths, oauth_base_dir, usage_data, include_estimates)`:**
+Gets structured quota info for all credentials, suitable for the TUI quota viewer and stats endpoint.
+
+**`get_max_requests_for_model(model, tier)`:**
+Returns the maximum number of requests for a model/tier combination. Uses learned values if available, otherwise falls back to defaults.
+
+**`discover_quota_costs(credential_path, models_to_test)`:**
+Manual utility to discover quota costs by making test requests and measuring before/after quota. Saves learned costs to `cache/gemini_cli/learned_quota_costs.json`.
+
+#### Integration with Background Jobs
+
+The Gemini CLI provider defines a background job for quota baseline refresh:
+
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    return {
+        "interval": 300,  # 5 minutes (configurable via GEMINI_CLI_QUOTA_REFRESH_INTERVAL)
+        "name": "gemini_cli_quota_refresh",
+        "run_on_start": True,
+    }
+```
+
+This job:
+1. On first run: Fetches quota for ALL credentials to establish baselines
+2. On subsequent runs: Only fetches for credentials used since last refresh
+3. Updates baselines in UsageManager for accurate estimation
+
+#### Data Storage
+
+Quota baselines are stored in UsageManager's per-model data:
+
+```json
+{
+  "credential_path": {
+    "models": {
+      "gemini_cli/gemini-2.5-pro": {
+        "request_count": 15,
+        "baseline_remaining_fraction": 0.94,
+        "baseline_fetched_at": 1734567890.0,
+        "requests_at_baseline": 15,
+        "quota_max_requests": 250,
+        "quota_display": "15/250"
+      }
+    }
+  }
+}
+```
+
+#### Environment Variables
+
+```env
+# Background job interval in seconds (default: 300 = 5 min)
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300
+
+# Override default quota groups
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
+QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
+QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
+```
+
+### 2.18. Shared Gemini OAuth Utilities (`providers/utilities/`)
+
+The PR refactors shared logic between Gemini CLI and Antigravity providers into reusable utility modules:
+
+| Module | Purpose |
+|--------|---------|
+| `gemini_shared_utils.py` | Shared constants (FINISH_REASON_MAP, DEFAULT_SAFETY_SETTINGS, CODE_ASSIST_ENDPOINT), helper functions (env_bool, env_int, inline_schema_refs, recursively_parse_json_strings) |
+| `base_quota_tracker.py` | Abstract base class for quota tracking with learned costs, credential discovery, and baseline management |
+| `gemini_credential_manager.py` | Mixin for OAuth credential tier management, initialization, and background job interface |
+| `gemini_file_logger.py` | Transaction-level file logging for debugging API requests and responses |
+| `gemini_tool_handler.py` | Tool schema transformation and Gemini 3 tool fix logic |
+
+**Benefits:**
+- Eliminates code duplication between Gemini CLI and Antigravity providers
+- Single source of truth for shared constants and logic
+- Easier maintenance and bug fixes
+- Consistent behavior across Google OAuth-based providers
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
@@ -1213,11 +1373,18 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 
 The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
 
-**New in PR #31**:
+**New in PR #62**:
+- **Quota Baseline Tracking**: Background job fetches quota status from API (`retrieveUserQuota`) to provide accurate remaining quota estimates
+- **GeminiCliQuotaTracker Mixin**: Inherits from `BaseQuotaTracker` for shared quota infrastructure with Antigravity
+- **env:// Credential Support**: Environment-based credentials are detected and loaded via `env://gemini_cli/N` URIs
+- **Quota Groups**: Models sharing quota are grouped (`pro`, `25-flash`, `3-flash`) for accurate cooldown propagation
+- **24-Hour Fixed Windows**: All tiers use fixed 24-hour windows from first request (verified 2026-01-07)
+
+**From PR #31**:
 - **Quota Parsing**: Implements `parse_quota_error()` using Google RPC format parser
 - **Tier Configuration**: Defines `tier_priorities` and `usage_reset_configs` for automatic priority resolution
-- **Balanced Rotation**: Defaults to balanced mode (unlike Antigravity which uses sequential)
-- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 1x)
+- **Sequential Rotation**: Defaults to sequential mode (uses credentials until quota exhausted)
+- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 2x in sequential mode)
 
 #### Authentication (`gemini_auth_base.py`)
 
@@ -1239,6 +1406,41 @@ The provider employs a sophisticated, cached discovery mechanism to find a valid
 
 *   **Internal Endpoints**: Uses `https://cloudcode-pa.googleapis.com/v1internal`, which typically has higher quotas than the public API.
 *   **Smart Fallback**: If `gemini-2.5-pro` hits a rate limit (`429`), the provider transparently retries the request using `gemini-2.5-pro-preview-06-05`. This fallback chain is configurable in code.
+
+#### Quota Tracking
+
+The provider implements quota tracking via the `GeminiCliQuotaTracker` mixin (see Section 2.17):
+
+*   **Real-Time Quota API**: Fetches quota status from `retrieveUserQuota` endpoint
+*   **Background Refresh**: Configurable interval (default: 5 minutes) via `GEMINI_CLI_QUOTA_REFRESH_INTERVAL`
+*   **Model Quota Groups**: Pro models share quota, Flash 2.x models share quota, Flash 3 is standalone
+
+**Default Quota Groups:**
+
+| Group Name | Models | Verified Sharing |
+|------------|--------|------------------|
+| `pro` | gemini-2.5-pro, gemini-3-pro-preview | Yes (same bucket) |
+| `25-flash` | gemini-2.0-flash, gemini-2.5-flash, gemini-2.5-flash-lite | Yes (same bucket) |
+| `3-flash` | gemini-3-flash-preview | Standalone |
+
+**Quota Limits by Tier:**
+
+| Tier | Pro Group | Flash Groups |
+|------|-----------|--------------|
+| standard-tier | 250 requests/24h | 1500 requests/24h |
+| free-tier | 100 requests/24h | 1000 requests/24h |
+
+#### Configuration (Environment Variables)
+
+```env
+# Quota tracking
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Background refresh interval (default: 5 min)
+
+# Override quota groups
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
+QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
+QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
+```
 
 ### 3.2. Qwen Code (`qwen_code_provider.py`)
 

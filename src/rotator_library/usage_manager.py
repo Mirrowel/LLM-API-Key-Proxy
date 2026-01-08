@@ -197,6 +197,15 @@ class UsageManager:
         """
         import re
 
+        # Pattern: env:// URI format (e.g., "env://antigravity/1" -> "antigravity")
+        if credential.startswith("env://"):
+            parts = credential[6:].split("/")  # Remove "env://" prefix
+            if parts and parts[0]:
+                return parts[0].lower()
+            # Malformed env:// URI (empty provider name)
+            lib_logger.warning(f"Malformed env:// credential URI: {credential}")
+            return None
+
         # Normalize path separators
         normalized = credential.replace("\\", "/")
 
@@ -377,7 +386,7 @@ class UsageManager:
 
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
-    _REQUEST_COUNT_PROVIDERS = {"antigravity"}
+    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli"}
 
     def _get_grouped_usage_count(self, key: str, model: str) -> int:
         """
