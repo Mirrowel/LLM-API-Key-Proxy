@@ -58,21 +58,101 @@ on:
         type: string
 
 jobs:
+  # ============================================================================
+  # COMMENT VALIDATION JOB
+  # ============================================================================
+  # Only runs for issue_comment events. Validates that the comment:
+  # 1. Was NOT posted by the bot itself (prevents infinite loops)
+  # 2. Contains trigger words in actual content (not in quotes or code blocks)
+  # ============================================================================
+  validate-comment:
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    outputs:
+      should_proceed: ${{ steps.validate.outputs.should_proceed }}
+    env:
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+    steps:
+      - name: Validate comment trigger
+        id: validate
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+        run: |
+          set -e
+          
+          echo "Validating comment from: $COMMENT_AUTHOR"
+          
+          # Must be on a PR
+          if [[ "$IS_PR" != "true" ]]; then
+            echo "::notice::Comment is not on a PR. Skipping."
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 1. Check if author is a bot
+          BOT_NAMES=("mirrobot" "mirrobot-agent" "mirrobot-agent[bot]")
+          for bot in "${BOT_NAMES[@]}"; do
+            if [[ "$COMMENT_AUTHOR" == "$bot" ]]; then
+              echo "::notice::Comment author is bot ($COMMENT_AUTHOR). Skipping to prevent loops."
+              echo "should_proceed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+          
+          echo "Author check passed: $COMMENT_AUTHOR is not a bot"
+          
+          # 2. Strip code blocks and quotes from comment body
+          TEMP_FILE=$(mktemp)
+          echo "$COMMENT_BODY" > "$TEMP_FILE"
+          
+          # Remove fenced code blocks (```...```) - handles multiline
+          CLEAN_BODY=$(awk '
+            /^```/ { in_code = !in_code; next }
+            !in_code { print }
+          ' "$TEMP_FILE")
+          
+          # Remove inline code (`...`)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
+          
+          # Remove quoted lines (lines starting with > at any level, with optional leading whitespace)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
+          
+          rm -f "$TEMP_FILE"
+          
+          echo "Clean body after stripping quotes/code:"
+          echo "$CLEAN_BODY"
+          echo "---"
+          
+          # 3. Check for trigger words in clean text
+          # Trigger: /mirrobot-check or /mirrobot_check
+          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then
+            echo "::notice::Valid trigger found in non-quoted, non-code text."
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Trigger only found in quotes/code blocks or not present. Skipping."
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+          fi
+
   compliance-check:
+    needs: [validate-comment]
     # Run when:
     # 1. Manual trigger via workflow_dispatch
-    # 2. PR marked ready for review or labeled 'ready-for-merge'
-    # 3. Comment contains '/mirrobot-check' or '/mirrobot_check'
-    # Note: ready_for_review will wait for PR Review to complete (see step below)
+    # 2. PR labeled 'ready-for-merge'
+    # 3. PR marked ready for review
+    # 4. workflow_run completed (PR Review finished)
+    # 5. Comment validation passed (for issue_comment events)
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_target' && 
-       (github.event.action == 'ready_for_review' ||
-        (github.event.action == 'labeled' && contains(github.event.label.name, 'ready-for-merge')))) ||
-      (github.event_name == 'issue_comment' && 
-       github.event.issue.pull_request && 
-       (contains(github.event.comment.body, '/mirrobot-check') || 
-        contains(github.event.comment.body, '/mirrobot_check')))
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'workflow_run' ||
+        (github.event_name == 'pull_request_target' && 
+         (github.event.action == 'ready_for_review' ||
+          (github.event.action == 'labeled' && contains(github.event.label.name, 'ready-for-merge')))) ||
+        (github.event_name == 'issue_comment' && needs.validate-comment.outputs.should_proceed == 'true')
+      )
     runs-on: ubuntu-latest
     
     # Minimal permissions following principle of least privilege
