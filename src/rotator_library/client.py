@@ -2464,7 +2464,12 @@ class RotatingClient:
         )
 
     def token_count(self, **kwargs) -> int:
-        """Calculates the number of tokens for a given text or list of messages."""
+        """Calculates the number of tokens for a given text or list of messages.
+
+        For Antigravity provider models, this also includes the preprompt tokens
+        that get injected during actual API calls (agent instruction + identity override).
+        This ensures token counts match actual usage.
+        """
         kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         text = kwargs.get("text")
@@ -2472,12 +2477,32 @@ class RotatingClient:
 
         if not model:
             raise ValueError("'model' is a required parameter.")
+
+        # Calculate base token count
         if messages:
-            return token_counter(model=model, messages=messages)
+            base_count = token_counter(model=model, messages=messages)
         elif text:
-            return token_counter(model=model, text=text)
+            base_count = token_counter(model=model, text=text)
         else:
             raise ValueError("Either 'text' or 'messages' must be provided.")
+
+        # Add preprompt tokens for Antigravity provider
+        # The Antigravity provider injects system instructions during actual API calls,
+        # so we need to account for those tokens in the count
+        provider = model.split("/")[0] if "/" in model else ""
+        if provider == "antigravity":
+            try:
+                from .providers.antigravity_provider import get_antigravity_preprompt_text
+
+                preprompt_text = get_antigravity_preprompt_text()
+                if preprompt_text:
+                    preprompt_tokens = token_counter(model=model, text=preprompt_text)
+                    base_count += preprompt_tokens
+            except ImportError:
+                # Provider not available, skip preprompt token counting
+                pass
+
+        return base_count
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""

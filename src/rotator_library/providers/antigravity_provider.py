@@ -449,6 +449,42 @@ CRITICAL: Interleaved thinking is required. You MUST emit a thinking block NOW t
 # =============================================================================
 
 
+def get_antigravity_preprompt_text() -> str:
+    """
+    Get the combined Antigravity preprompt text that gets injected into requests.
+
+    This function returns the exact text that gets prepended to system instructions
+    during actual API calls. It respects the current configuration settings:
+    - PREPEND_INSTRUCTION: Whether to include any preprompt at all
+    - USE_SHORT_ANTIGRAVITY_PROMPTS: Whether to use short or full versions
+    - INJECT_IDENTITY_OVERRIDE: Whether to include the identity override
+
+    This is useful for accurate token counting - the token count endpoints should
+    include these preprompts to match what actually gets sent to the API.
+
+    Returns:
+        The combined preprompt text, or empty string if prepending is disabled.
+    """
+    if not PREPEND_INSTRUCTION:
+        return ""
+
+    # Choose prompt versions based on USE_SHORT_ANTIGRAVITY_PROMPTS setting
+    if USE_SHORT_ANTIGRAVITY_PROMPTS:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION_SHORT
+    else:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION
+
+    # Build the combined preprompt
+    parts = [agent_instruction]
+
+    if INJECT_IDENTITY_OVERRIDE:
+        parts.append(override_instruction)
+
+    return "\n".join(parts)
+
+
 def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
     """
     Strip identifiable client headers for privacy/security.
