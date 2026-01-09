@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1096,8 +1097,28 @@ class AntigravityProvider(
     # =========================================================================
 
     def _alias_to_internal(self, alias: str) -> str:
-        """Convert public alias to internal model name."""
-        return MODEL_ALIAS_REVERSE.get(alias, alias)
+        """
+        Convert public alias to internal model name.
+        Includes pattern matching for versioned model names (e.g. from Claude Code probes).
+        """
+        if alias in MODEL_ALIAS_REVERSE:
+            return MODEL_ALIAS_REVERSE[alias]
+
+        # Pattern matching for versioned Claude/Gemini probes
+        alias_lower = alias.lower()
+        if "opus" in alias_lower:
+            return "claude-opus-4-5"
+        if "sonnet" in alias_lower:
+            return "claude-sonnet-4-5"
+        if "haiku" in alias_lower:
+            return "gemini-3-flash"
+        if "gemini-3" in alias_lower:
+            if "pro" in alias_lower:
+                return "gemini-3-pro-low"
+            if "flash" in alias_lower:
+                return "gemini-3-flash"
+
+        return alias
 
     def _internal_to_alias(self, internal: str) -> str:
         """Convert internal model name to public alias."""
@@ -1138,6 +1159,18 @@ class AntigravityProvider(
             clean_model = model
 
         normalized = self._api_to_user_model(clean_model)
+
+        # Pattern-based normalization for versioned model probes
+        if normalized == clean_model:
+            m_lower = clean_model.lower()
+            if "opus" in m_lower:
+                normalized = "claude-opus-4-5"
+            elif "sonnet" in m_lower:
+                normalized = "claude-sonnet-4-5"
+            elif "haiku" in m_lower:
+                normalized = "gemini-3-flash"
+            elif "gemini-3" in m_lower:
+                normalized = "gemini-3-pro-preview"
 
         if has_prefix:
             return f"{provider}/{normalized}"

@@ -925,6 +925,34 @@ class RotatingClient:
                         f"TransactionLogger: Failed to assemble/log final response: {e}"
                     )
 
+    def _resolve_provider_fallback(
+        self, model: str, kwargs: Dict[str, Any]
+    ) -> tuple[str, str]:
+        """
+        Resolve provider from model, with fallback for Claude Code probes.
+
+        If the model has no provider prefix but contains 'claude' or 'gemini',
+        and 'antigravity' provider is available, maps to antigravity.
+
+        Args:
+            model: The model name (may or may not have provider prefix)
+            kwargs: Request kwargs dict (will be mutated if model is remapped)
+
+        Returns:
+            Tuple of (provider, model) - both may be updated if fallback applied
+        """
+        provider = model.split("/")[0]
+        if provider not in self.all_credentials:
+            # Fallback for Claude Code probes: if no provider prefix, try mapping to 'antigravity'
+            if provider == model and (
+                "claude" in model.lower() or "gemini" in model.lower()
+            ):
+                if "antigravity" in self.all_credentials:
+                    model = f"antigravity/{model}"
+                    kwargs["model"] = model
+                    provider = "antigravity"
+        return provider, model
+
     async def _execute_with_retry(
         self,
         api_call: callable,
@@ -937,7 +965,7 @@ class RotatingClient:
         if not model:
             raise ValueError("'model' is a required parameter.")
 
-        provider = model.split("/")[0]
+        provider, model = self._resolve_provider_fallback(model, kwargs)
         if provider not in self.all_credentials:
             raise ValueError(
                 f"No API keys or OAuth credentials configured for provider: {provider}"
@@ -1685,7 +1713,7 @@ class RotatingClient:
     ) -> AsyncGenerator[str, None]:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
         model = kwargs.get("model")
-        provider = model.split("/")[0]
+        provider, model = self._resolve_provider_fallback(model, kwargs)
 
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
