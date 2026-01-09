@@ -644,8 +644,7 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 # FILE LOGGER
 # =============================================================================
 
-# NOTE: AntigravityFileLogger has been moved to utilities.gemini_file_logger
-# and is imported at top of file
+# NOTE: AntigravityProviderLogger is imported from transaction_logger at top of file
 
 
 # =============================================================================
@@ -3773,7 +3772,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         self,
         streaming_generator: AsyncGenerator[litellm.ModelResponse, None],
         model: str,
-        file_logger: Optional["AntigravityFileLogger"] = None,
+        file_logger: Optional["AntigravityProviderLogger"] = None,
     ) -> litellm.ModelResponse:
         """
         Collect all chunks from a streaming generator into a single non-streaming
@@ -3948,7 +3947,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         headers: Dict[str, str],
         payload: Dict[str, Any],
         model: str,
-        file_logger: Optional[AntigravityFileLogger] = None,
+        file_logger: Optional[AntigravityProviderLogger] = None,
         malformed_retry_num: Optional[int] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion.
@@ -4113,7 +4112,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         headers: Dict[str, str],
         payload: Dict[str, Any],
         model: str,
-        file_logger: Optional[AntigravityFileLogger] = None,
+        file_logger: Optional[AntigravityProviderLogger] = None,
         tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
         gemini_contents: Optional[List[Dict[str, Any]]] = None,
         gemini_payload: Optional[Dict[str, Any]] = None,

@@ -25,6 +25,12 @@ from ...transaction_logger import (
     AntigravityProviderLogger,
 )
 
+# Deprecated aliases for backward compatibility with external consumers
+# These map old class names to their new equivalents
+GeminiFileLogger = ProviderLogger
+GeminiCliFileLogger = ProviderLogger
+AntigravityFileLogger = AntigravityProviderLogger
+
 __all__ = [
     # Quota trackers
     "BaseQuotaTracker",
@@ -44,6 +50,10 @@ __all__ = [
     # Loggers (from transaction_logger)
     "ProviderLogger",
     "AntigravityProviderLogger",
+    # Deprecated logger aliases (for backward compatibility)
+    "GeminiFileLogger",
+    "GeminiCliFileLogger",
+    "AntigravityFileLogger",
     # Mixins
     "GeminiToolHandler",
     "GeminiCredentialManager",

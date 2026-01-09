@@ -246,7 +246,12 @@ class TransactionLogger:
         has_provider_logs = False
         if self.log_dir:
             provider_dir = self.log_dir / "provider"
-            has_provider_logs = provider_dir.exists() and any(provider_dir.iterdir())
+            try:
+                has_provider_logs = provider_dir.exists() and any(
+                    provider_dir.iterdir()
+                )
+            except OSError:
+                has_provider_logs = False
 
         metadata = {
             "request_id": self.request_id,
