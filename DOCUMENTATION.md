@@ -10,6 +10,7 @@ The project is a monorepo containing two primary components:
     *   **Batch Manager**: Optimizes high-volume embedding requests.
     *   **Detailed Logger**: Provides per-request file logging for debugging.
     *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
+    *   **Model Filter GUI**: Visual interface for configuring model ignore/whitelist rules per provider (see Section 6).
 2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
 
 This architecture cleanly separates the API interface from the resilience logic, making the library a portable and powerful tool for any application needing robust API key management.
@@ -151,12 +152,49 @@ The `EmbeddingBatcher` class optimizes high-throughput embedding workloads.
     2.  A time window (`timeout`, default: 0.1s) elapses since the first request in the batch.
 *   **Efficiency**: This reduces dozens of HTTP calls to a single API request, significantly reducing overhead and rate limit usage.
 
-### 2.4. `background_refresher.py` - Automated Token Maintenance
+### 2.4. `background_refresher.py` - Automated Token Maintenance & Provider Jobs
 
-The `BackgroundRefresher` ensures that OAuth tokens (for providers like Gemini CLI, Qwen, iFlow) never expire while the proxy is running.
+The `BackgroundRefresher` manages background tasks for the proxy, including OAuth token refresh and provider-specific periodic jobs.
 
-*   **Periodic Checks**: It runs a background task that wakes up at a configurable interval (default: 3600 seconds/1 hour).
+#### OAuth Token Refresh
+
+*   **Periodic Checks**: It runs a background task that wakes up at a configurable interval (default: 600 seconds/10 minutes via `OAUTH_REFRESH_INTERVAL`).
 *   **Proactive Refresh**: It iterates through all loaded OAuth credentials and calls their `proactively_refresh` method to ensure tokens are valid before they are needed.
+
+#### Provider-Specific Background Jobs
+
+Providers can define their own background jobs that run on independent schedules:
+
+*   **Independent Timers**: Each provider's job runs on its own interval, separate from the OAuth refresh cycle.
+*   **Configuration**: Providers implement `get_background_job_config()` to define their job settings.
+*   **Execution**: Providers implement `run_background_job()` to execute the periodic task.
+
+**Provider Job Configuration:**
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    """Return configuration for provider-specific background job."""
+    return {
+        "interval": 300,      # seconds between runs
+        "name": "quota_refresh",  # for logging
+        "run_on_start": True,  # whether to run immediately at startup
+    }
+
+async def run_background_job(
+    self,
+    usage_manager: "UsageManager",
+    credentials: List[str],
+) -> None:
+    """Execute the provider's periodic background job."""
+    # Provider-specific logic here
+    pass
+```
+
+**Current Provider Jobs:**
+
+| Provider | Job Name | Default Interval | Purpose |
+|----------|----------|------------------|---------|
+| Antigravity | `antigravity_quota_refresh` | 300s (5 min) | Fetches quota status from API to update remaining quota estimates |
+| Gemini CLI | `gemini_cli_quota_refresh` | 300s (5 min) | Fetches quota status from `retrieveUserQuota` API to update remaining quota estimates |
 
 ### 2.6. Credential Management Architecture
 
@@ -196,15 +234,44 @@ The manager supports loading credentials from two sources, with a clear priority
 **Priority 2: Environment Variables** (Stateless Deployment)
 - If no local files are found, the manager checks for provider-specific environment variables
 - This is the key to "Stateless Deployment" for platforms like Railway, Render, Heroku
+- Credentials are referenced internally using `env://` URIs (e.g., `env://gemini_cli/1`)
 
 **Gemini CLI Environment Variables:**
+
+Single credential (legacy format):
 ```
 GEMINI_CLI_ACCESS_TOKEN
 GEMINI_CLI_REFRESH_TOKEN
-GEMINI_CLI_E XPIRY_DATE
+GEMINI_CLI_EXPIRY_DATE
 GEMINI_CLI_EMAIL
 GEMINI_CLI_PROJECT_ID (optional)
-GEMINI_CLI_CLIENT_ID (optional)
+GEMINI_CLI_TIER (optional: standard-tier or free-tier)
+```
+
+Multiple credentials (use `_N_` suffix where N is 1, 2, 3...):
+```
+GEMINI_CLI_1_ACCESS_TOKEN
+GEMINI_CLI_1_REFRESH_TOKEN
+GEMINI_CLI_1_EXPIRY_DATE
+GEMINI_CLI_1_EMAIL
+GEMINI_CLI_1_PROJECT_ID (optional)
+GEMINI_CLI_1_TIER (optional)
+
+GEMINI_CLI_2_ACCESS_TOKEN
+GEMINI_CLI_2_REFRESH_TOKEN
+...
+```
+
+**Antigravity Environment Variables:**
+
+Same pattern as Gemini CLI:
+```
+ANTIGRAVITY_1_ACCESS_TOKEN
+ANTIGRAVITY_1_REFRESH_TOKEN
+ANTIGRAVITY_1_EXPIRY_DATE
+ANTIGRAVITY_1_EMAIL
+ANTIGRAVITY_1_PROJECT_ID (optional)
+ANTIGRAVITY_1_TIER (optional)
 ```
 
 **Qwen Code Environment Variables:**
@@ -225,10 +292,21 @@ IFLOW_API_KEY
 ```
 
 **How it works:**
-- If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
+- If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN` or `GEMINI_CLI_1_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
+- The credential is referenced internally as `env://gemini_cli/0` (legacy) or `env://gemini_cli/1` (numbered)
 - The credential behaves exactly like a file-based credential (automatic refresh, expiry detection, etc.)
 - No physical files are created or needed on the host system
 - Perfect for ephemeral containers or read-only filesystems
+
+**env:// URI Format:**
+```
+env://{provider}/{index}
+
+Examples:
+- env://gemini_cli/1  → GEMINI_CLI_1_ACCESS_TOKEN, etc.
+- env://gemini_cli/0  → GEMINI_CLI_ACCESS_TOKEN (legacy single credential)
+- env://antigravity/1 → ANTIGRAVITY_1_ACCESS_TOKEN, etc.
+```
 
 #### 2.6.3. Credential Tool Integration
 
@@ -295,15 +373,19 @@ class ErrorType(Enum):
    - `400` with "quota" → `QUOTA`
    - `500`/`502`/`503` → `SERVER_ERROR`
 
-2. **Message Analysis**: Fallback for ambiguous errors
+2. **Special Exception Types**:
+   - `EmptyResponseError` → `SERVER_ERROR` (status 503, rotatable)
+   - `TransientQuotaError` → `SERVER_ERROR` (status 503, rotatable - bare 429 without retry info)
+
+3. **Message Analysis**: Fallback for ambiguous errors
    - Searches for keywords like "quota exceeded", "rate limit", "invalid api key"
 
-3. **Provider-Specific Overrides**: Some providers use non-standard error formats
+4. **Provider-Specific Overrides**: Some providers use non-standard error formats
 
 **Usage in Client:**
 - `AUTHENTICATION` → Immediate 5-minute global lockout
 - `RATE_LIMIT`/`QUOTA` → Escalating per-model cooldown
-- `SERVER_ERROR` → Retry with same key (up to `max_retries`)
+- `SERVER_ERROR` → Retry with same key (up to `max_retries`), then rotate
 - `CONTEXT_LENGTH`/`CONTENT_FILTER` → Immediate failure (user needs to fix request)
 
 ---
@@ -409,6 +491,243 @@ A modular, shared caching system for providers to persist conversation state acr
 - **Background Persistence**: Batched disk writes every 60 seconds (configurable)
 - **Automatic Cleanup**: Background task removes expired entries from memory cache
 
+### 2.15. Antigravity Quota Tracker (`providers/utilities/antigravity_quota_tracker.py`)
+
+A mixin class providing quota tracking functionality for the Antigravity provider. This enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
+
+#### Core Concepts
+
+**Quota Baseline Tracking:**
+- Periodically fetches quota status from the Antigravity `fetchAvailableModels` API
+- Stores the remaining fraction as a baseline in UsageManager
+- Tracks requests since baseline to estimate current remaining quota
+- Syncs local request count with API's authoritative values
+
+**Quota Cost Constants:**
+Based on empirical testing (see `docs/ANTIGRAVITY_QUOTA_REPORT.md`), quota costs are known per model and tier:
+
+| Tier | Model Group | Cost per Request | Requests per 100% |
+|------|-------------|------------------|-------------------|
+| standard-tier | Claude/GPT-OSS | 0.40% | 250 |
+| standard-tier | Gemini 3 Pro | 0.25% | 400 |
+| standard-tier | Gemini 2.5 Flash | 0.0333% | ~3000 |
+| free-tier | Claude/GPT-OSS | 1.333% | 75 |
+| free-tier | Gemini 3 Pro | 0.40% | 250 |
+
+**Model Name Mappings:**
+Some user-facing model names don't exist directly in the API response:
+- `claude-opus-4-5` → `claude-opus-4-5-thinking` (Opus only exists as thinking variant)
+- `gemini-3-pro-preview` → `gemini-3-pro-high` (preview maps to high by default)
+
+#### Key Methods
+
+**`fetch_quota_from_api(credential_path)`:**
+Fetches current quota status from the Antigravity API. Returns remaining fraction and reset times for all models.
+
+**`estimate_remaining_quota(credential_path, model, model_data, tier)`:**
+Estimates remaining quota based on baseline + request tracking. Returns confidence level (high/medium/low) based on baseline age.
+
+**`refresh_active_quota_baselines(credentials, usage_data)`:**
+Only refreshes baselines for credentials that have been used recently (within the refresh interval).
+
+**`discover_quota_costs(credential_path, models_to_test)`:**
+Manual utility to discover quota costs by making test requests and measuring before/after quota. Saves learned costs to `cache/antigravity/learned_quota_costs.json`.
+
+#### Integration with Background Jobs
+
+The Antigravity provider defines a background job for quota baseline refresh:
+
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    return {
+        "interval": 300,  # 5 minutes (configurable via ANTIGRAVITY_QUOTA_REFRESH_INTERVAL)
+        "name": "quota_baseline_refresh",
+        "run_on_start": True,
+    }
+```
+
+This job:
+1. Identifies credentials used since the last refresh
+2. Fetches current quota from the API for those credentials
+3. Updates baselines in UsageManager for accurate estimation
+
+#### Data Storage
+
+Quota baselines are stored in UsageManager's per-model data:
+
+```json
+{
+  "credential_path": {
+    "models": {
+      "antigravity/claude-sonnet-4-5": {
+        "request_count": 15,
+        "baseline_remaining_fraction": 0.94,
+        "baseline_fetched_at": 1734567890.0,
+        "requests_at_baseline": 15,
+        "quota_max_requests": 250,
+        "quota_display": "15/250"
+      }
+    }
+  }
+}
+```
+
+### 2.16. TransientQuotaError (`error_handler.py`)
+
+A new error type for handling bare 429 responses without retry timing information.
+
+**When Raised:**
+- Provider returns HTTP 429 status code
+- Response doesn't contain retry timing info (no `quotaResetTimeStamp` or `retryDelay`)
+- After internal retry attempts are exhausted
+
+**Behavior:**
+- Classified as `server_error` (status 503) rather than quota exhaustion
+- Causes credential rotation to try the next credential
+- Does NOT trigger long-term quota cooldowns
+
+**Implementation in Antigravity:**
+```python
+# Non-streaming and streaming both retry bare 429s
+for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
+    try:
+        result = await self._handle_request(...)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            quota_info = self.parse_quota_error(e)
+            if quota_info is None:
+                # Bare 429 - retry like empty response
+                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
+                    continue
+                else:
+                    raise TransientQuotaError(provider, model, message)
+            # Has retry info - real quota exhaustion
+            raise
+```
+
+**Rationale:**
+Some 429 responses are transient rate limits rather than true quota exhaustion. These occur when the API is temporarily overloaded but the credential still has quota available. Retrying internally before rotating credentials provides better resilience.
+
+### 2.17. Gemini CLI Quota Tracker (`providers/utilities/gemini_cli_quota_tracker.py`)
+
+A mixin class providing quota tracking functionality for the Gemini CLI provider. This mirrors the Antigravity quota tracker (Section 2.15) and enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
+
+#### Core Concepts
+
+**Quota Baseline Tracking:**
+- Periodically fetches quota status from the `retrieveUserQuota` API endpoint
+- Stores the remaining fraction as a baseline in UsageManager
+- Tracks requests since baseline to estimate current remaining quota
+- Syncs local request count with API's authoritative values
+
+**Quota Cost Constants:**
+Based on empirical testing, quota limits are known per model and tier:
+
+| Tier | Model Group | Max Requests per 100% |
+|------|-------------|----------------------|
+| standard-tier | Pro (gemini-2.5-pro, gemini-3-pro-preview) | 250 |
+| standard-tier | 2.5-Flash (gemini-2.0-flash, gemini-2.5-flash, gemini-2.5-flash-lite) | 1500 |
+| standard-tier | 3-Flash (gemini-3-flash-preview) | 1500 |
+| free-tier | Pro | 100 |
+| free-tier | 2.5-Flash | 1000 |
+| free-tier | 3-Flash | 1000 |
+
+**Reset Windows:**
+- All tiers use 24-hour fixed windows from first request (verified 2026-01-07)
+- The reset time is set when the first request is made and does NOT roll forward
+
+**Model Quota Groups:**
+Models that share quota limits are grouped together:
+- `pro`: `gemini-2.5-pro`, `gemini-3-pro-preview`
+- `25-flash`: `gemini-2.0-flash`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+- `3-flash`: `gemini-3-flash-preview`
+
+Groups can be overridden via environment variables: `QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"`
+
+#### Key Methods
+
+**`retrieve_user_quota(credential_path)`:**
+Fetches current quota status from the Gemini CLI `retrieveUserQuota` API. Returns remaining fraction and reset times for all models.
+
+**`get_all_quota_info(credential_paths, oauth_base_dir, usage_data, include_estimates)`:**
+Gets structured quota info for all credentials, suitable for the TUI quota viewer and stats endpoint.
+
+**`get_max_requests_for_model(model, tier)`:**
+Returns the maximum number of requests for a model/tier combination. Uses learned values if available, otherwise falls back to defaults.
+
+**`discover_quota_costs(credential_path, models_to_test)`:**
+Manual utility to discover quota costs by making test requests and measuring before/after quota. Saves learned costs to `cache/gemini_cli/learned_quota_costs.json`.
+
+#### Integration with Background Jobs
+
+The Gemini CLI provider defines a background job for quota baseline refresh:
+
+```python
+def get_background_job_config(self) -> Optional[Dict[str, Any]]:
+    return {
+        "interval": 300,  # 5 minutes (configurable via GEMINI_CLI_QUOTA_REFRESH_INTERVAL)
+        "name": "gemini_cli_quota_refresh",
+        "run_on_start": True,
+    }
+```
+
+This job:
+1. On first run: Fetches quota for ALL credentials to establish baselines
+2. On subsequent runs: Only fetches for credentials used since last refresh
+3. Updates baselines in UsageManager for accurate estimation
+
+#### Data Storage
+
+Quota baselines are stored in UsageManager's per-model data:
+
+```json
+{
+  "credential_path": {
+    "models": {
+      "gemini_cli/gemini-2.5-pro": {
+        "request_count": 15,
+        "baseline_remaining_fraction": 0.94,
+        "baseline_fetched_at": 1734567890.0,
+        "requests_at_baseline": 15,
+        "quota_max_requests": 250,
+        "quota_display": "15/250"
+      }
+    }
+  }
+}
+```
+
+#### Environment Variables
+
+```env
+# Background job interval in seconds (default: 300 = 5 min)
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300
+
+# Override default quota groups
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
+QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
+QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
+```
+
+### 2.18. Shared Gemini OAuth Utilities (`providers/utilities/`)
+
+The PR refactors shared logic between Gemini CLI and Antigravity providers into reusable utility modules:
+
+| Module | Purpose |
+|--------|---------|
+| `gemini_shared_utils.py` | Shared constants (FINISH_REASON_MAP, DEFAULT_SAFETY_SETTINGS, CODE_ASSIST_ENDPOINT), helper functions (env_bool, env_int, inline_schema_refs, recursively_parse_json_strings) |
+| `base_quota_tracker.py` | Abstract base class for quota tracking with learned costs, credential discovery, and baseline management |
+| `gemini_credential_manager.py` | Mixin for OAuth credential tier management, initialization, and background job interface |
+| `gemini_file_logger.py` | Transaction-level file logging for debugging API requests and responses |
+| `gemini_tool_handler.py` | Tool schema transformation and Gemini 3 tool fix logic |
+
+**Benefits:**
+- Eliminates code duplication between Gemini CLI and Antigravity providers
+- Single source of truth for shared constants and logic
+- Easier maintenance and bug fixes
+- Consistent behavior across Google OAuth-based providers
+
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
 The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
@@ -421,8 +740,10 @@ The most sophisticated provider implementation, supporting Google's internal Ant
 - **Credential Prioritization**: Automatic tier detection with paid credentials prioritized over free (paid tier resets every 5 hours, free tier resets weekly)
 - **Sequential Rotation Mode**: Default rotation mode is sequential (use credentials until exhausted) to maximize thought signature cache hits
 - **Per-Model Quota Tracking**: Each model tracks independent usage windows with authoritative reset timestamps from quota errors
-- **Quota Groups**: Claude models (Sonnet 4.5 + Opus 4.5) can be grouped to share quota limits (disabled by default, configurable via `QUOTA_GROUPS_ANTIGRAVITY_CLAUDE`)
+- **Quota Groups**: Models that share quota limits are grouped together (Claude/GPT-OSS share quota, Gemini 3 Pro variants share quota, Gemini 2.5 Flash variants share quota)
 - **Priority Multipliers**: Paid tier credentials get higher concurrency limits (Priority 1: 5x, Priority 2: 3x, Priority 3+: 2x in sequential mode)
+- **Quota Baseline Tracking**: Background job fetches quota status from API to provide accurate remaining quota estimates
+- **TransientQuotaError Handling**: Bare 429 responses (without retry info) are retried internally before credential rotation
 
 #### Model Support
 
@@ -437,8 +758,18 @@ The most sophisticated provider implementation, supporting Google's internal Ant
   - Caching signatures from responses for reuse in follow-up messages
   - Automatic injection into functionCalls for multi-turn conversations
   - Fallback to bypass value if signature unavailable
+- **Parallel Tool Usage Instruction**: Configurable instruction injection to encourage parallel tool calls (disabled by default for Gemini 3)
 
-**Claude Opus 4.5 (NEW!):**
+**Gemini 2.5 Flash:**
+- Uses `-thinking` variant when `reasoning_effort` is provided
+- Shares quota with `gemini-2.5-flash-thinking` and `gemini-2.5-flash-lite` variants
+- Parallel tool usage instruction configurable
+
+**Gemini 2.5 Flash Lite:**
+- Configurable thinking budget, no name change required
+- Shares quota with Flash variants
+
+**Claude Opus 4.5:**
 - Anthropic's most powerful model, now available via Antigravity proxy
 - **Always uses thinking variant** - `claude-opus-4-5-thinking` is the only available variant (non-thinking version doesn't exist)
 - Uses `thinkingBudget` parameter for extended thinking control (-1 for auto, 0 to disable, or specific token count)
@@ -453,6 +784,11 @@ The most sophisticated provider implementation, supporting Google's internal Ant
   - Without `reasoning_effort`: Uses standard `claude-sonnet-4-5` variant
 - **Thinking Preservation**: Caches thinking content using composite keys (tool_call_id + text_hash)
 - **Schema Cleaning**: Removes unsupported properties (`$schema`, `additionalProperties`, `const` → `enum`)
+- **Parallel Tool Usage Instruction**: Automatic instruction injection to encourage parallel tool calls (enabled by default for Claude)
+
+**GPT-OSS 120B Medium:**
+- OpenAI-compatible model available via Antigravity
+- Shares quota with Claude models (Claude/GPT-OSS quota group)
 
 #### Base URL Fallback
 
@@ -494,6 +830,14 @@ ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable Claude thinking mode aut
 ANTIGRAVITY_GEMINI3_TOOL_PREFIX="gemini3_"  # Namespace prefix
 ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT="\n\nSTRICT PARAMETERS: {params}."
 ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
+
+# Parallel tool usage instruction
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Inject parallel tool instruction for Claude (default: true)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3=false  # Inject parallel tool instruction for Gemini 3 (default: false)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION="..."  # Custom instruction text
+
+# Quota tracking
+ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Background quota refresh interval in seconds (default: 300 = 5 min)
 ```
 
 #### Claude Extended Thinking Sanitization
@@ -714,15 +1058,24 @@ Models that share the same quota limits can be grouped:
 **Configuration**:
 ```env
 # Models in a group share quota/cooldown timing
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-sonnet-4-5-thinking,claude-opus-4-5,claude-opus-4-5-thinking,gpt-oss-120b-medium"
+QUOTA_GROUPS_ANTIGRAVITY_GEMINI_3_PRO="gemini-3-pro-high,gemini-3-pro-low,gemini-3-pro-preview"
+QUOTA_GROUPS_ANTIGRAVITY_GEMINI_2_5_FLASH="gemini-2.5-flash,gemini-2.5-flash-thinking,gemini-2.5-flash-lite"
 
 # To disable a default group:
 QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
 ```
 
+**Default Quota Groups (Antigravity)**:
+
+| Group Name | Models | Shared Quota |
+|------------|--------|--------------|
+| `claude` | claude-sonnet-4-5, claude-sonnet-4-5-thinking, claude-opus-4-5, claude-opus-4-5-thinking, gpt-oss-120b-medium | Yes (Claude and GPT-OSS share quota) |
+| `gemini-3-pro` | gemini-3-pro-high, gemini-3-pro-low, gemini-3-pro-preview | Yes |
+| `gemini-2.5-flash` | gemini-2.5-flash, gemini-2.5-flash-thinking, gemini-2.5-flash-lite | Yes |
+
 **Behavior**:
 - When one model hits quota, all models in the group receive the same `quota_reset_ts`
-- Combined weighted usage for credential selection (e.g., Opus counts 2x vs Sonnet)
 - Group resets only when ALL models' quotas have reset
 - Preserves unexpired cooldowns during other resets
 
@@ -730,11 +1083,26 @@ QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
 ```python
 class AntigravityProvider(ProviderInterface):
     model_quota_groups = {
-        "claude": ["claude-sonnet-4-5", "claude-opus-4-5"]
-    }
-    
-    model_usage_weights = {
-        "claude-opus-4-5": 2  # Opus counts 2x vs Sonnet
+        # Claude and GPT-OSS share the same quota pool
+        "claude": [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking",
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking",
+            "gpt-oss-120b-medium",
+        ],
+        # Gemini 3 Pro variants share quota
+        "gemini-3-pro": [
+            "gemini-3-pro-high",
+            "gemini-3-pro-low",
+            "gemini-3-pro-preview",
+        ],
+        # Gemini 2.5 Flash variants share quota
+        "gemini-2.5-flash": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-flash-lite",
+        ],
     }
 ```
 
@@ -1005,11 +1373,18 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 
 The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
 
-**New in PR #31**:
+**New in PR #62**:
+- **Quota Baseline Tracking**: Background job fetches quota status from API (`retrieveUserQuota`) to provide accurate remaining quota estimates
+- **GeminiCliQuotaTracker Mixin**: Inherits from `BaseQuotaTracker` for shared quota infrastructure with Antigravity
+- **env:// Credential Support**: Environment-based credentials are detected and loaded via `env://gemini_cli/N` URIs
+- **Quota Groups**: Models sharing quota are grouped (`pro`, `25-flash`, `3-flash`) for accurate cooldown propagation
+- **24-Hour Fixed Windows**: All tiers use fixed 24-hour windows from first request (verified 2026-01-07)
+
+**From PR #31**:
 - **Quota Parsing**: Implements `parse_quota_error()` using Google RPC format parser
 - **Tier Configuration**: Defines `tier_priorities` and `usage_reset_configs` for automatic priority resolution
-- **Balanced Rotation**: Defaults to balanced mode (unlike Antigravity which uses sequential)
-- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 1x)
+- **Sequential Rotation**: Defaults to sequential mode (uses credentials until quota exhausted)
+- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 2x in sequential mode)
 
 #### Authentication (`gemini_auth_base.py`)
 
@@ -1031,6 +1406,41 @@ The provider employs a sophisticated, cached discovery mechanism to find a valid
 
 *   **Internal Endpoints**: Uses `https://cloudcode-pa.googleapis.com/v1internal`, which typically has higher quotas than the public API.
 *   **Smart Fallback**: If `gemini-2.5-pro` hits a rate limit (`429`), the provider transparently retries the request using `gemini-2.5-pro-preview-06-05`. This fallback chain is configurable in code.
+
+#### Quota Tracking
+
+The provider implements quota tracking via the `GeminiCliQuotaTracker` mixin (see Section 2.17):
+
+*   **Real-Time Quota API**: Fetches quota status from `retrieveUserQuota` endpoint
+*   **Background Refresh**: Configurable interval (default: 5 minutes) via `GEMINI_CLI_QUOTA_REFRESH_INTERVAL`
+*   **Model Quota Groups**: Pro models share quota, Flash 2.x models share quota, Flash 3 is standalone
+
+**Default Quota Groups:**
+
+| Group Name | Models | Verified Sharing |
+|------------|--------|------------------|
+| `pro` | gemini-2.5-pro, gemini-3-pro-preview | Yes (same bucket) |
+| `25-flash` | gemini-2.0-flash, gemini-2.5-flash, gemini-2.5-flash-lite | Yes (same bucket) |
+| `3-flash` | gemini-3-flash-preview | Standalone |
+
+**Quota Limits by Tier:**
+
+| Tier | Pro Group | Flash Groups |
+|------|-----------|--------------|
+| standard-tier | 250 requests/24h | 1500 requests/24h |
+| free-tier | 100 requests/24h | 1000 requests/24h |
+
+#### Configuration (Environment Variables)
+
+```env
+# Quota tracking
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Background refresh interval (default: 5 min)
+
+# Override quota groups
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
+QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
+QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
+```
 
 ### 3.2. Qwen Code (`qwen_code_provider.py`)
 
@@ -1244,4 +1654,84 @@ health = writer.get_health_info()
 stats = cache.get_stats()
 # Includes: {"disk_available": True, "disk_errors": 0, ...}
 ```
+
+---
+
+## 6. Model Filter GUI
+
+The Model Filter GUI (`model_filter_gui.py`) provides a visual interface for configuring model ignore and whitelist rules per provider. It replaces the need to manually edit `IGNORE_MODELS_*` and `WHITELIST_MODELS_*` environment variables.
+
+### 6.1. Overview
+
+**Purpose**: Visually manage which models are exposed via the `/v1/models` endpoint for each provider.
+
+**Launch**: 
+```bash
+python -c "from src.proxy_app.model_filter_gui import run_model_filter_gui; run_model_filter_gui()"
+```
+
+Or via the launcher TUI if integrated.
+
+### 6.2. Features
+
+#### Core Functionality
+
+- **Provider Selection**: Dropdown to switch between available providers with automatic model fetching
+- **Ignore Rules**: Pattern-based rules (supports wildcards like `*-preview`, `gpt-4*`) to exclude models
+- **Whitelist Rules**: Pattern-based rules to explicitly include models, overriding ignore rules
+- **Real-time Preview**: Typing in rule input fields highlights affected models before committing
+- **Rule-Model Linking**: Click a model to highlight the affecting rule; click a rule to highlight all affected models
+- **Persistence**: Rules saved to `.env` file in standard `IGNORE_MODELS_<PROVIDER>` and `WHITELIST_MODELS_<PROVIDER>` format
+
+#### Dual-Pane Model View
+
+The interface displays two synchronized lists:
+
+| Left Pane | Right Pane |
+|-----------|------------|
+| All fetched models (plain text) | Same models with color-coded status |
+| Shows total count | Shows available/ignored count |
+| Scrolls in sync with right pane | Color indicates affecting rule |
+
+**Color Coding**:
+- **Green**: Model is available (no rule affects it, or whitelisted)
+- **Red/Orange tones**: Model is ignored (color matches the specific ignore rule)
+- **Blue/Teal tones**: Model is explicitly whitelisted (color matches the whitelist rule)
+
+#### Rule Management
+
+- **Comma-separated input**: Add multiple rules at once (e.g., `*-preview, *-beta, gpt-3.5*`)
+- **Wildcard support**: `*` matches any characters (e.g., `gemini-*-preview`)
+- **Affected count**: Each rule shows how many models it affects
+- **Tooltips**: Hover over a rule to see the list of affected models
+- **Instant delete**: Click the × button to remove a rule immediately
+
+### 6.3. Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+S` | Save changes to `.env` |
+| `Ctrl+R` | Refresh models from provider |
+| `Ctrl+F` | Focus search field |
+| `F1` | Show help dialog |
+| `Escape` | Clear search / Clear highlights |
+
+### 6.4. Context Menu
+
+Right-click on any model to access:
+
+- **Add to Ignore List**: Creates an ignore rule for the exact model name
+- **Add to Whitelist**: Creates a whitelist rule for the exact model name
+- **View Affecting Rule**: Highlights the rule that affects this model
+- **Copy Model Name**: Copies the full model ID to clipboard
+
+### 6.5. Integration with Proxy
+
+The GUI modifies the same environment variables that the `RotatingClient` reads:
+
+1. **GUI saves rules** → Updates `.env` file
+2. **Proxy reads on startup** → Loads `IGNORE_MODELS_*` and `WHITELIST_MODELS_*`
+3. **Proxy applies rules** → `get_available_models()` filters based on rules
+
+**Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
 

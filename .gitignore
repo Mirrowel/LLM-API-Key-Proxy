@@ -124,9 +124,11 @@ start_proxy.bat
 key_usage.json
 staged_changes.txt
 launcher_config.json
+quota_viewer_config.json
 cache/antigravity/thought_signatures.json
 logs/
 cache/
 *.env
 
 oauth_creds/
+

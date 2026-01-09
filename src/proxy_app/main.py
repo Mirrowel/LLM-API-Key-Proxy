@@ -15,7 +15,14 @@ parser.add_argument(
 )
 parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
 parser.add_argument(
-    "--enable-request-logging", action="store_true", help="Enable request logging."
+    "--enable-request-logging",
+    action="store_true",
+    help="Enable transaction logging in the library (logs request/response with provider correlation).",
+)
+parser.add_argument(
+    "--enable-raw-logging",
+    action="store_true",
+    help="Enable raw I/O logging at proxy boundary (captures unmodified HTTP data, disabled by default).",
 )
 parser.add_argument(
     "--add-credential",
@@ -108,7 +115,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import colorlog
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -126,7 +133,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
-    from proxy_app.detailed_logger import DetailedLogger
+    from proxy_app.detailed_logger import RawIOLogger
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -196,8 +203,7 @@ class EnrichedModelCard(BaseModel):
     _sources: Optional[List[str]] = None
     _match_type: Optional[str] = None
 
-    class Config:
-        extra = "allow"  # Allow extra fields from the service
+    model_config = ConfigDict(extra="allow")  # Allow extra fields from the service
 
 
 class ModelList(BaseModel):
@@ -337,8 +343,13 @@ load_dotenv(_root_dir / ".env")
 # --- Configuration ---
 USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
+ENABLE_RAW_LOGGING = args.enable_raw_logging
 if ENABLE_REQUEST_LOGGING:
-    logging.info("Request logging is enabled.")
+    logging.info(
+        "Transaction logging is enabled (library-level with provider correlation)."
+    )
+if ENABLE_RAW_LOGGING:
+    logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
@@ -669,7 +680,7 @@ async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
     response_stream: AsyncGenerator[str, None],
-    logger: Optional[DetailedLogger] = None,
+    logger: Optional[RawIOLogger] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion
@@ -847,7 +858,8 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
-    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
+    # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
+    raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
     try:
         # Read and parse the request body only once at the beginning.
         try:
@@ -879,9 +891,9 @@ async def chat_completions(
                     "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
                 )
 
-        # If logging is enabled, perform all logging operations using the parsed data.
-        if logger:
-            logger.log_request(headers=request.headers, body=request_data)
+        # If raw logging is enabled, capture the unmodified request data.
+        if raw_logger:
+            raw_logger.log_request(headers=request.headers, body=request_data)
 
         # Extract and log specific reasoning parameters for monitoring.
         model = request_data.get("model")
@@ -893,12 +905,9 @@ async def chat_completions(
         reasoning_effort = request_data.get("reasoning_effort") or generation_cfg.get(
             "reasoning_effort"
         )
-        custom_reasoning_budget = request_data.get(
-            "custom_reasoning_budget"
-        ) or generation_cfg.get("custom_reasoning_budget", False)
 
         logging.getLogger("rotator_library").debug(
-            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}, custom_reasoning_budget={custom_reasoning_budget}"
+            f"Handling reasoning parameters: model={model}, reasoning_effort={reasoning_effort}"
         )
 
         # Log basic request info to console (this is a separate, simpler logger).
@@ -914,13 +923,13 @@ async def chat_completions(
             response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
                 streaming_response_wrapper(
-                    request, request_data, response_generator, logger
+                    request, request_data, response_generator, raw_logger
                 ),
                 media_type="text/event-stream",
             )
         else:
             response = await client.acompletion(request=request, **request_data)
-            if logger:
+            if raw_logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object
                 response_headers = (
@@ -929,7 +938,7 @@ async def chat_completions(
                 status_code = (
                     response.status_code if hasattr(response, "status_code") else 200
                 )
-                logger.log_final_response(
+                raw_logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
                     body=response.model_dump(),
@@ -1146,6 +1155,145 @@ async def list_providers(_=Depends(verify_api_key)):
     Returns a list of all available providers.
     """
     return list(PROVIDER_PLUGINS.keys())
+
+
+@app.get("/v1/quota-stats")
+async def get_quota_stats(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+    provider: str = None,
+):
+    """
+    Returns quota and usage statistics for all credentials.
+
+    This returns cached data from the proxy without making external API calls.
+    Use POST to reload from disk or force refresh from external APIs.
+
+    Query Parameters:
+        provider: Optional filter to return stats for a specific provider only
+
+    Returns:
+        {
+            "providers": {
+                "provider_name": {
+                    "credential_count": int,
+                    "active_count": int,
+                    "on_cooldown_count": int,
+                    "exhausted_count": int,
+                    "total_requests": int,
+                    "tokens": {...},
+                    "approx_cost": float | null,
+                    "quota_groups": {...},  // For Antigravity
+                    "credentials": [...]
+                }
+            },
+            "summary": {...},
+            "data_source": "cache",
+            "timestamp": float
+        }
+    """
+    try:
+        stats = await client.get_quota_stats(provider_filter=provider)
+        return stats
+    except Exception as e:
+        logging.error(f"Failed to get quota stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/quota-stats")
+async def refresh_quota_stats(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """
+    Refresh quota and usage statistics.
+
+    Request body:
+        {
+            "action": "reload" | "force_refresh",
+            "scope": "all" | "provider" | "credential",
+            "provider": "antigravity",  // required if scope != "all"
+            "credential": "antigravity_oauth_1.json"  // required if scope == "credential"
+        }
+
+    Actions:
+        - reload: Re-read data from disk (no external API calls)
+        - force_refresh: For Antigravity, fetch live quota from API.
+                        For other providers, same as reload.
+
+    Returns:
+        Same as GET, plus a "refresh_result" field with operation details.
+    """
+    try:
+        data = await request.json()
+        action = data.get("action", "reload")
+        scope = data.get("scope", "all")
+        provider = data.get("provider")
+        credential = data.get("credential")
+
+        # Validate parameters
+        if action not in ("reload", "force_refresh"):
+            raise HTTPException(
+                status_code=400,
+                detail="action must be 'reload' or 'force_refresh'",
+            )
+
+        if scope not in ("all", "provider", "credential"):
+            raise HTTPException(
+                status_code=400,
+                detail="scope must be 'all', 'provider', or 'credential'",
+            )
+
+        if scope in ("provider", "credential") and not provider:
+            raise HTTPException(
+                status_code=400,
+                detail="'provider' is required when scope is 'provider' or 'credential'",
+            )
+
+        if scope == "credential" and not credential:
+            raise HTTPException(
+                status_code=400,
+                detail="'credential' is required when scope is 'credential'",
+            )
+
+        refresh_result = {
+            "action": action,
+            "scope": scope,
+            "provider": provider,
+            "credential": credential,
+        }
+
+        if action == "reload":
+            # Just reload from disk
+            start_time = time.time()
+            await client.reload_usage_from_disk()
+            refresh_result["duration_ms"] = int((time.time() - start_time) * 1000)
+            refresh_result["success"] = True
+            refresh_result["message"] = "Reloaded usage data from disk"
+
+        elif action == "force_refresh":
+            # Force refresh from external API (for supported providers like Antigravity)
+            result = await client.force_refresh_quota(
+                provider=provider if scope in ("provider", "credential") else None,
+                credential=credential if scope == "credential" else None,
+            )
+            refresh_result.update(result)
+            refresh_result["success"] = result["failed_count"] == 0
+
+        # Get updated stats
+        stats = await client.get_quota_stats(provider_filter=provider)
+        stats["refresh_result"] = refresh_result
+        stats["data_source"] = "refreshed"
+
+        return stats
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to refresh quota stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/token-count")

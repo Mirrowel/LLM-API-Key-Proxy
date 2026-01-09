@@ -61,6 +61,7 @@ class LauncherConfig:
             "host": "127.0.0.1",
             "port": 8000,
             "enable_request_logging": False,
+            "enable_raw_logging": False,
         }
         self.config = self.load()
 
@@ -155,6 +156,7 @@ class SettingsDetector:
     @staticmethod
     def detect_credentials() -> dict:
         """Detect API keys and OAuth credentials"""
+        import re
         from pathlib import Path
 
         providers = {}
@@ -168,14 +170,49 @@ class SettingsDetector:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["api_keys"] += 1
 
-        # Scan for OAuth credentials
-        oauth_dir = Path("oauth_credentials")
+        # Scan for file-based OAuth credentials
+        oauth_dir = Path("oauth_creds")
         if oauth_dir.exists():
             for file in oauth_dir.glob("*_oauth_*.json"):
                 provider = file.name.split("_oauth_")[0]
                 if provider not in providers:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["oauth"] += 1
+
+        # Scan for env-based OAuth credentials
+        # Maps provider name to the ENV_PREFIX used by the provider
+        # (duplicated from credential_manager to avoid heavy imports)
+        env_oauth_providers = {
+            "gemini_cli": "GEMINI_CLI",
+            "antigravity": "ANTIGRAVITY",
+            "qwen_code": "QWEN_CODE",
+            "iflow": "IFLOW",
+        }
+
+        for provider, env_prefix in env_oauth_providers.items():
+            oauth_count = 0
+
+            # Check numbered credentials (PROVIDER_N_ACCESS_TOKEN pattern)
+            numbered_pattern = re.compile(rf"^{env_prefix}_(\d+)_ACCESS_TOKEN$")
+            for key in env_vars.keys():
+                match = numbered_pattern.match(key)
+                if match:
+                    index = match.group(1)
+                    refresh_key = f"{env_prefix}_{index}_REFRESH_TOKEN"
+                    if refresh_key in env_vars and env_vars[refresh_key]:
+                        oauth_count += 1
+
+            # Check legacy single credential (if no numbered found)
+            if oauth_count == 0:
+                access_key = f"{env_prefix}_ACCESS_TOKEN"
+                refresh_key = f"{env_prefix}_REFRESH_TOKEN"
+                if env_vars.get(access_key) and env_vars.get(refresh_key):
+                    oauth_count = 1
+
+            if oauth_count > 0:
+                if provider not in providers:
+                    providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
+                providers[provider]["oauth"] += oauth_count
 
         # Mark custom providers (have API_BASE set)
         for provider in providers:
@@ -382,7 +419,10 @@ class LauncherTUI:
         self.console.print(f"   Host:                {self.config.config['host']}")
         self.console.print(f"   Port:                {self.config.config['port']}")
         self.console.print(
-            f"   Request Logging:     {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+        )
+        self.console.print(
+            f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
         )
 
         # Show actual API key value
@@ -429,9 +469,10 @@ class LauncherTUI:
             self.console.print("   3. 🔑 Manage Credentials")
 
         self.console.print("   4. 📊 View Provider & Advanced Settings")
-        self.console.print("   5. 🔄 Reload Configuration")
-        self.console.print("   6. ℹ️  About")
-        self.console.print("   7. 🚪 Exit")
+        self.console.print("   5. 📈 View Quota & Usage Stats (Alpha)")
+        self.console.print("   6. 🔄 Reload Configuration")
+        self.console.print("   7. ℹ️  About")
+        self.console.print("   8. 🚪 Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -439,7 +480,7 @@ class LauncherTUI:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
             show_choices=False,
         )
 
@@ -452,12 +493,14 @@ class LauncherTUI:
         elif choice == "4":
             self.show_provider_settings_menu()
         elif choice == "5":
+            self.launch_quota_viewer()
+        elif choice == "6":
             load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
             self.console.print("\n[green]✅ Configuration reloaded![/green]")
-        elif choice == "6":
-            self.show_about()
         elif choice == "7":
+            self.show_about()
+        elif choice == "8":
             self.running = False
             sys.exit(0)
 
@@ -512,7 +555,10 @@ class LauncherTUI:
             self.console.print(f"   Host:                {self.config.config['host']}")
             self.console.print(f"   Port:                {self.config.config['port']}")
             self.console.print(
-                f"   Request Logging:     {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+                f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            )
+            self.console.print(
+                f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
             )
             self.console.print(
                 f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}"
@@ -526,9 +572,10 @@ class LauncherTUI:
             self.console.print("   1. 🌐 Set Host IP")
             self.console.print("   2. 🔌 Set Port")
             self.console.print("   3. 🔑 Set Proxy API Key")
-            self.console.print("   4. 📝 Toggle Request Logging")
-            self.console.print("   5. 🔄 Reset to Default Settings")
-            self.console.print("   6. ↩️  Back to Main Menu")
+            self.console.print("   4. 📝 Toggle Transaction Logging")
+            self.console.print("   5. 📋 Toggle Raw I/O Logging")
+            self.console.print("   6. 🔄 Reset to Default Settings")
+            self.console.print("   7. ↩️  Back to Main Menu")
 
             self.console.print()
             self.console.print("━" * 70)
@@ -536,7 +583,7 @@ class LauncherTUI:
 
             choice = Prompt.ask(
                 "Select option",
-                choices=["1", "2", "3", "4", "5", "6"],
+                choices=["1", "2", "3", "4", "5", "6", "7"],
                 show_choices=False,
             )
 
@@ -633,20 +680,30 @@ class LauncherTUI:
                 current = self.config.config["enable_request_logging"]
                 self.config.update(enable_request_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Request Logging {'enabled' if not current else 'disabled'}![/green]"
+                    f"\n[green]✅ Transaction Logging {'enabled' if not current else 'disabled'}![/green]"
                 )
             elif choice == "5":
+                current = self.config.config.get("enable_raw_logging", False)
+                self.config.update(enable_raw_logging=not current)
+                self.console.print(
+                    f"\n[green]✅ Raw I/O Logging {'enabled' if not current else 'disabled'}![/green]"
+                )
+            elif choice == "6":
                 # Reset to Default Settings
                 # Define defaults
                 default_host = "127.0.0.1"
                 default_port = 8000
                 default_logging = False
+                default_raw_logging = False
                 default_api_key = "VerysecretKey"
 
                 # Get current values
                 current_host = self.config.config["host"]
                 current_port = self.config.config["port"]
                 current_logging = self.config.config["enable_request_logging"]
+                current_raw_logging = self.config.config.get(
+                    "enable_raw_logging", False
+                )
                 current_api_key = os.getenv("PROXY_API_KEY", "")
 
                 # Build comparison table
@@ -657,9 +714,12 @@ class LauncherTUI:
                     "   " + "─" * 62,
                     f"   Host IP              {current_host:20} →  {default_host}",
                     f"   Port                 {str(current_port):20} →  {default_port}",
-                    f"   Request Logging      {'Enabled':20} →  Disabled"
+                    f"   Transaction Logging  {'Enabled':20} →  Disabled"
                     if current_logging
-                    else f"   Request Logging      {'Disabled':20} →  Disabled",
+                    else f"   Transaction Logging  {'Disabled':20} →  Disabled",
+                    f"   Raw I/O Logging      {'Enabled':20} →  Disabled"
+                    if current_raw_logging
+                    else f"   Raw I/O Logging      {'Disabled':20} →  Disabled",
                     f"   Proxy API Key        {current_api_key[:20]:20} →  {default_api_key}",
                     "",
                     "[bold red]⚠️  This may break applications configured with current settings![/bold red]",
@@ -676,17 +736,19 @@ class LauncherTUI:
                     host=default_host,
                     port=default_port,
                     enable_request_logging=default_logging,
+                    enable_raw_logging=default_raw_logging,
                 )
                 LauncherConfig.update_proxy_api_key(default_api_key)
 
                 self.console.print(
                     "\n[green]✅ All settings have been reset to defaults![/green]"
                 )
-                self.console.print(f"   Host:             {default_host}")
-                self.console.print(f"   Port:             {default_port}")
-                self.console.print(f"   Request Logging:  Disabled")
-                self.console.print(f"   Proxy API Key:    {default_api_key}")
-            elif choice == "6":
+                self.console.print(f"   Host:               {default_host}")
+                self.console.print(f"   Port:               {default_port}")
+                self.console.print(f"   Transaction Logging: Disabled")
+                self.console.print(f"   Raw I/O Logging:    Disabled")
+                self.console.print(f"   Proxy API Key:      {default_api_key}")
+            elif choice == "7":
                 break
 
     def show_provider_settings_menu(self):
@@ -874,6 +936,20 @@ class LauncherTUI:
         # Reload environment after settings tool
         load_dotenv(dotenv_path=_get_env_file(), override=True)
 
+    def launch_quota_viewer(self):
+        """Launch the quota stats viewer"""
+        clear_screen()
+
+        self.console.print("━" * 70)
+        self.console.print("Quota & Usage Statistics Viewer")
+        self.console.print("━" * 70)
+        self.console.print()
+
+        # Import the lightweight viewer (no heavy imports)
+        from proxy_app.quota_viewer import run_quota_viewer
+
+        run_quota_viewer()
+
     def show_about(self):
         """Display About page with project information"""
         clear_screen()
@@ -992,6 +1068,8 @@ class LauncherTUI:
         ]
         if self.config.config["enable_request_logging"]:
             sys.argv.append("--enable-request-logging")
+        if self.config.config.get("enable_raw_logging", False):
+            sys.argv.append("--enable-raw-logging")
 
         # Exit TUI - main.py will continue execution
         self.running = False

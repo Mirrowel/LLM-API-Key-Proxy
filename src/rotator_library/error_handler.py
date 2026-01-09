@@ -26,6 +26,7 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
     Parse duration strings in various formats to total seconds.
 
     Handles:
+    - Milliseconds: '290.979975ms' -> 1 second (rounds up for sub-second values)
     - Compound durations: '156h14m36.752463453s', '2h30m', '45m30s'
     - Simple durations: '562476.752463453s', '3600s', '60m', '2h'
     - Plain seconds (no unit): '562476'
@@ -34,12 +35,13 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
         duration_str: Duration string to parse
 
     Returns:
-        Total seconds as integer, or None if parsing fails
+        Total seconds as integer, or None if parsing fails.
+        For sub-second values, returns at least 1 to avoid retry floods.
     """
     if not duration_str:
         return None
 
-    total_seconds = 0
+    total_seconds = 0.0
     remaining = duration_str.strip().lower()
 
     # Try parsing as plain number first (no units)
@@ -48,14 +50,23 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
     except ValueError:
         pass
 
+    # Handle pure milliseconds format: "290.979975ms"
+    # MUST check this BEFORE checking 'm' for minutes to avoid misinterpreting 'ms'
+    ms_match = re.match(r"^([\d.]+)ms$", remaining)
+    if ms_match:
+        ms_value = float(ms_match.group(1))
+        seconds = ms_value / 1000.0
+        # Round up to at least 1 second to avoid immediate retry floods
+        return max(1, int(seconds)) if seconds > 0 else 0
+
     # Parse hours component
     hour_match = re.match(r"(\d+)h", remaining)
     if hour_match:
         total_seconds += int(hour_match.group(1)) * 3600
         remaining = remaining[hour_match.end() :]
 
-    # Parse minutes component
-    min_match = re.match(r"(\d+)m", remaining)
+    # Parse minutes component - use negative lookahead to avoid matching 'ms'
+    min_match = re.match(r"(\d+)m(?!s)", remaining)
     if min_match:
         total_seconds += int(min_match.group(1)) * 60
         remaining = remaining[min_match.end() :]
@@ -63,9 +74,12 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
     # Parse seconds component (including decimals like 36.752463453s)
     sec_match = re.match(r"([\d.]+)s", remaining)
     if sec_match:
-        total_seconds += int(float(sec_match.group(1)))
+        total_seconds += float(sec_match.group(1))
 
-    return total_seconds if total_seconds > 0 else None
+    # For sub-second values, round up to at least 1
+    if total_seconds > 0:
+        return max(1, int(total_seconds))
+    return None
 
 
 def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
@@ -161,6 +175,32 @@ class EmptyResponseError(Exception):
         self.message = (
             message
             or f"Empty response from {provider}/{model} after multiple retry attempts"
+        )
+        super().__init__(self.message)
+
+
+class TransientQuotaError(Exception):
+    """
+    Raised when a provider returns a 429 without retry timing information.
+
+    This indicates a transient rate limit rather than true quota exhaustion.
+    The request has already been retried internally; this error signals
+    that the credential should be rotated to try the next one.
+
+    Treated as a transient server-side issue (503 equivalent), same as EmptyResponseError.
+
+    Attributes:
+        provider: The provider name (e.g., "antigravity")
+        model: The model that was requested
+        message: Human-readable message about the error
+    """
+
+    def __init__(self, provider: str, model: str, message: str = ""):
+        self.provider = provider
+        self.model = model
+        self.message = (
+            message
+            or f"Transient 429 from {provider}/{model} after multiple retry attempts"
         )
         super().__init__(self.message)
 
@@ -756,6 +796,15 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
     if isinstance(e, EmptyResponseError):
         # Transient server-side issue - provider returned empty response
+        # This is rotatable - try next credential
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=503,
+        )
+
+    if isinstance(e, TransientQuotaError):
+        # Transient 429 without retry info - provider returned bare rate limit
         # This is rotatable - try next credential
         return ClassifiedError(
             error_type="server_error",

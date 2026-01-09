@@ -329,10 +329,19 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 **Antigravity:**
 - Gemini 3 Pro with `thinkingLevel` support
+- Gemini 2.5 Flash/Flash Lite with thinking mode
 - Claude Opus 4.5 (thinking mode)
 - Claude Sonnet 4.5 (thinking and non-thinking)
+- GPT-OSS 120B Medium
 - Thought signature caching for multi-turn conversations
 - Tool hallucination prevention
+- Quota baseline tracking with background refresh
+- Parallel tool usage instruction injection
+- **Quota Groups**: Models that share quota are automatically grouped:
+    - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
+    - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
+    - Gemini 2.5 Flash: `gemini-2.5-flash`, `gemini-2.5-flash-thinking`, `gemini-2.5-flash-lite`
+    - All models in a group deplete the usage of the group equally. So in claude group - it is beneficial to use only Opus, and forget about Sonnet and GPT-OSS.
 
 **Qwen Code:**
 - Dual auth (API key + OAuth Device Flow)
@@ -394,6 +403,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>` | Concurrency multiplier per priority tier |
 | `QUOTA_GROUPS_<PROVIDER>_<GROUP>` | Models sharing quota limits |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
+| `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
+| `ANTIGRAVITY_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
 </details>
 
@@ -512,14 +523,48 @@ Uses Google OAuth to access internal Gemini endpoints with higher rate limits.
 - Automatic free-tier project onboarding
 - Paid vs free tier detection
 - Smart fallback on rate limits
+- Quota baseline tracking with background refresh (accurate remaining quota estimates)
+- Sequential rotation mode (uses credentials until quota exhausted)
+
+**Quota Groups:** Models that share quota are automatically grouped:
+- **Pro**: `gemini-2.5-pro`, `gemini-3-pro-preview`
+- **2.5-Flash**: `gemini-2.0-flash`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`
+- **3-Flash**: `gemini-3-flash-preview`
+
+All models in a group deplete the shared quota equally. 24-hour per-model quota windows.
 
 **Environment Variables (for stateless deployment):**
+
+Single credential (legacy):
 ```env
 GEMINI_CLI_ACCESS_TOKEN="ya29.your-access-token"
 GEMINI_CLI_REFRESH_TOKEN="1//your-refresh-token"
 GEMINI_CLI_EXPIRY_DATE="1234567890000"
 GEMINI_CLI_EMAIL="your-email@gmail.com"
 GEMINI_CLI_PROJECT_ID="your-gcp-project-id"  # Optional
+GEMINI_CLI_TIER="standard-tier"  # Optional: standard-tier or free-tier
+```
+
+Multiple credentials (use `_N_` suffix where N is 1, 2, 3...):
+```env
+GEMINI_CLI_1_ACCESS_TOKEN="ya29.first-token"
+GEMINI_CLI_1_REFRESH_TOKEN="1//first-refresh"
+GEMINI_CLI_1_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_1_EMAIL="first@gmail.com"
+GEMINI_CLI_1_PROJECT_ID="project-1"
+GEMINI_CLI_1_TIER="standard-tier"
+
+GEMINI_CLI_2_ACCESS_TOKEN="ya29.second-token"
+GEMINI_CLI_2_REFRESH_TOKEN="1//second-refresh"
+GEMINI_CLI_2_EXPIRY_DATE="1234567890000"
+GEMINI_CLI_2_EMAIL="second@gmail.com"
+GEMINI_CLI_2_PROJECT_ID="project-2"
+GEMINI_CLI_2_TIER="free-tier"
+```
+
+**Feature Toggles:**
+```env
+GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval in seconds (default: 300 = 5 min)
 ```
 
 </details>
@@ -531,9 +576,11 @@ Access Google's internal Antigravity API for cutting-edge models.
 
 **Supported Models:**
 - **Gemini 3 Pro** — with `thinkingLevel` support (low/high)
+- **Gemini 2.5 Flash** — with thinking mode support
+- **Gemini 2.5 Flash Lite** — configurable thinking budget
 - **Claude Opus 4.5** — Anthropic's most powerful model (thinking mode only)
 - **Claude Sonnet 4.5** — supports both thinking and non-thinking modes
-- Gemini 2.5 Pro/Flash
+- **GPT-OSS 120B** — OpenAI-compatible model
 
 **Setup:**
 1. Run `python -m rotator_library.credential_tool`
@@ -545,6 +592,8 @@ Access Google's internal Antigravity API for cutting-edge models.
 - Tool hallucination prevention via parameter signature injection
 - Automatic thinking block sanitization for Claude
 - Credential prioritization (paid resets every 5 hours, free weekly)
+- Quota baseline tracking with background refresh (accurate remaining quota estimates)
+- Parallel tool usage instruction injection for Claude
 
 **Environment Variables:**
 ```env
@@ -556,6 +605,8 @@ ANTIGRAVITY_EMAIL="your-email@gmail.com"
 # Feature toggles
 ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
 ANTIGRAVITY_GEMINI3_TOOL_FIX=true
+ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval (seconds)
+ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Parallel tool instruction for Claude
 ```
 
 > **Note:** Gemini 3 models require a paid-tier Google Cloud project.
