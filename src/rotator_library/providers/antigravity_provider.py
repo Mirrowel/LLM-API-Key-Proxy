@@ -2982,6 +2982,15 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             # Then add existing parts (shifted to later positions)
             new_parts.extend(existing_parts)
 
+            # If override is enabled but no user system prompt follows, add a minimal default.
+            # The override instruction says "the user's system prompt that follows" - when nothing
+            # follows, Antigravity's identity detection returns bare 429. This ensures the expected
+            # structure is maintained for clients that don't send system prompts (e.g., translation
+            # tools, simple chat UIs). The default matches the override's fallback statement:
+            # "If no user system prompt is provided, you are a helpful AI assistant."
+            if INJECT_IDENTITY_OVERRIDE and not existing_parts:
+                new_parts.append({"text": "You are a helpful AI assistant."})
+
         # Set the combined system instruction with role "user" (per Go implementation)
         if new_parts:
             request[target_key] = {
@@ -3894,12 +3903,35 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                         await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                                         continue
                                     else:
-                                        # Last attempt failed - raise TransientQuotaError to rotate
-                                        raise TransientQuotaError(
-                                            provider="antigravity",
-                                            model=model,
-                                            message=transient_429_msg,
-                                        )
+                                        # Last attempt failed - try streaming fallback before giving up
+                                        # Premium models (Gemini 3 Pro, Claude) often reject non-streaming
+                                        # but work with streaming
+                                        try:
+                                            return await self._collect_streaming_as_non_streaming(
+                                                client,
+                                                self._get_base_url(),
+                                                headers,
+                                                payload,
+                                                model,
+                                                file_logger,
+                                                tool_schemas,
+                                                current_gemini_contents,
+                                                gemini_payload,
+                                                project_id,
+                                                max_tokens,
+                                                reasoning_effort,
+                                                tool_choice,
+                                            )
+                                        except Exception as streaming_err:
+                                            # Streaming fallback also failed - raise original error
+                                            lib_logger.warning(
+                                                f"[Antigravity] Streaming fallback also failed for {model}: {streaming_err}"
+                                            )
+                                            raise TransientQuotaError(
+                                                provider="antigravity",
+                                                model=model,
+                                                message=transient_429_msg,
+                                            )
                                 # Has retry info - real quota exhaustion, propagate for cooldown
                                 lib_logger.debug(
                                     f"429 with retry info - propagating for cooldown: {e}"
@@ -3951,6 +3983,143 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         url = f"{url}?alt=sse"
                     continue  # Retry with new URL
                 raise  # No more fallback URLs
+
+    async def _collect_streaming_as_non_streaming(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        model: str,
+        file_logger: Optional["AntigravityFileLogger"],
+        tool_schemas: Optional[Dict[str, Dict[str, Any]]],
+        gemini_contents: Optional[List[Dict[str, Any]]],
+        gemini_payload: Optional[Dict[str, Any]],
+        project_id: Optional[str],
+        max_tokens: Optional[int],
+        reasoning_effort: Optional[str],
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> litellm.ModelResponse:
+        """
+        Fallback method: Make a streaming request and collect all chunks into
+        a single non-streaming ModelResponse.
+
+        Used when non-streaming requests fail with bare 429 but streaming works
+        (observed behavior with premium Antigravity models like Gemini 3 Pro, Claude).
+        """
+        # Modify URL and headers for streaming
+        streaming_url = f"{base_url}:streamGenerateContent?alt=sse"
+        streaming_headers = {
+            **headers,
+            "Accept": "text/event-stream",
+        }
+
+        lib_logger.info(
+            f"[Antigravity] Non-streaming failed with bare 429, "
+            f"falling back to streaming for {model}"
+        )
+
+        # Collect all chunks from streaming response
+        collected_content = ""
+        collected_reasoning = ""
+        collected_tool_calls = []
+        last_chunk = None
+        usage_info = None
+
+        async for chunk in self._streaming_with_retry(
+            client,
+            streaming_url,
+            streaming_headers,
+            payload,
+            model,
+            file_logger,
+            tool_schemas,
+            gemini_contents,
+            gemini_payload,
+            project_id,
+            max_tokens,
+            reasoning_effort,
+            tool_choice,
+        ):
+            last_chunk = chunk
+            if hasattr(chunk, "choices") and chunk.choices:
+                delta = chunk.choices[0].delta
+                if hasattr(delta, "content") and delta.content:
+                    collected_content += delta.content
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    collected_reasoning += delta.reasoning_content
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        # Accumulate tool call arguments
+                        if tc.index is not None:
+                            while len(collected_tool_calls) <= tc.index:
+                                collected_tool_calls.append(
+                                    {
+                                        "id": None,
+                                        "type": "function",
+                                        "function": {"name": None, "arguments": ""},
+                                    }
+                                )
+                            if tc.id:
+                                collected_tool_calls[tc.index]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    collected_tool_calls[tc.index]["function"][
+                                        "name"
+                                    ] = tc.function.name
+                                if tc.function.arguments:
+                                    collected_tool_calls[tc.index]["function"][
+                                        "arguments"
+                                    ] += tc.function.arguments
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage_info = chunk.usage
+
+        # Build final non-streaming response
+        finish_reason = "stop"
+        if last_chunk and hasattr(last_chunk, "choices") and last_chunk.choices:
+            finish_reason = last_chunk.choices[0].finish_reason or "stop"
+
+        message_dict: Dict[str, Any] = {"role": "assistant"}
+        if collected_content:
+            message_dict["content"] = collected_content
+        if collected_reasoning:
+            message_dict["reasoning_content"] = collected_reasoning
+        if collected_tool_calls:
+            # Convert to proper format
+            message_dict["tool_calls"] = [
+                {
+                    "id": tc["id"] or f"call_{i}",
+                    "type": "function",
+                    "function": tc["function"],
+                }
+                for i, tc in enumerate(collected_tool_calls)
+                if tc["function"]["name"]  # Only include if we have a name
+            ]
+            if message_dict["tool_calls"]:
+                finish_reason = "tool_calls"
+
+        response_dict = {
+            "id": last_chunk.id if last_chunk else f"chatcmpl-{model}",
+            "object": "chat.completion",
+            "created": int(asyncio.get_event_loop().time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_dict,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+        if usage_info:
+            response_dict["usage"] = (
+                usage_info.model_dump()
+                if hasattr(usage_info, "model_dump")
+                else dict(usage_info)
+            )
+
+        return litellm.ModelResponse(**response_dict)
 
     def _inject_tool_hardening_instruction(
         self, payload: Dict[str, Any], instruction_text: str
