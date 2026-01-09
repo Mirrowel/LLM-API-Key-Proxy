@@ -5,7 +5,7 @@ When using **Claude Code** (v2.1.2+) with the LLM-API-Key-Proxy, the client perf
 
 These probes appear in the proxy logs as requests for models such as:
 - `claude-haiku-4-5-20251001`
-- `gemini-claude-opus-4-5-thinking`
+- `claude-opus-4-5-20251101`
 - `claude-3-5-sonnet-20241022`
 
 ## Root Cause
@@ -13,23 +13,30 @@ These model names are hardcoded into the Claude Code binary for two primary purp
 1. **Capability Discovery**: Checking if the endpoint supports specific beta features (e.g., `interleaved-thinking`, `computer-use`).
 2. **Task Scaling**: Attempting to use a cheaper "Haiku-class" model for background indexing or file scanning tasks to optimize performance and cost.
 
-Because these requests are generated internally by the client, they lack the `antigravity/` provider prefix and use futuristic version strings that do not exist in the proxy's default mapping tables, resulting in `404 Not Found` errors from the backend.
+Because these requests are generated internally by the client, they lack the `antigravity/` provider prefix and use versioned model strings that may not exist in the proxy's default mapping tables.
 
-## Impact
+## Impact (Prior to Fix)
 - **Endless Thinking**: Claude Code may hang or show a "thinking" spinner indefinitely while it retries these failed background probes.
 - **Log Noise**: Proxy logs are cluttered with 400/404 errors for models that are not configured.
 - **Session Instability**: Critical background tasks like code indexing may fail to complete.
 
-## Recommended Workaround
-Since this behavior is hardcoded in the client and cannot be disabled via `--no-stats` or environment variables, the recommended solution is to provide a "safety net" mapping in the Proxy's configuration.
+## Resolution
+The proxy now includes built-in pattern matching to handle these probes automatically:
 
-Add the following to your `LLM-API-Key-Proxy/.env` file to funnel these probes into the models you actually have credentials for:
+1. **Provider Fallback** (`client.py`): The `_resolve_provider_fallback()` helper automatically routes requests containing "claude" or "gemini" (without a provider prefix) to the `antigravity` provider.
+
+2. **Pattern-Based Model Mapping** (`antigravity_provider.py`): The `_alias_to_internal()` method uses substring matching to map versioned model names to internal equivalents:
+   - Models containing `opus` → `claude-opus-4-5`
+   - Models containing `sonnet` → `claude-sonnet-4-5`
+   - Models containing `haiku` → `gemini-3-flash`
+   - Models containing `gemini-3` → appropriate Gemini variant
+
+## Manual Override (Optional)
+For edge cases not covered by the built-in patterns, you can add explicit mappings to your `.env` file:
 
 ```env
-# Map prefix-less background probes to the Antigravity provider
+# Map specific model probes to known models
 ANTIGRAVITY_MODELS='{
-  "claude-haiku-4-5-20251001": {"id": "claude-sonnet-4-5"},
-  "gemini-claude-opus-4-5-thinking": {"id": "claude-opus-4-5"},
   "claude-3-5-sonnet-20241022": {"id": "claude-sonnet-4-5"}
 }'
 ```
@@ -37,4 +44,4 @@ ANTIGRAVITY_MODELS='{
 ## Status
 - **Client**: Claude Code v2.1.2+
 - **Proxy Version**: PR #47 (Anthropic Compatibility)
-- **Status**: Identified as client-side behavior; requires configuration-level workaround for production stability.
+- **Status**: Resolved via built-in pattern matching; manual config only needed for edge cases.
