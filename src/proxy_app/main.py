@@ -118,7 +118,6 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from typing import Any, AsyncGenerator, List, Optional, Union
 
     import colorlog
-    from dotenv import load_dotenv
     from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
@@ -1037,6 +1036,13 @@ async def anthropic_messages(
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
+    # Initialize raw logger if enabled
+    raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    if raw_logger:
+        raw_logger.log_request(
+            headers=dict(request.headers), body=body.model_dump(exclude_none=True)
+        )
+
     try:
         response = await client.anthropic_messages(
             request=body,
@@ -1054,6 +1060,10 @@ async def anthropic_messages(
                 },
             )
         else:
+            if raw_logger:
+                raw_logger.log_final_response(
+                    status_code=200, headers=None, body=response
+                )
             return JSONResponse(content=response)
 
     except (
@@ -1092,8 +1102,8 @@ async def anthropic_messages(
         raise HTTPException(status_code=504, detail=error_response)
     except Exception as e:
         logging.error(f"Anthropic messages endpoint error: {e}")
-        if logger:
-            logger.log_final_response(
+        if raw_logger:
+            raw_logger.log_final_response(
                 status_code=500,
                 headers=None,
                 body={"error": str(e)},
