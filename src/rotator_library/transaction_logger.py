@@ -115,7 +115,14 @@ class TransactionLogger:
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())[:8]  # 8-char short ID
         self.provider = provider
-        self.model = _sanitize_name(model)
+
+        # Strip provider prefix from model if present
+        # e.g., "antigravity/claude-opus-4.5" → "claude-opus-4.5"
+        model_name = model
+        if "/" in model_name and model_name.split("/")[0] == provider:
+            model_name = model_name.split("/", 1)[1]
+
+        self.model = _sanitize_name(model_name)
         self.streaming = False
         self.log_dir: Optional[Path] = None
         self._dir_available = False
