@@ -869,6 +869,61 @@ class RotatingClient:
             ):
                 yield "data: [DONE]\n\n"
 
+    async def _transaction_logging_stream_wrapper(
+        self,
+        stream: Any,
+        transaction_logger: Optional[TransactionLogger],
+        request_data: Dict[str, Any],
+    ) -> Any:
+        """
+        Wrap a stream to log chunks and final response to TransactionLogger.
+
+        This wrapper:
+        1. Yields chunks unchanged (passthrough)
+        2. Parses SSE chunks and logs them via transaction_logger.log_stream_chunk()
+        3. Collects chunks for final response assembly
+        4. After stream ends, assembles and logs final response
+
+        Args:
+            stream: The streaming generator (yields SSE strings like "data: {...}")
+            transaction_logger: Optional TransactionLogger instance
+            request_data: Original request data for context
+        """
+        chunks = []
+        try:
+            async for chunk_str in stream:
+                yield chunk_str
+
+                # Log chunk if logging enabled
+                if (
+                    transaction_logger
+                    and isinstance(chunk_str, str)
+                    and chunk_str.strip()
+                    and chunk_str.startswith("data:")
+                ):
+                    content = chunk_str[len("data:") :].strip()
+                    if content and content != "[DONE]":
+                        try:
+                            chunk_data = json.loads(content)
+                            chunks.append(chunk_data)
+                            transaction_logger.log_stream_chunk(chunk_data)
+                        except json.JSONDecodeError:
+                            lib_logger.warning(
+                                f"TransactionLogger: Failed to parse chunk: {content[:100]}"
+                            )
+        finally:
+            # Assemble and log final response after stream ends
+            if transaction_logger and chunks:
+                try:
+                    final_response = TransactionLogger.assemble_streaming_response(
+                        chunks, request_data
+                    )
+                    transaction_logger.log_response(final_response)
+                except Exception as e:
+                    lib_logger.warning(
+                        f"TransactionLogger: Failed to assemble/log final response: {e}"
+                    )
+
     async def _execute_with_retry(
         self,
         api_call: callable,
@@ -1374,6 +1429,16 @@ class RotatingClient:
 
                             await self.usage_manager.release_key(current_cred, model)
                             key_acquired = False
+
+                            # Log response to transaction logger
+                            if transaction_logger:
+                                response_data = (
+                                    response.model_dump()
+                                    if hasattr(response, "model_dump")
+                                    else response
+                                )
+                                transaction_logger.log_response(response_data)
+
                             return response
 
                         except litellm.RateLimitError as e:
@@ -1876,7 +1941,14 @@ class RotatingClient:
                                     provider_plugin,
                                 )
 
-                                async for chunk in stream_generator:
+                                # Wrap with transaction logging
+                                logged_stream = (
+                                    self._transaction_logging_stream_wrapper(
+                                        stream_generator, transaction_logger, kwargs
+                                    )
+                                )
+
+                                async for chunk in logged_stream:
                                     yield chunk
                                 return
 
@@ -2124,7 +2196,12 @@ class RotatingClient:
                                 provider_instance,
                             )
 
-                            async for chunk in stream_generator:
+                            # Wrap with transaction logging
+                            logged_stream = self._transaction_logging_stream_wrapper(
+                                stream_generator, transaction_logger, kwargs
+                            )
+
+                            async for chunk in logged_stream:
                                 yield chunk
                             return
 

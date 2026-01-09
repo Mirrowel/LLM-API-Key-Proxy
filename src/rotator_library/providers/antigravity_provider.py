@@ -4061,6 +4061,38 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     final_chunk["usage"] = accumulator["last_usage"]
                 yield litellm.ModelResponse(**final_chunk)
 
+            # Log final assembled response for provider logging
+            if file_logger:
+                # Build final response from accumulated data
+                final_message = {"role": "assistant"}
+                if accumulator.get("text_content"):
+                    final_message["content"] = accumulator["text_content"]
+                if accumulator.get("reasoning_content"):
+                    final_message["reasoning_content"] = accumulator[
+                        "reasoning_content"
+                    ]
+                if accumulator.get("tool_calls"):
+                    final_message["tool_calls"] = accumulator["tool_calls"]
+
+                final_response = {
+                    "id": accumulator.get("response_id")
+                    or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": final_message,
+                            "finish_reason": "tool_calls"
+                            if accumulator.get("tool_calls")
+                            else "stop",
+                        }
+                    ],
+                    "usage": accumulator.get("last_usage"),
+                }
+                file_logger.log_final_response(final_response)
+
             # Cache Claude thinking after stream completes
             if (
                 self._is_claude(model)

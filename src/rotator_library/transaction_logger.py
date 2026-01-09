@@ -305,6 +305,131 @@ class TransactionLogger:
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to append to {filename}: {e}")
 
+    @staticmethod
+    def assemble_streaming_response(
+        chunks: list, request_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Assemble streaming chunks into a final chat.completion response.
+
+        This mirrors the aggregation logic from main.py's streaming_response_wrapper.
+        Takes a list of parsed chunk dicts and combines them into a complete response.
+
+        Args:
+            chunks: List of parsed streaming chunk dictionaries
+            request_data: Optional original request data for context
+
+        Returns:
+            A complete chat.completion response dictionary
+        """
+        if not chunks:
+            return {}
+
+        final_message: Dict[str, Any] = {"role": "assistant"}
+        aggregated_tool_calls: Dict[int, Dict[str, Any]] = {}
+        usage_data = None
+        finish_reason = None
+
+        for chunk in chunks:
+            if "choices" in chunk and chunk["choices"]:
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {})
+
+                # Dynamically aggregate all fields from the delta
+                for key, value in delta.items():
+                    if value is None:
+                        continue
+
+                    if key == "content":
+                        if "content" not in final_message:
+                            final_message["content"] = ""
+                        if value:
+                            final_message["content"] += value
+
+                    elif key == "tool_calls":
+                        for tc_chunk in value:
+                            index = tc_chunk.get("index", 0)
+                            if index not in aggregated_tool_calls:
+                                aggregated_tool_calls[index] = {
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            if "function" not in aggregated_tool_calls[index]:
+                                aggregated_tool_calls[index]["function"] = {
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            if tc_chunk.get("id"):
+                                aggregated_tool_calls[index]["id"] = tc_chunk["id"]
+                            if "function" in tc_chunk:
+                                if "name" in tc_chunk["function"]:
+                                    if tc_chunk["function"]["name"] is not None:
+                                        aggregated_tool_calls[index]["function"][
+                                            "name"
+                                        ] += tc_chunk["function"]["name"]
+                                if "arguments" in tc_chunk["function"]:
+                                    if tc_chunk["function"]["arguments"] is not None:
+                                        aggregated_tool_calls[index]["function"][
+                                            "arguments"
+                                        ] += tc_chunk["function"]["arguments"]
+
+                    elif key == "function_call":
+                        if "function_call" not in final_message:
+                            final_message["function_call"] = {
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if "name" in value and value["name"] is not None:
+                            final_message["function_call"]["name"] += value["name"]
+                        if "arguments" in value and value["arguments"] is not None:
+                            final_message["function_call"]["arguments"] += value[
+                                "arguments"
+                            ]
+
+                    else:  # Generic key handling for other data like 'reasoning'
+                        if key == "role":
+                            final_message[key] = value
+                        elif key not in final_message:
+                            final_message[key] = value
+                        elif isinstance(final_message.get(key), str):
+                            final_message[key] += value
+                        else:
+                            final_message[key] = value
+
+                if "finish_reason" in choice and choice["finish_reason"]:
+                    finish_reason = choice["finish_reason"]
+
+            if "usage" in chunk and chunk["usage"]:
+                usage_data = chunk["usage"]
+
+        # Final Response Construction
+        if aggregated_tool_calls:
+            final_message["tool_calls"] = list(aggregated_tool_calls.values())
+            finish_reason = "tool_calls"
+
+        # Ensure standard fields are present
+        for field in ["content", "tool_calls", "function_call"]:
+            if field not in final_message:
+                final_message[field] = None
+
+        first_chunk = chunks[0]
+        final_choice = {
+            "index": 0,
+            "message": final_message,
+            "finish_reason": finish_reason,
+        }
+
+        full_response = {
+            "id": first_chunk.get("id"),
+            "object": "chat.completion",
+            "created": first_chunk.get("created"),
+            "model": first_chunk.get("model"),
+            "choices": [final_choice],
+            "usage": usage_data,
+        }
+
+        return full_response
+
 
 class ProviderLogger:
     """
