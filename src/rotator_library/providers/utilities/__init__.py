@@ -16,13 +16,14 @@ from .gemini_shared_utils import (
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
 )
-from .gemini_file_logger import (
-    GeminiFileLogger,
-    GeminiCliFileLogger,
-    AntigravityFileLogger,
-)
 from .gemini_tool_handler import GeminiToolHandler
 from .gemini_credential_manager import GeminiCredentialManager
+
+# Re-export loggers from transaction_logger for backward compatibility
+from ...transaction_logger import (
+    ProviderLogger,
+    AntigravityProviderLogger,
+)
 
 __all__ = [
     # Quota trackers
@@ -40,10 +41,9 @@ __all__ = [
     "GEMINI3_TOOL_RENAMES_REVERSE",
     "FINISH_REASON_MAP",
     "DEFAULT_SAFETY_SETTINGS",
-    # File loggers
-    "GeminiFileLogger",
-    "GeminiCliFileLogger",
-    "AntigravityFileLogger",
+    # Loggers (from transaction_logger)
+    "ProviderLogger",
+    "AntigravityProviderLogger",
     # Mixins
     "GeminiToolHandler",
     "GeminiCredentialManager",

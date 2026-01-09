@@ -15,7 +15,14 @@ parser.add_argument(
 )
 parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
 parser.add_argument(
-    "--enable-request-logging", action="store_true", help="Enable request logging."
+    "--enable-request-logging",
+    action="store_true",
+    help="Enable transaction logging in the library (logs request/response with provider correlation).",
+)
+parser.add_argument(
+    "--enable-raw-logging",
+    action="store_true",
+    help="Enable raw I/O logging at proxy boundary (captures unmodified HTTP data, disabled by default).",
 )
 parser.add_argument(
     "--add-credential",
@@ -126,7 +133,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
-    from proxy_app.detailed_logger import DetailedLogger
+    from proxy_app.detailed_logger import RawIOLogger
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -336,8 +343,13 @@ load_dotenv(_root_dir / ".env")
 # --- Configuration ---
 USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
+ENABLE_RAW_LOGGING = args.enable_raw_logging
 if ENABLE_REQUEST_LOGGING:
-    logging.info("Request logging is enabled.")
+    logging.info(
+        "Transaction logging is enabled (library-level with provider correlation)."
+    )
+if ENABLE_RAW_LOGGING:
+    logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
@@ -668,7 +680,7 @@ async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
     response_stream: AsyncGenerator[str, None],
-    logger: Optional[DetailedLogger] = None,
+    logger: Optional[RawIOLogger] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Wraps a streaming response to log the full response after completion
@@ -846,7 +858,8 @@ async def chat_completions(
     OpenAI-compatible endpoint powered by the RotatingClient.
     Handles both streaming and non-streaming responses and logs them.
     """
-    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
+    # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
+    raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
     try:
         # Read and parse the request body only once at the beginning.
         try:
@@ -878,9 +891,9 @@ async def chat_completions(
                     "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
                 )
 
-        # If logging is enabled, perform all logging operations using the parsed data.
-        if logger:
-            logger.log_request(headers=request.headers, body=request_data)
+        # If raw logging is enabled, capture the unmodified request data.
+        if raw_logger:
+            raw_logger.log_request(headers=request.headers, body=request_data)
 
         # Extract and log specific reasoning parameters for monitoring.
         model = request_data.get("model")
@@ -910,13 +923,13 @@ async def chat_completions(
             response_generator = client.acompletion(request=request, **request_data)
             return StreamingResponse(
                 streaming_response_wrapper(
-                    request, request_data, response_generator, logger
+                    request, request_data, response_generator, raw_logger
                 ),
                 media_type="text/event-stream",
             )
         else:
             response = await client.acompletion(request=request, **request_data)
-            if logger:
+            if raw_logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object
                 response_headers = (
@@ -925,7 +938,7 @@ async def chat_completions(
                 status_code = (
                     response.status_code if hasattr(response, "status_code") else 200
                 )
-                logger.log_final_response(
+                raw_logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
                     body=response.model_dump(),

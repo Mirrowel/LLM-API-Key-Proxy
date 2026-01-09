@@ -57,7 +57,7 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
 )
-from .utilities.gemini_file_logger import AntigravityFileLogger
+from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
 from .utilities.gemini_credential_manager import GeminiCredentialManager
 from ..model_definitions import ModelDefinitions
@@ -3553,10 +3553,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         top_p = kwargs.get("top_p")
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        enable_logging = kwargs.pop("enable_request_logging", False)
+        transaction_context = kwargs.pop("transaction_context", None)
 
-        # Create logger
-        file_logger = AntigravityFileLogger(model, enable_logging)
+        # Create provider logger from transaction context
+        file_logger = AntigravityProviderLogger(transaction_context)
 
         # Determine if thinking is enabled for this request
         # Thinking is enabled if reasoning_effort is set and not explicitly disabled
