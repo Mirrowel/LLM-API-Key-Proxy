@@ -36,13 +36,19 @@ from .error_handler import (
     should_retry_same_key,
     should_rotate_on_error,
 )
-from .usage_manager import UsageManager
-from .cooldown_manager import CooldownManager
-from .credential_manager import CredentialManager
-from .background_refresher import BackgroundRefresher
+from .failure_logger import configure_failure_logger, log_failure
 from .model_definitions import ModelDefinitions
+from .providers import PROVIDER_PLUGINS
+from .providers.openai_compatible_provider import OpenAICompatibleProvider
+from .request_sanitizer import sanitize_request_payload
 from .transaction_logger import TransactionLogger
-from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
+from .usage_manager import UsageManager
+from .utils.paths import (
+    get_data_file,
+    get_default_root,
+    get_logs_dir,
+    get_oauth_dir,
+)
 
 
 class StreamedAPIError(Exception):
