@@ -1,3 +1,26 @@
+# src/proxy_app/detailed_logger.py
+"""
+Raw I/O Logger for the Proxy Layer.
+
+This logger captures the UNMODIFIED HTTP request and response at the proxy boundary.
+It is disabled by default and should only be enabled for debugging the proxy itself.
+
+Use this when you need to:
+- Verify that requests/responses are not being corrupted
+- Debug HTTP-level issues between the client and proxy
+- Capture exact payloads as received/sent by the proxy
+
+For normal request/response logging with provider correlation, use the
+TransactionLogger in the rotator_library instead (enabled via --enable-request-logging).
+
+Directory structure:
+    logs/raw_io/{YYYYMMDD_HHMMSS}_{request_id}/
+        request.json           # Unmodified incoming HTTP request
+        streaming_chunks.jsonl # If streaming mode
+        final_response.json    # Unmodified outgoing HTTP response
+        metadata.json          # Summary metadata
+"""
+
 import json
 import time
 import uuid
@@ -14,17 +37,22 @@ from rotator_library.utils.resilient_io import (
 from rotator_library.utils.paths import get_logs_dir
 
 
-def _get_detailed_logs_dir() -> Path:
-    """Get the detailed logs directory, creating it if needed."""
+def _get_raw_io_logs_dir() -> Path:
+    """Get the raw I/O logs directory, creating it if needed."""
     logs_dir = get_logs_dir()
-    detailed_dir = logs_dir / "detailed_logs"
-    detailed_dir.mkdir(parents=True, exist_ok=True)
-    return detailed_dir
+    raw_io_dir = logs_dir / "raw_io"
+    raw_io_dir.mkdir(parents=True, exist_ok=True)
+    return raw_io_dir
 
 
-class DetailedLogger:
+class RawIOLogger:
     """
-    Logs comprehensive details of each API transaction to a unique, timestamped directory.
+    Logs raw HTTP request/response at the proxy boundary.
+
+    This captures the EXACT data as received from and sent to the client,
+    without any transformations. Useful for debugging the proxy itself.
+
+    DISABLED by default. Enable with --enable-raw-logging flag.
 
     Uses fire-and-forget logging - if disk writes fail, logs are dropped (not buffered)
     to prevent memory issues, especially with streaming responses.
@@ -32,12 +60,13 @@ class DetailedLogger:
 
     def __init__(self):
         """
-        Initializes the logger for a single request, creating a unique directory to store all related log files.
+        Initializes the logger for a single request, creating a unique directory
+        to store all related log files.
         """
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = _get_detailed_logs_dir() / f"{timestamp}_{self.request_id}"
+        self.log_dir = _get_raw_io_logs_dir() / f"{timestamp}_{self.request_id}"
         self.streaming = False
         self._dir_available = safe_mkdir(self.log_dir, logging)
 
@@ -59,7 +88,7 @@ class DetailedLogger:
         )
 
     def log_request(self, headers: Dict[str, Any], body: Dict[str, Any]):
-        """Logs the initial request details."""
+        """Logs the raw incoming request details."""
         self.streaming = body.get("stream", False)
         request_data = {
             "request_id": self.request_id,
@@ -81,7 +110,7 @@ class DetailedLogger:
     def log_final_response(
         self, status_code: int, headers: Optional[Dict[str, Any]], body: Dict[str, Any]
     ):
-        """Logs the complete final response, either from a non-streaming call or after reassembling a stream."""
+        """Logs the raw outgoing response."""
         end_time = time.time()
         duration_ms = (end_time - self.start_time) * 1000
 
@@ -149,3 +178,7 @@ class DetailedLogger:
             metadata["reasoning_content"] = reasoning
 
         self._write_json("metadata.json", metadata)
+
+
+# Backward compatibility alias
+DetailedLogger = RawIOLogger

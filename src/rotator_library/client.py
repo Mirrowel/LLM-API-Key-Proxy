@@ -40,6 +40,7 @@ from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
+from .transaction_logger import TransactionLogger
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
 
 
@@ -868,6 +869,61 @@ class RotatingClient:
             ):
                 yield "data: [DONE]\n\n"
 
+    async def _transaction_logging_stream_wrapper(
+        self,
+        stream: Any,
+        transaction_logger: Optional[TransactionLogger],
+        request_data: Dict[str, Any],
+    ) -> Any:
+        """
+        Wrap a stream to log chunks and final response to TransactionLogger.
+
+        This wrapper:
+        1. Yields chunks unchanged (passthrough)
+        2. Parses SSE chunks and logs them via transaction_logger.log_stream_chunk()
+        3. Collects chunks for final response assembly
+        4. After stream ends, assembles and logs final response
+
+        Args:
+            stream: The streaming generator (yields SSE strings like "data: {...}")
+            transaction_logger: Optional TransactionLogger instance
+            request_data: Original request data for context
+        """
+        chunks = []
+        try:
+            async for chunk_str in stream:
+                yield chunk_str
+
+                # Log chunk if logging enabled
+                if (
+                    transaction_logger
+                    and isinstance(chunk_str, str)
+                    and chunk_str.strip()
+                    and chunk_str.startswith("data:")
+                ):
+                    content = chunk_str[len("data:") :].strip()
+                    if content and content != "[DONE]":
+                        try:
+                            chunk_data = json.loads(content)
+                            chunks.append(chunk_data)
+                            transaction_logger.log_stream_chunk(chunk_data)
+                        except json.JSONDecodeError:
+                            lib_logger.warning(
+                                f"TransactionLogger: Failed to parse chunk: {content[:100]}"
+                            )
+        finally:
+            # Assemble and log final response after stream ends
+            if transaction_logger and chunks:
+                try:
+                    final_response = TransactionLogger.assemble_streaming_response(
+                        chunks, request_data
+                    )
+                    transaction_logger.log_response(final_response)
+                except Exception as e:
+                    lib_logger.warning(
+                        f"TransactionLogger: Failed to assemble/log final response: {e}"
+                    )
+
     async def _execute_with_retry(
         self,
         api_call: callable,
@@ -888,6 +944,12 @@ class RotatingClient:
 
         # Establish a global deadline for the entire request lifecycle.
         deadline = time.time() + self.global_timeout
+
+        # Create transaction logger if request logging is enabled
+        transaction_logger = None
+        if self.enable_request_logging:
+            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger.log_request(kwargs)
 
         # Create a mutable copy of the keys and shuffle it to ensure
         # that the key selection is randomized, which is crucial when
@@ -1086,8 +1148,8 @@ class RotatingClient:
                         f"Provider '{provider}' has custom logic. Delegating call."
                     )
                     litellm_kwargs["credential_identifier"] = current_cred
-                    litellm_kwargs["enable_request_logging"] = (
-                        self.enable_request_logging
+                    litellm_kwargs["transaction_context"] = (
+                        transaction_logger.get_context() if transaction_logger else None
                     )
 
                     # Retry loop for custom providers - mirrors streaming path error handling
@@ -1121,6 +1183,16 @@ class RotatingClient:
 
                             await self.usage_manager.release_key(current_cred, model)
                             key_acquired = False
+
+                            # Log response to transaction logger
+                            if transaction_logger:
+                                response_data = (
+                                    response.model_dump()
+                                    if hasattr(response, "model_dump")
+                                    else response
+                                )
+                                transaction_logger.log_response(response_data)
+
                             return response
 
                         except (
@@ -1357,6 +1429,16 @@ class RotatingClient:
 
                             await self.usage_manager.release_key(current_cred, model)
                             key_acquired = False
+
+                            # Log response to transaction logger
+                            if transaction_logger:
+                                response_data = (
+                                    response.model_dump()
+                                    if hasattr(response, "model_dump")
+                                    else response
+                                )
+                                transaction_logger.log_response(response_data)
+
                             return response
 
                         except litellm.RateLimitError as e:
@@ -1622,6 +1704,13 @@ class RotatingClient:
             # (better to try unavailable creds than fail immediately)
 
         deadline = time.time() + self.global_timeout
+
+        # Create transaction logger if request logging is enabled
+        transaction_logger = None
+        if self.enable_request_logging:
+            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger.log_request(kwargs)
+
         tried_creds = set()
         last_exception = None
         kwargs = self._convert_model_params(**kwargs)
@@ -1808,8 +1897,10 @@ class RotatingClient:
                             f"Provider '{provider}' has custom logic. Delegating call."
                         )
                         litellm_kwargs["credential_identifier"] = current_cred
-                        litellm_kwargs["enable_request_logging"] = (
-                            self.enable_request_logging
+                        litellm_kwargs["transaction_context"] = (
+                            transaction_logger.get_context()
+                            if transaction_logger
+                            else None
                         )
 
                         for attempt in range(self.max_retries):
@@ -1850,7 +1941,14 @@ class RotatingClient:
                                     provider_plugin,
                                 )
 
-                                async for chunk in stream_generator:
+                                # Wrap with transaction logging
+                                logged_stream = (
+                                    self._transaction_logging_stream_wrapper(
+                                        stream_generator, transaction_logger, kwargs
+                                    )
+                                )
+
+                                async for chunk in logged_stream:
                                     yield chunk
                                 return
 
@@ -2098,7 +2196,12 @@ class RotatingClient:
                                 provider_instance,
                             )
 
-                            async for chunk in stream_generator:
+                            # Wrap with transaction logging
+                            logged_stream = self._transaction_logging_stream_wrapper(
+                                stream_generator, transaction_logger, kwargs
+                            )
+
+                            async for chunk in logged_stream:
                                 yield chunk
                             return
 

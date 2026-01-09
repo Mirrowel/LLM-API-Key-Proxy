@@ -11,7 +11,7 @@ from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..utils.paths import get_logs_dir
+from ..transaction_logger import ProviderLogger
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 from pathlib import Path
@@ -19,77 +19,6 @@ import uuid
 from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
-
-
-def _get_iflow_logs_dir() -> Path:
-    """Get the iFlow logs directory."""
-    logs_dir = get_logs_dir() / "iflow_logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir
-
-
-class _IFlowFileLogger:
-    """A simple file logger for a single iFlow transaction."""
-
-    def __init__(self, model_name: str, enabled: bool = True):
-        self.enabled = enabled
-        if not self.enabled:
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        request_id = str(uuid.uuid4())
-        # Sanitize model name for directory
-        safe_model_name = model_name.replace("/", "_").replace(":", "_")
-        self.log_dir = (
-            _get_iflow_logs_dir() / f"{timestamp}_{safe_model_name}_{request_id}"
-        )
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            lib_logger.error(f"Failed to create iFlow log directory: {e}")
-            self.enabled = False
-
-    def log_request(self, payload: Dict[str, Any]):
-        """Logs the request payload sent to iFlow."""
-        if not self.enabled:
-            return
-        try:
-            with open(
-                self.log_dir / "request_payload.json", "w", encoding="utf-8"
-            ) as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write request: {e}")
-
-    def log_response_chunk(self, chunk: str):
-        """Logs a raw chunk from the iFlow response stream."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
-                f.write(chunk + "\n")
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write response chunk: {e}")
-
-    def log_error(self, error_message: str):
-        """Logs an error message."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write error: {e}")
-
-    def log_final_response(self, response_data: Dict[str, Any]):
-        """Logs the final, reassembled response."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
-                json.dump(response_data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write final response: {e}")
 
 
 # Model list can be expanded as iFlow supports more models
@@ -537,11 +466,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         credential_path = kwargs.pop("credential_identifier")
-        enable_request_logging = kwargs.pop("enable_request_logging", False)
+        transaction_context = kwargs.pop("transaction_context", None)
         model = kwargs["model"]
 
-        # Create dedicated file logger for this request
-        file_logger = _IFlowFileLogger(model_name=model, enabled=enable_request_logging)
+        # Create provider logger from transaction context
+        file_logger = ProviderLogger(transaction_context)
 
         async def make_request():
             """Prepares and makes the actual API call."""

@@ -57,7 +57,7 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
 )
-from .utilities.gemini_file_logger import AntigravityFileLogger
+from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
 from .utilities.gemini_credential_manager import GeminiCredentialManager
 from ..model_definitions import ModelDefinitions
@@ -644,8 +644,7 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 # FILE LOGGER
 # =============================================================================
 
-# NOTE: AntigravityFileLogger has been moved to utilities.gemini_file_logger
-# and is imported at top of file
+# NOTE: AntigravityProviderLogger is imported from transaction_logger at top of file
 
 
 # =============================================================================
@@ -3553,10 +3552,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         top_p = kwargs.get("top_p")
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
-        enable_logging = kwargs.pop("enable_request_logging", False)
+        transaction_context = kwargs.pop("transaction_context", None)
 
-        # Create logger
-        file_logger = AntigravityFileLogger(model, enable_logging)
+        # Create provider logger from transaction context
+        file_logger = AntigravityProviderLogger(transaction_context)
 
         # Determine if thinking is enabled for this request
         # Thinking is enabled if reasoning_effort is set and not explicitly disabled
@@ -3773,7 +3772,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         self,
         streaming_generator: AsyncGenerator[litellm.ModelResponse, None],
         model: str,
-        file_logger: Optional["AntigravityFileLogger"] = None,
+        file_logger: Optional["AntigravityProviderLogger"] = None,
     ) -> litellm.ModelResponse:
         """
         Collect all chunks from a streaming generator into a single non-streaming
@@ -3948,7 +3947,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         headers: Dict[str, str],
         payload: Dict[str, Any],
         model: str,
-        file_logger: Optional[AntigravityFileLogger] = None,
+        file_logger: Optional[AntigravityProviderLogger] = None,
         malformed_retry_num: Optional[int] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming completion.
@@ -4061,6 +4060,38 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     final_chunk["usage"] = accumulator["last_usage"]
                 yield litellm.ModelResponse(**final_chunk)
 
+            # Log final assembled response for provider logging
+            if file_logger:
+                # Build final response from accumulated data
+                final_message = {"role": "assistant"}
+                if accumulator.get("text_content"):
+                    final_message["content"] = accumulator["text_content"]
+                if accumulator.get("reasoning_content"):
+                    final_message["reasoning_content"] = accumulator[
+                        "reasoning_content"
+                    ]
+                if accumulator.get("tool_calls"):
+                    final_message["tool_calls"] = accumulator["tool_calls"]
+
+                final_response = {
+                    "id": accumulator.get("response_id")
+                    or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": final_message,
+                            "finish_reason": "tool_calls"
+                            if accumulator.get("tool_calls")
+                            else "stop",
+                        }
+                    ],
+                    "usage": accumulator.get("last_usage"),
+                }
+                file_logger.log_final_response(final_response)
+
             # Cache Claude thinking after stream completes
             if (
                 self._is_claude(model)
@@ -4081,7 +4112,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         headers: Dict[str, str],
         payload: Dict[str, Any],
         model: str,
-        file_logger: Optional[AntigravityFileLogger] = None,
+        file_logger: Optional[AntigravityProviderLogger] = None,
         tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
         gemini_contents: Optional[List[Dict[str, Any]]] = None,
         gemini_payload: Optional[Dict[str, Any]] = None,

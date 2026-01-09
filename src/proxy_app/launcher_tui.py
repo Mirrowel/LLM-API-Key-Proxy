@@ -61,6 +61,7 @@ class LauncherConfig:
             "host": "127.0.0.1",
             "port": 8000,
             "enable_request_logging": False,
+            "enable_raw_logging": False,
         }
         self.config = self.load()
 
@@ -418,7 +419,10 @@ class LauncherTUI:
         self.console.print(f"   Host:                {self.config.config['host']}")
         self.console.print(f"   Port:                {self.config.config['port']}")
         self.console.print(
-            f"   Request Logging:     {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+        )
+        self.console.print(
+            f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
         )
 
         # Show actual API key value
@@ -551,7 +555,10 @@ class LauncherTUI:
             self.console.print(f"   Host:                {self.config.config['host']}")
             self.console.print(f"   Port:                {self.config.config['port']}")
             self.console.print(
-                f"   Request Logging:     {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+                f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            )
+            self.console.print(
+                f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
             )
             self.console.print(
                 f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}"
@@ -565,9 +572,10 @@ class LauncherTUI:
             self.console.print("   1. 🌐 Set Host IP")
             self.console.print("   2. 🔌 Set Port")
             self.console.print("   3. 🔑 Set Proxy API Key")
-            self.console.print("   4. 📝 Toggle Request Logging")
-            self.console.print("   5. 🔄 Reset to Default Settings")
-            self.console.print("   6. ↩️  Back to Main Menu")
+            self.console.print("   4. 📝 Toggle Transaction Logging")
+            self.console.print("   5. 📋 Toggle Raw I/O Logging")
+            self.console.print("   6. 🔄 Reset to Default Settings")
+            self.console.print("   7. ↩️  Back to Main Menu")
 
             self.console.print()
             self.console.print("━" * 70)
@@ -575,7 +583,7 @@ class LauncherTUI:
 
             choice = Prompt.ask(
                 "Select option",
-                choices=["1", "2", "3", "4", "5", "6"],
+                choices=["1", "2", "3", "4", "5", "6", "7"],
                 show_choices=False,
             )
 
@@ -672,20 +680,30 @@ class LauncherTUI:
                 current = self.config.config["enable_request_logging"]
                 self.config.update(enable_request_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Request Logging {'enabled' if not current else 'disabled'}![/green]"
+                    f"\n[green]✅ Transaction Logging {'enabled' if not current else 'disabled'}![/green]"
                 )
             elif choice == "5":
+                current = self.config.config.get("enable_raw_logging", False)
+                self.config.update(enable_raw_logging=not current)
+                self.console.print(
+                    f"\n[green]✅ Raw I/O Logging {'enabled' if not current else 'disabled'}![/green]"
+                )
+            elif choice == "6":
                 # Reset to Default Settings
                 # Define defaults
                 default_host = "127.0.0.1"
                 default_port = 8000
                 default_logging = False
+                default_raw_logging = False
                 default_api_key = "VerysecretKey"
 
                 # Get current values
                 current_host = self.config.config["host"]
                 current_port = self.config.config["port"]
                 current_logging = self.config.config["enable_request_logging"]
+                current_raw_logging = self.config.config.get(
+                    "enable_raw_logging", False
+                )
                 current_api_key = os.getenv("PROXY_API_KEY", "")
 
                 # Build comparison table
@@ -696,9 +714,12 @@ class LauncherTUI:
                     "   " + "─" * 62,
                     f"   Host IP              {current_host:20} →  {default_host}",
                     f"   Port                 {str(current_port):20} →  {default_port}",
-                    f"   Request Logging      {'Enabled':20} →  Disabled"
+                    f"   Transaction Logging  {'Enabled':20} →  Disabled"
                     if current_logging
-                    else f"   Request Logging      {'Disabled':20} →  Disabled",
+                    else f"   Transaction Logging  {'Disabled':20} →  Disabled",
+                    f"   Raw I/O Logging      {'Enabled':20} →  Disabled"
+                    if current_raw_logging
+                    else f"   Raw I/O Logging      {'Disabled':20} →  Disabled",
                     f"   Proxy API Key        {current_api_key[:20]:20} →  {default_api_key}",
                     "",
                     "[bold red]⚠️  This may break applications configured with current settings![/bold red]",
@@ -715,17 +736,19 @@ class LauncherTUI:
                     host=default_host,
                     port=default_port,
                     enable_request_logging=default_logging,
+                    enable_raw_logging=default_raw_logging,
                 )
                 LauncherConfig.update_proxy_api_key(default_api_key)
 
                 self.console.print(
                     "\n[green]✅ All settings have been reset to defaults![/green]"
                 )
-                self.console.print(f"   Host:             {default_host}")
-                self.console.print(f"   Port:             {default_port}")
-                self.console.print(f"   Request Logging:  Disabled")
-                self.console.print(f"   Proxy API Key:    {default_api_key}")
-            elif choice == "6":
+                self.console.print(f"   Host:               {default_host}")
+                self.console.print(f"   Port:               {default_port}")
+                self.console.print(f"   Transaction Logging: Disabled")
+                self.console.print(f"   Raw I/O Logging:    Disabled")
+                self.console.print(f"   Proxy API Key:      {default_api_key}")
+            elif choice == "7":
                 break
 
     def show_provider_settings_menu(self):
@@ -1045,6 +1068,8 @@ class LauncherTUI:
         ]
         if self.config.config["enable_request_logging"]:
             sys.argv.append("--enable-request-logging")
+        if self.config.config.get("enable_raw_logging", False):
+            sys.argv.append("--enable-raw-logging")
 
         # Exit TUI - main.py will continue execution
         self.running = False
