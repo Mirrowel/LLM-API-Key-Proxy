@@ -132,21 +132,6 @@ with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.batch_manager import EmbeddingBatcher
-    from proxy_app.detailed_logger import DetailedLogger
-    from proxy_app.request_logger import log_request_to_console
-    from rotator_library import RotatingClient
-    from rotator_library.anthropic_compat import (
-        AnthropicCountTokensRequest,
-        AnthropicCountTokensResponse,
-        AnthropicMessagesRequest,
-        AnthropicMessagesResponse,
-        anthropic_streaming_wrapper,
-        anthropic_to_openai_messages,
-        anthropic_to_openai_tool_choice,
-        anthropic_to_openai_tools,
-        openai_to_anthropic_response,
-        translate_anthropic_request,
-    from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import DetailedLogger, RawIOLogger
     from proxy_app.request_logger import log_request_to_console
     from rotator_library import RotatingClient
@@ -165,7 +150,6 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
-
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
 _provider_start = time.time()
