@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Dict,
@@ -36,34 +37,34 @@ from typing import (
     Optional,
     Tuple,
     Union,
-    TYPE_CHECKING,
 )
 
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
+from ..error_handler import EmptyResponseError, TransientQuotaError
+from ..model_definitions import ModelDefinitions
+from ..timeout_config import TimeoutConfig
+from ..utils.paths import get_cache_dir, get_logs_dir
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
+from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
+from .utilities.gemini_credential_manager import GeminiCredentialManager
+from .utilities.gemini_file_logger import AntigravityFileLogger
 from .utilities.gemini_shared_utils import (
+    DEFAULT_SAFETY_SETTINGS,
+    FINISH_REASON_MAP,
+    GEMINI3_TOOL_RENAMES,
+    GEMINI3_TOOL_RENAMES_REVERSE,
     env_bool,
     env_int,
     inline_schema_refs,
     normalize_type_arrays,
     recursively_parse_json_strings,
-    GEMINI3_TOOL_RENAMES,
-    GEMINI3_TOOL_RENAMES_REVERSE,
-    FINISH_REASON_MAP,
-    DEFAULT_SAFETY_SETTINGS,
 )
 from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
-from .utilities.gemini_credential_manager import GeminiCredentialManager
-from ..model_definitions import ModelDefinitions
-from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError, TransientQuotaError
-from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
     from ..usage_manager import UsageManager
@@ -288,7 +289,7 @@ VIOLATION OF THESE RULES WILL CAUSE IMMEDIATE SYSTEM FAILURE.
 ## COMMON FAILURE PATTERNS TO AVOID
 
 - Using 'path' when schema says 'filePath' (or vice versa)
-- Using 'content' when schema says 'text' (or vice versa)  
+- Using 'content' when schema says 'text' (or vice versa)
 - Providing {"file": "..."} when schema wants [{"path": "...", "line_ranges": [...]}]
 - Omitting required nested fields in array items
 - Adding 'additionalProperties' that the schema doesn't define
@@ -344,7 +345,7 @@ Your web applications should be built using the following technologies:,
 3. **Web App**: If the USER specifies that they want a more complex web app, use a framework like Next.js or Vite. Only do this if the USER explicitly requests a web app.
 4. **New Project Creation**: If you need to use a framework for a new app, use `npx` with the appropriate script, but there are some rules to follow:,
    - Use `npx -y` to automatically install the script and its dependencies
-   - You MUST run the command with `--help` flag to see all available options first, 
+   - You MUST run the command with `--help` flag to see all available options first,
    - Initialize the app in the current directory with `./` (example: `npx -y create-vite-app@latest ./`),
    - You should run in non-interactive mode so that the user doesn't need to input anything,
 5. **Running Locally**: When running locally, use `npm run dev` or equivalent dev server. Only build the production bundle if the USER explicitly requests it or you are validating the code for correctness.
@@ -393,7 +394,7 @@ Automatically implement SEO best practices on every page:,
 CRITICAL REMINDER: AESTHETICS ARE VERY IMPORTANT. If your web app looks simple and basic then you have FAILED!
 </web_application_development>
 <ephemeral_message>
-There will be an <EPHEMERAL_MESSAGE> appearing in the conversation at times. This is not coming from the user, but instead injected by the system as important information to pay attention to. 
+There will be an <EPHEMERAL_MESSAGE> appearing in the conversation at times. This is not coming from the user, but instead injected by the system as important information to pay attention to.
 Do not respond to nor acknowledge those messages, but do follow them strictly.
 </ephemeral_message>
 
@@ -511,6 +512,7 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "$ref",
         "$defs",
         "definitions",
+        "enumDescriptions",
     }
 
     # Validation keywords - only remove at schema-definition level,

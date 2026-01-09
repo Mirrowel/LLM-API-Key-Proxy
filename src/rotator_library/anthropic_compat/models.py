@@ -6,7 +6,8 @@ enabling compatibility with Claude Code and other Anthropic API clients.
 """
 
 from typing import Any, List, Optional, Union
-from pydantic import BaseModel
+
+from pydantic import BaseModel, ConfigDict
 
 
 # --- Content Blocks ---
@@ -88,6 +89,8 @@ class AnthropicThinkingConfig(BaseModel):
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request format."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: List[AnthropicMessage]
     max_tokens: int
@@ -129,6 +132,8 @@ class AnthropicMessagesResponse(BaseModel):
 # --- Count Tokens ---
 class AnthropicCountTokensRequest(BaseModel):
     """Anthropic count_tokens API request format."""
+
+    model_config = ConfigDict(extra="allow")
 
     model: str
     messages: List[AnthropicMessage]

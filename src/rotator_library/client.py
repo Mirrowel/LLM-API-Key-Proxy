@@ -1,18 +1,20 @@
 import asyncio
+import codecs
 import fnmatch
 import json
-import re
-import codecs
-import time
+import logging
 import os
 import random
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+
 import httpx
 import litellm
 from litellm.exceptions import APIConnectionError
 from litellm.litellm_core_utils.token_counter import token_counter
-import logging
-from pathlib import Path
-from typing import List, Dict, Any, AsyncGenerator, Optional, Union
 
 lib_logger = logging.getLogger("rotator_library")
 # Ensure the logger is configured to propagate to the root logger
@@ -20,22 +22,21 @@ lib_logger = logging.getLogger("rotator_library")
 # log levels and handlers centrally.
 lib_logger.propagate = False
 
-from .usage_manager import UsageManager
-from .failure_logger import log_failure, configure_failure_logger
+from .background_refresher import BackgroundRefresher
+from .cooldown_manager import CooldownManager
+from .credential_manager import CredentialManager
 from .error_handler import (
-    PreRequestCallbackError,
-    CredentialNeedsReauthError,
-    classify_error,
     AllProviders,
+    CredentialNeedsReauthError,
     NoAvailableKeysError,
-    should_rotate_on_error,
-    should_retry_same_key,
+    PreRequestCallbackError,
     RequestErrorAccumulator,
+    classify_error,
     mask_credential,
+    should_retry_same_key,
+    should_rotate_on_error,
 )
-from .providers import PROVIDER_PLUGINS
-from .providers.openai_compatible_provider import OpenAICompatibleProvider
-from .request_sanitizer import sanitize_request_payload
+from .usage_manager import UsageManager
 from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
@@ -2589,11 +2590,10 @@ class RotatingClient:
             For streaming: AsyncGenerator yielding Anthropic SSE format strings
         """
         from .anthropic_compat import (
-            translate_anthropic_request,
-            openai_to_anthropic_response,
             anthropic_streaming_wrapper,
+            openai_to_anthropic_response,
+            translate_anthropic_request,
         )
-        import uuid
 
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
         original_model = request.model
@@ -2666,7 +2666,6 @@ class RotatingClient:
             anthropic_to_openai_messages,
             anthropic_to_openai_tools,
         )
-        import json
 
         anthropic_request = request.model_dump(exclude_none=True)
 

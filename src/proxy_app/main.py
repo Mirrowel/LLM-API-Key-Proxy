@@ -1,13 +1,13 @@
-import time
-import uuid
+import argparse
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
-import os
-from pathlib import Path
-import sys
-import argparse
 import logging
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -57,8 +57,9 @@ if args.add_credential:
 _start_time = time.time()
 
 # Load all .env files from root folder (main .env first, then any additional *.env files)
-from dotenv import load_dotenv
 from glob import glob
+
+from dotenv import load_dotenv
 
 # Get the application root directory (EXE dir if frozen, else CWD)
 # Inlined here to avoid triggering heavy rotator_library imports before loading screen
@@ -105,17 +106,19 @@ _console = Console()
 print("  → Loading FastAPI framework...")
 with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request, HTTPException, Depends
+
+    from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse, JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
-    from dotenv import load_dotenv
-    import colorlog
     import json
-    from typing import AsyncGenerator, Any, List, Optional, Union
+    from typing import Any, AsyncGenerator, List, Optional, Union
+
+    import colorlog
+    from dotenv import load_dotenv
     from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
@@ -128,25 +131,40 @@ with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
 # Phase 4: Application imports with granular loading messages
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
+    from proxy_app.batch_manager import EmbeddingBatcher
+    from proxy_app.detailed_logger import DetailedLogger
+    from proxy_app.request_logger import log_request_to_console
     from rotator_library import RotatingClient
-    from rotator_library.credential_manager import CredentialManager
-    from rotator_library.background_refresher import BackgroundRefresher
-    from rotator_library.model_info_service import init_model_info_service
     from rotator_library.anthropic_compat import (
-        AnthropicMessagesRequest,
-        AnthropicMessagesResponse,
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
+        AnthropicMessagesRequest,
+        AnthropicMessagesResponse,
         anthropic_streaming_wrapper,
         anthropic_to_openai_messages,
-        anthropic_to_openai_tools,
         anthropic_to_openai_tool_choice,
+        anthropic_to_openai_tools,
+        openai_to_anthropic_response,
+        translate_anthropic_request,
+    from proxy_app.batch_manager import EmbeddingBatcher
+    from proxy_app.detailed_logger import DetailedLogger, RawIOLogger
+    from proxy_app.request_logger import log_request_to_console
+    from rotator_library import RotatingClient
+    from rotator_library.anthropic_compat import (
+        AnthropicCountTokensRequest,
+        AnthropicCountTokensResponse,
+        AnthropicMessagesRequest,
+        AnthropicMessagesResponse,
+        anthropic_streaming_wrapper,
+        anthropic_to_openai_messages,
+        anthropic_to_openai_tool_choice,
+        anthropic_to_openai_tools,
         openai_to_anthropic_response,
         translate_anthropic_request,
     )
-    from proxy_app.request_logger import log_request_to_console
-    from proxy_app.batch_manager import EmbeddingBatcher
-    from proxy_app.detailed_logger import RawIOLogger
+    from rotator_library.background_refresher import BackgroundRefresher
+    from rotator_library.credential_manager import CredentialManager
+    from rotator_library.model_info_service import init_model_info_service
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -263,7 +281,7 @@ print(
 
 # --- Logging Configuration ---
 # Import path utilities here (after loading screen) to avoid triggering heavy imports early
-from rotator_library.utils.paths import get_logs_dir, get_data_file
+from rotator_library.utils.paths import get_data_file, get_logs_dir
 
 LOG_DIR = get_logs_dir(_root_dir)
 
@@ -1035,86 +1053,15 @@ async def anthropic_messages(
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
-    request_id = f"msg_{uuid.uuid4().hex[:24]}"
-    original_model = body.model
-
-    # Initialize logger if enabled
-    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
-
     try:
-        # Convert Anthropic request to OpenAI format
-        anthropic_request = body.model_dump(exclude_none=True)
-
-        openai_messages = anthropic_to_openai_messages(
-            anthropic_request.get("messages", []), anthropic_request.get("system")
-        )
-
-        openai_tools = anthropic_to_openai_tools(anthropic_request.get("tools"))
-        openai_tool_choice = anthropic_to_openai_tool_choice(
-            anthropic_request.get("tool_choice")
-        )
-
-        # Build OpenAI-compatible request
-        openai_request = {
-            "model": body.model,
-            "messages": openai_messages,
-            "max_tokens": body.max_tokens,
-            "stream": body.stream or False,
-        }
-
-        if body.temperature is not None:
-            openai_request["temperature"] = body.temperature
-        if body.top_p is not None:
-            openai_request["top_p"] = body.top_p
-        if body.stop_sequences:
-            openai_request["stop"] = body.stop_sequences
-        if openai_tools:
-            openai_request["tools"] = openai_tools
-        if openai_tool_choice:
-            openai_request["tool_choice"] = openai_tool_choice
-
-        # Handle Anthropic thinking config -> reasoning_effort translation
-        if body.thinking:
-            if body.thinking.type == "enabled":
-                # Map budget_tokens to reasoning_effort level
-                # Default to "medium" if enabled but budget not specified
-                budget = body.thinking.budget_tokens or 10000
-                if budget >= 32000:
-                    openai_request["reasoning_effort"] = "high"
-                    openai_request["custom_reasoning_budget"] = True
-                elif budget >= 10000:
-                    openai_request["reasoning_effort"] = "high"
-                elif budget >= 5000:
-                    openai_request["reasoning_effort"] = "medium"
-                else:
-                    openai_request["reasoning_effort"] = "low"
-            elif body.thinking.type == "disabled":
-                openai_request["reasoning_effort"] = "disable"
-        elif "opus" in body.model.lower():
-            # Force high thinking for Opus models when no thinking config is provided
-            # Opus 4.5 always uses the -thinking variant, so we want maximum thinking budget
-            # Without this, the backend defaults to thinkingBudget: -1 (auto) instead of high
-            openai_request["reasoning_effort"] = "high"
-            openai_request["custom_reasoning_budget"] = True
-
-        log_request_to_console(
-            url=str(request.url),
-            headers=dict(request.headers),
-            client_info=(
-                request.client.host if request.client else "unknown",
-                request.client.port if request.client else 0,
-            ),
-            request_data=openai_request,
+        response = await client.anthropic_messages(
+            request=body,
+            raw_request=request,
         )
 
         if body.stream:
-            # Streaming response - acompletion returns a generator for streaming
-            response_generator = client.acompletion(request=request, **openai_request)
-
             return StreamingResponse(
-                anthropic_streaming_wrapper(
-                    request, response_generator, original_model, request_id
-                ),
+                response,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1123,30 +1070,7 @@ async def anthropic_messages(
                 },
             )
         else:
-            # Non-streaming response
-            response = await client.acompletion(request=request, **openai_request)
-
-            # Convert OpenAI response to Anthropic format
-            openai_response = (
-                response.model_dump()
-                if hasattr(response, "model_dump")
-                else dict(response)
-            )
-            anthropic_response = openai_to_anthropic_response(
-                openai_response, original_model
-            )
-
-            # Override the ID with our request ID
-            anthropic_response["id"] = request_id
-
-            if logger:
-                logger.log_final_response(
-                    status_code=200,
-                    headers=None,
-                    body=anthropic_response,
-                )
-
-            return JSONResponse(content=anthropic_response)
+            return JSONResponse(content=response)
 
     except (
         litellm.InvalidRequestError,
@@ -1214,38 +1138,8 @@ async def anthropic_count_tokens(
     Accepts requests in Anthropic's format and returns token count in Anthropic's format.
     """
     try:
-        # Convert Anthropic request to OpenAI format for token counting
-        anthropic_request = body.model_dump(exclude_none=True)
-
-        openai_messages = anthropic_to_openai_messages(
-            anthropic_request.get("messages", []), anthropic_request.get("system")
-        )
-
-        # Count tokens for messages
-        message_tokens = client.token_count(
-            model=body.model,
-            messages=openai_messages,
-        )
-
-        # Count tokens for tools if present
-        tool_tokens = 0
-        if body.tools:
-            # Tools add tokens based on their definitions
-            # Convert to JSON string and count tokens for tool definitions
-            openai_tools = anthropic_to_openai_tools(
-                [tool.model_dump() for tool in body.tools]
-            )
-            if openai_tools:
-                # Serialize tools to count their token contribution
-                tools_text = json.dumps(openai_tools)
-                tool_tokens = client.token_count(
-                    model=body.model,
-                    text=tools_text,
-                )
-
-        total_tokens = message_tokens + tool_tokens
-
-        return JSONResponse(content={"input_tokens": total_tokens})
+        response = await client.anthropic_count_tokens(request=body)
+        return JSONResponse(content=response)
 
     except (
         litellm.InvalidRequestError,
