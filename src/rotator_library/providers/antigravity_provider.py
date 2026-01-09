@@ -4051,6 +4051,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     for tc in delta.tool_calls:
                         # Accumulate tool call arguments
+                        if tc.index is None:
+                            # Handle edge case where provider omits index
+                            lib_logger.warning(
+                                f"[Antigravity] Tool call received without index field, "
+                                f"appending sequentially: {tc}"
+                            )
+                            tc.index = len(collected_tool_calls)
                         if tc.index is not None:
                             while len(collected_tool_calls) <= tc.index:
                                 collected_tool_calls.append(
@@ -4098,10 +4105,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             if message_dict["tool_calls"]:
                 finish_reason = "tool_calls"
 
+        # Warn if no chunks were received (edge case for debugging)
+        if last_chunk is None:
+            lib_logger.warning(
+                f"[Antigravity] Streaming fallback received zero chunks for {model}"
+            )
+
         response_dict = {
             "id": last_chunk.id if last_chunk else f"chatcmpl-{model}",
             "object": "chat.completion",
-            "created": int(asyncio.get_event_loop().time()),
+            "created": int(time.time()),
             "model": model,
             "choices": [
                 {
