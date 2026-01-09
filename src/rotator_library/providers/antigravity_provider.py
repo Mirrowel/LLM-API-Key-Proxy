@@ -46,13 +46,13 @@ import litellm
 from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
+from ..transaction_logger import AntigravityProviderLogger
 from ..utils.paths import get_cache_dir, get_logs_dir
 from .antigravity_auth_base import AntigravityAuthBase
 from .provider_cache import ProviderCache
 from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
 from .utilities.gemini_credential_manager import GeminiCredentialManager
-from .utilities.gemini_file_logger import AntigravityFileLogger
 from .utilities.gemini_shared_utils import (
     DEFAULT_SAFETY_SETTINGS,
     FINISH_REASON_MAP,
@@ -64,7 +64,6 @@ from .utilities.gemini_shared_utils import (
     normalize_type_arrays,
     recursively_parse_json_strings,
 )
-from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
 
 if TYPE_CHECKING:
