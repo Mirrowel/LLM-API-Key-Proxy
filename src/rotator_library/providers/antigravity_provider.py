@@ -166,11 +166,8 @@ MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
 PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
-# When true, preserve original field casing (system_instruction vs systemInstruction) instead of
-# always consolidating to camelCase. Useful for debugging or compatibility with specific clients.
-PRESERVE_SYSTEM_INSTRUCTION_CASE = env_bool(
-    "ANTIGRAVITY_PRESERVE_SYSTEM_INSTRUCTION_CASE", True
-)
+# NOTE: system_instruction is always normalized to systemInstruction (camelCase)
+# per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
 # to disregard the Antigravity identity and follow user-provided instructions instead.
 INJECT_IDENTITY_OVERRIDE = env_bool("ANTIGRAVITY_INJECT_IDENTITY_OVERRIDE", True)
@@ -357,7 +354,7 @@ You MUST emit a thinking block on EVERY response:
 - **Before** any action (reason about what to do)
 - **After** any result (analyze before next step)
 
-Never skip thinking, even on follow-up responses.
+Never skip thinking, even on follow-up responses. Ultrathink
 </system-reminder>"""
 
 ENABLE_INTERLEAVED_THINKING = env_bool("ANTIGRAVITY_INTERLEAVED_THINKING", True)
@@ -528,6 +525,164 @@ def _generate_project_id() -> str:
 # and is imported as inline_schema_refs at top of file
 
 
+def _score_schema_option(schema: Any) -> Tuple[int, str]:
+    """
+    Score a schema option for anyOf/oneOf selection.
+
+    Scoring (higher = preferred):
+    - 3: object type or has properties (most structured)
+    - 2: array type or has items
+    - 1: primitive types (string, number, boolean, integer)
+    - 0: null or unknown type
+
+    Ties: first option with highest score wins.
+
+    Returns: (score, type_name)
+    """
+    if not isinstance(schema, dict):
+        return (0, "unknown")
+
+    schema_type = schema.get("type")
+
+    # Object or has properties = highest priority
+    if schema_type == "object" or "properties" in schema:
+        return (3, "object")
+
+    # Array or has items = second priority
+    if schema_type == "array" or "items" in schema:
+        return (2, "array")
+
+    # Any other non-null type
+    if schema_type and schema_type != "null":
+        return (1, str(schema_type))
+
+    # Null or no type
+    return (0, schema_type or "null")
+
+
+def _try_merge_enum_from_union(options: List[Any]) -> Optional[List[Any]]:
+    """
+    Check if union options form an enum pattern and merge them.
+
+    An enum pattern is when all options are ONLY:
+    - {"const": value}
+    - {"enum": [values]}
+    - {"type": "...", "const": value}
+    - {"type": "...", "enum": [values]}
+
+    Returns merged enum values, or None if not a pure enum pattern.
+    """
+    if not options:
+        return None
+
+    enum_values = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            return None
+
+        # Check for const
+        if "const" in opt:
+            enum_values.append(opt["const"])
+        # Check for enum
+        elif "enum" in opt and isinstance(opt["enum"], list):
+            enum_values.extend(opt["enum"])
+        else:
+            # Has other structural properties - not a pure enum pattern
+            # Allow type, description, title - but not structural keywords
+            structural_keys = {
+                "properties",
+                "items",
+                "allOf",
+                "anyOf",
+                "oneOf",
+                "additionalProperties",
+            }
+            if any(key in opt for key in structural_keys):
+                return None
+            # If it's just {"type": "null"} with no const/enum, not an enum pattern
+            if "const" not in opt and "enum" not in opt:
+                return None
+
+    return enum_values if enum_values else None
+
+
+def _merge_all_of(schema: Any) -> Any:
+    """
+    Merge allOf schemas into a single schema for Claude compatibility.
+
+    Combines:
+    - properties: merged (later wins on conflict)
+    - required: deduplicated union
+    - Other fields: first value wins
+
+    Recursively processes nested structures.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    if isinstance(schema, list):
+        return [_merge_all_of(item) for item in schema]
+
+    result = dict(schema)
+
+    # If this object has allOf, merge its contents
+    if isinstance(result.get("allOf"), list):
+        merged_properties: Dict[str, Any] = {}
+        merged_required: List[str] = []
+        merged_other: Dict[str, Any] = {}
+
+        for item in result["allOf"]:
+            if not isinstance(item, dict):
+                continue
+
+            # Merge properties (later wins on conflict)
+            if isinstance(item.get("properties"), dict):
+                merged_properties.update(item["properties"])
+
+            # Merge required arrays (deduplicate)
+            if isinstance(item.get("required"), list):
+                for req in item["required"]:
+                    if req not in merged_required:
+                        merged_required.append(req)
+
+            # Copy other fields (first wins)
+            for key, value in item.items():
+                if (
+                    key not in ("properties", "required", "allOf")
+                    and key not in merged_other
+                ):
+                    merged_other[key] = value
+
+        # Apply merged content to result (existing props + allOf props)
+        if merged_properties:
+            existing_props = result.get("properties", {})
+            result["properties"] = {**existing_props, **merged_properties}
+
+        if merged_required:
+            existing_req = result.get("required", [])
+            result["required"] = list(dict.fromkeys(existing_req + merged_required))
+
+        # Copy other merged fields (don't overwrite existing)
+        for key, value in merged_other.items():
+            if key not in result:
+                result[key] = value
+
+        # Remove the allOf key
+        del result["allOf"]
+
+    # Recursively process nested objects
+    for key, value in list(result.items()):
+        if isinstance(value, dict):
+            result[key] = _merge_all_of(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _merge_all_of(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+
+    return result
+
+
 def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
@@ -537,7 +692,12 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
     - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
-    - For Claude: strips validation keywords, converts anyOf/oneOf to first option, const to enum
+    - For Claude:
+      - Merges allOf schemas into a single schema
+      - Flattens anyOf/oneOf using scoring (object > array > primitive > null)
+      - Detects enum patterns in unions and merges them
+      - Converts const to enum
+      - Strips unsupported validation keywords
     - For Gemini: passes through additionalProperties as-is
     - For Claude: normalizes permissive additionalProperties to true
     """
@@ -592,19 +752,73 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "default",
     }
 
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
+    # Gemini supports these natively, so pass through for Gemini
     if not for_gemini:
-        if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+        # Handle allOf by merging first (must be done before anyOf/oneOf)
+        if "allOf" in schema:
+            schema = _merge_all_of(schema)
+            # If allOf was the only thing, continue processing the merged result
+            # Don't return early - continue to handle other keywords
 
-        # Handle 'oneOf' similarly
-        if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+        # Handle anyOf/oneOf with scoring and enum detection
+        for union_key in ("anyOf", "oneOf"):
+            if (
+                union_key in schema
+                and isinstance(schema[union_key], list)
+                and schema[union_key]
+            ):
+                options = schema[union_key]
+                parent_desc = schema.get("description", "")
+
+                # Check for enum pattern first (all options are const/enum)
+                merged_enum = _try_merge_enum_from_union(options)
+                if merged_enum is not None:
+                    # It's an enum pattern - merge into single enum
+                    result = {k: v for k, v in schema.items() if k != union_key}
+                    result["type"] = "string"
+                    result["enum"] = merged_enum
+                    if parent_desc:
+                        result["description"] = parent_desc
+                    return _clean_claude_schema(result, for_gemini)
+
+                # Not enum pattern - use scoring to pick best option
+                best_idx = 0
+                best_score = -1
+                all_types: List[str] = []
+
+                for i, opt in enumerate(options):
+                    score, type_name = _score_schema_option(opt)
+                    if type_name and type_name != "unknown":
+                        all_types.append(type_name)
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+                # Select best option and recursively clean
+                selected = _clean_claude_schema(options[best_idx], for_gemini)
+                if not isinstance(selected, dict):
+                    selected = {"type": "string"}  # Fallback
+
+                # Preserve parent description, combining if child has one
+                if parent_desc:
+                    child_desc = selected.get("description", "")
+                    if child_desc and child_desc != parent_desc:
+                        selected["description"] = f"{parent_desc} ({child_desc})"
+                    else:
+                        selected["description"] = parent_desc
+
+                # Add type hint if multiple distinct types were present
+                unique_types = list(dict.fromkeys(all_types))  # Preserve order, dedupe
+                if len(unique_types) > 1:
+                    hint = f"Accepts: {' | '.join(unique_types)}"
+                    existing_desc = selected.get("description", "")
+                    if existing_desc:
+                        selected["description"] = f"{existing_desc}. {hint}"
+                    else:
+                        selected["description"] = hint
+
+                return selected
 
     cleaned = {}
     # Handle 'const' by converting to 'enum' with single value (Claude only)
@@ -1083,11 +1297,15 @@ class AntigravityProvider(
         )
         self._enable_parallel_tool_instruction_gemini3 = env_bool(
             "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3",
-            False,  # OFF for Gemini 3
+            True,  # ON for Gemini 3
         )
         self._parallel_tool_instruction = os.getenv(
             "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION", DEFAULT_PARALLEL_TOOL_INSTRUCTION
         )
+
+        # Tool name sanitization: sanitized_name → original_name
+        # Used to fix invalid tool names (e.g., containing '/') and restore them in responses
+        self._tool_name_mapping: Dict[str, str] = {}
 
         # Log configuration
         self._log_config()
@@ -1102,6 +1320,74 @@ class AntigravityProvider(
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
             f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
+
+    def _sanitize_tool_name(self, name: str) -> str:
+        """
+        Sanitize tool name to comply with Antigravity API rules.
+
+        Rules (from ANTIGRAVITY_API_SPEC.md):
+        - First char must be letter (a-z, A-Z) or underscore (_)
+        - Allowed chars: a-zA-Z0-9_.:-
+        - Max length: 64 characters
+        - Slashes (/) not allowed
+
+        Handles collisions by appending numeric suffix (_2, _3, etc.)
+
+        Returns sanitized name and stores mapping for later restoration.
+        """
+        if not name:
+            return name
+
+        original = name
+        sanitized = name
+
+        # Replace / with _ (most common issue)
+        sanitized = sanitized.replace("/", "_")
+
+        # If starts with digit, prepend underscore
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"_{sanitized}"
+
+        # Truncate to 60 chars (leave room for potential suffix)
+        if len(sanitized) > 60:
+            sanitized = sanitized[:60]
+
+        # Handle collisions - check if this sanitized name already maps to a DIFFERENT original
+        base_sanitized = sanitized
+        suffix = 2
+        existing_values = set(self._tool_name_mapping.values())
+        while (
+            sanitized in self._tool_name_mapping
+            and self._tool_name_mapping[sanitized] != original
+        ) or (sanitized in existing_values and original not in existing_values):
+            # Check if sanitized name is already used for a different original
+            if sanitized in self._tool_name_mapping:
+                if self._tool_name_mapping[sanitized] == original:
+                    break  # Same original, no collision
+            sanitized = f"{base_sanitized}_{suffix}"
+            suffix += 1
+            if suffix > 100:  # Safety limit
+                lib_logger.error(f"[Tool Name] Too many collisions for '{original}'")
+                break
+
+        # Truncate again if suffix made it too long
+        if len(sanitized) > 64:
+            sanitized = sanitized[:64]
+
+        # Store mapping for restoration (only if changed)
+        if sanitized != original:
+            self._tool_name_mapping[sanitized] = original
+            lib_logger.debug(f"[Tool Name] Sanitized: '{original}' → '{sanitized}'")
+
+        return sanitized
+
+    def _restore_tool_name(self, sanitized_name: str) -> str:
+        """Restore original tool name from sanitized version."""
+        return self._tool_name_mapping.get(sanitized_name, sanitized_name)
+
+    def _clear_tool_name_mapping(self) -> None:
+        """Clear tool name mapping at start of each request."""
+        self._tool_name_mapping.clear()
 
     def _get_antigravity_headers(self) -> Dict[str, str]:
         """Return the Antigravity API headers. Used by quota tracker mixin."""
@@ -2912,7 +3198,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             params = func.get("parameters")
 
             func_decl = {
-                "name": func.get("name", ""),
+                "name": self._sanitize_tool_name(func.get("name", "")),
                 "description": func.get("description", ""),
             }
 
@@ -3058,14 +3344,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         existing_parts = existing_sys_inst.get("parts", [])
 
-        # Determine target field name based on PRESERVE_SYSTEM_INSTRUCTION_CASE setting
-        if PRESERVE_SYSTEM_INSTRUCTION_CASE:
-            target_key = original_key
-        else:
-            target_key = "systemInstruction"  # Always use camelCase
-            # Remove snake_case version if present (avoid duplicate fields)
-            if has_snake_case:
-                del request["system_instruction"]
+        # Always normalize to camelCase (Antigravity API requirement)
+        target_key = "systemInstruction"
+        # Remove snake_case version if present (avoid duplicate fields)
+        if has_snake_case:
+            del request["system_instruction"]
 
         # Build new parts array
         if not PREPEND_INSTRUCTION:
@@ -3385,6 +3668,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             tool_name = self._strip_gemini3_prefix(tool_name)
 
+        # Restore original tool name after stripping any prefixes
+        tool_name = self._restore_tool_name(tool_name)
+
         raw_args = func_call.get("args", {})
 
         # Optionally parse JSON strings (handles escaped control chars, malformed JSON)
@@ -3554,6 +3840,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         3. Makes API call with fallback logic
         4. Transforms response to OpenAI format
         """
+        # Clear tool name mapping for fresh request
+        self._clear_tool_name_mapping()
+
         # Extract parameters
         model = self._strip_provider_prefix(kwargs.get("model", "gemini-2.5-pro"))
         messages = kwargs.get("messages", [])
