@@ -21,7 +21,7 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     CODE_ASSIST_ENDPOINT,
 )
-from .utilities.gemini_file_logger import GeminiCliFileLogger
+from ..transaction_logger import ProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
 from .utilities.gemini_credential_manager import GeminiCredentialManager
 from ..model_definitions import ModelDefinitions
@@ -1280,7 +1280,7 @@ class GeminiCliProvider(
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
-        enable_request_logging = kwargs.pop("enable_request_logging", False)
+        transaction_context = kwargs.pop("transaction_context", None)
 
         # Get fallback models for rate limit handling
         fallback_models = self._cli_preview_fallback_order(model)
@@ -1300,10 +1300,8 @@ class GeminiCliProvider(
             # Handle :thinking suffix
             model_name = attempt_model.split("/")[-1].replace(":thinking", "")
 
-            # Create a dedicated file logger for this request
-            file_logger = GeminiCliFileLogger(
-                model_name=model_name, enabled=enable_request_logging
-            )
+            # Create provider logger from transaction context
+            file_logger = ProviderLogger(transaction_context)
 
             is_gemini_3 = self._is_gemini_3(model_name)
 

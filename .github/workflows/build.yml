@@ -13,6 +13,9 @@ on:
         type: boolean
         default: false
   push:
+    branches:
+      - dev
+      - main
     paths:
       - 'src/proxy_app/**'
       - 'src/rotator_library/**'
