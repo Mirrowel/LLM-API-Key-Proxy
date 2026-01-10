@@ -16,7 +16,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from dataclasses import dataclass, field
 from pathlib import Path
 from glob import glob
-from typing import Dict, Any, Tuple, Union, Optional, List
+from typing import Dict, Any, Union, Optional, List
 
 import httpx
 from rich.console import Console
@@ -33,7 +33,9 @@ from ..error_handler import CredentialNeedsReauthError
 lib_logger = logging.getLogger("rotator_library")
 
 # OAuth constants (from openai/codex and opencode plugin)
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+# Note: CLIENT_ID is public and safe to expose (used for native/mobile apps).
+# OAuth endpoints are OpenAI's official OAuth endpoints for Codex CLI authentication.
+CLIENT_ID = os.getenv("CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 REDIRECT_URI = "http://localhost:1455/auth/callback"

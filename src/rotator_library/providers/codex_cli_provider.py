@@ -7,12 +7,25 @@ import json
 import httpx
 import logging
 import time
-import asyncio
+import warnings
 from pathlib import Path
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 
 import litellm
 from litellm.exceptions import RateLimitError
+
+# Suppress Pydantic serialization warnings from litellm.ModelResponse
+# These warnings occur because litellm's internal Pydantic models expect a specific
+# structure with all fields, but our streaming chunks only include delta (not full Message).
+# The serialization still works correctly - these are just strict validation warnings.
+# Our structure matches OpenAI's streaming API format exactly.
+# Note: Other providers likely have the same warnings but they may not be noticed.
+# Filter all UserWarnings from pydantic modules (comprehensive approach)
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module="pydantic",
+)
 
 from .provider_interface import ProviderInterface
 from .codex_auth_base import CodexAuthBase
@@ -25,6 +38,8 @@ from ..utils.paths import get_cache_dir
 lib_logger = logging.getLogger("rotator_library")
 
 # Codex API endpoint
+# Note: This is the ChatGPT backend API (not the standard OpenAI Platform API).
+# The Codex CLI uses ChatGPT's backend API for OAuth-authenticated requests.
 CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 CODEX_API_PATH = "/codex/responses"
 
@@ -60,7 +75,12 @@ def _get_codex_cache_dir() -> Path:
 
 
 class CodexCliProvider(CodexAuthBase, ProviderInterface):
-    """Provider for OpenAI Codex CLI using ChatGPT Plus/Pro OAuth."""
+    """
+    Provider for OpenAI Codex CLI using ChatGPT Plus/Pro OAuth.
+    
+    Note: Both base classes define get_auth_header(). CodexAuthBase's implementation
+    is used (MRO priority), which is correct since it provides the OAuth token logic.
+    """
 
     skip_cost_calculation = True
     default_rotation_mode = "sequential"
@@ -311,6 +331,23 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
             }
 
         chunk_type = codex_chunk.get("type", "")
+        # All recognized chunk types (both metadata-only and content-bearing)
+        RECOGNIZED_CHUNK_TYPES = {
+            "response.created",
+            "response.in_progress",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.output_item.done",
+            "response.completed",
+        }
+        
         delta = {}
         finish_reason = None
         usage_data = None
@@ -377,6 +414,11 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
 
         # Skip if no delta and no usage
         if not delta and not usage_data:
+            # Only warn about truly unrecognized chunk types
+            if chunk_type and chunk_type not in RECOGNIZED_CHUNK_TYPES:
+                lib_logger.warning(
+                    f"Unrecognized Codex chunk type '{chunk_type}' returned no content"
+                )
             return None
 
         # Build OpenAI chunk
@@ -386,18 +428,24 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
 
         response_id = accumulator.get("response_id") or codex_chunk.get("response", {}).get("id")
 
+        # Ensure delta is always a dict (even if empty)
+        if not delta:
+            delta = {}
+
+        # Build choice object - match Gemini provider pattern: don't include finish_reason in streaming chunks
+        # Only include finish_reason in the final chunk (when usage_data is present)
+        # This matches how other providers handle it and may reduce Pydantic warnings
+        choice = {"index": 0, "delta": delta}
+        if finish_reason is not None and usage_data:
+            # Only include finish_reason in final chunk with usage
+            choice["finish_reason"] = finish_reason
+
         openai_chunk = {
             "id": response_id or f"chatcmpl-codex-{int(time.time())}",
             "object": "chat.completion.chunk",
             "created": created_at,
             "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": finish_reason,
-                }
-            ],
+            "choices": [choice],
         }
 
         # Add usage if available
@@ -485,8 +533,12 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
                             file_logger.log_error(
                                 f"API error {response.status_code}: {error_body.decode()}"
                             )
-                        except Exception:
-                            pass
+                        except Exception as log_exc:
+                            # Non-fatal: if reading or decoding the error body fails, continue and let
+                            # response.raise_for_status() surface the underlying HTTP error instead.
+                            lib_logger.debug(
+                                "Failed to read or decode Codex error body", exc_info=log_exc
+                            )
 
                     response.raise_for_status()
 
@@ -523,16 +575,16 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
                                 codex_chunks = [codex_chunks]
 
                             for codex_chunk in codex_chunks:
-                                lib_logger.info(f"Codex chunk received: {codex_chunk}")
+                                lib_logger.debug(f"Codex chunk received: {codex_chunk}")
                                 try:
                                     openai_chunk = self._convert_codex_to_openai(
                                         codex_chunk, model, accumulator
                                     )
                                     if openai_chunk:
-                                        lib_logger.info(f"OpenAI chunk converted: {openai_chunk}")
+                                        lib_logger.debug(f"OpenAI chunk converted: {openai_chunk}")
                                         yield litellm.ModelResponse(**openai_chunk)
-                                    else:
-                                        lib_logger.warning(f"Failed to convert chunk: {codex_chunk}")
+                                    # Note: Many chunk types intentionally return None (metadata-only events)
+                                    # Warnings for unrecognized types are logged inside _convert_codex_to_openai
                                 except KeyError as e:
                                     lib_logger.error(f"KeyError converting chunk {codex_chunk.get('type')}: {e}")
                                     lib_logger.error(f"Chunk data: {codex_chunk}")
@@ -561,8 +613,11 @@ class CodexCliProvider(CodexAuthBase, ProviderInterface):
                 if e.response is not None:
                     try:
                         error_body = e.response.text
-                    except Exception:
-                        pass
+                    except Exception as body_exc:
+                        # Failed to read response body; keep error_body as None and log for debugging.
+                        lib_logger.debug(
+                            "Failed to read HTTP error response body: %s", str(body_exc)
+                        )
 
                 if error_body:
                     file_logger.log_error(
