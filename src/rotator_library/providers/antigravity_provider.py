@@ -190,6 +190,7 @@ GOOGLE_SEARCH_MODE = os.getenv("ANTIGRAVITY_GOOGLE_SEARCH_MODE", "dynamic")
 # When these tools are in the request, they're removed from functionDeclarations
 # and google_search is added instead
 SEARCH_TOOL_NAMES = {"google_search", "web_search", "search", "WebSearch"}
+SEARCH_TOOL_NAMES_LOWER = {name.lower() for name in SEARCH_TOOL_NAMES}
 
 # Identity override instruction - injected after Antigravity prompt to neutralize it
 # This tells the model to disregard the preceding identity and follow actual user instructions
@@ -2808,11 +2809,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         """
         if not tools:
             return False
-        search_names_lower = {name.lower() for name in SEARCH_TOOL_NAMES}
         for tool in tools:
             if tool.get("type") == "function":
                 name = tool.get("function", {}).get("name", "")
-                if name.lower() in search_names_lower:
+                if name.lower() in SEARCH_TOOL_NAMES_LOWER:
                     return True
         return False
 
@@ -2832,13 +2832,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         """
         if not tools:
             return []
-        search_names_lower = {name.lower() for name in SEARCH_TOOL_NAMES}
         return [
             tool
             for tool in tools
             if not (
                 tool.get("type") == "function"
-                and tool.get("function", {}).get("name", "").lower() in search_names_lower
+                and tool.get("function", {}).get("name", "").lower() in SEARCH_TOOL_NAMES_LOWER
             )
         ]
 
@@ -2868,7 +2867,6 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             - search_enabled: Whether search grounding is active
         """
         search_enabled = enable_search
-        result_tools = []
 
         # Check if client explicitly requested search via tool names
         if GOOGLE_SEARCH_MODE == "dynamic" and self._has_search_tool_request(tools):
@@ -2884,16 +2882,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if search_enabled:
             tools = self._filter_search_tools(tools)
 
-        if not tools:
-            # No function tools, but may still have search
-            if search_enabled and ENABLE_GOOGLE_SEARCH:
-                lib_logger.info("[Search] Enabling google_search grounding (no other tools)")
-                return [{"google_search": {}}], True
-            return None, False
-
+        # Build function declarations from remaining tools
         function_declarations = []
-
-        for tool in tools:
+        for tool in tools or []:
             if tool.get("type") != "function":
                 continue
 
@@ -2949,22 +2940,24 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
             function_declarations.append(func_decl)
 
-        if not function_declarations:
-            # No function declarations, but may still have search
-            if search_enabled and ENABLE_GOOGLE_SEARCH:
-                lib_logger.info("[Search] Enabling google_search grounding (no function tools)")
-                return [{"google_search": {}}], True
-            return None, False
+        # Build the final tools list
+        result_tools: List[Dict[str, Any]] = []
 
-        # Build the tools list
-        result_tools = [{"functionDeclarations": function_declarations}]
+        if function_declarations:
+            result_tools.append({"functionDeclarations": function_declarations})
 
-        # Append google_search if search is enabled
+        # Append google_search if search is enabled (single path for search tool)
         if search_enabled and ENABLE_GOOGLE_SEARCH:
             result_tools.append({"google_search": {}})
-            lib_logger.info(
-                f"[Search] Enabling google_search grounding alongside {len(function_declarations)} function tools"
-            )
+            if function_declarations:
+                lib_logger.info(
+                    f"[Search] Enabling google_search grounding alongside {len(function_declarations)} function tools"
+                )
+            else:
+                lib_logger.info("[Search] Enabling google_search grounding (no function tools)")
+
+        if not result_tools:
+            return None, False
 
         return result_tools, search_enabled
 
@@ -3226,6 +3219,29 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         """Extract Gemini response from Antigravity envelope."""
         return response.get("response", response)
 
+    def _extract_grounding_metadata(
+        self,
+        candidate: Dict[str, Any],
+        response: Dict[str, Any],
+        accumulator: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Extract and include grounding metadata from Google Search.
+
+        Args:
+            candidate: The Gemini candidate containing groundingMetadata
+            response: The response dict to add metadata to
+            accumulator: Optional accumulator for streaming responses
+        """
+        grounding_metadata = candidate.get("groundingMetadata")
+        if grounding_metadata:
+            response["grounding_metadata"] = grounding_metadata
+            # Also extract search entry point if present
+            if "searchEntryPoint" in grounding_metadata:
+                response["search_entry_point"] = grounding_metadata["searchEntryPoint"]
+            # Accumulate for final response (streaming only)
+            if accumulator is not None:
+                accumulator["grounding_metadata"] = grounding_metadata
+
     def _gemini_to_openai_chunk(
         self,
         chunk: Dict[str, Any],
@@ -3337,15 +3353,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             response["usage"] = usage
 
         # Extract and include grounding metadata from Google Search
-        grounding_metadata = candidate.get("groundingMetadata")
-        if grounding_metadata:
-            response["grounding_metadata"] = grounding_metadata
-            # Also extract search entry point if present
-            if "searchEntryPoint" in grounding_metadata:
-                response["search_entry_point"] = grounding_metadata["searchEntryPoint"]
-            # Accumulate for final response
-            if accumulator is not None:
-                accumulator["grounding_metadata"] = grounding_metadata
+        self._extract_grounding_metadata(candidate, response, accumulator)
 
         return response
 
@@ -3446,12 +3454,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             result["usage"] = usage
 
         # Extract and include grounding metadata from Google Search
-        grounding_metadata = candidate.get("groundingMetadata")
-        if grounding_metadata:
-            result["grounding_metadata"] = grounding_metadata
-            # Also extract search entry point if present
-            if "searchEntryPoint" in grounding_metadata:
-                result["search_entry_point"] = grounding_metadata["searchEntryPoint"]
+        self._extract_grounding_metadata(candidate, result)
 
         return result
 
@@ -3777,7 +3780,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             gemini_payload["generationConfig"] = gen_config
 
         # Add tools (and detect search grounding)
-        gemini_tools, search_enabled = self._build_tools_payload(tools, model)
+        gemini_tools, _ = self._build_tools_payload(tools, model)
 
         if gemini_tools:
             gemini_payload["tools"] = gemini_tools
