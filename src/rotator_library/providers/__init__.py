@@ -84,9 +84,12 @@ def _register_providers():
             ):
                 # Derives 'gemini_cli' from 'gemini_cli_provider.py'
                 # Remap 'nvidia' to 'nvidia_nim' to align with litellm's provider name
+                # Remap 'codex_cli' to 'codex' to match credential file naming
                 provider_name = module_name.replace("_provider", "")
                 if provider_name == "nvidia":
                     provider_name = "nvidia_nim"
+                elif provider_name == "codex_cli":
+                    provider_name = "codex"
                 PROVIDER_PLUGINS[provider_name] = attribute
                 import logging
                 logging.getLogger('rotator_library').debug(f"Registered provider: {provider_name}")
@@ -114,6 +117,7 @@ def _register_providers():
                 "qwen_code",
                 "gemini_cli",
                 "antigravity",
+                "codex",
             ]:
                 continue
 

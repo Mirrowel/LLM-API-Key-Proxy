@@ -56,6 +56,7 @@ OAUTH_FRIENDLY_NAMES = {
     "qwen_code": "Qwen Code",
     "iflow": "iFlow",
     "antigravity": "Antigravity",
+    "codex": "Codex",
 }
 
 
@@ -276,7 +277,7 @@ def _get_oauth_credentials_summary() -> dict:
         Example: {"gemini_cli": [{"email": "user@example.com", "tier": "free-tier", ...}, ...]}
     """
     provider_factory, _ = _ensure_providers_loaded()
-    oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity"]
+    oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity", "codex"]
     oauth_summary = {}
 
     for provider_name in oauth_providers:
@@ -1710,6 +1711,101 @@ async def export_antigravity_to_env():
         )
 
 
+async def export_codex_to_env():
+    """
+    Export a Codex credential JSON file to .env format.
+    Uses the auth class's build_env_lines() and list_credentials() methods.
+    """
+    clear_screen("Export Codex Credential")
+
+    # Get auth instance for this provider
+    provider_factory, _ = _ensure_providers_loaded()
+    auth_class = provider_factory.get_provider_auth_class("codex")
+    auth_instance = auth_class()
+
+    # List available credentials using auth class
+    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
+
+    if not credentials:
+        console.print(
+            Panel(
+                "No Codex credentials found. Please add one first using 'Add OAuth Credential'.",
+                style="bold red",
+                title="No Credentials",
+            )
+        )
+        return
+
+    # Display available credentials
+    cred_text = Text()
+    for i, cred_info in enumerate(credentials):
+        cred_text.append(
+            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
+        )
+
+    console.print(
+        Panel(
+            cred_text,
+            title="Available Codex Credentials",
+            style="bold blue",
+        )
+    )
+
+    choice = Prompt.ask(
+        Text.from_markup(
+            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
+        ),
+        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
+        show_choices=False,
+    )
+
+    if choice.lower() == "b":
+        return
+
+    try:
+        choice_index = int(choice) - 1
+        if 0 <= choice_index < len(credentials):
+            cred_info = credentials[choice_index]
+
+            # Use auth class to export
+            env_path = auth_instance.export_credential_to_env(
+                cred_info["file_path"], _get_oauth_base_dir()
+            )
+
+            if env_path:
+                numbered_prefix = f"CODEX_{cred_info['number']}"
+                success_text = Text.from_markup(
+                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
+                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
+                    f"[bold]To use this credential:[/bold]\n"
+                    f"1. Copy the contents to your main .env file, OR\n"
+                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n"
+                    f"3. Or on Windows: [bold cyan]Get-Content {Path(env_path).name} | ForEach-Object {{ $_ -replace '^([^#].*)$', 'set $1' }} | cmd[/bold cyan]\n\n"
+                    f"[bold]To combine multiple credentials:[/bold]\n"
+                    f"Copy lines from multiple .env files into one file.\n"
+                    f"Each credential uses a unique number ({numbered_prefix}_*)."
+                )
+                console.print(Panel(success_text, style="bold green", title="Success"))
+            else:
+                console.print(
+                    Panel(
+                        "Failed to export credential", style="bold red", title="Error"
+                    )
+                )
+        else:
+            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+    except ValueError:
+        console.print(
+            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
+        )
+    except Exception as e:
+        console.print(
+            Panel(
+                f"An error occurred during export: {e}", style="bold red", title="Error"
+            )
+        )
+
+
 async def export_all_provider_credentials(provider_name: str):
     """
     Export all credentials for a specific provider to individual .env files.
@@ -1979,19 +2075,22 @@ async def export_credentials_submenu():
                     "2. Export Qwen Code credential\n"
                     "3. Export iFlow credential\n"
                     "4. Export Antigravity credential\n"
+                    "5. Export Codex credential\n"
                     "\n"
                     "[bold]Bulk Exports (per provider):[/bold]\n"
-                    "5. Export ALL Gemini CLI credentials\n"
-                    "6. Export ALL Qwen Code credentials\n"
-                    "7. Export ALL iFlow credentials\n"
-                    "8. Export ALL Antigravity credentials\n"
+                    "6. Export ALL Gemini CLI credentials\n"
+                    "7. Export ALL Qwen Code credentials\n"
+                    "8. Export ALL iFlow credentials\n"
+                    "9. Export ALL Antigravity credentials\n"
+                    "10. Export ALL Codex credentials\n"
                     "\n"
                     "[bold]Combine Credentials:[/bold]\n"
-                    "9. Combine all Gemini CLI into one file\n"
-                    "10. Combine all Qwen Code into one file\n"
-                    "11. Combine all iFlow into one file\n"
-                    "12. Combine all Antigravity into one file\n"
-                    "13. Combine ALL providers into one file"
+                    "11. Combine all Gemini CLI into one file\n"
+                    "12. Combine all Qwen Code into one file\n"
+                    "13. Combine all iFlow into one file\n"
+                    "14. Combine all Antigravity into one file\n"
+                    "15. Combine all Codex into one file\n"
+                    "16. Combine ALL providers into one file"
                 ),
                 title="Choose export option",
                 style="bold blue",
@@ -2016,6 +2115,9 @@ async def export_credentials_submenu():
                 "11",
                 "12",
                 "13",
+                "14",
+                "15",
+                "16",
                 "b",
             ],
             show_choices=False,
@@ -2043,40 +2145,53 @@ async def export_credentials_submenu():
             input()
         # Bulk exports (all credentials for a provider)
         elif export_choice == "5":
+            await export_codex_to_env()
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        # Bulk exports (all credentials for a provider)
+        elif export_choice == "6":
             await export_all_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "6":
+        elif export_choice == "7":
             await export_all_provider_credentials("qwen_code")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "7":
+        elif export_choice == "8":
             await export_all_provider_credentials("iflow")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "8":
+        elif export_choice == "9":
             await export_all_provider_credentials("antigravity")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
+        elif export_choice == "10":
+            await export_all_provider_credentials("codex")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
         # Combine per provider
-        elif export_choice == "9":
+        elif export_choice == "11":
             await combine_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "10":
+        elif export_choice == "12":
             await combine_provider_credentials("qwen_code")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "11":
+        elif export_choice == "13":
             await combine_provider_credentials("iflow")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "12":
+        elif export_choice == "14":
             await combine_provider_credentials("antigravity")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
         # Combine all providers
-        elif export_choice == "13":
+        elif export_choice == "15":
+            await combine_provider_credentials("codex")
+            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
+            input()
+        elif export_choice == "16":
             await combine_all_credentials()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
