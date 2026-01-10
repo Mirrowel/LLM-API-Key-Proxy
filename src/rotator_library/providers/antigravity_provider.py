@@ -1436,9 +1436,7 @@ class AntigravityProvider(
             f"gemini3_fix={self._enable_gemini3_tool_fix}, gemini3_strict_schema={self._gemini3_enforce_strict_schema}, "
             f"claude_fix={self._enable_claude_tool_fix}, thinking_sanitization={self._enable_thinking_sanitization}, "
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
-            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}, "
-            f"claude_interleaved_hint={self._enable_claude_interleaved_hint}, "
-            f"claude_tool_result_reminder={self._enable_claude_tool_result_reminder}"
+            f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
 
     def _sanitize_tool_name(self, name: str) -> str:
@@ -2763,24 +2761,10 @@ class AntigravityProvider(
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
 
-        should_add_reminder = (
-            self._is_claude(model)
-            and self._enable_claude_tool_result_reminder
-            and self._claude_tool_result_reminder
-        )
-
         try:
             parsed_content = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             parsed_content = content
-
-        if should_add_reminder:
-            if isinstance(parsed_content, str):
-                parsed_content = (
-                    f"{parsed_content}\n\n{self._claude_tool_result_reminder}"
-                )
-            elif isinstance(parsed_content, dict):
-                parsed_content["_system_reminder"] = self._claude_tool_result_reminder
 
         return [
             {
