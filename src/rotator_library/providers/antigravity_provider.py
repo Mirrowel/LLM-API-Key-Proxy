@@ -2807,14 +2807,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         Returns:
             True if any search tool is present
         """
-        if not tools:
-            return False
-        for tool in tools:
-            if tool.get("type") == "function":
-                name = tool.get("function", {}).get("name", "")
-                if name.lower() in SEARCH_TOOL_NAMES_LOWER:
-                    return True
-        return False
+        return any(
+            tool.get("type") == "function"
+            and tool.get("function", {}).get("name", "").lower() in SEARCH_TOOL_NAMES_LOWER
+            for tool in tools or []
+        )
 
     def _filter_search_tools(
         self, tools: Optional[List[Dict[str, Any]]]
@@ -3236,8 +3233,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if grounding_metadata:
             response["grounding_metadata"] = grounding_metadata
             # Also extract search entry point if present
-            if "searchEntryPoint" in grounding_metadata:
-                response["search_entry_point"] = grounding_metadata["searchEntryPoint"]
+            search_entry_point = grounding_metadata.get("searchEntryPoint")
+            if search_entry_point:
+                response["search_entry_point"] = search_entry_point
             # Accumulate for final response (streaming only)
             if accumulator is not None:
                 accumulator["grounding_metadata"] = grounding_metadata
