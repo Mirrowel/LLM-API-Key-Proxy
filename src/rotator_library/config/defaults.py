@@ -71,7 +71,7 @@ DEFAULT_FAIR_CYCLE_CROSS_TIER: bool = False
 
 # Cycle duration in seconds (how long before cycle auto-resets)
 # Override: FAIR_CYCLE_DURATION_{PROVIDER}=<seconds>
-DEFAULT_FAIR_CYCLE_DURATION: int = 86400  # 24 hours
+DEFAULT_FAIR_CYCLE_DURATION: int = 172800  # 48 hours
 
 # Exhaustion cooldown threshold in seconds
 # Cooldowns longer than this mark credential as "exhausted" for fair cycle
