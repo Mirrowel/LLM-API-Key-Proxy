@@ -576,11 +576,15 @@ async def lifespan(app: FastAPI):
         "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
     }
 
+    # Load global timeout from environment (default 30 seconds)
+    global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
+
     # The client now uses the root logger configuration
     client = RotatingClient(
         api_keys=api_keys,
         oauth_credentials=oauth_credentials,  # Pass OAuth config
         configure_logging=True,
+        global_timeout=global_timeout,
         litellm_provider_params=litellm_provider_params,
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,

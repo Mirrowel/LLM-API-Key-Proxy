@@ -34,6 +34,10 @@ DEFAULT_ROTATION_TOLERANCE: float = 3.0
 DEFAULT_MAX_RETRIES: int = 2
 
 # Global request timeout in seconds
+# This controls how long a request can wait for an available credential.
+# If all credentials are on cooldown and the soonest one won't be available
+# within this timeout, the request fails fast with a clear message.
+# Override via environment variable: GLOBAL_TIMEOUT=<seconds>
 DEFAULT_GLOBAL_TIMEOUT: int = 30
 
 # =============================================================================

@@ -1573,6 +1573,50 @@ class UsageManager:
             "available": available,
         }
 
+    async def get_soonest_cooldown_end(
+        self,
+        credentials: List[str],
+        model: str,
+    ) -> Optional[float]:
+        """
+        Find the soonest time when any credential will come off cooldown.
+
+        This is used for smart waiting logic - if no credentials are available,
+        we can determine whether to wait (if soonest cooldown < deadline) or
+        fail fast (if soonest cooldown > deadline).
+
+        Args:
+            credentials: List of credential identifiers to check
+            model: Model name to check cooldowns for
+
+        Returns:
+            Timestamp of soonest cooldown end, or None if no credentials are on cooldown
+        """
+        await self._lazy_init()
+        now = time.time()
+        soonest_end = None
+
+        async with self._data_lock:
+            for key in credentials:
+                key_data = self._usage_data.get(key, {})
+                normalized_model = self._normalize_model(key, model)
+
+                # Check key-level cooldown
+                key_cooldown = key_data.get("key_cooldown_until") or 0
+                if key_cooldown > now:
+                    if soonest_end is None or key_cooldown < soonest_end:
+                        soonest_end = key_cooldown
+
+                # Check model-level cooldown
+                model_cooldown = (
+                    key_data.get("model_cooldowns", {}).get(normalized_model) or 0
+                )
+                if model_cooldown > now:
+                    if soonest_end is None or model_cooldown < soonest_end:
+                        soonest_end = model_cooldown
+
+        return soonest_end
+
     async def _reset_daily_stats_if_needed(self):
         """
         Checks if usage stats need to be reset for any key.
@@ -2267,10 +2311,35 @@ class UsageManager:
                     all_potential_keys.extend(keys_list)
 
                 if not all_potential_keys:
-                    lib_logger.warning(
-                        "No keys are eligible (all on cooldown or filtered out). Waiting before re-evaluating."
+                    # All credentials are on cooldown - check if waiting makes sense
+                    soonest_end = await self.get_soonest_cooldown_end(
+                        available_keys, model
                     )
-                    await asyncio.sleep(1)
+
+                    if soonest_end is None:
+                        # No cooldowns active but no keys available (shouldn't happen)
+                        lib_logger.warning(
+                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    remaining_budget = deadline - time.time()
+                    wait_needed = soonest_end - time.time()
+
+                    if wait_needed > remaining_budget:
+                        # Fail fast - no credential will be available in time
+                        lib_logger.warning(
+                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
+                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                        )
+                        break  # Exit loop, will raise NoAvailableKeysError
+
+                    # Wait for the credential to become available
+                    lib_logger.info(
+                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
+                    )
+                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
                     continue
 
                 # Wait for the highest priority key with lowest usage
@@ -2444,10 +2513,35 @@ class UsageManager:
 
                 all_potential_keys = tier1_keys + tier2_keys
                 if not all_potential_keys:
-                    lib_logger.warning(
-                        "No keys are eligible (all on cooldown). Waiting before re-evaluating."
+                    # All credentials are on cooldown - check if waiting makes sense
+                    soonest_end = await self.get_soonest_cooldown_end(
+                        available_keys, model
                     )
-                    await asyncio.sleep(1)
+
+                    if soonest_end is None:
+                        # No cooldowns active but no keys available (shouldn't happen)
+                        lib_logger.warning(
+                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    remaining_budget = deadline - time.time()
+                    wait_needed = soonest_end - time.time()
+
+                    if wait_needed > remaining_budget:
+                        # Fail fast - no credential will be available in time
+                        lib_logger.warning(
+                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
+                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                        )
+                        break  # Exit loop, will raise NoAvailableKeysError
+
+                    # Wait for the credential to become available
+                    lib_logger.info(
+                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
+                    )
+                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
                     continue
 
                 # Wait on the condition of the key with the lowest current usage.
