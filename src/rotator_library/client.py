@@ -42,6 +42,7 @@ from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
+from .utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
 from .config import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_GLOBAL_TIMEOUT,
@@ -118,6 +119,12 @@ class RotatingClient:
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
+
+        # Suppress harmless Pydantic serialization warnings from litellm
+        # See: https://github.com/BerriAI/litellm/issues/11759
+        # TODO: Remove this workaround once litellm patches the issue
+        suppress_litellm_serialization_warnings()
+
         if configure_logging:
             # When True, this allows logs from this library to be handled
             # by the parent application's logging configuration.
