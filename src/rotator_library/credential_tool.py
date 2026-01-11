@@ -304,6 +304,100 @@ def _get_all_credentials_summary() -> dict:
     }
 
 
+def _get_existing_custom_providers() -> list:
+    """
+    Scan the .env file for existing custom OpenAI-compatible providers.
+
+    Custom providers are identified by *_CUSTOM_API_BASE entries.
+
+    Returns:
+        List of dicts with provider info:
+        [{"name": "myserver", "api_base": "http://...", "has_key": True}, ...]
+    """
+    custom_providers = []
+    env_file = _get_env_file()
+
+    if not env_file.is_file():
+        return custom_providers
+
+    try:
+        # First pass: collect all CUSTOM_API_BASE entries
+        api_bases = {}
+        api_keys = set()
+
+        with open(env_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key_name, _, value = line.partition("=")
+                key_name = key_name.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key_name.endswith("_CUSTOM_API_BASE") and value:
+                    provider_name = key_name[:-16].lower()  # Remove _CUSTOM_API_BASE
+                    api_bases[provider_name] = value
+                elif "_API_KEY" in key_name and value:
+                    # Extract provider name from API key
+                    provider_prefix = key_name.split("_API_KEY")[0].lower()
+                    api_keys.add(provider_prefix)
+
+        # Build result list
+        for provider_name, api_base in sorted(api_bases.items()):
+            custom_providers.append(
+                {
+                    "name": provider_name,
+                    "api_base": api_base,
+                    "has_key": provider_name in api_keys,
+                }
+            )
+
+    except Exception as e:
+        console.print(f"[bold red]Error reading .env file: {e}[/bold red]")
+
+    return custom_providers
+
+
+def _display_custom_providers_summary():
+    """
+    Display a summary of existing custom OpenAI-compatible providers.
+    """
+    custom_providers = _get_existing_custom_providers()
+
+    if not custom_providers:
+        console.print(
+            "[dim]No custom OpenAI-compatible providers configured yet.[/dim]\n"
+        )
+        return
+
+    table = Table(
+        title="Existing Custom Providers",
+        box=None,
+        padding=(0, 2),
+        title_style="bold cyan",
+    )
+    table.add_column("Provider", style="yellow", no_wrap=True)
+    table.add_column("API Base", style="dim")
+    table.add_column("API Key", style="green", justify="center")
+
+    for provider in custom_providers:
+        name = provider["name"].upper()
+        api_base = provider["api_base"]
+        # Truncate long URLs
+        if len(api_base) > 40:
+            api_base = api_base[:37] + "..."
+        has_key = "✓" if provider["has_key"] else "✗"
+        key_style = "green" if provider["has_key"] else "red"
+        table.add_row(name, api_base, Text(has_key, style=key_style))
+
+    console.print(table)
+    console.print()
+
+
 def _display_credentials_summary():
     """
     Display a compact 2-column summary of all configured credentials.
@@ -1425,14 +1519,18 @@ LITELLM_PROVIDERS = {
     # =========================================================================
     # LOCAL / SELF-HOSTED - Run locally or on your own infrastructure
     # =========================================================================
-    "Ollama": {
-        "api_key": None,
-        "category": "local",
-        "note": "Local provider. No API key required. Make sure Ollama is running.",
-        "extra_vars": [
-            ("OLLAMA_API_BASE", "Ollama URL", "http://localhost:11434"),
-        ],
-    },
+    # NOTE: Providers with no API key are commented out because the library
+    # requires credentials (API keys or OAuth files) to function.
+    # Use "Add Custom OpenAI-Compatible Provider" for local providers.
+    #
+    # "Ollama": {
+    #     "api_key": None,  # No API key - use custom provider option instead
+    #     "category": "local",
+    #     "note": "Local provider. No API key required. Make sure Ollama is running.",
+    #     "extra_vars": [
+    #         ("OLLAMA_API_BASE", "Ollama URL", "http://localhost:11434"),
+    #     ],
+    # },
     "LM Studio": {
         "api_key": "LM_STUDIO_API_KEY",
         "category": "local",
@@ -1441,14 +1539,14 @@ LITELLM_PROVIDERS = {
             ("LM_STUDIO_API_BASE", "API Base URL", "http://localhost:1234/v1"),
         ],
     },
-    "Llamafile": {
-        "api_key": None,
-        "category": "local",
-        "note": "Local provider. No API key required.",
-        "extra_vars": [
-            ("LLAMAFILE_API_BASE", "Llamafile URL", "http://localhost:8080/v1"),
-        ],
-    },
+    # "Llamafile": {
+    #     "api_key": None,  # No API key - use custom provider option instead
+    #     "category": "local",
+    #     "note": "Local provider. No API key required.",
+    #     "extra_vars": [
+    #         ("LLAMAFILE_API_BASE", "Llamafile URL", "http://localhost:8080/v1"),
+    #     ],
+    # },
     "vLLM (Hosted)": {
         "api_key": "HOSTED_VLLM_API_KEY",
         "category": "local",
@@ -1517,16 +1615,16 @@ LITELLM_PROVIDERS = {
             ("LEMONADE_API_BASE", "Lemonade URL", "http://localhost:8000/api/v1"),
         ],
     },
-    "Petals": {
-        "api_key": None,
-        "category": "local",
-        "note": "Distributed inference network. No API key required.",
-    },
-    "Triton Inference Server": {
-        "api_key": None,
-        "category": "local",
-        "note": "NVIDIA Triton server. No API key required.",
-    },
+    # "Petals": {
+    #     "api_key": None,  # No API key - use custom provider option instead
+    #     "category": "local",
+    #     "note": "Distributed inference network. No API key required.",
+    # },
+    # "Triton Inference Server": {
+    #     "api_key": None,  # No API key - use custom provider option instead
+    #     "category": "local",
+    #     "note": "NVIDIA Triton server. No API key required.",
+    # },
     # =========================================================================
     # OTHER - Miscellaneous providers
     # =========================================================================
@@ -1604,6 +1702,8 @@ PROVIDER_CATEGORIES = [
     ("specialized", "Specialized (Image/Audio/Embeddings)"),
     ("regional", "Regional"),
     ("local", "Local / Self-Hosted"),
+    ("custom", "Custom (First-Party)"),
+    ("custom_openai", "Custom OpenAI-Compatible"),
     ("other", "Other"),
 ]
 
@@ -1652,6 +1752,85 @@ async def setup_api_key():
     )
     console.print()
 
+    # -------------------------------------------------------------------------
+    # Discover custom providers from project's provider registry
+    # -------------------------------------------------------------------------
+    _, PROVIDER_PLUGINS = _ensure_providers_loaded()
+    from .providers import DynamicOpenAICompatibleProvider
+    from .providers.provider_interface import ProviderInterface
+
+    # Build a set of API key env vars already in LITELLM_PROVIDERS
+    litellm_api_keys = set()
+    for config in LITELLM_PROVIDERS.values():
+        if config.get("api_key"):
+            litellm_api_keys.add(config["api_key"])
+
+    # OAuth-only providers to exclude entirely from API key setup
+    oauth_only_providers = {
+        "gemini_cli",  # OAuth-only
+        "antigravity",  # OAuth-only
+        "qwen_code",  # OAuth is primary, don't advertise API key
+        "iflow",  # OAuth is primary
+    }
+
+    # Base classes to exclude
+    base_classes = {
+        "openai_compatible",
+    }
+
+    # Create combined providers dict with custom providers
+    all_providers = dict(LITELLM_PROVIDERS)
+
+    for provider_key, provider_class in PROVIDER_PLUGINS.items():
+        # Skip OAuth-only providers
+        if provider_key in oauth_only_providers:
+            continue
+
+        # Skip base classes
+        if provider_key in base_classes:
+            continue
+
+        # Check if this is a dynamic OpenAI-compatible provider
+        try:
+            is_dynamic = isinstance(provider_class, type) and issubclass(
+                provider_class, DynamicOpenAICompatibleProvider
+            )
+        except TypeError:
+            is_dynamic = False
+
+        if is_dynamic:
+            # Dynamic OpenAI-compatible provider uses _CUSTOM_API_BASE pattern
+            # but standard _API_KEY (allows reusing existing keys for overrides)
+            env_var = f"{provider_key.upper()}_API_KEY"
+
+            # Skip if somehow already in list
+            if env_var in litellm_api_keys:
+                continue
+
+            display_name = provider_key.replace("_", " ").title()
+            all_providers[display_name] = {
+                "api_key": env_var,
+                "category": "custom_openai",
+                "note": "Custom OpenAI-compatible provider.",
+                "extra_vars": [
+                    (f"{provider_key.upper()}_CUSTOM_API_BASE", "API Base URL", None),
+                ],
+            }
+        else:
+            # First-party file-based provider
+            env_var = f"{provider_key.upper()}_API_KEY"
+
+            # Skip if already in LiteLLM list
+            if env_var in litellm_api_keys:
+                continue
+
+            display_name = provider_key.replace("_", " ").title()
+            all_providers[display_name] = {
+                "api_key": env_var,
+                "category": "custom",
+                "note": "First-party provider from the library.",
+            }
+
     # Search prompt
     search_query = Prompt.ask(
         "[bold]Search providers[/bold] [dim](or press Enter to see all)[/dim]",
@@ -1661,7 +1840,7 @@ async def setup_api_key():
     # Build provider list based on search
     if search_query.strip():
         # Search mode
-        matches = _search_providers(search_query, LITELLM_PROVIDERS)
+        matches = _search_providers(search_query, all_providers)
         if not matches:
             console.print(
                 f"[bold yellow]No providers found matching '{search_query}'[/bold yellow]"
@@ -1700,7 +1879,7 @@ async def setup_api_key():
 
     else:
         # Full categorized list mode
-        by_category = _get_providers_by_category(LITELLM_PROVIDERS)
+        by_category = _get_providers_by_category(all_providers)
         provider_list = []
         provider_text = Text()
 
@@ -1843,6 +2022,189 @@ async def setup_api_key():
         )
         console.print("\n[dim]Press Enter to continue...[/dim]")
         input()
+
+
+async def setup_custom_openai_provider():
+    """
+    Interactively sets up a custom OpenAI-compatible provider.
+
+    This adds a new provider that uses the standard OpenAI API format but points
+    to a custom endpoint (LM Studio, Ollama, vLLM, custom server, etc.).
+    """
+    clear_screen("Add Custom OpenAI-Compatible Provider")
+
+    # Show info panel
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]Custom OpenAI-Compatible Providers[/bold]\n\n"
+                "Add a custom endpoint that uses the OpenAI API format.\n"
+                "This works with: LM Studio, Ollama, vLLM, text-generation-webui, "
+                "and other OpenAI-compatible servers.\n\n"
+                "[dim]The library will automatically discover available models from your endpoint.[/dim]\n"
+                "[dim]You can also override built-in providers (e.g., OPENAI) to route traffic elsewhere.[/dim]\n\n"
+                "[yellow]Please consult the provider's documentation for the correct API base URL.[/yellow]"
+            ),
+            style="blue",
+            title="Custom Provider Setup",
+            expand=False,
+        )
+    )
+    console.print()
+
+    # Show existing custom providers
+    _display_custom_providers_summary()
+
+    # Prompt for provider name
+    console.print("[dim]Provider name will be used for environment variables.[/dim]")
+    console.print(
+        "[dim]Use alphanumeric characters and underscores only (e.g., MY_LOCAL_LLM).[/dim]\n"
+    )
+
+    while True:
+        provider_name = Prompt.ask(
+            "[bold]Enter provider name[/bold] [dim](or 'b' to go back)[/dim]",
+            default="",
+        )
+
+        if provider_name.lower() == "b" or not provider_name.strip():
+            return
+
+        provider_name = provider_name.strip().upper()
+
+        # Validate name (alphanumeric + underscores only)
+        import re
+
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", provider_name):
+            console.print(
+                "[bold red]Invalid name. Use letters, numbers, and underscores only. "
+                "Must start with a letter.[/bold red]"
+            )
+            continue
+
+        # Check for conflict with built-in LiteLLM providers
+        conflict_provider = None
+        for litellm_name, config in LITELLM_PROVIDERS.items():
+            api_key_var = config.get("api_key", "")
+            if api_key_var:
+                # Extract prefix from API key var (e.g., OPENAI_API_KEY -> OPENAI)
+                prefix = api_key_var.replace("_API_KEY", "").replace("_TOKEN", "")
+                if prefix == provider_name:
+                    conflict_provider = litellm_name
+                    break
+
+        if conflict_provider:
+            console.print(
+                f"\n[bold yellow]Warning:[/bold yellow] '{provider_name}' matches the built-in "
+                f"'{conflict_provider}' provider."
+            )
+            console.print(
+                "If you continue, requests to this provider will be routed to your custom endpoint "
+                "instead of the official API.\n"
+            )
+            override_confirm = Prompt.ask(
+                "[bold]Do you want to override the built-in provider?[/bold]",
+                choices=["y", "n"],
+                default="n",
+            )
+            if override_confirm.lower() != "y":
+                continue
+
+        break
+
+    # Prompt for API Base URL (required)
+    console.print()
+    console.print("[dim]The API base URL is where requests will be sent.[/dim]")
+    console.print(
+        "[dim]Common examples: http://localhost:1234/v1, http://localhost:11434/v1[/dim]\n"
+    )
+
+    while True:
+        api_base = Prompt.ask(
+            "[bold]Enter API Base URL[/bold] [dim](required)[/dim]",
+            default="",
+        )
+
+        if not api_base.strip():
+            console.print("[bold red]API Base URL is required.[/bold red]")
+            continue
+
+        api_base = api_base.strip()
+
+        # Validate URL format
+        if not api_base.startswith(("http://", "https://")):
+            console.print(
+                "[bold red]Invalid URL. Must start with http:// or https://[/bold red]"
+            )
+            continue
+
+        break
+
+    # Prompt for API Key (required)
+    console.print()
+    console.print("[dim]Enter the API key for authentication.[/dim]")
+    console.print(
+        "[dim]If your server doesn't require authentication, enter any placeholder value.[/dim]\n"
+    )
+
+    while True:
+        api_key = Prompt.ask(
+            "[bold]Enter API Key[/bold] [dim](required)[/dim]",
+            default="",
+        )
+
+        if not api_key.strip():
+            console.print("[bold red]API Key is required.[/bold red]")
+            continue
+
+        api_key = api_key.strip()
+        break
+
+    # Save to .env file
+    env_file = _get_env_file()
+
+    # Save API Base URL
+    api_base_var = f"{provider_name}_CUSTOM_API_BASE"
+    set_key(str(env_file), api_base_var, api_base)
+
+    # Save API Key (find next available index)
+    api_key_var_base = f"{provider_name}_API_KEY"
+    key_index = 1
+    if env_file.is_file():
+        with open(env_file, "r") as f:
+            content = f.read()
+            while f"{api_key_var_base}_{key_index}=" in content:
+                key_index += 1
+
+    api_key_var = f"{api_key_var_base}_{key_index}"
+    set_key(str(env_file), api_key_var, api_key)
+
+    # Mask the API key for display
+    if len(api_key) > 8:
+        masked_key = f"{api_key[:4]}...{api_key[-4:]}"
+    elif len(api_key) > 4:
+        masked_key = f"****{api_key[-4:]}"
+    else:
+        masked_key = "****"
+
+    # Show success message
+    console.print(
+        Panel(
+            Text.from_markup(
+                f"Successfully configured custom provider [bold]{provider_name}[/bold]:\n\n"
+                f"  [yellow]{api_base_var}[/yellow] = {api_base}\n"
+                f"  [yellow]{api_key_var}[/yellow] = {masked_key}\n\n"
+                "[dim]The library will automatically fetch available models from your endpoint.[/dim]\n"
+                "[dim]Use launcher menu option 4 'List Available Models' to verify the setup.[/dim]"
+            ),
+            style="bold green",
+            title="Success",
+            expand=False,
+        )
+    )
+
+    console.print("\n[dim]Press Enter to continue...[/dim]")
+    input()
 
 
 async def setup_new_credential(provider_name: str):
@@ -2691,9 +3053,10 @@ async def main(clear_on_start=True):
                 Text.from_markup(
                     "1. Add OAuth Credential\n"
                     "2. Add API Key\n"
-                    "3. Export Credentials\n"
-                    "4. View Credentials\n"
-                    "5. Manage Credentials"
+                    "3. Add Custom OpenAI-Compatible Provider\n"
+                    "4. Export Credentials\n"
+                    "5. View Credentials\n"
+                    "6. Manage Credentials"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -2704,7 +3067,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"
             ),
-            choices=["1", "2", "3", "4", "5", "q"],
+            choices=["1", "2", "3", "4", "5", "6", "q"],
             show_choices=False,
         )
 
@@ -2780,12 +3143,15 @@ async def main(clear_on_start=True):
             # input()
 
         elif setup_type == "3":
-            await export_credentials_submenu()
+            await setup_custom_openai_provider()
 
         elif setup_type == "4":
-            await view_credentials_menu()
+            await export_credentials_submenu()
 
         elif setup_type == "5":
+            await view_credentials_menu()
+
+        elif setup_type == "6":
             await manage_credentials_submenu()
 
 

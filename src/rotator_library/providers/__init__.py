@@ -13,7 +13,19 @@ PROVIDER_PLUGINS: Dict[str, Type[ProviderInterface]] = {}
 class DynamicOpenAICompatibleProvider:
     """
     Dynamic provider class for custom OpenAI-compatible providers.
-    Created at runtime for providers with API_BASE environment variables.
+    Created at runtime for providers with _CUSTOM_API_BASE environment variables.
+
+    Environment variable pattern:
+        <NAME>_CUSTOM_API_BASE - The API base URL (required)
+        <NAME>_API_KEY         - The API key (can reuse existing keys for overrides)
+
+    Example:
+        MYSERVER_CUSTOM_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_KEY=sk-xxx
+
+    Override example (route OpenAI traffic to custom server):
+        OPENAI_CUSTOM_API_BASE=http://my-local-llm.com/v1
+        OPENAI_API_KEY=sk-xxx  # Existing key is reused
     """
 
     # Class attribute - no need to instantiate
@@ -21,11 +33,11 @@ class DynamicOpenAICompatibleProvider:
 
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
-        # Get API base URL from environment
-        self.api_base = os.getenv(f"{provider_name.upper()}_API_BASE")
+        # Get API base URL from environment (using _CUSTOM_API_BASE pattern)
+        self.api_base = os.getenv(f"{provider_name.upper()}_CUSTOM_API_BASE")
         if not self.api_base:
             raise ValueError(
-                f"Environment variable {provider_name.upper()}_API_BASE is required for OpenAI-compatible provider"
+                f"Environment variable {provider_name.upper()}_CUSTOM_API_BASE is required for custom OpenAI-compatible provider"
             )
 
         # Import model definitions
@@ -89,32 +101,21 @@ def _register_providers():
                     provider_name = "nvidia_nim"
                 PROVIDER_PLUGINS[provider_name] = attribute
                 import logging
-                logging.getLogger('rotator_library').debug(f"Registered provider: {provider_name}")
+
+                logging.getLogger("rotator_library").debug(
+                    f"Registered provider: {provider_name}"
+                )
 
     # Then, create dynamic plugins for custom OpenAI-compatible providers
-    # Use environment variables directly (load_dotenv already called in main.py)
+    # These use the pattern: <NAME>_CUSTOM_API_BASE and <NAME>_CUSTOM_API_KEY
+    # This avoids collision with LiteLLM's standard *_API_BASE variables
 
     for env_var in os.environ:
-        if env_var.endswith("_API_BASE"):
-            provider_name = env_var[:-9].lower()  # Remove '_API_BASE' suffix
+        if env_var.endswith("_CUSTOM_API_BASE"):
+            provider_name = env_var[:-16].lower()  # Remove '_CUSTOM_API_BASE' suffix
 
-            # Skip known providers that already have file-based plugins
-            if provider_name in [
-                "openai",
-                "anthropic",
-                "google",
-                "gemini",
-                "nvidia",
-                "mistral",
-                "cohere",
-                "groq",
-                "openrouter",
-                "chutes",
-                "iflow",
-                "qwen_code",
-                "gemini_cli",
-                "antigravity",
-            ]:
+            # Skip if this provider name already exists (file-based plugin)
+            if provider_name in PROVIDER_PLUGINS:
                 continue
 
             # Create a dynamic plugin class
@@ -129,7 +130,10 @@ def _register_providers():
             plugin_class = create_plugin_class(provider_name)
             PROVIDER_PLUGINS[provider_name] = plugin_class
             import logging
-            logging.getLogger('rotator_library').debug(f"Registered dynamic provider: {provider_name}")
+
+            logging.getLogger("rotator_library").debug(
+                f"Registered dynamic provider: {provider_name}"
+            )
 
 
 # Discover and register providers when the package is imported

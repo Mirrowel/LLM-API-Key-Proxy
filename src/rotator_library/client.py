@@ -755,6 +755,16 @@ class RotatingClient:
         """
         Converts model parameters specifically for LiteLLM calls.
         This is called right before calling LiteLLM to handle custom providers.
+
+        Custom OpenAI-compatible providers use the pattern:
+        - <NAME>_CUSTOM_API_BASE: The custom API base URL
+        - <NAME>_API_KEY: The API key (can reuse existing keys for overrides)
+
+        This allows users to override built-in providers by setting e.g.:
+        - OPENAI_CUSTOM_API_BASE=http://my-local-llm.com/v1
+        - OPENAI_API_KEY=sk-xxx
+
+        The custom provider takes priority over LiteLLM's built-in provider.
         """
         model = kwargs.get("model")
         if not model:
@@ -763,16 +773,18 @@ class RotatingClient:
         provider = model.split("/")[0]
 
         # Handle custom OpenAI-compatible providers
-        # Check if this is a custom provider by looking for API_BASE environment variable
+        # Check if this provider has a _CUSTOM_API_BASE override
         import os
 
-        api_base_env = f"{provider.upper()}_API_BASE"
-        if os.getenv(api_base_env):
-            # For custom providers, tell LiteLLM to use openai provider with custom model name
-            # This preserves original model name in logs but converts for LiteLLM
+        custom_api_base_env = f"{provider.upper()}_CUSTOM_API_BASE"
+        custom_api_base = os.getenv(custom_api_base_env)
+
+        if custom_api_base:
+            # Custom provider override - route to custom endpoint
+            # This takes priority over LiteLLM's built-in provider
             kwargs = kwargs.copy()  # Don't modify original
             kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-            kwargs["api_base"] = os.getenv(api_base_env).rstrip("/")
+            kwargs["api_base"] = custom_api_base.rstrip("/")
             kwargs["custom_llm_provider"] = "openai"
 
         return kwargs
@@ -841,12 +853,17 @@ class RotatingClient:
         return self.oauth_credentials
 
     def _is_custom_openai_compatible_provider(self, provider_name: str) -> bool:
-        """Checks if a provider is a custom OpenAI-compatible provider."""
+        """
+        Checks if a provider is a custom OpenAI-compatible provider.
+
+        Custom providers are identified by having a _CUSTOM_API_BASE environment variable.
+        This pattern avoids collision with LiteLLM's standard *_API_BASE variables.
+        """
         import os
 
-        # Check if the provider has an API_BASE environment variable
-        api_base_env = f"{provider_name.upper()}_API_BASE"
-        return os.getenv(api_base_env) is not None
+        # Check if the provider has a _CUSTOM_API_BASE environment variable
+        custom_api_base_env = f"{provider_name.upper()}_CUSTOM_API_BASE"
+        return os.getenv(custom_api_base_env) is not None
 
     def _get_provider_instance(self, provider_name: str):
         """
