@@ -42,6 +42,14 @@ from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
+from .config import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_GLOBAL_TIMEOUT,
+    DEFAULT_ROTATION_TOLERANCE,
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
+)
 
 
 class StreamedAPIError(Exception):
@@ -62,17 +70,17 @@ class RotatingClient:
         self,
         api_keys: Optional[Dict[str, List[str]]] = None,
         oauth_credentials: Optional[Dict[str, List[str]]] = None,
-        max_retries: int = 2,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         usage_file_path: Optional[Union[str, Path]] = None,
         configure_logging: bool = True,
-        global_timeout: int = 30,
+        global_timeout: int = DEFAULT_GLOBAL_TIMEOUT,
         abort_on_callback_error: bool = True,
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         ignore_models: Optional[Dict[str, List[str]]] = None,
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
-        rotation_tolerance: float = 3.0,
+        rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
     ):
         """
@@ -200,7 +208,9 @@ class RotatingClient:
                 # Get sequential fallback from provider class
                 if hasattr(provider_class, "default_sequential_fallback_multiplier"):
                     fallback = provider_class.default_sequential_fallback_multiplier
-                    if fallback != 1:  # Only store if different from global default
+                    if (
+                        fallback != DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
+                    ):  # Only store if different from global default
                         sequential_fallback_multipliers[provider] = fallback
 
             # Override with environment variables
@@ -326,20 +336,22 @@ class RotatingClient:
                 provider_class, "default_fair_cycle_duration"
             ):
                 duration = provider_class.default_fair_cycle_duration
-                if duration != 86400:  # Only store if different from global default
+                if (
+                    duration != DEFAULT_FAIR_CYCLE_DURATION
+                ):  # Only store if different from global default
                     fair_cycle_duration[provider] = duration
 
         # Build exhaustion cooldown threshold per provider
         # Check global env first, then per-provider env, then provider class default
         exhaustion_cooldown_threshold: Dict[str, int] = {}
         global_threshold_str = os.getenv("EXHAUSTION_COOLDOWN_THRESHOLD")
-        global_threshold = 300  # Default 5 minutes
+        global_threshold = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
         if global_threshold_str:
             try:
                 global_threshold = int(global_threshold_str)
             except ValueError:
                 lib_logger.warning(
-                    f"Invalid EXHAUSTION_COOLDOWN_THRESHOLD: {global_threshold_str}. Using default 300."
+                    f"Invalid EXHAUSTION_COOLDOWN_THRESHOLD: {global_threshold_str}. Using default {DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD}."
                 )
 
         for provider in self.all_credentials.keys():
@@ -359,9 +371,11 @@ class RotatingClient:
                 provider_class, "default_exhaustion_cooldown_threshold"
             ):
                 threshold = provider_class.default_exhaustion_cooldown_threshold
-                if threshold != 300:  # Only store if different from global default
+                if (
+                    threshold != DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+                ):  # Only store if different from global default
                     exhaustion_cooldown_threshold[provider] = threshold
-            elif global_threshold != 300:
+            elif global_threshold != DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD:
                 # Use global threshold if set and different from default
                 exhaustion_cooldown_threshold[provider] = global_threshold
 

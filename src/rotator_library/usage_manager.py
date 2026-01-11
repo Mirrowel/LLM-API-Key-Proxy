@@ -14,6 +14,17 @@ from .error_handler import ClassifiedError, NoAvailableKeysError, mask_credentia
 from .providers import PROVIDER_PLUGINS
 from .utils.resilient_io import ResilientStateWriter
 from .utils.paths import get_data_file
+from .config import (
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_MODE,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE,
+    COOLDOWN_BACKOFF_TIERS,
+    COOLDOWN_BACKOFF_MAX,
+    COOLDOWN_AUTH_ERROR,
+    COOLDOWN_TRANSIENT_ERROR,
+    COOLDOWN_RATE_LIMIT_DEFAULT,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
@@ -217,7 +228,7 @@ class UsageManager:
         Returns:
             Duration in seconds (default 86400 = 24 hours)
         """
-        return self.fair_cycle_duration.get(provider, 86400)
+        return self.fair_cycle_duration.get(provider, DEFAULT_FAIR_CYCLE_DURATION)
 
     def _get_exhaustion_cooldown_threshold(self, provider: str) -> int:
         """
@@ -228,7 +239,9 @@ class UsageManager:
         Returns:
             Threshold in seconds (default 300 = 5 minutes)
         """
-        return self.exhaustion_cooldown_threshold.get(provider, 300)
+        return self.exhaustion_cooldown_threshold.get(
+            provider, DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+        )
 
     # =========================================================================
     # CUSTOM CAPS HELPERS
@@ -393,8 +406,8 @@ class UsageManager:
         Returns:
             Cooldown end timestamp (clamped), or None if can't calculate
         """
-        mode = cap_config.get("cooldown_mode", "quota_reset")
-        value = cap_config.get("cooldown_value", 0)
+        mode = cap_config.get("cooldown_mode", DEFAULT_CUSTOM_CAP_COOLDOWN_MODE)
+        value = cap_config.get("cooldown_value", DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE)
 
         if mode == "quota_reset":
             calculated = natural_reset_ts
@@ -2781,7 +2794,9 @@ class UsageManager:
             if classified_error.error_type == "quota_exceeded":
                 # Quota exhausted - use authoritative reset timestamp if available
                 quota_reset_ts = classified_error.quota_reset_timestamp
-                cooldown_seconds = classified_error.retry_after or 60
+                cooldown_seconds = (
+                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
+                )
 
                 if quota_reset_ts and reset_mode == "per_model":
                     # Set quota_reset_ts on model - this becomes authoritative stats reset time
@@ -2894,7 +2909,9 @@ class UsageManager:
 
             elif classified_error.error_type == "rate_limit":
                 # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
-                cooldown_seconds = classified_error.retry_after or 60
+                cooldown_seconds = (
+                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
+                )
                 model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
                     f"Rate limit on {mask_credential(key)} for model {model}. "
@@ -2903,8 +2920,8 @@ class UsageManager:
 
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
-                key_data["key_cooldown_until"] = now_ts + 300
-                cooldown_seconds = 300
+                key_data["key_cooldown_until"] = now_ts + COOLDOWN_AUTH_ERROR
+                cooldown_seconds = COOLDOWN_AUTH_ERROR
                 model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.warning(
                     f"Authentication error on key {mask_credential(key)}. Applying 5-minute key-level lockout."
@@ -2921,8 +2938,9 @@ class UsageManager:
 
                 # If cooldown wasn't set by specific error type, use escalating backoff
                 if cooldown_seconds is None:
-                    backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
-                    cooldown_seconds = backoff_tiers.get(count, 7200)
+                    cooldown_seconds = COOLDOWN_BACKOFF_TIERS.get(
+                        count, COOLDOWN_BACKOFF_MAX
+                    )
                     model_cooldowns[model] = now_ts + cooldown_seconds
                     lib_logger.warning(
                         f"Failure #{count} for key {mask_credential(key)} with model {model}. "
@@ -2931,7 +2949,7 @@ class UsageManager:
             else:
                 # Provider-level errors: apply short cooldown but don't count against key
                 if cooldown_seconds is None:
-                    cooldown_seconds = 30
+                    cooldown_seconds = COOLDOWN_TRANSIENT_ERROR
                     model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
                     f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} "
