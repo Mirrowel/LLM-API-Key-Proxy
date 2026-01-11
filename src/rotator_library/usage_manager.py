@@ -2585,6 +2585,10 @@ class UsageManager:
                                 },
                             )
                             other_model_data["request_count"] = new_request_count
+                            # Sync window timing (shared quota pool = shared window)
+                            window_start = model_data.get("window_start_ts")
+                            if window_start:
+                                other_model_data["window_start_ts"] = window_start
                             # Also sync quota_max_requests if set
                             max_req = model_data.get("quota_max_requests")
                             if max_req:
@@ -3184,6 +3188,10 @@ class UsageManager:
                         # Sync reset timestamp if valid
                         if valid_reset_ts:
                             other_model_data["quota_reset_ts"] = reset_timestamp
+                        # Sync window start time
+                        window_start = model_data.get("window_start_ts")
+                        if window_start:
+                            other_model_data["window_start_ts"] = window_start
                         # Sync cooldown if exhausted (with ±5 min check)
                         if is_exhausted and valid_reset_ts:
                             existing_grouped = model_cooldowns.get(grouped_model)
