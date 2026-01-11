@@ -18,6 +18,7 @@ on:
 
 jobs:
   review-pr:
+    # Bot check is in the issue_comment branch - workflow shows "skipped" for bot comments
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
@@ -26,6 +27,9 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
+        github.event.comment.user.login != 'mirrobot' &&
+        github.event.comment.user.login != 'mirrobot-agent' &&
+        github.event.comment.user.login != 'mirrobot-agent[bot]' &&
         (contains(github.event.comment.body, '/mirrobot-review') || contains(github.event.comment.body, '/mirrobot_review'))
       )
     runs-on: ubuntu-latest
@@ -43,11 +47,58 @@ jobs:
       THREAD_COMMENT_FETCH_LIMIT: '5'
 
     steps:
+      # ========================================================================
+      # COMMENT VALIDATION STEP (only for issue_comment events)
+      # ========================================================================
+      # Validates that trigger words are in actual content (not in quotes/code)
+      # If validation fails, subsequent steps are skipped
+      # ========================================================================
+      - name: Validate comment trigger
+        id: validate
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          
+          # Save comment to temp file for processing
+          TEMP_FILE=$(mktemp)
+          echo "$COMMENT_BODY" > "$TEMP_FILE"
+          
+          # Remove fenced code blocks (```...```)
+          CLEAN_BODY=$(awk '
+            /^```/ { in_code = !in_code; next }
+            !in_code { print }
+          ' "$TEMP_FILE")
+          
+          # Remove inline code (`...`)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
+          
+          # Remove quoted lines (lines starting with >)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
+          
+          rm -f "$TEMP_FILE"
+          
+          echo "Clean body after stripping quotes/code:"
+          echo "$CLEAN_BODY"
+          echo "---"
+          
+          # Check for trigger words in clean text
+          # Trigger: /mirrobot-review or /mirrobot_review
+          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]review'; then
+            echo "::notice::Valid trigger found in non-quoted, non-code text."
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Checkout repository
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
 
       - name: Bot Setup
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: setup
         uses: ./.github/actions/bot-setup
         with:
@@ -59,6 +110,7 @@ jobs:
           custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
 
       - name: Clear pending bot review
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
@@ -86,6 +138,7 @@ jobs:
           done <<< "$pending_review_ids"
 
       - name: Add reaction to PR
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
@@ -98,6 +151,7 @@ jobs:
             -f content='eyes'
 
       - name: Fetch and Format Full PR Context
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: pr_meta
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -388,6 +442,7 @@ jobs:
       
 
       - name: Determine Review Type and Last Reviewed SHA
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: review_type
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -464,9 +519,11 @@ jobs:
       
 
       - name: Save secure prompt from base branch
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         run: cp .github/prompts/pr-review.md /tmp/pr-review.md
 
       - name: Checkout PR head
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ env.PR_HEAD_SHA }}
@@ -474,7 +531,7 @@ jobs:
           fetch-depth: 0  # Full history needed for diff generation
 
       - name: Generate PR Diff for First Review
-        if: steps.review_type.outputs.is_first_review == 'true'
+        if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && steps.review_type.outputs.is_first_review == 'true'
         id: first_review_diff
         run: |
           BASE_BRANCH="${{ env.BASE_BRANCH }}"
@@ -530,7 +587,7 @@ jobs:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
 
       - name: Generate Incremental Diff
-        if: steps.review_type.outputs.is_first_review == 'false' && steps.review_type.outputs.last_reviewed_sha != ''
+        if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && steps.review_type.outputs.is_first_review == 'false' && steps.review_type.outputs.last_reviewed_sha != ''
         id: incremental_diff
         run: |
           LAST_SHA=${{ steps.review_type.outputs.last_reviewed_sha }}
@@ -575,6 +632,7 @@ jobs:
 
 
       - name: Assemble Review Prompt
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           REVIEW_TYPE: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST' || 'FOLLOW-UP' }}
           PR_AUTHOR: ${{ env.PR_AUTHOR }}
@@ -603,6 +661,7 @@ jobs:
           echo "FILTER_ERROR_COMMENTS=" >> "$GITHUB_ENV" || true
 
       - name: Review PR with OpenCode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
@@ -626,7 +685,7 @@ jobs:
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
 
       - name: Verify AI Review Footers
-        if: always()
+        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}

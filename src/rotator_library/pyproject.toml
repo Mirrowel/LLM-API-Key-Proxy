@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotator_library"
-version = "1.05"
+version = "1.15"
 authors = [
-    { name="Mirrowel", email="nuh@uh.com" },
+    { name="Mirrowel", email="mirrowel-github.appraiser015@aleeas.com" },
 ]
 description = "A robust Python client for intelligent API key rotation and retry logic, leveraging LiteLLM. It manages usage, handles various API errors (rate limits, server errors, authentication), and supports dynamic model discovery across multiple LLM providers."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",

@@ -151,6 +151,11 @@ def get_scheme_for_host(host: str, port: int) -> str:
     return "http"
 
 
+def is_full_url(host: str) -> bool:
+    """Check if host is already a full URL (starts with http:// or https://)."""
+    return host.startswith("http://") or host.startswith("https://")
+
+
 def format_cooldown(seconds: int) -> str:
     """Format cooldown seconds as human-readable string."""
     if seconds < 60:
@@ -210,9 +215,56 @@ class QuotaViewer:
         if not self.current_remote:
             return "http://127.0.0.1:8000"
         host = self.current_remote.get("host", "127.0.0.1")
+
+        # If host is a full URL, use it directly (strip trailing slash)
+        if is_full_url(host):
+            return host.rstrip("/")
+
+        # Otherwise construct from host:port
         port = self.current_remote.get("port", 8000)
         scheme = get_scheme_for_host(host, port)
         return f"{scheme}://{host}:{port}"
+
+    def _build_endpoint_url(self, endpoint: str) -> str:
+        """
+        Build a full endpoint URL with smart path handling.
+
+        Handles cases where base URL already contains a path (e.g., /v1):
+        - Base: "https://api.example.com/v1", Endpoint: "/v1/quota-stats"
+          -> "https://api.example.com/v1/quota-stats" (no duplication)
+        - Base: "http://localhost:8000", Endpoint: "/v1/quota-stats"
+          -> "http://localhost:8000/v1/quota-stats"
+
+        Args:
+            endpoint: The endpoint path (e.g., "/v1/quota-stats")
+
+        Returns:
+            Full URL string
+        """
+        base_url = self._get_base_url()
+        endpoint = endpoint.lstrip("/")
+
+        # Check if base URL already ends with a path segment that matches
+        # the start of the endpoint (e.g., base ends with /v1, endpoint starts with v1/)
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url)
+        base_path = parsed.path.rstrip("/")
+
+        # If base has a path and endpoint starts with the same segment, avoid duplication
+        if base_path:
+            # e.g., base_path = "/v1", endpoint = "v1/quota-stats"
+            # We want to produce "/v1/quota-stats", not "/v1/v1/quota-stats"
+            base_segments = base_path.split("/")
+            endpoint_segments = endpoint.split("/")
+
+            # Check if first endpoint segment matches last base segment
+            if base_segments and endpoint_segments:
+                if base_segments[-1] == endpoint_segments[0]:
+                    # Skip the duplicated segment in endpoint
+                    endpoint = "/".join(endpoint_segments[1:])
+
+        return f"{base_url}/{endpoint}"
 
     def check_connection(
         self, remote: Dict[str, Any], timeout: float = 3.0
@@ -228,9 +280,18 @@ class QuotaViewer:
             Tuple of (is_online, status_message)
         """
         host = remote.get("host", "127.0.0.1")
-        port = remote.get("port", 8000)
-        scheme = get_scheme_for_host(host, port)
-        url = f"{scheme}://{host}:{port}/"
+
+        # If host is a full URL, extract scheme and netloc to hit root
+        if is_full_url(host):
+            from urllib.parse import urlparse
+
+            parsed = urlparse(host)
+            # Hit the root domain, not the path (e.g., /v1 would 404)
+            url = f"{parsed.scheme}://{parsed.netloc}/"
+        else:
+            port = remote.get("port", 8000)
+            scheme = get_scheme_for_host(host, port)
+            url = f"{scheme}://{host}:{port}/"
 
         headers = {}
         if remote.get("api_key"):
@@ -262,7 +323,7 @@ class QuotaViewer:
         Returns:
             Stats dict or None on failure
         """
-        url = f"{self._get_base_url()}/v1/quota-stats"
+        url = self._build_endpoint_url("/v1/quota-stats")
         if provider:
             url += f"?provider={provider}"
 
@@ -437,7 +498,7 @@ class QuotaViewer:
         Returns:
             Response dict or None on failure
         """
-        url = f"{self._get_base_url()}/v1/quota-stats"
+        url = self._build_endpoint_url("/v1/quota-stats")
         payload = {
             "action": action,
             "scope": scope,
@@ -517,6 +578,14 @@ class QuotaViewer:
         remote_host = self.current_remote.get("host", "") if self.current_remote else ""
         remote_port = self.current_remote.get("port", "") if self.current_remote else ""
 
+        # Format connection display - handle full URLs
+        if is_full_url(remote_host):
+            connection_display = remote_host
+        elif remote_port:
+            connection_display = f"{remote_host}:{remote_port}"
+        else:
+            connection_display = remote_host
+
         # Calculate data age
         data_age = ""
         if self.cached_stats and self.cached_stats.get("timestamp"):
@@ -535,7 +604,7 @@ class QuotaViewer:
         )
         self.console.print("━" * 78)
         self.console.print(
-            f"Connected to: [bold]{remote_name}[/bold] ({remote_host}:{remote_port}) "
+            f"Connected to: [bold]{remote_name}[/bold] ({connection_display}) "
             f"[green]✅[/green] | {data_age}"
         )
         self.console.print()
@@ -544,13 +613,15 @@ class QuotaViewer:
             self.console.print("[yellow]No data available. Press R to reload.[/yellow]")
         else:
             # Build provider table
-            table = Table(box=None, show_header=True, header_style="bold")
-            table.add_column("Provider", style="cyan", min_width=12)
-            table.add_column("Creds", justify="center", min_width=6)
+            table = Table(
+                box=None, show_header=True, header_style="bold", padding=(0, 1)
+            )
+            table.add_column("Provider", style="cyan", min_width=10)
+            table.add_column("Creds", justify="center", min_width=5)
             table.add_column("Quota Status", min_width=28)
-            table.add_column("Requests", justify="right", min_width=9)
-            table.add_column("Tokens (in/out)", min_width=22)
-            table.add_column("Cost", justify="right", min_width=8)
+            table.add_column("Requests", justify="right", min_width=8)
+            table.add_column("Tokens (in/out)", min_width=20)
+            table.add_column("Cost", justify="right", min_width=6)
 
             providers = self.cached_stats.get("providers", {})
             provider_list = list(providers.keys())
@@ -585,8 +656,8 @@ class QuotaViewer:
                 if quota_groups:
                     quota_lines = []
                     for group_name, group_stats in quota_groups.items():
-                        # Use total requests for global view
-                        total_used = group_stats.get("total_requests_used", 0)
+                        # Use remaining requests (not used) so percentage matches displayed value
+                        total_remaining = group_stats.get("total_requests_remaining", 0)
                         total_max = group_stats.get("total_requests_max", 0)
                         total_pct = group_stats.get("total_remaining_pct")
                         tiers = group_stats.get("tiers", {})
@@ -625,15 +696,21 @@ class QuotaViewer:
                             color = "dim"
 
                         bar = create_progress_bar(total_pct)
-                        display_name = group_name[:11]
                         pct_str = f"{total_pct}%" if total_pct is not None else "?"
 
                         # Build status suffix (just tiers now, no outer parens)
                         status = tier_str
 
-                        # Compact format: "claude: 1228/1625 24% ████░░░░░░ (5(15)f/2s)"
+                        # Fixed-width format for aligned bars
+                        # Adjust these to change column spacing:
+                        QUOTA_NAME_WIDTH = 10  # name + colon, left-aligned
+                        QUOTA_USAGE_WIDTH = (
+                            12  # remaining/max ratio, right-aligned (handles 100k+)
+                        )
+                        display_name = group_name[: QUOTA_NAME_WIDTH - 1]
+                        usage_str = f"{total_remaining}/{total_max}"
                         quota_lines.append(
-                            f"[{color}]{display_name}: {total_used}/{total_max} {pct_str} {bar}[/{color}] {status}"
+                            f"[{color}]{display_name + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>4} {bar}[/{color}] {status}"
                         )
 
                     # First line goes in the main row
@@ -1012,12 +1089,17 @@ class QuotaViewer:
                 remaining_pct = group_stats.get("remaining_pct")
                 requests_used = group_stats.get("requests_used", 0)
                 requests_max = group_stats.get("requests_max")
+                requests_remaining = group_stats.get("requests_remaining")
                 is_exhausted = group_stats.get("is_exhausted", False)
                 reset_time = format_reset_time(group_stats.get("reset_time_iso"))
                 confidence = group_stats.get("confidence", "low")
 
-                # Format display
-                display = group_stats.get("display", f"{requests_used}/?")
+                # Format display - use requests_remaining/max format
+                if requests_remaining is None and requests_max:
+                    requests_remaining = max(0, requests_max - requests_used)
+                display = group_stats.get(
+                    "display", f"{requests_remaining or 0}/{requests_max or '?'}"
+                )
                 bar = create_progress_bar(remaining_pct)
 
                 # Build status text - always show reset time if available
@@ -1105,7 +1187,15 @@ class QuotaViewer:
         for idx, (remote, is_online, status_msg) in enumerate(remote_status, 1):
             name = remote.get("name", "Unknown")
             host = remote.get("host", "")
-            port = remote.get("port", 8000)
+            port = remote.get("port", "")
+
+            # Format connection display - handle full URLs
+            if is_full_url(host):
+                connection_display = host
+            elif port:
+                connection_display = f"{host}:{port}"
+            else:
+                connection_display = host
 
             is_current = name == current_name
             current_marker = " (current)" if is_current else ""
@@ -1116,7 +1206,7 @@ class QuotaViewer:
                 status_icon = f"[red]⚠️ {status_msg}[/red]"
 
             self.console.print(
-                f"   {idx}. {name:<20} {host}:{port:<6} {status_icon}{current_marker}"
+                f"   {idx}. {name:<20} {connection_display:<30} {status_icon}{current_marker}"
             )
 
         self.console.print()
@@ -1240,6 +1330,9 @@ class QuotaViewer:
         """Dialog to add a new remote."""
         self.console.print()
         self.console.print("[bold]Add New Remote[/bold]")
+        self.console.print(
+            "[dim]For full URLs (e.g., https://api.example.com/v1), leave port empty[/dim]"
+        )
         self.console.print()
 
         name = Prompt.ask("Name", default="").strip()
@@ -1247,16 +1340,27 @@ class QuotaViewer:
             self.console.print("[dim]Cancelled.[/dim]")
             return
 
-        host = Prompt.ask("Host", default="").strip()
+        host = Prompt.ask("Host (or full URL)", default="").strip()
         if not host:
             self.console.print("[dim]Cancelled.[/dim]")
             return
 
-        port_str = Prompt.ask("Port", default="8000").strip()
-        try:
-            port = int(port_str)
-        except ValueError:
-            port = 8000
+        # For full URLs, default to empty port
+        if is_full_url(host):
+            port_default = ""
+        else:
+            port_default = "8000"
+
+        port_str = Prompt.ask(
+            "Port (empty for full URLs)", default=port_default
+        ).strip()
+        if port_str == "":
+            port = ""
+        else:
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = 8000
 
         api_key = Prompt.ask("API Key (optional)", default="").strip() or None
 
@@ -1271,16 +1375,30 @@ class QuotaViewer:
         """Dialog to edit an existing remote."""
         self.console.print()
         self.console.print(f"[bold]Edit Remote: {remote['name']}[/bold]")
-        self.console.print("[dim]Press Enter to keep current value[/dim]")
+        self.console.print(
+            "[dim]Press Enter to keep current value. For full URLs, leave port empty.[/dim]"
+        )
         self.console.print()
 
         new_name = Prompt.ask("Name", default=remote["name"]).strip()
-        new_host = Prompt.ask("Host", default=remote.get("host", "")).strip()
-        new_port_str = Prompt.ask("Port", default=str(remote.get("port", 8000))).strip()
-        try:
-            new_port = int(new_port_str)
-        except ValueError:
-            new_port = remote.get("port", 8000)
+        new_host = Prompt.ask(
+            "Host (or full URL)", default=remote.get("host", "")
+        ).strip()
+
+        # Get current port, handle empty string
+        current_port = remote.get("port", "")
+        port_default = str(current_port) if current_port != "" else ""
+
+        new_port_str = Prompt.ask(
+            "Port (empty for full URLs)", default=port_default
+        ).strip()
+        if new_port_str == "":
+            new_port = ""
+        else:
+            try:
+                new_port = int(new_port_str)
+            except ValueError:
+                new_port = current_port if current_port != "" else 8000
 
         current_key = remote.get("api_key", "") or ""
         display_key = f"{current_key[:8]}..." if len(current_key) > 8 else current_key

@@ -9,7 +9,7 @@ Handles remote proxy configurations including:
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 class QuotaViewerConfig:
@@ -109,7 +109,7 @@ class QuotaViewerConfig:
         self,
         name: str,
         host: str,
-        port: int = 8000,
+        port: Optional[Union[int, str]] = 8000,
         api_key: Optional[str] = None,
         is_default: bool = False,
     ) -> bool:
@@ -118,8 +118,8 @@ class QuotaViewerConfig:
 
         Args:
             name: Display name for the remote
-            host: Hostname or IP address
-            port: Port number (default 8000)
+            host: Hostname, IP address, or full URL (e.g., https://api.example.com/v1)
+            port: Port number (default 8000). Can be None or empty string for full URLs.
             api_key: Optional API key for authentication
             is_default: Whether this should be the default remote
 
@@ -135,10 +135,18 @@ class QuotaViewerConfig:
             for remote in self.config.get("remotes", []):
                 remote["is_default"] = False
 
+        # Normalize port - allow empty/None for full URL hosts
+        if port == "" or port is None:
+            normalized_port = ""
+        else:
+            normalized_port = (
+                int(port) if isinstance(port, str) and port.isdigit() else port
+            )
+
         remote = {
             "name": name,
             "host": host,
-            "port": port,
+            "port": normalized_port,
             "api_key": api_key,
             "is_default": is_default,
         }
@@ -152,6 +160,7 @@ class QuotaViewerConfig:
         Args:
             name: Name of the remote to update
             **kwargs: Fields to update (host, port, api_key, is_default, new_name)
+                      port can be int, str, or empty string for full URL hosts
 
         Returns:
             True on success, False if remote not found

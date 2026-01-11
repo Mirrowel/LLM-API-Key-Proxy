@@ -2,8 +2,8 @@
 Antigravity Quota Tracking Mixin
 
 Provides quota tracking, estimation, and verification methods for the
-Antigravity provider. This is a mixin class that assumes the provider
-has certain methods and attributes available.
+Antigravity provider. This inherits from BaseQuotaTracker for shared
+functionality and implements Antigravity-specific quota API calls.
 
 Required from provider:
     - self._get_effective_quota_groups() -> Dict[str, List[str]]
@@ -21,15 +21,14 @@ Required from provider:
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
-from ...utils.paths import get_cache_dir
+from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
     from ...usage_manager import UsageManager
@@ -38,72 +37,67 @@ if TYPE_CHECKING:
 lib_logger = logging.getLogger("rotator_library")
 
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment variable."""
-    return os.getenv(key, str(default).lower()).lower() in ("true", "1", "yes")
-
-
 # =============================================================================
-# QUOTA COST CONSTANTS (in PERCENTAGE format)
+# QUOTA LIMITS (max requests per 100% quota)
 # =============================================================================
-# Quota costs per request as PERCENTAGE of 100% quota.
-# E.g., 0.4 means 0.4% per request = 250 requests total (100 / 0.4 = 250)
-# Derived from empirical testing - see docs/ANTIGRAVITY_QUOTA_REPORT.md
-# These are the default values; learned costs override these if available.
+# Max requests per quota period. This is the SOURCE OF TRUTH.
+# Cost percentage is derived as: 100 / max_requests
+# Using integers avoids floating-point precision issues (e.g., 149 vs 150).
+#
+# Verified empirically 2026-01-07 - see tests/quota_verification/QUOTA_TESTING_GUIDE.md
+# Learned values (from file) override these defaults if available.
 
-DEFAULT_QUOTA_COSTS: Dict[str, Dict[str, float]] = {
+DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
     "standard-tier": {
-        # Claude/GPT-OSS group (0.67% per request, ~150 requests total)
-        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
-        "claude-sonnet-4-5": 0.67,
-        "claude-sonnet-4-5-thinking": 0.67,
-        "claude-opus-4-5": 0.67,
-        "claude-opus-4-5-thinking": 0.67,
-        "gpt-oss-120b-medium": 0.67,
-        # Gemini 3 Pro group (0.42% per request, ~240 requests total)
-        # Updated 2025-12-30: was 0.25% (400 req), now 0.42% (~240 req)
-        "gemini-3-pro-high": 0.42,
-        "gemini-3-pro-low": 0.42,
-        "gemini-3-pro-preview": 0.42,
-        # Gemini 3 Flash (0.25% per request, 400 requests total - separate quota pool)
-        "gemini-3-flash": 0.25,
-        # Gemini 2.5 Flash group (0.0333% per request, ~3000 requests)
-        "gemini-2.5-flash": 0.0333,
-        "gemini-2.5-flash-thinking": 0.0333,
-        "gemini-2.5-flash-lite": 0.0333,
-        # Gemini 2.5 Pro (0.10% per request, ~1000 requests)
-        "gemini-2.5-pro": 0.1,
+        # Claude/GPT-OSS group (verified: 0.6667% per request = 150 requests)
+        "claude-sonnet-4-5": 150,
+        "claude-sonnet-4-5-thinking": 150,
+        "claude-opus-4-5": 150,
+        "claude-opus-4-5-thinking": 150,
+        "claude-sonnet-4.5": 150,
+        "claude-opus-4.5": 150,
+        "gpt-oss-120b-medium": 150,
+        # Gemini 3 Pro group (verified: 0.3125% per request = 320 requests)
+        "gemini-3-pro-high": 320,
+        "gemini-3-pro-low": 320,
+        "gemini-3-pro-preview": 320,
+        # Gemini 3 Flash (verified: 0.25% per request = 400 requests)
+        "gemini-3-flash": 400,
+        # Gemini 2.5 Flash group (verified: 0.0333% per request = 3000 requests)
+        "gemini-2.5-flash": 3000,
+        "gemini-2.5-flash-thinking": 3000,
+        # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
+        "gemini-2.5-flash-lite": 5000,
+        # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
+        "gemini-2.5-pro": 1000,
     },
     "free-tier": {
-        # Claude/GPT-OSS group (2.0% per request, 50 requests total)
-        # Updated 2025-12-30: was 1.333% (75 req), now 2.0% (50 req)
-        "claude-sonnet-4-5": 2.0,
-        "claude-sonnet-4-5-thinking": 2.0,
-        "claude-opus-4-5": 2.0,
-        "claude-opus-4-5-thinking": 2.0,
-        "gpt-oss-120b-medium": 2.0,
-        # Gemini 3 Pro group (0.67% per request, ~150 requests total)
-        # Updated 2025-12-30: was 0.40% (250 req), now 0.67% (~150 req)
-        "gemini-3-pro-high": 0.67,
-        "gemini-3-pro-low": 0.67,
-        "gemini-3-pro-preview": 0.67,
-        # Gemini 3 Flash (0.20% per request, 500 requests total - separate quota pool)
-        "gemini-3-flash": 0.20,
-        # Gemini 2.5 Flash group (same as standard-tier)
-        "gemini-2.5-flash": 0.0333,
-        "gemini-2.5-flash-thinking": 0.0333,
-        "gemini-2.5-flash-lite": 0.0333,
-        # Gemini 2.5 Pro (same as standard-tier)
-        "gemini-2.5-pro": 0.1,
+        # Claude/GPT-OSS group (verified: 2.0% per request = 50 requests)
+        "claude-sonnet-4-5": 50,
+        "claude-sonnet-4-5-thinking": 50,
+        "claude-opus-4-5": 50,
+        "claude-opus-4-5-thinking": 50,
+        "claude-sonnet-4.5": 50,
+        "claude-opus-4.5": 50,
+        "gpt-oss-120b-medium": 50,
+        # Gemini 3 Pro group (verified: 0.6667% per request = 150 requests)
+        "gemini-3-pro-high": 150,
+        "gemini-3-pro-low": 150,
+        "gemini-3-pro-preview": 150,
+        # Gemini 3 Flash (verified: 0.2% per request = 500 requests)
+        "gemini-3-flash": 500,
+        # Gemini 2.5 Flash group (verified: 0.0333% per request = 3000 requests)
+        "gemini-2.5-flash": 3000,
+        "gemini-2.5-flash-thinking": 3000,
+        # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
+        "gemini-2.5-flash-lite": 5000,
+        # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
+        "gemini-2.5-pro": 1000,
     },
 }
 
-# Default quota cost for unknown models (1% = 100 requests max)
-DEFAULT_QUOTA_COST_UNKNOWN = 1.0
-
-# Delay before fetching quota after a request (API needs time to update)
-# Used by discover_quota_costs() for manual cost discovery
-QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
+# Default max requests for unknown models (1% = 100 requests)
+DEFAULT_MAX_REQUESTS_UNKNOWN = 100
 
 # =============================================================================
 # MODEL NAME MAPPINGS
@@ -111,33 +105,26 @@ QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
 # Some user-facing model names don't exist in the API response.
 # These mappings convert between user-facing names and API names.
 
-# User-facing name → API name (for looking up quota in fetchAvailableModels response)
+# User-facing name -> API name (for looking up quota in fetchAvailableModels response)
 _USER_TO_API_MODEL_MAP: Dict[str, str] = {
-    "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API
+    "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (legacy)
+    "claude-opus-4.5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (new format)
     "gemini-3-pro-preview": "gemini-3-pro-high",  # Preview maps to high by default
 }
 
-# API name → User-facing name (for consistency when processing API responses)
+# API name -> User-facing name (for consistency when processing API responses)
 _API_TO_USER_MODEL_MAP: Dict[str, str] = {
-    "claude-opus-4-5-thinking": "claude-opus-4-5",  # Normalize to user-facing name
-    "claude-sonnet-4-5-thinking": "claude-sonnet-4-5",  # Normalize to user-facing name
+    "claude-opus-4-5-thinking": "claude-opus-4.5",  # Normalize to new user-facing name
+    "claude-opus-4-5": "claude-opus-4.5",  # Normalize old format to new
+    "claude-sonnet-4-5-thinking": "claude-sonnet-4.5",  # Normalize to new user-facing name
+    "claude-sonnet-4-5": "claude-sonnet-4.5",  # Normalize old format to new
     "gemini-3-pro-high": "gemini-3-pro-preview",  # Could map to preview (but high is valid too)
     "gemini-3-pro-low": "gemini-3-pro-preview",  # Could map to preview (but low is valid too)
     "gemini-2.5-flash-thinking": "gemini-2.5-flash",  # Normalize to user-facing name
 }
 
 
-def _get_antigravity_cache_dir() -> Path:
-    """Get the cache directory for Antigravity files."""
-    return get_cache_dir(subdir="antigravity")
-
-
-def _get_learned_costs_file() -> Path:
-    """Get path to the learned quota costs JSON file."""
-    return _get_antigravity_cache_dir() / "learned_quota_costs.json"
-
-
-class AntigravityQuotaTracker:
+class AntigravityQuotaTracker(BaseQuotaTracker):
     """
     Mixin class providing quota tracking functionality for Antigravity provider.
 
@@ -153,25 +140,47 @@ class AntigravityQuotaTracker:
             ...
 
     The provider class must initialize these instance attributes in __init__:
-        self._learned_costs: Dict[str, Dict[str, float]] = {}
+        self._learned_costs: Dict[str, Dict[str, int]] = {}
         self._learned_costs_loaded: bool = False
         self._quota_refresh_interval: int = 300  # 5 min default
     """
 
+    # =========================================================================
+    # CLASS ATTRIBUTES - BaseQuotaTracker configuration
+    # =========================================================================
+
+    provider_env_prefix = "ANTIGRAVITY"
+    cache_subdir = "antigravity"
+    user_to_api_model_map = _USER_TO_API_MODEL_MAP
+    api_to_user_model_map = _API_TO_USER_MODEL_MAP
+
     # Type hints for attributes that must exist on the provider
-    _learned_costs: Dict[str, Dict[str, float]]
+    _learned_costs: Dict[str, Dict[str, int]]
     _learned_costs_loaded: bool
     _quota_refresh_interval: int
     project_tier_cache: Dict[str, str]
     project_id_cache: Dict[str, str]
 
+    # =========================================================================
+    # ANTIGRAVITY-SPECIFIC HELPERS
+    # =========================================================================
+
+    def _get_provider_prefix(self) -> str:
+        """Get the provider prefix for model names."""
+        return "antigravity"
+
+    # =========================================================================
+    # LEARNED COSTS MANAGEMENT (Override for integer max_requests)
+    # =========================================================================
+
     def _load_learned_costs(self) -> None:
-        """Load learned quota costs from persistent file."""
+        """Load learned max_requests values from persistent file."""
         if self._learned_costs_loaded:
             return
 
-        costs_file = _get_learned_costs_file()
+        costs_file = self._get_learned_costs_file()
         if not costs_file.exists():
+            self._learned_costs = {}
             self._learned_costs_loaded = True
             return
 
@@ -179,10 +188,26 @@ class AntigravityQuotaTracker:
             with open(costs_file, "r") as f:
                 data = json.load(f)
 
-            self._learned_costs = data.get("costs", {})
+            # Support both old format (float costs) and new format (int max_requests)
+            raw_costs = data.get("max_requests", data.get("costs", {}))
+
+            # Convert to int if loading old float format
+            self._learned_costs = {}
+            for tier, models in raw_costs.items():
+                self._learned_costs[tier] = {}
+                for model, value in models.items():
+                    if isinstance(value, float) and value < 10:
+                        # Old format: cost percentage -> convert to max_requests
+                        self._learned_costs[tier][model] = (
+                            int(100.0 / value) if value > 0 else 100
+                        )
+                    else:
+                        # New format: already max_requests
+                        self._learned_costs[tier][model] = int(value)
+
             lib_logger.debug(
-                f"Loaded learned quota costs from {costs_file.name}: "
-                f"{sum(len(m) for m in self._learned_costs.values())} model costs"
+                f"Loaded learned quota limits from {costs_file.name}: "
+                f"{sum(len(m) for m in self._learned_costs.values())} model entries"
             )
         except (json.JSONDecodeError, IOError) as e:
             lib_logger.warning(f"Failed to load learned costs: {e}")
@@ -191,20 +216,20 @@ class AntigravityQuotaTracker:
         self._learned_costs_loaded = True
 
     def _save_learned_costs(self) -> None:
-        """Persist learned quota costs to file."""
-        costs_file = _get_learned_costs_file()
+        """Persist learned max_requests values to file."""
+        costs_file = self._get_learned_costs_file()
         costs_file.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
-            "schema_version": 1,
+            "schema_version": 2,
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "costs": self._learned_costs,
+            "max_requests": self._learned_costs,
         }
 
         try:
             with open(costs_file, "w") as f:
                 json.dump(data, f, indent=2)
-            lib_logger.debug(f"Saved learned quota costs to {costs_file.name}")
+            lib_logger.debug(f"Saved learned quota limits to {costs_file.name}")
         except IOError as e:
             lib_logger.warning(f"Failed to save learned costs: {e}")
 
@@ -212,56 +237,58 @@ class AntigravityQuotaTracker:
         """
         Get quota cost per request for a model/tier combination.
 
-        Priority:
-        1. Learned costs (from file, validated by measurement)
-        2. Default costs (from constants)
-        3. Unknown model fallback
+        Cost is DERIVED from max_requests: cost = 100 / max_requests
+        This ensures exact integer results when calculating max_requests back.
 
         Args:
             model: Model name (without provider prefix)
             tier: Account tier ("standard-tier" or "free-tier")
 
         Returns:
-            Cost as fraction (e.g., 0.004 = 0.40% per request)
+            Cost as percentage (e.g., 0.6667 for 0.6667% per request)
         """
-        # Ensure learned costs are loaded
-        self._load_learned_costs()
-
-        # Strip provider prefix if present
-        clean_model = model.split("/")[-1] if "/" in model else model
-
-        # Check learned costs first
-        if tier in self._learned_costs:
-            if clean_model in self._learned_costs[tier]:
-                return self._learned_costs[tier][clean_model]
-
-        # Fall back to defaults
-        if tier in DEFAULT_QUOTA_COSTS:
-            if clean_model in DEFAULT_QUOTA_COSTS[tier]:
-                return DEFAULT_QUOTA_COSTS[tier][clean_model]
-
-        # Unknown model - use conservative estimate
-        lib_logger.debug(
-            f"Unknown quota cost for model={clean_model}, tier={tier}. "
-            f"Using default {DEFAULT_QUOTA_COST_UNKNOWN}"
-        )
-        return DEFAULT_QUOTA_COST_UNKNOWN
+        max_requests = self.get_max_requests_for_model(model, tier)
+        if max_requests <= 0:
+            return 100.0  # Fallback: 1 request max
+        return 100.0 / max_requests
 
     def get_max_requests_for_model(self, model: str, tier: str) -> int:
         """
-        Calculate maximum requests per 100% quota for a model/tier.
+        Get maximum requests per 100% quota for a model/tier.
+
+        This is a direct lookup from DEFAULT_MAX_REQUESTS (source of truth).
+        Learned values override defaults if available.
+        Using integers avoids floating-point precision issues.
 
         Args:
             model: Model name
             tier: Account tier
 
         Returns:
-            Max requests (e.g., 250 for Claude on standard-tier)
+            Max requests (e.g., 150 for Claude on standard-tier)
         """
-        cost_percent = self.get_quota_cost(model, tier)  # Returns percentage
-        if cost_percent <= 0:
-            return 0
-        return int(100.0 / cost_percent)  # 100% / cost_percent
+        # Ensure learned values are loaded
+        self._load_learned_costs()
+
+        # Strip provider prefix if present
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        # Check learned values first (stored as max_requests integers)
+        if tier in self._learned_costs:
+            if clean_model in self._learned_costs[tier]:
+                return self._learned_costs[tier][clean_model]
+
+        # Fall back to defaults
+        if tier in DEFAULT_MAX_REQUESTS:
+            if clean_model in DEFAULT_MAX_REQUESTS[tier]:
+                return DEFAULT_MAX_REQUESTS[tier][clean_model]
+
+        # Unknown model - use conservative default
+        lib_logger.debug(
+            f"Unknown max requests for model={clean_model}, tier={tier}. "
+            f"Using default {DEFAULT_MAX_REQUESTS_UNKNOWN}"
+        )
+        return DEFAULT_MAX_REQUESTS_UNKNOWN
 
     def _get_quota_group_for_model(self, model: str) -> Optional[str]:
         """Get the quota group name for a model."""
@@ -272,37 +299,128 @@ class AntigravityQuotaTracker:
                 return group_name
         return None
 
-    def _user_to_api_model(self, model: str) -> str:
+    # =========================================================================
+    # BaseQuotaTracker ABSTRACT METHOD IMPLEMENTATIONS
+    # =========================================================================
+
+    async def _fetch_quota_for_credential(
+        self,
+        credential_path: str,
+    ) -> Dict[str, Any]:
         """
-        Convert user-facing model name to API model name for quota lookup.
+        Fetch quota information from the Antigravity fetchAvailableModels API.
+        """
+        return await self.fetch_quota_from_api(credential_path)
 
-        Some models the user requests don't exist in the API response:
-        - claude-opus-4-5 → claude-opus-4-5-thinking (opus only has thinking variant)
-        - gemini-3-pro-preview → gemini-3-pro-high (preview maps to high by default)
-
-        Args:
-            model: User-facing model name (without provider prefix)
+    def _extract_model_quota_from_response(
+        self,
+        quota_data: Dict[str, Any],
+        tier: str,
+    ) -> List[Tuple[str, float, Optional[int]]]:
+        """
+        Extract model quota information from Antigravity models response.
 
         Returns:
-            API model name to look up in fetchAvailableModels response
+            List of tuples: (model_name, remaining_fraction, max_requests)
         """
-        clean_model = model.split("/")[-1] if "/" in model else model
-        return _USER_TO_API_MODEL_MAP.get(clean_model, clean_model)
+        results = []
 
-    def _api_to_user_model(self, model: str) -> str:
+        # Get user-facing model names we care about
+        available_models = set(self._get_available_models())
+
+        # Track which user-facing models we've already added to avoid duplicates
+        added_models: set = set()
+
+        for api_model_name, model_info in quota_data.get("models", {}).items():
+            remaining = model_info.get("remaining_fraction")
+            if remaining is None:
+                continue
+
+            # Convert API name to user-facing name
+            user_model = self._api_to_user_model(api_model_name)
+
+            # Only include if this is a model we expose to users
+            if user_model not in available_models:
+                continue
+
+            # Skip duplicates (e.g., claude-sonnet-4-5 and claude-sonnet-4-5-thinking)
+            if user_model in added_models:
+                continue
+
+            # Calculate max_requests for this model/tier
+            max_requests = self.get_max_requests_for_model(user_model, tier)
+
+            results.append((user_model, remaining, max_requests))
+            added_models.add(user_model)
+
+        return results
+
+    async def _make_test_request(
+        self,
+        credential_path: str,
+        model: str,
+    ) -> Dict[str, Any]:
         """
-        Convert API model name to user-facing model name.
-
-        Normalizes API-specific names (like -thinking variants) to user-facing names
-        for consistent storage and display.
+        Make a minimal test request to consume quota.
 
         Args:
-            model: API model name from fetchAvailableModels response
+            credential_path: Credential to use
+            model: Model to test
 
         Returns:
-            User-facing model name
+            {"success": bool, "error": str | None}
         """
-        return _API_TO_USER_MODEL_MAP.get(model, model)
+        try:
+            # Get auth header
+            auth_header = await self.get_auth_header(credential_path)
+            access_token = auth_header["Authorization"].split(" ")[1]
+
+            # Get project_id
+            project_id = self.project_id_cache.get(credential_path)
+            if not project_id:
+                project_id = await self._discover_project_id(
+                    credential_path, access_token, {}
+                )
+
+            # Map user model to internal model name
+            internal_model = self._user_to_api_model(model)
+
+            # Build minimal request payload
+            url = f"{self._get_base_url()}:generateContent"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                **self._get_antigravity_headers(),
+            }
+
+            payload = {
+                "project": project_id,
+                "model": internal_model,
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": "Say 'test'"}]}],
+                    "generationConfig": {"maxOutputTokens": 10},
+                },
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url, headers=headers, json=payload, timeout=60
+                )
+
+                if response.status_code == 200:
+                    return {"success": True, "error": None}
+                else:
+                    return {
+                        "success": False,
+                        "error": f"HTTP {response.status_code}: {response.text[:200]}",
+                    }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # ANTIGRAVITY-SPECIFIC QUOTA API
+    # =========================================================================
 
     async def fetch_quota_from_api(
         self,
@@ -423,6 +541,10 @@ class AntigravityQuotaTracker:
                 "fetched_at": time.time(),
             }
 
+    # =========================================================================
+    # QUOTA ESTIMATION (Antigravity-specific)
+    # =========================================================================
+
     def estimate_remaining_quota(
         self,
         credential_path: str,
@@ -498,11 +620,10 @@ class AntigravityQuotaTracker:
         is_exhausted = estimated_remaining <= 0
         remaining_percent = f"{int(estimated_remaining * 100)}%"
         requests_used = current_request_count
-        display = (
-            f"{requests_used}/{max_requests}"
-            if max_requests > 0
-            else f"{requests_used}/?"
+        requests_remaining = (
+            max(0, max_requests - requests_used) if max_requests > 0 else 0
         )
+        display = f"{requests_remaining}/{max_requests}" if max_requests > 0 else f"?/?"
 
         return {
             "remaining_fraction": estimated_remaining,
@@ -510,6 +631,7 @@ class AntigravityQuotaTracker:
             "is_exhausted": is_exhausted,
             "is_estimated": is_estimated,
             "requests_used": requests_used,
+            "requests_remaining": requests_remaining,
             "requests_total": max_requests,
             "display": display,
             "confidence": confidence,
@@ -518,38 +640,9 @@ class AntigravityQuotaTracker:
             else None,
         }
 
-    def discover_all_credentials(
-        self,
-        oauth_base_dir: Optional[Path] = None,
-    ) -> List[str]:
-        """
-        Discover all Antigravity credentials (file-based and env-based).
-
-        Args:
-            oauth_base_dir: Directory for file-based credentials (default: oauth_creds)
-
-        Returns:
-            List of credential identifiers (file paths or env:// URIs)
-        """
-        credentials = []
-
-        # 1. File-based credentials
-        file_creds = self.list_credentials(oauth_base_dir)
-        credentials.extend([c["file_path"] for c in file_creds])
-
-        # 2. Env-based credentials
-        # Check for ANTIGRAVITY_1_ACCESS_TOKEN, ANTIGRAVITY_2_ACCESS_TOKEN, etc.
-        for i in range(1, 100):  # Reasonable upper limit
-            if os.getenv(f"ANTIGRAVITY_{i}_ACCESS_TOKEN"):
-                credentials.append(f"env://antigravity/{i}")
-            else:
-                break  # Stop at first gap
-
-        # Also check legacy single credential (if no numbered ones found)
-        if not credentials and os.getenv("ANTIGRAVITY_ACCESS_TOKEN"):
-            credentials.append("env://antigravity/0")
-
-        return credentials
+    # =========================================================================
+    # GET ALL QUOTA INFO (uses shared infrastructure)
+    # =========================================================================
 
     async def get_all_quota_info(
         self,
@@ -585,8 +678,9 @@ class AntigravityQuotaTracker:
                                 "is_estimated": bool,
                                 "is_exhausted": bool,
                                 "requests_used": int,
+                                "requests_remaining": int,
                                 "requests_total": int,
-                                "display": str,
+                                "display": str,  # remaining/max format
                                 "reset_time_iso": str | None,
                                 "models": List[str],
                             }
@@ -723,6 +817,11 @@ class AntigravityQuotaTracker:
                             is_estimated = False
                             confidence = "low"
 
+                        requests_remaining = (
+                            max(0, max_requests - total_requests)
+                            if max_requests > 0
+                            else 0
+                        )
                         group_info.update(
                             {
                                 "remaining_fraction": estimated_remaining,
@@ -730,8 +829,9 @@ class AntigravityQuotaTracker:
                                 "is_estimated": is_estimated,
                                 "is_exhausted": estimated_remaining <= 0,
                                 "requests_used": total_requests,
+                                "requests_remaining": requests_remaining,
                                 "requests_total": max_requests,
-                                "display": f"{total_requests}/{max_requests}",
+                                "display": f"{requests_remaining}/{max_requests}",
                                 "reset_time_iso": reset_time_iso,
                                 "confidence": confidence,
                             }
@@ -775,6 +875,10 @@ class AntigravityQuotaTracker:
             },
             "timestamp": time.time(),
         }
+
+    # =========================================================================
+    # BASELINE MANAGEMENT (Override for Antigravity-specific cooldown logging)
+    # =========================================================================
 
     async def refresh_active_quota_baselines(
         self,
@@ -899,6 +1003,10 @@ class AntigravityQuotaTracker:
         # Get user-facing model names we care about
         available_models = set(self._get_available_models())
 
+        # Aggregate cooldown info for consolidated logging
+        # Structure: {short_cred_name: {group_or_model: hours_until_reset}}
+        cooldowns_by_cred: Dict[str, Dict[str, float]] = {}
+
         for cred_path, quota_data in quota_results.items():
             if quota_data.get("status") != "success":
                 continue
@@ -909,6 +1017,14 @@ class AntigravityQuotaTracker:
             models = quota_data.get("models", {})
             # Track which user-facing models we've already stored to avoid duplicates
             stored_for_cred: set = set()
+
+            # Short credential name for logging (strip antigravity_ prefix and .json suffix)
+            if cred_path.startswith("env://"):
+                short_cred = cred_path.split("/")[-1]
+            else:
+                short_cred = Path(cred_path).stem
+                if short_cred.startswith("antigravity_"):
+                    short_cred = short_cred[len("antigravity_") :]
 
             for api_model_name, model_info in models.items():
                 remaining = model_info.get("remaining_fraction")
@@ -930,13 +1046,38 @@ class AntigravityQuotaTracker:
                 # Calculate max_requests for this model/tier
                 max_requests = self.get_max_requests_for_model(user_model, tier)
 
+                # Extract reset_timestamp (already parsed to float in fetch_quota_from_api)
+                reset_timestamp = model_info.get("reset_timestamp")
+
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
-                await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests
+                cooldown_info = await usage_manager.update_quota_baseline(
+                    cred_path, prefixed_model, remaining, max_requests, reset_timestamp
                 )
+
+                # Aggregate cooldown info if returned
+                if cooldown_info:
+                    group_or_model = cooldown_info["group_or_model"]
+                    hours = cooldown_info["hours_until_reset"]
+                    if short_cred not in cooldowns_by_cred:
+                        cooldowns_by_cred[short_cred] = {}
+                    # Only keep first occurrence per group/model (avoids duplicates)
+                    if group_or_model not in cooldowns_by_cred[short_cred]:
+                        cooldowns_by_cred[short_cred][group_or_model] = hours
+
                 stored_for_cred.add(user_model)
                 stored_count += 1
+
+        # Log consolidated message for all cooldowns
+        if cooldowns_by_cred:
+            # Build message: "oauth_1[claude 3.4h, gemini-3-pro 2.1h], oauth_2[claude 5.2h]"
+            parts = []
+            for cred_name, groups in sorted(cooldowns_by_cred.items()):
+                group_strs = [f"{g} {h:.1f}h" for g, h in sorted(groups.items())]
+                parts.append(f"{cred_name}[{', '.join(group_strs)}]")
+            lib_logger.info(f"Antigravity quota exhausted: {', '.join(parts)}")
+        else:
+            lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
 
         return stored_count
 
@@ -946,13 +1087,13 @@ class AntigravityQuotaTracker:
         models_to_test: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Discover quota costs by making test requests and measuring before/after.
+        Discover quota limits by making test requests and measuring before/after.
 
         MANUAL USE ONLY - This makes actual API requests that consume quota.
-        Use once per new tier to establish baseline costs for unknown tiers.
+        Use once per new tier to establish baseline limits for unknown tiers.
 
         The method tests one model per quota group, measures the quota consumption,
-        and stores the discovered costs in the learned_costs.json file.
+        and stores the discovered max_requests in the learned_quota_costs.json file.
 
         Args:
             credential_path: Credential to test with (file path or env:// URI)
@@ -963,7 +1104,7 @@ class AntigravityQuotaTracker:
                 "status": "success" | "partial" | "error",
                 "tier": str,
                 "credential": str,
-                "discovered_costs": {"model": cost_percent, ...},
+                "discovered_max_requests": {"model": max_requests_int, ...},
                 "updated_groups": ["group1", "group2", ...],
                 "errors": [...],
                 "message": str,
@@ -979,7 +1120,7 @@ class AntigravityQuotaTracker:
             "status": "error",
             "tier": "unknown",
             "credential": identifier,
-            "discovered_costs": {},
+            "discovered_max_requests": {},
             "updated_groups": [],
             "errors": [],
             "message": "",
@@ -1031,7 +1172,7 @@ class AntigravityQuotaTracker:
         )
 
         # 3. Test each model
-        discovered_costs: Dict[str, float] = {}
+        discovered_max_requests: Dict[str, int] = {}
         updated_groups: List[str] = []
 
         for model in models_to_test:
@@ -1090,7 +1231,7 @@ class AntigravityQuotaTracker:
                     # Quota exhausted after our request
                     after_remaining = 0.0
 
-                # Calculate cost
+                # Calculate max_requests from the delta
                 delta = before_remaining - after_remaining
                 if delta < 0:
                     result["errors"].append(
@@ -1098,7 +1239,7 @@ class AntigravityQuotaTracker:
                     )
                     continue
 
-                cost_percent = round(delta * 100.0, 4)
+                cost_percent = delta * 100.0  # Convert fraction to percentage
 
                 if cost_percent < 0.001:
                     result["errors"].append(
@@ -1106,10 +1247,13 @@ class AntigravityQuotaTracker:
                     )
                     continue
 
-                discovered_costs[model] = cost_percent
+                # Calculate max_requests as integer (source of truth)
+                max_requests = int(round(100.0 / cost_percent))
+
+                discovered_max_requests[model] = max_requests
                 lib_logger.info(
-                    f"Discovered cost for {model}: {cost_percent}% per request "
-                    f"(~{int(100.0 / cost_percent)} requests per 100%)"
+                    f"Discovered max requests for {model}: {max_requests} "
+                    f"({cost_percent:.4f}% per request)"
                 )
 
                 # Update all models in the same group
@@ -1117,93 +1261,30 @@ class AntigravityQuotaTracker:
                 if quota_group:
                     groups = self._get_effective_quota_groups()
                     for group_model in groups.get(quota_group, []):
-                        discovered_costs[group_model] = cost_percent
+                        discovered_max_requests[group_model] = max_requests
                     updated_groups.append(quota_group)
 
             except Exception as e:
                 result["errors"].append(f"{model}: Exception: {e}")
                 lib_logger.warning(f"Error testing {model}: {e}")
 
-        # 4. Save discovered costs to file
-        if discovered_costs:
+        # 4. Save discovered max_requests to file
+        if discovered_max_requests:
             self._load_learned_costs()
             if tier not in self._learned_costs:
                 self._learned_costs[tier] = {}
-            self._learned_costs[tier].update(discovered_costs)
+            self._learned_costs[tier].update(discovered_max_requests)
             self._save_learned_costs()
 
             result["status"] = "success" if not result["errors"] else "partial"
-            result["discovered_costs"] = discovered_costs
+            result["discovered_max_requests"] = discovered_max_requests
             result["updated_groups"] = updated_groups
             result["message"] = (
-                f"Discovered costs for {len(discovered_costs)} models in tier '{tier}'. "
+                f"Discovered max requests for {len(discovered_max_requests)} models in tier '{tier}'. "
                 f"Saved to learned_quota_costs.json"
             )
             lib_logger.info(result["message"])
         else:
-            result["message"] = "No costs discovered"
+            result["message"] = "No max requests discovered"
 
         return result
-
-    async def _make_test_request(
-        self,
-        credential_path: str,
-        model: str,
-    ) -> Dict[str, Any]:
-        """
-        Make a minimal test request to consume quota.
-
-        Args:
-            credential_path: Credential to use
-            model: Model to test
-
-        Returns:
-            {"success": bool, "error": str | None}
-        """
-        try:
-            # Get auth header
-            auth_header = await self.get_auth_header(credential_path)
-            access_token = auth_header["Authorization"].split(" ")[1]
-
-            # Get project_id
-            project_id = self.project_id_cache.get(credential_path)
-            if not project_id:
-                project_id = await self._discover_project_id(
-                    credential_path, access_token, {}
-                )
-
-            # Map user model to internal model name
-            internal_model = self._user_to_api_model(model)
-
-            # Build minimal request payload
-            url = f"{self._get_base_url()}:generateContent"
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
-            }
-
-            payload = {
-                "project": project_id,
-                "model": internal_model,
-                "request": {
-                    "contents": [{"role": "user", "parts": [{"text": "Say 'test'"}]}],
-                    "generationConfig": {"maxOutputTokens": 10},
-                },
-            }
-
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url, headers=headers, json=payload, timeout=60
-                )
-
-                if response.status_code == 200:
-                    return {"success": True, "error": None}
-                else:
-                    return {
-                        "success": False,
-                        "error": f"HTTP {response.status_code}: {response.text[:200]}",
-                    }
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}

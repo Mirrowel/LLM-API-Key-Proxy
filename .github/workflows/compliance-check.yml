@@ -59,20 +59,22 @@ on:
 
 jobs:
   compliance-check:
-    # Run when:
-    # 1. Manual trigger via workflow_dispatch
-    # 2. PR marked ready for review or labeled 'ready-for-merge'
-    # 3. Comment contains '/mirrobot-check' or '/mirrobot_check'
-    # Note: ready_for_review will wait for PR Review to complete (see step below)
+    # Bot check is in the issue_comment branch - workflow shows "skipped" for bot comments
+    # Note: workflow_run is NOT in this condition - the trigger exists but job skips unless other conditions match
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && 
        (github.event.action == 'ready_for_review' ||
         (github.event.action == 'labeled' && contains(github.event.label.name, 'ready-for-merge')))) ||
-      (github.event_name == 'issue_comment' && 
-       github.event.issue.pull_request && 
-       (contains(github.event.comment.body, '/mirrobot-check') || 
-        contains(github.event.comment.body, '/mirrobot_check')))
+      (
+        github.event_name == 'issue_comment' && 
+        github.event.issue.pull_request &&
+        github.event.comment.user.login != 'mirrobot' &&
+        github.event.comment.user.login != 'mirrobot-agent' &&
+        github.event.comment.user.login != 'mirrobot-agent[bot]' &&
+        (contains(github.event.comment.body, '/mirrobot-check') || 
+         contains(github.event.comment.body, '/mirrobot_check'))
+      )
     runs-on: ubuntu-latest
     
     # Minimal permissions following principle of least privilege
@@ -159,16 +161,64 @@ jobs:
         ]
 
     steps:
+      # ========================================================================
+      # COMMENT VALIDATION STEP (only for issue_comment events)
+      # ========================================================================
+      # Validates that trigger words are in actual content (not in quotes/code)
+      # If validation fails, subsequent steps are skipped
+      # ========================================================================
+      - name: Validate comment trigger
+        id: validate
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          
+          # Save comment to temp file for processing
+          TEMP_FILE=$(mktemp)
+          echo "$COMMENT_BODY" > "$TEMP_FILE"
+          
+          # Remove fenced code blocks (```...```)
+          CLEAN_BODY=$(awk '
+            /^```/ { in_code = !in_code; next }
+            !in_code { print }
+          ' "$TEMP_FILE")
+          
+          # Remove inline code (`...`)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
+          
+          # Remove quoted lines (lines starting with >)
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
+          
+          rm -f "$TEMP_FILE"
+          
+          echo "Clean body after stripping quotes/code:"
+          echo "$CLEAN_BODY"
+          echo "---"
+          
+          # Check for trigger words in clean text
+          # Trigger: /mirrobot-check or /mirrobot_check
+          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then
+            echo "::notice::Valid trigger found in non-quoted, non-code text."
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+          fi
+
       # ======================================================================
       # PHASE 1: SECURE SETUP
       # ======================================================================
       # SECURITY: Checkout base branch first to access trusted prompt file.
       # This prevents malicious PRs from injecting code into the AI prompt.
       - name: Checkout base branch (for trusted prompt)
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
 
       # Initialize bot credentials and OpenCode API access
       - name: Bot Setup
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: setup
         uses: ./.github/actions/bot-setup
         with:
@@ -186,7 +236,7 @@ jobs:
       # This ensures sequential execution: PR Review → Compliance Check
       # For other triggers (labels, comments), skip and proceed immediately
       - name: Wait for PR Review Workflow (if triggered by ready_for_review)
-        if: github.event.action == 'ready_for_review'
+        if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && github.event.action == 'ready_for_review'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
         run: |
@@ -233,6 +283,7 @@ jobs:
       # ======================================================================
       # Fetch PR metadata: title, author, files changed, labels, reviewers
       - name: Get PR Metadata
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: pr_info
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -277,6 +328,7 @@ jobs:
       # Retrieve previous compliance check results for this PR
       # This allows the AI to track previously identified issues
       - name: Fetch Previous Compliance Reviews
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: prev_reviews
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -314,11 +366,13 @@ jobs:
       # CRITICAL: Save the trusted prompt from base branch to /tmp BEFORE
       # checking out PR code. This prevents prompt injection attacks.
       - name: Save secure prompt from base branch
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         run: cp .github/prompts/compliance-check.md /tmp/compliance-check.md
 
       # NOW it's safe to checkout the PR code (untrusted)
       # The prompt is already secured in /tmp
       - name: Checkout PR Head for Diff Generation
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr_info.outputs.head_sha }}
@@ -327,6 +381,7 @@ jobs:
       # Generate a unified diff of all PR changes for the AI to analyze
       # The diff is saved to a file for efficient context usage
       - name: Generate PR Diff
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: diff
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
@@ -384,6 +439,7 @@ jobs:
       # ======================================================================
       # Convert FILE_GROUPS_JSON to human-readable format for AI prompt
       - name: Format File Groups for Prompt
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: file_groups
         run: |
           # Convert JSON config to human-readable format for the AI
@@ -404,6 +460,7 @@ jobs:
       # Create template structure for the compliance report
       # AI will fill in the analysis sections
       - name: Generate Report Template
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: template
         run: |
           cat > /tmp/report_template.md <<'TEMPLATE'
@@ -447,6 +504,7 @@ jobs:
       # Substitute environment variables into the prompt template
       # Uses the TRUSTED prompt from /tmp (not from PR code)
       - name: Assemble Compliance Prompt
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           PR_NUMBER: ${{ env.PR_NUMBER }}
           PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
@@ -470,6 +528,7 @@ jobs:
       # The AI will analyze the PR using multiple turns (5-20+ expected)
       # and post its findings as a comment + status check
       - name: Run Compliance Check with OpenCode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           OPENCODE_PERMISSION: |
@@ -496,7 +555,7 @@ jobs:
       # If enabled, prepend @reviewer mentions to the compliance report
       # This is controlled by ENABLE_REVIEWER_MENTIONS at the top
       - name: Prepend Reviewer Mentions to Posted Comment
-        if: always() && env.ENABLE_REVIEWER_MENTIONS == 'true'
+        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && env.ENABLE_REVIEWER_MENTIONS == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -541,7 +600,7 @@ jobs:
           fi
 
       - name: Verify Compliance Review Footers
-        if: always()
+        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
