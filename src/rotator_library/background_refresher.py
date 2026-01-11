@@ -10,6 +10,22 @@ if TYPE_CHECKING:
 
 lib_logger = logging.getLogger("rotator_library")
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+# These can be overridden via environment variables.
+
+# OAuth token refresh interval in seconds
+# Override: OAUTH_REFRESH_INTERVAL=<seconds>
+DEFAULT_OAUTH_REFRESH_INTERVAL: int = 600  # 10 minutes
+
+# Default interval for provider background jobs (quota refresh, etc.)
+# Individual providers can override this in their get_background_job_config()
+DEFAULT_BACKGROUND_JOB_INTERVAL: int = 300  # 5 minutes
+
+# Whether to run background jobs immediately on start (before first interval)
+DEFAULT_BACKGROUND_JOB_RUN_ON_START: bool = True
+
 
 class BackgroundRefresher:
     """
@@ -28,13 +44,16 @@ class BackgroundRefresher:
         self._provider_job_tasks: Dict[str, asyncio.Task] = {}  # provider -> task
         self._initialized = False
         try:
-            interval_str = os.getenv("OAUTH_REFRESH_INTERVAL", "600")
+            interval_str = os.getenv(
+                "OAUTH_REFRESH_INTERVAL", str(DEFAULT_OAUTH_REFRESH_INTERVAL)
+            )
             self._interval = int(interval_str)
         except ValueError:
             lib_logger.warning(
-                f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. Falling back to 600s."
+                f"Invalid OAUTH_REFRESH_INTERVAL '{interval_str}'. "
+                f"Falling back to {DEFAULT_OAUTH_REFRESH_INTERVAL}s."
             )
-            self._interval = 600
+            self._interval = DEFAULT_OAUTH_REFRESH_INTERVAL
 
     def start(self):
         """Starts the background refresh task."""
@@ -186,7 +205,7 @@ class BackgroundRefresher:
             self._provider_job_tasks[provider] = task
 
             job_name = config.get("name", "background_job")
-            interval = config.get("interval", 300)
+            interval = config.get("interval", DEFAULT_BACKGROUND_JOB_INTERVAL)
             lib_logger.info(f"Started {provider} {job_name} (interval: {interval}s)")
 
     async def _run_provider_background_job(
@@ -205,9 +224,9 @@ class BackgroundRefresher:
             credentials: List of credential paths for this provider
             config: Background job configuration from get_background_job_config()
         """
-        interval = config.get("interval", 300)
+        interval = config.get("interval", DEFAULT_BACKGROUND_JOB_INTERVAL)
         job_name = config.get("name", "background_job")
-        run_on_start = config.get("run_on_start", True)
+        run_on_start = config.get("run_on_start", DEFAULT_BACKGROUND_JOB_RUN_ON_START)
 
         # Run immediately on start if configured
         if run_on_start:
