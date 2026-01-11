@@ -224,6 +224,7 @@ EXCLUDED_MODELS = {
 
 # Directory paths - use centralized path management
 
+
 def _get_antigravity_cache_dir():
     return get_cache_dir(subdir="antigravity")
 
@@ -1023,6 +1024,33 @@ class AntigravityProvider(
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
     default_sequential_fallback_multiplier = 2
+
+    # Custom caps examples (commented - uncomment and modify as needed)
+    # default_custom_caps = {
+    #     # Tier 2 (standard-tier / paid)
+    #     2: {
+    #         "claude": {
+    #             "max_requests": 100,  # Cap at 100 instead of 150
+    #             "cooldown_mode": "quota_reset",
+    #             "cooldown_value": 0,
+    #         },
+    #     },
+    #     # Tiers 2 and 3 together
+    #     (2, 3): {
+    #         "g25-flash": {
+    #             "max_requests": "80%",  # 80% of actual max
+    #             "cooldown_mode": "offset",
+    #             "cooldown_value": 1800,  # +30 min buffer
+    #         },
+    #     },
+    #     # Default for unknown tiers
+    #     "default": {
+    #         "claude": {
+    #             "max_requests": "50%",
+    #             "cooldown_mode": "quota_reset",
+    #         },
+    #     },
+    # }
 
     @staticmethod
     def parse_quota_error(
