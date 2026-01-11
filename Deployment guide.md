@@ -197,7 +197,12 @@ cd LLM-API-Key-Proxy
 # Create your .env file
 cp .env.example .env
 nano .env  # Add your PROXY_API_KEY and provider keys
+
+# Create key_usage.json file (required before first run)
+touch key_usage.json
 ```
+
+> **Important:** You must create `key_usage.json` before running Docker Compose. If this file doesn't exist on the host, Docker will create it as a directory instead of a file, causing the container to fail.
 
 2. **Start the proxy:**
 

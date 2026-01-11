@@ -60,9 +60,13 @@ docker run -d \
 **Using Docker Compose:**
 
 ```bash
-# Create your .env file first, then:
+# Create your .env file and key_usage.json first, then:
+cp .env.example .env
+touch key_usage.json
 docker compose up -d
 ```
+
+> **Important:** You must create both `.env` and `key_usage.json` files before running Docker Compose. If `key_usage.json` doesn't exist, Docker will create it as a directory instead of a file, causing errors.
 
 > **Note:** For OAuth providers, complete authentication locally first using the credential tool, then mount the `oauth_creds/` directory or export credentials to environment variables.
 
@@ -767,16 +771,24 @@ The proxy is available as a multi-architecture Docker image (amd64/arm64) from G
 cp .env.example .env
 nano .env
 
-# 2. Start the proxy
+# 2. Create key_usage.json file (required before first run)
+touch key_usage.json
+
+# 3. Start the proxy
 docker compose up -d
 
-# 3. Check logs
+# 4. Check logs
 docker compose logs -f
 ```
+
+> **Important:** You must create `key_usage.json` before running Docker Compose. If this file doesn't exist on the host, Docker will create it as a directory instead of a file, causing the container to fail.
 
 **Manual Docker Run:**
 
 ```bash
+# Create key_usage.json if it doesn't exist
+touch key_usage.json
+
 docker run -d \
   --name llm-api-proxy \
   --restart unless-stopped \
