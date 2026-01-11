@@ -1,9 +1,26 @@
 services:
+  nginx-proxy-manager:
+    image: "jc21/nginx-proxy-manager:latest"
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "80:80" # Public HTTP
+      - "443:443" # Public HTTPS
+      - "81:81" # Admin Web Interface
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    # This allows the proxy to talk to other containers using "host.docker.internal"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
   llm-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: llm-api-proxy-dev
+    image: ghcr.io/mirrowel/llm-api-key-proxy:latest
+    container_name: llm-api-proxy-tls
     restart: unless-stopped
     logging:
       driver: "json-file"
