@@ -223,9 +223,6 @@ EXCLUDED_MODELS = {
 
 
 # Directory paths - use centralized path management
-def _get_antigravity_logs_dir():
-    return get_logs_dir() / "antigravity_logs"
-
 
 def _get_antigravity_cache_dir():
     return get_cache_dir(subdir="antigravity")
@@ -485,8 +482,6 @@ def _generate_stable_session_id(contents: List[Dict[str, Any]]) -> str:
     Uses SHA256 hash of the first user message to create a deterministic
     session ID, ensuring the same conversation gets the same session ID.
     Falls back to random session ID if no user message found.
-
-    Per CLIProxyAPI Go implementation: generateStableSessionID()
     """
     import hashlib
     import struct
@@ -3318,7 +3313,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         )
 
         # Prepend Antigravity agent system instruction to existing system instruction
-        # Per CLIProxyAPI Go buildRequest(): Sets request.systemInstruction.role = "user"
+        # Sets request.systemInstruction.role = "user"
         # and sets parts.0.text to the agent identity/guidelines
         # We preserve any existing parts by shifting them (Antigravity = parts[0], existing = parts[1:])
         #
