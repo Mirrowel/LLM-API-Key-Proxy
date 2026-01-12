@@ -23,6 +23,14 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+
+# Retry interval in seconds for failed buffered writes
+# Used by BufferedWriteRegistry and ResilientStateWriter
+DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL: float = 30.0
+
 
 # =============================================================================
 # BUFFERED WRITE REGISTRY (SINGLETON)
@@ -57,12 +65,13 @@ class BufferedWriteRegistry:
     _instance: Optional["BufferedWriteRegistry"] = None
     _instance_lock = threading.Lock()
 
-    def __init__(self, retry_interval: float = 30.0):
+    def __init__(self, retry_interval: float = DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL):
         """
         Initialize the registry. Use get_instance() instead of direct construction.
 
         Args:
-            retry_interval: Seconds between retry attempts (default: 30)
+            retry_interval: Seconds between retry attempts
+                           (default: DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL)
         """
         self._pending: Dict[str, Tuple[Any, Callable[[Any], str], Dict[str, Any]]] = {}
         self._retry_interval = retry_interval
@@ -78,7 +87,9 @@ class BufferedWriteRegistry:
         atexit.register(self._atexit_handler)
 
     @classmethod
-    def get_instance(cls, retry_interval: float = 30.0) -> "BufferedWriteRegistry":
+    def get_instance(
+        cls, retry_interval: float = DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL
+    ) -> "BufferedWriteRegistry":
         """
         Get or create the singleton instance.
 
@@ -325,7 +336,7 @@ class ResilientStateWriter:
         self,
         path: Union[str, Path],
         logger: logging.Logger,
-        retry_interval: float = 30.0,
+        retry_interval: float = DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL,
         serializer: Optional[Callable[[Any], str]] = None,
     ):
         """

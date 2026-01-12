@@ -14,6 +14,17 @@ from .error_handler import ClassifiedError, NoAvailableKeysError, mask_credentia
 from .providers import PROVIDER_PLUGINS
 from .utils.resilient_io import ResilientStateWriter
 from .utils.paths import get_data_file
+from .config import (
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_MODE,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE,
+    COOLDOWN_BACKOFF_TIERS,
+    COOLDOWN_BACKOFF_MAX,
+    COOLDOWN_AUTH_ERROR,
+    COOLDOWN_TRANSIENT_ERROR,
+    COOLDOWN_RATE_LIMIT_DEFAULT,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
@@ -63,6 +74,14 @@ class UsageManager:
             Dict[str, Dict[str, Dict[int, int]]]
         ] = None,
         sequential_fallback_multipliers: Optional[Dict[str, int]] = None,
+        fair_cycle_enabled: Optional[Dict[str, bool]] = None,
+        fair_cycle_tracking_mode: Optional[Dict[str, str]] = None,
+        fair_cycle_cross_tier: Optional[Dict[str, bool]] = None,
+        fair_cycle_duration: Optional[Dict[str, int]] = None,
+        exhaustion_cooldown_threshold: Optional[Dict[str, int]] = None,
+        custom_caps: Optional[
+            Dict[str, Dict[Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]]]
+        ] = None,
     ):
         """
         Initialize the UsageManager.
@@ -88,6 +107,22 @@ class UsageManager:
             sequential_fallback_multipliers: Dict mapping provider -> fallback multiplier.
                 Used in sequential mode when priority not in priority_multipliers.
                 Example: {"antigravity": 2}
+            fair_cycle_enabled: Dict mapping provider -> bool to enable fair cycle rotation.
+                When enabled, credentials must all exhaust before any can be reused.
+                Default: enabled for sequential mode only.
+            fair_cycle_tracking_mode: Dict mapping provider -> tracking mode.
+                - "model_group": Track per quota group or model (default)
+                - "credential": Track per credential globally
+            fair_cycle_cross_tier: Dict mapping provider -> bool for cross-tier tracking.
+                - False: Each tier cycles independently (default)
+                - True: All credentials must exhaust regardless of tier
+            fair_cycle_duration: Dict mapping provider -> cycle duration in seconds.
+                Default: 86400 (24 hours)
+            exhaustion_cooldown_threshold: Dict mapping provider -> threshold in seconds.
+                A cooldown must exceed this to qualify as "exhausted". Default: 300 (5 min)
+            custom_caps: Dict mapping provider -> tier -> model/group -> cap config.
+                Allows setting custom usage limits per tier, per model or quota group.
+                See ProviderInterface.default_custom_caps for format details.
         """
         # Resolve file_path - use default if not provided
         if file_path is None:
@@ -105,6 +140,16 @@ class UsageManager:
         self.sequential_fallback_multipliers = sequential_fallback_multipliers or {}
         self._provider_instances: Dict[str, Any] = {}  # Cache for provider instances
         self.key_states: Dict[str, Dict[str, Any]] = {}
+
+        # Fair cycle rotation configuration
+        self.fair_cycle_enabled = fair_cycle_enabled or {}
+        self.fair_cycle_tracking_mode = fair_cycle_tracking_mode or {}
+        self.fair_cycle_cross_tier = fair_cycle_cross_tier or {}
+        self.fair_cycle_duration = fair_cycle_duration or {}
+        self.exhaustion_cooldown_threshold = exhaustion_cooldown_threshold or {}
+        self.custom_caps = custom_caps or {}
+        # In-memory cycle state: {provider: {tier_key: {tracking_key: {"cycle_started_at": float, "exhausted": Set[str]}}}}
+        self._cycle_exhausted: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
 
         self._data_lock = asyncio.Lock()
         self._usage_data: Optional[Dict] = None
@@ -136,6 +181,598 @@ class UsageManager:
             "balanced" or "sequential"
         """
         return self.provider_rotation_modes.get(provider, "balanced")
+
+    # =========================================================================
+    # FAIR CYCLE ROTATION HELPERS
+    # =========================================================================
+
+    def _is_fair_cycle_enabled(self, provider: str, rotation_mode: str) -> bool:
+        """
+        Check if fair cycle rotation is enabled for a provider.
+
+        Args:
+            provider: Provider name
+            rotation_mode: Current rotation mode ("balanced" or "sequential")
+
+        Returns:
+            True if fair cycle is enabled
+        """
+        # Check provider-specific setting first
+        if provider in self.fair_cycle_enabled:
+            return self.fair_cycle_enabled[provider]
+        # Default: enabled only for sequential mode
+        return rotation_mode == "sequential"
+
+    def _get_fair_cycle_tracking_mode(self, provider: str) -> str:
+        """
+        Get fair cycle tracking mode for a provider.
+
+        Returns:
+            "model_group" or "credential"
+        """
+        return self.fair_cycle_tracking_mode.get(provider, "model_group")
+
+    def _is_fair_cycle_cross_tier(self, provider: str) -> bool:
+        """
+        Check if fair cycle tracks across all tiers (ignoring priority boundaries).
+
+        Returns:
+            True if cross-tier tracking is enabled
+        """
+        return self.fair_cycle_cross_tier.get(provider, False)
+
+    def _get_fair_cycle_duration(self, provider: str) -> int:
+        """
+        Get fair cycle duration in seconds for a provider.
+
+        Returns:
+            Duration in seconds (default 86400 = 24 hours)
+        """
+        return self.fair_cycle_duration.get(provider, DEFAULT_FAIR_CYCLE_DURATION)
+
+    def _get_exhaustion_cooldown_threshold(self, provider: str) -> int:
+        """
+        Get exhaustion cooldown threshold in seconds for a provider.
+
+        A cooldown must exceed this duration to qualify as "exhausted" for fair cycle.
+
+        Returns:
+            Threshold in seconds (default 300 = 5 minutes)
+        """
+        return self.exhaustion_cooldown_threshold.get(
+            provider, DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+        )
+
+    # =========================================================================
+    # CUSTOM CAPS HELPERS
+    # =========================================================================
+
+    def _get_custom_cap_config(
+        self,
+        provider: str,
+        tier_priority: int,
+        model: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get custom cap config for a provider/tier/model combination.
+
+        Resolution order:
+        1. tier + model (exact match)
+        2. tier + group (model's quota group)
+        3. "default" + model
+        4. "default" + group
+
+        Args:
+            provider: Provider name
+            tier_priority: Credential's priority level
+            model: Model name (with provider prefix)
+
+        Returns:
+            Cap config dict or None if no custom cap applies
+        """
+        provider_caps = self.custom_caps.get(provider)
+        if not provider_caps:
+            return None
+
+        # Strip provider prefix from model
+        clean_model = model.split("/")[-1] if "/" in model else model
+
+        # Get quota group for this model
+        group = self._get_model_quota_group_by_provider(provider, model)
+
+        # Try to find matching tier config
+        tier_config = None
+        default_config = None
+
+        for tier_key, models_config in provider_caps.items():
+            if tier_key == "default":
+                default_config = models_config
+                continue
+
+            # Check if this tier_key matches our priority
+            if isinstance(tier_key, int) and tier_key == tier_priority:
+                tier_config = models_config
+                break
+            elif isinstance(tier_key, tuple) and tier_priority in tier_key:
+                tier_config = models_config
+                break
+
+        # Resolution order for tier config
+        if tier_config:
+            # Try model first
+            if clean_model in tier_config:
+                return tier_config[clean_model]
+            # Try group
+            if group and group in tier_config:
+                return tier_config[group]
+
+        # Resolution order for default config
+        if default_config:
+            # Try model first
+            if clean_model in default_config:
+                return default_config[clean_model]
+            # Try group
+            if group and group in default_config:
+                return default_config[group]
+
+        return None
+
+    def _get_model_quota_group_by_provider(
+        self, provider: str, model: str
+    ) -> Optional[str]:
+        """
+        Get quota group for a model using provider name instead of credential.
+
+        Args:
+            provider: Provider name
+            model: Model name
+
+        Returns:
+            Group name or None
+        """
+        plugin_instance = self._get_provider_instance(provider)
+        if plugin_instance and hasattr(plugin_instance, "get_model_quota_group"):
+            return plugin_instance.get_model_quota_group(model)
+        return None
+
+    def _resolve_custom_cap_max(
+        self,
+        provider: str,
+        model: str,
+        cap_config: Dict[str, Any],
+        actual_max: Optional[int],
+    ) -> Optional[int]:
+        """
+        Resolve custom cap max_requests value, handling percentages and clamping.
+
+        Args:
+            provider: Provider name
+            model: Model name (for logging)
+            cap_config: Custom cap configuration
+            actual_max: Actual API max requests (may be None if unknown)
+
+        Returns:
+            Resolved cap value (clamped), or None if can't be calculated
+        """
+        max_requests = cap_config.get("max_requests")
+        if max_requests is None:
+            return None
+
+        # Handle percentage
+        if isinstance(max_requests, str) and max_requests.endswith("%"):
+            if actual_max is None:
+                lib_logger.warning(
+                    f"Custom cap '{max_requests}' for {provider}/{model} requires known max_requests. "
+                    f"Skipping until quota baseline is fetched. Use absolute value for immediate enforcement."
+                )
+                return None
+            try:
+                percentage = float(max_requests.rstrip("%")) / 100.0
+                calculated = int(actual_max * percentage)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid percentage cap '{max_requests}' for {provider}/{model}"
+                )
+                return None
+        else:
+            # Absolute value
+            try:
+                calculated = int(max_requests)
+            except (ValueError, TypeError):
+                lib_logger.warning(
+                    f"Invalid cap value '{max_requests}' for {provider}/{model}"
+                )
+                return None
+
+        # Clamp to actual max (can only be MORE restrictive)
+        if actual_max is not None:
+            return min(calculated, actual_max)
+        return calculated
+
+    def _calculate_custom_cooldown_until(
+        self,
+        cap_config: Dict[str, Any],
+        window_start_ts: Optional[float],
+        natural_reset_ts: Optional[float],
+    ) -> Optional[float]:
+        """
+        Calculate when custom cap cooldown should end, clamped to natural reset.
+
+        Args:
+            cap_config: Custom cap configuration
+            window_start_ts: When first request was made (for fixed mode)
+            natural_reset_ts: Natural quota reset timestamp
+
+        Returns:
+            Cooldown end timestamp (clamped), or None if can't calculate
+        """
+        mode = cap_config.get("cooldown_mode", DEFAULT_CUSTOM_CAP_COOLDOWN_MODE)
+        value = cap_config.get("cooldown_value", DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE)
+
+        if mode == "quota_reset":
+            calculated = natural_reset_ts
+        elif mode == "offset":
+            if natural_reset_ts is None:
+                return None
+            calculated = natural_reset_ts + value
+        elif mode == "fixed":
+            if window_start_ts is None:
+                return None
+            calculated = window_start_ts + value
+        else:
+            lib_logger.warning(f"Unknown cooldown_mode '{mode}', using quota_reset")
+            calculated = natural_reset_ts
+
+        if calculated is None:
+            return None
+
+        # Clamp to natural reset (can only be MORE restrictive = longer cooldown)
+        if natural_reset_ts is not None:
+            return max(calculated, natural_reset_ts)
+        return calculated
+
+    def _check_and_apply_custom_cap(
+        self,
+        credential: str,
+        model: str,
+        request_count: int,
+    ) -> bool:
+        """
+        Check if custom cap is exceeded and apply cooldown if so.
+
+        This should be called after incrementing request_count in record_success().
+
+        Args:
+            credential: Credential identifier
+            model: Model name (with provider prefix)
+            request_count: Current request count for this model
+
+        Returns:
+            True if cap exceeded and cooldown applied, False otherwise
+        """
+        provider = self._get_provider_from_credential(credential)
+        if not provider:
+            return False
+
+        priority = self._get_credential_priority(credential, provider)
+        cap_config = self._get_custom_cap_config(provider, priority, model)
+        if not cap_config:
+            return False
+
+        # Get model data for actual max and timing info
+        key_data = self._usage_data.get(credential, {})
+        model_data = key_data.get("models", {}).get(model, {})
+        actual_max = model_data.get("quota_max_requests")
+        window_start_ts = model_data.get("window_start_ts")
+        natural_reset_ts = model_data.get("quota_reset_ts")
+
+        # Resolve custom cap max
+        custom_max = self._resolve_custom_cap_max(
+            provider, model, cap_config, actual_max
+        )
+        if custom_max is None:
+            return False
+
+        # Check if exceeded
+        if request_count < custom_max:
+            return False
+
+        # Calculate cooldown end time
+        cooldown_until = self._calculate_custom_cooldown_until(
+            cap_config, window_start_ts, natural_reset_ts
+        )
+        if cooldown_until is None:
+            # Can't calculate cooldown, use natural reset if available
+            if natural_reset_ts:
+                cooldown_until = natural_reset_ts
+            else:
+                lib_logger.warning(
+                    f"Custom cap hit for {mask_credential(credential)}/{model} but can't calculate cooldown. "
+                    f"Skipping cooldown application."
+                )
+                return False
+
+        now_ts = time.time()
+
+        # Apply cooldown
+        model_cooldowns = key_data.setdefault("model_cooldowns", {})
+        model_cooldowns[model] = cooldown_until
+
+        # Store custom cap info in model data for reference
+        model_data["custom_cap_max"] = custom_max
+        model_data["custom_cap_hit_at"] = now_ts
+        model_data["custom_cap_cooldown_until"] = cooldown_until
+
+        hours_until = (cooldown_until - now_ts) / 3600
+        lib_logger.info(
+            f"Custom cap hit: {mask_credential(credential)} reached {request_count}/{custom_max} "
+            f"for {model}. Cooldown for {hours_until:.1f}h"
+        )
+
+        # Sync cooldown across quota group
+        group = self._get_model_quota_group(credential, model)
+        if group:
+            grouped_models = self._get_grouped_models(credential, group)
+            for grouped_model in grouped_models:
+                if grouped_model != model:
+                    model_cooldowns[grouped_model] = cooldown_until
+
+        # Check if this should trigger fair cycle exhaustion
+        cooldown_duration = cooldown_until - now_ts
+        threshold = self._get_exhaustion_cooldown_threshold(provider)
+        if cooldown_duration > threshold:
+            rotation_mode = self._get_rotation_mode(provider)
+            if self._is_fair_cycle_enabled(provider, rotation_mode):
+                tier_key = self._get_tier_key(provider, priority)
+                tracking_key = self._get_tracking_key(credential, model, provider)
+                self._mark_credential_exhausted(
+                    credential, provider, tier_key, tracking_key
+                )
+
+        return True
+
+    def _get_tier_key(self, provider: str, priority: int) -> str:
+        """
+        Get the tier key for cycle tracking based on cross_tier setting.
+
+        Args:
+            provider: Provider name
+            priority: Credential priority level
+
+        Returns:
+            "__all_tiers__" if cross-tier enabled, else str(priority)
+        """
+        if self._is_fair_cycle_cross_tier(provider):
+            return "__all_tiers__"
+        return str(priority)
+
+    def _get_tracking_key(self, credential: str, model: str, provider: str) -> str:
+        """
+        Get the key for exhaustion tracking based on tracking mode.
+
+        Args:
+            credential: Credential identifier
+            model: Model name (with provider prefix)
+            provider: Provider name
+
+        Returns:
+            Tracking key string (quota group name, model name, or "__credential__")
+        """
+        mode = self._get_fair_cycle_tracking_mode(provider)
+        if mode == "credential":
+            return "__credential__"
+        # model_group mode: use quota group if exists, else model
+        group = self._get_model_quota_group(credential, model)
+        return group if group else model
+
+    def _get_credential_priority(self, credential: str, provider: str) -> int:
+        """
+        Get the priority level for a credential.
+
+        Args:
+            credential: Credential identifier
+            provider: Provider name
+
+        Returns:
+            Priority level (default 999 if unknown)
+        """
+        plugin_instance = self._get_provider_instance(provider)
+        if plugin_instance and hasattr(plugin_instance, "get_credential_priority"):
+            priority = plugin_instance.get_credential_priority(credential)
+            if priority is not None:
+                return priority
+        return 999
+
+    def _get_cycle_data(
+        self, provider: str, tier_key: str, tracking_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get cycle data for a provider/tier/tracking key combination.
+
+        Returns:
+            Cycle data dict or None if not exists
+        """
+        return (
+            self._cycle_exhausted.get(provider, {}).get(tier_key, {}).get(tracking_key)
+        )
+
+    def _ensure_cycle_structure(
+        self, provider: str, tier_key: str, tracking_key: str
+    ) -> Dict[str, Any]:
+        """
+        Ensure the nested cycle structure exists and return the cycle data dict.
+        """
+        if provider not in self._cycle_exhausted:
+            self._cycle_exhausted[provider] = {}
+        if tier_key not in self._cycle_exhausted[provider]:
+            self._cycle_exhausted[provider][tier_key] = {}
+        if tracking_key not in self._cycle_exhausted[provider][tier_key]:
+            self._cycle_exhausted[provider][tier_key][tracking_key] = {
+                "cycle_started_at": None,
+                "exhausted": set(),
+            }
+        return self._cycle_exhausted[provider][tier_key][tracking_key]
+
+    def _mark_credential_exhausted(
+        self,
+        credential: str,
+        provider: str,
+        tier_key: str,
+        tracking_key: str,
+    ) -> None:
+        """
+        Mark a credential as exhausted for fair cycle tracking.
+
+        Starts the cycle timer on first exhaustion.
+        """
+        cycle_data = self._ensure_cycle_structure(provider, tier_key, tracking_key)
+
+        # Start cycle timer on first exhaustion
+        if cycle_data["cycle_started_at"] is None:
+            cycle_data["cycle_started_at"] = time.time()
+            lib_logger.info(
+                f"Fair cycle started for {provider} tier={tier_key} tracking='{tracking_key}'"
+            )
+
+        cycle_data["exhausted"].add(credential)
+        lib_logger.info(
+            f"Fair cycle: marked {mask_credential(credential)} exhausted "
+            f"for {tracking_key} ({len(cycle_data['exhausted'])} total)"
+        )
+
+    def _is_credential_exhausted_in_cycle(
+        self,
+        credential: str,
+        provider: str,
+        tier_key: str,
+        tracking_key: str,
+    ) -> bool:
+        """
+        Check if a credential was exhausted in the current cycle.
+        """
+        cycle_data = self._get_cycle_data(provider, tier_key, tracking_key)
+        if cycle_data is None:
+            return False
+        return credential in cycle_data.get("exhausted", set())
+
+    def _is_cycle_expired(
+        self, provider: str, tier_key: str, tracking_key: str
+    ) -> bool:
+        """
+        Check if the current cycle has exceeded its duration.
+        """
+        cycle_data = self._get_cycle_data(provider, tier_key, tracking_key)
+        if cycle_data is None:
+            return False
+        cycle_started = cycle_data.get("cycle_started_at")
+        if cycle_started is None:
+            return False
+        duration = self._get_fair_cycle_duration(provider)
+        return time.time() >= cycle_started + duration
+
+    def _should_reset_cycle(
+        self,
+        provider: str,
+        tier_key: str,
+        tracking_key: str,
+        all_credentials_in_tier: List[str],
+    ) -> bool:
+        """
+        Check if all credentials in tier are exhausted (cycle complete).
+
+        Returns True if:
+        1. Cycle duration has expired, OR
+        2. All credentials in the tier have been marked exhausted
+        """
+        # Check duration first
+        if self._is_cycle_expired(provider, tier_key, tracking_key):
+            return True
+
+        # Check if all exhausted
+        cycle_data = self._get_cycle_data(provider, tier_key, tracking_key)
+        if cycle_data is None:
+            return False
+
+        exhausted = cycle_data.get("exhausted", set())
+        # All must be exhausted (and there must be at least one credential)
+        return (
+            len(exhausted) >= len(all_credentials_in_tier)
+            and len(all_credentials_in_tier) > 0
+        )
+
+    def _reset_cycle(self, provider: str, tier_key: str, tracking_key: str) -> None:
+        """
+        Reset exhaustion tracking for a completed cycle.
+        """
+        cycle_data = self._get_cycle_data(provider, tier_key, tracking_key)
+        if cycle_data:
+            exhausted_count = len(cycle_data.get("exhausted", set()))
+            lib_logger.info(
+                f"Fair cycle complete for {provider} tier={tier_key} "
+                f"tracking='{tracking_key}' - resetting ({exhausted_count} credentials cycled)"
+            )
+            cycle_data["cycle_started_at"] = None
+            cycle_data["exhausted"] = set()
+
+    def _get_all_credentials_for_tier_key(
+        self,
+        provider: str,
+        tier_key: str,
+        available_keys: List[str],
+        credential_priorities: Optional[Dict[str, int]],
+    ) -> List[str]:
+        """
+        Get all credentials that belong to a tier key.
+
+        Args:
+            provider: Provider name
+            tier_key: Either "__all_tiers__" or str(priority)
+            available_keys: List of available credential identifiers
+            credential_priorities: Dict mapping credentials to priorities
+
+        Returns:
+            List of credentials belonging to this tier key
+        """
+        if tier_key == "__all_tiers__":
+            # Cross-tier: all credentials for this provider
+            return list(available_keys)
+        else:
+            # Within-tier: only credentials with matching priority
+            priority = int(tier_key)
+            if credential_priorities:
+                return [
+                    k
+                    for k in available_keys
+                    if credential_priorities.get(k, 999) == priority
+                ]
+            return list(available_keys)
+
+    def _count_fair_cycle_excluded(
+        self,
+        provider: str,
+        tier_key: str,
+        tracking_key: str,
+        candidates: List[str],
+    ) -> int:
+        """
+        Count how many candidates are excluded by fair cycle.
+
+        Args:
+            provider: Provider name
+            tier_key: Tier key for tracking
+            tracking_key: Model/group tracking key
+            candidates: List of candidate credentials (not on cooldown)
+
+        Returns:
+            Number of candidates excluded by fair cycle
+        """
+        count = 0
+        for cred in candidates:
+            if self._is_credential_exhausted_in_cycle(
+                cred, provider, tier_key, tracking_key
+            ):
+                count += 1
+        return count
 
     def _get_priority_multiplier(
         self, provider: str, priority: int, rotation_mode: str
@@ -673,6 +1310,79 @@ class UsageManager:
 
         return sorted_candidates
 
+    # =========================================================================
+    # FAIR CYCLE PERSISTENCE
+    # =========================================================================
+
+    def _serialize_cycle_state(self) -> Dict[str, Any]:
+        """
+        Serialize in-memory cycle state for JSON persistence.
+
+        Converts sets to lists for JSON compatibility.
+        """
+        result: Dict[str, Any] = {}
+        for provider, tier_data in self._cycle_exhausted.items():
+            result[provider] = {}
+            for tier_key, tracking_data in tier_data.items():
+                result[provider][tier_key] = {}
+                for tracking_key, cycle_data in tracking_data.items():
+                    result[provider][tier_key][tracking_key] = {
+                        "cycle_started_at": cycle_data.get("cycle_started_at"),
+                        "exhausted": list(cycle_data.get("exhausted", set())),
+                    }
+        return result
+
+    def _deserialize_cycle_state(self, data: Dict[str, Any]) -> None:
+        """
+        Deserialize cycle state from JSON and populate in-memory structure.
+
+        Converts lists back to sets and validates expired cycles.
+        """
+        self._cycle_exhausted = {}
+        now_ts = time.time()
+
+        for provider, tier_data in data.items():
+            if not isinstance(tier_data, dict):
+                continue
+            self._cycle_exhausted[provider] = {}
+
+            for tier_key, tracking_data in tier_data.items():
+                if not isinstance(tracking_data, dict):
+                    continue
+                self._cycle_exhausted[provider][tier_key] = {}
+
+                for tracking_key, cycle_data in tracking_data.items():
+                    if not isinstance(cycle_data, dict):
+                        continue
+
+                    cycle_started = cycle_data.get("cycle_started_at")
+                    exhausted_list = cycle_data.get("exhausted", [])
+
+                    # Check if cycle has expired
+                    if cycle_started is not None:
+                        duration = self._get_fair_cycle_duration(provider)
+                        if now_ts >= cycle_started + duration:
+                            # Cycle expired - skip (don't restore)
+                            lib_logger.debug(
+                                f"Fair cycle expired for {provider}/{tier_key}/{tracking_key} - not restoring"
+                            )
+                            continue
+
+                    # Restore valid cycle
+                    self._cycle_exhausted[provider][tier_key][tracking_key] = {
+                        "cycle_started_at": cycle_started,
+                        "exhausted": set(exhausted_list) if exhausted_list else set(),
+                    }
+
+        # Log restoration summary
+        total_cycles = sum(
+            len(tracking)
+            for tier in self._cycle_exhausted.values()
+            for tracking in tier.values()
+        )
+        if total_cycles > 0:
+            lib_logger.info(f"Restored {total_cycles} active fair cycle(s) from disk")
+
     async def _lazy_init(self):
         """Initializes the usage data by loading it from the file asynchronously."""
         async with self._init_lock:
@@ -706,6 +1416,11 @@ class UsageManager:
                 )
                 self._usage_data = {}
 
+            # Restore fair cycle state from persisted data
+            fair_cycle_data = self._usage_data.get("__fair_cycle__", {})
+            if fair_cycle_data:
+                self._deserialize_cycle_state(fair_cycle_data)
+
     async def _save_usage(self):
         """Saves the current usage data using the resilient state writer."""
         if self._usage_data is None:
@@ -714,6 +1429,14 @@ class UsageManager:
         async with self._data_lock:
             # Add human-readable timestamp fields before saving
             self._add_readable_timestamps(self._usage_data)
+
+            # Persist fair cycle state (separate from credential data)
+            if self._cycle_exhausted:
+                self._usage_data["__fair_cycle__"] = self._serialize_cycle_state()
+            elif "__fair_cycle__" in self._usage_data:
+                # Clean up empty cycle data
+                del self._usage_data["__fair_cycle__"]
+
             # Hand off to resilient writer - handles retries and disk failures
             self._state_writer.write(self._usage_data)
 
@@ -772,6 +1495,125 @@ class UsageManager:
                 available.append(key)
 
         return available
+
+    async def get_credential_availability_stats(
+        self,
+        credentials: List[str],
+        model: str,
+        credential_priorities: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, int]:
+        """
+        Get credential availability statistics including cooldown and fair cycle exclusions.
+
+        This is used for logging to show why credentials are excluded.
+
+        Args:
+            credentials: List of credential identifiers to check
+            model: Model name to check
+            credential_priorities: Optional dict mapping credentials to priorities
+
+        Returns:
+            Dict with:
+                "total": Total credentials
+                "on_cooldown": Count on cooldown
+                "fair_cycle_excluded": Count excluded by fair cycle
+                "available": Count available for selection
+        """
+        await self._lazy_init()
+        now = time.time()
+
+        total = len(credentials)
+        on_cooldown = 0
+        not_on_cooldown = []
+
+        # First pass: check cooldowns
+        async with self._data_lock:
+            for key in credentials:
+                key_data = self._usage_data.get(key, {})
+
+                # Check if key-level or model-level cooldown is active
+                normalized_model = self._normalize_model(key, model)
+                if (key_data.get("key_cooldown_until") or 0) > now or (
+                    key_data.get("model_cooldowns", {}).get(normalized_model) or 0
+                ) > now:
+                    on_cooldown += 1
+                else:
+                    not_on_cooldown.append(key)
+
+        # Second pass: check fair cycle exclusions (only for non-cooldown credentials)
+        fair_cycle_excluded = 0
+        if not_on_cooldown:
+            provider = self._get_provider_from_credential(not_on_cooldown[0])
+            if provider:
+                rotation_mode = self._get_rotation_mode(provider)
+                if self._is_fair_cycle_enabled(provider, rotation_mode):
+                    # Check each credential against its own tier's exhausted set
+                    for key in not_on_cooldown:
+                        key_priority = (
+                            credential_priorities.get(key, 999)
+                            if credential_priorities
+                            else 999
+                        )
+                        tier_key = self._get_tier_key(provider, key_priority)
+                        tracking_key = self._get_tracking_key(key, model, provider)
+
+                        if self._is_credential_exhausted_in_cycle(
+                            key, provider, tier_key, tracking_key
+                        ):
+                            fair_cycle_excluded += 1
+
+        available = total - on_cooldown - fair_cycle_excluded
+
+        return {
+            "total": total,
+            "on_cooldown": on_cooldown,
+            "fair_cycle_excluded": fair_cycle_excluded,
+            "available": available,
+        }
+
+    async def get_soonest_cooldown_end(
+        self,
+        credentials: List[str],
+        model: str,
+    ) -> Optional[float]:
+        """
+        Find the soonest time when any credential will come off cooldown.
+
+        This is used for smart waiting logic - if no credentials are available,
+        we can determine whether to wait (if soonest cooldown < deadline) or
+        fail fast (if soonest cooldown > deadline).
+
+        Args:
+            credentials: List of credential identifiers to check
+            model: Model name to check cooldowns for
+
+        Returns:
+            Timestamp of soonest cooldown end, or None if no credentials are on cooldown
+        """
+        await self._lazy_init()
+        now = time.time()
+        soonest_end = None
+
+        async with self._data_lock:
+            for key in credentials:
+                key_data = self._usage_data.get(key, {})
+                normalized_model = self._normalize_model(key, model)
+
+                # Check key-level cooldown
+                key_cooldown = key_data.get("key_cooldown_until") or 0
+                if key_cooldown > now:
+                    if soonest_end is None or key_cooldown < soonest_end:
+                        soonest_end = key_cooldown
+
+                # Check model-level cooldown
+                model_cooldown = (
+                    key_data.get("model_cooldowns", {}).get(normalized_model) or 0
+                )
+                if model_cooldown > now:
+                    if soonest_end is None or model_cooldown < soonest_end:
+                        soonest_end = model_cooldown
+
+        return soonest_end
 
     async def _reset_daily_stats_if_needed(self):
         """
@@ -1335,6 +2177,38 @@ class UsageManager:
                     provider = model.split("/")[0] if "/" in model else ""
                     rotation_mode = self._get_rotation_mode(provider)
 
+                    # Fair cycle filtering
+                    if provider and self._is_fair_cycle_enabled(
+                        provider, rotation_mode
+                    ):
+                        tier_key = self._get_tier_key(provider, priority_level)
+                        tracking_key = self._get_tracking_key(
+                            keys_in_priority[0][0] if keys_in_priority else "",
+                            model,
+                            provider,
+                        )
+
+                        # Get all credentials for this tier (for cycle completion check)
+                        all_tier_creds = self._get_all_credentials_for_tier_key(
+                            provider, tier_key, available_keys, credential_priorities
+                        )
+
+                        # Check if cycle should reset (all exhausted or expired)
+                        if self._should_reset_cycle(
+                            provider, tier_key, tracking_key, all_tier_creds
+                        ):
+                            self._reset_cycle(provider, tier_key, tracking_key)
+
+                        # Filter out exhausted credentials
+                        filtered_keys = []
+                        for key, usage_count in keys_in_priority:
+                            if not self._is_credential_exhausted_in_cycle(
+                                key, provider, tier_key, tracking_key
+                            ):
+                                filtered_keys.append((key, usage_count))
+
+                        keys_in_priority = filtered_keys
+
                     # Calculate effective concurrency based on priority tier
                     multiplier = self._get_priority_multiplier(
                         provider, priority_level, rotation_mode
@@ -1435,10 +2309,35 @@ class UsageManager:
                     all_potential_keys.extend(keys_list)
 
                 if not all_potential_keys:
-                    lib_logger.warning(
-                        "No keys are eligible (all on cooldown or filtered out). Waiting before re-evaluating."
+                    # All credentials are on cooldown - check if waiting makes sense
+                    soonest_end = await self.get_soonest_cooldown_end(
+                        available_keys, model
                     )
-                    await asyncio.sleep(1)
+
+                    if soonest_end is None:
+                        # No cooldowns active but no keys available (shouldn't happen)
+                        lib_logger.warning(
+                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    remaining_budget = deadline - time.time()
+                    wait_needed = soonest_end - time.time()
+
+                    if wait_needed > remaining_budget:
+                        # Fail fast - no credential will be available in time
+                        lib_logger.warning(
+                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
+                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                        )
+                        break  # Exit loop, will raise NoAvailableKeysError
+
+                    # Wait for the credential to become available
+                    lib_logger.info(
+                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
+                    )
+                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
                     continue
 
                 # Wait for the highest priority key with lowest usage
@@ -1494,6 +2393,42 @@ class UsageManager:
                             < effective_max_concurrent
                         ):
                             tier2_keys.append((key, usage_count))
+
+                # Fair cycle filtering (non-priority case)
+                if provider and self._is_fair_cycle_enabled(provider, rotation_mode):
+                    tier_key = self._get_tier_key(provider, default_priority)
+                    tracking_key = self._get_tracking_key(
+                        available_keys[0] if available_keys else "",
+                        model,
+                        provider,
+                    )
+
+                    # Get all credentials for this tier (for cycle completion check)
+                    all_tier_creds = self._get_all_credentials_for_tier_key(
+                        provider, tier_key, available_keys, None
+                    )
+
+                    # Check if cycle should reset (all exhausted or expired)
+                    if self._should_reset_cycle(
+                        provider, tier_key, tracking_key, all_tier_creds
+                    ):
+                        self._reset_cycle(provider, tier_key, tracking_key)
+
+                    # Filter out exhausted credentials from both tiers
+                    tier1_keys = [
+                        (key, usage)
+                        for key, usage in tier1_keys
+                        if not self._is_credential_exhausted_in_cycle(
+                            key, provider, tier_key, tracking_key
+                        )
+                    ]
+                    tier2_keys = [
+                        (key, usage)
+                        for key, usage in tier2_keys
+                        if not self._is_credential_exhausted_in_cycle(
+                            key, provider, tier_key, tracking_key
+                        )
+                    ]
 
                 if rotation_mode == "sequential":
                     # Sequential mode: sort credentials by priority, usage, recency
@@ -1576,10 +2511,35 @@ class UsageManager:
 
                 all_potential_keys = tier1_keys + tier2_keys
                 if not all_potential_keys:
-                    lib_logger.warning(
-                        "No keys are eligible (all on cooldown). Waiting before re-evaluating."
+                    # All credentials are on cooldown - check if waiting makes sense
+                    soonest_end = await self.get_soonest_cooldown_end(
+                        available_keys, model
                     )
-                    await asyncio.sleep(1)
+
+                    if soonest_end is None:
+                        # No cooldowns active but no keys available (shouldn't happen)
+                        lib_logger.warning(
+                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    remaining_budget = deadline - time.time()
+                    wait_needed = soonest_end - time.time()
+
+                    if wait_needed > remaining_budget:
+                        # Fail fast - no credential will be available in time
+                        lib_logger.warning(
+                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
+                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                        )
+                        break  # Exit loop, will raise NoAvailableKeysError
+
+                    # Wait for the credential to become available
+                    lib_logger.info(
+                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
+                    )
+                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
                     continue
 
                 # Wait on the condition of the key with the lowest current usage.
@@ -1730,6 +2690,10 @@ class UsageManager:
                                 },
                             )
                             other_model_data["request_count"] = new_request_count
+                            # Sync window timing (shared quota pool = shared window)
+                            window_start = model_data.get("window_start_ts")
+                            if window_start:
+                                other_model_data["window_start_ts"] = window_start
                             # Also sync quota_max_requests if set
                             max_req = model_data.get("quota_max_requests")
                             if max_req:
@@ -1744,6 +2708,14 @@ class UsageManager:
                     model_data["quota_display"] = (
                         f"{model_data['request_count']}/{max_req}"
                     )
+
+                # Check custom cap
+                if self._check_and_apply_custom_cap(
+                    key, model, model_data["request_count"]
+                ):
+                    # Custom cap exceeded, cooldown applied
+                    # Continue to record tokens/cost but credential will be skipped next time
+                    pass
 
                 usage_data_ref = model_data  # For token/cost recording below
 
@@ -1914,7 +2886,9 @@ class UsageManager:
             if classified_error.error_type == "quota_exceeded":
                 # Quota exhausted - use authoritative reset timestamp if available
                 quota_reset_ts = classified_error.quota_reset_timestamp
-                cooldown_seconds = classified_error.retry_after or 60
+                cooldown_seconds = (
+                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
+                )
 
                 if quota_reset_ts and reset_mode == "per_model":
                     # Set quota_reset_ts on model - this becomes authoritative stats reset time
@@ -2006,9 +2980,30 @@ class UsageManager:
                         f"Cooldown: {cooldown_seconds}s ({hours:.1f}h)"
                     )
 
+                # Mark credential as exhausted for fair cycle if cooldown exceeds threshold
+                effective_cooldown = (
+                    (quota_reset_ts - now_ts)
+                    if quota_reset_ts
+                    else (cooldown_seconds or 0)
+                )
+                provider = self._get_provider_from_credential(key)
+                if provider:
+                    threshold = self._get_exhaustion_cooldown_threshold(provider)
+                    if effective_cooldown > threshold:
+                        rotation_mode = self._get_rotation_mode(provider)
+                        if self._is_fair_cycle_enabled(provider, rotation_mode):
+                            priority = self._get_credential_priority(key, provider)
+                            tier_key = self._get_tier_key(provider, priority)
+                            tracking_key = self._get_tracking_key(key, model, provider)
+                            self._mark_credential_exhausted(
+                                key, provider, tier_key, tracking_key
+                            )
+
             elif classified_error.error_type == "rate_limit":
                 # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
-                cooldown_seconds = classified_error.retry_after or 60
+                cooldown_seconds = (
+                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
+                )
                 model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
                     f"Rate limit on {mask_credential(key)} for model {model}. "
@@ -2017,8 +3012,8 @@ class UsageManager:
 
             elif classified_error.error_type == "authentication":
                 # Apply a 5-minute key-level lockout for auth errors
-                key_data["key_cooldown_until"] = now_ts + 300
-                cooldown_seconds = 300
+                key_data["key_cooldown_until"] = now_ts + COOLDOWN_AUTH_ERROR
+                cooldown_seconds = COOLDOWN_AUTH_ERROR
                 model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.warning(
                     f"Authentication error on key {mask_credential(key)}. Applying 5-minute key-level lockout."
@@ -2035,8 +3030,9 @@ class UsageManager:
 
                 # If cooldown wasn't set by specific error type, use escalating backoff
                 if cooldown_seconds is None:
-                    backoff_tiers = {1: 10, 2: 30, 3: 60, 4: 120}
-                    cooldown_seconds = backoff_tiers.get(count, 7200)
+                    cooldown_seconds = COOLDOWN_BACKOFF_TIERS.get(
+                        count, COOLDOWN_BACKOFF_MAX
+                    )
                     model_cooldowns[model] = now_ts + cooldown_seconds
                     lib_logger.warning(
                         f"Failure #{count} for key {mask_credential(key)} with model {model}. "
@@ -2045,7 +3041,7 @@ class UsageManager:
             else:
                 # Provider-level errors: apply short cooldown but don't count against key
                 if cooldown_seconds is None:
-                    cooldown_seconds = 30
+                    cooldown_seconds = COOLDOWN_TRANSIENT_ERROR
                     model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.info(
                     f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} "
@@ -2259,6 +3255,26 @@ class UsageManager:
                         "hours_until_reset": hours_until_reset,
                     }
 
+                # Mark credential as exhausted in fair cycle if cooldown exceeds threshold
+                # This ensures background refresh detection counts toward cycle completion
+                cooldown_duration = reset_timestamp - now_ts
+                provider = self._get_provider_from_credential(credential)
+                if provider:
+                    threshold = self._get_exhaustion_cooldown_threshold(provider)
+                    if cooldown_duration > threshold:
+                        rotation_mode = self._get_rotation_mode(provider)
+                        if self._is_fair_cycle_enabled(provider, rotation_mode):
+                            priority = self._get_credential_priority(
+                                credential, provider
+                            )
+                            tier_key = self._get_tier_key(provider, priority)
+                            tracking_key = self._get_tracking_key(
+                                credential, model, provider
+                            )
+                            self._mark_credential_exhausted(
+                                credential, provider, tier_key, tracking_key
+                            )
+
                 # Defensive clamp: ensure request_count doesn't exceed max when exhausted
                 if (
                     max_requests is not None
@@ -2302,6 +3318,10 @@ class UsageManager:
                         # Sync reset timestamp if valid
                         if valid_reset_ts:
                             other_model_data["quota_reset_ts"] = reset_timestamp
+                        # Sync window start time
+                        window_start = model_data.get("window_start_ts")
+                        if window_start:
+                            other_model_data["window_start_ts"] = window_start
                         # Sync cooldown if exhausted (with ±5 min check)
                         if is_exhausted and valid_reset_ts:
                             existing_grouped = model_cooldowns.get(grouped_model)

@@ -28,6 +28,9 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Extensible**: Easily add support for new providers through a simple plugin-based architecture.
 -   **Temperature Override**: Global temperature=0 override to prevent tool hallucination with low-temperature settings.
 -   **Shared OAuth Base**: Refactored OAuth implementation with reusable [`GoogleOAuthBase`](providers/google_oauth_base.py) for multiple providers.
+-   **Fair Cycle Rotation**: Ensures each credential exhausts at least once before any can be reused within a tier. Prevents a single credential from being repeatedly used while others sit idle. Configurable per provider with tracking modes and cross-tier support.
+-   **Custom Usage Caps**: Set custom limits per tier, per model/group that are more restrictive than actual API limits. Supports percentages (e.g., "80%") and multiple cooldown modes (`quota_reset`, `offset`, `fixed`). Credentials go on cooldown before hitting actual API limits.
+-   **Centralized Defaults**: All tunable defaults are defined in [`config/defaults.py`](config/defaults.py) for easy customization and visibility.
 
 ## Installation
 
@@ -232,6 +235,8 @@ Use this tool to:
     - Claude Sonnet 4.5: Uses `thinkingBudget` (optional - supports both thinking and non-thinking modes)
     - Claude Opus 4.5: Uses `thinkingBudget` (always uses thinking variant)
 -   **Base URL Fallback**: Automatic fallback between sandbox and production endpoints.
+-   **Fair Cycle Rotation**: Enabled by default in sequential mode. Ensures all credentials cycle before reuse.
+-   **Custom Caps**: Configurable per-tier caps with offset cooldowns for pacing usage. See `config/defaults.py`.
 
 ## Error Handling and Cooldowns
 

@@ -20,6 +20,18 @@ from pathlib import Path
 
 lib_logger = logging.getLogger("rotator_library")
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+
+# Maximum time to wait for a re-authentication flow to complete (in seconds)
+# This includes user interaction time for OAuth browser flow
+DEFAULT_REAUTH_TIMEOUT: float = 300.0  # 5 minutes
+
+# Threshold for logging queue wait time (in seconds)
+# Waits longer than this will be logged
+REAUTH_QUEUE_LOG_THRESHOLD: float = 1.0
+
 
 class ReauthCoordinator:
     """
@@ -80,7 +92,7 @@ class ReauthCoordinator:
         credential_path: str,
         provider_name: str,
         reauth_func: Callable[[], Awaitable[Dict[str, Any]]],
-        timeout: float = 300.0,  # 5 minutes default timeout
+        timeout: float = DEFAULT_REAUTH_TIMEOUT,
     ) -> Dict[str, Any]:
         """
         Execute a re-authentication function with global serialization.
@@ -133,7 +145,7 @@ class ReauthCoordinator:
                     self._reauth_start_time = time.time()
                     self._total_reauths += 1
 
-                if wait_duration > 1.0:
+                if wait_duration > REAUTH_QUEUE_LOG_THRESHOLD:
                     lib_logger.info(
                         f"[ReauthCoordinator] Starting re-auth for '{display_name}' ({provider_name}) "
                         f"after waiting {wait_duration:.1f}s in queue"

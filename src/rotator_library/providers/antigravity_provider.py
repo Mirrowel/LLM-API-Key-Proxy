@@ -166,11 +166,8 @@ MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
 PREPEND_INSTRUCTION = env_bool("ANTIGRAVITY_PREPEND_INSTRUCTION", True)
-# When true, preserve original field casing (system_instruction vs systemInstruction) instead of
-# always consolidating to camelCase. Useful for debugging or compatibility with specific clients.
-PRESERVE_SYSTEM_INSTRUCTION_CASE = env_bool(
-    "ANTIGRAVITY_PRESERVE_SYSTEM_INSTRUCTION_CASE", True
-)
+# NOTE: system_instruction is always normalized to systemInstruction (camelCase)
+# per Antigravity API requirements. snake_case system_instruction is not supported.
 # When true, inject an override instruction after the Antigravity prompt that tells the model
 # to disregard the Antigravity identity and follow user-provided instructions instead.
 INJECT_IDENTITY_OVERRIDE = env_bool("ANTIGRAVITY_INJECT_IDENTITY_OVERRIDE", True)
@@ -239,8 +236,6 @@ EXCLUDED_MODELS = {
 
 
 # Directory paths - use centralized path management
-def _get_antigravity_logs_dir():
-    return get_logs_dir() / "antigravity_logs"
 
 
 def _get_antigravity_cache_dir():
@@ -334,6 +329,46 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 
 # Parallel tool usage encouragement instruction
 DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+
+# Interleaved thinking support for Claude models
+# Allows Claude to think between tool calls and after receiving tool results
+# Header is not needed - commented for reference
+# ANTHROPIC_BETA_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
+
+# Strong system prompt for interleaved thinking (injected into system_instruction)
+CLAUDE_INTERLEAVED_THINKING_HINT = """# Interleaved Thinking - MANDATORY
+
+CRITICAL: Interleaved thinking is ACTIVE and REQUIRED for this session.
+
+---
+
+## Requirements
+
+You MUST reason before acting. Emit a thinking block on EVERY response:
+- **Before** taking any action (to reason about what you're doing and plan your approach)
+- **After** receiving any results (to analyze the information before proceeding)
+
+---
+
+## Rules
+
+1. This applies to EVERY response, not just the first
+2. Never skip thinking, even for simple or sequential actions
+3. Think first, act second. Analyze results and context before deciding your next step
+"""
+
+# Reminder appended to last real user message when in thinking-enabled tool loop
+CLAUDE_USER_INTERLEAVED_THINKING_REMINDER = """<system-reminder>
+# Interleaved Thinking - Active
+
+You MUST emit a thinking block on EVERY response:
+- **Before** any action (reason about what to do)
+- **After** any result (analyze before next step)
+
+Never skip thinking, even on follow-up responses. Ultrathink
+</system-reminder>"""
+
+ENABLE_INTERLEAVED_THINKING = env_bool("ANTIGRAVITY_INTERLEAVED_THINKING", True)
 
 # Dynamic Antigravity agent system instruction (from CLIProxyAPI discovery)
 # This is PREPENDED to any existing system instruction in buildRequest()
@@ -461,8 +496,6 @@ def _generate_stable_session_id(contents: List[Dict[str, Any]]) -> str:
     Uses SHA256 hash of the first user message to create a deterministic
     session ID, ensuring the same conversation gets the same session ID.
     Falls back to random session ID if no user message found.
-
-    Per CLIProxyAPI Go implementation: generateStableSessionID()
     """
     import hashlib
     import struct
@@ -501,6 +534,164 @@ def _generate_project_id() -> str:
 # and is imported as inline_schema_refs at top of file
 
 
+def _score_schema_option(schema: Any) -> Tuple[int, str]:
+    """
+    Score a schema option for anyOf/oneOf selection.
+
+    Scoring (higher = preferred):
+    - 3: object type or has properties (most structured)
+    - 2: array type or has items
+    - 1: primitive types (string, number, boolean, integer)
+    - 0: null or unknown type
+
+    Ties: first option with highest score wins.
+
+    Returns: (score, type_name)
+    """
+    if not isinstance(schema, dict):
+        return (0, "unknown")
+
+    schema_type = schema.get("type")
+
+    # Object or has properties = highest priority
+    if schema_type == "object" or "properties" in schema:
+        return (3, "object")
+
+    # Array or has items = second priority
+    if schema_type == "array" or "items" in schema:
+        return (2, "array")
+
+    # Any other non-null type
+    if schema_type and schema_type != "null":
+        return (1, str(schema_type))
+
+    # Null or no type
+    return (0, schema_type or "null")
+
+
+def _try_merge_enum_from_union(options: List[Any]) -> Optional[List[Any]]:
+    """
+    Check if union options form an enum pattern and merge them.
+
+    An enum pattern is when all options are ONLY:
+    - {"const": value}
+    - {"enum": [values]}
+    - {"type": "...", "const": value}
+    - {"type": "...", "enum": [values]}
+
+    Returns merged enum values, or None if not a pure enum pattern.
+    """
+    if not options:
+        return None
+
+    enum_values = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            return None
+
+        # Check for const
+        if "const" in opt:
+            enum_values.append(opt["const"])
+        # Check for enum
+        elif "enum" in opt and isinstance(opt["enum"], list):
+            enum_values.extend(opt["enum"])
+        else:
+            # Has other structural properties - not a pure enum pattern
+            # Allow type, description, title - but not structural keywords
+            structural_keys = {
+                "properties",
+                "items",
+                "allOf",
+                "anyOf",
+                "oneOf",
+                "additionalProperties",
+            }
+            if any(key in opt for key in structural_keys):
+                return None
+            # If it's just {"type": "null"} with no const/enum, not an enum pattern
+            if "const" not in opt and "enum" not in opt:
+                return None
+
+    return enum_values if enum_values else None
+
+
+def _merge_all_of(schema: Any) -> Any:
+    """
+    Merge allOf schemas into a single schema for Claude compatibility.
+
+    Combines:
+    - properties: merged (later wins on conflict)
+    - required: deduplicated union
+    - Other fields: first value wins
+
+    Recursively processes nested structures.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    if isinstance(schema, list):
+        return [_merge_all_of(item) for item in schema]
+
+    result = dict(schema)
+
+    # If this object has allOf, merge its contents
+    if isinstance(result.get("allOf"), list):
+        merged_properties: Dict[str, Any] = {}
+        merged_required: List[str] = []
+        merged_other: Dict[str, Any] = {}
+
+        for item in result["allOf"]:
+            if not isinstance(item, dict):
+                continue
+
+            # Merge properties (later wins on conflict)
+            if isinstance(item.get("properties"), dict):
+                merged_properties.update(item["properties"])
+
+            # Merge required arrays (deduplicate)
+            if isinstance(item.get("required"), list):
+                for req in item["required"]:
+                    if req not in merged_required:
+                        merged_required.append(req)
+
+            # Copy other fields (first wins)
+            for key, value in item.items():
+                if (
+                    key not in ("properties", "required", "allOf")
+                    and key not in merged_other
+                ):
+                    merged_other[key] = value
+
+        # Apply merged content to result (existing props + allOf props)
+        if merged_properties:
+            existing_props = result.get("properties", {})
+            result["properties"] = {**existing_props, **merged_properties}
+
+        if merged_required:
+            existing_req = result.get("required", [])
+            result["required"] = list(dict.fromkeys(existing_req + merged_required))
+
+        # Copy other merged fields (don't overwrite existing)
+        for key, value in merged_other.items():
+            if key not in result:
+                result[key] = value
+
+        # Remove the allOf key
+        del result["allOf"]
+
+    # Recursively process nested objects
+    for key, value in list(result.items()):
+        if isinstance(value, dict):
+            result[key] = _merge_all_of(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _merge_all_of(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+
+    return result
+
+
 def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     """
     Recursively clean JSON Schema for Antigravity/Google's Proto-based API.
@@ -510,7 +701,12 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
     - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
-    - For Claude: strips validation keywords, converts anyOf/oneOf to first option, const to enum
+    - For Claude:
+      - Merges allOf schemas into a single schema
+      - Flattens anyOf/oneOf using scoring (object > array > primitive > null)
+      - Detects enum patterns in unions and merges them
+      - Converts const to enum
+      - Strips unsupported validation keywords
     - For Gemini: passes through additionalProperties as-is
     - For Claude: normalizes permissive additionalProperties to true
     """
@@ -565,19 +761,73 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "default",
     }
 
-    # Handle 'anyOf' by taking the first option (Claude doesn't support anyOf)
-    # Gemini supports anyOf/oneOf, so pass through for Gemini
+    # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
+    # Gemini supports these natively, so pass through for Gemini
     if not for_gemini:
-        if "anyOf" in schema and isinstance(schema["anyOf"], list) and schema["anyOf"]:
-            first_option = _clean_claude_schema(schema["anyOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+        # Handle allOf by merging first (must be done before anyOf/oneOf)
+        if "allOf" in schema:
+            schema = _merge_all_of(schema)
+            # If allOf was the only thing, continue processing the merged result
+            # Don't return early - continue to handle other keywords
 
-        # Handle 'oneOf' similarly
-        if "oneOf" in schema and isinstance(schema["oneOf"], list) and schema["oneOf"]:
-            first_option = _clean_claude_schema(schema["oneOf"][0], for_gemini)
-            if isinstance(first_option, dict):
-                return first_option
+        # Handle anyOf/oneOf with scoring and enum detection
+        for union_key in ("anyOf", "oneOf"):
+            if (
+                union_key in schema
+                and isinstance(schema[union_key], list)
+                and schema[union_key]
+            ):
+                options = schema[union_key]
+                parent_desc = schema.get("description", "")
+
+                # Check for enum pattern first (all options are const/enum)
+                merged_enum = _try_merge_enum_from_union(options)
+                if merged_enum is not None:
+                    # It's an enum pattern - merge into single enum
+                    result = {k: v for k, v in schema.items() if k != union_key}
+                    result["type"] = "string"
+                    result["enum"] = merged_enum
+                    if parent_desc:
+                        result["description"] = parent_desc
+                    return _clean_claude_schema(result, for_gemini)
+
+                # Not enum pattern - use scoring to pick best option
+                best_idx = 0
+                best_score = -1
+                all_types: List[str] = []
+
+                for i, opt in enumerate(options):
+                    score, type_name = _score_schema_option(opt)
+                    if type_name and type_name != "unknown":
+                        all_types.append(type_name)
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+                # Select best option and recursively clean
+                selected = _clean_claude_schema(options[best_idx], for_gemini)
+                if not isinstance(selected, dict):
+                    selected = {"type": "string"}  # Fallback
+
+                # Preserve parent description, combining if child has one
+                if parent_desc:
+                    child_desc = selected.get("description", "")
+                    if child_desc and child_desc != parent_desc:
+                        selected["description"] = f"{parent_desc} ({child_desc})"
+                    else:
+                        selected["description"] = parent_desc
+
+                # Add type hint if multiple distinct types were present
+                unique_types = list(dict.fromkeys(all_types))  # Preserve order, dedupe
+                if len(unique_types) > 1:
+                    hint = f"Accepts: {' | '.join(unique_types)}"
+                    existing_desc = selected.get("description", "")
+                    if existing_desc:
+                        selected["description"] = f"{existing_desc}. {hint}"
+                    else:
+                        selected["description"] = hint
+
+                return selected
 
     cleaned = {}
     # Handle 'const' by converting to 'enum' with single value (Claude only)
@@ -787,6 +1037,33 @@ class AntigravityProvider(
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
     default_sequential_fallback_multiplier = 2
+
+    # Custom caps examples (commented - uncomment and modify as needed)
+    # default_custom_caps = {
+    #     # Tier 2 (standard-tier / paid)
+    #     2: {
+    #         "claude": {
+    #             "max_requests": 100,  # Cap at 100 instead of 150
+    #             "cooldown_mode": "quota_reset",
+    #             "cooldown_value": 0,
+    #         },
+    #     },
+    #     # Tiers 2 and 3 together
+    #     (2, 3): {
+    #         "g25-flash": {
+    #             "max_requests": "80%",  # 80% of actual max
+    #             "cooldown_mode": "offset",
+    #             "cooldown_value": 1800,  # +30 min buffer
+    #         },
+    #     },
+    #     # Default for unknown tiers
+    #     "default": {
+    #         "claude": {
+    #             "max_requests": "50%",
+    #             "cooldown_mode": "quota_reset",
+    #         },
+    #     },
+    # }
 
     @staticmethod
     def parse_quota_error(
@@ -1056,11 +1333,15 @@ class AntigravityProvider(
         )
         self._enable_parallel_tool_instruction_gemini3 = env_bool(
             "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3",
-            False,  # OFF for Gemini 3
+            True,  # ON for Gemini 3
         )
         self._parallel_tool_instruction = os.getenv(
             "ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION", DEFAULT_PARALLEL_TOOL_INSTRUCTION
         )
+
+        # Tool name sanitization: sanitized_name → original_name
+        # Used to fix invalid tool names (e.g., containing '/') and restore them in responses
+        self._tool_name_mapping: Dict[str, str] = {}
 
         # Log configuration
         self._log_config()
@@ -1075,6 +1356,74 @@ class AntigravityProvider(
             f"parallel_tool_claude={self._enable_parallel_tool_instruction_claude}, "
             f"parallel_tool_gemini3={self._enable_parallel_tool_instruction_gemini3}"
         )
+
+    def _sanitize_tool_name(self, name: str) -> str:
+        """
+        Sanitize tool name to comply with Antigravity API rules.
+
+        Rules (from ANTIGRAVITY_API_SPEC.md):
+        - First char must be letter (a-z, A-Z) or underscore (_)
+        - Allowed chars: a-zA-Z0-9_.:-
+        - Max length: 64 characters
+        - Slashes (/) not allowed
+
+        Handles collisions by appending numeric suffix (_2, _3, etc.)
+
+        Returns sanitized name and stores mapping for later restoration.
+        """
+        if not name:
+            return name
+
+        original = name
+        sanitized = name
+
+        # Replace / with _ (most common issue)
+        sanitized = sanitized.replace("/", "_")
+
+        # If starts with digit, prepend underscore
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"_{sanitized}"
+
+        # Truncate to 60 chars (leave room for potential suffix)
+        if len(sanitized) > 60:
+            sanitized = sanitized[:60]
+
+        # Handle collisions - check if this sanitized name already maps to a DIFFERENT original
+        base_sanitized = sanitized
+        suffix = 2
+        existing_values = set(self._tool_name_mapping.values())
+        while (
+            sanitized in self._tool_name_mapping
+            and self._tool_name_mapping[sanitized] != original
+        ) or (sanitized in existing_values and original not in existing_values):
+            # Check if sanitized name is already used for a different original
+            if sanitized in self._tool_name_mapping:
+                if self._tool_name_mapping[sanitized] == original:
+                    break  # Same original, no collision
+            sanitized = f"{base_sanitized}_{suffix}"
+            suffix += 1
+            if suffix > 100:  # Safety limit
+                lib_logger.error(f"[Tool Name] Too many collisions for '{original}'")
+                break
+
+        # Truncate again if suffix made it too long
+        if len(sanitized) > 64:
+            sanitized = sanitized[:64]
+
+        # Store mapping for restoration (only if changed)
+        if sanitized != original:
+            self._tool_name_mapping[sanitized] = original
+            lib_logger.debug(f"[Tool Name] Sanitized: '{original}' → '{sanitized}'")
+
+        return sanitized
+
+    def _restore_tool_name(self, sanitized_name: str) -> str:
+        """Restore original tool name from sanitized version."""
+        return self._tool_name_mapping.get(sanitized_name, sanitized_name)
+
+    def _clear_tool_name_mapping(self) -> None:
+        """Clear tool name mapping at start of each request."""
+        self._tool_name_mapping.clear()
 
     def _get_antigravity_headers(self) -> Dict[str, str]:
         """Return the Antigravity API headers. Used by quota tracker mixin."""
@@ -1351,22 +1700,17 @@ class AntigravityProvider(
         """
         Sanitize thinking blocks in conversation history for Claude compatibility.
 
-        Handles the following scenarios per Claude docs:
-        1. If thinking is disabled, remove all thinking blocks from conversation
-        2. If thinking is enabled:
-           a. In a tool use loop WITH thinking: preserve it (same mode continues)
-           b. In a tool use loop WITHOUT thinking: this is INVALID toggle - force disable
-           c. Not in tool loop: strip old thinking, new response adds thinking naturally
+        For interleaved thinking:
+        1. If thinking disabled: strip ALL thinking blocks
+        2. If thinking enabled:
+           a. Recover thinking from cache for ALL model messages in current turn
+           b. If first model message has thinking after recovery: valid turn, continue
+           c. If first model message has NO thinking: close loop with synthetic messages
 
         Per Claude docs:
         - "If thinking is enabled, the final assistant turn must start with a thinking block"
-        - "If thinking is disabled, the final assistant turn must not contain any thinking blocks"
         - Tool use loops are part of a single assistant turn
         - You CANNOT toggle thinking mid-turn
-
-        The key insight: We only force-disable thinking when TOGGLING it ON mid-turn.
-        If thinking was already enabled (assistant has thinking), we preserve.
-        If thinking was disabled (assistant has no thinking), enabling it now is invalid.
 
         Returns:
             Tuple of (sanitized_messages, force_disable_thinking)
@@ -1380,158 +1724,143 @@ class AntigravityProvider(
             f"[Thinking Sanitization] thinking_enabled={thinking_enabled}, "
             f"in_tool_loop={state['in_tool_loop']}, "
             f"turn_has_thinking={state['turn_has_thinking']}, "
-            f"turn_start_idx={state['turn_start_idx']}, "
-            f"last_assistant_has_thinking={state['last_assistant_has_thinking']}, "
-            f"last_assistant_has_tool_calls={state['last_assistant_has_tool_calls']}"
+            f"turn_start_idx={state['turn_start_idx']}"
         )
 
         if not thinking_enabled:
-            # CASE 1: Thinking is disabled - strip ALL thinking blocks
+            # Thinking disabled - strip ALL thinking blocks
             return self._strip_all_thinking_blocks(messages), False
 
-        # CASE 2: Thinking is enabled
-        if state["in_tool_loop"]:
-            # We're in a tool use loop (conversation ends with tool_result)
-            # Per Claude docs: entire assistant turn must operate in single thinking mode
-            #
-            # KEY FIX: Check turn_has_thinking (thinking at turn START), not last_assistant_has_thinking.
-            # In multi-message tool loops, thinking is at the FIRST assistant message of the turn,
-            # not necessarily the last one (which might just have tool_calls).
-
-            if state["turn_has_thinking"]:
-                # The TURN started with thinking - this is valid!
-                # Thinking was enabled when tool was called, continue with thinking enabled.
-                # Preserve thinking for the turn start message.
+        # Thinking is enabled
+        # Always try to recover thinking for ALL model messages in current turn
+        if state["turn_start_idx"] >= 0:
+            recovered = self._recover_all_turn_thinking(
+                messages, state["turn_start_idx"]
+            )
+            if recovered > 0:
                 lib_logger.debug(
-                    "[Thinking Sanitization] Tool loop with thinking at turn start - preserving. "
-                    f"turn_start_idx={state['turn_start_idx']}, last_assistant_idx={state['last_assistant_idx']}"
+                    f"[Thinking Sanitization] Recovered {recovered} thinking blocks from cache"
                 )
-                return self._preserve_turn_start_thinking(
-                    messages, state["turn_start_idx"]
-                ), False
+                # Re-analyze state after recovery
+                state = self._analyze_conversation_state(messages)
+
+        if state["in_tool_loop"]:
+            # In tool loop - first model message MUST have thinking
+            if state["turn_has_thinking"]:
+                # Valid: first message has thinking, continue
+                lib_logger.debug(
+                    "[Thinking Sanitization] Tool loop with thinking at turn start - valid"
+                )
+                return messages, False
             else:
-                # The TURN did NOT start with thinking, but thinking is NOW enabled
-                # This is the INVALID case: toggling thinking ON mid-turn
-                #
-                # Per Claude docs, this causes:
-                # "Expected `thinking` or `redacted_thinking`, but found `tool_use`."
-                #
-                # There are TWO possible scenarios:
-                # 1. Original turn was made WITHOUT thinking (e.g., by Gemini or non-thinking Claude)
-                #    → Solution: Close the tool loop with synthetic message
-                # 2. Original turn HAD thinking but compaction stripped it
-                #    → Solution: Try to inject cached thinking, fallback to synthetic closure
+                # Invalid: first message has no thinking, close loop
+                lib_logger.info(
+                    "[Thinking Sanitization] Closing tool loop - turn has no thinking at start"
+                )
+                return self._close_tool_loop_for_thinking(messages), False
+        else:
+            # Not in tool loop - just return messages as-is
+            return messages, False
 
-                turn_start_msg = (
-                    messages[state["turn_start_idx"]]
-                    if state["turn_start_idx"] >= 0
-                    else None
+    def _remove_empty_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Remove empty messages from conversation history.
+
+        A message is considered empty if it has no parts, or all parts are:
+        - Empty/whitespace-only text
+        - No thinking blocks
+        - No functionCall
+        - No functionResponse
+
+        This cleans up after compaction or stripping operations that may leave
+        hollow message structures.
+        """
+        cleaned = []
+        for msg in messages:
+            parts = msg.get("parts", [])
+
+            if not parts:
+                # No parts at all - skip
+                lib_logger.debug(
+                    f"[Cleanup] Removing message with no parts: role={msg.get('role')}"
+                )
+                continue
+
+            has_content = False
+            for part in parts:
+                if isinstance(part, dict):
+                    # Check for non-empty text (empty string or whitespace-only is invalid)
+                    if "text" in part and part["text"].strip():
+                        has_content = True
+                        break
+                    # Check for thinking
+                    if part.get("thought") is True:
+                        has_content = True
+                        break
+                    # Check for function call
+                    if "functionCall" in part:
+                        has_content = True
+                        break
+                    # Check for function response
+                    if "functionResponse" in part:
+                        has_content = True
+                        break
+
+            if has_content:
+                cleaned.append(msg)
+            else:
+                lib_logger.debug(
+                    f"[Cleanup] Removing empty message: role={msg.get('role')}, "
+                    f"parts_count={len(parts)}"
                 )
 
-                # Check if this looks like a compacted thinking turn
-                if turn_start_msg and self._looks_like_compacted_thinking_turn(
-                    turn_start_msg
-                ):
-                    # Try to recover cached thinking block
-                    recovered = self._try_recover_thinking_from_cache(
-                        messages, state["turn_start_idx"]
+        return cleaned
+
+    def _inject_interleaved_thinking_reminder(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Inject interleaved thinking reminder into the last real user message.
+
+        Appends an additional text part to the last user message that contains
+        actual text (not just functionResponse). This is the same anchor message
+        used for tool loop detection - the start of the current turn.
+
+        If no real user message exists, no injection occurs.
+        """
+        # Find last real user message (same logic as _analyze_conversation_state)
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "user":
+                parts = msg.get("parts", [])
+
+                # Check if this is a real user message (has text, not just functionResponse)
+                has_text = any(
+                    isinstance(p, dict) and "text" in p and p.get("text", "").strip()
+                    for p in parts
+                )
+                has_function_response = any(
+                    isinstance(p, dict) and "functionResponse" in p for p in parts
+                )
+
+                if has_text and not has_function_response:
+                    # This is the last real user message - append reminder
+                    messages[i]["parts"].append(
+                        {"text": CLAUDE_USER_INTERLEAVED_THINKING_REMINDER}
                     )
-                    if recovered:
-                        lib_logger.info(
-                            "[Thinking Sanitization] Recovered thinking from cache for compacted turn."
-                        )
-                        return self._preserve_turn_start_thinking(
-                            messages, state["turn_start_idx"]
-                        ), False
-                    else:
-                        # Can't recover from cache - close the loop with synthetic messages
-                        # This allows Claude to start a fresh turn with thinking
-                        lib_logger.info(
-                            "[Thinking Sanitization] Compacted thinking turn detected in tool loop. "
-                            "Cache miss - closing loop with synthetic messages to enable fresh thinking turn."
-                        )
-                        return self._close_tool_loop_for_thinking(messages), False
-                else:
-                    # Not a compacted turn - genuinely no thinking. Close the loop.
-                    lib_logger.info(
-                        "[Thinking Sanitization] Closing tool loop with synthetic response. "
-                        "Turn did not start with thinking (turn_has_thinking=False). "
-                        "This allows thinking to be enabled on the new turn."
+                    lib_logger.debug(
+                        f"[Interleaved Thinking] Injected reminder to user message at index {i}"
                     )
-                    return self._close_tool_loop_for_thinking(messages), False
-        else:
-            # Not in a tool loop - this is the simple case
-            # The conversation doesn't end with tool_result, so we're starting fresh.
-            #
-            # HOWEVER, there's a special case: compaction might have removed the thinking
-            # block from the turn start, but Claude still expects it.
-            # We detect this by checking if there's an assistant message with tool_calls
-            # but no thinking, and the conversation structure suggests thinking was expected.
+                    return messages
 
-            # Check if we need to inject a fake thinking block for compaction recovery
-            if state["last_assistant_idx"] >= 0:
-                last_assistant = messages[state["last_assistant_idx"]]
-
-                if (
-                    state["last_assistant_has_tool_calls"]
-                    and not state["turn_has_thinking"]
-                ):
-                    # The turn has functionCall but no thinking at turn start.
-                    # This could be:
-                    # 1. Compaction removed the thinking block
-                    # 2. The original call was made without thinking
-                    #
-                    # For case 1, we need to close the turn and start fresh.
-                    # For case 2, we let the model respond naturally.
-                    #
-                    # We can detect case 1 if there's evidence thinking was expected:
-                    # - The turn_start message has functionCall (typical thinking-enabled flow)
-                    # - The content structure suggests a thinking block was stripped
-
-                    # Check if turn_start has the hallmarks of a compacted thinking response
-                    turn_start_msg = (
-                        messages[state["turn_start_idx"]]
-                        if state["turn_start_idx"] >= 0
-                        else None
-                    )
-                    if turn_start_msg and self._looks_like_compacted_thinking_turn(
-                        turn_start_msg
-                    ):
-                        # Try cache recovery first
-                        recovered = self._try_recover_thinking_from_cache(
-                            messages, state["turn_start_idx"]
-                        )
-                        if recovered:
-                            lib_logger.info(
-                                "[Thinking Sanitization] Recovered thinking from cache for compacted turn (not in tool loop)."
-                            )
-                            return self._strip_old_turn_thinking(
-                                messages, state["turn_start_idx"]
-                            ), False
-                        else:
-                            # Can't recover - add synthetic user to start fresh turn (Gemini format)
-                            lib_logger.info(
-                                "[Thinking Sanitization] Detected compacted turn missing thinking block. "
-                                "Adding synthetic user message to start fresh thinking turn."
-                            )
-                            # Add synthetic user message to trigger new turn with thinking
-                            synthetic_user = {
-                                "role": "user",
-                                "parts": [{"text": "[Continue]"}],
-                            }
-                            messages.append(synthetic_user)
-                            return self._strip_all_thinking_blocks(messages), False
-                    else:
-                        lib_logger.debug(
-                            "[Thinking Sanitization] Last model has functionCall but no thinking. "
-                            "This is likely from context compression or non-thinking model. "
-                            "New response will include thinking naturally."
-                        )
-
-            # Strip thinking from old turns, let new response add thinking naturally
-            return self._strip_old_turn_thinking(
-                messages, state["last_assistant_idx"]
-            ), False
+        # No real user message found - no injection
+        lib_logger.debug(
+            "[Interleaved Thinking] No real user message found for reminder injection"
+        )
+        return messages
 
     def _strip_all_thinking_blocks(
         self, messages: List[Dict[str, Any]]
@@ -1762,6 +2091,97 @@ class AntigravityProvider(
                 f"[Thinking Sanitization] Failed to parse cached thinking"
             )
             return False
+
+    def _recover_all_turn_thinking(
+        self, messages: List[Dict[str, Any]], turn_start_idx: int
+    ) -> int:
+        """
+        Recover thinking from cache for ALL model messages in current turn.
+
+        For interleaved thinking, every model response in the turn may have thinking.
+        Clients strip thinking content, so we restore from cache.
+        Always overwrites existing thinking (safer - ensures signature is valid).
+
+        Args:
+            messages: Gemini-format messages
+            turn_start_idx: Index of first model message in current turn
+
+        Returns:
+            Count of messages where thinking was recovered.
+        """
+        if turn_start_idx < 0:
+            return 0
+
+        recovered_count = 0
+
+        for i in range(turn_start_idx, len(messages)):
+            msg = messages[i]
+            if msg.get("role") != "model":
+                continue
+
+            parts = msg.get("parts", [])
+
+            # Extract text content and tool_calls for cache lookup
+            # Also collect non-thinking parts to rebuild the message
+            text_content = ""
+            tool_calls = []
+            non_thinking_parts = []
+
+            for part in parts:
+                if isinstance(part, dict):
+                    if part.get("thought") is True:
+                        # Skip existing thinking - we'll overwrite with cached version
+                        continue
+                    if "text" in part:
+                        text_content = part["text"]
+                        non_thinking_parts.append(part)
+                    elif "functionCall" in part:
+                        fc = part["functionCall"]
+                        tool_calls.append(
+                            {
+                                "id": fc.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": fc.get("name", ""),
+                                    "arguments": json.dumps(fc.get("args", {})),
+                                },
+                            }
+                        )
+                        non_thinking_parts.append(part)
+                    else:
+                        non_thinking_parts.append(part)
+
+            # Try cache recovery
+            cache_key = self._generate_thinking_cache_key(text_content, tool_calls)
+            if not cache_key:
+                continue
+
+            cached_json = self._thinking_cache.retrieve(cache_key)
+            if not cached_json:
+                continue
+
+            try:
+                thinking_data = json.loads(cached_json)
+                thinking_text = thinking_data.get("thinking_text", "")
+                signature = thinking_data.get("thought_signature", "")
+
+                if thinking_text and signature:
+                    # Inject recovered thinking at beginning
+                    thinking_part = {
+                        "text": thinking_text,
+                        "thought": True,
+                        "thoughtSignature": signature,
+                    }
+                    msg["parts"] = [thinking_part] + non_thinking_parts
+                    recovered_count += 1
+                    lib_logger.debug(
+                        f"[Thinking Recovery] Recovered thinking for msg {i}: "
+                        f"{len(thinking_text)} chars"
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        return recovered_count
 
     def _close_tool_loop_for_thinking(
         self, messages: List[Dict[str, Any]]
@@ -2793,9 +3213,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
     # REQUEST TRANSFORMATION
     # =========================================================================
 
-    def _has_search_tool_request(
-        self, tools: Optional[List[Dict[str, Any]]]
-    ) -> bool:
+    def _has_search_tool_request(self, tools: Optional[List[Dict[str, Any]]]) -> bool:
         """Check if the client has requested a search tool.
 
         When a search tool is requested, we enable google_search grounding
@@ -2809,7 +3227,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         """
         return any(
             tool.get("type") == "function"
-            and tool.get("function", {}).get("name", "").lower() in SEARCH_TOOL_NAMES_LOWER
+            and tool.get("function", {}).get("name", "").lower()
+            in SEARCH_TOOL_NAMES_LOWER
             for tool in tools or []
         )
 
@@ -2834,7 +3253,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             for tool in tools
             if not (
                 tool.get("type") == "function"
-                and tool.get("function", {}).get("name", "").lower() in SEARCH_TOOL_NAMES_LOWER
+                and tool.get("function", {}).get("name", "").lower()
+                in SEARCH_TOOL_NAMES_LOWER
             )
         ]
 
@@ -2868,10 +3288,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         # Check if client explicitly requested search via tool names
         if GOOGLE_SEARCH_MODE == "dynamic" and self._has_search_tool_request(tools):
             search_enabled = True
-            lib_logger.debug("[Search] Search tool detected in request, enabling google_search grounding")
+            lib_logger.debug(
+                "[Search] Search tool detected in request, enabling google_search grounding"
+            )
         elif GOOGLE_SEARCH_MODE == "always":
             search_enabled = True
-            lib_logger.debug("[Search] Search mode is 'always', enabling google_search grounding")
+            lib_logger.debug(
+                "[Search] Search mode is 'always', enabling google_search grounding"
+            )
         elif GOOGLE_SEARCH_MODE == "never":
             search_enabled = False
 
@@ -2889,7 +3313,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             params = func.get("parameters")
 
             func_decl = {
-                "name": func.get("name", ""),
+                "name": self._sanitize_tool_name(func.get("name", "")),
                 "description": func.get("description", ""),
             }
 
@@ -2951,7 +3375,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     f"[Search] Enabling google_search grounding alongside {len(function_declarations)} function tools"
                 )
             else:
-                lib_logger.info("[Search] Enabling google_search grounding (no function tools)")
+                lib_logger.info(
+                    "[Search] Enabling google_search grounding (no function tools)"
+                )
 
         if not result_tools:
             return None, False
@@ -3023,7 +3449,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         )
 
         # Prepend Antigravity agent system instruction to existing system instruction
-        # Per CLIProxyAPI Go buildRequest(): Sets request.systemInstruction.role = "user"
+        # Sets request.systemInstruction.role = "user"
         # and sets parts.0.text to the agent identity/guidelines
         # We preserve any existing parts by shifting them (Antigravity = parts[0], existing = parts[1:])
         #
@@ -3049,14 +3475,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         existing_parts = existing_sys_inst.get("parts", [])
 
-        # Determine target field name based on PRESERVE_SYSTEM_INSTRUCTION_CASE setting
-        if PRESERVE_SYSTEM_INSTRUCTION_CASE:
-            target_key = original_key
-        else:
-            target_key = "systemInstruction"  # Always use camelCase
-            # Remove snake_case version if present (avoid duplicate fields)
-            if has_snake_case:
-                del request["system_instruction"]
+        # Always normalize to camelCase (Antigravity API requirement)
+        target_key = "systemInstruction"
+        # Remove snake_case version if present (avoid duplicate fields)
+        if has_snake_case:
+            del request["system_instruction"]
 
         # Build new parts array
         if not PREPEND_INSTRUCTION:
@@ -3355,107 +3778,6 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         return response
 
-    def _gemini_to_openai_non_streaming(
-        self,
-        response: Dict[str, Any],
-        model: str,
-        tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Convert Gemini response to OpenAI non-streaming format."""
-        candidates = response.get("candidates", [])
-        if not candidates:
-            return {}
-
-        candidate = candidates[0]
-        content_parts = candidate.get("content", {}).get("parts", [])
-
-        text_content = ""
-        reasoning_content = ""
-        tool_calls = []
-        thought_sig = ""
-
-        for part in content_parts:
-            has_func = "functionCall" in part
-            has_text = "text" in part
-            has_sig = bool(part.get("thoughtSignature"))
-            is_thought = (
-                part.get("thought") is True
-                or str(part.get("thought")).lower() == "true"
-            )
-
-            if has_sig and is_thought:
-                thought_sig = part["thoughtSignature"]
-
-            if has_sig and not has_func and (not has_text or not part.get("text")):
-                continue
-
-            if has_text:
-                if is_thought:
-                    reasoning_content += part["text"]
-                else:
-                    text_content += part["text"]
-
-            if has_func:
-                tool_call = self._extract_tool_call(
-                    part, model, len(tool_calls), tool_schemas=tool_schemas
-                )
-
-                # Store signature for each tool call (needed for parallel tool calls)
-                if has_sig:
-                    self._handle_tool_signature(tool_call, part["thoughtSignature"])
-
-                tool_calls.append(tool_call)
-
-        # Cache Claude thinking
-        if (
-            reasoning_content
-            and self._is_claude(model)
-            and self._enable_signature_cache
-        ):
-            self._cache_thinking(
-                reasoning_content, thought_sig, text_content, tool_calls
-            )
-
-        # Build message
-        message = {"role": "assistant"}
-        if text_content:
-            message["content"] = text_content
-        elif not tool_calls:
-            message["content"] = ""
-        if reasoning_content:
-            message["reasoning_content"] = reasoning_content
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-            message.pop("content", None)
-
-        finish_reason = self._map_finish_reason(
-            candidate.get("finishReason"), bool(tool_calls)
-        )
-        usage = self._build_usage(response.get("usageMetadata", {}))
-
-        # For non-streaming, always include finish_reason (should always be present)
-        result = {
-            "id": response.get("responseId", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finish_reason or "stop",
-                }
-            ],
-        }
-
-        if usage:
-            result["usage"] = usage
-
-        # Extract and include grounding metadata from Google Search
-        self._extract_grounding_metadata(candidate, result)
-
-        return result
-
     def _build_tool_schema_map(
         self, tools: Optional[List[Dict[str, Any]]], model: str
     ) -> Dict[str, Dict[str, Any]]:
@@ -3503,6 +3825,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         tool_name = func_call.get("name", "")
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             tool_name = self._strip_gemini3_prefix(tool_name)
+
+        # Restore original tool name after stripping any prefixes
+        tool_name = self._restore_tool_name(tool_name)
 
         raw_args = func_call.get("args", {})
 
@@ -3673,6 +3998,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         3. Makes API call with fallback logic
         4. Transforms response to OpenAI format
         """
+        # Clear tool name mapping for fresh request
+        self._clear_tool_name_mapping()
+
         # Extract parameters
         model = self._strip_provider_prefix(kwargs.get("model", "gemini-2.5-pro"))
         messages = kwargs.get("messages", [])
@@ -3690,23 +4018,34 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         file_logger = AntigravityProviderLogger(transaction_context)
 
         # Determine if thinking is enabled for this request
-        # Thinking is enabled if reasoning_effort is set and not explicitly disabled
+        # Thinking is enabled if:
+        # 1. Model is a thinking model (opus or -thinking suffix) - ALWAYS enabled, cannot be disabled
+        # 2. For non-thinking models: reasoning_effort is set and not explicitly disabled
         thinking_enabled = False
         if self._is_claude(model):
-            # For Claude, thinking is enabled when reasoning_effort is provided and not "disable"/"none"/"off"
-            if reasoning_effort is not None:
-                if isinstance(reasoning_effort, str):
-                    thinking_enabled = reasoning_effort.lower().strip() not in (
-                        "disable",
-                        "none",
-                        "off",
-                        "",
-                    )
-                elif isinstance(reasoning_effort, (int, float)):
-                    # Numeric: enabled if > 0
-                    thinking_enabled = float(reasoning_effort) > 0
-                else:
-                    thinking_enabled = True
+            model_lower = model.lower()
+
+            # Check if this is a thinking model by name (opus or -thinking suffix)
+            is_thinking_model = "opus" in model_lower or "-thinking" in model_lower
+
+            if is_thinking_model:
+                # Thinking models ALWAYS have thinking enabled - cannot be disabled
+                thinking_enabled = True
+                # Note: invalid disable requests in reasoning_effort are handled later
+            else:
+                # Non-thinking models - reasoning_effort controls thinking
+                if reasoning_effort is not None:
+                    if isinstance(reasoning_effort, str):
+                        effort_lower = reasoning_effort.lower().strip()
+                        if effort_lower in ("disable", "none", "off", ""):
+                            thinking_enabled = False
+                        else:
+                            thinking_enabled = True
+                    elif isinstance(reasoning_effort, (int, float)):
+                        # Numeric: enabled if > 0
+                        thinking_enabled = float(reasoning_effort) > 0
+                    else:
+                        thinking_enabled = True
 
         # Transform messages to Gemini format FIRST
         # This restores thinking from cache if reasoning_content was stripped by client
@@ -3727,6 +4066,21 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             if force_disable_thinking:
                 thinking_enabled = False
                 reasoning_effort = "disable"  # Force disable for this request
+
+        # Clean up any empty messages left by stripping/recovery operations
+        gemini_contents = self._remove_empty_messages(gemini_contents)
+
+        # Inject interleaved thinking reminder to last real user message
+        # Only if thinking is enabled and tools are present
+        if (
+            ENABLE_INTERLEAVED_THINKING
+            and thinking_enabled
+            and self._is_claude(model)
+            and tools
+        ):
+            gemini_contents = self._inject_interleaved_thinking_reminder(
+                gemini_contents
+            )
 
         # Build payload
         gemini_payload = {"contents": gemini_contents}
@@ -3756,6 +4110,16 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             ):
                 self._inject_tool_hardening_instruction(
                     gemini_payload, self._parallel_tool_instruction
+                )
+
+            # Inject interleaved thinking hint for Claude thinking models with tools
+            if (
+                ENABLE_INTERLEAVED_THINKING
+                and self._is_claude(model)
+                and thinking_enabled
+            ):
+                self._inject_tool_hardening_instruction(
+                    gemini_payload, CLAUDE_INTERLEAVED_THINKING_HINT
                 )
 
         # Add generation config

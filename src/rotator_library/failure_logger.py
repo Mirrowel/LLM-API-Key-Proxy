@@ -8,6 +8,29 @@ from typing import Optional, Union
 from .error_handler import mask_credential
 from .utils.paths import get_logs_dir
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+
+# Maximum size of the failure log file before rotation (in bytes)
+# Default: 5 MB
+FAILURE_LOG_MAX_SIZE: int = 5 * 1024 * 1024
+
+# Number of backup log files to keep
+FAILURE_LOG_BACKUP_COUNT: int = 2
+
+# Maximum characters per individual error message in the chain
+FAILURE_LOG_ERROR_MESSAGE_LIMIT: int = 2000
+
+# Maximum error chain length to prevent excessive nesting
+FAILURE_LOG_ERROR_CHAIN_LIMIT: int = 5
+
+# Maximum length of full error message in detailed log
+FAILURE_LOG_FULL_MESSAGE_LIMIT: int = 5000
+
+# Maximum length of raw response in detailed log
+FAILURE_LOG_RAW_RESPONSE_LIMIT: int = 10000
+
 
 class JsonFormatter(logging.Formatter):
     """Custom JSON formatter for structured logs."""
@@ -60,8 +83,8 @@ def _setup_failure_logger(logs_dir: Path) -> logging.Logger:
 
         handler = RotatingFileHandler(
             logs_dir / "failures.log",
-            maxBytes=5 * 1024 * 1024,  # 5 MB
-            backupCount=2,
+            maxBytes=FAILURE_LOG_MAX_SIZE,
+            backupCount=FAILURE_LOG_BACKUP_COUNT,
         )
         handler.setFormatter(JsonFormatter())
         logger.addHandler(handler)
@@ -186,13 +209,13 @@ def log_failure(
         error_chain.append(
             {
                 "type": type(current_error).__name__,
-                "message": str(current_error)[:2000],  # Limit per-error message size
+                "message": str(current_error)[:FAILURE_LOG_ERROR_MESSAGE_LIMIT],
             }
         )
         current_error = getattr(current_error, "__cause__", None) or getattr(
             current_error, "__context__", None
         )
-        if len(error_chain) > 5:  # Prevent excessive chain length
+        if len(error_chain) > FAILURE_LOG_ERROR_CHAIN_LIMIT:
             break
 
     detailed_log_data = {
@@ -201,10 +224,10 @@ def log_failure(
         "model": model,
         "attempt_number": attempt,
         "error_type": type(error).__name__,
-        "error_message": full_error_message[:5000],  # Limit total size
-        "raw_response": raw_response[:10000]
+        "error_message": full_error_message[:FAILURE_LOG_FULL_MESSAGE_LIMIT],
+        "raw_response": raw_response[:FAILURE_LOG_RAW_RESPONSE_LIMIT]
         if raw_response
-        else None,  # Limit response size
+        else None,
         "request_headers": request_headers,
         "error_chain": error_chain if len(error_chain) > 1 else None,
     }

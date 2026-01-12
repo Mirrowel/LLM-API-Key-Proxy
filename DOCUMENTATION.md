@@ -728,6 +728,94 @@ The PR refactors shared logic between Gemini CLI and Antigravity providers into 
 - Easier maintenance and bug fixes
 - Consistent behavior across Google OAuth-based providers
 
+### 2.19. Fair Cycle Rotation
+
+Fair Cycle Rotation ensures each credential is used at least once before any credential can be reused within a tier. This prevents a single credential from being repeatedly used and exhausted while others sit idle.
+
+**Problem Solved:**
+- In sequential mode, the same high-priority credential might be used repeatedly
+- When exhausted, it gets a cooldown, but after cooldown expires, it's used again
+- Other credentials of the same tier never get used
+
+**Solution:**
+- When a credential hits a long cooldown (> threshold), mark it as "exhausted"
+- Exhausted credentials are skipped until ALL credentials in the tier exhaust
+- Once all exhaust OR cycle duration expires, the cycle resets
+
+**Configuration (Environment Variables):**
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `FAIR_CYCLE_{PROVIDER}` | bool | sequential only | Enable/disable fair cycle |
+| `FAIR_CYCLE_TRACKING_MODE_{PROVIDER}` | string | `model_group` | `model_group` or `credential` |
+| `FAIR_CYCLE_CROSS_TIER_{PROVIDER}` | bool | `false` | Track across all tiers |
+| `FAIR_CYCLE_DURATION_{PROVIDER}` | int | `86400` | Cycle duration in seconds |
+| `EXHAUSTION_COOLDOWN_THRESHOLD_{PROVIDER}` | int | `300` | Threshold in seconds |
+
+**Defaults:** All defaults are defined in `src/rotator_library/config/defaults.py`.
+
+**Logging Format:**
+```
+Acquiring key for model antigravity/claude-opus-4.5. Tried keys: 0/12(17,cd:3,fc:2)
+# Breakdown: 0 tried, 12 available, 17 total, 3 on cooldown, 2 fair-cycle excluded
+```
+
+**Persistence:**
+Cycle state is persisted in `key_usage.json` under the `__fair_cycle__` key.
+
+### 2.20. Custom Caps
+
+Custom Caps allow setting custom usage limits per tier, per model/group that are MORE restrictive than actual API limits. When the custom cap is reached, the credential is put on cooldown BEFORE hitting the actual API limit.
+
+**Use Cases:**
+- Pace usage across quota window (don't burn 150 requests in first hour)
+- Reserve capacity for certain times of day
+- Add safety buffer (stop at 120/150 to avoid edge cases)
+- Extend cooldown beyond natural reset for pacing
+
+**Key Principle: More Restrictive Only**
+- Custom cap is always <= actual max (clamped if set higher)
+- Custom cooldown is always >= natural reset time (clamped if set shorter)
+
+**Configuration (Environment Variables):**
+
+```bash
+# Format
+CUSTOM_CAP_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<value>
+CUSTOM_CAP_COOLDOWN_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<mode>:<value>
+
+# Examples
+CUSTOM_CAP_ANTIGRAVITY_T2_CLAUDE=100
+CUSTOM_CAP_COOLDOWN_ANTIGRAVITY_T2_CLAUDE=quota_reset
+
+CUSTOM_CAP_ANTIGRAVITY_T3_CLAUDE=30
+CUSTOM_CAP_COOLDOWN_ANTIGRAVITY_T3_CLAUDE=offset:3600
+```
+
+**Cap Values:**
+- Absolute number: `100`
+- Percentage of actual max: `"80%"`
+
+**Cooldown Modes:**
+
+| Mode | Formula | Use Case |
+|------|---------|----------|
+| `quota_reset` | `quota_reset_ts` | Same as natural behavior |
+| `offset` | `quota_reset_ts + value` | Add buffer time |
+| `fixed` | `window_start_ts + value` | Fixed window from start |
+
+**Resolution Priority:**
+1. Tier + Model (most specific)
+2. Tier + Group (model's quota group)
+3. Default + Model
+4. Default + Group
+5. No custom cap (use actual API limits)
+
+**Integration with Fair Cycle:**
+When a custom cap triggers a cooldown longer than the exhaustion threshold, it also marks the credential as exhausted for fair cycle rotation.
+
+**Defaults:** See `src/rotator_library/config/defaults.py` for all configurable defaults.
+
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
 The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
