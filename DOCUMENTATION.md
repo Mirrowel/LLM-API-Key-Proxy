@@ -885,6 +885,25 @@ Automatic fallback chain for resilience:
 2. `autopush-cloudcode-pa.sandbox.googleapis.com` (fallback sandbox)
 3. `cloudcode-pa.googleapis.com` (production fallback)
 
+#### Google Search Grounding
+
+Enables real-time web search capabilities via Gemini's native `googleSearch` tool. When enabled, the model can fetch current information from the web to provide grounded, up-to-date responses with citations.
+
+**How it works:**
+- The proxy injects `{"googleSearch": {}}` into the tools array sent to Gemini
+- Gemini performs searches server-side and returns grounded responses
+- Response includes `groundingMetadata` with search queries, sources, and citations
+- No client-side handling required - it's entirely transparent
+
+**Modes:**
+| Mode | Behavior |
+|------|----------|
+| `off` | Disabled (default) |
+| `on` | Inject googleSearch when client provides tools |
+| `always` | Always inject, even for pure chat requests |
+
+**Conflict handling:** If the client sends a tool named `google_search`, it is automatically replaced with native Gemini grounding for better search results.
+
 #### Message Transformation
 
 **OpenAI → Gemini Format:**
@@ -926,6 +945,13 @@ ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION="..."  # Custom instruction text
 
 # Quota tracking
 ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Background quota refresh interval in seconds (default: 300 = 5 min)
+
+# Google Search Grounding
+# Injects Gemini's native google_search tool for real-time web search
+# "off" = disabled (default)
+# "on" = inject google_search when client provides tools
+# "always" = inject google_search even for pure chat (no client tools)
+ANTIGRAVITY_GOOGLE_SEARCH=off
 ```
 
 #### Claude Extended Thinking Sanitization

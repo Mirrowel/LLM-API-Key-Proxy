@@ -337,6 +337,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 - Tool hallucination prevention
 - Quota baseline tracking with background refresh
 - Parallel tool usage instruction injection
+- Google Search Grounding (real-time web search via native `google_search` tool)
 - **Quota Groups**: Models that share quota are automatically grouped:
     - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
     - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
@@ -594,6 +595,7 @@ Access Google's internal Antigravity API for cutting-edge models.
 - Credential prioritization (paid resets every 5 hours, free weekly)
 - Quota baseline tracking with background refresh (accurate remaining quota estimates)
 - Parallel tool usage instruction injection for Claude
+- **Google Search Grounding** — Real-time web search via Gemini's native `google_search` tool
 
 **Environment Variables:**
 ```env
@@ -607,6 +609,9 @@ ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
 ANTIGRAVITY_GEMINI3_TOOL_FIX=true
 ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval (seconds)
 ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Parallel tool instruction for Claude
+
+# Google Search Grounding: "off" (default), "on" (with tools), "always" (all requests)
+ANTIGRAVITY_GOOGLE_SEARCH=off
 ```
 
 > **Note:** Gemini 3 models require a paid-tier Google Cloud project.
