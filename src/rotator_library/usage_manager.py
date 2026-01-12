@@ -3255,6 +3255,26 @@ class UsageManager:
                         "hours_until_reset": hours_until_reset,
                     }
 
+                # Mark credential as exhausted in fair cycle if cooldown exceeds threshold
+                # This ensures background refresh detection counts toward cycle completion
+                cooldown_duration = reset_timestamp - now_ts
+                provider = self._get_provider_from_credential(credential)
+                if provider:
+                    threshold = self._get_exhaustion_cooldown_threshold(provider)
+                    if cooldown_duration > threshold:
+                        rotation_mode = self._get_rotation_mode(provider)
+                        if self._is_fair_cycle_enabled(provider, rotation_mode):
+                            priority = self._get_credential_priority(
+                                credential, provider
+                            )
+                            tier_key = self._get_tier_key(provider, priority)
+                            tracking_key = self._get_tracking_key(
+                                credential, model, provider
+                            )
+                            self._mark_credential_exhausted(
+                                credential, provider, tier_key, tracking_key
+                            )
+
                 # Defensive clamp: ensure request_count doesn't exceed max when exhausted
                 if (
                     max_requests is not None
