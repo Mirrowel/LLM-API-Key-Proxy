@@ -1547,18 +1547,16 @@ class UsageManager:
             if provider:
                 rotation_mode = self._get_rotation_mode(provider)
                 if self._is_fair_cycle_enabled(provider, rotation_mode):
-                    # Determine tier_key based on first credential's priority
-                    first_priority = (
-                        credential_priorities.get(not_on_cooldown[0], 999)
-                        if credential_priorities
-                        else 999
-                    )
-                    tier_key = self._get_tier_key(provider, first_priority)
-                    tracking_key = self._get_tracking_key(
-                        not_on_cooldown[0], model, provider
-                    )
-
+                    # Check each credential against its own tier's exhausted set
                     for key in not_on_cooldown:
+                        key_priority = (
+                            credential_priorities.get(key, 999)
+                            if credential_priorities
+                            else 999
+                        )
+                        tier_key = self._get_tier_key(provider, key_priority)
+                        tracking_key = self._get_tracking_key(key, model, provider)
+
                         if self._is_credential_exhausted_in_cycle(
                             key, provider, tier_key, tracking_key
                         ):
