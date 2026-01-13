@@ -15,6 +15,7 @@ DEFAULT_OAUTH_DIRS = {
     "qwen_code": Path.home() / ".qwen",
     "iflow": Path.home() / ".iflow",
     "antigravity": Path.home() / ".antigravity",
+    "codex": Path.home() / ".codex",
     # Add other providers like 'claude' here if they have a standard CLI path
 }
 
@@ -25,6 +26,7 @@ ENV_OAUTH_PROVIDERS = {
     "antigravity": "ANTIGRAVITY",
     "qwen_code": "QWEN_CODE",
     "iflow": "IFLOW",
+    "codex": "CODEX",
 }
 
 
