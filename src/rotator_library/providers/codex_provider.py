@@ -38,6 +38,7 @@ import litellm
 
 from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .openai_oauth_base import OpenAIOAuthBase
+from .utilities.codex_quota_tracker import CodexQuotaTracker
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..error_handler import EmptyResponseError, TransientQuotaError
@@ -489,12 +490,19 @@ def _apply_reasoning_to_message(
 # PROVIDER IMPLEMENTATION
 # =============================================================================
 
-class CodexProvider(OpenAIOAuthBase, ProviderInterface):
+class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
     """
     OpenAI Codex Provider
 
     Provides access to OpenAI Codex models (GPT-5, Codex) via the Responses API.
     Uses OAuth with PKCE for authentication.
+
+    Features:
+    - OAuth-based authentication with PKCE
+    - Responses API for streaming
+    - Rate limit / quota tracking via CodexQuotaTracker
+    - Reasoning/thinking output with configurable effort levels
+    - Tool calling support
     """
 
     # Provider configuration
@@ -529,19 +537,27 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
         ),
     }
 
-    # Model quota groups (models that share limits)
+    # Model quota groups - for Codex, these represent time-based rate limit windows
+    # rather than model groupings, since all Codex models share the same global limits
     model_quota_groups: QuotaGroupMap = {
-        "gpt5": ["gpt-5", "gpt-5.1", "gpt-5.2"],
-        "codex": ["gpt-5-codex", "gpt-5.1-codex", "gpt-5.2-codex", "gpt-5.1-codex-max"],
+        "5h-limit": ["_5h_window"],  # Primary window (5 hour rolling)
+        "weekly-limit": ["_weekly_window"],  # Secondary window (weekly)
     }
 
     def __init__(self):
-        # Initialize both parent classes
+        # Initialize parent classes
         ProviderInterface.__init__(self)
         OpenAIOAuthBase.__init__(self)
 
         self.model_definitions = ModelDefinitions()
         self._session_cache: Dict[str, str] = {}  # Cache session IDs per credential
+
+        # Initialize quota tracker
+        self._init_quota_tracker()
+
+        # Set available models for quota tracking (used by _store_baselines_to_usage_manager)
+        # Codex has a global rate limit, so we store the same baseline for all models
+        self._available_models_for_quota = AVAILABLE_MODELS
 
     def has_custom_logic(self) -> bool:
         """This provider uses custom logic (Responses API instead of litellm)."""
@@ -649,11 +665,13 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
 
         if stream:
             return self._stream_response(
-                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT)
+                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
+                credential_path
             )
         else:
             return await self._non_stream_response(
-                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT)
+                client, headers, payload, requested_model, kwargs.get("reasoning_compat", DEFAULT_REASONING_COMPAT),
+                credential_path
             )
 
     async def _stream_response(
@@ -663,6 +681,7 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
         payload: Dict[str, Any],
         model: str,
         reasoning_compat: str,
+        credential_path: str = "",
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """Handle streaming response from Responses API."""
         created = int(time.time())
@@ -681,6 +700,11 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
             json=payload,
             timeout=TimeoutConfig.streaming(),
         ) as response:
+            # Capture rate limit headers for quota tracking
+            if credential_path:
+                response_headers = {k.lower(): v for k, v in response.headers.items()}
+                self.update_quota_from_headers(credential_path, response_headers)
+
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
@@ -882,6 +906,7 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
         payload: Dict[str, Any],
         model: str,
         reasoning_compat: str,
+        credential_path: str = "",
     ) -> litellm.ModelResponse:
         """Handle non-streaming response by collecting stream."""
         created = int(time.time())
@@ -901,6 +926,11 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
             json=payload,
             timeout=TimeoutConfig.streaming(),
         ) as response:
+            # Capture rate limit headers for quota tracking
+            if credential_path:
+                response_headers = {k.lower(): v for k, v in response.headers.items()}
+                self.update_quota_from_headers(credential_path, response_headers)
+
             if response.status_code >= 400:
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
@@ -1058,3 +1088,126 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
             pass
 
         return None
+
+    # =========================================================================
+    # QUOTA INFO METHODS
+    # =========================================================================
+
+    async def get_quota_remaining(
+        self,
+        credential_path: str,
+        force_refresh: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get remaining quota info for a credential.
+
+        This returns the rate limit status including primary/secondary windows
+        and credits info.
+
+        Args:
+            credential_path: Credential to check quota for
+            force_refresh: If True, fetch fresh data from API
+
+        Returns:
+            Dict with quota info or None if not available:
+            {
+                "primary": {
+                    "remaining_percent": float,
+                    "used_percent": float,
+                    "reset_in_seconds": float | None,
+                    "is_exhausted": bool,
+                },
+                "secondary": {...} | None,
+                "credits": {
+                    "has_credits": bool,
+                    "unlimited": bool,
+                    "balance": str | None,
+                },
+                "plan_type": str | None,
+                "is_stale": bool,
+            }
+        """
+        # Check cache first
+        cached = self.get_cached_quota(credential_path)
+
+        if force_refresh or cached is None or cached.is_stale:
+            # Fetch fresh data
+            snapshot = await self.fetch_quota_from_api(credential_path, CODEX_API_BASE)
+        else:
+            snapshot = cached
+
+        if snapshot.status not in ("success", "cached"):
+            return None
+
+        result: Dict[str, Any] = {
+            "plan_type": snapshot.plan_type,
+            "is_stale": snapshot.is_stale,
+            "fetched_at": snapshot.fetched_at,
+        }
+
+        if snapshot.primary:
+            result["primary"] = {
+                "remaining_percent": snapshot.primary.remaining_percent,
+                "used_percent": snapshot.primary.used_percent,
+                "window_minutes": snapshot.primary.window_minutes,
+                "reset_in_seconds": snapshot.primary.seconds_until_reset(),
+                "is_exhausted": snapshot.primary.is_exhausted,
+            }
+
+        if snapshot.secondary:
+            result["secondary"] = {
+                "remaining_percent": snapshot.secondary.remaining_percent,
+                "used_percent": snapshot.secondary.used_percent,
+                "window_minutes": snapshot.secondary.window_minutes,
+                "reset_in_seconds": snapshot.secondary.seconds_until_reset(),
+                "is_exhausted": snapshot.secondary.is_exhausted,
+            }
+
+        if snapshot.credits:
+            result["credits"] = {
+                "has_credits": snapshot.credits.has_credits,
+                "unlimited": snapshot.credits.unlimited,
+                "balance": snapshot.credits.balance,
+            }
+
+        return result
+
+    def get_quota_display(self, credential_path: str) -> str:
+        """
+        Get a human-readable quota display string for a credential.
+
+        Returns a string like "85% remaining (resets in 2h 30m)" or
+        "EXHAUSTED (resets in 45m)".
+
+        Args:
+            credential_path: Credential to get display for
+
+        Returns:
+            Human-readable quota string
+        """
+        cached = self.get_cached_quota(credential_path)
+        if not cached or cached.status != "success":
+            return "quota unknown"
+
+        if not cached.primary:
+            return "no rate limit data"
+
+        primary = cached.primary
+        remaining = primary.remaining_percent
+        reset_seconds = primary.seconds_until_reset()
+
+        if reset_seconds is not None:
+            hours = int(reset_seconds // 3600)
+            minutes = int((reset_seconds % 3600) // 60)
+            if hours > 0:
+                reset_str = f"{hours}h {minutes}m"
+            else:
+                reset_str = f"{minutes}m"
+        else:
+            reset_str = "unknown"
+
+        if primary.is_exhausted:
+            return f"EXHAUSTED (resets in {reset_str})"
+        else:
+            return f"{remaining:.0f}% remaining (resets in {reset_str})"
+
