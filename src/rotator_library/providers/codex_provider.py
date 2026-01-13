@@ -86,8 +86,8 @@ else:
     CODEX_API_BASE = os.getenv("CODEX_API_BASE", "https://chatgpt.com/backend-api/codex")
     CODEX_RESPONSES_ENDPOINT = f"{CODEX_API_BASE}/responses"
 
-# Available models
-AVAILABLE_MODELS = [
+# Available models - base models
+BASE_MODELS = [
     # GPT-5 models
     "gpt-5",
     "gpt-5.1",
@@ -103,6 +103,33 @@ AVAILABLE_MODELS = [
 
 # Reasoning effort levels
 REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+
+# Models that support reasoning effort variants
+# Maps model -> allowed effort levels
+REASONING_MODEL_EFFORTS = {
+    "gpt-5": {"low", "medium", "high"},
+    "gpt-5.1": {"low", "medium", "high"},
+    "gpt-5.2": {"low", "medium", "high", "xhigh"},
+    "gpt-5-codex": {"low", "medium", "high"},
+    "gpt-5.1-codex": {"low", "medium", "high"},
+    "gpt-5.2-codex": {"low", "medium", "high", "xhigh"},
+    "gpt-5.1-codex-max": {"low", "medium", "high", "xhigh"},
+    "gpt-5.1-codex-mini": {"low", "medium", "high"},
+    "codex-mini": {"low", "medium", "high"},
+}
+
+def _build_available_models() -> list:
+    """Build full list of available models including reasoning variants."""
+    models = list(BASE_MODELS)
+
+    # Add reasoning effort variants for each model
+    for model, efforts in REASONING_MODEL_EFFORTS.items():
+        for effort in sorted(efforts):
+            models.append(f"{model}:{effort}")
+
+    return models
+
+AVAILABLE_MODELS = _build_available_models()
 
 # Default reasoning configuration
 DEFAULT_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "medium")
