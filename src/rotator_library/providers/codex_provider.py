@@ -486,7 +486,7 @@ class CodexProvider(OpenAIOAuthBase, ProviderInterface):
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """Return available Codex models."""
-        return AVAILABLE_MODELS.copy()
+        return [f"codex/{m}" for m in AVAILABLE_MODELS]
 
     def get_credential_tier_name(self, credential: str) -> Optional[str]:
         """Get tier name for a credential."""
