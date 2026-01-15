@@ -28,6 +28,23 @@ lib_logger = logging.getLogger("rotator_library")
 
 console = Console()
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+# These are class-level defaults that can be overridden per subclass.
+# Environment variable overrides are checked at runtime (see callback_port property).
+
+# Default OAuth callback port for local redirect server
+# Override per-provider: {ENV_PREFIX}_OAUTH_PORT=<port>
+DEFAULT_OAUTH_CALLBACK_PORT: int = 8085
+
+# Default OAuth callback path
+DEFAULT_OAUTH_CALLBACK_PATH: str = "/oauth2callback"
+
+# Token refresh buffer in seconds (refresh tokens this far before expiry)
+# Default: 30 minutes before expiry
+DEFAULT_REFRESH_EXPIRY_BUFFER: int = 30 * 60  # 1800 seconds
+
 
 @dataclass
 class CredentialSetupResult:
@@ -72,9 +89,9 @@ class GoogleOAuthBase:
     # Subclasses MAY override these
     TOKEN_URI: str = "https://oauth2.googleapis.com/token"
     USER_INFO_URI: str = "https://www.googleapis.com/oauth2/v1/userinfo"
-    CALLBACK_PORT: int = 8085
-    CALLBACK_PATH: str = "/oauth2callback"
-    REFRESH_EXPIRY_BUFFER_SECONDS: int = 30 * 60  # 30 minutes
+    CALLBACK_PORT: int = DEFAULT_OAUTH_CALLBACK_PORT
+    CALLBACK_PATH: str = DEFAULT_OAUTH_CALLBACK_PATH
+    REFRESH_EXPIRY_BUFFER_SECONDS: int = DEFAULT_REFRESH_EXPIRY_BUFFER
 
     @property
     def callback_port(self) -> int:

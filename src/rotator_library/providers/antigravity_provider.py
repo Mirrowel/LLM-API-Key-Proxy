@@ -223,8 +223,6 @@ EXCLUDED_MODELS = {
 
 
 # Directory paths - use centralized path management
-def _get_antigravity_logs_dir():
-    return get_logs_dir() / "antigravity_logs"
 
 
 def _get_antigravity_cache_dir():
@@ -485,8 +483,6 @@ def _generate_stable_session_id(contents: List[Dict[str, Any]]) -> str:
     Uses SHA256 hash of the first user message to create a deterministic
     session ID, ensuring the same conversation gets the same session ID.
     Falls back to random session ID if no user message found.
-
-    Per CLIProxyAPI Go implementation: generateStableSessionID()
     """
     import hashlib
     import struct
@@ -1028,6 +1024,33 @@ class AntigravityProvider(
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
     default_sequential_fallback_multiplier = 2
+
+    # Custom caps examples (commented - uncomment and modify as needed)
+    # default_custom_caps = {
+    #     # Tier 2 (standard-tier / paid)
+    #     2: {
+    #         "claude": {
+    #             "max_requests": 100,  # Cap at 100 instead of 150
+    #             "cooldown_mode": "quota_reset",
+    #             "cooldown_value": 0,
+    #         },
+    #     },
+    #     # Tiers 2 and 3 together
+    #     (2, 3): {
+    #         "g25-flash": {
+    #             "max_requests": "80%",  # 80% of actual max
+    #             "cooldown_mode": "offset",
+    #             "cooldown_value": 1800,  # +30 min buffer
+    #         },
+    #     },
+    #     # Default for unknown tiers
+    #     "default": {
+    #         "claude": {
+    #             "max_requests": "50%",
+    #             "cooldown_mode": "quota_reset",
+    #         },
+    #     },
+    # }
 
     @staticmethod
     def parse_quota_error(
@@ -3318,7 +3341,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         )
 
         # Prepend Antigravity agent system instruction to existing system instruction
-        # Per CLIProxyAPI Go buildRequest(): Sets request.systemInstruction.role = "user"
+        # Sets request.systemInstruction.role = "user"
         # and sets parts.0.text to the agent identity/guidelines
         # We preserve any existing parts by shifting them (Antigravity = parts[0], existing = parts[1:])
         #
