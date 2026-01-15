@@ -8,7 +8,10 @@ OpenAI SSE (Server-Sent Events) format to Anthropic's streaming format.
 import json
 import logging
 import uuid
-from typing import AsyncGenerator, Callable, Optional, Awaitable
+from typing import AsyncGenerator, Callable, Optional, Awaitable, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..transaction_logger import TransactionLogger
 
 logger = logging.getLogger("rotator_library.anthropic_compat")
 
@@ -18,6 +21,7 @@ async def anthropic_streaming_wrapper(
     original_model: str,
     request_id: Optional[str] = None,
     is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
+    transaction_logger: Optional["TransactionLogger"] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Convert OpenAI streaming format to Anthropic streaming format.
@@ -39,6 +43,7 @@ async def anthropic_streaming_wrapper(
         original_model: The model name to include in responses
         request_id: Optional request ID (auto-generated if not provided)
         is_disconnected: Optional async callback that returns True if client disconnected
+        transaction_logger: Optional TransactionLogger for logging the final Anthropic response
 
     Yields:
         SSE format strings in Anthropic's streaming format
@@ -55,6 +60,9 @@ async def anthropic_streaming_wrapper(
     input_tokens = 0
     output_tokens = 0
     cached_tokens = 0  # Track cached tokens for proper Anthropic format
+    accumulated_text = ""  # Track accumulated text for logging
+    accumulated_thinking = ""  # Track accumulated thinking for logging
+    stop_reason_final = "end_turn"  # Track final stop reason for logging
 
     try:
         async for chunk_str in openai_stream:
@@ -71,7 +79,10 @@ async def anthropic_streaming_wrapper(
                 # Claude Code and other clients require message_start before message_stop
                 if not message_started:
                     # Build usage with cached tokens properly handled
-                    usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+                    usage_dict = {
+                        "input_tokens": input_tokens - cached_tokens,
+                        "output_tokens": 0,
+                    }
                     if cached_tokens > 0:
                         usage_dict["cache_read_input_tokens"] = cached_tokens
                         usage_dict["cache_creation_input_tokens"] = 0
@@ -111,6 +122,7 @@ async def anthropic_streaming_wrapper(
 
                 # Determine stop_reason based on whether we had tool calls
                 stop_reason = "tool_use" if tool_calls_by_index else "end_turn"
+                stop_reason_final = stop_reason
 
                 # Build final usage dict with cached tokens
                 final_usage = {"output_tokens": output_tokens}
@@ -123,6 +135,66 @@ async def anthropic_streaming_wrapper(
 
                 # Send message_stop
                 yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+                # Log final Anthropic response if logger provided
+                if transaction_logger:
+                    # Build content blocks for logging
+                    content_blocks = []
+                    if accumulated_thinking:
+                        content_blocks.append(
+                            {
+                                "type": "thinking",
+                                "thinking": accumulated_thinking,
+                            }
+                        )
+                    if accumulated_text:
+                        content_blocks.append(
+                            {
+                                "type": "text",
+                                "text": accumulated_text,
+                            }
+                        )
+                    # Add tool use blocks
+                    for tc_index in sorted(tool_calls_by_index.keys()):
+                        tc = tool_calls_by_index[tc_index]
+                        # Parse arguments JSON string to dict
+                        try:
+                            input_data = json.loads(tc.get("arguments", "{}"))
+                        except json.JSONDecodeError:
+                            input_data = {}
+                        content_blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": tc.get("id", ""),
+                                "name": tc.get("name", ""),
+                                "input": input_data,
+                            }
+                        )
+
+                    # Build usage for logging
+                    log_usage = {
+                        "input_tokens": input_tokens - cached_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                    if cached_tokens > 0:
+                        log_usage["cache_read_input_tokens"] = cached_tokens
+                        log_usage["cache_creation_input_tokens"] = 0
+
+                    anthropic_response = {
+                        "id": request_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content_blocks,
+                        "model": original_model,
+                        "stop_reason": stop_reason_final,
+                        "stop_sequence": None,
+                        "usage": log_usage,
+                    }
+                    transaction_logger.log_response(
+                        anthropic_response,
+                        filename="anthropic_response.json",
+                    )
+
                 break
 
             try:
@@ -139,12 +211,17 @@ async def anthropic_streaming_wrapper(
                 output_tokens = usage.get("completion_tokens", output_tokens)
                 # Extract cached tokens from prompt_tokens_details
                 if usage.get("prompt_tokens_details"):
-                    cached_tokens = usage["prompt_tokens_details"].get("cached_tokens", cached_tokens)
+                    cached_tokens = usage["prompt_tokens_details"].get(
+                        "cached_tokens", cached_tokens
+                    )
 
             # Send message_start on first chunk
             if not message_started:
                 # Build usage with cached tokens properly handled for Anthropic format
-                usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+                usage_dict = {
+                    "input_tokens": input_tokens - cached_tokens,
+                    "output_tokens": 0,
+                }
                 if cached_tokens > 0:
                     usage_dict["cache_read_input_tokens"] = cached_tokens
                     usage_dict["cache_creation_input_tokens"] = 0
@@ -165,7 +242,7 @@ async def anthropic_streaming_wrapper(
                 yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
                 message_started = True
 
-            choices = chunk.get("choices", [])
+            choices = chunk.get("choices") or []
             if not choices:
                 continue
 
@@ -191,6 +268,8 @@ async def anthropic_streaming_wrapper(
                     "delta": {"type": "thinking_delta", "thinking": reasoning_content},
                 }
                 yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                # Accumulate thinking for logging
+                accumulated_thinking += reasoning_content
 
             # Handle text content
             content = delta.get("content")
@@ -218,8 +297,11 @@ async def anthropic_streaming_wrapper(
                     "delta": {"type": "text_delta", "text": content},
                 }
                 yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                # Accumulate text for logging
+                accumulated_text += content
 
             # Handle tool calls
+            # Use `or []` to handle providers that send "tool_calls": null
             tool_calls = delta.get("tool_calls", [])
             for tc in tool_calls:
                 tc_index = tc.get("index", 0)
@@ -289,7 +371,10 @@ async def anthropic_streaming_wrapper(
         # Claude Code and other clients may ignore events that come before message_start
         if not message_started:
             # Build usage with cached tokens properly handled
-            usage_dict = {"input_tokens": input_tokens - cached_tokens, "output_tokens": 0}
+            usage_dict = {
+                "input_tokens": input_tokens - cached_tokens,
+                "output_tokens": 0,
+            }
             if cached_tokens > 0:
                 usage_dict["cache_read_input_tokens"] = cached_tokens
                 usage_dict["cache_creation_input_tokens"] = 0

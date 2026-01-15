@@ -1025,8 +1025,15 @@ async def anthropic_messages(
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
-    # Initialize logger if enabled
-    logger = DetailedLogger() if ENABLE_REQUEST_LOGGING else None
+    # Initialize raw I/O logger if enabled (for debugging proxy boundary)
+    logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+
+    # Log raw Anthropic request if raw logging is enabled
+    if logger:
+        logger.log_request(
+            headers=dict(request.headers),
+            body=body.model_dump(exclude_none=True),
+        )
 
     try:
         # Log the request to console

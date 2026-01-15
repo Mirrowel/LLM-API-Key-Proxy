@@ -1244,13 +1244,22 @@ class RotatingClient:
                 f"No API keys or OAuth credentials configured for provider: {provider}"
             )
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Establish a global deadline for the entire request lifecycle.
         deadline = time.time() + self.global_timeout
 
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         # Create a mutable copy of the keys and shuffle it to ensure
@@ -2000,6 +2009,9 @@ class RotatingClient:
         model = kwargs.get("model")
         provider = model.split("/")[0]
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
@@ -2022,7 +2034,13 @@ class RotatingClient:
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         tried_creds = set()
@@ -2921,7 +2939,9 @@ class RotatingClient:
         provider = model.split("/")[0] if "/" in model else ""
         if provider == "antigravity":
             try:
-                from .providers.antigravity_provider import get_antigravity_preprompt_text
+                from .providers.antigravity_provider import (
+                    get_antigravity_preprompt_text,
+                )
 
                 preprompt_text = get_antigravity_preprompt_text()
                 if preprompt_text:
@@ -3477,8 +3497,30 @@ class RotatingClient:
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
         original_model = request.model
 
+        # Extract provider from model for logging
+        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+
+        # Create Anthropic transaction logger if request logging is enabled
+        anthropic_logger = None
+        if self.enable_request_logging:
+            anthropic_logger = TransactionLogger(
+                provider,
+                original_model,
+                enabled=True,
+                api_format="ant",
+            )
+            # Log original Anthropic request
+            anthropic_logger.log_request(
+                request.model_dump(exclude_none=True),
+                filename="anthropic_request.json",
+            )
+
         # Translate Anthropic request to OpenAI format
         openai_request = translate_anthropic_request(request)
+
+        # Pass parent log directory to acompletion for nested logging
+        if anthropic_logger and anthropic_logger.log_dir:
+            openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
         if request.stream:
             # Streaming response
@@ -3494,11 +3536,13 @@ class RotatingClient:
                 is_disconnected = raw_request.is_disconnected
 
             # Return the streaming wrapper
+            # Note: For streaming, the anthropic response logging happens in the wrapper
             return anthropic_streaming_wrapper(
                 openai_stream=response_generator,
                 original_model=original_model,
                 request_id=request_id,
                 is_disconnected=is_disconnected,
+                transaction_logger=anthropic_logger,
             )
         else:
             # Non-streaming response
@@ -3510,12 +3554,23 @@ class RotatingClient:
 
             # Convert OpenAI response to Anthropic format
             openai_response = (
-                response.model_dump() if hasattr(response, "model_dump") else dict(response)
+                response.model_dump()
+                if hasattr(response, "model_dump")
+                else dict(response)
             )
-            anthropic_response = openai_to_anthropic_response(openai_response, original_model)
+            anthropic_response = openai_to_anthropic_response(
+                openai_response, original_model
+            )
 
             # Override the ID with our request ID
             anthropic_response["id"] = request_id
+
+            # Log Anthropic response
+            if anthropic_logger:
+                anthropic_logger.log_response(
+                    anthropic_response,
+                    filename="anthropic_response.json",
+                )
 
             return anthropic_response
 
