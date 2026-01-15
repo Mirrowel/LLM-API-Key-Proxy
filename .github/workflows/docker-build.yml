@@ -3,6 +3,12 @@ name: Create and publish a Docker image
 
 # Configures this workflow to run every time a change is pushed to the branch called `main` or `dev`.
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or commit SHA). Leave empty for default.'
+        required: false
+        default: ''
   push:
     branches: ["main", "dev"]
     paths:
@@ -31,6 +37,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

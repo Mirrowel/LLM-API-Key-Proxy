@@ -1,5 +1,4 @@
-# Universal LLM API Proxy & Resilience Library
-
+# Universal LLM API Proxy & Resilience Library 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Mirrowel/LLM-API-Key-Proxy) [![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/Mirrowel/LLM-API-Key-Proxy)
 
@@ -89,10 +88,10 @@ python src/proxy_app/main.py
 
 Once the proxy is running, configure your application with these settings:
 
-| Setting                     | Value                      |
-| --------------------------- | -------------------------- |
+| Setting | Value |
+|---------|-------|
 | **Base URL / API Endpoint** | `http://127.0.0.1:8000/v1` |
-| **API Key**                 | Your `PROXY_API_KEY`       |
+| **API Key** | Your `PROXY_API_KEY` |
 
 ### Model Format: `provider/model_name`
 
@@ -180,16 +179,16 @@ In your configuration file (e.g., `config.json`):
 
 ### API Endpoints
 
-| Endpoint                    | Description                                           |
-| --------------------------- | ----------------------------------------------------- |
-| `GET /`                     | Status check — confirms proxy is running              |
-| `POST /v1/chat/completions` | Chat completions (main endpoint)                      |
-| `POST /v1/embeddings`       | Text embeddings                                       |
-| `GET /v1/models`            | List all available models with pricing & capabilities |
-| `GET /v1/models/{model_id}` | Get details for a specific model                      |
-| `GET /v1/providers`         | List configured providers                             |
-| `POST /v1/token-count`      | Calculate token count for a payload                   |
-| `POST /v1/cost-estimate`    | Estimate cost based on token counts                   |
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Status check — confirms proxy is running |
+| `POST /v1/chat/completions` | Chat completions (main endpoint) |
+| `POST /v1/embeddings` | Text embeddings |
+| `GET /v1/models` | List all available models with pricing & capabilities |
+| `GET /v1/models/{model_id}` | Get details for a specific model |
+| `GET /v1/providers` | List configured providers |
+| `POST /v1/token-count` | Calculate token count for a payload |
+| `POST /v1/cost-estimate` | Estimate cost based on token counts |
 
 > **Tip:** The `/v1/models` endpoint is useful for discovering available models in your client. Many apps can fetch this list automatically. Add `?enriched=false` for a minimal response without pricing data.
 
@@ -215,10 +214,10 @@ python -m rotator_library.credential_tool
 
 ### Credential Types
 
-| Type         | Providers                                                                    | How to Add                                    |
-| ------------ | ---------------------------------------------------------------------------- | --------------------------------------------- |
-| **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env`             |
-| **OAuth**    | Gemini CLI, Antigravity, Qwen Code, iFlow                                    | Interactive browser login via credential tool |
+| Type | Providers | How to Add |
+|------|-----------|------------|
+| **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env` |
+| **OAuth** | Gemini CLI, Antigravity, Qwen Code, iFlow | Interactive browser login via credential tool |
 
 ### The `.env` File
 
@@ -273,7 +272,6 @@ async with client:
 ### Library Documentation
 
 See the [Library README](src/rotator_library/README.md) for complete documentation including:
-
 - All initialization parameters
 - Streaming support
 - Error handling and cooldown strategies
@@ -298,9 +296,9 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 ### Configuration Files
 
-| File                   | Contents                                    |
-| ---------------------- | ------------------------------------------- |
-| `.env`                 | All credentials and advanced settings       |
+| File | Contents |
+|------|----------|
+| `.env` | All credentials and advanced settings |
 | `launcher_config.json` | TUI-specific settings (host, port, logging) |
 
 ---
@@ -418,21 +416,21 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 ### Proxy Settings
 
-| Variable                 | Description                             | Default  |
-| ------------------------ | --------------------------------------- | -------- |
-| `PROXY_API_KEY`          | Authentication key for your proxy       | Required |
-| `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds)  | `600`    |
-| `SKIP_OAUTH_INIT_CHECK`  | Skip interactive OAuth setup on startup | `false`  |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PROXY_API_KEY` | Authentication key for your proxy | Required |
+| `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds) | `600` |
+| `SKIP_OAUTH_INIT_CHECK` | Skip interactive OAuth setup on startup | `false` |
 
 ### Per-Provider Settings
 
-| Pattern                                      | Description                               | Example                                    |
-| -------------------------------------------- | ----------------------------------------- | ------------------------------------------ |
-| `<PROVIDER>_API_KEY_<N>`                     | API key for provider                      | `GEMINI_API_KEY_1`                         |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Concurrent request limit                  | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3` |
-| `ROTATION_MODE_<PROVIDER>`                   | `balanced` or `sequential`                | `ROTATION_MODE_GEMINI=sequential`          |
-| `IGNORE_MODELS_<PROVIDER>`                   | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*`          |
-| `WHITELIST_MODELS_<PROVIDER>`                | Whitelist (overrides blacklist)           | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro`   |
+| Pattern | Description | Example |
+|---------|-------------|---------|
+| `<PROVIDER>_API_KEY_<N>` | API key for provider | `GEMINI_API_KEY_1` |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Concurrent request limit | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3` |
+| `ROTATION_MODE_<PROVIDER>` | `balanced` or `sequential` | `ROTATION_MODE_GEMINI=sequential` |
+| `IGNORE_MODELS_<PROVIDER>` | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*` |
+| `WHITELIST_MODELS_<PROVIDER>` | Whitelist (overrides blacklist) | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro` |
 
 ### Advanced Features
 
@@ -916,14 +914,14 @@ See [VPS Deployment](Deployment%20guide.md#appendix-deploying-to-a-custom-vps) f
 
 ## Troubleshooting
 
-| Issue                       | Solution                                                                   |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `401 Unauthorized`          | Verify `PROXY_API_KEY` matches your `Authorization: Bearer` header exactly |
+| Issue | Solution |
+|-------|----------|
+| `401 Unauthorized` | Verify `PROXY_API_KEY` matches your `Authorization: Bearer` header exactly |
 | `500 Internal Server Error` | Check provider key validity; enable `--enable-request-logging` for details |
-| All keys on cooldown        | All keys failed recently; check `logs/detailed_logs/` for upstream errors  |
-| Model not found             | Verify format is `provider/model_name` (e.g., `gemini/gemini-2.5-flash`)   |
-| OAuth callback failed       | Ensure callback port (8085, 51121, 11451) isn't blocked by firewall        |
-| Streaming hangs             | Increase `TIMEOUT_READ_STREAMING`; check provider status                   |
+| All keys on cooldown | All keys failed recently; check `logs/detailed_logs/` for upstream errors |
+| Model not found | Verify format is `provider/model_name` (e.g., `gemini/gemini-2.5-flash`) |
+| OAuth callback failed | Ensure callback port (8085, 51121, 11451) isn't blocked by firewall |
+| Streaming hangs | Increase `TIMEOUT_READ_STREAMING`; check provider status |
 
 **Detailed Logs:**
 
@@ -938,12 +936,12 @@ When `--enable-request-logging` is enabled, check `logs/detailed_logs/` for:
 
 ## Documentation
 
-| Document                                        | Description                                       |
-| ----------------------------------------------- | ------------------------------------------------- |
-| [Technical Documentation](DOCUMENTATION.md)     | Architecture, internals, provider implementations |
-| [Library README](src/rotator_library/README.md) | Using the resilience library directly             |
-| [Deployment Guide](Deployment%20guide.md)       | Hosting on Render, Railway, VPS                   |
-| [.env.example](.env.example)                    | Complete environment variable reference           |
+| Document | Description |
+|----------|-------------|
+| [Technical Documentation](DOCUMENTATION.md) | Architecture, internals, provider implementations |
+| [Library README](src/rotator_library/README.md) | Using the resilience library directly |
+| [Deployment Guide](Deployment%20guide.md) | Hosting on Render, Railway, VPS |
+| [.env.example](.env.example) | Complete environment variable reference |
 
 ---
 
