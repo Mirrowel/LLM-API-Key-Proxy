@@ -10,6 +10,7 @@ The project is a monorepo containing two primary components:
     *   **Batch Manager**: Optimizes high-volume embedding requests.
     *   **Detailed Logger**: Provides per-request file logging for debugging.
     *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
+    *   **Anthropic-Compatible Endpoints**: `/v1/messages`, `/v1/messages/count_tokens` for Claude Code and other Anthropic API clients.
     *   **Model Filter GUI**: Visual interface for configuring model ignore/whitelist rules per provider (see Section 6).
 2.  **The Resilience Library (`rotator_library`)**: This is the core engine that provides high availability. It is consumed by the proxy app to manage a pool of API keys, handle errors gracefully, and ensure requests are completed successfully even when individual keys or provider endpoints face issues.
 
@@ -815,6 +816,108 @@ CUSTOM_CAP_COOLDOWN_ANTIGRAVITY_T3_CLAUDE=offset:3600
 When a custom cap triggers a cooldown longer than the exhaustion threshold, it also marks the credential as exhausted for fair cycle rotation.
 
 **Defaults:** See `src/rotator_library/config/defaults.py` for all configurable defaults.
+
+### 2.21. Anthropic API Compatibility (`anthropic_compat/`)
+
+A translation layer that enables Anthropic API clients (like Claude Code) to use any OpenAI-compatible provider through the proxy.
+
+#### Architecture
+
+The module consists of three components:
+
+| File | Purpose |
+|------|---------|
+| `models.py` | Pydantic models for Anthropic request/response formats (`AnthropicMessagesRequest`, `AnthropicMessage`, `AnthropicTool`, etc.) |
+| `translator.py` | Bidirectional format translation functions |
+| `streaming.py` | SSE format conversion for streaming responses |
+
+#### Request Translation (`translate_anthropic_request`)
+
+Converts Anthropic Messages API requests to OpenAI Chat Completions format:
+
+**Message Conversion:**
+- Anthropic `system` field → OpenAI system message
+- `content` blocks (text, image, tool_use, tool_result) → OpenAI format
+- Image blocks with base64 data → OpenAI `image_url` with data URI
+- Document blocks (PDF, etc.) → OpenAI `image_url` format
+
+**Tool Conversion:**
+- Anthropic `tools` with `input_schema` → OpenAI `tools` with `parameters`
+- `tool_choice.type: "any"` → `"required"`
+- `tool_choice.type: "tool"` → `{"type": "function", "function": {"name": ...}}`
+
+**Thinking Configuration:**
+- `thinking.type: "enabled"` → `reasoning_effort: "high"` + `thinking_budget`
+- `thinking.type: "disabled"` → `reasoning_effort: "disable"`
+- Opus models default to thinking enabled
+
+**Special Handling:**
+- Reorders assistant content blocks: thinking → text → tool_use
+- Injects `[Continue]` prompt for fresh thinking turns
+- Preserves thinking signatures for multi-turn conversations
+
+#### Response Translation (`openai_to_anthropic_response`)
+
+Converts OpenAI Chat Completions responses to Anthropic Messages format:
+
+**Content Blocks:**
+- `reasoning_content` → thinking block with signature
+- `content` → text block
+- `tool_calls` → tool_use blocks with parsed JSON input
+
+**Field Mapping:**
+- `finish_reason: "stop"` → `stop_reason: "end_turn"`
+- `finish_reason: "length"` → `stop_reason: "max_tokens"`
+- `finish_reason: "tool_calls"` → `stop_reason: "tool_use"`
+
+**Usage Translation:**
+- `prompt_tokens` minus `cached_tokens` → `input_tokens`
+- `completion_tokens` → `output_tokens`
+- `prompt_tokens_details.cached_tokens` → `cache_read_input_tokens`
+
+#### Streaming Wrapper (`anthropic_streaming_wrapper`)
+
+Converts OpenAI SSE streaming format to Anthropic's event-based format:
+
+**Event Types Generated:**
+```
+message_start      → Initial message metadata
+content_block_start → Start of text/thinking/tool_use block
+content_block_delta → Incremental content (text_delta, thinking_delta, input_json_delta)
+content_block_stop  → End of content block
+message_delta      → Final metadata (stop_reason, usage)
+message_stop       → End of message
+```
+
+**Features:**
+- Accumulates tool call arguments across chunks
+- Handles thinking/reasoning content from `delta.reasoning_content`
+- Proper block indexing for multiple content blocks
+- Cache token handling in usage statistics
+- Error recovery with proper message structure
+
+#### Client Integration
+
+The `RotatingClient` provides two methods for Anthropic compatibility:
+
+```python
+async def anthropic_messages(self, request, raw_request=None, pre_request_callback=None):
+    """Handle Anthropic Messages API requests."""
+    # 1. Translate Anthropic request to OpenAI format
+    # 2. Call acompletion() with translated request
+    # 3. Convert response back to Anthropic format
+    # 4. For streaming: wrap with anthropic_streaming_wrapper
+
+async def anthropic_count_tokens(self, request):
+    """Count tokens for Anthropic-format request."""
+    # Translates messages and tools, then uses token_count()
+```
+
+#### Authentication
+
+The proxy accepts both Anthropic and OpenAI authentication styles:
+- `x-api-key` header (Anthropic style)
+- `Authorization: Bearer` header (OpenAI style)
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
