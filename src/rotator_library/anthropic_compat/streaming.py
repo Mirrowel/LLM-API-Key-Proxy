@@ -302,7 +302,7 @@ async def anthropic_streaming_wrapper(
 
             # Handle tool calls
             # Use `or []` to handle providers that send "tool_calls": null
-            tool_calls = delta.get("tool_calls", [])
+            tool_calls = delta.get("tool_calls") or []
             for tc in tool_calls:
                 tc_index = tc.get("index", 0)
 
