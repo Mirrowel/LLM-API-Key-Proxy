@@ -957,24 +957,33 @@ class GeminiCliProvider(
 
             if "usageMetadata" in response_data:
                 usage = response_data["usageMetadata"]
-                prompt_tokens = usage.get("promptTokenCount", 0)
-                thoughts_tokens = usage.get("thoughtsTokenCount", 0)
-                candidate_tokens = usage.get("candidatesTokenCount", 0)
+                prompt_tokens = usage.get("promptTokenCount", 0)  # Input
+                thoughts_tokens = usage.get(
+                    "thoughtsTokenCount", 0
+                )  # Output (thinking)
+                candidate_tokens = usage.get(
+                    "candidatesTokenCount", 0
+                )  # Output (content)
+                cached_tokens = usage.get("cachedContentTokenCount", 0)  # Input subset
 
                 openai_chunk["usage"] = {
-                    "prompt_tokens": prompt_tokens
-                    + thoughts_tokens,  # Include thoughts in prompt tokens
-                    "completion_tokens": candidate_tokens,
+                    "prompt_tokens": prompt_tokens,  # Input only
+                    "completion_tokens": candidate_tokens
+                    + thoughts_tokens,  # All output
                     "total_tokens": usage.get("totalTokenCount", 0),
                 }
 
-                # Add reasoning tokens details if present (OpenAI o1 format)
+                # Add input breakdown: cached tokens
+                if cached_tokens > 0:
+                    openai_chunk["usage"]["prompt_tokens_details"] = {
+                        "cached_tokens": cached_tokens
+                    }
+
+                # Add output breakdown: reasoning tokens
                 if thoughts_tokens > 0:
-                    if "completion_tokens_details" not in openai_chunk["usage"]:
-                        openai_chunk["usage"]["completion_tokens_details"] = {}
-                    openai_chunk["usage"]["completion_tokens_details"][
-                        "reasoning_tokens"
-                    ] = thoughts_tokens
+                    openai_chunk["usage"]["completion_tokens_details"] = {
+                        "reasoning_tokens": thoughts_tokens
+                    }
 
             yield openai_chunk
 

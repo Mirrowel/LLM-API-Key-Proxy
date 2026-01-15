@@ -3782,20 +3782,33 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         return "tool_calls" if has_tool_calls else reason
 
     def _build_usage(self, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Build usage dict from Gemini usage metadata."""
+        """Build usage dict from Gemini usage metadata.
+
+        Token accounting:
+        - prompt_tokens: Input tokens sent to model (promptTokenCount)
+        - completion_tokens: Output tokens received (candidatesTokenCount + thoughtsTokenCount)
+        - prompt_tokens_details.cached_tokens: Cached input tokens subset
+        - completion_tokens_details.reasoning_tokens: Thinking tokens subset of output
+        """
         if not metadata:
             return None
 
-        prompt = metadata.get("promptTokenCount", 0)
-        thoughts = metadata.get("thoughtsTokenCount", 0)
-        completion = metadata.get("candidatesTokenCount", 0)
+        prompt = metadata.get("promptTokenCount", 0)  # Input tokens
+        thoughts = metadata.get("thoughtsTokenCount", 0)  # Output (thinking)
+        completion = metadata.get("candidatesTokenCount", 0)  # Output (content)
+        cached = metadata.get("cachedContentTokenCount", 0)  # Input subset (cached)
 
         usage = {
-            "prompt_tokens": prompt + thoughts,
-            "completion_tokens": completion,
+            "prompt_tokens": prompt,  # Input only
+            "completion_tokens": completion + thoughts,  # All output
             "total_tokens": metadata.get("totalTokenCount", 0),
         }
 
+        # Input breakdown: cached tokens (subset of prompt_tokens)
+        if cached > 0:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
+
+        # Output breakdown: reasoning/thinking tokens (subset of completion_tokens)
         if thoughts > 0:
             usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}
 

@@ -1802,6 +1802,7 @@ class UsageManager:
             {
                 "success_count": 0,
                 "prompt_tokens": 0,
+                "prompt_tokens_cached": 0,
                 "completion_tokens": 0,
                 "approx_cost": 0.0,
             },
@@ -1809,6 +1810,9 @@ class UsageManager:
 
         global_model["success_count"] += model_data.get("success_count", 0)
         global_model["prompt_tokens"] += model_data.get("prompt_tokens", 0)
+        global_model["prompt_tokens_cached"] += model_data.get(
+            "prompt_tokens_cached", 0
+        )
         global_model["completion_tokens"] += model_data.get("completion_tokens", 0)
         global_model["approx_cost"] += model_data.get("approx_cost", 0.0)
 
@@ -1974,12 +1978,16 @@ class UsageManager:
                 {
                     "success_count": 0,
                     "prompt_tokens": 0,
+                    "prompt_tokens_cached": 0,
                     "completion_tokens": 0,
                     "approx_cost": 0.0,
                 },
             )
             global_model_stats["success_count"] += stats.get("success_count", 0)
             global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
+            global_model_stats["prompt_tokens_cached"] += stats.get(
+                "prompt_tokens_cached", 0
+            )
             global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
             global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
 
@@ -2644,6 +2652,7 @@ class UsageManager:
                         "failure_count": 0,
                         "request_count": 0,
                         "prompt_tokens": 0,
+                        "prompt_tokens_cached": 0,
                         "completion_tokens": 0,
                         "approx_cost": 0.0,
                     },
@@ -2685,6 +2694,7 @@ class UsageManager:
                                     "failure_count": 0,
                                     "request_count": 0,
                                     "prompt_tokens": 0,
+                                    "prompt_tokens_cached": 0,
                                     "completion_tokens": 0,
                                     "approx_cost": 0.0,
                                 },
@@ -2740,6 +2750,7 @@ class UsageManager:
                     {
                         "success_count": 0,
                         "prompt_tokens": 0,
+                        "prompt_tokens_cached": 0,
                         "completion_tokens": 0,
                         "approx_cost": 0.0,
                     },
@@ -2761,7 +2772,27 @@ class UsageManager:
                 and completion_response.usage
             ):
                 usage = completion_response.usage
-                usage_data_ref["prompt_tokens"] += usage.prompt_tokens
+                prompt_total = usage.prompt_tokens
+
+                # Extract cached tokens from prompt_tokens_details if present
+                cached_tokens = 0
+                prompt_details = getattr(usage, "prompt_tokens_details", None)
+                if prompt_details:
+                    if isinstance(prompt_details, dict):
+                        cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+                    elif hasattr(prompt_details, "cached_tokens"):
+                        cached_tokens = prompt_details.cached_tokens or 0
+
+                # Store uncached tokens (prompt_tokens is total, subtract cached)
+                uncached_tokens = prompt_total - cached_tokens
+                usage_data_ref["prompt_tokens"] += uncached_tokens
+
+                # Store cached tokens separately
+                if cached_tokens > 0:
+                    usage_data_ref["prompt_tokens_cached"] = (
+                        usage_data_ref.get("prompt_tokens_cached", 0) + cached_tokens
+                    )
+
                 usage_data_ref["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
                 )
@@ -2902,6 +2933,7 @@ class UsageManager:
                             "failure_count": 0,
                             "request_count": 0,
                             "prompt_tokens": 0,
+                            "prompt_tokens_cached": 0,
                             "completion_tokens": 0,
                             "approx_cost": 0.0,
                         },
@@ -2935,6 +2967,7 @@ class UsageManager:
                                     "failure_count": 0,
                                     "request_count": 0,
                                     "prompt_tokens": 0,
+                                    "prompt_tokens_cached": 0,
                                     "completion_tokens": 0,
                                     "approx_cost": 0.0,
                                 },
@@ -3064,6 +3097,7 @@ class UsageManager:
                         "failure_count": 0,
                         "request_count": 0,
                         "prompt_tokens": 0,
+                        "prompt_tokens_cached": 0,
                         "completion_tokens": 0,
                         "approx_cost": 0.0,
                     },
@@ -3089,6 +3123,7 @@ class UsageManager:
                                         "failure_count": 0,
                                         "request_count": 0,
                                         "prompt_tokens": 0,
+                                        "prompt_tokens_cached": 0,
                                         "completion_tokens": 0,
                                         "approx_cost": 0.0,
                                     },
@@ -3172,6 +3207,7 @@ class UsageManager:
                     "failure_count": 0,
                     "request_count": 0,
                     "prompt_tokens": 0,
+                    "prompt_tokens_cached": 0,
                     "completion_tokens": 0,
                     "approx_cost": 0.0,
                     "baseline_remaining_fraction": None,
@@ -3298,6 +3334,7 @@ class UsageManager:
                                 "failure_count": 0,
                                 "request_count": 0,
                                 "prompt_tokens": 0,
+                                "prompt_tokens_cached": 0,
                                 "completion_tokens": 0,
                                 "approx_cost": 0.0,
                             },
