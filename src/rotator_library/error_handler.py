@@ -960,31 +960,21 @@ class AllProviders:
     def _load_custom_providers(self):
         """
         Loads custom OpenAI-compatible providers from environment variables.
-        Looks for environment variables in the format: PROVIDER_API_BASE
+        Looks for environment variables in the format: PROVIDER_CUSTOM_API_BASE
         where PROVIDER is the name of the custom provider.
+
+        This pattern avoids collision with LiteLLM's standard *_API_BASE variables.
+        Users can override built-in providers by setting e.g.:
+        - OPENAI_CUSTOM_API_BASE=http://my-local-llm.com/v1
         """
         import os
 
-        # Get all environment variables that end with _API_BASE
+        # Get all environment variables that end with _CUSTOM_API_BASE
         for env_var in os.environ:
-            if env_var.endswith("_API_BASE"):
-                provider_name = env_var.split("_API_BASE")[
-                    0
-                ].lower()  # Remove '_API_BASE' suffix and lowercase
-
-                # Skip known providers that are already handled
-                if provider_name in [
-                    "openai",
-                    "anthropic",
-                    "google",
-                    "gemini",
-                    "nvidia",
-                    "mistral",
-                    "cohere",
-                    "groq",
-                    "openrouter",
-                ]:
-                    continue
+            if env_var.endswith("_CUSTOM_API_BASE"):
+                provider_name = env_var[
+                    :-16
+                ].lower()  # Remove '_CUSTOM_API_BASE' suffix and lowercase
 
                 api_base = os.getenv(env_var)
                 if api_base:

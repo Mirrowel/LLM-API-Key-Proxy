@@ -69,7 +69,7 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
         "gemini-2.5-flash-lite": 5000,
         # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
-        "gemini-2.5-pro": 1000,
+        "gemini-2.5-pro": 1,
     },
     "free-tier": {
         # Claude/GPT-OSS group (verified: 2.0% per request = 50 requests)
@@ -92,7 +92,7 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # Gemini 2.5 Flash Lite - SEPARATE pool (verified: 0.02% per request = 5000 requests)
         "gemini-2.5-flash-lite": 5000,
         # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
-        "gemini-2.5-pro": 1000,
+        "gemini-2.5-pro": 1,
     },
 }
 

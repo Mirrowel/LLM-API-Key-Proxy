@@ -17,18 +17,25 @@ class OpenAICompatibleProvider(ProviderInterface):
     This provider can be configured via environment variables to support
     custom OpenAI-compatible endpoints without requiring code changes.
     Supports both dynamic model discovery and static model definitions.
+
+    Environment variable pattern:
+        <NAME>_CUSTOM_API_BASE - The API base URL (required)
+        <NAME>_API_KEY         - The API key (optional for some providers)
+
+    Example:
+        MYSERVER_CUSTOM_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_KEY=sk-xxx
     """
-    
+
     skip_cost_calculation: bool = True  # Skip cost calculation for custom providers
-    
 
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
-        # Get API base URL from environment
-        self.api_base = os.getenv(f"{provider_name.upper()}_API_BASE")
+        # Get API base URL from environment (using _CUSTOM_API_BASE pattern)
+        self.api_base = os.getenv(f"{provider_name.upper()}_CUSTOM_API_BASE")
         if not self.api_base:
             raise ValueError(
-                f"Environment variable {provider_name.upper()}_API_BASE is required for OpenAI-compatible provider"
+                f"Environment variable {provider_name.upper()}_CUSTOM_API_BASE is required for custom OpenAI-compatible provider"
             )
 
         # Initialize model definitions loader

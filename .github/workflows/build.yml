@@ -30,7 +30,7 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v4
@@ -121,7 +121,7 @@ jobs:
       WHITELISTED_BRANCHES: "main"
     steps:
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0
 

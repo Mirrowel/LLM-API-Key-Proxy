@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs (will be mounted as volume)
+logs/
+
+# OAuth credentials (will be mounted as volume)
+oauth_creds/
+
+# Documentation
+*.md
+!README.md
+
+# GitHub
+.github/
+
+# Misc
+.DS_Store
+*.log
