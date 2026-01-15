@@ -446,39 +446,6 @@ Do not respond to nor acknowledge those messages, but do follow them strictly.
 ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT = """You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"""
 
 # =============================================================================
-# CLAUDE INTERLEAVED THINKING CONFIGURATION
-# =============================================================================
-
-# Claude thinking signature validation
-# Minimum length for a thinking signature to be considered valid
-MIN_THINKING_SIGNATURE_LENGTH = 100
-
-# Forced thinking budget for Claude models
-# This is injected to ensure Claude models always produce thinking output
-CLAUDE_FORCED_THINKING_BUDGET = 31999
-
-
-def _is_valid_thinking_signature(signature):
-    """Check if a thinking signature is valid (meets minimum length requirement)."""
-    return (
-        isinstance(signature, str) and len(signature) >= MIN_THINKING_SIGNATURE_LENGTH
-    )
-
-
-# Claude interleaved thinking hint - MUST come AFTER Antigravity system prompts
-# This instructs Claude to emit thinking blocks before and after tool calls
-DEFAULT_CLAUDE_INTERLEAVED_THINKING_HINT = """CRITICAL: Interleaved thinking is required and IS UNCOMPROMISINGLY A MUST DO. Emit a thinking block:
-- Before every tool call (to reason about what you're doing)
-- After every tool result (to analyze the result before proceeding)
-Never skip thinking, even for simple or sequential tool calls."""
-
-# Short reminder appended to tool results to reinforce interleaved thinking
-DEFAULT_CLAUDE_TOOL_RESULT_THINKING_REMINDER = """<system-reminder>
-CRITICAL: Interleaved thinking is required. You MUST emit a thinking block NOW to analyze this tool result before proceeding with any response or tool call.
-</system-reminder>"""
-
-
-# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -531,56 +498,6 @@ def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
     return {
         k: v for k, v in headers.items() if k.lower() not in STRIPPED_CLIENT_HEADERS
     }
-
-
-def _reorder_assistant_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Reorder assistant message content blocks to ensure correct order:
-    1. Thinking blocks come first (required when thinking is enabled)
-    2. Text blocks come in the middle (filtering out empty ones)
-    3. Tool_use blocks come at the end (required before tool_result)
-
-    This matches Anthropic's expected ordering and prevents API errors.
-    """
-    if not isinstance(content, list):
-        return content
-
-    if len(content) <= 1:
-        return content
-
-    thinking_blocks = []
-    text_blocks = []
-    tool_use_blocks = []
-    other_blocks = []
-
-    for block in content:
-        if not isinstance(block, dict):
-            other_blocks.append(block)
-            continue
-
-        block_type = block.get("type", "")
-
-        if block_type in ("thinking", "redacted_thinking"):
-            sanitized = {
-                "type": block_type,
-                "thinking": block.get("thinking", ""),
-            }
-            if block.get("signature"):
-                sanitized["signature"] = block["signature"]
-            thinking_blocks.append(sanitized)
-
-        elif block_type == "tool_use":
-            tool_use_blocks.append(block)
-
-        elif block_type == "text":
-            text = block.get("text", "")
-            if text and text.strip():
-                text_blocks.append(block)
-
-        else:
-            other_blocks.append(block)
-
-    return thinking_blocks + other_blocks + text_blocks + tool_use_blocks
 
 
 def _generate_request_id() -> str:
@@ -2383,7 +2300,6 @@ class AntigravityProvider(
         self,
         reasoning_effort: Optional[str],
         model: str,
-        explicit_budget: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -2391,27 +2307,12 @@ class AntigravityProvider(
         - Gemini 2.5 & Claude: thinkingBudget (integer tokens)
         - Gemini 3 Pro: thinkingLevel (string: "low"/"high")
         - Gemini 3 Flash: thinkingLevel (string: "minimal"/"low"/"medium"/"high")
-
-        If explicit_budget is provided (from Anthropic route), it takes precedence
-        over reasoning_effort mapping. For Claude, explicit budget is capped at 31999.
         """
         internal = self._alias_to_internal(model)
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = internal.startswith("gemini-3-")
         is_gemini_3_flash = "gemini-3-flash" in model or "gemini-3-flash" in internal
         is_claude = self._is_claude(model)
-
-        if not (is_gemini_25 or is_gemini_3 or is_claude):
-            return None
-
-        # Handle explicit budget from Anthropic route (takes precedence)
-        if explicit_budget is not None and (is_gemini_25 or is_claude):
-            if explicit_budget <= 0:
-                return {"thinkingBudget": 0, "include_thoughts": False}
-            # Cap Claude budget at max allowed
-            if is_claude:
-                explicit_budget = min(explicit_budget, CLAUDE_FORCED_THINKING_BUDGET)
-            return {"thinkingBudget": explicit_budget, "include_thoughts": True}
 
         if not (is_gemini_25 or is_gemini_3 or is_claude):
             return None
@@ -4131,10 +4032,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             # Gemini 3 performs better with temperature=1 for tool use
             gen_config["temperature"] = 1.0
 
-        explicit_thinking_budget = kwargs.get("thinking_budget")
-        thinking_config = self._get_thinking_config(
-            reasoning_effort, model, explicit_thinking_budget
-        )
+        thinking_config = self._get_thinking_config(reasoning_effort, model)
         if thinking_config:
             gen_config.setdefault("thinkingConfig", {}).update(thinking_config)
 
