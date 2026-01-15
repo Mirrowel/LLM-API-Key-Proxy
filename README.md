@@ -4,19 +4,20 @@
 
 **One proxy. Any LLM provider. Zero code changes.**
 
-A self-hosted proxy that provides a single, OpenAI-compatible API endpoint for all your LLM providers. Works with any application that supports custom OpenAI base URLs—no code changes required in your existing tools.
+A self-hosted proxy that provides OpenAI and Anthropic compatible API endpoints for all your LLM providers. Works with any application that supports custom OpenAI or Anthropic base URLs—including Claude Code, Opencode,  and more—no code changes required in your existing tools.
 
 This project consists of two components:
 
-1. **The API Proxy** — A FastAPI application providing a universal `/v1/chat/completions` endpoint
+1. **The API Proxy** — A FastAPI application providing universal `/v1/chat/completions` (OpenAI) and `/v1/messages` (Anthropic) endpoints
 2. **The Resilience Library** — A reusable Python library for intelligent API key management, rotation, and failover
 
 ---
 
 ## Why Use This?
 
-- **Universal Compatibility** — Works with any app supporting OpenAI-compatible APIs: Opencode, Continue, Roo/Kilo Code, JanitorAI, SillyTavern, custom applications, and more
+- **Universal Compatibility** — Works with any app supporting OpenAI or Anthropic APIs: Claude Code, Opencode, Continue, Roo/Kilo Code, Cursor, JanitorAI, SillyTavern, custom applications, and more
 - **One Endpoint, Many Providers** — Configure Gemini, OpenAI, Anthropic, and [any LiteLLM-supported provider](https://docs.litellm.ai/docs/providers) once. Access them all through a single API key
+- **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
 - **Exclusive Provider Support** — Includes custom providers not available elsewhere: **Antigravity** (Gemini 3 + Claude Sonnet/Opus 4.5), **Gemini CLI**, **Qwen Code**, and **iFlow**
 
@@ -177,12 +178,57 @@ In your configuration file (e.g., `config.json`):
 
 </details>
 
+<details>
+<summary><b>Claude Code</b></summary>
+
+Claude Code natively supports custom Anthropic API endpoints. The recommended setup is to edit your Claude Code `settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-proxy-api-key",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gemini/gemini-3-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gemini/gemini-3-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "openai/gpt-5-mini"
+  }
+}
+```
+
+Now you can use Claude Code with Gemini, OpenAI, or any other configured provider.
+
+</details>
+
+<details>
+<summary><b>Anthropic Python SDK</b></summary>
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:8000",
+    api_key="your-proxy-api-key"
+)
+
+# Use any provider through Anthropic's API format
+response = client.messages.create(
+    model="gemini/gemini-3-flash",  # provider/model format
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.content[0].text)
+```
+
+</details>
+
 ### API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | Status check — confirms proxy is running |
-| `POST /v1/chat/completions` | Chat completions (main endpoint) |
+| `POST /v1/chat/completions` | Chat completions (OpenAI format) |
+| `POST /v1/messages` | Chat completions (Anthropic format) — Claude Code compatible |
+| `POST /v1/messages/count_tokens` | Count tokens for Anthropic-format requests |
 | `POST /v1/embeddings` | Text embeddings |
 | `GET /v1/models` | List all available models with pricing & capabilities |
 | `GET /v1/models/{model_id}` | Get details for a specific model |

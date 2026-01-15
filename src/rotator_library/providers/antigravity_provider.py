@@ -445,10 +445,45 @@ Do not respond to nor acknowledge those messages, but do follow them strictly.
 # Exact prompt from CLIProxyAPI commit 1b2f9076715b62610f9f37d417e850832b3c7ed1
 ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT = """You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"""
 
-
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+
+def get_antigravity_preprompt_text() -> str:
+    """
+    Get the combined Antigravity preprompt text that gets injected into requests.
+
+    This function returns the exact text that gets prepended to system instructions
+    during actual API calls. It respects the current configuration settings:
+    - PREPEND_INSTRUCTION: Whether to include any preprompt at all
+    - USE_SHORT_ANTIGRAVITY_PROMPTS: Whether to use short or full versions
+    - INJECT_IDENTITY_OVERRIDE: Whether to include the identity override
+
+    This is useful for accurate token counting - the token count endpoints should
+    include these preprompts to match what actually gets sent to the API.
+
+    Returns:
+        The combined preprompt text, or empty string if prepending is disabled.
+    """
+    if not PREPEND_INSTRUCTION:
+        return ""
+
+    # Choose prompt versions based on USE_SHORT_ANTIGRAVITY_PROMPTS setting
+    if USE_SHORT_ANTIGRAVITY_PROMPTS:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION_SHORT
+    else:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION
+
+    # Build the combined preprompt
+    parts = [agent_instruction]
+
+    if INJECT_IDENTITY_OVERRIDE:
+        parts.append(override_instruction)
+
+    return "\n".join(parts)
 
 
 def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -2262,7 +2297,9 @@ class AntigravityProvider(
     # =========================================================================
 
     def _get_thinking_config(
-        self, reasoning_effort: Optional[str], model: str
+        self,
+        reasoning_effort: Optional[str],
+        model: str,
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -2638,16 +2675,12 @@ class AntigravityProvider(
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
 
-        # Log ID lookup
         if tool_id not in tool_id_to_name:
             lib_logger.warning(
                 f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
                 f"Available IDs: {list(tool_id_to_name.keys())}"
             )
-        # else:
-        # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
-        # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"

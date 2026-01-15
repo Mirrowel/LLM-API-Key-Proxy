@@ -1244,13 +1244,22 @@ class RotatingClient:
                 f"No API keys or OAuth credentials configured for provider: {provider}"
             )
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Establish a global deadline for the entire request lifecycle.
         deadline = time.time() + self.global_timeout
 
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         # Create a mutable copy of the keys and shuffle it to ensure
@@ -2000,6 +2009,9 @@ class RotatingClient:
         model = kwargs.get("model")
         provider = model.split("/")[0]
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
@@ -2022,7 +2034,13 @@ class RotatingClient:
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         tried_creds = set()
@@ -2893,7 +2911,12 @@ class RotatingClient:
         )
 
     def token_count(self, **kwargs) -> int:
-        """Calculates the number of tokens for a given text or list of messages."""
+        """Calculates the number of tokens for a given text or list of messages.
+
+        For Antigravity provider models, this also includes the preprompt tokens
+        that get injected during actual API calls (agent instruction + identity override).
+        This ensures token counts match actual usage.
+        """
         kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         text = kwargs.get("text")
@@ -2901,12 +2924,34 @@ class RotatingClient:
 
         if not model:
             raise ValueError("'model' is a required parameter.")
+
+        # Calculate base token count
         if messages:
-            return token_counter(model=model, messages=messages)
+            base_count = token_counter(model=model, messages=messages)
         elif text:
-            return token_counter(model=model, text=text)
+            base_count = token_counter(model=model, text=text)
         else:
             raise ValueError("Either 'text' or 'messages' must be provided.")
+
+        # Add preprompt tokens for Antigravity provider
+        # The Antigravity provider injects system instructions during actual API calls,
+        # so we need to account for those tokens in the count
+        provider = model.split("/")[0] if "/" in model else ""
+        if provider == "antigravity":
+            try:
+                from .providers.antigravity_provider import (
+                    get_antigravity_preprompt_text,
+                )
+
+                preprompt_text = get_antigravity_preprompt_text()
+                if preprompt_text:
+                    preprompt_tokens = token_counter(model=model, text=preprompt_text)
+                    base_count += preprompt_tokens
+            except ImportError:
+                # Provider not available, skip preprompt token counting
+                pass
+
+        return base_count
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""
@@ -3417,3 +3462,168 @@ class RotatingClient:
 
         result["duration_ms"] = int((time.time() - start_time) * 1000)
         return result
+
+    # --- Anthropic API Compatibility Methods ---
+
+    async def anthropic_messages(
+        self,
+        request: "AnthropicMessagesRequest",
+        raw_request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+    ) -> Any:
+        """
+        Handle Anthropic Messages API requests.
+
+        This method accepts requests in Anthropic's format, translates them to
+        OpenAI format internally, processes them through the existing acompletion
+        method, and returns responses in Anthropic's format.
+
+        Args:
+            request: An AnthropicMessagesRequest object
+            raw_request: Optional raw request object for disconnect checks
+            pre_request_callback: Optional async callback before each API request
+
+        Returns:
+            For non-streaming: dict in Anthropic Messages format
+            For streaming: AsyncGenerator yielding Anthropic SSE format strings
+        """
+        from .anthropic_compat import (
+            translate_anthropic_request,
+            openai_to_anthropic_response,
+            anthropic_streaming_wrapper,
+        )
+        import uuid
+
+        request_id = f"msg_{uuid.uuid4().hex[:24]}"
+        original_model = request.model
+
+        # Extract provider from model for logging
+        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+
+        # Create Anthropic transaction logger if request logging is enabled
+        anthropic_logger = None
+        if self.enable_request_logging:
+            anthropic_logger = TransactionLogger(
+                provider,
+                original_model,
+                enabled=True,
+                api_format="ant",
+            )
+            # Log original Anthropic request
+            anthropic_logger.log_request(
+                request.model_dump(exclude_none=True),
+                filename="anthropic_request.json",
+            )
+
+        # Translate Anthropic request to OpenAI format
+        openai_request = translate_anthropic_request(request)
+
+        # Pass parent log directory to acompletion for nested logging
+        if anthropic_logger and anthropic_logger.log_dir:
+            openai_request["_parent_log_dir"] = anthropic_logger.log_dir
+
+        if request.stream:
+            # Streaming response
+            response_generator = self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Create disconnect checker if raw_request provided
+            is_disconnected = None
+            if raw_request is not None and hasattr(raw_request, "is_disconnected"):
+                is_disconnected = raw_request.is_disconnected
+
+            # Return the streaming wrapper
+            # Note: For streaming, the anthropic response logging happens in the wrapper
+            return anthropic_streaming_wrapper(
+                openai_stream=response_generator,
+                original_model=original_model,
+                request_id=request_id,
+                is_disconnected=is_disconnected,
+                transaction_logger=anthropic_logger,
+            )
+        else:
+            # Non-streaming response
+            response = await self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Convert OpenAI response to Anthropic format
+            openai_response = (
+                response.model_dump()
+                if hasattr(response, "model_dump")
+                else dict(response)
+            )
+            anthropic_response = openai_to_anthropic_response(
+                openai_response, original_model
+            )
+
+            # Override the ID with our request ID
+            anthropic_response["id"] = request_id
+
+            # Log Anthropic response
+            if anthropic_logger:
+                anthropic_logger.log_response(
+                    anthropic_response,
+                    filename="anthropic_response.json",
+                )
+
+            return anthropic_response
+
+    async def anthropic_count_tokens(
+        self,
+        request: "AnthropicCountTokensRequest",
+    ) -> dict:
+        """
+        Handle Anthropic count_tokens API requests.
+
+        Counts the number of tokens that would be used by a Messages API request.
+        This is useful for estimating costs and managing context windows.
+
+        Args:
+            request: An AnthropicCountTokensRequest object
+
+        Returns:
+            Dict with input_tokens count in Anthropic format
+        """
+        from .anthropic_compat import (
+            anthropic_to_openai_messages,
+            anthropic_to_openai_tools,
+        )
+        import json
+
+        anthropic_request = request.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        # Count tokens for messages
+        message_tokens = self.token_count(
+            model=request.model,
+            messages=openai_messages,
+        )
+
+        # Count tokens for tools if present
+        tool_tokens = 0
+        if request.tools:
+            # Tools add tokens based on their definitions
+            # Convert to JSON string and count tokens for tool definitions
+            openai_tools = anthropic_to_openai_tools(
+                [tool.model_dump() for tool in request.tools]
+            )
+            if openai_tools:
+                # Serialize tools to count their token contribution
+                tools_text = json.dumps(openai_tools)
+                tool_tokens = self.token_count(
+                    model=request.model,
+                    text=tools_text,
+                )
+
+        total_tokens = message_tokens + tool_tokens
+
+        return {"input_tokens": total_tokens}
