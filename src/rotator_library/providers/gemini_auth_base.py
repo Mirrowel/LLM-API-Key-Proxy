@@ -14,6 +14,14 @@ from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 lib_logger = logging.getLogger("rotator_library")
 
+# Headers for Gemini CLI auth/discovery calls
+# Uses KV string format for Client-Metadata (different from Antigravity's JSON format)
+GEMINI_CLI_AUTH_HEADERS = {
+    "User-Agent": "google-api-nodejs-client/9.15.1",
+    "X-Goog-Api-Client": "gl-node/22.17.0",
+    "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+}
+
 
 class GeminiAuthBase(GoogleOAuthBase):
     """
@@ -187,6 +195,7 @@ class GeminiAuthBase(GoogleOAuthBase):
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
+            **GEMINI_CLI_AUTH_HEADERS,
         }
 
         discovered_project_id = None

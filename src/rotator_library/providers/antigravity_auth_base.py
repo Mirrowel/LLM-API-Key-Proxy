@@ -14,6 +14,15 @@ from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 lib_logger = logging.getLogger("rotator_library")
 
+# Headers for Antigravity auth/discovery calls
+# Note: ideType in Client-Metadata header stays IDE_UNSPECIFIED for compatibility,
+# while ideType in request body metadata uses "ANTIGRAVITY"
+ANTIGRAVITY_AUTH_HEADERS = {
+    "User-Agent": "google-api-nodejs-client/9.15.1",
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+}
+
 
 class AntigravityAuthBase(GoogleOAuthBase):
     """
@@ -191,6 +200,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
+            **ANTIGRAVITY_AUTH_HEADERS,
         }
 
         discovered_project_id = None
@@ -204,7 +214,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
             try:
                 # Build metadata - include duetProject only if we have a configured project
                 core_client_metadata = {
-                    "ideType": "IDE_UNSPECIFIED",
+                    "ideType": "ANTIGRAVITY",
                     "platform": "PLATFORM_UNSPECIFIED",
                     "pluginType": "GEMINI",
                 }
