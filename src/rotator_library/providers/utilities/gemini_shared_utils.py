@@ -39,6 +39,14 @@ def env_int(key: str, default: int) -> int:
 # Google Code Assist API endpoint (used by Gemini CLI and Antigravity providers)
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
+# Gemini CLI endpoint fallback chain
+# Sandbox endpoints may have separate/higher rate limits than production
+# Order: sandbox daily -> production (fallback)
+GEMINI_CLI_ENDPOINT_FALLBACKS = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",  # Sandbox daily
+    "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
+]
+
 
 # =============================================================================
 # GEMINI 3 TOOL RENAMING CONSTANTS

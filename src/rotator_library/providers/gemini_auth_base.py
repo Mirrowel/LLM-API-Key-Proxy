@@ -15,11 +15,18 @@ from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 lib_logger = logging.getLogger("rotator_library")
 
 # Headers for Gemini CLI auth/discovery calls
-# Uses KV string format for Client-Metadata (different from Antigravity's JSON format)
+# Aligned with native gemini-cli client fingerprint
+# Source: stuff/gemini-cli/packages/core/src/code_assist/experiments/client_metadata.ts
 GEMINI_CLI_AUTH_HEADERS = {
-    "User-Agent": "google-api-nodejs-client/9.15.1",
-    "X-Goog-Api-Client": "gl-node/22.17.0",
-    "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+    "User-Agent": "GeminiCLI/0.26.0 (win32; x64)",
+    "X-Goog-Api-Client": "gl-node/22.17.0 gdcl/1.30.0",
+    "Client-Metadata": (
+        "ideType=IDE_UNSPECIFIED,"
+        "pluginType=GEMINI,"
+        "ideVersion=0.26.0,"
+        "platform=WINDOWS_AMD64,"
+        "updateChannel=stable"
+    ),
 }
 
 
