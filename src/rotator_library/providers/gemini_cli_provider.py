@@ -480,13 +480,18 @@ class GeminiCliProvider(
         """
         Build request headers matching native gemini-cli client.
 
-        Headers are constructed to match the official client's fingerprint,
-        potentially accessing more favorable rate-limit buckets.
+        For the OAuth/Code Assist path, native gemini-cli only sends:
+        - Content-Type: application/json (handled by httpx)
+        - Authorization: Bearer <token> (handled by auth_header)
+        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch})
 
-        Note: X-Goog-User-Project is intentionally NOT included as it causes
-        403 errors for free-tier users with server-managed projects.
+        Headers NOT sent by native CLI (confirmed via explore agent analysis):
+        - X-Goog-Api-Client: Not used in Code Assist path (only in SDK/API key path)
+        - Client-Metadata: Not sent as HTTP header (only in request body for management endpoints)
+        - X-Goog-User-Project: Only used in MCP path, causes 403 errors in Code Assist
 
-        Source: stuff/gemini-cli/packages/core/src/code_assist/experiments/client_metadata.ts
+        Source: gemini-cli/packages/core/src/code_assist/server.ts:332
+        Source: gemini-cli/packages/core/src/core/contentGenerator.ts:129
         """
         model_name = model.split("/")[-1].replace(":thinking", "")
 
@@ -494,25 +499,32 @@ class GeminiCliProvider(
         # Native format: GeminiCLI/${version}/${model} (${platform}; ${arch})
         user_agent = f"GeminiCLI/0.26.0/{model_name} (win32; x64)"
 
-        # Native format: gl-node/${node_version} gdcl/${sdk_version}
-        # gdcl = @google/genai SDK version from package.json
-        x_goog_api_client = "gl-node/22.17.0 gdcl/1.30.0"
+        # =========================================================================
+        # COMMENTED OUT HEADERS - Not sent by native gemini-cli for Code Assist path
+        # Keeping these for reference as they worked well for SDK mimicry.
+        # Uncomment if rate limiting issues arise and you want to try SDK fingerprinting.
+        # =========================================================================
 
-        # Native ClientMetadata structure with all 5 fields
-        # Platform enum: WINDOWS_AMD64 (hardcoded)
-        client_metadata = (
-            "ideType=IDE_UNSPECIFIED,"
-            "pluginType=GEMINI,"
-            "ideVersion=0.26.0,"
-            "platform=WINDOWS_AMD64,"
-            "updateChannel=stable"
-        )
+        # X-Goog-Api-Client: Mimics @google/genai SDK but native CLI doesn't send this
+        # for OAuth/Code Assist path (only set when using API key authentication)
+        # x_goog_api_client = "gl-node/22.17.0 gdcl/1.30.0"
+
+        # Client-Metadata: Native CLI sends this in REQUEST BODY for management endpoints
+        # (loadCodeAssist, onboardUser, listExperiments, recordCodeAssistMetrics)
+        # but NOT as an HTTP header for generateContent requests.
+        # client_metadata = (
+        #     "ideType=IDE_UNSPECIFIED,"
+        #     "pluginType=GEMINI,"
+        #     "ideVersion=0.26.0,"
+        #     "platform=WINDOWS_AMD64,"
+        #     "updateChannel=stable"
+        # )
 
         return {
             "User-Agent": user_agent,
-            "X-Goog-Api-Client": x_goog_api_client,
-            "Client-Metadata": client_metadata,
-            "Accept": "application/json",
+            # "X-Goog-Api-Client": x_goog_api_client,  # Not sent by native CLI
+            # "Client-Metadata": client_metadata,      # Not sent as header by native CLI
+            # "Accept": "application/json",            # Not explicitly sent by native CLI
         }
 
     def _get_available_models(self) -> List[str]:
@@ -1391,11 +1403,11 @@ class GeminiCliProvider(
             contents = self._fix_tool_response_grouping(contents)
 
             # Generate unique prompt ID for this request (matches native gemini-cli)
-            # Source: stuff/gemini-cli/packages/cli/src/gemini.tsx line 668
+            # Source: gemini-cli/packages/cli/src/gemini.tsx line 668
             user_prompt_id = self._generate_user_prompt_id()
 
             # Build payload matching native gemini-cli structure
-            # Source: stuff/gemini-cli/packages/core/src/code_assist/converter.ts lines 31-48
+            # Source: gemini-cli/packages/core/src/code_assist/converter.ts lines 31-48
             request_payload = {
                 "model": model_name,
                 "project": project_id,
