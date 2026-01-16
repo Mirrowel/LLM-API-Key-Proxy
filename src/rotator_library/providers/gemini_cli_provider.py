@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import uuid
 import secrets
+import hashlib
 from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
@@ -409,9 +410,6 @@ class GeminiCliProvider(
         self._learned_costs: Dict[str, Dict[str, float]] = {}
         self._learned_costs_loaded: bool = False
 
-        # Session ID for Code Assist API (persistent per provider instance)
-        # Matches native gemini-cli behavior: single session UUID for conversation lifetime
-        self._session_id: str = str(uuid.uuid4())
 
     # =========================================================================
     # CREDENTIAL TIER LOOKUP (Provider-specific - uses cache)
@@ -475,6 +473,44 @@ class GeminiCliProvider(
         Python equivalent using secrets for cryptographic randomness.
         """
         return secrets.token_hex(7)  # 14 hex characters
+
+    def _generate_stable_session_id(self, contents: List[Dict[str, Any]]) -> str:
+        """
+        Generate a stable session ID based on the first user message.
+
+        This ensures:
+        - Same conversation = same session_id (even across server restarts)
+        - Different conversations = different session_ids
+        - Multi-user scenarios are properly isolated
+
+        Uses SHA256 hash of the first user message to create a deterministic
+        UUID-formatted session ID. Falls back to random UUID if no user message.
+
+        This approach mirrors Antigravity's _generate_stable_session_id() but
+        uses UUID format instead of the -{number} format to match native
+        gemini-cli's crypto.randomUUID() output format.
+
+        Args:
+            contents: List of message contents in Gemini format
+
+        Returns:
+            UUID-formatted session ID string
+        """
+        # Find first user message text
+        for content in contents:
+            if content.get("role") == "user":
+                parts = content.get("parts", [])
+                for part in parts:
+                    if isinstance(part, dict):
+                        text = part.get("text", "")
+                        if text:
+                            # SHA256 hash and use first 16 bytes to create UUID
+                            h = hashlib.sha256(text.encode("utf-8")).digest()
+                            # Format as UUID (8-4-4-4-12 hex chars)
+                            return f"{h[:4].hex()}-{h[4:6].hex()}-{h[6:8].hex()}-{h[8:10].hex()}-{h[10:16].hex()}"
+
+        # Fallback to random UUID if no user message found
+        return str(uuid.uuid4())
 
     def _get_gemini_cli_request_headers(self, model: str) -> Dict[str, str]:
         """
@@ -1415,7 +1451,7 @@ class GeminiCliProvider(
                 "request": {
                     "contents": contents,
                     "generationConfig": gen_config,
-                    "session_id": self._session_id,
+                    "session_id": self._generate_stable_session_id(contents),
                 },
             }
 
@@ -1751,7 +1787,7 @@ class GeminiCliProvider(
             "user_prompt_id": self._generate_user_prompt_id(),
             "request": {
                 "contents": contents,
-                "session_id": self._session_id,
+                "session_id": self._generate_stable_session_id(contents),
             },
         }
 
