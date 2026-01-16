@@ -1,7 +1,0 @@
-This project contains components with different licenses.
-
-- The core library, located in `src/rotator_library/`, is licensed under the GNU Lesser General Public License, Version 3.0. Copies of the license can be found in `src/rotator_library/COPYING` and `src/rotator_library/COPYING.LESSER`.
-
-- The proxy application, located in `src/proxy_app/`, is licensed under the MIT License. A copy of the license can be found in `src/proxy_app/LICENSE`.
-
-Please see the individual license files for the full terms.
