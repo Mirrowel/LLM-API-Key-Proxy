@@ -1023,7 +1023,7 @@ class UsageManager:
 
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
-    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli"}
+    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli", "chutes"}
 
     def _get_grouped_usage_count(self, key: str, model: str) -> int:
         """
