@@ -1810,9 +1810,9 @@ class UsageManager:
 
         global_model["success_count"] += model_data.get("success_count", 0)
         global_model["prompt_tokens"] += model_data.get("prompt_tokens", 0)
-        global_model["prompt_tokens_cached"] += model_data.get(
+        global_model["prompt_tokens_cached"] = global_model.get(
             "prompt_tokens_cached", 0
-        )
+        ) + model_data.get("prompt_tokens_cached", 0)
         global_model["completion_tokens"] += model_data.get("completion_tokens", 0)
         global_model["approx_cost"] += model_data.get("approx_cost", 0.0)
 
@@ -1985,9 +1985,9 @@ class UsageManager:
             )
             global_model_stats["success_count"] += stats.get("success_count", 0)
             global_model_stats["prompt_tokens"] += stats.get("prompt_tokens", 0)
-            global_model_stats["prompt_tokens_cached"] += stats.get(
+            global_model_stats["prompt_tokens_cached"] = global_model_stats.get(
                 "prompt_tokens_cached", 0
-            )
+            ) + stats.get("prompt_tokens_cached", 0)
             global_model_stats["completion_tokens"] += stats.get("completion_tokens", 0)
             global_model_stats["approx_cost"] += stats.get("approx_cost", 0.0)
 
