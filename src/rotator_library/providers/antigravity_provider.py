@@ -722,13 +722,14 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     - Removes unsupported validation keywords at schema-definition level
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
-    - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
+    - Always strips: $schema, $id, $ref, $defs, definitions, default, examples, title
+    - Always converts: const → enum (API doesn't support const)
+    - For Gemini: passes through anyOf, oneOf, allOf (API converts internally)
     - For Claude:
       - Merges allOf schemas into a single schema
       - Flattens anyOf/oneOf using scoring (object > array > primitive > null)
       - Detects enum patterns in unions and merges them
-      - Converts const to enum
-      - Strips unsupported validation keywords
+      - Strips additional validation keywords (minItems, pattern, format, etc.)
     - For Gemini: passes through additionalProperties as-is
     - For Claude: normalizes permissive additionalProperties to true
     """
@@ -737,11 +738,16 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 
     # Meta/structural keywords - always remove regardless of context
     # These are JSON Schema infrastructure, never valid property names
+    # Note: 'parameters' key rejects these (unlike 'parametersJsonSchema')
     meta_keywords = {
         "$id",
         "$ref",
         "$defs",
+        "$schema",  # Rejected by 'parameters' key
         "definitions",
+        "default",  # Rejected by 'parameters' key
+        "examples",  # Rejected by 'parameters' key
+        "title",  # May cause issues in nested objects
     }
 
     # Validation keywords - only remove at schema-definition level,
@@ -749,14 +755,12 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     # Note: These are common property names that could be used by tools:
     # - "pattern" (glob, grep, regex tools)
     # - "format" (export, date/time tools)
-    # - "default" (config tools)
-    # - "title" (document tools)
     # - "minimum"/"maximum" (range tools)
     #
-    # Keywords to strip for Claude only (Gemini accepts these):
-    # Claude rejects most JSON Schema validation keywords
+    # Keywords to strip for Claude only (Gemini with 'parametersJsonSchema' accepts these,
+    # but we now use 'parameters' key which may silently ignore some):
+    # Note: $schema, default, examples, title moved to meta_keywords (always stripped)
     validation_keywords_claude_only = {
-        "$schema",
         "minItems",
         "maxItems",
         "uniqueItems",
@@ -778,9 +782,6 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "deprecated",
         "readOnly",
         "writeOnly",
-        "examples",
-        "title",
-        "default",
     }
 
     # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
@@ -852,9 +853,9 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 return selected
 
     cleaned = {}
-    # Handle 'const' by converting to 'enum' with single value (Claude only)
-    # Gemini supports const, so pass through for Gemini
-    if "const" in schema and not for_gemini:
+    # Handle 'const' by converting to 'enum' with single value
+    # The 'parameters' key doesn't support 'const', so always convert
+    if "const" in schema:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
 
@@ -863,8 +864,8 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         if key in meta_keywords:
             continue
 
-        # Skip "const" for Claude (already converted to enum above)
-        if key == "const" and not for_gemini:
+        # Skip "const" (already converted to enum above)
+        if key == "const":
             continue
 
         # Strip Claude-only keywords when not targeting Gemini
