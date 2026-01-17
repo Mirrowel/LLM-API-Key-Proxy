@@ -507,6 +507,7 @@ class BaseQuotaTracker:
         self,
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
+        sync_mode: str = "force",
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
@@ -514,6 +515,7 @@ class BaseQuotaTracker:
         Args:
             quota_results: Dict from _fetch_quota_for_credential or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
+            sync_mode: How to sync request_count ("force", "if_exhausted", "none")
 
         Returns:
             Number of baselines successfully stored
@@ -541,7 +543,11 @@ class BaseQuotaTracker:
 
                 # Store baseline
                 await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests=max_requests
+                    cred_path,
+                    prefixed_model,
+                    remaining,
+                    max_requests=max_requests,
+                    sync_mode=sync_mode,
                 )
                 stored_count += 1
 

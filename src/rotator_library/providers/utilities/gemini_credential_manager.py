@@ -245,7 +245,9 @@ class GeminiCredentialManager:
         Refresh quota baselines for credentials.
 
         On first run (startup): Fetches quota for ALL credentials to establish baselines.
-        On subsequent runs: Only fetches for credentials used since last refresh.
+        On subsequent runs: Behavior depends on provider:
+            - Antigravity: Disabled (local counting is authoritative)
+            - Others: Only fetches for credentials used since last refresh.
 
         Handles both file paths and env:// credential formats.
 
@@ -257,6 +259,7 @@ class GeminiCredentialManager:
             return
 
         provider_name = getattr(self, "provider_env_name", "Provider")
+        is_antigravity = provider_name.lower() == "antigravity"
 
         if not self._initial_quota_fetch_done:
             # First run: fetch ALL credentials to establish baselines
@@ -265,24 +268,46 @@ class GeminiCredentialManager:
             )
             quota_results = await self.fetch_initial_baselines(credentials)
             self._initial_quota_fetch_done = True
+
+            if not quota_results:
+                return
+
+            # For Antigravity: use "if_exhausted" to pick up state from other instances
+            # For others: use "force" (backwards-compatible default)
+            sync_mode = "if_exhausted" if is_antigravity else "force"
+            stored = await self._store_baselines_to_usage_manager(
+                quota_results, usage_manager, sync_mode=sync_mode
+            )
+            if stored > 0:
+                lib_logger.debug(
+                    f"{provider_name} initial quota fetch: updated {stored} model baselines"
+                )
         else:
-            # Subsequent runs: only recently used credentials (incremental updates)
+            # Subsequent runs
+            if is_antigravity:
+                # Antigravity: Background refresh disabled (local counting is authoritative)
+                lib_logger.debug(
+                    f"{provider_name}: Background quota refresh disabled (local counting is authoritative)"
+                )
+                return
+
+            # Other providers: refresh recently used credentials
             usage_data = await usage_manager._get_usage_data_snapshot()
             quota_results = await self.refresh_active_quota_baselines(
                 credentials, usage_data
             )
 
-        if not quota_results:
-            return
+            if not quota_results:
+                return
 
-        # Store new baselines in UsageManager
-        stored = await self._store_baselines_to_usage_manager(
-            quota_results, usage_manager
-        )
-        if stored > 0:
-            lib_logger.debug(
-                f"{provider_name} quota refresh: updated {stored} model baselines"
+            # Store new baselines in UsageManager
+            stored = await self._store_baselines_to_usage_manager(
+                quota_results, usage_manager
             )
+            if stored > 0:
+                lib_logger.debug(
+                    f"{provider_name} quota refresh: updated {stored} model baselines"
+                )
 
     # =========================================================================
     # ABSTRACT METHODS - Must be implemented by providers

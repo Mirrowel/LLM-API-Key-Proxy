@@ -2843,6 +2843,37 @@ class UsageManager:
 
         await self._save_usage()
 
+    async def increment_request_count(self, key: str, model: str) -> None:
+        """
+        Increment request_count for a model. Used for tracking retry attempts
+        that don't go through record_success/record_failure (e.g., bare 429 retries).
+        """
+        await self._lazy_init()
+        model = self._normalize_model(key, model)
+
+        async with self._data_lock:
+            key_data = self._usage_data.get(key)
+            if not key_data or "models" not in key_data:
+                return
+
+            model_data = key_data["models"].get(model)
+            if not model_data:
+                return
+
+            model_data["request_count"] = model_data.get("request_count", 0) + 1
+
+            # Sync across quota group
+            group = self._get_model_quota_group(key, model)
+            if group:
+                new_count = model_data["request_count"]
+                for grouped_model in self._get_grouped_models(key, group):
+                    if grouped_model != model:
+                        other = key_data["models"].get(grouped_model)
+                        if other:
+                            other["request_count"] = new_count
+
+        await self._save_usage()
+
     async def record_failure(
         self,
         key: str,
@@ -2953,6 +2984,14 @@ class UsageManager:
                         model_data["quota_display"] = f"{max_req}/{max_req}"
                     new_request_count = model_data["request_count"]
 
+                    # Track measured max requests (highest count before exhaustion)
+                    measured_max = model_data.get("measured_max_requests")
+                    if measured_max is None or new_request_count > measured_max:
+                        model_data["measured_max_requests"] = new_request_count
+                        lib_logger.info(
+                            f"New measured max for {model}: {new_request_count} requests"
+                        )
+
                     # Apply to all models in the same quota group
                     group = self._get_model_quota_group(key, model)
                     if group:
@@ -2975,6 +3014,11 @@ class UsageManager:
                             group_model_data["quota_reset_ts"] = quota_reset_ts
                             # Sync request_count across quota group
                             group_model_data["request_count"] = new_request_count
+                            # Sync measured_max_requests across quota group
+                            if model_data.get("measured_max_requests"):
+                                group_model_data["measured_max_requests"] = model_data[
+                                    "measured_max_requests"
+                                ]
                             # Also sync quota_max_requests if set
                             max_req = model_data.get("quota_max_requests")
                             if max_req:
@@ -3152,6 +3196,7 @@ class UsageManager:
         remaining_fraction: float,
         max_requests: Optional[int] = None,
         reset_timestamp: Optional[float] = None,
+        sync_mode: str = "force",
     ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline data for a credential/model after fetching from API.
@@ -3170,6 +3215,10 @@ class UsageManager:
             reset_timestamp: Unix timestamp when quota resets. Only trusted when
                 remaining_fraction < 1.0 (quota has been used). API returns garbage
                 reset times for unused quota (100%).
+            sync_mode: How to sync request_count from API:
+                - "force": Always overwrite with API value (default, backwards-compatible)
+                - "if_exhausted": Use max() but overwrite if exhausted (first refresh)
+                - "none": Don't touch request_count (local counting is authoritative)
 
         Returns:
             None if no cooldown was set/updated, otherwise:
@@ -3243,9 +3292,24 @@ class UsageManager:
                     used_requests = model_data.get("request_count", 0)
                     max_requests = model_data.get("quota_max_requests")
 
-            # Sync local request count to API's authoritative value
-            model_data["request_count"] = used_requests
-            model_data["requests_at_baseline"] = used_requests
+            # Sync request_count based on sync_mode
+            current_count = model_data.get("request_count", 0)
+            if sync_mode == "force":
+                # Force refresh: always overwrite with API value
+                synced_count = used_requests
+            elif sync_mode == "if_exhausted":
+                if remaining_fraction <= 0.0:
+                    # Exhausted: accept API value (pick up state from other instances)
+                    synced_count = used_requests
+                else:
+                    # Not exhausted: use max() to prevent downward reset
+                    synced_count = max(current_count, used_requests)
+            else:  # sync_mode == "none"
+                # Don't touch request_count (local counting is authoritative)
+                synced_count = current_count
+
+            model_data["request_count"] = synced_count
+            model_data["requests_at_baseline"] = synced_count
 
             # Update baseline fields
             model_data["baseline_remaining_fraction"] = remaining_fraction
@@ -3254,7 +3318,7 @@ class UsageManager:
             # Update max_requests and quota_display
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
-                model_data["quota_display"] = f"{used_requests}/{max_requests}"
+                model_data["quota_display"] = f"{synced_count}/{max_requests}"
 
             # Handle reset_timestamp: only trust it when quota has been used (< 100%)
             # API returns garbage reset times for unused quota
@@ -3270,11 +3334,13 @@ class UsageManager:
             # Set cooldowns when quota is exhausted
             model_cooldowns = key_data.setdefault("model_cooldowns", {})
             is_exhausted = remaining_fraction <= 0.0
+            # Only mark exhausted from API if sync_mode allows it
+            can_mark_exhausted = sync_mode in ("force", "if_exhausted")
             cooldown_set_info = (
                 None  # Will be returned if cooldown was newly set/updated
             )
 
-            if is_exhausted and valid_reset_ts:
+            if is_exhausted and valid_reset_ts and can_mark_exhausted:
                 # Only update cooldown if not set or differs by more than 5 minutes
                 existing_cooldown = model_cooldowns.get(model)
                 should_update = (
@@ -3339,19 +3405,19 @@ class UsageManager:
                                 "approx_cost": 0.0,
                             },
                         )
-                        # Sync request tracking
-                        other_model_data["request_count"] = used_requests
+                        # Sync request tracking (use synced_count for consistency)
+                        other_model_data["request_count"] = synced_count
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
-                                f"{used_requests}/{max_requests}"
+                                f"{synced_count}/{max_requests}"
                             )
                         # Sync baseline fields
                         other_model_data["baseline_remaining_fraction"] = (
                             remaining_fraction
                         )
                         other_model_data["baseline_fetched_at"] = now_ts
-                        other_model_data["requests_at_baseline"] = used_requests
+                        other_model_data["requests_at_baseline"] = synced_count
                         # Sync reset timestamp if valid
                         if valid_reset_ts:
                             other_model_data["quota_reset_ts"] = reset_timestamp
@@ -3360,7 +3426,7 @@ class UsageManager:
                         if window_start:
                             other_model_data["window_start_ts"] = window_start
                         # Sync cooldown if exhausted (with ±5 min check)
-                        if is_exhausted and valid_reset_ts:
+                        if is_exhausted and valid_reset_ts and can_mark_exhausted:
                             existing_grouped = model_cooldowns.get(grouped_model)
                             should_update_grouped = (
                                 existing_grouped is None
@@ -3381,7 +3447,7 @@ class UsageManager:
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
-                f"remaining={remaining_fraction:.2%}, synced_request_count={used_requests}"
+                f"remaining={remaining_fraction:.2%}, synced_request_count={synced_count}, sync_mode={sync_mode}"
             )
 
         await self._save_usage()

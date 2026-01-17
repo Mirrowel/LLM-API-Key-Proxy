@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
+    Awaitable,
+    Callable,
     Dict,
     List,
     Optional,
@@ -3924,6 +3926,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         temperature = kwargs.get("temperature")
         max_tokens = kwargs.get("max_tokens")
         transaction_context = kwargs.pop("transaction_context", None)
+        on_retry_attempt = kwargs.pop("on_retry_attempt", None)
 
         # Create provider logger from transaction context
         file_logger = AntigravityProviderLogger(transaction_context)
@@ -4136,6 +4139,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     max_tokens,
                     reasoning_effort,
                     tool_choice,
+                    on_retry_attempt,
                 )
 
                 if stream:
@@ -4527,6 +4531,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        on_retry_attempt: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> AsyncGenerator[litellm.ModelResponse, None]:
         """
         Wrapper around _handle_streaming that retries on empty responses, bare 429s,
@@ -4538,6 +4543,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         If MALFORMED_FUNCTION_CALL is detected, inject corrective messages and retry
         up to MALFORMED_CALL_MAX_RETRIES times.
+
+        Args:
+            on_retry_attempt: Optional callback invoked on retry attempts (attempt > 0).
+                Used to track additional requests that consume quota.
         """
         empty_error_msg = (
             "The model returned an empty response after multiple attempts. "
@@ -4554,6 +4563,13 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         current_payload = payload
 
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
+            # Track retry attempts (not first attempt - that's counted by record_success/failure)
+            if attempt > 0 and on_retry_attempt:
+                try:
+                    await on_retry_attempt(model)
+                except Exception as e:
+                    lib_logger.warning(f"Retry attempt callback failed: {e}")
+
             chunk_count = 0
 
             try:

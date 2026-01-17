@@ -1495,6 +1495,14 @@ class RotatingClient:
                                             f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                         )
 
+                            # Add retry callback to track additional requests (bare 429s, empty responses)
+                            async def on_retry_attempt(m: str) -> None:
+                                await self.usage_manager.increment_request_count(
+                                    current_cred, m
+                                )
+
+                            litellm_kwargs["on_retry_attempt"] = on_retry_attempt
+
                             response = await provider_plugin.acompletion(
                                 self.http_client, **litellm_kwargs
                             )
@@ -2267,6 +2275,14 @@ class RotatingClient:
                                             lib_logger.warning(
                                                 f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                             )
+
+                                # Add retry callback to track additional requests (bare 429s, empty responses)
+                                async def on_retry_attempt(m: str) -> None:
+                                    await self.usage_manager.increment_request_count(
+                                        current_cred, m
+                                    )
+
+                                litellm_kwargs["on_retry_attempt"] = on_retry_attempt
 
                                 response = await provider_plugin.acompletion(
                                     self.http_client, **litellm_kwargs
