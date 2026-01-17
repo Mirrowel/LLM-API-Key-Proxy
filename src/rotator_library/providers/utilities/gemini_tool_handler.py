@@ -456,13 +456,17 @@ class GeminiToolHandler:
         to help Gemini 3 use the correct parameter names.
 
         Args:
-            func_decl: Function declaration dict with name, description, parametersJsonSchema
+            func_decl: Function declaration dict with name, description, and schema
+                      (either 'parametersJsonSchema' or 'parameters' key)
             description_prompt: Template string with {params} placeholder
 
         Returns:
             Modified function declaration with signature appended to description
         """
-        schema = func_decl.get("parametersJsonSchema", {})
+        # Support both parametersJsonSchema and parameters keys
+        schema = func_decl.get("parametersJsonSchema") or func_decl.get(
+            "parameters", {}
+        )
         if not schema:
             return func_decl
 

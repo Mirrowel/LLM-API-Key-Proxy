@@ -2741,7 +2741,8 @@ class AntigravityProvider(
         Apply strict schema enforcement to all tools in a list.
 
         Wraps the mixin's _enforce_strict_schema() method to operate on a list of tools,
-        applying 'additionalProperties: false' to each tool's parametersJsonSchema.
+        applying 'additionalProperties: false' to each tool's schema.
+        Supports both 'parametersJsonSchema' and 'parameters' keys.
         """
         if not tools:
             return tools
@@ -2749,11 +2750,14 @@ class AntigravityProvider(
         modified = copy.deepcopy(tools)
         for tool in modified:
             for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    # Delegate to mixin's singular _enforce_strict_schema method
-                    func_decl["parametersJsonSchema"] = self._enforce_strict_schema(
-                        func_decl["parametersJsonSchema"]
-                    )
+                # Support both parametersJsonSchema and parameters keys
+                for schema_key in ("parametersJsonSchema", "parameters"):
+                    if schema_key in func_decl:
+                        # Delegate to mixin's singular _enforce_strict_schema method
+                        func_decl[schema_key] = self._enforce_strict_schema(
+                            func_decl[schema_key]
+                        )
+                        break  # Only process one schema key per function
 
         return modified
 
@@ -3240,11 +3244,19 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         For Gemini models, all tools are placed in a SINGLE functionDeclarations array.
         This matches the format expected by Gemini CLI and prevents MALFORMED_FUNCTION_CALL errors.
+
+        Uses 'parameters' key for all models. The Antigravity API backend expects this format.
+        Schema cleaning is applied based on target model (Claude vs Gemini).
         """
         if not tools:
             return None
 
         function_declarations = []
+
+        # Always use 'parameters' key - Antigravity API expects this for all models
+        # Previously used 'parametersJsonSchema' but this caused MALFORMED_FUNCTION_CALL
+        # errors with Gemini 3 Pro models. Using 'parameters' works for all backends.
+        schema_key = "parameters"
 
         for tool in tools:
             if tool.get("type") != "function":
@@ -3285,11 +3297,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     }
                     schema["required"] = ["_confirm"]
 
-                func_decl["parametersJsonSchema"] = schema
+                func_decl[schema_key] = schema
             else:
                 # No parameters provided - use default with required confirm param
                 # to ensure the tool call is emitted properly
-                func_decl["parametersJsonSchema"] = {
+                func_decl[schema_key] = {
                     "type": "object",
                     "properties": {
                         "_confirm": {
@@ -3531,30 +3543,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 first_func_seen = True
                             # Subsequent parallel calls: leave as-is (no signature)
 
-        # Claude-specific tool schema transformation
-        if internal_model.startswith("claude-sonnet-") or internal_model.startswith(
-            "claude-opus-"
-        ):
-            self._apply_claude_tool_transform(antigravity_payload)
-
         return antigravity_payload
-
-    def _apply_claude_tool_transform(self, payload: Dict[str, Any]) -> None:
-        """Apply Claude-specific tool schema transformations.
-
-        Converts parametersJsonSchema to parameters and applies Claude-specific
-        schema sanitization (inlines $ref, removes unsupported JSON Schema fields).
-        """
-        tools = payload["request"].get("tools", [])
-        for tool in tools:
-            for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    params = func_decl["parametersJsonSchema"]
-                    if isinstance(params, dict):
-                        params = inline_schema_refs(params)
-                        params = _clean_claude_schema(params)
-                    func_decl["parameters"] = params
-                    del func_decl["parametersJsonSchema"]
 
     # =========================================================================
     # RESPONSE TRANSFORMATION
