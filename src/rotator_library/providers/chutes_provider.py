@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 # Create a local logger for this module
 import logging
 
-lib_logger = logging.getLogger(__name__)
+lib_logger = logging.getLogger("rotator_library")
 
 # Concurrency limit for parallel quota fetches
 QUOTA_FETCH_CONCURRENCY = 5
@@ -67,7 +67,7 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
             return [
                 f"chutes/{model['id']}" for model in response.json().get("data", [])
             ]
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch chutes.ai models: {e}")
             return []
 
@@ -138,7 +138,7 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
                     lib_logger.warning(f"Failed to refresh Chutes quota usage: {e}")
 
         # Fetch all credentials in parallel with shared HTTP client
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             tasks = [
                 refresh_single_credential(api_key, client) for api_key in credentials
             ]

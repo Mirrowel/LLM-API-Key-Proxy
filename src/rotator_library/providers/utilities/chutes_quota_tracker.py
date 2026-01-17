@@ -19,12 +19,9 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-
-if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
