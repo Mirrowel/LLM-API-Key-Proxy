@@ -855,9 +855,20 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     cleaned = {}
     # Handle 'const' by converting to 'enum' with single value
     # The 'parameters' key doesn't support 'const', so always convert
+    # Also add 'type' if not present, since enum requires type: "string"
     if "const" in schema:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
+        # Gemini requires type when using enum - infer from const value or default to string
+        if "type" not in schema:
+            if isinstance(const_value, bool):
+                cleaned["type"] = "boolean"
+            elif isinstance(const_value, int):
+                cleaned["type"] = "integer"
+            elif isinstance(const_value, float):
+                cleaned["type"] = "number"
+            else:
+                cleaned["type"] = "string"
 
     for key, value in schema.items():
         # Always skip meta keywords
