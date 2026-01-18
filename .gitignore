@@ -117,6 +117,9 @@ dmypy.json
 # pytype static analyzer
 .pytype/
 
+# Local tooling
+.opencode/
+
 # Cython debug symbols
 cython_debug/
 test_proxy.py
