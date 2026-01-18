@@ -223,7 +223,6 @@ async def run_demo() -> int:
     finally:
         litellm.acompletion = original_acompletion
 
-    original_streaming = litellm.acompletion
     try:
         print("Dry run: triggering streaming fallback...")
         stream = client._streaming_acompletion_with_retry(
@@ -243,7 +242,6 @@ async def run_demo() -> int:
         if not saw_done:
             print("Streaming: no completion emitted (unexpected in dry run)")
     finally:
-        litellm.acompletion = original_streaming
         client._streaming_acompletion_with_retry = original_streaming_impl
 
         client.usage_manager.acquire_key = original_acquire_key

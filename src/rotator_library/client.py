@@ -3029,6 +3029,11 @@ class RotatingClient:
                         f"Fallback model {fallback_model} is not available for provider {fallback_provider}."
                     )
                     return None
+        else:
+            lib_logger.info(
+                f"Fallback provider {fallback_provider} reported no available models."
+            )
+            return None
 
         # Construct fallback model ID
         # We assume model names (suffixes) are consistent across compatible providers
