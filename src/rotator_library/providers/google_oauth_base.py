@@ -1136,11 +1136,13 @@ class GoogleOAuthBase:
         lib_logger.info(f"Attempting to exchange authorization code for tokens...")
         async with httpx.AsyncClient() as client:
             # [PKCE + HEADERS] Include code_verifier and explicit headers for token exchange
+            # Uses GEMINI_CLI style headers for consistent fingerprinting
             response = await client.post(
                 self.TOKEN_URI,
                 headers={
-                    "Accept": "*/*",
                     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Accept": "*/*",
+                    "Accept-Encoding": "gzip, deflate, br",
                     "User-Agent": "google-api-nodejs-client/10.3.0",
                     "X-Goog-Api-Client": "gl-node/22.18.0",
                 },
@@ -1171,9 +1173,14 @@ class GoogleOAuthBase:
             new_creds["universe_domain"] = "googleapis.com"
 
             # Fetch user info and add metadata
+            # Uses GEMINI_CLI style headers per PR 246
             user_info_response = await client.get(
                 self.USER_INFO_URI,
-                headers={"Authorization": f"Bearer {new_creds['access_token']}"},
+                headers={
+                    "Authorization": f"Bearer {new_creds['access_token']}",
+                    "User-Agent": "google-api-nodejs-client/10.3.0",
+                    "X-Goog-Api-Client": "gl-node/22.18.0",
+                },
             )
             user_info_response.raise_for_status()
             user_info = user_info_response.json()

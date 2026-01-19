@@ -14,11 +14,10 @@ from .google_oauth_base import GoogleOAuthBase
 
 lib_logger = logging.getLogger("rotator_library")
 
-# Headers for Antigravity auth/discovery calls
-# Uses Gemini CLI style User-Agent/X-Goog-Api-Client for compatibility with newer API versions,
-# with Antigravity-specific Client-Metadata (JSON format)
-# Note: ideType in Client-Metadata header stays IDE_UNSPECIFIED for compatibility,
-# while ideType in request body metadata uses "ANTIGRAVITY"
+# Headers for Antigravity auth/discovery calls (loadCodeAssist, onboardUser)
+# CRITICAL: User-Agent MUST be google-api-nodejs-client/* for standard-tier detection.
+# Using antigravity/* UA causes server to return free-tier only (tested via matrix test).
+# X-Goog-Api-Client value doesn't affect tier detection.
 ANTIGRAVITY_AUTH_HEADERS = {
     "User-Agent": "google-api-nodejs-client/10.3.0",
     "X-Goog-Api-Client": "gl-node/22.18.0",
@@ -155,7 +154,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
         from .utilities.gemini_shared_utils import ANTIGRAVITY_LOAD_ENDPOINT_ORDER
 
         core_client_metadata = {
-            "ideType": "ANTIGRAVITY",
+            "ideType": "IDE_UNSPECIFIED",
             "platform": "PLATFORM_UNSPECIFIED",
             "pluginType": "GEMINI",
         }
@@ -348,7 +347,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
 
         # Build core metadata for API requests
         core_client_metadata = {
-            "ideType": "ANTIGRAVITY",
+            "ideType": "IDE_UNSPECIFIED",
             "platform": "PLATFORM_UNSPECIFIED",
             "pluginType": "GEMINI",
         }
