@@ -624,8 +624,13 @@ class UsageManager:
         Mark a credential as exhausted for fair cycle tracking.
 
         Starts the cycle timer on first exhaustion.
+        Skips if credential is already in the exhausted set (prevents duplicate logging).
         """
         cycle_data = self._ensure_cycle_structure(provider, tier_key, tracking_key)
+
+        # Skip if already exhausted in this cycle (prevents duplicate logging)
+        if credential in cycle_data.get("exhausted", set()):
+            return
 
         # Start cycle timer on first exhaustion
         if cycle_data["cycle_started_at"] is None:
@@ -676,22 +681,34 @@ class UsageManager:
         tier_key: str,
         tracking_key: str,
         all_credentials_in_tier: List[str],
+        available_not_on_cooldown: Optional[List[str]] = None,
     ) -> bool:
         """
-        Check if all credentials in tier are exhausted (cycle complete).
+        Check if cycle should reset.
 
         Returns True if:
         1. Cycle duration has expired, OR
-        2. All credentials in the tier have been marked exhausted
+        2. No credentials remain available (after cooldown + fair cycle exclusion), OR
+        3. All credentials in the tier have been marked exhausted (fallback)
         """
         # Check duration first
         if self._is_cycle_expired(provider, tier_key, tracking_key):
             return True
 
-        # Check if all exhausted
         cycle_data = self._get_cycle_data(provider, tier_key, tracking_key)
         if cycle_data is None:
             return False
+
+        # If available credentials are provided, reset when none remain usable
+        if available_not_on_cooldown is not None:
+            has_available = any(
+                not self._is_credential_exhausted_in_cycle(
+                    cred, provider, tier_key, tracking_key
+                )
+                for cred in available_not_on_cooldown
+            )
+            if not has_available and len(all_credentials_in_tier) > 0:
+                return True
 
         exhausted = cycle_data.get("exhausted", set())
         # All must be exhausted (and there must be at least one credential)
@@ -2105,6 +2122,7 @@ class UsageManager:
         max_concurrent: int = 1,
         credential_priorities: Optional[Dict[str, int]] = None,
         credential_tier_names: Optional[Dict[str, str]] = None,
+        all_provider_credentials: Optional[List[str]] = None,
     ) -> str:
         """
         Acquires the best available key using a tiered, model-aware locking strategy,
@@ -2123,6 +2141,7 @@ class UsageManager:
             max_concurrent: Maximum concurrent requests allowed per credential
             credential_priorities: Optional dict mapping credentials to priority levels (1=highest)
             credential_tier_names: Optional dict mapping credentials to tier names (for logging)
+            all_provider_credentials: Full list of provider credentials (used for cycle reset checks)
 
         Returns:
             Selected credential identifier
@@ -2198,12 +2217,21 @@ class UsageManager:
 
                         # Get all credentials for this tier (for cycle completion check)
                         all_tier_creds = self._get_all_credentials_for_tier_key(
-                            provider, tier_key, available_keys, credential_priorities
+                            provider,
+                            tier_key,
+                            all_provider_credentials or available_keys,
+                            credential_priorities,
                         )
 
-                        # Check if cycle should reset (all exhausted or expired)
+                        # Check if cycle should reset (all exhausted, expired, or none available)
                         if self._should_reset_cycle(
-                            provider, tier_key, tracking_key, all_tier_creds
+                            provider,
+                            tier_key,
+                            tracking_key,
+                            all_tier_creds,
+                            available_not_on_cooldown=[
+                                key for key, _ in keys_in_priority
+                            ],
                         ):
                             self._reset_cycle(provider, tier_key, tracking_key)
 
@@ -2413,12 +2441,21 @@ class UsageManager:
 
                     # Get all credentials for this tier (for cycle completion check)
                     all_tier_creds = self._get_all_credentials_for_tier_key(
-                        provider, tier_key, available_keys, None
+                        provider,
+                        tier_key,
+                        all_provider_credentials or available_keys,
+                        None,
                     )
 
-                    # Check if cycle should reset (all exhausted or expired)
+                    # Check if cycle should reset (all exhausted, expired, or none available)
                     if self._should_reset_cycle(
-                        provider, tier_key, tracking_key, all_tier_creds
+                        provider,
+                        tier_key,
+                        tracking_key,
+                        all_tier_creds,
+                        available_not_on_cooldown=[
+                            key for key, _ in (tier1_keys + tier2_keys)
+                        ],
                     ):
                         self._reset_cycle(provider, tier_key, tracking_key)
 
@@ -2914,6 +2951,14 @@ class UsageManager:
             cooldown_seconds = None
             model_cooldowns = key_data.setdefault("model_cooldowns", {})
 
+            # Capture existing cooldown BEFORE we modify it
+            # Used to determine if this is a fresh exhaustion vs re-processing
+            existing_cooldown_before = model_cooldowns.get(model)
+            was_already_on_cooldown = (
+                existing_cooldown_before is not None
+                and existing_cooldown_before > now_ts
+            )
+
             if classified_error.error_type == "quota_exceeded":
                 # Quota exhausted - use authoritative reset timestamp if available
                 quota_reset_ts = classified_error.quota_reset_timestamp
@@ -3014,23 +3059,28 @@ class UsageManager:
                     )
 
                 # Mark credential as exhausted for fair cycle if cooldown exceeds threshold
-                effective_cooldown = (
-                    (quota_reset_ts - now_ts)
-                    if quota_reset_ts
-                    else (cooldown_seconds or 0)
-                )
-                provider = self._get_provider_from_credential(key)
-                if provider:
-                    threshold = self._get_exhaustion_cooldown_threshold(provider)
-                    if effective_cooldown > threshold:
-                        rotation_mode = self._get_rotation_mode(provider)
-                        if self._is_fair_cycle_enabled(provider, rotation_mode):
-                            priority = self._get_credential_priority(key, provider)
-                            tier_key = self._get_tier_key(provider, priority)
-                            tracking_key = self._get_tracking_key(key, model, provider)
-                            self._mark_credential_exhausted(
-                                key, provider, tier_key, tracking_key
-                            )
+                # BUT only if this is a FRESH exhaustion (wasn't already on cooldown)
+                # This prevents re-marking after cycle reset
+                if not was_already_on_cooldown:
+                    effective_cooldown = (
+                        (quota_reset_ts - now_ts)
+                        if quota_reset_ts
+                        else (cooldown_seconds or 0)
+                    )
+                    provider = self._get_provider_from_credential(key)
+                    if provider:
+                        threshold = self._get_exhaustion_cooldown_threshold(provider)
+                        if effective_cooldown > threshold:
+                            rotation_mode = self._get_rotation_mode(provider)
+                            if self._is_fair_cycle_enabled(provider, rotation_mode):
+                                priority = self._get_credential_priority(key, provider)
+                                tier_key = self._get_tier_key(provider, priority)
+                                tracking_key = self._get_tracking_key(
+                                    key, model, provider
+                                )
+                                self._mark_credential_exhausted(
+                                    key, provider, tier_key, tracking_key
+                                )
 
             elif classified_error.error_type == "rate_limit":
                 # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
@@ -3275,8 +3325,14 @@ class UsageManager:
             )
 
             if is_exhausted and valid_reset_ts:
-                # Only update cooldown if not set or differs by more than 5 minutes
+                # Check if there was an existing ACTIVE cooldown before we update
+                # This distinguishes between fresh exhaustion vs refresh of existing state
                 existing_cooldown = model_cooldowns.get(model)
+                was_already_on_cooldown = (
+                    existing_cooldown is not None and existing_cooldown > now_ts
+                )
+
+                # Only update cooldown if not set or differs by more than 5 minutes
                 should_update = (
                     existing_cooldown is None
                     or abs(existing_cooldown - reset_timestamp) > 300
@@ -3292,24 +3348,26 @@ class UsageManager:
                     }
 
                 # Mark credential as exhausted in fair cycle if cooldown exceeds threshold
-                # This ensures background refresh detection counts toward cycle completion
-                cooldown_duration = reset_timestamp - now_ts
-                provider = self._get_provider_from_credential(credential)
-                if provider:
-                    threshold = self._get_exhaustion_cooldown_threshold(provider)
-                    if cooldown_duration > threshold:
-                        rotation_mode = self._get_rotation_mode(provider)
-                        if self._is_fair_cycle_enabled(provider, rotation_mode):
-                            priority = self._get_credential_priority(
-                                credential, provider
-                            )
-                            tier_key = self._get_tier_key(provider, priority)
-                            tracking_key = self._get_tracking_key(
-                                credential, model, provider
-                            )
-                            self._mark_credential_exhausted(
-                                credential, provider, tier_key, tracking_key
-                            )
+                # BUT only if this is a FRESH exhaustion (wasn't already on cooldown)
+                # This prevents re-marking after cycle reset when quota refresh sees existing cooldown
+                if not was_already_on_cooldown:
+                    cooldown_duration = reset_timestamp - now_ts
+                    provider = self._get_provider_from_credential(credential)
+                    if provider:
+                        threshold = self._get_exhaustion_cooldown_threshold(provider)
+                        if cooldown_duration > threshold:
+                            rotation_mode = self._get_rotation_mode(provider)
+                            if self._is_fair_cycle_enabled(provider, rotation_mode):
+                                priority = self._get_credential_priority(
+                                    credential, provider
+                                )
+                                tier_key = self._get_tier_key(provider, priority)
+                                tracking_key = self._get_tracking_key(
+                                    credential, model, provider
+                                )
+                                self._mark_credential_exhausted(
+                                    credential, provider, tier_key, tracking_key
+                                )
 
                 # Defensive clamp: ensure request_count doesn't exceed max when exhausted
                 if (

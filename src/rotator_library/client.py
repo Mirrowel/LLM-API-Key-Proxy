@@ -1437,6 +1437,7 @@ class RotatingClient:
                     max_concurrent=max_concurrent,
                     credential_priorities=credential_priorities,
                     credential_tier_names=credential_tier_names,
+                    all_provider_credentials=credentials_for_provider,
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
@@ -2202,6 +2203,7 @@ class RotatingClient:
                         max_concurrent=max_concurrent,
                         credential_priorities=credential_priorities,
                         credential_tier_names=credential_tier_names,
+                        all_provider_credentials=credentials_for_provider,
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)
