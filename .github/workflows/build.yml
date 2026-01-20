@@ -217,6 +217,8 @@ jobs:
     - name: Generate Changelog
       id: changelog
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BRANCH_NAME=${{ github.ref_name }}
         if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
