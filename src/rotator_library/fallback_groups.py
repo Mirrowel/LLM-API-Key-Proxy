@@ -133,11 +133,13 @@ class FallbackGroupManager:
 
         group = self._groups[group_idx]
 
-        # Move target to front, preserve relative order of others
+        # Move target to front, preserve relative order of others, and deduplicate
         reordered = [provider_model]
+        seen = {provider_model}
         for entry in group:
-            if entry != provider_model:
+            if entry not in seen:
                 reordered.append(entry)
+                seen.add(entry)
 
         return reordered
 

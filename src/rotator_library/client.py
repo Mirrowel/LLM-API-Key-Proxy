@@ -1183,9 +1183,21 @@ class RotatingClient:
         api_call: callable,
         request: Optional[Any],
         pre_request_callback: Optional[callable] = None,
+        credentials_for_provider: Optional[List[str]] = None,
         **kwargs,
     ) -> Any:
-        """A generic retry mechanism for non-streaming API calls."""
+        """A generic retry mechanism for non-streaming API calls.
+
+        Args:
+            api_call: The API call function to execute
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            credentials_for_provider: Optional list of credentials to use instead of
+                                      self.all_credentials[provider]. Used by fallback
+                                      logic to pass filtered credentials without modifying
+                                      global state.
+            **kwargs: Additional arguments for the API call
+        """
         model = kwargs.get("model")
         if not model:
             raise ValueError("'model' is a required parameter.")
@@ -1217,7 +1229,12 @@ class RotatingClient:
         # Create a mutable copy of the keys and shuffle it to ensure
         # that the key selection is randomized, which is crucial when
         # multiple keys have the same usage stats.
-        credentials_for_provider = list(self.all_credentials[provider])
+        # If credentials_for_provider is passed (e.g., from fallback logic),
+        # use that instead of reading from self.all_credentials.
+        if credentials_for_provider is not None:
+            credentials_for_provider = list(credentials_for_provider)
+        else:
+            credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
 
         # Filter out credentials that are unavailable (queued for re-auth)
@@ -2057,40 +2074,33 @@ class RotatingClient:
                     f"Fallback: trying {entry} with {len(tier_creds)} tier-{tier} credentials"
                 )
 
-                # Temporarily swap credentials for this provider
-                original_creds = self.all_credentials.get(provider, [])
-                self.all_credentials[provider] = tier_creds
+                # Update kwargs with this entry's model
+                entry_kwargs = kwargs.copy()
+                entry_kwargs["model"] = entry
 
-                try:
-                    # Update kwargs with this entry's model
-                    entry_kwargs = kwargs.copy()
-                    entry_kwargs["model"] = entry
+                # Call existing retry logic with filtered credentials
+                # (no global state modification - pass credentials directly)
+                result = await self._execute_with_retry(
+                    api_call,
+                    request,
+                    pre_request_callback,
+                    credentials_for_provider=tier_creds,
+                    **entry_kwargs,
+                )
 
-                    # Call existing retry logic
-                    result = await self._execute_with_retry(
-                        api_call,
-                        request,
-                        pre_request_callback,
-                        **entry_kwargs,
-                    )
-
-                    # Check if result is successful (not an error response)
-                    if result is not None:
-                        if isinstance(result, dict) and "error" in result:
-                            # Error response - continue to next entry
-                            last_result = result
-                            lib_logger.info(
-                                f"Fallback entry {entry} exhausted, trying next"
-                            )
-                            continue
-                        else:
-                            # Success!
-                            lib_logger.info(f"Fallback succeeded with {entry}")
-                            return result
-
-                finally:
-                    # Restore original credentials
-                    self.all_credentials[provider] = original_creds
+                # Check if result is successful (not an error response)
+                if result is not None:
+                    if isinstance(result, dict) and "error" in result:
+                        # Error response - continue to next entry
+                        last_result = result
+                        lib_logger.info(
+                            f"Fallback entry {entry} exhausted, trying next"
+                        )
+                        continue
+                    else:
+                        # Success!
+                        lib_logger.info(f"Fallback succeeded with {entry}")
+                        return result
 
         # All entries exhausted
         lib_logger.warning(f"All fallback entries exhausted for {original_model}")
@@ -2216,58 +2226,51 @@ class RotatingClient:
                     f"Fallback (streaming): trying {entry} with {len(tier_creds)} tier-{tier} credentials"
                 )
 
-                # Temporarily swap credentials for this provider
-                original_creds = self.all_credentials.get(provider, [])
-                self.all_credentials[provider] = tier_creds
+                # Update kwargs with this entry's model
+                entry_kwargs = kwargs.copy()
+                entry_kwargs["model"] = entry
 
-                try:
-                    # Update kwargs with this entry's model
-                    entry_kwargs = kwargs.copy()
-                    entry_kwargs["model"] = entry
+                # Call existing streaming logic with filtered credentials
+                # (no global state modification - pass credentials directly)
+                stream = self._streaming_acompletion_with_retry(
+                    request,
+                    pre_request_callback,
+                    credentials_for_provider=tier_creds,
+                    **entry_kwargs,
+                )
 
-                    # Call existing streaming logic
-                    stream = self._streaming_acompletion_with_retry(
-                        request,
-                        pre_request_callback,
-                        **entry_kwargs,
-                    )
+                # Consume the stream
+                chunks_yielded = 0
+                async for chunk in stream:
+                    # Check if this is an error response
+                    if chunk.startswith("data: ") and chunks_yielded == 0:
+                        try:
+                            content = chunk[6:].strip()
+                            if content and content != "[DONE]":
+                                data = json.loads(content)
+                                if isinstance(data, dict) and "error" in data:
+                                    # This is an error - don't yield, try next entry
+                                    last_error = data
+                                    lib_logger.info(
+                                        f"Fallback entry {entry} (streaming) returned error, trying next"
+                                    )
+                                    break
+                        except json.JSONDecodeError:
+                            pass
 
-                    # Consume the stream
-                    chunks_yielded = 0
-                    async for chunk in stream:
-                        # Check if this is an error response
-                        if chunk.startswith("data: ") and chunks_yielded == 0:
-                            try:
-                                content = chunk[6:].strip()
-                                if content and content != "[DONE]":
-                                    data = json.loads(content)
-                                    if isinstance(data, dict) and "error" in data:
-                                        # This is an error - don't yield, try next entry
-                                        last_error = data
-                                        lib_logger.info(
-                                            f"Fallback entry {entry} (streaming) returned error, trying next"
-                                        )
-                                        break
-                            except json.JSONDecodeError:
-                                pass
+                    # Not an error, yield the chunk
+                    yield chunk
+                    chunks_yielded += 1
 
-                        # Not an error, yield the chunk
-                        yield chunk
-                        chunks_yielded += 1
-
-                        # If we've yielded data, we're committed to this entry
-                        if chunks_yielded > 0 and not chunk.startswith("data: [DONE]"):
-                            success = True
-
-                    # Check if stream completed successfully
-                    if chunks_yielded > 0:
+                    # If we've yielded data, we're committed to this entry
+                    if chunks_yielded > 0 and not chunk.startswith("data: [DONE]"):
                         success = True
-                        lib_logger.info(f"Fallback (streaming) succeeded with {entry}")
-                        return
 
-                finally:
-                    # Restore original credentials
-                    self.all_credentials[provider] = original_creds
+                # Check if stream completed successfully
+                if chunks_yielded > 0:
+                    success = True
+                    lib_logger.info(f"Fallback (streaming) succeeded with {entry}")
+                    return
 
         # All entries exhausted
         if not success:
@@ -2291,9 +2294,20 @@ class RotatingClient:
         self,
         request: Optional[Any],
         pre_request_callback: Optional[callable] = None,
+        credentials_for_provider: Optional[List[str]] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
-        """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
+        """A dedicated generator for retrying streaming completions with full request preparation and per-key retries.
+
+        Args:
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            credentials_for_provider: Optional list of credentials to use instead of
+                                      self.all_credentials[provider]. Used by fallback
+                                      logic to pass filtered credentials without modifying
+                                      global state.
+            **kwargs: Additional arguments for the API call
+        """
         model = kwargs.get("model")
         provider = model.split("/")[0]
 
@@ -2301,7 +2315,12 @@ class RotatingClient:
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
 
         # Create a mutable copy of the keys and shuffle it.
-        credentials_for_provider = list(self.all_credentials[provider])
+        # If credentials_for_provider is passed (e.g., from fallback logic),
+        # use that instead of reading from self.all_credentials.
+        if credentials_for_provider is not None:
+            credentials_for_provider = list(credentials_for_provider)
+        else:
+            credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
 
         # Filter out credentials that are unavailable (queued for re-auth)
