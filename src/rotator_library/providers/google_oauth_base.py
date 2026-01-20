@@ -93,6 +93,77 @@ class GoogleOAuthBase:
     CALLBACK_PATH: str = DEFAULT_OAUTH_CALLBACK_PATH
     REFRESH_EXPIRY_BUFFER_SECONDS: int = DEFAULT_REFRESH_EXPIRY_BUFFER
 
+    # =========================================================================
+    # PKCE (Proof Key for Code Exchange) SUPPORT
+    # =========================================================================
+
+    def _generate_pkce(self) -> tuple:
+        """
+        Generate PKCE code_verifier and code_challenge.
+
+        PKCE (Proof Key for Code Exchange) prevents authorization code interception attacks.
+        Required for public OAuth clients per RFC 7636.
+
+        Returns:
+            Tuple of (code_verifier, code_challenge)
+        """
+        import secrets
+        import hashlib
+        import base64
+
+        # code_verifier: 43-128 chars, using URL-safe base64
+        code_verifier = secrets.token_urlsafe(32)  # Produces 43 chars
+
+        # code_challenge: BASE64URL(SHA256(code_verifier)) without padding
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+        return code_verifier, code_challenge
+
+    def _encode_oauth_state(self, code_verifier: str) -> str:
+        """
+        Encode OAuth state parameter containing PKCE verifier.
+
+        The state parameter provides CSRF protection and carries the PKCE verifier
+        so it can be recovered after the OAuth callback.
+
+        Args:
+            code_verifier: The PKCE code verifier to encode
+
+        Returns:
+            Base64url-encoded state string
+        """
+        import base64
+
+        state_data = {"v": code_verifier}  # Minimal - just verifier
+        json_bytes = json.dumps(state_data, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(json_bytes).decode("ascii").rstrip("=")
+
+    def _decode_oauth_state(self, state: str) -> str:
+        """
+        Decode OAuth state and return code_verifier.
+
+        Args:
+            state: The base64url-encoded state string from OAuth callback
+
+        Returns:
+            The decoded code_verifier
+
+        Raises:
+            ValueError: If state cannot be decoded or is missing verifier
+        """
+        import base64
+
+        # Re-pad base64 string (base64url encoding strips padding)
+        padded = state + "=" * (-len(state) % 4)
+        try:
+            state_data = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            if "v" not in state_data:
+                raise ValueError("Missing verifier in state")
+            return state_data["v"]
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ValueError(f"Invalid state parameter: {e}")
+
     @property
     def callback_port(self) -> int:
         """
@@ -912,6 +983,12 @@ class GoogleOAuthBase:
         # [HEADLESS DETECTION] Check if running in headless environment
         is_headless = is_headless_environment()
 
+        # [PKCE] Generate PKCE code verifier and challenge for enhanced security
+        code_verifier, code_challenge = self._generate_pkce()
+
+        # [STATE] Encode state parameter with PKCE verifier for CSRF protection
+        oauth_state = self._encode_oauth_state(code_verifier)
+
         auth_code_future = asyncio.get_event_loop().create_future()
         server = None
 
@@ -928,8 +1005,13 @@ class GoogleOAuthBase:
                 query_params = parse_qs(urlparse(path_str).query)
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
                 if "code" in query_params:
+                    # Extract code and state from callback
+                    auth_code = query_params["code"][0]
+                    received_state = query_params.get("state", [None])[0]
+
                     if not auth_code_future.done():
-                        auth_code_future.set_result(query_params["code"][0])
+                        # Return both code and state for validation
+                        auth_code_future.set_result((auth_code, received_state))
                     writer.write(
                         b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>"
                     )
@@ -954,6 +1036,7 @@ class GoogleOAuthBase:
             )
             from urllib.parse import urlencode
 
+            # [PKCE + STATE] Include code_challenge, code_challenge_method, and state in auth URL
             auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
                 {
                     "client_id": self.CLIENT_ID,
@@ -962,6 +1045,9 @@ class GoogleOAuthBase:
                     "access_type": "offline",
                     "response_type": "code",
                     "prompt": "consent",
+                    "code_challenge": code_challenge,
+                    "code_challenge_method": "S256",
+                    "state": oauth_state,
                 }
             )
 
@@ -1016,7 +1102,30 @@ class GoogleOAuthBase:
             ):
                 # Note: The 300s timeout here is handled by the ReauthCoordinator
                 # We use a slightly longer internal timeout to let the coordinator handle it
-                auth_code = await asyncio.wait_for(auth_code_future, timeout=310)
+                auth_code, received_state = await asyncio.wait_for(
+                    auth_code_future, timeout=310
+                )
+
+            # [STATE VALIDATION] Validate state parameter and extract verifier
+            effective_verifier = code_verifier  # Default to original verifier
+            if received_state:
+                try:
+                    decoded_verifier = self._decode_oauth_state(received_state)
+                    if decoded_verifier != code_verifier:
+                        lib_logger.warning(
+                            "OAuth state verifier mismatch - possible CSRF attempt. "
+                            "Using original verifier."
+                        )
+                    else:
+                        effective_verifier = decoded_verifier
+                except ValueError as e:
+                    lib_logger.warning(
+                        f"Failed to decode OAuth state: {e}. Using original verifier."
+                    )
+            else:
+                lib_logger.debug(
+                    "No state parameter in callback - using original verifier"
+                )
         except asyncio.TimeoutError:
             raise Exception("OAuth flow timed out. Please try again.")
         finally:
@@ -1026,14 +1135,24 @@ class GoogleOAuthBase:
 
         lib_logger.info(f"Attempting to exchange authorization code for tokens...")
         async with httpx.AsyncClient() as client:
+            # [PKCE + HEADERS] Include code_verifier and explicit headers for token exchange
+            # Uses GEMINI_CLI style headers for consistent fingerprinting
             response = await client.post(
                 self.TOKEN_URI,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Accept": "*/*",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "User-Agent": "google-api-nodejs-client/10.3.0",
+                    "X-Goog-Api-Client": "gl-node/22.18.0",
+                },
                 data={
                     "code": auth_code.strip(),
                     "client_id": self.CLIENT_ID,
                     "client_secret": self.CLIENT_SECRET,
                     "redirect_uri": f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}",
                     "grant_type": "authorization_code",
+                    "code_verifier": effective_verifier,
                 },
             )
             response.raise_for_status()
@@ -1054,9 +1173,14 @@ class GoogleOAuthBase:
             new_creds["universe_domain"] = "googleapis.com"
 
             # Fetch user info and add metadata
+            # Uses GEMINI_CLI style headers per PR 246
             user_info_response = await client.get(
                 self.USER_INFO_URI,
-                headers={"Authorization": f"Bearer {new_creds['access_token']}"},
+                headers={
+                    "Authorization": f"Bearer {new_creds['access_token']}",
+                    "User-Agent": "google-api-nodejs-client/10.3.0",
+                    "X-Goog-Api-Client": "gl-node/22.18.0",
+                },
             )
             user_info_response.raise_for_status()
             user_info = user_info_response.json()
