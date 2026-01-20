@@ -17,7 +17,12 @@ from rich.table import Table
 from rich.text import Text
 
 from .utils.paths import get_oauth_dir, get_data_file
-from .provider_config import LITELLM_PROVIDERS, PROVIDER_CATEGORIES
+from .provider_config import LITELLM_PROVIDERS, PROVIDER_CATEGORIES, PROVIDER_BLACKLIST
+from .litellm_providers import (
+    SCRAPED_PROVIDERS,
+    get_provider_api_key_var,
+    get_provider_display_name,
+)
 
 
 def _get_oauth_base_dir() -> Path:
@@ -1142,12 +1147,16 @@ def ensure_env_defaults():
 
 
 def _search_providers(query: str, providers: dict) -> list:
-    """Search providers by substring match (case-insensitive)."""
+    """Search providers by substring match (case-insensitive).
+
+    Searches both the provider key and display name.
+    """
     query_lower = query.lower()
     matches = []
-    for name, config in providers.items():
-        if query_lower in name.lower():
-            matches.append((name, config))
+    for provider_key, config in providers.items():
+        display_name = config.get("display_name", provider_key)
+        if query_lower in provider_key.lower() or query_lower in display_name.lower():
+            matches.append((provider_key, config))
     return matches
 
 
@@ -1192,11 +1201,11 @@ async def setup_api_key():
     from .providers import DynamicOpenAICompatibleProvider
     from .providers.provider_interface import ProviderInterface
 
-    # Build a set of API key env vars already in LITELLM_PROVIDERS
+    # Build a set of API key env vars already in SCRAPED_PROVIDERS
     litellm_api_keys = set()
-    for config in LITELLM_PROVIDERS.values():
-        if config.get("api_key"):
-            litellm_api_keys.add(config["api_key"])
+    for info in SCRAPED_PROVIDERS.values():
+        for api_key_var in info.get("api_key_env_vars", []):
+            litellm_api_keys.add(api_key_var)
 
     # OAuth-only providers to exclude entirely from API key setup
     oauth_only_providers = {
@@ -1211,9 +1220,33 @@ async def setup_api_key():
         "openai_compatible",
     }
 
-    # Create combined providers dict with custom providers
-    all_providers = dict(LITELLM_PROVIDERS)
+    # Create combined providers dict with scraped data + UI config
+    # Key is the provider route key, value includes display_name, api_key, category, etc.
+    all_providers = {}
 
+    # Add all scraped providers with their UI config
+    for provider_key in SCRAPED_PROVIDERS:
+        # Skip blacklisted providers
+        if provider_key in PROVIDER_BLACKLIST:
+            continue
+
+        scraped_info = SCRAPED_PROVIDERS[provider_key]
+        ui_config = LITELLM_PROVIDERS.get(provider_key, {"category": "other"})
+
+        # Skip providers without API keys (OAuth-only or no auth)
+        api_key_vars = scraped_info.get("api_key_env_vars", [])
+        if not api_key_vars:
+            continue
+
+        all_providers[provider_key] = {
+            "display_name": scraped_info.get("display_name", provider_key),
+            "api_key": api_key_vars[0] if api_key_vars else None,
+            "category": ui_config.get("category", "other"),
+            "note": ui_config.get("note"),
+            "extra_vars": ui_config.get("extra_vars", []),
+        }
+
+    # Add custom providers from PROVIDER_PLUGINS
     for provider_key, provider_class in PROVIDER_PLUGINS.items():
         # Skip OAuth-only providers
         if provider_key in oauth_only_providers:
@@ -1221,6 +1254,10 @@ async def setup_api_key():
 
         # Skip base classes
         if provider_key in base_classes:
+            continue
+
+        # Skip if already in scraped providers
+        if provider_key in all_providers:
             continue
 
         # Check if this is a dynamic OpenAI-compatible provider
@@ -1231,16 +1268,18 @@ async def setup_api_key():
         except TypeError:
             is_dynamic = False
 
+        env_var = f"{provider_key.upper()}_API_KEY"
+
+        # Skip if API key already covered
+        if env_var in litellm_api_keys:
+            continue
+
+        display_name = provider_key.replace("_", " ").title()
+
         if is_dynamic:
             # Dynamic OpenAI-compatible provider uses _API_BASE pattern
-            env_var = f"{provider_key.upper()}_API_KEY"
-
-            # Skip if somehow already in list
-            if env_var in litellm_api_keys:
-                continue
-
-            display_name = provider_key.replace("_", " ").title()
-            all_providers[display_name] = {
+            all_providers[provider_key] = {
+                "display_name": display_name,
                 "api_key": env_var,
                 "category": "custom_openai",
                 "note": "Custom OpenAI-compatible provider.",
@@ -1250,14 +1289,8 @@ async def setup_api_key():
             }
         else:
             # First-party file-based provider
-            env_var = f"{provider_key.upper()}_API_KEY"
-
-            # Skip if already in LiteLLM list
-            if env_var in litellm_api_keys:
-                continue
-
-            display_name = provider_key.replace("_", " ").title()
-            all_providers[display_name] = {
+            all_providers[provider_key] = {
+                "display_name": display_name,
                 "api_key": env_var,
                 "category": "custom",
                 "note": "First-party provider from the library.",
@@ -1288,8 +1321,9 @@ async def setup_api_key():
             f"\nMatching providers for '{search_query}':\n\n", style="bold cyan"
         )
 
-        for i, (name, config) in enumerate(matches, 1):
-            provider_list.append((name, config))
+        for i, (provider_key, config) in enumerate(matches, 1):
+            provider_list.append((provider_key, config))
+            display_name = config.get("display_name", provider_key)
             category = config.get("category", "other")
             category_label = next(
                 (label for cat, label in PROVIDER_CATEGORIES if cat == category),
@@ -1302,9 +1336,11 @@ async def setup_api_key():
                     .replace("_TOKEN", "")
                     .replace("_", " ")
                 )
-                provider_text.append(f"  {i}. {name} ({key_prefix}) ", style="white")
+                provider_text.append(
+                    f"  {i}. {display_name} ({key_prefix}) ", style="white"
+                )
             else:
-                provider_text.append(f"  {i}. {name} ", style="white")
+                provider_text.append(f"  {i}. {display_name} ", style="white")
             provider_text.append(f"[{category_label}]\n", style="dim")
 
         console.print(provider_text)
@@ -1322,9 +1358,10 @@ async def setup_api_key():
             providers_in_cat = by_category[category_key]
             provider_text.append(f"\n--- {category_label} ---\n", style="bold cyan")
 
-            for name, config in providers_in_cat:
+            for provider_key, config in providers_in_cat:
                 idx = len(provider_list) + 1
-                provider_list.append((name, config))
+                provider_list.append((provider_key, config))
+                display_name = config.get("display_name", provider_key)
                 api_key_var = config.get("api_key")
                 if api_key_var:
                     key_prefix = (
@@ -1332,9 +1369,11 @@ async def setup_api_key():
                         .replace("_TOKEN", "")
                         .replace("_", " ")
                     )
-                    provider_text.append(f"  {idx}. {name} ({key_prefix})\n")
+                    provider_text.append(f"  {idx}. {display_name} ({key_prefix})\n")
                 else:
-                    provider_text.append(f"  {idx}. {name} [dim](no API key)[/dim]\n")
+                    provider_text.append(
+                        f"  {idx}. {display_name} [dim](no API key)[/dim]\n"
+                    )
 
         console.print(provider_text)
 
@@ -1356,12 +1395,39 @@ async def setup_api_key():
             console.print("[bold red]Invalid choice.[/bold red]")
             return
 
-        display_name, provider_config = provider_list[choice_index]
+        provider_key, provider_config = provider_list[choice_index]
+        display_name = provider_config.get("display_name", provider_key)
         api_key_var = provider_config.get("api_key")
         note = provider_config.get("note")
         extra_vars = provider_config.get("extra_vars", [])
 
+        # Get additional info from scraped data
+        scraped_info = SCRAPED_PROVIDERS.get(provider_key, {})
+        route = scraped_info.get("route", "").rstrip("/")
+        api_base_url = scraped_info.get("api_base_url")
+
         console.print()
+
+        # Build and show provider info panel
+        info_lines = []
+        if route:
+            info_lines.append(f"Route: [cyan]{route}/[/cyan]")
+            info_lines.append(f"Example: [dim]{route}/model-name[/dim]")
+        if api_base_url:
+            info_lines.append(f"API Base: [dim]{api_base_url}[/dim]")
+        if api_key_var:
+            info_lines.append(f"Env Variable: [green]{api_key_var}[/green]")
+
+        if info_lines:
+            console.print(
+                Panel(
+                    "\n".join(info_lines),
+                    title=f"[bold]{display_name}[/bold]",
+                    expand=False,
+                    border_style="blue",
+                )
+            )
+            console.print()
 
         # Show provider note if exists
         if note:
@@ -1380,7 +1446,7 @@ async def setup_api_key():
         # Prompt for API key (if provider has one)
         if api_key_var:
             api_key = Prompt.ask(
-                f"[bold]Enter API key for {display_name}[/bold] [dim](or press Enter to skip)[/dim]",
+                f"[bold]Enter {api_key_var}[/bold] [dim](or press Enter to skip)[/dim]",
                 default="",
             )
 

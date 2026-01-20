@@ -2,225 +2,187 @@
 """
 Centralized provider configuration for the rotator library.
 
-This module handles:
-- Known LiteLLM provider definitions
+This module handl- Known LiteLLM provider definitions (from scraped data)
+- UI configuration (categories, notes, extra vars) for credential tool
 - API base overrides for known providers
 - Custom OpenAI-compatible provider detection and routing
 """
 
 import os
-import re
 import logging
 from typing import Dict, Any, Set, Optional
+
+from .litellm_providers import (
+    SCRAPED_PROVIDERS,
+    get_provider_route,
+    get_provider_api_key_var,
+    get_provider_display_name,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
 # =============================================================================
-# LiteLLM Provider Configuration
-# Auto-generated from LiteLLM documentation. For full provider docs, visit:
-# https://docs.litellm.ai/docs/providers
+# LiteLLM Provider UI Configuration
 #
-# Structure: Each provider has:
-#   - api_key: Environment variable for API key (None if not needed)
+# Keys are route-based provider identifiers (e.g., "openai", "anthropic").
+# Provider data (display_name, api_key_env_vars, etc.) comes from SCRAPED_PROVIDERS.
+#
+# This dict only contains UI-specific configuration:
 #   - category: Provider category for display grouping
 #   - note: (optional) Configuration notes shown to user
-#   - extra_vars: (optional) Additional env vars needed [(name, label, default), ...]
-#
-# Note: Adding multiple API base URLs per provider is not yet supported.
+#   - extra_vars: (optional) Additional env vars to prompt for [(name, label, default), ...]
 # =============================================================================
 
-LITELLM_PROVIDERS = {
+LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # POPULAR - Most commonly used providers
     # =========================================================================
-    "OpenAI": {
-        "api_key": "OPENAI_API_KEY",
+    "openai": {
         "category": "popular",
     },
-    "Anthropic": {
-        "api_key": "ANTHROPIC_API_KEY",
+    "anthropic": {
         "category": "popular",
     },
-    "Google AI Studio (Gemini)": {
-        "api_key": "GEMINI_API_KEY",
+    "gemini": {
         "category": "popular",
     },
-    "xAI": {
-        "api_key": "XAI_API_KEY",
+    "xai": {
         "category": "popular",
     },
-    "Deepseek": {
-        "api_key": "DEEPSEEK_API_KEY",
+    "deepseek": {
         "category": "popular",
     },
-    "Mistral AI": {
-        "api_key": "MISTRAL_API_KEY",
+    "mistral": {
         "category": "popular",
     },
-    "Codestral (Mistral)": {
-        "api_key": "CODESTRAL_API_KEY",
+    "codestral": {
         "category": "popular",
     },
-    "OpenRouter": {
-        "api_key": "OPENROUTER_API_KEY",
+    "openrouter": {
         "category": "popular",
         "extra_vars": [
             ("OPENROUTER_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Groq": {
-        "api_key": "GROQ_API_KEY",
+    "groq": {
         "category": "popular",
     },
-    "Chutes": {
-        "api_key": "CHUTES_API_KEY",
+    "chutes": {
         "category": "popular",
     },
-    "NVIDIA NIM": {
-        "api_key": "NVIDIA_NIM_API_KEY",
+    "nvidia_nim": {
         "category": "popular",
         "extra_vars": [
             ("NVIDIA_NIM_API_BASE", "NIM API Base (optional)", None),
         ],
     },
-    "Perplexity AI": {
-        "api_key": "PERPLEXITYAI_API_KEY",
+    "perplexity": {
         "category": "popular",
     },
-    "Moonshot AI": {
-        "api_key": "MOONSHOT_API_KEY",
+    "moonshot": {
         "category": "popular",
         "extra_vars": [
             ("MOONSHOT_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Z.AI (Zhipu AI)": {
-        "api_key": "ZAI_API_KEY",
+    "zai": {
         "category": "popular",
     },
-    "MiniMax": {
-        "api_key": "MINIMAX_API_KEY",
+    "minimax": {
         "category": "popular",
         "extra_vars": [
             ("MINIMAX_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Xiaomi MiMo": {
-        "api_key": "XIAOMI_MIMO_API_KEY",
+    "xiaomi_mimo": {
         "category": "popular",
     },
-    "NanoGPT": {
-        "api_key": "NANOGPT_API_KEY",
+    "nano-gpt": {
         "category": "popular",
     },
-    "Synthetic": {
-        "api_key": "SYNTHETIC_API_KEY",
+    "synthetic": {
         "category": "popular",
     },
     # =========================================================================
     # CLOUD PLATFORMS - Aggregators & cloud inference platforms
     # =========================================================================
-    "Together AI": {
-        "api_key": "TOGETHERAI_API_KEY",
+    "together_ai": {
         "category": "cloud",
     },
-    "Fireworks AI": {
-        "api_key": "FIREWORKS_AI_API_KEY",
+    "fireworks_ai": {
         "category": "cloud",
         "extra_vars": [
             ("FIREWORKS_AI_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Replicate": {
-        "api_key": "REPLICATE_API_KEY",
+    "replicate": {
         "category": "cloud",
     },
-    "DeepInfra": {
-        "api_key": "DEEPINFRA_API_KEY",
+    "deepinfra": {
         "category": "cloud",
     },
-    "Anyscale": {
-        "api_key": "ANYSCALE_API_KEY",
+    "anyscale": {
         "category": "cloud",
     },
-    "Baseten": {
-        "api_key": "BASETEN_API_KEY",
+    "baseten": {
         "category": "cloud",
     },
-    "Predibase": {
-        "api_key": "PREDIBASE_API_KEY",
+    "predibase": {
         "category": "cloud",
     },
-    "Novita AI": {
-        "api_key": "NOVITA_API_KEY",
+    "novita": {
         "category": "cloud",
     },
-    "Featherless AI": {
-        "api_key": "FEATHERLESS_AI_API_KEY",
+    "featherless_ai": {
         "category": "cloud",
     },
-    "Hyperbolic": {
-        "api_key": "HYPERBOLIC_API_KEY",
+    "hyperbolic": {
         "category": "cloud",
     },
-    "Lambda AI": {
-        "api_key": "LAMBDA_API_KEY",
+    "lambda_ai": {
         "category": "cloud",
         "extra_vars": [
             ("LAMBDA_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Nebius AI Studio": {
-        "api_key": "NEBIUS_API_KEY",
+    "nebius": {
         "category": "cloud",
     },
-    "Galadriel": {
-        "api_key": "GALADRIEL_API_KEY",
+    "galadriel": {
         "category": "cloud",
     },
-    "FriendliAI": {
-        "api_key": "FRIENDLI_TOKEN",
+    "friendliai": {
         "category": "cloud",
     },
-    "SambaNova": {
-        "api_key": "SAMBANOVA_API_KEY",
+    "sambanova": {
         "category": "cloud",
     },
-    "Cerebras": {
-        "api_key": "CEREBRAS_API_KEY",
+    "cerebras": {
         "category": "cloud",
     },
-    "Meta Llama": {
-        "api_key": "LLAMA_API_KEY",
+    "meta_llama": {
         "category": "cloud",
     },
-    "AI21": {
-        "api_key": "AI21_API_KEY",
+    "ai21": {
         "category": "cloud",
     },
-    "Cohere": {
-        "api_key": "COHERE_API_KEY",
+    "cohere_chat": {
         "category": "cloud",
     },
-    "Aleph Alpha": {
-        "api_key": "ALEPHALPHA_API_KEY",
+    "alephalpha": {
         "category": "cloud",
     },
-    "Hugging Face": {
-        "api_key": "HF_TOKEN",
+    "huggingface": {
         "category": "cloud",
     },
-    "GitHub Models": {
-        "api_key": "GITHUB_API_KEY",
+    "github": {
         "category": "cloud",
     },
-    "Helicone": {
-        "api_key": "HELICONE_API_KEY",
+    "helicone": {
         "category": "cloud",
         "note": "LLM gateway/proxy with analytics.",
     },
-    "Heroku": {
-        "api_key": "HEROKU_API_KEY",
+    "heroku": {
         "category": "cloud",
         "extra_vars": [
             (
@@ -230,27 +192,22 @@ LITELLM_PROVIDERS = {
             ),
         ],
     },
-    "Morph": {
-        "api_key": "MORPH_API_KEY",
+    "morph": {
         "category": "cloud",
     },
-    "Poe": {
-        "api_key": "POE_API_KEY",
+    "poe": {
         "category": "cloud",
     },
-    "LlamaGate": {
-        "api_key": "LLAMAGATE_API_KEY",
+    "llamagate": {
         "category": "cloud",
     },
-    "Manus": {
-        "api_key": "MANUS_API_KEY",
+    "manus": {
         "category": "cloud",
     },
     # =========================================================================
     # ENTERPRISE / COMPLEX AUTH - Major cloud providers (may need extra config)
     # =========================================================================
-    "Azure OpenAI": {
-        "api_key": "AZURE_API_KEY",
+    "azure": {
         "category": "enterprise",
         "note": "Requires Azure endpoint and API version.",
         "extra_vars": [
@@ -258,15 +215,13 @@ LITELLM_PROVIDERS = {
             ("AZURE_API_VERSION", "API version", "2024-02-15-preview"),
         ],
     },
-    "Azure AI Studio": {
-        "api_key": "AZURE_AI_API_KEY",
+    "azure_ai": {
         "category": "enterprise",
         "extra_vars": [
             ("AZURE_AI_API_BASE", "Azure AI endpoint URL", None),
         ],
     },
-    "Vertex AI": {
-        "api_key": "GOOGLE_APPLICATION_CREDENTIALS",
+    "vertex_ai": {
         "category": "enterprise",
         "note": "Uses Google Cloud service account. Enter path to credentials JSON file.",
         "extra_vars": [
@@ -274,8 +229,7 @@ LITELLM_PROVIDERS = {
             ("VERTEXAI_LOCATION", "GCP Location", "us-central1"),
         ],
     },
-    "AWS Bedrock": {
-        "api_key": "AWS_ACCESS_KEY_ID",
+    "bedrock": {
         "category": "enterprise",
         "note": "Requires all three AWS credentials.",
         "extra_vars": [
@@ -283,8 +237,7 @@ LITELLM_PROVIDERS = {
             ("AWS_REGION_NAME", "AWS Region", "us-east-1"),
         ],
     },
-    "AWS Sagemaker": {
-        "api_key": "AWS_ACCESS_KEY_ID",
+    "sagemaker": {
         "category": "enterprise",
         "note": "Requires all three AWS credentials.",
         "extra_vars": [
@@ -292,206 +245,166 @@ LITELLM_PROVIDERS = {
             ("AWS_REGION_NAME", "AWS Region", "us-east-1"),
         ],
     },
-    "Databricks": {
-        "api_key": "DATABRICKS_API_KEY",
+    "databricks": {
         "category": "enterprise",
         "extra_vars": [
             ("DATABRICKS_API_BASE", "Databricks workspace URL", None),
         ],
     },
-    "Snowflake": {
-        "api_key": "SNOWFLAKE_JWT",
+    "snowflake": {
         "category": "enterprise",
         "note": "Uses JWT authentication.",
         "extra_vars": [
             ("SNOWFLAKE_ACCOUNT_ID", "Snowflake Account ID", None),
         ],
     },
-    "IBM watsonx.ai": {
-        "api_key": "WATSONX_APIKEY",
+    "watsonx": {
         "category": "enterprise",
         "extra_vars": [
             ("WATSONX_URL", "watsonx.ai URL (optional)", None),
         ],
     },
-    "Cloudflare Workers AI": {
-        "api_key": "CLOUDFLARE_API_KEY",
+    "cloudflare": {
         "category": "enterprise",
         "extra_vars": [
             ("CLOUDFLARE_ACCOUNT_ID", "Cloudflare Account ID", None),
         ],
     },
+    "oci": {
+        "category": "enterprise",
+        "note": "Oracle Cloud Infrastructure. Requires OCI SDK configuration.",
+    },
+    "sap": {
+        "category": "enterprise",
+        "note": "SAP Generative AI Hub. Requires AI Core configuration.",
+    },
     # =========================================================================
     # SPECIALIZED - Image, audio, embeddings, rerank providers
     # =========================================================================
-    "Stability AI": {
-        "api_key": "STABILITY_API_KEY",
+    "stability": {
         "category": "specialized",
         "note": "Image generation provider.",
     },
-    "Fal AI": {
-        "api_key": "FAL_AI_API_KEY",
+    "fal_ai": {
         "category": "specialized",
         "note": "Image generation provider.",
     },
-    "RunwayML": {
-        "api_key": "RUNWAYML_API_KEY",
+    "runwayml": {
         "category": "specialized",
         "note": "Image generation provider.",
     },
-    "Recraft": {
-        "api_key": "RECRAFT_API_KEY",
+    "recraft": {
         "category": "specialized",
         "note": "Image generation and editing.",
         "extra_vars": [
             ("RECRAFT_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Topaz": {
-        "api_key": "TOPAZ_API_KEY",
+    "topaz": {
         "category": "specialized",
         "note": "Image enhancement provider.",
     },
-    "ElevenLabs": {
-        "api_key": "ELEVENLABS_API_KEY",
+    "elevenlabs": {
         "category": "specialized",
         "note": "Text-to-speech and audio transcription.",
     },
-    "Deepgram": {
-        "api_key": "DEEPGRAM_API_KEY",
+    "deepgram": {
         "category": "specialized",
         "note": "Audio transcription provider.",
     },
-    "Voyage AI": {
-        "api_key": "VOYAGE_API_KEY",
+    "voyage": {
         "category": "specialized",
         "note": "Embeddings and rerank provider.",
     },
-    "Jina AI": {
-        "api_key": "JINA_AI_API_KEY",
+    "jina_ai": {
         "category": "specialized",
         "note": "Embeddings and rerank provider.",
     },
-    "Clarifai": {
-        "api_key": "CLARIFAI_API_KEY",
+    "clarifai": {
         "category": "specialized",
     },
-    "NLP Cloud": {
-        "api_key": "NLP_CLOUD_API_KEY",
+    "nlp_cloud": {
         "category": "specialized",
     },
-    "Milvus": {
-        "api_key": "MILVUS_API_KEY",
+    "milvus": {
         "category": "specialized",
         "note": "Vector database provider.",
         "extra_vars": [
             ("MILVUS_API_BASE", "Milvus Server URL", None),
         ],
     },
+    "infinity": {
+        "category": "specialized",
+        "note": "Self-hosted embeddings/rerank server. API key is optional.",
+        "extra_vars": [
+            ("INFINITY_API_BASE", "Infinity Server URL", "http://localhost:8080"),
+        ],
+    },
     # =========================================================================
     # REGIONAL - Region-specific or specialized regional providers
     # =========================================================================
-    "Dashscope (Qwen)": {
-        "api_key": "DASHSCOPE_API_KEY",
+    "dashscope": {
         "category": "regional",
         "note": "Alibaba Cloud Qwen models.",
     },
-    "Volcano Engine": {
-        "api_key": "VOLCENGINE_API_KEY",
+    "volcengine": {
         "category": "regional",
         "note": "ByteDance cloud platform.",
     },
-    "OVHCloud AI Endpoints": {
-        "api_key": "OVHCLOUD_API_KEY",
+    "ovhcloud": {
         "category": "regional",
         "note": "European cloud provider.",
     },
-    "Nscale (EU Sovereign)": {
-        "api_key": "NSCALE_API_KEY",
+    "nscale": {
         "category": "regional",
         "note": "EU sovereign cloud.",
     },
     # =========================================================================
     # LOCAL / SELF-HOSTED - Run locally or on your own infrastructure
     # =========================================================================
-    # NOTE: Providers with no API key are commented out because the library
-    # requires credentials (API keys or OAuth files) to function.
-    # Use "Add Custom OpenAI-Compatible Provider" for local providers.
-    #
-    # "Ollama": {
-    #     "api_key": None,  # No API key - use custom provider option instead
-    #     "category": "local",
-    #     "note": "Local provider. No API key required. Make sure Ollama is running.",
-    #     "extra_vars": [
-    #         ("OLLAMA_API_BASE", "Ollama URL", "http://localhost:11434"),
-    #     ],
-    # },
-    "LM Studio": {
-        "api_key": "LM_STUDIO_API_KEY",
+    "lm_studio": {
         "category": "local",
         "note": "Local provider. API key is optional. Start LM Studio server first.",
         "extra_vars": [
             ("LM_STUDIO_API_BASE", "API Base URL", "http://localhost:1234/v1"),
         ],
     },
-    # "Llamafile": {
-    #     "api_key": None,  # No API key - use custom provider option instead
-    #     "category": "local",
-    #     "note": "Local provider. No API key required.",
-    #     "extra_vars": [
-    #         ("LLAMAFILE_API_BASE", "Llamafile URL", "http://localhost:8080/v1"),
-    #     ],
-    # },
-    "vLLM (Hosted)": {
-        "api_key": "HOSTED_VLLM_API_KEY",
+    "hosted_vllm": {
         "category": "local",
         "note": "Self-hosted vLLM server. API key is optional.",
         "extra_vars": [
             ("HOSTED_VLLM_API_BASE", "vLLM Server URL", None),
         ],
     },
-    "Xinference": {
-        "api_key": "XINFERENCE_API_KEY",
+    "xinference": {
         "category": "local",
         "note": "Local Xinference server. API key is optional.",
         "extra_vars": [
             ("XINFERENCE_API_BASE", "Xinference URL", "http://127.0.0.1:9997/v1"),
         ],
     },
-    "Infinity": {
-        "api_key": "INFINITY_API_KEY",
-        "category": "local",
-        "note": "Self-hosted embeddings/rerank server. API key is optional.",
-        "extra_vars": [
-            ("INFINITY_API_BASE", "Infinity Server URL", "http://localhost:8080"),
-        ],
-    },
-    "LiteLLM Proxy": {
-        "api_key": "LITELLM_PROXY_API_KEY",
+    "litellm_proxy": {
         "category": "local",
         "note": "Self-hosted LiteLLM Proxy gateway.",
         "extra_vars": [
             ("LITELLM_PROXY_API_BASE", "LiteLLM Proxy URL", "http://localhost:4000"),
         ],
     },
-    "LangGraph": {
-        "api_key": "LANGGRAPH_API_KEY",
+    "langgraph": {
         "category": "local",
         "note": "Self-hosted LangGraph server.",
         "extra_vars": [
             ("LANGGRAPH_API_BASE", "LangGraph URL", "http://localhost:2024"),
         ],
     },
-    "RAGFlow": {
-        "api_key": "RAGFLOW_API_KEY",
+    "ragflow": {
         "category": "local",
         "note": "Self-hosted RAGFlow server.",
         "extra_vars": [
             ("RAGFLOW_API_BASE", "RAGFlow URL", "http://localhost:9380"),
         ],
     },
-    "Docker Model Runner": {
-        "api_key": "DOCKER_MODEL_RUNNER_API_KEY",
+    "docker_model_runner": {
         "category": "local",
         "note": "Local Docker Model Runner. API key is optional.",
         "extra_vars": [
@@ -502,146 +415,209 @@ LITELLM_PROVIDERS = {
             ),
         ],
     },
-    "Lemonade": {
-        "api_key": "LEMONADE_API_KEY",
+    "lemonade": {
         "category": "local",
         "note": "Local proxy. API key is optional.",
         "extra_vars": [
             ("LEMONADE_API_BASE", "Lemonade URL", "http://localhost:8000/api/v1"),
         ],
     },
-    # "Petals": {
-    #     "api_key": None,  # No API key - use custom provider option instead
-    #     "category": "local",
-    #     "note": "Distributed inference network. No API key required.",
-    # },
-    # "Triton Inference Server": {
-    #     "api_key": None,  # No API key - use custom provider option instead
-    #     "category": "local",
-    #     "note": "NVIDIA Triton server. No API key required.",
-    # },
+    # NOTE: ollama, llamafile, petals, triton are in PROVIDER_BLACKLIST
+    # because they don't use standard API key authentication.
+    # Use "Add Custom OpenAI-Compatible Provider" for these.
     # =========================================================================
     # OTHER - Miscellaneous providers
     # =========================================================================
-    "AI/ML API": {
-        "api_key": "AIML_API_KEY",
+    "aiml": {
         "category": "other",
         "extra_vars": [
             ("AIML_API_BASE", "API Base URL (optional)", None),
         ],
     },
-    "Abliteration": {
-        "api_key": "ABLITERATION_API_KEY",
+    "abliteration": {
         "category": "other",
     },
-    "Amazon Nova": {
-        "api_key": "AMAZON_NOVA_API_KEY",
+    "amazon_nova": {
         "category": "other",
     },
-    "Apertis AI (Stima)": {
-        "api_key": "STIMA_API_KEY",
+    "apertis": {
         "category": "other",
     },
-    "Bytez": {
-        "api_key": "BYTEZ_API_KEY",
+    "bytez": {
         "category": "other",
     },
-    "CometAPI": {
-        "api_key": "COMETAPI_KEY",
+    "cometapi": {
         "category": "other",
     },
-    "CompactifAI": {
-        "api_key": "COMPACTIFAI_API_KEY",
+    "compactifai": {
         "category": "other",
     },
-    "DataRobot": {
-        "api_key": "DATAROBOT_API_KEY",
+    "datarobot": {
         "category": "other",
         "extra_vars": [
             ("DATAROBOT_API_BASE", "DataRobot URL", "https://app.datarobot.com"),
         ],
     },
-    "GradientAI": {
-        "api_key": "GRADIENT_AI_API_KEY",
+    "gradient_ai": {
         "category": "other",
         "extra_vars": [
             ("GRADIENT_AI_AGENT_ENDPOINT", "Gradient AI Endpoint (optional)", None),
         ],
     },
-    "PublicAI": {
-        "api_key": "PUBLICAI_API_KEY",
+    "publicai": {
         "category": "other",
         "extra_vars": [
             ("PUBLICAI_API_BASE", "PublicAI URL", "https://platform.publicai.co/"),
         ],
     },
     "v0": {
-        "api_key": "V0_API_KEY",
         "category": "other",
     },
-    "Vercel AI Gateway": {
-        "api_key": "VERCEL_AI_GATEWAY_API_KEY",
+    "vercel_ai_gateway": {
         "category": "other",
     },
-    "Weights & Biases": {
-        "api_key": "WANDB_API_KEY",
+    "wandb": {
         "category": "other",
     },
 }
 
 # Category display order and labels
 PROVIDER_CATEGORIES = [
+    ("custom", "Custom (First-Party)"),
+    ("custom_openai", "Custom OpenAI-Compatible"),
     ("popular", "Popular"),
     ("cloud", "Cloud Platforms"),
     ("enterprise", "Enterprise / Complex Auth"),
     ("specialized", "Specialized (Image/Audio/Embeddings)"),
     ("regional", "Regional"),
     ("local", "Local / Self-Hosted"),
-    ("custom", "Custom (First-Party)"),
-    ("custom_openai", "Custom OpenAI-Compatible"),
     ("other", "Other"),
 ]
+
+# =============================================================================
+# Provider Blacklist
+# =============================================================================
+# Providers that are in LiteLLM but should be excluded from:
+# - KNOWN_PROVIDERS (so _API_BASE for them creates a "custom" provider)
+# - Credential tool UI (won't show up in provider selection)
+#
+# Reasons for blacklisting:
+# - No standard API key authentication (requires OAuth, token files, etc.)
+# - Not actual LLM providers (protocols, templates, etc.)
+# - Legacy/deprecated APIs
+# - Complex auth requiring multiple credentials
+# =============================================================================
+
+PROVIDER_BLACKLIST: Set[str] = {
+    # Not standard LLM providers / protocols
+    "a2a",  # Pydantic AI agent-to-agent protocol
+    "my-custom-llm",  # Template, not a real provider
+    "text-completion-openai",  # Legacy text completion API
+    # Require special auth (token files, OAuth, etc.)
+    "github_copilot",  # Requires token file configuration
+    "vercel_ai_gateway",  # Requires OIDC token
+    # No API key authentication (use custom provider instead)
+    "ollama",  # Local, no API key
+    "llamafile",  # Local, no API key
+    "petals",  # Distributed network, no API key
+    "triton",  # NVIDIA Triton server, no API key
+    "lemonade",  # Local, no API key
+    "oci",  # OCI SDK auth only
+    # Complex multi-credential auth (proxy only supports API_KEY + API_BASE)
+    "azure",  # Requires API key + endpoint + API version
+    "bedrock",  # Requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + region
+    "sagemaker",  # Same as bedrock
+    "vertex_ai",  # File path credential + project + location
+    "sap",  # Multiple service credentials required
+    "cloudflare",  # Requires API key + account ID
+    "snowflake",  # Requires JWT + account ID
+    "watsonx",  # Requires API key + special URL parameter
+}
 
 
 def _build_known_providers_set() -> Set[str]:
     """
-    Extract provider names from LITELLM_PROVIDERS api_key patterns.
+    Build set of known provider routes from scraped LiteLLM data.
 
-    Examples:
-        OPENAI_API_KEY → openai
-        ANTHROPIC_API_KEY → anthropic
-        GEMINI_API_KEY → gemini
+    Uses routes as the primary identifier (authoritative from LiteLLM docs).
+    Only uses API key prefix as fallback when provider has no route.
+
+    Excludes providers in PROVIDER_BLACKLIST.
 
     Returns:
-        Set of lowercase provider names known to LiteLLM.
+        Set of lowercase provider route identifiers known to LiteLLM.
     """
     known = set()
-    for provider_info in LITELLM_PROVIDERS.values():
-        api_key_var = provider_info.get("api_key", "")
-        if not api_key_var:
+
+    for provider_key, info in SCRAPED_PROVIDERS.items():
+        # Skip blacklisted providers
+        if provider_key in PROVIDER_BLACKLIST:
             continue
-        # Extract provider name: OPENAI_API_KEY → openai
-        # Handle special cases like HF_TOKEN, FRIENDLI_TOKEN
-        if api_key_var.endswith("_API_KEY"):
-            provider_name = api_key_var[:-8].lower()  # Remove _API_KEY
-            known.add(provider_name)
-        elif api_key_var.endswith("_TOKEN"):
-            provider_name = api_key_var[:-6].lower()  # Remove _TOKEN
-            known.add(provider_name)
-        elif api_key_var.endswith("_APIKEY"):
-            provider_name = api_key_var[:-7].lower()  # Remove _APIKEY
-            known.add(provider_name)
-        elif api_key_var.endswith("_JWT"):
-            provider_name = api_key_var[:-4].lower()  # Remove _JWT
-            known.add(provider_name)
-        elif api_key_var.endswith("_KEY"):
-            provider_name = api_key_var[:-4].lower()  # Remove _KEY (e.g., COMETAPI_KEY)
-            known.add(provider_name)
+
+        route = info.get("route", "").rstrip("/").lower()
+
+        if route:
+            # Provider has a route - use it as the canonical key
+            known.add(route)
+        else:
+            # No route - fall back to API key prefix
+            for api_key_var in info.get("api_key_env_vars", []):
+                prefix = _extract_api_key_prefix(api_key_var)
+                if prefix:
+                    known.add(prefix)
+                    break  # Only need one fallback
+
     return known
+
+
+def _extract_api_key_prefix(api_key_var: str) -> Optional[str]:
+    """Extract provider prefix from an API key environment variable name.
+
+    Examples:
+        OPENAI_API_KEY -> openai
+        HF_TOKEN -> hf
+        WATSONX_APIKEY -> watsonx
+    """
+    if not api_key_var:
+        return None
+
+    api_key_var = api_key_var.upper()
+
+    if api_key_var.endswith("_API_KEY"):
+        return api_key_var[:-8].lower()
+    elif api_key_var.endswith("_TOKEN"):
+        return api_key_var[:-6].lower()
+    elif api_key_var.endswith("_APIKEY"):
+        return api_key_var[:-7].lower()
+    elif api_key_var.endswith("_KEY"):
+        return api_key_var[:-4].lower()
+    elif api_key_var.endswith("_JWT"):
+        return api_key_var[:-4].lower()
+
+    return None
 
 
 # Pre-computed set of known provider names
 KNOWN_PROVIDERS: Set[str] = _build_known_providers_set()
+
+
+def get_provider_ui_config(provider_key: str) -> Dict[str, Any]:
+    """Get UI configuration for a provider.
+
+    Returns the UI-specific config (category, note, extra_vars) if defined,
+    otherwise returns a default config.
+    """
+    return LITELLM_PROVIDERS.get(provider_key, {"category": "other"})
+
+
+def get_full_provider_config(provider_key: str) -> Dict[str, Any]:
+    """Get combined provider config (scraped data + UI config).
+
+    Merges scraped provider data with UI configuration.
+    """
+    scraped = SCRAPED_PROVIDERS.get(provider_key, {})
+    ui_config = LITELLM_PROVIDERS.get(provider_key, {"category": "other"})
+    return {**scraped, **ui_config}
 
 
 class ProviderConfig:
