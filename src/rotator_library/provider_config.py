@@ -506,6 +506,7 @@ PROVIDER_CATEGORIES = [
 # - Not actual LLM providers (protocols, templates, etc.)
 # - Legacy/deprecated APIs
 # - Complex auth requiring multiple credentials
+# - Non-standard API key patterns (proxy only supports *_API_KEY)
 # =============================================================================
 
 PROVIDER_BLACKLIST: Set[str] = {
@@ -532,6 +533,10 @@ PROVIDER_BLACKLIST: Set[str] = {
     "cloudflare",  # Requires API key + account ID
     "snowflake",  # Requires JWT + account ID
     "watsonx",  # Requires API key + special URL parameter
+    # Non-standard API key patterns (uses *_TOKEN or *_KEY, not *_API_KEY)
+    "cometapi",  # Uses COMETAPI_KEY
+    "friendliai",  # Uses FRIENDLI_TOKEN
+    "huggingface",  # Uses HF_TOKEN
 }
 
 

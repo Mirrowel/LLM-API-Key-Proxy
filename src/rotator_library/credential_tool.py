@@ -1238,9 +1238,18 @@ async def setup_api_key():
         if not api_key_vars:
             continue
 
+        # Prefer *_API_KEY pattern, fall back to first
+        api_key_var = None
+        for var in api_key_vars:
+            if var.endswith("_API_KEY"):
+                api_key_var = var
+                break
+        if not api_key_var:
+            api_key_var = api_key_vars[0]
+
         all_providers[provider_key] = {
             "display_name": scraped_info.get("display_name", provider_key),
-            "api_key": api_key_vars[0] if api_key_vars else None,
+            "api_key": api_key_var,
             "category": ui_config.get("category", "other"),
             "note": ui_config.get("note"),
             "extra_vars": ui_config.get("extra_vars", []),
