@@ -3294,8 +3294,13 @@ class UsageManager:
                     max_requests = model_data.get("quota_max_requests")
 
             # Sync local request count to API's authoritative value
-            model_data["request_count"] = used_requests
-            model_data["requests_at_baseline"] = used_requests
+            # Use max() to prevent API from resetting our count if it returns stale/cached 100%
+            # The API can only increase our count (if we missed requests), not decrease it
+            # See: https://github.com/Mirrowel/LLM-API-Key-Proxy/issues/75
+            current_count = model_data.get("request_count", 0)
+            synced_count = max(current_count, used_requests)
+            model_data["request_count"] = synced_count
+            model_data["requests_at_baseline"] = synced_count
 
             # Update baseline fields
             model_data["baseline_remaining_fraction"] = remaining_fraction
@@ -3304,7 +3309,7 @@ class UsageManager:
             # Update max_requests and quota_display
             if max_requests is not None:
                 model_data["quota_max_requests"] = max_requests
-                model_data["quota_display"] = f"{used_requests}/{max_requests}"
+                model_data["quota_display"] = f"{synced_count}/{max_requests}"
 
             # Handle reset_timestamp: only trust it when quota has been used (< 100%)
             # API returns garbage reset times for unused quota
@@ -3397,19 +3402,19 @@ class UsageManager:
                                 "approx_cost": 0.0,
                             },
                         )
-                        # Sync request tracking
-                        other_model_data["request_count"] = used_requests
+                        # Sync request tracking (use synced_count to prevent reset bug)
+                        other_model_data["request_count"] = synced_count
                         if max_requests is not None:
                             other_model_data["quota_max_requests"] = max_requests
                             other_model_data["quota_display"] = (
-                                f"{used_requests}/{max_requests}"
+                                f"{synced_count}/{max_requests}"
                             )
                         # Sync baseline fields
                         other_model_data["baseline_remaining_fraction"] = (
                             remaining_fraction
                         )
                         other_model_data["baseline_fetched_at"] = now_ts
-                        other_model_data["requests_at_baseline"] = used_requests
+                        other_model_data["requests_at_baseline"] = synced_count
                         # Sync reset timestamp if valid
                         if valid_reset_ts:
                             other_model_data["quota_reset_ts"] = reset_timestamp
@@ -3439,7 +3444,7 @@ class UsageManager:
 
             lib_logger.debug(
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
-                f"remaining={remaining_fraction:.2%}, synced_request_count={used_requests}"
+                f"remaining={remaining_fraction:.2%}, synced_request_count={synced_count}"
             )
 
         await self._save_usage()
