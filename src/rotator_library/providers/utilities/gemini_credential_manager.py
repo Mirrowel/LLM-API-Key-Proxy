@@ -41,7 +41,7 @@ class GeminiCredentialManager:
     - _discover_project_id(path, token, params) -> str - Discover project ID
     - fetch_initial_baselines(credentials) -> Dict - Fetch quota for all credentials
     - refresh_active_quota_baselines(credentials, usage_data) -> Dict - Refresh active
-    - _store_baselines_to_usage_manager(results, manager) -> int - Store baselines
+    - _store_baselines_to_usage_manager(results, manager, sync_mode="force") -> int - Store baselines
     """
 
     # Type hints for attributes that must be defined by providers
@@ -267,7 +267,6 @@ class GeminiCredentialManager:
                 f"{provider_name}: Fetching initial quota baselines for {len(credentials)} credentials..."
             )
             quota_results = await self.fetch_initial_baselines(credentials)
-            self._initial_quota_fetch_done = True
 
             if not quota_results:
                 return
@@ -278,10 +277,12 @@ class GeminiCredentialManager:
             stored = await self._store_baselines_to_usage_manager(
                 quota_results, usage_manager, sync_mode=sync_mode
             )
+            self._initial_quota_fetch_done = True
             if stored > 0:
                 lib_logger.debug(
                     f"{provider_name} initial quota fetch: updated {stored} model baselines"
                 )
+
         else:
             # Subsequent runs
             if is_antigravity:
@@ -342,9 +343,13 @@ class GeminiCredentialManager:
         )
 
     async def _store_baselines_to_usage_manager(
-        self, quota_results: Dict[str, Any], usage_manager: "UsageManager"
+        self,
+        quota_results: Dict[str, Any],
+        usage_manager: "UsageManager",
+        sync_mode: str = "force",
     ) -> int:
         """Store quota baselines to usage manager. Must be implemented by quota tracker."""
+
         raise NotImplementedError(
             "Subclass must implement _store_baselines_to_usage_manager"
         )

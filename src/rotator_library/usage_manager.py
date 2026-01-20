@@ -3228,6 +3228,11 @@ class UsageManager:
             }
         """
         await self._lazy_init()
+        if sync_mode not in ("force", "if_exhausted", "none"):
+            lib_logger.warning(
+                f"Unknown sync_mode '{sync_mode}', defaulting to 'force'"
+            )
+            sync_mode = "force"
         async with self._data_lock:
             now_ts = time.time()
 
