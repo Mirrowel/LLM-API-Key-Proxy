@@ -22,6 +22,12 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
     Provider implementation for the chutes.ai API with quota tracking.
     """
 
+    # Quota groups for tracking daily limits
+    # Uses a virtual model "_quota" for credential-level quota tracking
+    model_quota_groups = {
+        "chutes_global": ["_quota"],
+    }
+
     def __init__(self, *args, **kwargs):
         """Initialize ChutesProvider with quota tracking."""
         super().__init__(*args, **kwargs)
@@ -46,6 +52,51 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
             Quota group identifier for shared credential-level tracking
         """
         return "chutes_global"
+
+    def get_models_in_quota_group(self, group: str) -> List[str]:
+        """
+        Get all models in a quota group.
+
+        For Chutes, we use a virtual model "_quota" to track the
+        credential-level daily quota.
+
+        Args:
+            group: Quota group name
+
+        Returns:
+            List of model names in the group
+        """
+        if group == "chutes_global":
+            return ["_quota"]
+        return []
+
+    def get_quota_groups(self) -> List[str]:
+        """
+        Get the list of quota groups for this provider.
+
+        Returns:
+            List of quota group names
+        """
+        return ["chutes_global"]
+
+    def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
+        """
+        Return usage reset configuration for Chutes credentials.
+
+        Chutes uses per_model mode to track usage at the model level,
+        with daily quotas managed via the background job.
+
+        Args:
+            credential: The API key (unused, same config for all)
+
+        Returns:
+            Configuration with per_model mode
+        """
+        return {
+            "mode": "per_model",
+            "window_seconds": 86400,  # 24 hours (daily quota reset)
+            "field_name": "daily",
+        }
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
