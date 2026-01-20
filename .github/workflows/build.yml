@@ -241,8 +241,9 @@ jobs:
         if [ -n "$LAST_TAG" ]; then
           # Standard run: A previous tag was found.
           echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
-        git-cliff \
-          --config .github/cliff.toml \
+          git-cliff \
+            --config .github/cliff.toml \
+            --github-repo "${{ github.repository }}" \
             --strip all \
             --output changelog.md \
             "$LAST_TAG..HEAD"
