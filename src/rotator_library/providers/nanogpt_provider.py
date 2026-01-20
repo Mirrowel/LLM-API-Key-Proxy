@@ -94,11 +94,6 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     def __init__(self):
         self.model_definitions = ModelDefinitions()
 
-        # Set the API base for litellm routing via existing _CUSTOM_API_BASE pattern
-        # This allows the client's existing infrastructure to handle routing
-        if not os.getenv("NANOGPT_CUSTOM_API_BASE"):
-            os.environ["NANOGPT_CUSTOM_API_BASE"] = NANOGPT_API_BASE + "/v1"
-
         # Quota tracking cache
         self._subscription_cache: Dict[str, Dict[str, Any]] = {}
         self._quota_refresh_interval = int(
@@ -107,6 +102,9 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
 
         # Tier cache (credential -> tier name)
         self._tier_cache: Dict[str, str] = {}
+
+        # Track discovered models for quota group sync
+        self._discovered_models: set = set()
 
     # =========================================================================
     # QUOTA GROUPING
@@ -126,6 +124,27 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
             Quota group identifier for shared credential-level tracking
         """
         return "nanogpt_global"
+
+    def get_models_in_quota_group(self, group: str) -> List[str]:
+        """
+        Get all models that belong to a quota group.
+
+        Used by UsageManager to sync request_count and quota baselines
+        across all models sharing the same pool.
+
+        Args:
+            group: Quota group identifier
+
+        Returns:
+            List of model names (without provider prefix) in the group
+        """
+        if group == "nanogpt_global":
+            # Return all discovered models plus the virtual subscription model
+            models = list(self._discovered_models)
+            if "_subscription" not in models:
+                models.append("_subscription")
+            return models
+        return []
 
     # =========================================================================
     # MODEL DISCOVERY
@@ -172,6 +191,8 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                     models.append(f"nanogpt/{model_id}")
                     seen_ids.add(model_id)
                     dynamic_count += 1
+                    # Track for quota group sync
+                    self._discovered_models.add(model_id)
 
             if dynamic_count > 0:
                 lib_logger.debug(
@@ -190,9 +211,18 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                 lib_logger.debug(
                     f"Using {len(NANOGPT_FALLBACK_MODELS)} fallback models for nanogpt"
                 )
+                # Track fallback models for quota group sync
+                for model_id in NANOGPT_FALLBACK_MODELS:
+                    self._discovered_models.add(model_id)
 
-        # Refresh subscription usage to get tier info
-        await self._refresh_tier_from_api(api_key)
+        # Also track static models for quota group sync
+        for model in models:
+            model_id = model.split("/")[-1] if "/" in model else model
+            self._discovered_models.add(model_id)
+
+        # Refresh subscription usage to get tier info (only if not already cached)
+        if api_key not in self._tier_cache:
+            await self._refresh_tier_from_api(api_key)
 
         return models
 
@@ -266,18 +296,21 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         """
         Refresh subscription usage for all credentials in parallel.
 
+        Uses the mixin's refresh_subscription_usage method to avoid code duplication.
+
         Args:
             usage_manager: UsageManager instance
             credentials: List of API keys
         """
         semaphore = asyncio.Semaphore(QUOTA_FETCH_CONCURRENCY)
 
-        async def refresh_single_credential(
-            api_key: str, client: httpx.AsyncClient
-        ) -> None:
+        async def refresh_single_credential(api_key: str) -> None:
             async with semaphore:
                 try:
-                    usage_data = await self.fetch_subscription_usage(api_key, client)
+                    # Use mixin method for refresh (handles caching internally)
+                    usage_data = await self.refresh_subscription_usage(
+                        api_key, credential_identifier=api_key
+                    )
 
                     if usage_data.get("status") == "success":
                         # Update tier cache
@@ -285,18 +318,18 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                         tier = self.get_tier_from_state(state)
                         self._tier_cache[api_key] = tier
 
-                        # Update subscription cache
-                        self._subscription_cache[api_key] = usage_data
-
                         # Calculate remaining fraction for quota tracking
                         remaining = self.get_remaining_fraction(usage_data)
                         reset_ts = self.get_reset_timestamp(usage_data)
 
                         # Store baseline in usage manager
-                        # Since NanoGPT uses credential-level quota, we use a special model key
+                        # Virtual model 'nanogpt/_subscription' represents credential-level quota.
+                        # This naming convention allows UsageManager to track subscription-wide
+                        # usage separately from individual model usage while keeping them
+                        # in the same quota group for synchronized request counting.
                         await usage_manager.update_quota_baseline(
                             api_key,
-                            "nanogpt/_subscription",  # Virtual model for credential-level tracking
+                            "nanogpt/_subscription",
                             remaining,
                             max_requests=usage_data.get("limits", {}).get("daily", 0),
                             reset_timestamp=reset_ts,
@@ -313,9 +346,6 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                         f"Failed to refresh NanoGPT subscription usage: {e}"
                     )
 
-        # Fetch all credentials in parallel with shared HTTP client
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            tasks = [
-                refresh_single_credential(api_key, client) for api_key in credentials
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Fetch all credentials in parallel
+        tasks = [refresh_single_credential(api_key) for api_key in credentials]
+        await asyncio.gather(*tasks, return_exceptions=True)
