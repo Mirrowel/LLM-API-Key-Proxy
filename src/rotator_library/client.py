@@ -41,6 +41,7 @@ from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
+from .fallback_groups import FallbackGroupManager
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
 from .utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
 from .config import (
@@ -83,6 +84,7 @@ class RotatingClient:
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
+        model_fallback_groups: Optional[List[List[str]]] = None,
     ):
         """
         Initialize the RotatingClient with intelligent credential rotation.
@@ -106,6 +108,11 @@ class RotatingClient:
                 - 5.0+: High randomness, more unpredictable selection patterns
             data_dir: Root directory for all data files (logs, cache, oauth_creds, key_usage.json).
                       If None, auto-detects: EXE directory if frozen, else current working directory.
+            model_fallback_groups: List of fallback groups for cross-provider model pooling.
+                Each group is a list of "provider/model" strings. When a request matches
+                any entry in a group, all entries become fallback candidates.
+                Order matters: earlier entries have higher priority within each tier.
+                Can also be configured via MODEL_FALLBACK_GROUPS environment variable.
         """
         # Resolve data_dir early - this becomes the root for all file operations
         if data_dir is not None:
@@ -525,6 +532,9 @@ class RotatingClient:
                     f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
                 )
                 self.max_concurrent_requests_per_key[provider] = 1
+
+        # Initialize cross-provider fallback groups
+        self.fallback_manager = FallbackGroupManager(model_fallback_groups)
 
     def _parse_custom_cap_env_key(
         self, remainder: str
@@ -1941,6 +1951,342 @@ class RotatingClient:
         )
         return None
 
+    async def _execute_with_fallback(
+        self,
+        api_call: callable,
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+        fallback_entries: List[str],
+        **kwargs,
+    ) -> Any:
+        """
+        Execute request with cross-provider fallback.
+
+        Collects credentials from all providers in the fallback group,
+        groups them by tier (priority), and attempts each tier exhaustively
+        before moving to the next tier. Within each tier, entries are tried
+        in the order specified in the fallback group.
+
+        Args:
+            api_call: The API call function (litellm.acompletion)
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            fallback_entries: Ordered list of "provider/model" to try
+            **kwargs: Additional arguments for the API call
+
+        Returns:
+            API response on success, error response on failure
+        """
+        # Extract the original model for logging
+        original_model = kwargs.get("model", fallback_entries[0])
+        lib_logger.debug(
+            f"Cross-provider fallback activated for {original_model}. "
+            f"Group: {', '.join(fallback_entries[:3])}{'...' if len(fallback_entries) > 3 else ''}"
+        )
+
+        # Build tier-grouped structure: {tier: [(entry, provider, model, [credentials])]}
+        # We need to collect credentials from each provider and group by tier
+        from collections import defaultdict
+
+        tier_entries: Dict[int, List[Tuple[str, str, str, List[str]]]] = defaultdict(
+            list
+        )
+
+        for entry in fallback_entries:
+            parts = entry.split("/", 1)
+            if len(parts) != 2:
+                lib_logger.warning(f"Invalid fallback entry format: {entry}")
+                continue
+
+            provider = parts[0]
+            model = parts[1]
+
+            # Get credentials for this provider
+            provider_creds = self.all_credentials.get(provider, [])
+            if not provider_creds:
+                lib_logger.debug(
+                    f"No credentials for provider '{provider}' in fallback entry '{entry}'"
+                )
+                continue
+
+            # Get provider plugin for priority lookup
+            provider_plugin = self._get_provider_instance(provider)
+
+            # Group credentials by tier for this entry
+            creds_by_tier: Dict[int, List[str]] = defaultdict(list)
+            for cred in provider_creds:
+                if provider_plugin and hasattr(
+                    provider_plugin, "get_credential_priority"
+                ):
+                    priority = provider_plugin.get_credential_priority(cred)
+                    tier = priority if priority is not None else 999
+                else:
+                    tier = 999
+                creds_by_tier[tier].append(cred)
+
+            # Add each tier's credentials for this entry
+            for tier, creds in creds_by_tier.items():
+                tier_entries[tier].append((entry, provider, model, creds))
+
+        if not tier_entries:
+            lib_logger.error("No credentials available for any fallback entry")
+            return {
+                "error": {
+                    "message": "No credentials available for fallback group",
+                    "type": "no_available_keys",
+                    "code": 503,
+                }
+            }
+
+        # Iterate through tiers in order (lower number = higher priority)
+        sorted_tiers = sorted(tier_entries.keys())
+        last_result = None
+
+        for tier in sorted_tiers:
+            entries_in_tier = tier_entries[tier]
+            lib_logger.debug(
+                f"Trying tier {tier} with {len(entries_in_tier)} entries: "
+                f"{', '.join(e[0] for e in entries_in_tier[:3])}{'...' if len(entries_in_tier) > 3 else ''}"
+            )
+
+            for entry, provider, model, tier_creds in entries_in_tier:
+                if not tier_creds:
+                    continue
+
+                lib_logger.debug(
+                    f"Fallback: trying {entry} with {len(tier_creds)} tier-{tier} credentials"
+                )
+
+                # Temporarily swap credentials for this provider
+                original_creds = self.all_credentials.get(provider, [])
+                self.all_credentials[provider] = tier_creds
+
+                try:
+                    # Update kwargs with this entry's model
+                    entry_kwargs = kwargs.copy()
+                    entry_kwargs["model"] = entry
+
+                    # Call existing retry logic
+                    result = await self._execute_with_retry(
+                        api_call,
+                        request,
+                        pre_request_callback,
+                        **entry_kwargs,
+                    )
+
+                    # Check if result is successful (not an error response)
+                    if result is not None:
+                        if isinstance(result, dict) and "error" in result:
+                            # Error response - continue to next entry
+                            last_result = result
+                            lib_logger.info(
+                                f"Fallback entry {entry} exhausted, trying next"
+                            )
+                            continue
+                        else:
+                            # Success!
+                            lib_logger.info(f"Fallback succeeded with {entry}")
+                            return result
+
+                finally:
+                    # Restore original credentials
+                    self.all_credentials[provider] = original_creds
+
+        # All entries exhausted
+        lib_logger.warning(f"All fallback entries exhausted for {original_model}")
+
+        if last_result is not None:
+            return last_result
+
+        return {
+            "error": {
+                "message": f"All fallback entries exhausted for {original_model}",
+                "type": "no_available_keys",
+                "code": 503,
+            }
+        }
+
+    async def _streaming_with_fallback(
+        self,
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+        fallback_entries: List[str],
+        **kwargs,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Execute streaming request with cross-provider fallback.
+
+        Similar to _execute_with_fallback but for streaming responses.
+        Collects credentials from all providers in the fallback group,
+        groups them by tier (priority), and attempts each tier exhaustively
+        before moving to the next tier.
+
+        Args:
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            fallback_entries: Ordered list of "provider/model" to try
+            **kwargs: Additional arguments for the API call
+
+        Yields:
+            SSE formatted strings
+        """
+        from collections import defaultdict
+
+        # Extract the original model for logging
+        original_model = kwargs.get("model", fallback_entries[0])
+        lib_logger.debug(
+            f"Cross-provider fallback (streaming) activated for {original_model}. "
+            f"Group: {', '.join(fallback_entries[:3])}{'...' if len(fallback_entries) > 3 else ''}"
+        )
+
+        # Build tier-grouped structure: {tier: [(entry, provider, model, [credentials])]}
+        tier_entries: Dict[int, List[Tuple[str, str, str, List[str]]]] = defaultdict(
+            list
+        )
+
+        for entry in fallback_entries:
+            parts = entry.split("/", 1)
+            if len(parts) != 2:
+                lib_logger.warning(f"Invalid fallback entry format: {entry}")
+                continue
+
+            provider = parts[0]
+            model = parts[1]
+
+            # Get credentials for this provider
+            provider_creds = self.all_credentials.get(provider, [])
+            if not provider_creds:
+                lib_logger.debug(
+                    f"No credentials for provider '{provider}' in fallback entry '{entry}'"
+                )
+                continue
+
+            # Get provider plugin for priority lookup
+            provider_plugin = self._get_provider_instance(provider)
+
+            # Group credentials by tier for this entry
+            creds_by_tier: Dict[int, List[str]] = defaultdict(list)
+            for cred in provider_creds:
+                if provider_plugin and hasattr(
+                    provider_plugin, "get_credential_priority"
+                ):
+                    priority = provider_plugin.get_credential_priority(cred)
+                    tier = priority if priority is not None else 999
+                else:
+                    tier = 999
+                creds_by_tier[tier].append(cred)
+
+            # Add each tier's credentials for this entry
+            for tier, creds in creds_by_tier.items():
+                tier_entries[tier].append((entry, provider, model, creds))
+
+        if not tier_entries:
+            lib_logger.error(
+                "No credentials available for any fallback entry (streaming)"
+            )
+            error_data = {
+                "error": {
+                    "message": "No credentials available for fallback group",
+                    "type": "no_available_keys",
+                }
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Iterate through tiers in order (lower number = higher priority)
+        sorted_tiers = sorted(tier_entries.keys())
+        last_error = None
+        success = False
+
+        for tier in sorted_tiers:
+            if success:
+                break
+
+            entries_in_tier = tier_entries[tier]
+            lib_logger.debug(
+                f"Trying tier {tier} (streaming) with {len(entries_in_tier)} entries"
+            )
+
+            for entry, provider, model, tier_creds in entries_in_tier:
+                if not tier_creds or success:
+                    continue
+
+                lib_logger.debug(
+                    f"Fallback (streaming): trying {entry} with {len(tier_creds)} tier-{tier} credentials"
+                )
+
+                # Temporarily swap credentials for this provider
+                original_creds = self.all_credentials.get(provider, [])
+                self.all_credentials[provider] = tier_creds
+
+                try:
+                    # Update kwargs with this entry's model
+                    entry_kwargs = kwargs.copy()
+                    entry_kwargs["model"] = entry
+
+                    # Call existing streaming logic
+                    stream = self._streaming_acompletion_with_retry(
+                        request,
+                        pre_request_callback,
+                        **entry_kwargs,
+                    )
+
+                    # Consume the stream
+                    chunks_yielded = 0
+                    async for chunk in stream:
+                        # Check if this is an error response
+                        if chunk.startswith("data: ") and chunks_yielded == 0:
+                            try:
+                                content = chunk[6:].strip()
+                                if content and content != "[DONE]":
+                                    data = json.loads(content)
+                                    if isinstance(data, dict) and "error" in data:
+                                        # This is an error - don't yield, try next entry
+                                        last_error = data
+                                        lib_logger.info(
+                                            f"Fallback entry {entry} (streaming) returned error, trying next"
+                                        )
+                                        break
+                            except json.JSONDecodeError:
+                                pass
+
+                        # Not an error, yield the chunk
+                        yield chunk
+                        chunks_yielded += 1
+
+                        # If we've yielded data, we're committed to this entry
+                        if chunks_yielded > 0 and not chunk.startswith("data: [DONE]"):
+                            success = True
+
+                    # Check if stream completed successfully
+                    if chunks_yielded > 0:
+                        success = True
+                        lib_logger.info(f"Fallback (streaming) succeeded with {entry}")
+                        return
+
+                finally:
+                    # Restore original credentials
+                    self.all_credentials[provider] = original_creds
+
+        # All entries exhausted
+        if not success:
+            lib_logger.warning(
+                f"All fallback entries exhausted for {original_model} (streaming)"
+            )
+
+            if last_error:
+                yield f"data: {json.dumps(last_error)}\n\n"
+            else:
+                error_data = {
+                    "error": {
+                        "message": f"All fallback entries exhausted for {original_model}",
+                        "type": "no_available_keys",
+                    }
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
     async def _streaming_acompletion_with_retry(
         self,
         request: Optional[Any],
@@ -2805,6 +3151,9 @@ class RotatingClient:
             )
             kwargs.pop("stream_options", None)
 
+        # Check for cross-provider fallback group
+        fallback_entries = self.fallback_manager.get_fallback_group(model)
+
         if kwargs.get("stream"):
             # Only add stream_options for providers that support it (excluding iflow)
             if provider != "iflow":
@@ -2813,16 +3162,33 @@ class RotatingClient:
                 if "include_usage" not in kwargs["stream_options"]:
                     kwargs["stream_options"]["include_usage"] = True
 
-            return self._streaming_acompletion_with_retry(
-                request=request, pre_request_callback=pre_request_callback, **kwargs
-            )
+            if fallback_entries:
+                return self._streaming_with_fallback(
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    fallback_entries=fallback_entries,
+                    **kwargs,
+                )
+            else:
+                return self._streaming_acompletion_with_retry(
+                    request=request, pre_request_callback=pre_request_callback, **kwargs
+                )
         else:
-            return self._execute_with_retry(
-                litellm.acompletion,
-                request=request,
-                pre_request_callback=pre_request_callback,
-                **kwargs,
-            )
+            if fallback_entries:
+                return self._execute_with_fallback(
+                    litellm.acompletion,
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    fallback_entries=fallback_entries,
+                    **kwargs,
+                )
+            else:
+                return self._execute_with_retry(
+                    litellm.acompletion,
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    **kwargs,
+                )
 
     def aembedding(
         self,
