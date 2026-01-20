@@ -13,19 +13,19 @@ PROVIDER_PLUGINS: Dict[str, Type[ProviderInterface]] = {}
 class DynamicOpenAICompatibleProvider:
     """
     Dynamic provider class for custom OpenAI-compatible providers.
-    Created at runtime for providers with _CUSTOM_API_BASE environment variables.
+    Created at runtime for providers with _API_BASE environment variables
+    that are NOT known LiteLLM providers.
 
     Environment variable pattern:
-        <NAME>_CUSTOM_API_BASE - The API base URL (required)
-        <NAME>_API_KEY         - The API key (can reuse existing keys for overrides)
+        <NAME>_API_BASE - The API base URL (required)
+        <NAME>_API_KEY  - The API key
 
     Example:
-        MYSERVER_CUSTOM_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_BASE=http://localhost:8000/v1
         MYSERVER_API_KEY=sk-xxx
 
-    Override example (route OpenAI traffic to custom server):
-        OPENAI_CUSTOM_API_BASE=http://my-local-llm.com/v1
-        OPENAI_API_KEY=sk-xxx  # Existing key is reused
+    Note: For known providers (openai, anthropic, etc.), setting _API_BASE
+    will override their default endpoint without creating a custom provider.
     """
 
     # Class attribute - no need to instantiate
@@ -33,11 +33,11 @@ class DynamicOpenAICompatibleProvider:
 
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
-        # Get API base URL from environment (using _CUSTOM_API_BASE pattern)
-        self.api_base = os.getenv(f"{provider_name.upper()}_CUSTOM_API_BASE")
+        # Get API base URL from environment (using _API_BASE pattern)
+        self.api_base = os.getenv(f"{provider_name.upper()}_API_BASE")
         if not self.api_base:
             raise ValueError(
-                f"Environment variable {provider_name.upper()}_CUSTOM_API_BASE is required for custom OpenAI-compatible provider"
+                f"Environment variable {provider_name.upper()}_API_BASE is required for custom OpenAI-compatible provider"
             )
 
         # Import model definitions
@@ -107,12 +107,19 @@ def _register_providers():
                 )
 
     # Then, create dynamic plugins for custom OpenAI-compatible providers
-    # These use the pattern: <NAME>_CUSTOM_API_BASE and <NAME>_CUSTOM_API_KEY
-    # This avoids collision with LiteLLM's standard *_API_BASE variables
+    # These use the pattern: <NAME>_API_BASE where NAME is not a known LiteLLM provider
+    # Known providers just get their api_base overridden via ProviderConfig
+
+    # Import KNOWN_PROVIDERS to check against
+    from ..provider_config import KNOWN_PROVIDERS
 
     for env_var in os.environ:
-        if env_var.endswith("_CUSTOM_API_BASE"):
-            provider_name = env_var[:-16].lower()  # Remove '_CUSTOM_API_BASE' suffix
+        if env_var.endswith("_API_BASE"):
+            provider_name = env_var[:-9].lower()  # Remove '_API_BASE' suffix
+
+            # Skip if this is a known LiteLLM provider (not a custom provider)
+            if provider_name in KNOWN_PROVIDERS:
+                continue
 
             # Skip if this provider name already exists (file-based plugin)
             if provider_name in PROVIDER_PLUGINS:

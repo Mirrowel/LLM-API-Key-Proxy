@@ -26,13 +26,13 @@ from .error_handler import (
     PreRequestCallbackError,
     CredentialNeedsReauthError,
     classify_error,
-    AllProviders,
     NoAvailableKeysError,
     should_rotate_on_error,
     should_retry_same_key,
     RequestErrorAccumulator,
     mask_credential,
 )
+from .provider_config import ProviderConfig
 from .providers import PROVIDER_PLUGINS
 from .providers.openai_compatible_provider import OpenAICompatibleProvider
 from .request_sanitizer import sanitize_request_payload
@@ -508,7 +508,7 @@ class RotatingClient:
         )
         self._model_list_cache = {}
         self.http_client = httpx.AsyncClient()
-        self.all_providers = AllProviders()
+        self.provider_config = ProviderConfig()
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
         self.ignore_models = ignore_models or {}
@@ -741,61 +741,6 @@ class RotatingClient:
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()
 
-    def _convert_model_params(self, **kwargs) -> Dict[str, Any]:
-        """
-        Converts model parameters for specific providers.
-        For example, the 'chutes' provider requires the model name to be prepended
-        with 'openai/' and a specific 'api_base'.
-        """
-        model = kwargs.get("model")
-        if not model:
-            return kwargs
-
-        provider = model.split("/")[0]
-        if provider == "chutes":
-            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-            kwargs["api_base"] = "https://llm.chutes.ai/v1"
-
-        return kwargs
-
-    def _convert_model_params_for_litellm(self, **kwargs) -> Dict[str, Any]:
-        """
-        Converts model parameters specifically for LiteLLM calls.
-        This is called right before calling LiteLLM to handle custom providers.
-
-        Custom OpenAI-compatible providers use the pattern:
-        - <NAME>_CUSTOM_API_BASE: The custom API base URL
-        - <NAME>_API_KEY: The API key (can reuse existing keys for overrides)
-
-        This allows users to override built-in providers by setting e.g.:
-        - OPENAI_CUSTOM_API_BASE=http://my-local-llm.com/v1
-        - OPENAI_API_KEY=sk-xxx
-
-        The custom provider takes priority over LiteLLM's built-in provider.
-        """
-        model = kwargs.get("model")
-        if not model:
-            return kwargs
-
-        provider = model.split("/")[0]
-
-        # Handle custom OpenAI-compatible providers
-        # Check if this provider has a _CUSTOM_API_BASE override
-        import os
-
-        custom_api_base_env = f"{provider.upper()}_CUSTOM_API_BASE"
-        custom_api_base = os.getenv(custom_api_base_env)
-
-        if custom_api_base:
-            # Custom provider override - route to custom endpoint
-            # This takes priority over LiteLLM's built-in provider
-            kwargs = kwargs.copy()  # Don't modify original
-            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-            kwargs["api_base"] = custom_api_base.rstrip("/")
-            kwargs["custom_llm_provider"] = "openai"
-
-        return kwargs
-
     def _apply_default_safety_settings(
         self, litellm_kwargs: Dict[str, Any], provider: str
     ):
@@ -863,14 +808,11 @@ class RotatingClient:
         """
         Checks if a provider is a custom OpenAI-compatible provider.
 
-        Custom providers are identified by having a _CUSTOM_API_BASE environment variable.
-        This pattern avoids collision with LiteLLM's standard *_API_BASE variables.
+        Custom providers are identified by:
+        1. Having a _API_BASE environment variable set, AND
+        2. NOT being in the list of known LiteLLM providers
         """
-        import os
-
-        # Check if the provider has a _CUSTOM_API_BASE environment variable
-        custom_api_base_env = f"{provider_name.upper()}_CUSTOM_API_BASE"
-        return os.getenv(custom_api_base_env) is not None
+        return self.provider_config.is_custom_provider(provider_name)
 
     def _get_provider_instance(self, provider_name: str):
         """
@@ -1283,7 +1225,6 @@ class RotatingClient:
 
         tried_creds = set()
         last_exception = None
-        kwargs = self._convert_model_params(**kwargs)
 
         # The main rotation loop. It continues as long as there are untried credentials and the global deadline has not been exceeded.
 
@@ -1442,7 +1383,7 @@ class RotatingClient:
                 key_acquired = True
                 tried_creds.add(current_cred)
 
-                litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+                litellm_kwargs = kwargs.copy()
 
                 # [NEW] Merge provider-specific params
                 if provider in self.litellm_provider_params:
@@ -1738,7 +1679,7 @@ class RotatingClient:
                                         )
 
                             # Convert model parameters for custom providers right before LiteLLM call
-                            final_kwargs = self._convert_model_params_for_litellm(
+                            final_kwargs = self.provider_config.convert_for_litellm(
                                 **litellm_kwargs
                             )
 
@@ -2046,7 +1987,6 @@ class RotatingClient:
 
         tried_creds = set()
         last_exception = None
-        kwargs = self._convert_model_params(**kwargs)
 
         consecutive_quota_failures = 0
 
@@ -2208,9 +2148,7 @@ class RotatingClient:
                     key_acquired = True
                     tried_creds.add(current_cred)
 
-                    litellm_kwargs = self.all_providers.get_provider_kwargs(
-                        **kwargs.copy()
-                    )
+                    litellm_kwargs = kwargs.copy()
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
 
@@ -2520,7 +2458,7 @@ class RotatingClient:
 
                             # lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
                             # Convert model parameters for custom providers right before LiteLLM call
-                            final_kwargs = self._convert_model_params_for_litellm(
+                            final_kwargs = self.provider_config.convert_for_litellm(
                                 **litellm_kwargs
                             )
 
@@ -2919,7 +2857,6 @@ class RotatingClient:
         that get injected during actual API calls (agent instruction + identity override).
         This ensures token counts match actual usage.
         """
-        kwargs = self._convert_model_params(**kwargs)
         model = kwargs.get("model")
         text = kwargs.get("text")
         messages = kwargs.get("messages")

@@ -19,23 +19,26 @@ class OpenAICompatibleProvider(ProviderInterface):
     Supports both dynamic model discovery and static model definitions.
 
     Environment variable pattern:
-        <NAME>_CUSTOM_API_BASE - The API base URL (required)
-        <NAME>_API_KEY         - The API key (optional for some providers)
+        <NAME>_API_BASE - The API base URL (required)
+        <NAME>_API_KEY  - The API key (optional for some providers)
 
     Example:
-        MYSERVER_CUSTOM_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_BASE=http://localhost:8000/v1
         MYSERVER_API_KEY=sk-xxx
+
+    Note: This is only used for providers NOT in the known LiteLLM providers list.
+    For known providers, setting _API_BASE will override their default endpoint.
     """
 
     skip_cost_calculation: bool = True  # Skip cost calculation for custom providers
 
     def __init__(self, provider_name: str):
         self.provider_name = provider_name
-        # Get API base URL from environment (using _CUSTOM_API_BASE pattern)
-        self.api_base = os.getenv(f"{provider_name.upper()}_CUSTOM_API_BASE")
+        # Get API base URL from environment (using _API_BASE pattern)
+        self.api_base = os.getenv(f"{provider_name.upper()}_API_BASE")
         if not self.api_base:
             raise ValueError(
-                f"Environment variable {provider_name.upper()}_CUSTOM_API_BASE is required for custom OpenAI-compatible provider"
+                f"Environment variable {provider_name.upper()}_API_BASE is required for custom OpenAI-compatible provider"
             )
 
         # Initialize model definitions loader
