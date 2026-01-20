@@ -878,6 +878,17 @@ class UsageManager:
         if match:
             return match.group(1).lower()
 
+        # Pattern: API key prefixes for specific providers
+        # These are raw API keys with recognizable prefixes
+        api_key_prefixes = {
+            "sk-nano-": "nanogpt",
+            "sk-or-": "openrouter",
+            "sk-ant-": "anthropic",
+        }
+        for prefix, provider in api_key_prefixes.items():
+            if credential.startswith(prefix):
+                return provider
+
         return None
 
     def _get_provider_instance(self, provider: str) -> Optional[Any]:
@@ -1040,7 +1051,7 @@ class UsageManager:
 
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
-    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli", "chutes"}
+    _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli", "chutes", "nanogpt"}
 
     def _get_grouped_usage_count(self, key: str, model: str) -> int:
         """
