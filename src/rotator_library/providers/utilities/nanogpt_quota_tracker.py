@@ -233,6 +233,7 @@ class NanoGptQuotaTracker:
         self,
         api_key: str,
         credential_identifier: str,
+        client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
         """
         Refresh and cache subscription usage for a credential.
@@ -240,11 +241,12 @@ class NanoGptQuotaTracker:
         Args:
             api_key: NanoGPT API key
             credential_identifier: Identifier for caching
+            client: Optional HTTP client for connection reuse/concurrency control
 
         Returns:
             Usage data from fetch_subscription_usage()
         """
-        usage_data = await self.fetch_subscription_usage(api_key)
+        usage_data = await self.fetch_subscription_usage(api_key, client)
 
         if usage_data.get("status") == "success":
             self._subscription_cache[credential_identifier] = usage_data

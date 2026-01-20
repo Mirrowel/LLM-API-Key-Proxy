@@ -83,20 +83,7 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         "monthly": ["_monthly"],
     }
 
-    # =========================================================================
-    # USAGE TRACKING CONFIGURATION
-    # =========================================================================
 
-    # Daily quota resets at UTC midnight
-    # NanoGPT tracks usage at credential level (all models share the pool)
-    usage_reset_configs = {
-        "default": UsageResetConfigDef(
-            window_seconds=24 * 60 * 60,  # 24 hours
-            mode="credential",  # All models share daily quota
-            description="Daily subscription quota (UTC midnight reset)",
-            field_name="daily",
-        ),
-    }
 
     def __init__(self):
         self.model_definitions = ModelDefinitions()
@@ -133,7 +120,6 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         return {
             "mode": "per_model",
             "window_seconds": 86400,  # 24 hours (daily quota reset)
-            "field_name": "daily",
         }
 
     # =========================================================================
@@ -144,46 +130,41 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         """
         Get the quota group for a model.
 
-        NanoGPT tracks quota via virtual models:
-        - _daily: belongs to "daily" quota group
-        - _monthly: belongs to "monthly" quota group
-        - Other models: no group (tracked individually)
+        All NanoGPT models share the same subscription quota pool.
+        - Real models + _daily: belong to "daily" group (enforces exhaustion)
+        - _monthly: belongs to "monthly" group (separate limit tracking)
 
         Args:
             model: Model name
 
         Returns:
-            Quota group name or None if not grouped
+            Quota group name
         """
         # Strip provider prefix if present
         clean_model = model.split("/")[-1] if "/" in model else model
 
-        if clean_model == "_daily":
-            return "daily"
-        elif clean_model == "_monthly":
+        # _monthly has its own group to prevent cross-syncing of limits
+        if clean_model == "_monthly":
             return "monthly"
 
-        # Real models are not grouped - they're tracked individually
-        # Their usage doesn't sync with the virtual quota models
-        return None
+        # All other models (real models + _daily) share the daily quota
+        return "daily"
 
     def get_models_in_quota_group(self, group: str) -> List[str]:
         """
-        Get all models that belong to a quota group.
+        Get the canonical model(s) for quota group stats display.
 
-        NanoGPT has two quota groups:
-        - "daily": Daily usage limit (e.g., 2000 requests/day)
-        - "monthly": Monthly usage limit (e.g., 60000 requests/month)
-
-        All models share both pools at the credential level.
+        This returns only the virtual quota tracker models for display purposes.
+        All real models share these quota pools via get_model_quota_group().
 
         Args:
             group: Quota group identifier
 
         Returns:
-            List of model names (without provider prefix) in the group
+            List with the virtual quota tracker model
         """
         if group == "daily":
+            # Only _daily for stats display - it has the baseline from API
             return ["_daily"]
         elif group == "monthly":
             return ["_monthly"]
@@ -356,12 +337,15 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         """
         semaphore = asyncio.Semaphore(QUOTA_FETCH_CONCURRENCY)
 
-        async def refresh_single_credential(api_key: str) -> None:
+        async def refresh_single_credential(
+            api_key: str, client: httpx.AsyncClient
+        ) -> None:
             async with semaphore:
                 try:
                     # Use mixin method for refresh (handles caching internally)
+                    # Pass the shared client to respect concurrency control
                     usage_data = await self.refresh_subscription_usage(
-                        api_key, credential_identifier=api_key
+                        api_key, credential_identifier=api_key, client=client
                     )
 
                     if usage_data.get("status") == "success":
@@ -417,6 +401,9 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                         f"Failed to refresh NanoGPT subscription usage: {e}"
                     )
 
-        # Fetch all credentials in parallel
-        tasks = [refresh_single_credential(api_key) for api_key in credentials]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Fetch all credentials in parallel using a shared client
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = [
+                refresh_single_credential(api_key, client) for api_key in credentials
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
