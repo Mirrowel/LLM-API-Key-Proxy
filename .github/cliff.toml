@@ -15,14 +15,14 @@ body = """
 {% if breaking_commits %}
 ### 💥 Breaking Changes
 {% for commit in breaking_commits -%}
-- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})) by @{{ commit.author.name }}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})){% if commit.remote.username %} by @{{ commit.remote.username }}{% else %} by {{ commit.author.name }}{% endif %}
 {% endfor -%}
 {% endif -%}
 
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group }}
 {% for commit in commits -%}
-- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})) by @{{ commit.author.name }}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`]({{ repository_url }}/commit/{{ commit.id }})){% if commit.remote.username %} by @{{ commit.remote.username }}{% else %} by {{ commit.author.name }}{% endif %}
 {% endfor -%}
 {% endfor -%}
 """

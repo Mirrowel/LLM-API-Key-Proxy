@@ -217,6 +217,8 @@ jobs:
     - name: Generate Changelog
       id: changelog
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BRANCH_NAME=${{ github.ref_name }}
         if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
@@ -241,8 +243,9 @@ jobs:
         if [ -n "$LAST_TAG" ]; then
           # Standard run: A previous tag was found.
           echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
-        git-cliff \
-          --config .github/cliff.toml \
+          git-cliff \
+            --config .github/cliff.toml \
+            --github-repo "${{ github.repository }}" \
             --strip all \
             --output changelog.md \
             "$LAST_TAG..HEAD"
