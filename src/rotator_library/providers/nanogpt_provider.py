@@ -100,6 +100,9 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         # Track discovered models for quota group sync
         self._discovered_models: set = set()
 
+        # Track subscription-only models (subject to daily/monthly limits)
+        self._subscription_models: set = set()
+
     # =========================================================================
     # USAGE TRACKING CONFIGURATION
     # =========================================================================
@@ -130,9 +133,12 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         """
         Get the quota group for a model.
 
-        All NanoGPT models share the same subscription quota pool.
-        - Real models + _daily: belong to "daily" group (enforces exhaustion)
-        - _monthly: belongs to "monthly" group (separate limit tracking)
+        NanoGPT has two quota types:
+        - Daily: Soft limit (2000/day) - display only, does NOT block
+        - Monthly: Hard limit (60000/month) - BLOCKS when exhausted
+
+        Real models belong to "monthly" so they're only blocked by the
+        hard limit. The "daily" group is just for display.
 
         Args:
             model: Model name
@@ -143,31 +149,34 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         # Strip provider prefix if present
         clean_model = model.split("/")[-1] if "/" in model else model
 
-        # _monthly has its own group to prevent cross-syncing of limits
-        if clean_model == "_monthly":
-            return "monthly"
+        # _daily is for soft limit display only
+        if clean_model == "_daily":
+            return "daily"
 
-        # All other models (real models + _daily) share the daily quota
-        return "daily"
+        # Real models + _monthly belong to monthly (hard limit)
+        return "monthly"
 
     def get_models_in_quota_group(self, group: str) -> List[str]:
         """
-        Get the canonical model(s) for quota group stats display.
+        Get all models belonging to a quota group.
 
-        This returns only the virtual quota tracker models for display purposes.
-        All real models share these quota pools via get_model_quota_group().
+        This is used by UsageManager.update_quota_baseline to sync
+        request_count, baseline, and cooldowns across all group members.
 
         Args:
             group: Quota group identifier
 
         Returns:
-            List with the virtual quota tracker model
+            List of model names in the group
         """
         if group == "daily":
-            # Only _daily for stats display - it has the baseline from API
+            # Daily is soft limit - only virtual tracker for display
             return ["_daily"]
         elif group == "monthly":
-            return ["_monthly"]
+            # Monthly is hard limit - include subscription models for sync
+            models = ["_monthly"]
+            models.extend(list(self._subscription_models))
+            return models
         return []
 
     def get_quota_groups(self) -> List[str]:
@@ -253,11 +262,44 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
             model_id = model.split("/")[-1] if "/" in model else model
             self._discovered_models.add(model_id)
 
+        # Fetch subscription-only models for quota tracking
+        await self._fetch_subscription_models(api_key, client)
+
         # Refresh subscription usage to get tier info (only if not already cached)
         if api_key not in self._tier_cache:
             await self._refresh_tier_from_api(api_key)
 
         return models
+
+    async def _fetch_subscription_models(self, api_key: str, client: httpx.AsyncClient):
+        """
+        Fetch subscription-only models from NanoGPT API.
+
+        These are the models subject to daily/monthly quota limits.
+        Non-subscription (paid) models are pay-as-you-go and not limited.
+        """
+        try:
+            response = await client.get(
+                f"{NANOGPT_API_BASE}/api/subscription/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            self._subscription_models.clear()
+            for model in data.get("data", []):
+                model_id = model.get("id", "")
+                if model_id and not model_id.startswith("auto-model"):
+                    self._subscription_models.add(model_id)
+
+            lib_logger.debug(
+                f"Discovered {len(self._subscription_models)} subscription models for nanogpt"
+            )
+        except Exception as e:
+            lib_logger.debug(f"Subscription model discovery failed for nanogpt: {e}")
+            # Fall back to treating all discovered models as subscription
+            self._subscription_models = self._discovered_models.copy()
 
     # =========================================================================
     # TIER MANAGEMENT
