@@ -31,7 +31,7 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Shared OAuth Base**: Refactored OAuth implementation with reusable [`GoogleOAuthBase`](providers/google_oauth_base.py) for multiple providers.
 -   **Fair Cycle Rotation**: Ensures each credential exhausts at least once before any can be reused within a tier. Prevents a single credential from being repeatedly used while others sit idle. Configurable per provider with tracking modes and cross-tier support.
 -   **Custom Usage Caps**: Set custom limits per tier, per model/group that are more restrictive than actual API limits. Supports percentages (e.g., "80%") and multiple cooldown modes (`quota_reset`, `offset`, `fixed`). Credentials go on cooldown before hitting actual API limits.
--   **Cross-Provider Fallback Groups**: Pool credentials from multiple providers for equivalent models. When one provider's credentials are exhausted, automatically fall back to the next provider. Supports tier-first ordering (all tier-2 across providers before tier-1) and different model names per provider.
+-   **Cross-Provider Fallback Groups**: Pool credentials from multiple providers for equivalent models. When one provider's credentials are exhausted, automatically fall back to the next provider in the configured order. Each provider uses its own internal tier rotation.
 -   **Centralized Defaults**: All tunable defaults are defined in [`config/defaults.py`](config/defaults.py) for easy customization and visibility.
 
 ## Installation

@@ -947,8 +947,8 @@ client = RotatingClient(
 
 - **Fallback Group**: A list of `provider/model` combinations that are considered equivalent
 - **Target Promotion**: When a request matches an entry in a group, that entry is moved to the front
-- **Tier-First Ordering**: All tier-2 credentials across ALL providers are tried before any tier-1 credentials
-- **Provider Priority**: Within each tier, providers are tried in the order specified in the configuration
+- **Sequential Provider Rotation**: Each provider is tried completely (with its internal tier rotation) before moving to the next
+- **Provider Priority**: Providers are tried in the order specified in the configuration
 
 #### Algorithm
 
@@ -957,28 +957,28 @@ Given a request for `gemini_cli/gemini-2.5-pro` with fallback group:
 
 1. **Find matching group**: Scan all groups for exact match `gemini_cli/gemini-2.5-pro`
 2. **Reorder with target first**: `["gemini_cli/gemini-2.5-pro", "gemini/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"]`
-3. **Group by tier**: Collect credentials from each provider/model, sorted by tier
-4. **Try tier-2 first**: For each entry in order, call `_execute_with_retry()` with that provider/model's tier-2 credentials
-5. **Then tier-1**: If all tier-2 exhausted, repeat with tier-1 credentials
-6. **Success stops iteration**: First successful response is returned immediately
+3. **Try each provider sequentially**:
+   - Try `gemini_cli/gemini-2.5-pro` with all its credentials (tier-2 first, then tier-1 - internal rotation)
+   - If exhausted, try `gemini/gemini-2.5-pro` with all its credentials
+   - If exhausted, try `openrouter/google/gemini-2.5-pro` with all its credentials
+4. **Success stops iteration**: First successful response is returned immediately
 
 #### Implementation Details
 
 The fallback system reuses existing retry logic completely:
 
 ```
-For each tier (2, 1, ...):
-    For each entry in fallback group:
-        Temporarily swap credentials to only tier-N creds for this provider
-        Call existing _execute_with_retry() with entry's provider/model
-        If success: return response
-        If exhausted: continue to next entry
-        Restore original credentials
+For each entry in fallback group (in order):
+    Call existing _execute_with_retry() with entry's provider/model
+    If success: return response
+    If exhausted: continue to next entry
 ```
 
 **Key Benefits:**
+- Simple, predictable provider ordering
+- Each provider uses its own internal tier rotation
 - Existing cooldown, fair cycle, and rotation logic remains intact
-- Each provider operates independently (provider-specific settings respected)
+- Provider-specific settings (like concurrency limits) are respected
 - No changes needed to `UsageManager` - orchestration is at client level
 
 #### Edge Cases
@@ -992,8 +992,9 @@ For each tier (2, 1, ...):
 
 #### Logging
 
-- `INFO`: When fallback activated, which entry/tier being tried
+- `DEBUG`: When fallback activated, which entry being tried
 - `INFO`: When entry exhausted and moving to next
+- `INFO`: When fallback succeeds with a specific entry
 - `WARNING`: When all entries exhausted
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
