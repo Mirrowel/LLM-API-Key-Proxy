@@ -24,6 +24,7 @@ from ..types import (
     GlobalFairCycleState,
     StorageSchema,
 )
+from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -60,10 +61,11 @@ class UsageStorage:
         self._pending_save: bool = False
         self._save_lock = asyncio.Lock()
         self._dirty: bool = False
+        self._writer = ResilientStateWriter(self.file_path, lib_logger)
 
     async def load(
         self,
-    ) -> tuple[Dict[str, CredentialState], Dict[str, Dict[str, Any]]]:
+    ) -> tuple[Dict[str, CredentialState], Dict[str, Dict[str, Any]], bool]:
         """
         Load usage data from file.
 
@@ -71,17 +73,14 @@ class UsageStorage:
             Dict of stable_id -> CredentialState
         """
         if not self.file_path.exists():
-            lib_logger.info(f"No usage file found at {self.file_path}, starting fresh")
-            return {}, {}
+            return {}, {}, False
 
         try:
             async with self._file_lock():
-                content = await self._read_file()
+                data = safe_read_json(self.file_path, lib_logger, parse_json=True)
 
-            if not content:
-                return {}, {}
-
-            data = json.loads(content)
+            if not data:
+                return {}, {}, True
 
             # Check schema version
             version = data.get("schema_version", 1)
@@ -99,14 +98,14 @@ class UsageStorage:
                     states[stable_id] = state
 
             lib_logger.info(f"Loaded {len(states)} credentials from {self.file_path}")
-            return states, data.get("fair_cycle_global", {})
+            return states, data.get("fair_cycle_global", {}), True
 
         except json.JSONDecodeError as e:
             lib_logger.error(f"Failed to parse usage file: {e}")
-            return {}, {}
+            return {}, {}, True
         except Exception as e:
             lib_logger.error(f"Failed to load usage file: {e}")
-            return {}, {}
+            return {}, {}, True
 
     async def save(
         self,
@@ -149,14 +148,18 @@ class UsageStorage:
                     )
                     data["accessor_index"][state.accessor] = stable_id
 
-                # Write atomically
-                await self._write_file(json.dumps(data, indent=2))
+                saved = self._writer.write(data)
 
-                self._last_save = now
-                self._dirty = False
+                if saved:
+                    self._last_save = now
+                    self._dirty = False
+                    lib_logger.debug(
+                        f"Saved {len(states)} credentials to {self.file_path}"
+                    )
+                    return True
 
-                lib_logger.debug(f"Saved {len(states)} credentials to {self.file_path}")
-                return True
+                self._dirty = True
+                return False
 
             except Exception as e:
                 lib_logger.error(f"Failed to save usage file: {e}")
@@ -199,33 +202,18 @@ class UsageStorage:
         return self._save_lock
 
     async def _read_file(self) -> str:
-        """Read file contents asynchronously."""
-        try:
-            import aiofiles
-
-            async with aiofiles.open(self.file_path, "r", encoding="utf-8") as f:
-                return await f.read()
-        except ImportError:
-            # Fallback to sync read
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                return f.read()
+        """Deprecated: use safe_read_json instead."""
+        data = safe_read_json(self.file_path, lib_logger, parse_json=True)
+        return json.dumps(data) if data is not None else ""
 
     async def _write_file(self, content: str) -> None:
-        """Write file contents atomically."""
-        temp_path = self.file_path.with_suffix(".tmp")
-
+        """Deprecated: writes handled by ResilientStateWriter."""
         try:
-            import aiofiles
-
-            async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
-                await f.write(content)
-        except ImportError:
-            # Fallback to sync write
-            with open(temp_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-        # Atomic rename
-        temp_path.replace(self.file_path)
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            self._writer.write(data)
 
     def _migrate(self, data: Dict[str, Any], from_version: int) -> Dict[str, Any]:
         """Migrate data from older schema versions."""

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -270,7 +270,7 @@ class GeminiCredentialManager:
             self._initial_quota_fetch_done = True
         else:
             # Subsequent runs: only recently used credentials (incremental updates)
-            usage_data = await usage_manager._get_usage_data_snapshot()
+            usage_data = await usage_manager.get_usage_snapshot()
             quota_results = await self.refresh_active_quota_baselines(
                 credentials, usage_data
             )

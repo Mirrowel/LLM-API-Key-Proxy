@@ -34,7 +34,7 @@ import httpx
 from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -1054,14 +1054,23 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
 
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
+                quota_used = None
+                if max_requests is not None:
+                    quota_used = int((1.0 - remaining) * max_requests)
+                quota_group = self.get_model_quota_group(user_model)
                 cooldown_info = await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests, reset_timestamp
+                    cred_path,
+                    prefixed_model,
+                    quota_max_requests=max_requests,
+                    quota_reset_ts=reset_timestamp,
+                    quota_used=quota_used,
+                    quota_group=quota_group,
                 )
 
                 # Aggregate cooldown info if returned
                 if cooldown_info:
-                    group_or_model = cooldown_info["group_or_model"]
-                    hours = cooldown_info["hours_until_reset"]
+                    group_or_model = cooldown_info["model"]
+                    hours = cooldown_info["cooldown_hours"]
                     if short_cred not in cooldowns_by_cred:
                         cooldowns_by_cred[short_cred] = {}
                     # Only keep first occurrence per group/model (avoids duplicates)
@@ -1073,12 +1082,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
 
         # Log consolidated message for all cooldowns
         if cooldowns_by_cred:
-            # Build message: "oauth_1[claude 3.4h, gemini-3-pro 2.1h], oauth_2[claude 5.2h]"
-            parts = []
-            for cred_name, groups in sorted(cooldowns_by_cred.items()):
-                group_strs = [f"{g} {h:.1f}h" for g, h in sorted(groups.items())]
-                parts.append(f"{cred_name}[{', '.join(group_strs)}]")
-            lib_logger.info(f"Antigravity quota exhausted: {', '.join(parts)}")
+            lib_logger.debug("Antigravity quota baseline refresh: cooldowns recorded")
         else:
             lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
 

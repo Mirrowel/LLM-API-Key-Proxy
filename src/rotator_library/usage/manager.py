@@ -212,6 +212,11 @@ class UsageManager:
         self._states: Dict[str, CredentialState] = {}
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._loaded_from_storage = False
+        self._loaded_count = 0
+        self._quota_exhausted_summary: Dict[str, Dict[str, float]] = {}
+        self._quota_exhausted_task: Optional[asyncio.Task] = None
+        self._quota_exhausted_lock = asyncio.Lock()
 
         # Concurrency control: per-credential locks and conditions for waiting
         self._key_locks: Dict[str, asyncio.Lock] = {}
@@ -236,7 +241,13 @@ class UsageManager:
                 return
             # Load persisted state
             if self._storage:
-                self._states, fair_cycle_global = await self._storage.load()
+                (
+                    self._states,
+                    fair_cycle_global,
+                    loaded_from_storage,
+                ) = await self._storage.load()
+                self._loaded_from_storage = loaded_from_storage
+                self._loaded_count = len(self._states)
                 if fair_cycle_global:
                     self._limits.fair_cycle_checker.load_global_state_dict(
                         fair_cycle_global
@@ -273,8 +284,10 @@ class UsageManager:
                     effective_concurrent = base_concurrent * multiplier
                     self._states[stable_id].max_concurrent = effective_concurrent
 
+            self._backfill_group_usage()
+
             self._initialized = True
-            lib_logger.info(
+            lib_logger.debug(
                 f"UsageManager initialized for {self.provider} with {len(credentials)} credentials"
             )
 
@@ -1013,10 +1026,124 @@ class UsageManager:
                         limit=source_window.limit,
                     )
 
+                group_usage = state.group_usage.setdefault(group, UsageStats())
+                group_usage.windows[window_def.name] = WindowStats(
+                    name=source_window.name,
+                    request_count=source_window.request_count,
+                    total_tokens=source_window.total_tokens,
+                    prompt_tokens=source_window.prompt_tokens,
+                    prompt_tokens_cached=source_window.prompt_tokens_cached,
+                    completion_tokens=source_window.completion_tokens,
+                    approx_cost=source_window.approx_cost,
+                    started_at=source_window.started_at,
+                    reset_at=source_window.reset_at,
+                    limit=source_window.limit,
+                )
+
         lib_logger.debug(
             f"Synced request_count={current_count} across quota group '{group}' "
             f"({len(grouped_models)} models)"
         )
+
+    def _backfill_group_usage(self) -> None:
+        """Backfill group usage windows and cooldowns from model data."""
+        for state in self._states.values():
+            self._backfill_group_usage_for_state(state)
+            self._backfill_group_cooldowns(state)
+
+    def _backfill_group_usage_for_state(self, state: CredentialState) -> None:
+        group_windows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        for model, usage in state.model_usage.items():
+            group = self._get_model_quota_group(model)
+            if not group:
+                continue
+            for window_name, window in usage.windows.items():
+                bucket = group_windows.setdefault(group, {}).setdefault(
+                    window_name,
+                    {
+                        "counts": [],
+                        "prompt_tokens": [],
+                        "completion_tokens": [],
+                        "prompt_tokens_cached": [],
+                        "total_tokens": [],
+                        "approx_cost": [],
+                        "started_at": [],
+                        "reset_at": [],
+                        "limit": [],
+                    },
+                )
+                bucket["counts"].append(window.request_count)
+                bucket["prompt_tokens"].append(window.prompt_tokens)
+                bucket["completion_tokens"].append(window.completion_tokens)
+                bucket["prompt_tokens_cached"].append(window.prompt_tokens_cached)
+                bucket["total_tokens"].append(window.total_tokens)
+                bucket["approx_cost"].append(window.approx_cost)
+                if window.started_at is not None:
+                    bucket["started_at"].append(window.started_at)
+                if window.reset_at is not None:
+                    bucket["reset_at"].append(window.reset_at)
+                if window.limit is not None:
+                    bucket["limit"].append(window.limit)
+
+        for group, windows in group_windows.items():
+            group_usage = state.group_usage.setdefault(group, UsageStats())
+            for window_name, bucket in windows.items():
+                counts = bucket["counts"]
+                if not counts:
+                    continue
+                synced = all(count == counts[0] for count in counts)
+                if synced:
+                    request_count = counts[0]
+                    prompt_tokens = bucket["prompt_tokens"][0]
+                    completion_tokens = bucket["completion_tokens"][0]
+                    prompt_tokens_cached = bucket["prompt_tokens_cached"][0]
+                    total_tokens = bucket["total_tokens"][0]
+                    approx_cost = bucket["approx_cost"][0]
+                else:
+                    request_count = sum(counts)
+                    prompt_tokens = sum(bucket["prompt_tokens"])
+                    completion_tokens = sum(bucket["completion_tokens"])
+                    prompt_tokens_cached = sum(bucket["prompt_tokens_cached"])
+                    total_tokens = sum(bucket["total_tokens"])
+                    approx_cost = sum(bucket["approx_cost"])
+
+                started_at = min(bucket["started_at"]) if bucket["started_at"] else None
+                reset_at = max(bucket["reset_at"]) if bucket["reset_at"] else None
+                limit = max(bucket["limit"]) if bucket["limit"] else None
+
+                group_usage.windows[window_name] = WindowStats(
+                    name=window_name,
+                    request_count=request_count,
+                    total_tokens=total_tokens,
+                    prompt_tokens=prompt_tokens,
+                    prompt_tokens_cached=prompt_tokens_cached,
+                    completion_tokens=completion_tokens,
+                    approx_cost=approx_cost,
+                    started_at=started_at,
+                    reset_at=reset_at,
+                    limit=limit,
+                )
+
+    def _backfill_group_cooldowns(self, state: CredentialState) -> None:
+        for model, cooldown in list(state.cooldowns.items()):
+            if model in {"_global_"}:
+                continue
+            group = self._get_model_quota_group(model)
+            if not group:
+                continue
+            existing = state.cooldowns.get(group)
+            if not existing or existing.until < cooldown.until:
+                state.cooldowns[group] = cooldown
+
+        for group in list(state.group_usage.keys()):
+            cooldown = state.cooldowns.get(group)
+            if not cooldown:
+                continue
+            for grouped_model in self._get_grouped_models(group):
+                existing = state.cooldowns.get(grouped_model)
+                if not existing or existing.until < cooldown.until:
+                    state.cooldowns[grouped_model] = cooldown
 
     async def save(self, force: bool = False) -> bool:
         """
@@ -1034,6 +1161,21 @@ class UsageManager:
                 self._states, fair_cycle_global, force=force
             )
         return False
+
+    async def get_usage_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get a lightweight usage snapshot keyed by accessor.
+
+        Returns:
+            Dict mapping accessor -> usage metadata.
+        """
+        async with self._lock:
+            snapshot: Dict[str, Dict[str, Any]] = {}
+            for state in self._states.values():
+                snapshot[state.accessor] = {
+                    "last_used_ts": state.usage.last_used_at or 0,
+                }
+            return snapshot
 
     async def shutdown(self) -> None:
         """Shutdown and save any pending data."""
@@ -1108,6 +1250,20 @@ class UsageManager:
             primary_window.request_count = quota_used
             state.usage.model_request_counts[normalized_model] = quota_used
 
+        if group_key != normalized_model:
+            group_usage = state.get_usage_for_scope("group", group_key)
+            window_name = primary_def.name if primary_def else primary_window.name
+            group_window = self._window_manager.get_or_create_window(
+                group_usage.windows,
+                window_name,
+            )
+            if quota_max_requests is not None:
+                group_window.limit = quota_max_requests
+            if quota_reset_ts is not None:
+                group_window.reset_at = quota_reset_ts
+            if quota_used is not None:
+                group_window.request_count = quota_used
+
         # Mark state as updated
         state.last_updated = time.time()
 
@@ -1124,9 +1280,19 @@ class UsageManager:
                 source="api_quota",
             )
 
-            lib_logger.info(
-                f"Quota exhausted for {self._mask_accessor(accessor)}/{model}, "
-                f"cooldown until {quota_reset_ts}"
+            if group_key != normalized_model:
+                await self._tracking.apply_cooldown(
+                    state=state,
+                    reason="quota_exhausted",
+                    until=quota_reset_ts,
+                    model_or_group=normalized_model,
+                    source="api_quota",
+                )
+
+            await self._queue_quota_exhausted_log(
+                accessor=accessor,
+                group_key=group_key,
+                quota_reset_ts=quota_reset_ts,
             )
 
             await self._save_if_needed()
@@ -1135,6 +1301,7 @@ class UsageManager:
                 "cooldown_until": quota_reset_ts,
                 "reason": "quota_exhausted",
                 "model": model,
+                "cooldown_hours": max(0.0, (quota_reset_ts - time.time()) / 3600),
             }
 
         await self._save_if_needed()
@@ -1185,6 +1352,16 @@ class UsageManager:
         """Get all credential states."""
         return self._states
 
+    @property
+    def loaded_from_storage(self) -> bool:
+        """Whether usage data was loaded from storage."""
+        return self._loaded_from_storage
+
+    @property
+    def loaded_credentials(self) -> int:
+        """Number of credentials loaded from storage."""
+        return self._loaded_count
+
     # =========================================================================
     # PRIVATE METHODS
     # =========================================================================
@@ -1220,6 +1397,40 @@ class UsageManager:
         if condition:
             async with condition:
                 condition.notify_all()
+
+    async def _queue_quota_exhausted_log(
+        self, accessor: str, group_key: str, quota_reset_ts: float
+    ) -> None:
+        async with self._quota_exhausted_lock:
+            masked = self._mask_accessor(accessor)
+            if masked not in self._quota_exhausted_summary:
+                self._quota_exhausted_summary[masked] = {}
+            self._quota_exhausted_summary[masked][group_key] = quota_reset_ts
+
+            if self._quota_exhausted_task is None or self._quota_exhausted_task.done():
+                self._quota_exhausted_task = asyncio.create_task(
+                    self._flush_quota_exhausted_log()
+                )
+
+    async def _flush_quota_exhausted_log(self) -> None:
+        await asyncio.sleep(0.2)
+        async with self._quota_exhausted_lock:
+            summary = self._quota_exhausted_summary
+            self._quota_exhausted_summary = {}
+
+        if not summary:
+            return
+
+        now = time.time()
+        parts = []
+        for accessor, groups in sorted(summary.items()):
+            group_parts = []
+            for group, reset_ts in sorted(groups.items()):
+                hours = max(0.0, (reset_ts - now) / 3600) if reset_ts else 0.0
+                group_parts.append(f"{group} {hours:.1f}h")
+            parts.append(f"{accessor}[{', '.join(group_parts)}]")
+
+        lib_logger.info(f"Quota exhausted: {', '.join(parts)}")
 
     async def _save_if_needed(self) -> None:
         """Persist state if storage is configured."""

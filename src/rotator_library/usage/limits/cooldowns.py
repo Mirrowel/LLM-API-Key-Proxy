@@ -46,13 +46,19 @@ class CooldownChecker(LimitChecker):
         now = time.time()
         group_key = quota_group or model
 
-        # Check model/group-specific cooldown
+        # Check model/group-specific cooldowns
+        keys_to_check = []
         if group_key:
-            cooldown = state.cooldowns.get(group_key)
+            keys_to_check.append(group_key)
+        if quota_group and quota_group != model:
+            keys_to_check.append(model)
+
+        for key in keys_to_check:
+            cooldown = state.cooldowns.get(key)
             if cooldown and cooldown.until > now:
                 return LimitCheckResult.blocked(
                     result=LimitResult.BLOCKED_COOLDOWN,
-                    reason=f"Cooldown for '{group_key}': {cooldown.reason} (expires in {cooldown.remaining_seconds:.0f}s)",
+                    reason=f"Cooldown for '{key}': {cooldown.reason} (expires in {cooldown.remaining_seconds:.0f}s)",
                     blocked_until=cooldown.until,
                 )
 

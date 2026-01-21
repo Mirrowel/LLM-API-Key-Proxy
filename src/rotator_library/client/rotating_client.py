@@ -192,9 +192,13 @@ class RotatingClient:
 
         # Resolve usage file path base
         if usage_file_path:
-            self._usage_base_path = Path(usage_file_path).parent
+            base_path = Path(usage_file_path)
+            if base_path.suffix:
+                base_path = base_path.parent
+            self._usage_base_path = base_path / "usage"
         else:
-            self._usage_base_path = self.data_dir
+            self._usage_base_path = self.data_dir / "usage"
+        self._usage_base_path.mkdir(parents=True, exist_ok=True)
 
         # Build provider configs using ConfigLoader
         provider_configs = {}
@@ -241,17 +245,43 @@ class RotatingClient:
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
+        self._usage_initialized = False
+        self._usage_init_lock = asyncio.Lock()
 
     async def __aenter__(self):
-        # Initialize new usage managers
-        for provider, manager in self._usage_managers.items():
-            credentials = self.all_credentials.get(provider, [])
-            priorities, tiers = self._get_credential_metadata(provider, credentials)
-            await manager.initialize(credentials, priorities=priorities, tiers=tiers)
+        await self.initialize_usage_managers()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+    async def initialize_usage_managers(self) -> None:
+        """Initialize usage managers once before background jobs run."""
+        if self._usage_initialized:
+            return
+        async with self._usage_init_lock:
+            if self._usage_initialized:
+                return
+            for provider, manager in self._usage_managers.items():
+                credentials = self.all_credentials.get(provider, [])
+                priorities, tiers = self._get_credential_metadata(provider, credentials)
+                await manager.initialize(
+                    credentials, priorities=priorities, tiers=tiers
+                )
+            summaries = []
+            for provider, manager in self._usage_managers.items():
+                credentials = self.all_credentials.get(provider, [])
+                status = (
+                    f"loaded {manager.loaded_credentials}"
+                    if manager.loaded_from_storage
+                    else "fresh"
+                )
+                summaries.append(f"{provider}:{len(credentials)} ({status})")
+            if summaries:
+                lib_logger.info(
+                    f"Usage managers initialized: {', '.join(sorted(summaries))}"
+                )
+            self._usage_initialized = True
 
     async def close(self):
         """Close the HTTP client and save usage data."""

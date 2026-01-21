@@ -603,6 +603,8 @@ async def lifespan(app: FastAPI):
         max_concurrent_requests_per_key=max_concurrent_requests_per_key,
     )
 
+    await client.initialize_usage_managers()
+
     # Log loaded credentials summary (compact, always visible for deployment verification)
     # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
     # _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"

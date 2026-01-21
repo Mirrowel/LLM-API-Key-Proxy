@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from ...utils.paths import get_cache_dir
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -543,8 +543,16 @@ class BaseQuotaTracker:
                     max_requests = self.get_max_requests_for_model(user_model, tier)
 
                 # Store baseline
+                quota_used = None
+                if max_requests is not None:
+                    quota_used = int((1.0 - remaining) * max_requests)
+                quota_group = self.get_model_quota_group(user_model)
                 await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests=max_requests
+                    cred_path,
+                    prefixed_model,
+                    quota_max_requests=max_requests,
+                    quota_used=quota_used,
+                    quota_group=quota_group,
                 )
                 stored_count += 1
 

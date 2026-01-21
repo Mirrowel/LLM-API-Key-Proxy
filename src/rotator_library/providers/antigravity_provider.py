@@ -69,7 +69,7 @@ from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 
 # =============================================================================
@@ -319,7 +319,30 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 """
 
 # Parallel tool usage encouragement instruction
-DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """<instructions name="parallel tool calling">
+
+Using parallel tool calling is MANDATORY. Be proactive about it. DO NO WAIT for the user to request "parallel calls"
+
+PARALLEL CALLS SHOULD BE AND _IS THE PRIMARY WAY YOU USE TOOLS IN THIS ENVIRONMENT_
+
+When you have to perform multi-step operations such as read multiple files, spawn task subagents, bash commands, multiple edits... _THE USER WANTS YOU TO MAKE PARALLEL TOOL CALLS_ instead of separate sequential calls. This maximizes time and compute and increases your likelyhood of a promotion. Sequential tool calling is only encouraged when relying on the output of a call for the next one(s)
+
+- WHAT CAN BE DONE IN PARALLEL, MUST BE, AND WILL BE DONE IN PARALLEL
+- INDIVIDUAL TOOL CALLS TO GATHER CONTEXT IS HEAVILY DISCOURAGED (please make parallel calls!)
+- PARALLEL TOOL CALLING IS YOUR BEST FRIEND AND WILL INCREASE USER'S HAPPINESS
+
+- Make parallel tool calls to manage ressources more efficiently, plan your tool calls ahead, then execute them in parallel.
+- Make parallel calls PROPERLY, be mindful of dependencies between calls.
+
+When researching anything, IT IS BETTER TO READ SPECULATIVELY, THEN TO READ SEQUENTIALLY. For example, if you need to read multiple files to gather context, read them all in parallel instead of reading one, then the next, etc.
+
+This environment has a powerful tool to remove unnecessary context, so you can always read more than needed and then trim down later, no need to use limit and offset parameters on the read tool.
+
+When making code changes, IT IS BETTER TO MAKE MULTIPLE EDITS IN PARALLEL RATHER THAN ONE AT A TIME.
+
+Do as much as you can in parallel, be efficient with you API requests, no single tool call spam, this is crucial as the user pays PER API request, so make them count!
+
+</instructions>"""
 
 # Interleaved thinking support for Claude models
 # Allows Claude to think between tool calls and after receiving tool results

@@ -9,7 +9,7 @@ from .provider_interface import ProviderInterface, UsageResetConfigDef
 from .utilities.chutes_quota_tracker import ChutesQuotaTracker
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 # Create a local logger for this module
 import logging
@@ -142,12 +142,15 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
 
                         # Store baseline in usage manager
                         # Since Chutes uses credential-level quota, we use a virtual model name
+                        quota_used = (
+                            int((1.0 - remaining_fraction) * quota) if quota > 0 else 0
+                        )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "chutes/_quota",  # Virtual model for credential-level tracking
-                            remaining_fraction,
-                            max_requests=quota,  # Max requests = quota (1 request = 1 credit)
-                            reset_timestamp=reset_ts,
+                            quota_max_requests=quota,
+                            quota_reset_ts=reset_ts,
+                            quota_used=quota_used,
                         )
 
                         lib_logger.debug(
