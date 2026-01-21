@@ -225,8 +225,12 @@ jobs:
                       echo "::group::Merging $branch"
                       git fetch origin "$branch" 2>/dev/null || {{ echo "| $branch | :x: Not Found | - |" >> $GITHUB_STEP_SUMMARY; echo "::endgroup::"; continue; }}
                       if git merge "origin/$branch" --no-commit --no-ff; then
-                        git commit -m "chore(dev): merge branch '$branch'"
-                        echo "| $branch | :white_check_mark: Clean | - |" >> $GITHUB_STEP_SUMMARY
+                        if git diff --cached --quiet; then
+                          echo "| $branch | :white_check_mark: Already merged | - |" >> $GITHUB_STEP_SUMMARY
+                        else
+                          git commit -m "chore(dev): merge branch '$branch'"
+                          echo "| $branch | :white_check_mark: Clean | - |" >> $GITHUB_STEP_SUMMARY
+                        fi
                       else
                         echo "Conflicts in $branch - invoking Opencode..."
                         for file in $(git diff --name-only --diff-filter=U); do
