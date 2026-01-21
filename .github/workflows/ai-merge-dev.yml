@@ -49,9 +49,8 @@ jobs:
             "provider": {
               "llm-proxy": {
                 "api": "openai",
-                "url": "$LLM_PROXY_URL",
                 "models": { "$MODEL": {} },
-                "options": { "apiKey": "$LLM_PROXY_API_KEY" }
+                "options": { "apiKey": "$LLM_PROXY_API_KEY", "baseURL": "$LLM_PROXY_URL" }
               }
             },
             "model": "llm-proxy/$MODEL"
