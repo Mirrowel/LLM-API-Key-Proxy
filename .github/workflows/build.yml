@@ -443,6 +443,64 @@ jobs:
         echo ""
         
         # ═══════════════════════════════════════════════════════════
+        # LAYER PR: Generate Community Contributions section
+        # ═══════════════════════════════════════════════════════════
+        PR_COUNT=0
+        if [ -n "$PREV_TAG" ]; then
+          echo "🔍 Layer PR: Generating Community Contributions section..."
+          
+          # Get all merge commits in the range
+          MERGE_COMMITS=$(git log "$PREV_TAG".."$CURRENT_SHA" --oneline --grep="Merge pull request" 2>/dev/null || true)
+          
+          if [ -n "$MERGE_COMMITS" ]; then
+            PR_SECTION=""
+            
+            while IFS= read -r commit_line; do
+              if [ -n "$commit_line" ]; then
+                # Extract PR number from "Merge pull request #XX from ..."
+                PR_NUM=$(echo "$commit_line" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+                
+                if [ -n "$PR_NUM" ]; then
+                  # Fetch PR info from GitHub API
+                  PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
+                    --jq '{title: .title, author: .user.login}' 2>/dev/null || echo "{}")
+                  
+                  PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
+                  PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
+                  
+                  if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ]; then
+                    PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUM"
+                    PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
+                    PR_COUNT=$((PR_COUNT + 1))
+                    echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
+                  else
+                    echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
+                  fi
+                fi
+              fi
+            done <<< "$MERGE_COMMITS"
+            
+            if [ "$PR_COUNT" -gt 0 ]; then
+              # Append PR section to changelog
+              {
+                echo ""
+                echo "### 💜 Community Contributions"
+                echo ""
+                echo "Thank you to our community contributors!"
+                echo ""
+                echo "$PR_SECTION"
+              } >> changelog.md
+              echo "   ✅ Added $PR_COUNT PRs to Community Contributions section"
+            fi
+          else
+            echo "   ℹ️ No merge commits found in range"
+          fi
+        else
+          echo "⚠️ Layer PR: Skipped (no previous tag available)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
         # Summary
         # ═══════════════════════════════════════════════════════════
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -453,6 +511,7 @@ jobs:
         echo "   Layer B-2 (Per-commit): $LAYER_B2_RESOLVED"
         echo "   Layer D (Noreply):      $LAYER_D_RESOLVED"
         echo "   Fallback (name only):   $LAYER_FINAL_COUNT"
+        echo "   Community PRs:          $PR_COUNT"
         echo ""
         
         # Verify no placeholders remain

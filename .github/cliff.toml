@@ -37,6 +37,10 @@ commit_preprocessors = [
 ]
 
 commit_parsers = [
+    # Skip merge commits - they'll be handled separately as PR entries
+    { message = "^Merge pull request", skip = true },
+    { message = "^Merge branch", skip = true },
+
     # Scoped commits (most specific)
     { message = "^\\w+\\(ci\\)", group = "🤖 Continuous Integration" },
     { message = "^\\w+\\(build\\)", group = "📦 Build System" },
