@@ -1365,6 +1365,31 @@ TIMEOUT_POOL=120
 
 ---
 
+### 2.19. Custom OpenAI-Compatible Upstreams
+
+The `rotator_library` includes a dynamic provider registration system that allows it to support any OpenAI-compatible API backend without requiring a specific plugin.
+
+#### Dynamic Registration Logic
+
+During initialization, the library scans environment variables for any key ending in `_API_BASE` (excluding built-in providers). For each match, it:
+1.  Registers a new provider name (derived from the prefix).
+2.  Creates a dynamic instance of `DynamicOpenAICompatibleProvider`.
+3.  Maps all requests for this provider to LiteLLM's standard `openai` implementation.
+
+#### Implementation Details
+
+- **`src/rotator_library/providers/__init__.py`**: Contains the logic that iterates over `os.environ` and populates `PROVIDER_PLUGINS` with dynamic classes.
+- **`src/rotator_library/client.py`**: In `_convert_model_params_for_litellm`, it detects these custom providers and re-writes the `model` parameter to `openai/{model_name}` while injecting the custom `api_base` and setting `custom_llm_provider="openai"`.
+- **Model Discovery**: Custom providers delegate model listing to `OpenAICompatibleProvider.get_models()`, which performs an authenticated `GET` request to the upstream's `/v1/models` endpoint.
+
+#### Usage Requirements
+
+For a custom provider to be active, it must have:
+- `{PROVIDER}_API_BASE`: The full URL to the OpenAI-compatible v1 endpoint.
+- `{PROVIDER}_API_KEY`: At least one API key configured (can be a dummy value if the upstream doesn't require authentication).
+
+---
+
 ## 3. Provider Specific Implementations
 
 The library handles provider idiosyncrasies through specialized "Provider" classes in `src/rotator_library/providers/`.

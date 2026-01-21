@@ -798,7 +798,16 @@ class SettingsTool:
                 )
             )
 
-            self.console.print()
+            self.console.print(
+                Panel(
+                    "Register any OpenAI-compatible upstream (vLLM, Ollama, etc.) by defining a base URL.\n"
+                    "Usage: Set [bold]PROVIDER_API_BASE[/bold] here and [bold]PROVIDER_API_KEY[/bold] in credentials.\n"
+                    "Models will be available as [bold]provider/model-id[/bold].",
+                    title="[dim]How it works[/dim]",
+                    border_style="dim",
+                )
+            )
+
             self.console.print("[bold]📋 Configured Custom Providers[/bold]")
             self.console.print("━" * 70)
 

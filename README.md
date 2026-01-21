@@ -187,6 +187,21 @@ python -m rotator_library.credential_tool
 | **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env` |
 | **OAuth** | Gemini CLI, Antigravity, Qwen Code, iFlow | Interactive browser login via credential tool |
 
+### 🔌 Custom OpenAI-Compatible Providers (vLLM, Ollama, local LLM)
+
+The proxy supports dynamic registration of any OpenAI-compatible upstream. This allows you to integrate local instances of vLLM, Ollama, or other custom backends without modifying the code.
+
+#### Configuration
+Add the following to your `.env` file (replacing `CUSTOM` with your desired provider name):
+
+1.  **Base URL:** `CUSTOM_API_BASE="http://127.0.0.1:8001/v1"`
+2.  **API Key:** `CUSTOM_API_KEY="any-value"` (A non-empty value is required to mark the provider as active)
+
+#### Usage
+Access your custom models using the format: `custom/model-id`.
+*   **Example:** If using vLLM, set `VLLM_API_BASE` and call the proxy with model `vllm/llama-3-8b`.
+*   **Model Discovery:** The proxy's `/v1/models` endpoint will automatically attempt to fetch and list available models from your custom upstream's `/models` endpoint.
+
 ### The `.env` File
 
 Credentials are stored in a `.env` file. You can edit it directly or use the TUI:
