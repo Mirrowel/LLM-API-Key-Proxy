@@ -270,6 +270,205 @@ jobs:
           echo "has_changelog=false" >> $GITHUB_OUTPUT
         fi
 
+    - name: Resolve GitHub Usernames in Changelog
+      id: resolve_usernames
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔍 Resolving GitHub Usernames in Changelog"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Exit early if no changelog
+        if [ ! -s changelog.md ]; then
+          echo "ℹ️ No changelog to process, skipping username resolution"
+          exit 0
+        fi
+        
+        PREV_TAG="${{ steps.changelog.outputs.previous_tag }}"
+        CURRENT_SHA="${{ github.sha }}"
+        
+        echo "📋 Configuration:"
+        echo "   Previous tag: ${PREV_TAG:-'(none)'}"
+        echo "   Current SHA: $CURRENT_SHA"
+        echo ""
+        
+        # Count placeholders before processing
+        TOTAL_PLACEHOLDERS=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md | wc -l || echo "0")
+        echo "📊 Found $TOTAL_PLACEHOLDERS author placeholders to resolve"
+        echo ""
+        
+        if [ "$TOTAL_PLACEHOLDERS" -eq 0 ]; then
+          echo "ℹ️ No placeholders found, skipping"
+          exit 0
+        fi
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER B-1: Compare API (single call, up to 250 commits)
+        # ═══════════════════════════════════════════════════════════
+        LAYER_B1_RESOLVED=0
+        if [ -n "$PREV_TAG" ]; then
+          echo "🔍 Layer B-1: Fetching authors via Compare API..."
+          echo "   Endpoint: repos/${{ github.repository }}/compare/$PREV_TAG...$CURRENT_SHA"
+          
+          AUTHOR_MAP=$(gh api "repos/${{ github.repository }}/compare/$PREV_TAG...$CURRENT_SHA" \
+            --jq '[.commits[] | {sha: .sha, username: .author.login}] | map(select(.username != null))' 2>/dev/null || echo "[]")
+          
+          COMPARE_COUNT=$(echo "$AUTHOR_MAP" | jq 'length')
+          echo "   Retrieved $COMPARE_COUNT commits with linked GitHub accounts"
+          
+          # Apply replacements from Compare API
+          while read -r entry; do
+            if [ -n "$entry" ] && [ "$entry" != "null" ]; then
+              SHA=$(echo "$entry" | jq -r '.sha')
+              USERNAME=$(echo "$entry" | jq -r '.username')
+              if [ -n "$SHA" ] && [ -n "$USERNAME" ] && [ "$USERNAME" != "null" ]; then
+                # Replace [[SHA|...|...]] with @username
+                if grep -q "\[\[$SHA" changelog.md 2>/dev/null; then
+                  sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                  LAYER_B1_RESOLVED=$((LAYER_B1_RESOLVED + 1))
+                fi
+              fi
+            fi
+          done < <(echo "$AUTHOR_MAP" | jq -c '.[]' 2>/dev/null || true)
+          
+          echo "   ✅ Layer B-1 resolved: $LAYER_B1_RESOLVED authors"
+        else
+          echo "⚠️ Layer B-1: Skipped (no previous tag available)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER B-2: Per-commit API (for remaining unresolved)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_B2=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_B2_COUNT=$(echo "$REMAINING_B2" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_B2_RESOLVED=0
+        
+        if [ "$REMAINING_B2_COUNT" -gt 0 ] && [ -n "$REMAINING_B2" ]; then
+          echo "🔍 Layer B-2: Resolving $REMAINING_B2_COUNT remaining via per-commit API..."
+          
+          # Get unique SHAs only
+          UNIQUE_SHAS=$(echo "$REMAINING_B2" | grep -oE '\[\[[a-f0-9]{40}' | sed 's/\[\[//' | sort -u)
+          
+          while read -r SHA; do
+            if [ -n "$SHA" ]; then
+              USERNAME=$(gh api "repos/${{ github.repository }}/commits/$SHA" \
+                --jq '.author.login // empty' 2>/dev/null || true)
+              
+              if [ -n "$USERNAME" ]; then
+                sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                LAYER_B2_RESOLVED=$((LAYER_B2_RESOLVED + 1))
+                echo "   ✅ $SHA -> @$USERNAME"
+              else
+                echo "   ⚠️ $SHA -> (no GitHub account linked)"
+              fi
+            fi
+          done <<< "$UNIQUE_SHAS"
+          
+          echo "   ✅ Layer B-2 resolved: $LAYER_B2_RESOLVED authors"
+        else
+          echo "ℹ️ Layer B-2: Skipped (no remaining placeholders)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER D: Noreply email extraction (no API needed)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_D=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_D_COUNT=$(echo "$REMAINING_D" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_D_RESOLVED=0
+        
+        if [ "$REMAINING_D_COUNT" -gt 0 ] && [ -n "$REMAINING_D" ]; then
+          echo "🔍 Layer D: Extracting usernames from noreply emails..."
+          
+          echo "$REMAINING_D" | while read -r placeholder; do
+            if [ -n "$placeholder" ]; then
+              # Extract SHA, email, and name from [[sha|email|name]]
+              SHA=$(echo "$placeholder" | sed 's/\[\[\([^|]*\)|.*/\1/')
+              EMAIL=$(echo "$placeholder" | sed 's/\[\[[^|]*|\([^|]*\)|.*/\1/')
+              NAME=$(echo "$placeholder" | sed 's/\[\[[^|]*|[^|]*|\([^]]*\)\]\]/\1/')
+              
+              USERNAME=""
+              # Pattern 1: ID+username@users.noreply.github.com
+              if [[ "$EMAIL" =~ ^[0-9]+\+([^@]+)@users\.noreply\.github\.com$ ]]; then
+                USERNAME="${BASH_REMATCH[1]}"
+              # Pattern 2: username@users.noreply.github.com (no ID)
+              elif [[ "$EMAIL" =~ ^([^@+\[]+)@users\.noreply\.github\.com$ ]]; then
+                USERNAME="${BASH_REMATCH[1]}"
+              fi
+              
+              if [ -n "$USERNAME" ]; then
+                sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                echo "   ✅ Extracted @$USERNAME from $EMAIL"
+              fi
+            fi
+          done
+          
+          # Recount after Layer D
+          AFTER_D=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null | wc -l || echo "0")
+          LAYER_D_RESOLVED=$((REMAINING_D_COUNT - AFTER_D))
+          echo "   ✅ Layer D resolved: $LAYER_D_RESOLVED authors"
+        else
+          echo "ℹ️ Layer D: Skipped (no remaining placeholders)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER FINAL: Git author name fallback (no @)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_FINAL=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_FINAL_COUNT=$(echo "$REMAINING_FINAL" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_FINAL_COUNT=0
+        
+        if [ "$REMAINING_FINAL_COUNT" -gt 0 ] && [ -n "$REMAINING_FINAL" ]; then
+          echo "⚠️ Final fallback: Using git author names for $REMAINING_FINAL_COUNT unresolved..."
+          
+          echo "$REMAINING_FINAL" | while read -r placeholder; do
+            if [ -n "$placeholder" ]; then
+              # Extract name from [[sha|email|name]]
+              SHA=$(echo "$placeholder" | sed 's/\[\[\([^|]*\)|.*/\1/')
+              NAME=$(echo "$placeholder" | sed 's/\[\[[^|]*|[^|]*|\([^]]*\)\]\]/\1/')
+              
+              sed -i "s|\[\[$SHA[^]]*\]\]|$NAME|g" changelog.md
+              echo "   ⚠️ Using fallback: $NAME"
+            fi
+          done
+          
+          LAYER_FINAL_COUNT=$REMAINING_FINAL_COUNT
+        else
+          echo "ℹ️ Final fallback: Not needed (all resolved)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # Summary
+        # ═══════════════════════════════════════════════════════════
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📊 Resolution Summary"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "   Total placeholders:     $TOTAL_PLACEHOLDERS"
+        echo "   Layer B-1 (Compare):    $LAYER_B1_RESOLVED"
+        echo "   Layer B-2 (Per-commit): $LAYER_B2_RESOLVED"
+        echo "   Layer D (Noreply):      $LAYER_D_RESOLVED"
+        echo "   Fallback (name only):   $LAYER_FINAL_COUNT"
+        echo ""
+        
+        # Verify no placeholders remain
+        REMAINING_CHECK=$(grep -c '\[\[[a-f0-9]\{40\}|' changelog.md 2>/dev/null || echo "0")
+        if [ "$REMAINING_CHECK" -eq 0 ]; then
+          echo "✅ All author placeholders resolved successfully!"
+        else
+          echo "⚠️ Warning: $REMAINING_CHECK placeholders may still remain"
+        fi
+        
+        # Re-encode the changelog for the next step
+        if [ -s changelog.md ]; then
+          CHANGELOG_B64=$(base64 -w 0 changelog.md)
+          echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
+        fi
+
     - name: Debug artifact contents
       shell: bash
       run: |
@@ -351,8 +550,11 @@ jobs:
     - name: Create Release
       shell: bash
       run: |
-        # Prepare changelog content
-        if [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
+        # Prepare changelog content - prefer resolved version if available
+        if [ -n "${{ steps.resolve_usernames.outputs.changelog_b64 }}" ]; then
+          echo "${{ steps.resolve_usernames.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
+          CHANGELOG_CONTENT=$(cat decoded_changelog.md)
+        elif [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
           echo "${{ steps.changelog.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
           CHANGELOG_CONTENT=$(cat decoded_changelog.md)
         else
