@@ -1,5 +1,5 @@
 name: AI Multi-Branch Merge
-run-name: Merging branches into dev by @${{ github.actor }}
+run-name: Merging branches into dev by @${{  github.actor  }}
 
 on:
   workflow_dispatch:
@@ -8,8 +8,24 @@ on:
         description: 'Reset dev to main before merging (destroys existing dev)'
         type: boolean
         default: false
+      branch_feature_chutes_quota_system:
+        description: 'feature/chutes-quota-system'
+        type: boolean
+        default: false
+      branch_feature_firmware_quota_tracking:
+        description: 'feature/firmware-quota-tracking'
+        type: boolean
+        default: false
+      branch_feature_google_search:
+        description: 'feature/google_search'
+        type: boolean
+        default: false
+      branch_feature_nanogpt_quota_system:
+        description: 'feature/nanogpt-quota-system'
+        type: boolean
+        default: false
       custom_branches:
-        description: 'Branches to merge (comma-separated)'
+        description: 'Additional branches (comma-separated, optional)'
         type: string
         required: false
 
@@ -28,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT }}
+          token: ${{  secrets.GH_PAT  }}
 
       - name: Configure Git
         run: |
@@ -40,9 +56,9 @@ jobs:
 
       - name: Configure Opencode for LLM Proxy
         env:
-          LLM_PROXY_URL: ${{ secrets.LLM_PROXY_URL }}
-          LLM_PROXY_API_KEY: ${{ secrets.LLM_PROXY_API_KEY }}
-          LLM_PROXY_MODEL: ${{ secrets.LLM_PROXY_MODEL }}
+          LLM_PROXY_URL: ${{  secrets.LLM_PROXY_URL  }}
+          LLM_PROXY_API_KEY: ${{  secrets.LLM_PROXY_API_KEY  }}
+          LLM_PROXY_MODEL: ${{  secrets.LLM_PROXY_MODEL  }}
         run: |
           mkdir -p ~/.config/opencode
           DOLLAR='$'
@@ -64,16 +80,16 @@ jobs:
       - name: Collect selected branches
         id: collect
         env:
-          INPUTS_JSON: ${{ toJSON(github.event.inputs) }}
+          INPUTS_JSON: ${{  toJSON(github.event.inputs)  }}
         run: |
           echo "Processing inputs..."
           branches=""
           selected=$(echo "$INPUTS_JSON" | jq -r 'to_entries | .[] | select(.key | startswith("branch_")) | select(.value == "true") | .key')
           for input_name in $selected; do
-            branch_name=$(grep -A1 "^      $input_name:" .github/workflows/ai-merge-dev.yml | grep "description:" | sed "s/.*description: '\(.*\)'/\1/")
+            branch_name=$(grep -A1 "^      $input_name:" .github/workflows/ai-merge-dev.yml | grep "description:" | sed "s/.*description: '\\(.*\\)'/\\1/")
             if [ -n "$branch_name" ]; then branches="${branches:+$branches, }$branch_name"; fi
           done
-          custom="${{ github.event.inputs.custom_branches }}"
+          custom="${{  github.event.inputs.custom_branches  }}"
           if [ -n "$custom" ]; then branches="${branches:+$branches, }$custom"; fi
           echo "Selected branches: $branches"
           echo "branches=$branches" >> $GITHUB_OUTPUT
@@ -81,7 +97,7 @@ jobs:
 
       - name: Prepare Dev Branch
         env:
-          RESET_DEV: ${{ github.event.inputs.reset_dev }}
+          RESET_DEV: ${{  github.event.inputs.reset_dev  }}
         run: |
           echo "## AI Multi-Branch Merge" >> $GITHUB_STEP_SUMMARY
           git fetch origin main:main
@@ -101,7 +117,7 @@ jobs:
 
       - name: Merge Branches
         env:
-          BRANCHES_INPUT: ${{ steps.collect.outputs.branches }}
+          BRANCHES_INPUT: ${{  steps.collect.outputs.branches  }}
         run: |
           echo "### Merge Results" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | Status | Notes |" >> $GITHUB_STEP_SUMMARY
