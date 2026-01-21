@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p ~/.config/opencode
           DOLLAR='$'
-          MODEL="${LLM_PROXY_MODEL:-claude-sonnet-4-20250514}"
+          MODEL="${LLM_PROXY_MODEL:-nano_gpt/zai-org/glm-4.7}"
           cat > ~/.config/opencode/opencode.json <<EOFCFG
           {
             "${DOLLAR}schema": "https://opencode.ai/config.json",
