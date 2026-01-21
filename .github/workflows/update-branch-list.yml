@@ -112,10 +112,10 @@ jobs:
                   run: |
                     mkdir -p ~/.config/opencode
                     DOLLAR='$'
-                    MODEL="${{LLM_PROXY_MODEL:-nano_gpt/zai-org/glm-4.7}}"
+                    MODEL="{bash_expr('LLM_PROXY_MODEL:-nano_gpt/zai-org/glm-4.7')}"
                     cat > ~/.config/opencode/opencode.json <<EOFCFG
                     {{
-                      "${{DOLLAR}}schema": "https://opencode.ai/config.json",
+                      "{bash_expr('DOLLAR')}schema": "https://opencode.ai/config.json",
                       "provider": {{
                         "llm-proxy": {{
                           "api": "openai",
