@@ -1,0 +1,359 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""
+Streaming response handler.
+
+Extracts streaming logic from client.py _safe_streaming_wrapper (lines 904-1117).
+Handles:
+- Chunk processing with finish_reason logic
+- JSON reassembly for fragmented responses
+- Error detection in streamed data
+- Usage tracking from final chunks
+- Client disconnect handling
+"""
+
+import codecs
+import json
+import logging
+import re
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, Optional, TYPE_CHECKING
+
+from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
+from ..core.types import ProcessedChunk
+
+if TYPE_CHECKING:
+    from ..usage.manager import CredentialContext
+
+lib_logger = logging.getLogger("rotator_library")
+
+
+class StreamingHandler:
+    """
+    Process streaming responses with error handling and usage tracking.
+
+    This class extracts the streaming logic that was in _safe_streaming_wrapper
+    and provides a clean interface for processing LiteLLM streams.
+    """
+
+    def __init__(self, usage_manager: Optional[Any] = None):
+        """
+        Initialize StreamingHandler.
+
+        Args:
+            usage_manager: Legacy UsageManager instance for recording usage.
+                          If None, usage recording is skipped.
+                          NOTE: When using CredentialContext, pass None here
+                          as the context handles recording.
+        """
+        self._usage = usage_manager
+
+    async def wrap_stream(
+        self,
+        stream: AsyncIterator[Any],
+        credential: str,
+        model: str,
+        request: Optional[Any] = None,
+        cred_context: Optional["CredentialContext"] = None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Wrap a LiteLLM stream with error handling and usage tracking.
+
+        FINISH_REASON HANDLING:
+        - Strip finish_reason from intermediate chunks (litellm defaults to "stop")
+        - Track accumulated_finish_reason with priority: tool_calls > length/content_filter > stop
+        - Only emit finish_reason on final chunk (detected by usage.completion_tokens > 0)
+
+        Args:
+            stream: The async iterator from LiteLLM
+            credential: Credential identifier for usage recording (legacy)
+            model: Model name for usage recording
+            request: Optional FastAPI request for disconnect detection
+            cred_context: Optional CredentialContext for marking success/failure.
+                         If provided, this takes precedence over legacy usage_manager.
+
+        Yields:
+            SSE-formatted strings: "data: {...}\\n\\n"
+        """
+        last_usage = None
+        stream_completed = False
+        json_buffer = ""
+        accumulated_finish_reason: Optional[str] = None
+        has_tool_calls = False
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        try:
+            async for chunk in stream:
+                # Check client disconnect
+                if request and await request.is_disconnected():
+                    lib_logger.info(
+                        f"Client disconnected. Aborting stream for model {model}."
+                    )
+                    break
+
+                # Clear buffer on successful chunk receipt
+                if json_buffer:
+                    lib_logger.warning(
+                        f"Discarding incomplete JSON buffer: {json_buffer[:100]}..."
+                    )
+                    json_buffer = ""
+
+                # Process chunk
+                processed = self._process_chunk(
+                    chunk,
+                    accumulated_finish_reason,
+                    has_tool_calls,
+                )
+
+                # Update tracking state
+                if processed.has_tool_calls:
+                    has_tool_calls = True
+                    accumulated_finish_reason = "tool_calls"
+                if processed.finish_reason and not has_tool_calls:
+                    # Only update if not already tool_calls (highest priority)
+                    accumulated_finish_reason = processed.finish_reason
+                if processed.usage:
+                    last_usage = processed.usage
+                    # Extract token counts
+                    if isinstance(processed.usage, dict):
+                        prompt_tokens = processed.usage.get("prompt_tokens", 0)
+                        completion_tokens = processed.usage.get("completion_tokens", 0)
+
+                yield processed.sse_string
+
+            stream_completed = True
+
+        except CredentialNeedsReauthError as e:
+            # Credential needs re-auth but re-auth is already queued
+            # Wrap for outer retry loop to handle
+            if cred_context:
+                from ..error_handler import classify_error
+
+                cred_context.mark_failure(classify_error(e))
+            raise StreamedAPIError("Credential needs re-authentication", data=e)
+
+        except StreamedAPIError:
+            # Re-raise for retry loop
+            raise
+
+        except Exception as e:
+            # Try to extract JSON from fragmented response
+            extracted = self._try_extract_error(e, json_buffer)
+            if extracted:
+                if cred_context:
+                    from ..error_handler import classify_error
+
+                    cred_context.mark_failure(classify_error(e))
+                raise StreamedAPIError("Provider error in stream", data=extracted)
+            raise
+
+        finally:
+            # Record usage if stream completed
+            if stream_completed:
+                if cred_context:
+                    # Use new context-based recording
+                    cred_context.mark_success(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
+                elif self._usage:
+                    # Legacy recording
+                    if last_usage:
+                        await self._record_usage(credential, model, last_usage)
+                    else:
+                        await self._usage.record_success(credential, model)
+
+    def _process_chunk(
+        self,
+        chunk: Any,
+        accumulated_finish_reason: Optional[str],
+        has_tool_calls: bool,
+    ) -> ProcessedChunk:
+        """
+        Process a single streaming chunk.
+
+        Handles finish_reason logic:
+        - Strip from intermediate chunks
+        - Apply correct finish_reason on final chunk
+
+        Args:
+            chunk: Raw chunk from LiteLLM
+            accumulated_finish_reason: Current accumulated finish reason
+            has_tool_calls: Whether any chunk has had tool_calls
+
+        Returns:
+            ProcessedChunk with SSE string and metadata
+        """
+        # Convert chunk to dict
+        if hasattr(chunk, "model_dump"):
+            chunk_dict = chunk.model_dump()
+        elif hasattr(chunk, "dict"):
+            chunk_dict = chunk.dict()
+        else:
+            chunk_dict = chunk
+
+        # Extract metadata before modifying
+        usage = chunk_dict.get("usage")
+        finish_reason = None
+        chunk_has_tool_calls = False
+
+        if "choices" in chunk_dict and chunk_dict["choices"]:
+            choice = chunk_dict["choices"][0]
+            delta = choice.get("delta", {})
+
+            # Check for tool_calls
+            if delta.get("tool_calls"):
+                chunk_has_tool_calls = True
+
+            # Detect final chunk: has usage with completion_tokens > 0
+            has_completion_tokens = (
+                usage
+                and isinstance(usage, dict)
+                and usage.get("completion_tokens", 0) > 0
+            )
+
+            if has_completion_tokens:
+                # FINAL CHUNK: Determine correct finish_reason
+                if has_tool_calls or chunk_has_tool_calls:
+                    choice["finish_reason"] = "tool_calls"
+                elif accumulated_finish_reason:
+                    choice["finish_reason"] = accumulated_finish_reason
+                else:
+                    choice["finish_reason"] = "stop"
+                finish_reason = choice["finish_reason"]
+            else:
+                # INTERMEDIATE CHUNK: Never emit finish_reason
+                choice["finish_reason"] = None
+
+        return ProcessedChunk(
+            sse_string=f"data: {json.dumps(chunk_dict)}\n\n",
+            usage=usage,
+            finish_reason=finish_reason,
+            has_tool_calls=chunk_has_tool_calls,
+        )
+
+    def _try_extract_error(
+        self,
+        exception: Exception,
+        buffer: str,
+    ) -> Optional[Dict]:
+        """
+        Try to extract error JSON from exception or buffer.
+
+        Handles multiple error formats:
+        - Google-style bytes representation: b'{...}'
+        - "Received chunk:" prefix
+        - JSON in buffer accumulation
+
+        Args:
+            exception: The caught exception
+            buffer: Current JSON buffer content
+
+        Returns:
+            Parsed error dict or None
+        """
+        error_str = str(exception)
+
+        # Pattern 1: Google-style bytes representation
+        match = re.search(r"b'(\{.*\})'", error_str, re.DOTALL)
+        if match:
+            try:
+                decoded = codecs.decode(match.group(1), "unicode_escape")
+                return json.loads(decoded)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Pattern 2: "Received chunk:" prefix
+        if "Received chunk:" in error_str:
+            chunk = error_str.split("Received chunk:")[-1].strip()
+            try:
+                return json.loads(chunk)
+            except json.JSONDecodeError:
+                pass
+
+        # Pattern 3: Buffer accumulation
+        if buffer:
+            try:
+                return json.loads(buffer)
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    async def _record_usage(
+        self,
+        credential: str,
+        model: str,
+        usage: Dict[str, Any],
+    ) -> None:
+        """
+        Record usage from streaming response.
+
+        Creates a minimal response object for the usage manager.
+
+        Args:
+            credential: Credential identifier
+            model: Model name
+            usage: Usage dict from final chunk
+        """
+        if not self._usage:
+            return
+
+        # Create a simple object with usage attribute
+        class UsageResponse:
+            def __init__(self, usage_dict):
+                self.usage = type("Usage", (), usage_dict)()
+
+        try:
+            response = UsageResponse(usage)
+            await self._usage.record_success(credential, model, response)
+        except Exception as e:
+            lib_logger.warning(f"Failed to record streaming usage: {e}")
+
+
+class StreamBuffer:
+    """
+    Buffer for reassembling fragmented JSON in streams.
+
+    Some providers send JSON split across multiple chunks, especially
+    for error responses. This class handles accumulation and parsing.
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._complete = False
+
+    def append(self, chunk: str) -> Optional[Dict]:
+        """
+        Append a chunk and try to parse.
+
+        Args:
+            chunk: Raw chunk string
+
+        Returns:
+            Parsed dict if complete, None if still accumulating
+        """
+        self._buffer += chunk
+
+        try:
+            result = json.loads(self._buffer)
+            self._complete = True
+            return result
+        except json.JSONDecodeError:
+            return None
+
+    def reset(self) -> None:
+        """Reset the buffer."""
+        self._buffer = ""
+        self._complete = False
+
+    @property
+    def content(self) -> str:
+        """Get current buffer content."""
+        return self._buffer
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if buffer contains complete JSON."""
+        return self._complete

@@ -1,0 +1,617 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""
+Unified request execution with retry and rotation.
+
+This module extracts and unifies the retry logic that was duplicated in:
+- _execute_with_retry (lines 1174-1945)
+- _streaming_acompletion_with_retry (lines 1947-2780)
+
+The RequestExecutor provides a single code path for all request types,
+with streaming vs non-streaming handled as a parameter.
+"""
+
+import asyncio
+import json
+import logging
+import random
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, TYPE_CHECKING, Union
+
+import httpx
+import litellm
+from litellm.exceptions import (
+    APIConnectionError,
+    RateLimitError,
+    ServiceUnavailableError,
+    InternalServerError,
+)
+
+from ..core.types import RequestContext, ErrorAction
+from ..core.errors import (
+    NoAvailableKeysError,
+    PreRequestCallbackError,
+    StreamedAPIError,
+    ClassifiedError,
+    RequestErrorAccumulator,
+    classify_error,
+    should_rotate_on_error,
+    should_retry_same_key,
+    mask_credential,
+)
+from ..core.constants import DEFAULT_MAX_RETRIES
+
+from .types import RetryState, AvailabilityStats
+from .filters import CredentialFilter
+from .transforms import ProviderTransforms
+from .streaming import StreamingHandler
+
+if TYPE_CHECKING:
+    from ..usage import UsageManager
+
+lib_logger = logging.getLogger("rotator_library")
+
+
+class RequestExecutor:
+    """
+    Unified retry/rotation logic for all request types.
+
+    This class handles:
+    - Credential rotation across providers
+    - Per-credential retry with backoff
+    - Error classification and handling
+    - Streaming and non-streaming requests
+    """
+
+    def __init__(
+        self,
+        usage_managers: Dict[str, "UsageManager"],
+        cooldown_manager: Any,
+        credential_filter: CredentialFilter,
+        provider_transforms: ProviderTransforms,
+        provider_plugins: Dict[str, Any],
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        global_timeout: int = 30,
+        abort_on_callback_error: bool = True,
+    ):
+        """
+        Initialize RequestExecutor.
+
+        Args:
+            usage_managers: Dict mapping provider names to UsageManager instances
+            cooldown_manager: CooldownManager instance
+            credential_filter: CredentialFilter instance
+            provider_transforms: ProviderTransforms instance
+            provider_plugins: Dict mapping provider names to plugin classes
+            max_retries: Max retries per credential
+            global_timeout: Global request timeout in seconds
+            abort_on_callback_error: Abort on pre-request callback errors
+        """
+        self._usage_managers = usage_managers
+        self._cooldown = cooldown_manager
+        self._filter = credential_filter
+        self._transforms = provider_transforms
+        self._plugins = provider_plugins
+        self._plugin_instances: Dict[str, Any] = {}
+        self._max_retries = max_retries
+        self._global_timeout = global_timeout
+        self._abort_on_callback_error = abort_on_callback_error
+        # StreamingHandler no longer needs usage_manager - we pass cred_context directly
+        self._streaming_handler = StreamingHandler()
+
+    def _get_plugin_instance(self, provider: str) -> Optional[Any]:
+        """Get or create a plugin instance for a provider."""
+        if provider not in self._plugin_instances:
+            plugin_class = self._plugins.get(provider)
+            if plugin_class:
+                if isinstance(plugin_class, type):
+                    self._plugin_instances[provider] = plugin_class()
+                else:
+                    self._plugin_instances[provider] = plugin_class
+            else:
+                return None
+        return self._plugin_instances[provider]
+
+    async def execute(
+        self,
+        context: RequestContext,
+    ) -> Union[Any, AsyncGenerator[str, None]]:
+        """
+        Execute request with retry/rotation.
+
+        This is the main entry point for request execution.
+
+        Args:
+            context: RequestContext with all request details
+
+        Returns:
+            Response object or async generator for streaming
+        """
+        if context.streaming:
+            return self._execute_streaming(context)
+        else:
+            return await self._execute_non_streaming(context)
+
+    async def _execute_non_streaming(
+        self,
+        context: RequestContext,
+    ) -> Any:
+        """
+        Execute non-streaming request with retry/rotation.
+
+        Args:
+            context: RequestContext with all request details
+
+        Returns:
+            Response object
+        """
+        provider = context.provider
+        model = context.model
+        deadline = context.deadline
+
+        # Get the UsageManager for this provider
+        usage_manager = self._usage_managers.get(provider)
+        if not usage_manager:
+            raise NoAvailableKeysError(f"No UsageManager for provider {provider}")
+
+        # Filter credentials by tier
+        filter_result = self._filter.filter_by_tier(
+            context.credentials, model, provider
+        )
+        credentials = filter_result.all_usable
+
+        if not credentials:
+            raise NoAvailableKeysError(f"No compatible credentials for model {model}")
+
+        error_accumulator = RequestErrorAccumulator()
+        error_accumulator.model = model
+        error_accumulator.provider = provider
+
+        retry_state = RetryState()
+        last_exception: Optional[Exception] = None
+
+        while time.time() < deadline:
+            # Check for untried credentials
+            untried = [c for c in credentials if c not in retry_state.tried_credentials]
+            if not untried:
+                lib_logger.warning(
+                    f"All {len(credentials)} credentials tried for {model}"
+                )
+                break
+
+            # Wait for provider cooldown
+            await self._wait_for_cooldown(provider, deadline)
+
+            # Acquire credential using context manager
+            try:
+                async with usage_manager.acquire_credential(
+                    model=model,
+                    candidates=untried,
+                    priorities=filter_result.priorities,
+                    deadline=deadline,
+                ) as cred_context:
+                    cred = cred_context.credential
+                    retry_state.record_attempt(cred)
+
+                    try:
+                        # Apply transforms
+                        kwargs = await self._transforms.apply(
+                            provider, model, cred, context.kwargs.copy()
+                        )
+
+                        # Get provider plugin
+                        plugin = self._get_plugin_instance(provider)
+
+                        # Execute request with retries
+                        for attempt in range(self._max_retries):
+                            try:
+                                # Pre-request callback
+                                if context.pre_request_callback:
+                                    try:
+                                        await context.pre_request_callback(
+                                            context.request, kwargs
+                                        )
+                                    except Exception as e:
+                                        if self._abort_on_callback_error:
+                                            raise PreRequestCallbackError(str(e)) from e
+                                        lib_logger.warning(
+                                            f"Pre-request callback failed: {e}"
+                                        )
+
+                                # Make the API call
+                                if plugin and plugin.has_custom_logic():
+                                    kwargs["credential_identifier"] = cred
+                                    response = await plugin.acompletion(
+                                        httpx.AsyncClient(), **kwargs
+                                    )
+                                else:
+                                    # Standard LiteLLM call
+                                    kwargs["api_key"] = cred
+                                    response = await litellm.acompletion(**kwargs)
+
+                                # Success! Extract token usage if available
+                                prompt_tokens = 0
+                                completion_tokens = 0
+                                if hasattr(response, "usage") and response.usage:
+                                    prompt_tokens = (
+                                        getattr(response.usage, "prompt_tokens", 0) or 0
+                                    )
+                                    completion_tokens = (
+                                        getattr(response.usage, "completion_tokens", 0)
+                                        or 0
+                                    )
+
+                                cred_context.mark_success(
+                                    response=response,
+                                    prompt_tokens=prompt_tokens,
+                                    completion_tokens=completion_tokens,
+                                )
+                                return response
+
+                            except Exception as e:
+                                last_exception = e
+                                action = await self._handle_error_with_context(
+                                    e,
+                                    cred_context,
+                                    model,
+                                    provider,
+                                    attempt,
+                                    error_accumulator,
+                                    retry_state,
+                                )
+
+                                if action == ErrorAction.RETRY_SAME:
+                                    continue
+                                elif action == ErrorAction.ROTATE:
+                                    break  # Try next credential
+                                else:  # FAIL
+                                    raise
+
+                    except PreRequestCallbackError:
+                        raise
+                    except Exception:
+                        # Let context manager handle cleanup
+                        pass
+
+            except NoAvailableKeysError:
+                break
+
+        # All credentials exhausted
+        error_accumulator.timeout_occurred = time.time() >= deadline
+        if last_exception and not error_accumulator.has_errors():
+            raise last_exception
+
+        # Return error response
+        return error_accumulator.build_client_error_response()
+
+    async def _execute_streaming(
+        self,
+        context: RequestContext,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Execute streaming request with retry/rotation.
+
+        This is an async generator that yields SSE-formatted strings.
+
+        Args:
+            context: RequestContext with all request details
+
+        Yields:
+            SSE-formatted strings
+        """
+        provider = context.provider
+        model = context.model
+        deadline = context.deadline
+
+        # Get the UsageManager for this provider
+        usage_manager = self._usage_managers.get(provider)
+        if not usage_manager:
+            error_data = {
+                "error": {
+                    "message": f"No UsageManager for provider {provider}",
+                    "type": "proxy_error",
+                }
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Filter credentials by tier
+        filter_result = self._filter.filter_by_tier(
+            context.credentials, model, provider
+        )
+        credentials = filter_result.all_usable
+
+        if not credentials:
+            error_data = {
+                "error": {
+                    "message": f"No compatible credentials for {model}",
+                    "type": "proxy_error",
+                }
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        error_accumulator = RequestErrorAccumulator()
+        error_accumulator.model = model
+        error_accumulator.provider = provider
+
+        retry_state = RetryState()
+        last_exception: Optional[Exception] = None
+
+        try:
+            while time.time() < deadline:
+                # Check for untried credentials
+                untried = [
+                    c for c in credentials if c not in retry_state.tried_credentials
+                ]
+                if not untried:
+                    lib_logger.warning(
+                        f"All {len(credentials)} credentials tried for {model}"
+                    )
+                    break
+
+                # Wait for provider cooldown
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                await self._wait_for_cooldown(provider, deadline)
+
+                # Acquire credential using context manager
+                try:
+                    async with usage_manager.acquire_credential(
+                        model=model,
+                        candidates=untried,
+                        priorities=filter_result.priorities,
+                        deadline=deadline,
+                    ) as cred_context:
+                        cred = cred_context.credential
+                        retry_state.record_attempt(cred)
+
+                        try:
+                            # Apply transforms
+                            kwargs = await self._transforms.apply(
+                                provider, model, cred, context.kwargs.copy()
+                            )
+
+                            # Add stream options
+                            if "stream_options" not in kwargs:
+                                kwargs["stream_options"] = {}
+                            if "include_usage" not in kwargs["stream_options"]:
+                                kwargs["stream_options"]["include_usage"] = True
+
+                            # Get provider plugin
+                            plugin = self._get_plugin_instance(provider)
+
+                            # Execute request with retries
+                            for attempt in range(self._max_retries):
+                                try:
+                                    # Pre-request callback
+                                    if context.pre_request_callback:
+                                        try:
+                                            await context.pre_request_callback(
+                                                context.request, kwargs
+                                            )
+                                        except Exception as e:
+                                            if self._abort_on_callback_error:
+                                                raise PreRequestCallbackError(
+                                                    str(e)
+                                                ) from e
+                                            lib_logger.warning(
+                                                f"Pre-request callback failed: {e}"
+                                            )
+
+                                    # Make the API call
+                                    if plugin and plugin.has_custom_logic():
+                                        kwargs["credential_identifier"] = cred
+                                        stream = await plugin.acompletion(
+                                            httpx.AsyncClient(), **kwargs
+                                        )
+                                    else:
+                                        kwargs["api_key"] = cred
+                                        kwargs["stream"] = True
+                                        stream = await litellm.acompletion(**kwargs)
+
+                                    # Hand off to streaming handler with cred_context
+                                    # The handler will call mark_success on completion
+                                    async for (
+                                        chunk
+                                    ) in self._streaming_handler.wrap_stream(
+                                        stream,
+                                        cred,
+                                        model,
+                                        context.request,
+                                        cred_context,
+                                    ):
+                                        yield chunk
+                                    return
+
+                                except StreamedAPIError as e:
+                                    last_exception = e
+                                    original = getattr(e, "data", e)
+                                    classified = classify_error(original, provider)
+                                    error_accumulator.record_error(
+                                        cred, classified, str(original)[:150]
+                                    )
+
+                                    if not should_rotate_on_error(classified):
+                                        cred_context.mark_failure(classified)
+                                        raise
+
+                                    cred_context.mark_failure(classified)
+                                    break  # Rotate
+
+                                except (RateLimitError, httpx.HTTPStatusError) as e:
+                                    last_exception = e
+                                    classified = classify_error(e, provider)
+                                    error_accumulator.record_error(
+                                        cred, classified, str(e)[:150]
+                                    )
+
+                                    if not should_rotate_on_error(classified):
+                                        cred_context.mark_failure(classified)
+                                        raise
+
+                                    cred_context.mark_failure(classified)
+                                    break  # Rotate
+
+                                except (
+                                    APIConnectionError,
+                                    InternalServerError,
+                                    ServiceUnavailableError,
+                                ) as e:
+                                    last_exception = e
+                                    classified = classify_error(e, provider)
+
+                                    if attempt >= self._max_retries - 1:
+                                        error_accumulator.record_error(
+                                            cred, classified, str(e)[:150]
+                                        )
+                                        cred_context.mark_failure(classified)
+                                        break  # Rotate
+
+                                    # Calculate wait time
+                                    wait_time = classified.retry_after or (
+                                        2**attempt
+                                    ) + random.uniform(0, 1)
+                                    remaining = deadline - time.time()
+                                    if wait_time > remaining:
+                                        break  # No time to wait
+
+                                    await asyncio.sleep(wait_time)
+                                    continue  # Retry
+
+                                except Exception as e:
+                                    last_exception = e
+                                    classified = classify_error(e, provider)
+                                    error_accumulator.record_error(
+                                        cred, classified, str(e)[:150]
+                                    )
+
+                                    if not should_rotate_on_error(classified):
+                                        cred_context.mark_failure(classified)
+                                        raise
+
+                                    cred_context.mark_failure(classified)
+                                    break  # Rotate
+
+                        except PreRequestCallbackError:
+                            raise
+                        except Exception:
+                            # Let context manager handle cleanup
+                            pass
+
+                except NoAvailableKeysError:
+                    break
+
+            # All credentials exhausted or timeout
+            error_accumulator.timeout_occurred = time.time() >= deadline
+            error_data = error_accumulator.build_client_error_response()
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except NoAvailableKeysError as e:
+            lib_logger.error(f"No keys available: {e}")
+            error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
+            error_data = {"error": {"message": str(e), "type": "proxy_internal_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    async def _wait_for_cooldown(
+        self,
+        provider: str,
+        deadline: float,
+    ) -> None:
+        """
+        Wait for provider-level cooldown to end.
+
+        Args:
+            provider: Provider name
+            deadline: Request deadline
+        """
+        if not self._cooldown:
+            return
+
+        remaining = await self._cooldown.get_remaining_cooldown(provider)
+        if remaining > 0:
+            budget = deadline - time.time()
+            if remaining > budget:
+                lib_logger.warning(
+                    f"Provider {provider} cooldown ({remaining:.1f}s) exceeds budget ({budget:.1f}s)"
+                )
+                return  # Will fail on no keys available
+            lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
+            await asyncio.sleep(remaining)
+
+    async def _handle_error_with_context(
+        self,
+        error: Exception,
+        cred_context: Any,  # CredentialContext
+        model: str,
+        provider: str,
+        attempt: int,
+        error_accumulator: RequestErrorAccumulator,
+        retry_state: RetryState,
+    ) -> str:
+        """
+        Handle an error and determine next action.
+
+        Args:
+            error: The caught exception
+            cred_context: CredentialContext for marking failure
+            model: Model name
+            provider: Provider name
+            attempt: Current attempt number
+            error_accumulator: Error tracking
+            retry_state: Retry state tracking
+
+        Returns:
+            ErrorAction indicating what to do next
+        """
+        classified = classify_error(error, provider)
+        error_message = str(error)[:150]
+        credential = cred_context.credential
+
+        # Check for quota errors
+        if classified.error_type == "quota_exceeded":
+            retry_state.increment_quota_failures()
+            if retry_state.consecutive_quota_failures >= 3:
+                # Likely request is too large
+                lib_logger.error(
+                    f"3 consecutive quota errors - request may be too large"
+                )
+                error_accumulator.record_error(credential, classified, error_message)
+                cred_context.mark_failure(classified)
+                return ErrorAction.FAIL
+        else:
+            retry_state.reset_quota_failures()
+
+        # Check if should rotate
+        if not should_rotate_on_error(classified):
+            error_accumulator.record_error(credential, classified, error_message)
+            cred_context.mark_failure(classified)
+            return ErrorAction.FAIL
+
+        # Check if should retry same key
+        if should_retry_same_key(classified) and attempt < self._max_retries - 1:
+            wait_time = classified.retry_after or (2**attempt) + random.uniform(0, 1)
+            lib_logger.info(
+                f"Retrying {mask_credential(credential)} in {wait_time:.1f}s"
+            )
+            await asyncio.sleep(wait_time)
+            return ErrorAction.RETRY_SAME
+
+        # Record error and rotate
+        error_accumulator.record_error(credential, classified, error_message)
+        cred_context.mark_failure(classified)
+        lib_logger.info(
+            f"Rotating from {mask_credential(credential)} after {classified.error_type}"
+        )
+        return ErrorAction.ROTATE
