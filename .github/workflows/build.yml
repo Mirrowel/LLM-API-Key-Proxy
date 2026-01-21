@@ -236,6 +236,77 @@ jobs:
             echo "No new format tag found. Falling back to search for any older build tag..."
             LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
           fi
+          
+          # ═══════════════════════════════════════════════════════════
+          # PARENT BRANCH FALLBACK: Find closest parent branch's tag
+          # ═══════════════════════════════════════════════════════════
+          if [ -z "$LAST_TAG" ]; then
+            echo ""
+            echo "⚠️ No tag found for '$BRANCH_NAME', searching parent branches..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            FALLBACK_BRANCHES="main master develop dev"
+            BEST_TAG=""
+            BEST_DISTANCE=999999
+            BEST_PARENT=""
+            
+            for PARENT in $FALLBACK_BRANCHES; do
+              # Skip if same as current branch
+              [ "$PARENT" == "$BRANCH_NAME" ] && continue
+              
+              # Check if branch exists (remote first, then local)
+              if git rev-parse --verify "origin/$PARENT" >/dev/null 2>&1; then
+                BRANCH_REF="origin/$PARENT"
+              elif git rev-parse --verify "$PARENT" >/dev/null 2>&1; then
+                BRANCH_REF="$PARENT"
+              else
+                echo "   $PARENT: doesn't exist, skipping"
+                continue
+              fi
+              
+              # Find merge-base (common ancestor)
+              MERGE_BASE=$(git merge-base HEAD "$BRANCH_REF" 2>/dev/null || true)
+              if [ -z "$MERGE_BASE" ]; then
+                echo "   $PARENT: no common ancestor, skipping"
+                continue
+              fi
+              
+              # Count commits from merge-base to HEAD (distance = how far we've diverged)
+              DISTANCE=$(git rev-list --count "$MERGE_BASE"..HEAD 2>/dev/null || echo "999999")
+              
+              # Find tag at or before merge-base
+              PARENT_TAG=$(git describe --tags --abbrev=0 --match="$PARENT/build-*" "$MERGE_BASE" 2>/dev/null || true)
+              
+              if [ -n "$PARENT_TAG" ]; then
+                echo "   $PARENT: found $PARENT_TAG (distance: $DISTANCE commits)"
+                if [ "$DISTANCE" -lt "$BEST_DISTANCE" ]; then
+                  BEST_DISTANCE=$DISTANCE
+                  BEST_TAG=$PARENT_TAG
+                  BEST_PARENT=$PARENT
+                fi
+              else
+                echo "   $PARENT: no build tag found at merge-base"
+              fi
+            done
+            
+            if [ -n "$BEST_TAG" ]; then
+              LAST_TAG="$BEST_TAG"
+              echo ""
+              echo "✅ Using parent tag: $LAST_TAG (from '$BEST_PARENT', $BEST_DISTANCE commits ago)"
+            fi
+          fi
+          
+          # ═══════════════════════════════════════════════════════════
+          # ULTIMATE FALLBACK: Any ancestor tag
+          # ═══════════════════════════════════════════════════════════
+          if [ -z "$LAST_TAG" ]; then
+            echo ""
+            echo "🔍 No parent branch tag found, trying any ancestor tag..."
+            LAST_TAG=$(git describe --tags --abbrev=0 --match="*/build-*" HEAD 2>/dev/null || true)
+            if [ -n "$LAST_TAG" ]; then
+              echo "✅ Found ancestor tag: $LAST_TAG"
+            fi
+          fi
         fi
         
         echo "✅ Using tag: $LAST_TAG"
