@@ -198,7 +198,9 @@ class RequestExecutor:
                 )
                 break
 
-            availability = usage_manager.get_availability_stats(model, quota_group)
+            availability = await usage_manager.get_availability_stats(
+                model, quota_group
+            )
             blocked = availability.get("blocked_by", {})
             blocked_parts = []
             if blocked.get("cooldowns"):
@@ -222,7 +224,9 @@ class RequestExecutor:
 
             # Acquire credential using context manager
             try:
-                availability = usage_manager.get_availability_stats(model, quota_group)
+                availability = await usage_manager.get_availability_stats(
+                    model, quota_group
+                )
                 async with await usage_manager.acquire_credential(
                     model=model,
                     quota_group=quota_group,
@@ -241,9 +245,9 @@ class RequestExecutor:
                     selection_mode = availability.get("rotation_mode")
                     quota_display = "?/?"
                     primary_def = None
-                    if state and getattr(usage_manager, "limits", None):
+                    if state and getattr(usage_manager, "window_manager", None):
                         primary_def = (
-                            usage_manager.limits.windows.get_primary_definition()
+                            usage_manager.window_manager.get_primary_definition()
                         )
                     if state and primary_def:
                         scope_key = (
@@ -468,7 +472,9 @@ class RequestExecutor:
         last_exception: Optional[Exception] = None
 
         try:
-            availability = usage_manager.get_availability_stats(model, quota_group)
+            availability = await usage_manager.get_availability_stats(
+                model, quota_group
+            )
             blocked = availability.get("blocked_by", {})
             blocked_parts = []
             if blocked.get("cooldowns"):
@@ -506,7 +512,7 @@ class RequestExecutor:
 
                 # Acquire credential using context manager
                 try:
-                    availability = usage_manager.get_availability_stats(
+                    availability = await usage_manager.get_availability_stats(
                         model, quota_group
                     )
                     async with await usage_manager.acquire_credential(
@@ -527,9 +533,9 @@ class RequestExecutor:
                         selection_mode = availability.get("rotation_mode")
                         quota_display = "?/?"
                         primary_def = None
-                        if state and getattr(usage_manager, "limits", None):
+                        if state and getattr(usage_manager, "window_manager", None):
                             primary_def = (
-                                usage_manager.limits.windows.get_primary_definition()
+                                usage_manager.window_manager.get_primary_definition()
                             )
                         if state and primary_def:
                             scope_key = (

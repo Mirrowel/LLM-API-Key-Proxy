@@ -1479,6 +1479,11 @@ class UsageManager:
         return self._limits
 
     @property
+    def window_manager(self) -> WindowManager:
+        """Get the window manager."""
+        return self._window_manager
+
+    @property
     def selection(self) -> SelectionEngine:
         """Get the selection engine."""
         return self._selection
