@@ -1,5 +1,86 @@
 name: Build and Release Executable
 
+# ╔═══════════════════════════════════════════════════════════════════════════════════════╗
+# ║                              CONFIGURATION SECTION                                     ║
+# ║  Edit the values below to customize build triggers, release contents, and behavior.   ║
+# ║  All user-configurable options are centralized in this section for easy maintenance.  ║
+# ╚═══════════════════════════════════════════════════════════════════════════════════════╝
+
+env:
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ BRANCH CONFIGURATION                                                                  │
+  # │ NOTE: BUILD_BRANCHES is for reference only. To change which branches trigger builds, │
+  # │       you must ALSO update the 'on.push.branches' section below.                      │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  
+  # Branches that trigger automatic builds (for reference - actual triggers are in 'on:' block)
+  BUILD_BRANCHES: "dev,main"
+  
+  # Branches marked as "stable" releases (non-prerelease, marked as "latest")
+  # Branches NOT in this list will be marked as experimental/prerelease
+  STABLE_BRANCHES: "main"
+  
+  # Parent branches to search for tags when current branch has none (space-separated, priority order)
+  # Used for first build on a new branch to find a comparison point
+  FALLBACK_BRANCHES: "main master develop dev"
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ RELEASE FILES - Files to include in release archives                                 │
+  # │ Paths are relative to repository root. Space-separated.                              │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  
+  # Files included in ALL platform archives (Windows, Linux, macOS)
+  RELEASE_FILES_ALL: ".env.example README.md DOCUMENTATION.md LICENSE"
+  
+  # Platform-specific files (in addition to RELEASE_FILES_ALL)
+  RELEASE_FILES_WINDOWS: ""
+  RELEASE_FILES_LINUX: ""
+  RELEASE_FILES_MACOS: ""
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ FILE DESCRIPTIONS - Shown in release notes under "Included Files"                    │
+  # │ Format: One file per line as "filename|description"                                  │
+  # │ Use **text** for bold in descriptions (markdown supported)                           │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  FILE_DESCRIPTIONS: |
+    proxy_app.exe|Main application executable with built-in TUI launcher for **Windows**.
+    proxy_app|Main application executable with built-in TUI launcher for **Linux** and **macOS**.
+    .env.example|Example configuration file. Copy to `.env` and add your API keys.
+    README.md|Project overview and quick start guide.
+    DOCUMENTATION.md|Detailed configuration and usage documentation.
+    LICENSE|License.
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ EXPERIMENTAL BUILD WARNING                                                            │
+  # │ Shown at the top of release notes for branches NOT in STABLE_BRANCHES                │
+  # │ Placeholders: {BRANCH} = branch name, {VERSION} = build version, {REPO} = owner/repo │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  EXPERIMENTAL_WARNING: |
+    > [!WARNING]
+    > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
+    > |:---------------------------:|
+    > This release is from the [`{BRANCH}`](https://github.com/{REPO}/tree/{BRANCH}) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
+    >
+    > **Do not use in production environments.**
+    >
+    > ---
+    >
+    > **Found an issue?** Please [report it here](https://github.com/{REPO}/issues/new/choose) and include the build version (`{VERSION}`) in your report.
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ RELEASE PRUNING CONFIGURATION                                                         │
+  # │ Automatically clean up old releases to save space                                     │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  PRUNE_ENABLED: "false"
+  PRUNE_PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
+  PRUNE_RETENTION_DAYS: "1"
+  PRUNE_KEEP_DAILY_SNAPSHOT: "true"
+  PRUNE_MAX_COUNT: "10"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#                                    WORKFLOW TRIGGERS
+# ════════════════════════════════════════════════════════════════════════════════════════════
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,14 +94,25 @@ on:
         type: boolean
         default: false
   push:
+    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
+    # │ BRANCHES: Update this list to match BUILD_BRANCHES in the env section above        │
+    # └─────────────────────────────────────────────────────────────────────────────────────┘
     branches:
       - dev
       - main
+    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
+    # │ PATHS: Files/directories that trigger a build when changed                         │
+    # │ The build will only run if changes are made to files matching these patterns       │
+    # └─────────────────────────────────────────────────────────────────────────────────────┘
     paths:
-      - 'src/proxy_app/**'
-      - 'src/rotator_library/**'
-      - '.github/workflows/build.yml'
-      - 'cliff.toml'
+      - 'src/proxy_app/**'       # Main application source code
+      - 'src/rotator_library/**' # Key rotation library
+      - '.github/workflows/build.yml'  # This workflow file
+      - 'cliff.toml'             # Changelog configuration
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#                                         JOBS
+# ════════════════════════════════════════════════════════════════════════════════════════════
 
 jobs:
   build:
@@ -117,8 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      WHITELISTED_BRANCHES: "main"
+    # Note: STABLE_BRANCHES is defined in the top-level env section
     steps:
     - name: Check out repository
       uses: actions/checkout@v5
@@ -175,11 +266,51 @@ jobs:
         for dir in release-assets/proxy-app-build-*; do
             if [ -d "$dir" ]; then
                 os_name=$(basename "$dir" | cut -d'-' -f4)
+                
+                echo "📦 Processing $os_name archive..."
+                
+                # ═══════════════════════════════════════════════════════════
+                # Copy common files (from RELEASE_FILES_ALL config)
+                # ═══════════════════════════════════════════════════════════
+                for file in ${{ env.RELEASE_FILES_ALL }}; do
+                  if [ -f "$file" ]; then
+                    cp "$file" "$dir/"
+                    echo "   ✓ Added: $file"
+                  else
+                    echo "   ⚠ Not found: $file"
+                  fi
+                done
+                
+                # ═══════════════════════════════════════════════════════════
+                # Copy platform-specific files
+                # ═══════════════════════════════════════════════════════════
+                case "$os_name" in
+                  Windows) EXTRA_FILES="${{ env.RELEASE_FILES_WINDOWS }}" ;;
+                  Linux)   EXTRA_FILES="${{ env.RELEASE_FILES_LINUX }}" ;;
+                  macOS)   EXTRA_FILES="${{ env.RELEASE_FILES_MACOS }}" ;;
+                  *)       EXTRA_FILES="" ;;
+                esac
+                
+                if [ -n "$EXTRA_FILES" ]; then
+                  for file in $EXTRA_FILES; do
+                    if [ -f "$file" ]; then
+                      cp "$file" "$dir/"
+                      echo "   ✓ Added ($os_name only): $file"
+                    else
+                      echo "   ⚠ Not found: $file"
+                    fi
+                  done
+                fi
+                
+                # Create the archive
                 archive_name="LLM-API-Key-Proxy-${os_name}-${{ steps.version.outputs.archive_version_part }}.zip"
                 (
                     cd "$dir"
                     zip -r "../../$archive_name" .
                 )
+                
+                echo "   ✅ Created: $archive_name"
+                
                 if [ -z "$ASSET_PATHS" ]; then
                     ASSET_PATHS="$archive_name"
                 else
@@ -245,7 +376,8 @@ jobs:
             echo "⚠️ No tag found for '$BRANCH_NAME', searching parent branches..."
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
-            FALLBACK_BRANCHES="main master develop dev"
+            # Use FALLBACK_BRANCHES from config
+            FALLBACK_BRANCHES="${{ env.FALLBACK_BRANCHES }}"
             BEST_TAG=""
             BEST_DISTANCE=999999
             BEST_PARENT=""
@@ -698,11 +830,16 @@ jobs:
           CHANGELOG_URL=""
         fi
 
-        # Generate file descriptions
+        # Generate file descriptions table from FILE_DESCRIPTIONS config
         FILE_TABLE="| File | Description |
-        |------|-------------|
-        | \`proxy_app.exe\` | Main application executable with built-in TUI launcher for **Windows**. |
-        | \`proxy_app\` | Main application executable with built-in TUI launcher for **Linux** and **macOS**. |"
+        |------|-------------|"
+        while IFS='|' read -r filename description; do
+          # Skip empty lines
+          if [ -n "$filename" ] && [ -n "$description" ]; then
+            FILE_TABLE="$FILE_TABLE
+        | \`$filename\` | $description |"
+          fi
+        done <<< "${{ env.FILE_DESCRIPTIONS }}"
 
         # List archives
         WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
@@ -752,23 +889,16 @@ jobs:
         LATEST_FLAG="--latest"
         EXPERIMENTAL_NOTE=""
 
-        # Check if the current branch is in the comma-separated whitelist
-        if ! [[ ",${{ env.WHITELISTED_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
+        # Check if the current branch is in the stable branches list
+        if ! [[ ",${{ env.STABLE_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
           PRERELEASE_FLAG="--prerelease"
-          LATEST_FLAG="" # Do not mark non-whitelisted branches as 'latest'
-          EXPERIMENTAL_NOTE=$(cat <<-EOF
-        > [!WARNING]
-        > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
-        > |:---------------------------:|
-        > This release is from the [\`$CURRENT_BRANCH\`](https://github.com/${{ github.repository }}/tree/$CURRENT_BRANCH) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
-        >
-        > **Do not use in production environments.**
-        >
-        > ---
-        >
-        > **Found an issue?** Please [report it here](https://github.com/${{ github.repository }}/issues/new/choose) and include the build version (\`${{ steps.version.outputs.version }}\`) in your report.
-        EOF
-          )
+          LATEST_FLAG="" # Do not mark non-stable branches as 'latest'
+          
+          # Generate experimental warning from template with placeholder substitution
+          EXPERIMENTAL_NOTE=$(echo '${{ env.EXPERIMENTAL_WARNING }}' | \
+            sed "s|{BRANCH}|$CURRENT_BRANCH|g" | \
+            sed "s|{VERSION}|${{ steps.version.outputs.version }}|g" | \
+            sed "s|{REPO}|${{ github.repository }}|g")
         fi
 
         # Prepend the experimental note if it exists
@@ -798,11 +928,12 @@ jobs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        PRUNE_ENABLED: false
-        PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
-        RETENTION_DAYS_FULL: 1
-        RETENTION_KEEP_ONE_DAILY_OLDER: true
-        RETENTION_MAX_COUNT: 10
+        # Pruning config from top-level env section
+        PRUNE_ENABLED: ${{ env.PRUNE_ENABLED }}
+        PROTECTED_BRANCHES: ${{ env.PRUNE_PROTECTED_BRANCHES }}
+        RETENTION_DAYS_FULL: ${{ env.PRUNE_RETENTION_DAYS }}
+        RETENTION_KEEP_ONE_DAILY_OLDER: ${{ env.PRUNE_KEEP_DAILY_SNAPSHOT }}
+        RETENTION_MAX_COUNT: ${{ env.PRUNE_MAX_COUNT }}
         DRY_RUN: ${{ github.event.inputs.dry_run }}
         CURRENT_TAG: ${{ steps.version.outputs.release_tag }}
       run: |
