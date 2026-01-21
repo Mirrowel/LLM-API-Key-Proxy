@@ -5,7 +5,7 @@ import re
 import json
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import httpx
 
 from litellm.exceptions import (
@@ -439,6 +439,8 @@ class ClassifiedError:
         status_code: Optional[int] = None,
         retry_after: Optional[int] = None,
         quota_reset_timestamp: Optional[float] = None,
+        quota_value: Optional[str] = None,
+        quota_id: Optional[str] = None,
     ):
         self.error_type = error_type
         self.original_exception = original_exception
@@ -447,6 +449,9 @@ class ClassifiedError:
         # Unix timestamp when quota resets (from quota_exhausted errors)
         # This is the authoritative reset time parsed from provider's error response
         self.quota_reset_timestamp = quota_reset_timestamp
+        # Quota details extracted from Google/Gemini API error responses
+        self.quota_value = quota_value  # e.g., "50" or "1000/minute"
+        self.quota_id = quota_id  # e.g., "GenerateContentPerMinutePerProject"
 
     def __str__(self):
         parts = [
@@ -456,6 +461,10 @@ class ClassifiedError:
         ]
         if self.quota_reset_timestamp:
             parts.append(f"quota_reset_ts={self.quota_reset_timestamp}")
+        if self.quota_value:
+            parts.append(f"quota_value={self.quota_value}")
+        if self.quota_id:
+            parts.append(f"quota_id={self.quota_id}")
         parts.append(f"original_exc={self.original_exception}")
         return f"ClassifiedError({', '.join(parts)})"
 
@@ -518,6 +527,73 @@ def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
         pass
 
     return None
+
+
+def _extract_quota_details(json_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract quota details (quotaValue, quotaId) from a JSON error response.
+
+    Handles Google/Gemini API error formats with nested details array containing
+    QuotaFailure violations.
+
+    Example error structure:
+    {
+        "error": {
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaValue": "50",
+                            "quotaId": "GenerateContentPerMinutePerProject"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    Args:
+        json_text: JSON string containing error response
+
+    Returns:
+        Tuple of (quota_value, quota_id), both None if not found
+    """
+    try:
+        # Find JSON object in the text
+        json_match = re.search(r"(\{.*\})", json_text, re.DOTALL)
+        if not json_match:
+            return None, None
+
+        error_json = json.loads(json_match.group(1))
+        error_obj = error_json.get("error", {})
+        details = error_obj.get("details", [])
+
+        if not isinstance(details, list):
+            return None, None
+
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+
+            violations = detail.get("violations", [])
+            if not isinstance(violations, list):
+                continue
+
+            for violation in violations:
+                if not isinstance(violation, dict):
+                    continue
+
+                quota_value = violation.get("quotaValue")
+                quota_id = violation.get("quotaId")
+
+                if quota_value is not None or quota_id is not None:
+                    return str(quota_value) if quota_value else None, quota_id
+
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        pass
+
+    return None, None
 
 
 def get_retry_after(error: Exception) -> Optional[int]:
@@ -672,12 +748,19 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     reset_ts = quota_info.get("reset_timestamp")
                     quota_reset_timestamp = quota_info.get("quota_reset_timestamp")
 
+                    # Extract quota details from error body
+                    quota_value, quota_id = None, None
+                    if error_body:
+                        quota_value, quota_id = _extract_quota_details(error_body)
+
                     # Log the parsed result with human-readable duration
                     hours = retry_after / 3600
                     lib_logger.info(
                         f"Provider '{provider}' parsed quota error: "
                         f"retry_after={retry_after}s ({hours:.1f}h), reason={reason}"
                         + (f", resets at {reset_ts}" if reset_ts else "")
+                        + (f", quota={quota_value}" if quota_value else "")
+                        + (f", quotaId={quota_id}" if quota_id else "")
                     )
 
                     return ClassifiedError(
@@ -686,6 +769,8 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                         status_code=429,
                         retry_after=retry_after,
                         quota_reset_timestamp=quota_reset_timestamp,
+                        quota_value=quota_value,
+                        quota_id=quota_id,
                     )
         except Exception as parse_error:
             lib_logger.debug(
@@ -723,11 +808,23 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             retry_after = get_retry_after(e)
             # Check if this is a quota error vs rate limit
             if "quota" in error_body or "resource_exhausted" in error_body:
+                # Extract quota details from the original (non-lowercased) response
+                quota_value, quota_id = None, None
+                try:
+                    original_body = (
+                        e.response.text if hasattr(e.response, "text") else ""
+                    )
+                    quota_value, quota_id = _extract_quota_details(original_body)
+                except Exception:
+                    pass
+
                 return ClassifiedError(
                     error_type="quota_exceeded",
                     original_exception=e,
                     status_code=status_code,
                     retry_after=retry_after,
+                    quota_value=quota_value,
+                    quota_id=quota_id,
                 )
             return ClassifiedError(
                 error_type="rate_limit",
@@ -820,11 +917,21 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         # Check if this is a quota error vs rate limit
         error_msg = str(e).lower()
         if "quota" in error_msg or "resource_exhausted" in error_msg:
+            # Try to extract quota details from exception body
+            quota_value, quota_id = None, None
+            try:
+                error_body = getattr(e, "body", None) or str(e)
+                quota_value, quota_id = _extract_quota_details(str(error_body))
+            except Exception:
+                pass
+
             return ClassifiedError(
                 error_type="quota_exceeded",
                 original_exception=e,
                 status_code=status_code or 429,
                 retry_after=retry_after,
+                quota_value=quota_value,
+                quota_id=quota_id,
             )
         return ClassifiedError(
             error_type="rate_limit",

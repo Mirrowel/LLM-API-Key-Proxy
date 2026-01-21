@@ -275,6 +275,9 @@ class RotatingClient:
                 f"Invalid model format or no credentials for provider: {model}"
             )
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Resolve model ID
         resolved_model = self._model_resolver.resolve_model_id(model, provider)
         kwargs["model"] = resolved_model
@@ -286,6 +289,7 @@ class RotatingClient:
                 provider=provider,
                 model=resolved_model,
                 enabled=True,
+                parent_dir=parent_log_dir,
             )
             transaction_logger.log_request(kwargs)
 

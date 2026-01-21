@@ -34,19 +34,9 @@ class StreamingHandler:
 
     This class extracts the streaming logic that was in _safe_streaming_wrapper
     and provides a clean interface for processing LiteLLM streams.
+
+    Usage recording is handled via CredentialContext passed to wrap_stream().
     """
-
-    def __init__(self, usage_manager: Optional[Any] = None):
-        """
-        Initialize StreamingHandler.
-
-        Args:
-            usage_manager: Legacy UsageManager instance for recording usage.
-                          If None, usage recording is skipped.
-                          NOTE: When using CredentialContext, pass None here
-                          as the context handles recording.
-        """
-        self._usage = usage_manager
 
     async def wrap_stream(
         self,
@@ -66,16 +56,14 @@ class StreamingHandler:
 
         Args:
             stream: The async iterator from LiteLLM
-            credential: Credential identifier for usage recording (legacy)
+            credential: Credential identifier (for logging)
             model: Model name for usage recording
             request: Optional FastAPI request for disconnect detection
-            cred_context: Optional CredentialContext for marking success/failure.
-                         If provided, this takes precedence over legacy usage_manager.
+            cred_context: CredentialContext for marking success/failure
 
         Yields:
             SSE-formatted strings: "data: {...}\\n\\n"
         """
-        last_usage = None
         stream_completed = False
         error_buffer = StreamBuffer()  # Use StreamBuffer for JSON reassembly
         accumulated_finish_reason: Optional[str] = None
@@ -115,14 +103,10 @@ class StreamingHandler:
                     if processed.finish_reason and not has_tool_calls:
                         # Only update if not already tool_calls (highest priority)
                         accumulated_finish_reason = processed.finish_reason
-                    if processed.usage:
-                        last_usage = processed.usage
-                        # Extract token counts
-                        if isinstance(processed.usage, dict):
-                            prompt_tokens = processed.usage.get("prompt_tokens", 0)
-                            completion_tokens = processed.usage.get(
-                                "completion_tokens", 0
-                            )
+                    if processed.usage and isinstance(processed.usage, dict):
+                        # Extract token counts from final chunk
+                        prompt_tokens = processed.usage.get("prompt_tokens", 0)
+                        completion_tokens = processed.usage.get("completion_tokens", 0)
 
                     yield processed.sse_string
 
@@ -187,17 +171,10 @@ class StreamingHandler:
             # Record usage if stream completed
             if stream_completed:
                 if cred_context:
-                    # Use new context-based recording
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                     )
-                elif self._usage:
-                    # Legacy recording
-                    if last_usage:
-                        await self._record_usage(credential, model, last_usage)
-                    else:
-                        await self._usage.record_success(credential, model)
 
                 # Yield [DONE] for completed streams
                 yield "data: [DONE]\n\n"
@@ -318,36 +295,6 @@ class StreamingHandler:
                 pass
 
         return None
-
-    async def _record_usage(
-        self,
-        credential: str,
-        model: str,
-        usage: Dict[str, Any],
-    ) -> None:
-        """
-        Record usage from streaming response.
-
-        Creates a minimal response object for the usage manager.
-
-        Args:
-            credential: Credential identifier
-            model: Model name
-            usage: Usage dict from final chunk
-        """
-        if not self._usage:
-            return
-
-        # Create a simple object with usage attribute
-        class UsageResponse:
-            def __init__(self, usage_dict):
-                self.usage = type("Usage", (), usage_dict)()
-
-        try:
-            response = UsageResponse(usage)
-            await self._usage.record_success(credential, model, response)
-        except Exception as e:
-            lib_logger.warning(f"Failed to record streaming usage: {e}")
 
 
 class StreamBuffer:
