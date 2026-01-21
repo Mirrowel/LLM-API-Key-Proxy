@@ -52,22 +52,37 @@ class WindowLimitChecker(LimitChecker):
         Returns:
             LimitCheckResult indicating pass/fail
         """
-        # Check all windows
-        for window_name, window in state.usage.windows.items():
-            # Skip if no limit defined
-            if window.limit is None:
+        group_key = quota_group or model
+
+        # Check all configured windows
+        for definition in self._windows.definitions.values():
+            scope_key = None
+            if definition.applies_to == "model":
+                scope_key = model
+            elif definition.applies_to == "group":
+                scope_key = group_key
+
+            usage = state.get_usage_for_scope(
+                definition.applies_to, scope_key, create=False
+            )
+            if usage is None:
                 continue
 
-            # Check if window is still active
-            active = self._windows.get_active_window(state.usage.windows, window_name)
-            if active is None:
-                continue  # Window expired, will be reset
+            window = usage.windows.get(definition.name)
+            if window is None or window.limit is None:
+                continue
 
-            # Check if limit exceeded
+            active = self._windows.get_active_window(usage.windows, definition.name)
+            if active is None:
+                continue
+
             if active.request_count >= active.limit:
                 return LimitCheckResult.blocked(
                     result=LimitResult.BLOCKED_WINDOW,
-                    reason=f"Window '{window_name}' exhausted ({active.request_count}/{active.limit})",
+                    reason=(
+                        f"Window '{definition.name}' exhausted "
+                        f"({active.request_count}/{active.limit})"
+                    ),
                     blocked_until=active.reset_at,
                 )
 
@@ -77,6 +92,8 @@ class WindowLimitChecker(LimitChecker):
         self,
         state: CredentialState,
         window_name: str,
+        model: Optional[str] = None,
+        quota_group: Optional[str] = None,
     ) -> Optional[int]:
         """
         Get remaining requests in a specific window.
@@ -88,11 +105,30 @@ class WindowLimitChecker(LimitChecker):
         Returns:
             Remaining requests, or None if unlimited/unknown
         """
-        return self._windows.get_window_remaining(state.usage.windows, window_name)
+        group_key = quota_group or model or ""
+        definition = self._windows.definitions.get(window_name)
+        if not definition:
+            return self._windows.get_window_remaining(state.usage.windows, window_name)
+
+        scope_key = None
+        if definition.applies_to == "model":
+            scope_key = model
+        elif definition.applies_to == "group":
+            scope_key = group_key
+
+        usage = state.get_usage_for_scope(
+            definition.applies_to, scope_key, create=False
+        )
+        if not usage:
+            return None
+
+        return self._windows.get_window_remaining(usage.windows, window_name)
 
     def get_all_remaining(
         self,
         state: CredentialState,
+        model: Optional[str] = None,
+        quota_group: Optional[str] = None,
     ) -> dict[str, Optional[int]]:
         """
         Get remaining requests for all windows.
@@ -104,6 +140,11 @@ class WindowLimitChecker(LimitChecker):
             Dict of window_name -> remaining (None if unlimited)
         """
         result = {}
-        for window_name in state.usage.windows:
-            result[window_name] = self.get_remaining(state, window_name)
+        for definition in self._windows.definitions.values():
+            result[definition.name] = self.get_remaining(
+                state,
+                definition.name,
+                model=model,
+                quota_group=quota_group,
+            )
         return result

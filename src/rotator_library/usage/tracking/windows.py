@@ -118,6 +118,8 @@ class WindowManager:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
+        request_count: int = 1,
         limit: Optional[int] = None,
     ) -> WindowStats:
         """
@@ -136,11 +138,12 @@ class WindowManager:
         """
         window = self.get_or_create_window(windows, window_name, limit)
 
-        window.request_count += 1
+        window.request_count += request_count
         window.prompt_tokens += prompt_tokens
         window.prompt_tokens_cached += prompt_tokens_cached
         window.completion_tokens += completion_tokens
-        window.total_tokens += prompt_tokens + completion_tokens
+        window.approx_cost += approx_cost
+        window.total_tokens += prompt_tokens + completion_tokens + prompt_tokens_cached
 
         return window
 
@@ -160,6 +163,13 @@ class WindowManager:
         for name, definition in self.definitions.items():
             if definition.is_primary:
                 return self.get_active_window(windows, name)
+        return None
+
+    def get_primary_definition(self) -> Optional[WindowDefinition]:
+        """Get the primary window definition."""
+        for definition in self.definitions.values():
+            if definition.is_primary:
+                return definition
         return None
 
     def get_window_remaining(

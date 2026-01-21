@@ -61,7 +61,9 @@ class UsageStorage:
         self._save_lock = asyncio.Lock()
         self._dirty: bool = False
 
-    async def load(self) -> Dict[str, CredentialState]:
+    async def load(
+        self,
+    ) -> tuple[Dict[str, CredentialState], Dict[str, Dict[str, Any]]]:
         """
         Load usage data from file.
 
@@ -70,14 +72,14 @@ class UsageStorage:
         """
         if not self.file_path.exists():
             lib_logger.info(f"No usage file found at {self.file_path}, starting fresh")
-            return {}
+            return {}, {}
 
         try:
             async with self._file_lock():
                 content = await self._read_file()
 
             if not content:
-                return {}
+                return {}, {}
 
             data = json.loads(content)
 
@@ -97,14 +99,14 @@ class UsageStorage:
                     states[stable_id] = state
 
             lib_logger.info(f"Loaded {len(states)} credentials from {self.file_path}")
-            return states
+            return states, data.get("fair_cycle_global", {})
 
         except json.JSONDecodeError as e:
             lib_logger.error(f"Failed to parse usage file: {e}")
-            return {}
+            return {}, {}
         except Exception as e:
             lib_logger.error(f"Failed to load usage file: {e}")
-            return {}
+            return {}, {}
 
     async def save(
         self,
@@ -248,6 +250,65 @@ class UsageStorage:
 
         return data
 
+    def _parse_usage_stats(self, data: Dict[str, Any]) -> UsageStats:
+        """Parse usage stats from storage data."""
+        windows = {}
+        for name, wdata in data.get("windows", {}).items():
+            windows[name] = WindowStats(
+                name=name,
+                request_count=wdata.get("request_count", 0),
+                total_tokens=wdata.get("total_tokens", 0),
+                prompt_tokens=wdata.get("prompt_tokens", 0),
+                prompt_tokens_cached=wdata.get("prompt_tokens_cached", 0),
+                completion_tokens=wdata.get("completion_tokens", 0),
+                approx_cost=wdata.get("approx_cost", 0.0),
+                started_at=wdata.get("started_at"),
+                reset_at=wdata.get("reset_at"),
+                limit=wdata.get("limit"),
+            )
+
+        return UsageStats(
+            windows=windows,
+            total_requests=data.get("total_requests", 0),
+            total_successes=data.get("total_successes", 0),
+            total_failures=data.get("total_failures", 0),
+            total_tokens=data.get("total_tokens", 0),
+            total_prompt_tokens_cached=data.get("total_prompt_tokens_cached", 0),
+            total_approx_cost=data.get("total_approx_cost", 0.0),
+            first_used_at=data.get("first_used_at"),
+            last_used_at=data.get("last_used_at"),
+            model_request_counts=dict(data.get("model_request_counts", {})),
+        )
+
+    def _serialize_usage_stats(self, usage: UsageStats) -> Dict[str, Any]:
+        """Serialize usage stats for storage."""
+        windows = {}
+        for name, window in usage.windows.items():
+            windows[name] = {
+                "request_count": window.request_count,
+                "total_tokens": window.total_tokens,
+                "prompt_tokens": window.prompt_tokens,
+                "prompt_tokens_cached": window.prompt_tokens_cached,
+                "completion_tokens": window.completion_tokens,
+                "approx_cost": window.approx_cost,
+                "started_at": window.started_at,
+                "reset_at": window.reset_at,
+                "limit": window.limit,
+            }
+
+        return {
+            "windows": windows,
+            "total_requests": usage.total_requests,
+            "total_successes": usage.total_successes,
+            "total_failures": usage.total_failures,
+            "total_tokens": usage.total_tokens,
+            "total_prompt_tokens_cached": usage.total_prompt_tokens_cached,
+            "total_approx_cost": usage.total_approx_cost,
+            "first_used_at": usage.first_used_at,
+            "last_used_at": usage.last_used_at,
+            "model_request_counts": usage.model_request_counts,
+        }
+
     def _parse_credential_state(
         self,
         stable_id: str,
@@ -255,30 +316,16 @@ class UsageStorage:
     ) -> Optional[CredentialState]:
         """Parse a credential state from storage data."""
         try:
-            # Parse windows
-            windows = {}
-            for name, wdata in data.get("windows", {}).items():
-                windows[name] = WindowStats(
-                    name=name,
-                    request_count=wdata.get("request_count", 0),
-                    total_tokens=wdata.get("total_tokens", 0),
-                    prompt_tokens=wdata.get("prompt_tokens", 0),
-                    completion_tokens=wdata.get("completion_tokens", 0),
-                    started_at=wdata.get("started_at"),
-                    reset_at=wdata.get("reset_at"),
-                    limit=wdata.get("limit"),
-                )
+            usage = self._parse_usage_stats(data)
 
-            # Parse usage stats
-            usage = UsageStats(
-                windows=windows,
-                total_requests=data.get("total_requests", 0),
-                total_successes=data.get("total_successes", 0),
-                total_failures=data.get("total_failures", 0),
-                total_tokens=data.get("total_tokens", 0),
-                first_used_at=data.get("first_used_at"),
-                last_used_at=data.get("last_used_at"),
-            )
+            model_usage = {
+                key: self._parse_usage_stats(usage_data)
+                for key, usage_data in data.get("model_usage", {}).items()
+            }
+            group_usage = {
+                key: self._parse_usage_stats(usage_data)
+                for key, usage_data in data.get("group_usage", {}).items()
+            }
 
             # Parse cooldowns
             cooldowns = {}
@@ -311,6 +358,8 @@ class UsageStorage:
                 tier=data.get("tier"),
                 priority=data.get("priority", 999),
                 usage=usage,
+                model_usage=model_usage,
+                group_usage=group_usage,
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
                 active_requests=0,  # Always starts at 0
@@ -325,19 +374,6 @@ class UsageStorage:
 
     def _serialize_credential_state(self, state: CredentialState) -> Dict[str, Any]:
         """Serialize a credential state for storage."""
-        # Serialize windows
-        windows = {}
-        for name, window in state.usage.windows.items():
-            windows[name] = {
-                "request_count": window.request_count,
-                "total_tokens": window.total_tokens,
-                "prompt_tokens": window.prompt_tokens,
-                "completion_tokens": window.completion_tokens,
-                "started_at": window.started_at,
-                "reset_at": window.reset_at,
-                "limit": window.limit,
-            }
-
         # Serialize cooldowns (only active ones)
         now = time.time()
         cooldowns = {}
@@ -368,13 +404,15 @@ class UsageStorage:
             "display_name": state.display_name,
             "tier": state.tier,
             "priority": state.priority,
-            "windows": windows,
-            "total_requests": state.usage.total_requests,
-            "total_successes": state.usage.total_successes,
-            "total_failures": state.usage.total_failures,
-            "total_tokens": state.usage.total_tokens,
-            "first_used_at": state.usage.first_used_at,
-            "last_used_at": state.usage.last_used_at,
+            **self._serialize_usage_stats(state.usage),
+            "model_usage": {
+                key: self._serialize_usage_stats(usage)
+                for key, usage in state.model_usage.items()
+            },
+            "group_usage": {
+                key: self._serialize_usage_stats(usage)
+                for key, usage in state.group_usage.items()
+            },
             "cooldowns": cooldowns,
             "fair_cycle": fair_cycle,
             "max_concurrent": state.max_concurrent,

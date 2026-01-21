@@ -19,6 +19,8 @@ import logging
 import re
 from typing import Any, AsyncGenerator, AsyncIterator, Dict, Optional, TYPE_CHECKING
 
+import litellm
+
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 
@@ -45,6 +47,7 @@ class StreamingHandler:
         model: str,
         request: Optional[Any] = None,
         cred_context: Optional["CredentialContext"] = None,
+        skip_cost_calculation: bool = False,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a LiteLLM stream with error handling and usage tracking.
@@ -69,6 +72,8 @@ class StreamingHandler:
         accumulated_finish_reason: Optional[str] = None
         has_tool_calls = False
         prompt_tokens = 0
+        prompt_tokens_cached = 0
+        prompt_tokens_uncached = 0
         completion_tokens = 0
 
         # Use manual iteration to allow continue after partial JSON errors
@@ -107,6 +112,19 @@ class StreamingHandler:
                         # Extract token counts from final chunk
                         prompt_tokens = processed.usage.get("prompt_tokens", 0)
                         completion_tokens = processed.usage.get("completion_tokens", 0)
+                        prompt_details = processed.usage.get("prompt_tokens_details")
+                        if prompt_details:
+                            if isinstance(prompt_details, dict):
+                                prompt_tokens_cached = (
+                                    prompt_details.get("cached_tokens", 0) or 0
+                                )
+                            else:
+                                prompt_tokens_cached = (
+                                    getattr(prompt_details, "cached_tokens", 0) or 0
+                                )
+                        prompt_tokens_uncached = max(
+                            0, prompt_tokens - prompt_tokens_cached
+                        )
 
                     yield processed.sse_string
 
@@ -171,9 +189,18 @@ class StreamingHandler:
             # Record usage if stream completed
             if stream_completed:
                 if cred_context:
+                    approx_cost = 0.0
+                    if not skip_cost_calculation:
+                        approx_cost = self._calculate_stream_cost(
+                            model,
+                            prompt_tokens_uncached + prompt_tokens_cached,
+                            completion_tokens,
+                        )
                     cred_context.mark_success(
-                        prompt_tokens=prompt_tokens,
+                        prompt_tokens=prompt_tokens_uncached,
                         completion_tokens=completion_tokens,
+                        prompt_tokens_cached=prompt_tokens_cached,
+                        approx_cost=approx_cost,
                     )
 
                 # Yield [DONE] for completed streams
@@ -295,6 +322,26 @@ class StreamingHandler:
                 pass
 
         return None
+
+    def _calculate_stream_cost(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> float:
+        try:
+            model_info = litellm.get_model_info(model)
+            input_cost = model_info.get("input_cost_per_token")
+            output_cost = model_info.get("output_cost_per_token")
+            total_cost = 0.0
+            if input_cost:
+                total_cost += prompt_tokens * input_cost
+            if output_cost:
+                total_cost += completion_tokens * output_cost
+            return total_cost
+        except Exception as exc:
+            lib_logger.debug(f"Stream cost calculation failed for {model}: {exc}")
+            return 0.0
 
 
 class StreamBuffer:

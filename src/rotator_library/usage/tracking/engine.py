@@ -18,6 +18,8 @@ from ..types import (
     CredentialState,
     CooldownInfo,
     FairCycleState,
+    TrackingMode,
+    FAIR_CYCLE_GLOBAL_KEY,
 )
 from ..config import WindowDefinition, ProviderUsageConfig
 from .windows import WindowManager
@@ -61,6 +63,8 @@ class TrackingEngine:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
+        request_count: int = 1,
         response_headers: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
@@ -78,40 +82,86 @@ class TrackingEngine:
         async with self._lock:
             now = time.time()
             group_key = quota_group or model
+            fair_cycle_key = self._resolve_fair_cycle_key(group_key)
+            fair_cycle_key = self._resolve_fair_cycle_key(group_key)
 
             # Update usage stats
             usage = state.usage
-            usage.total_requests += 1
-            usage.total_successes += 1
-            usage.total_tokens += prompt_tokens + completion_tokens
+            usage.total_requests += request_count
+            usage.total_successes += request_count
+            usage.total_tokens += (
+                prompt_tokens + completion_tokens + prompt_tokens_cached
+            )
             usage.total_prompt_tokens_cached += prompt_tokens_cached
+            usage.total_approx_cost += approx_cost
             usage.last_used_at = now
             if usage.first_used_at is None:
                 usage.first_used_at = now
 
+            self._update_scoped_usage(
+                state,
+                scope="model",
+                key=model,
+                now=now,
+                request_count=request_count,
+                success_count=request_count,
+                failure_count=0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                prompt_tokens_cached=prompt_tokens_cached,
+                approx_cost=approx_cost,
+            )
+            if group_key != model:
+                self._update_scoped_usage(
+                    state,
+                    scope="group",
+                    key=group_key,
+                    now=now,
+                    request_count=request_count,
+                    success_count=request_count,
+                    failure_count=0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    prompt_tokens_cached=prompt_tokens_cached,
+                    approx_cost=approx_cost,
+                )
+
             # Update per-model request count (for quota group sync)
             usage.model_request_counts[model] = (
-                usage.model_request_counts.get(model, 0) + 1
+                usage.model_request_counts.get(model, 0) + request_count
             )
 
             # Record in all windows
             for window_def in self._config.windows:
-                self._windows.record_request(
-                    usage.windows,
+                scoped_usage = self._get_usage_for_window(
+                    state, window_def, model, group_key
+                )
+                if scoped_usage is None:
+                    continue
+                window = self._windows.record_request(
+                    scoped_usage.windows,
                     window_def.name,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     prompt_tokens_cached=prompt_tokens_cached,
+                    approx_cost=approx_cost,
+                    request_count=request_count,
                 )
+                if window.limit is not None and window.request_count >= window.limit:
+                    if self._config.fair_cycle.enabled:
+                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
 
             # Update from response headers if provided
             if response_headers:
-                self._update_from_headers(state, response_headers)
+                self._update_from_headers(state, response_headers, model, group_key)
 
             # Update fair cycle request count
-            fc_state = state.fair_cycle.get(group_key)
-            if fc_state:
-                fc_state.cycle_request_count += 1
+            if self._config.fair_cycle.enabled:
+                fc_state = state.fair_cycle.get(fair_cycle_key)
+                if not fc_state:
+                    fc_state = FairCycleState(model_or_group=fair_cycle_key)
+                    state.fair_cycle[fair_cycle_key] = fc_state
+                fc_state.cycle_request_count += request_count
 
             state.last_updated = now
 
@@ -124,6 +174,7 @@ class TrackingEngine:
         cooldown_duration: Optional[float] = None,
         quota_reset_timestamp: Optional[float] = None,
         mark_exhausted: bool = False,
+        request_count: int = 1,
     ) -> None:
         """
         Record a failed request.
@@ -142,14 +193,58 @@ class TrackingEngine:
             group_key = quota_group or model
 
             # Update failure stats
-            state.usage.total_requests += 1
-            state.usage.total_failures += 1
+            state.usage.total_requests += request_count
+            state.usage.total_failures += request_count
             state.usage.last_used_at = now
+
+            self._update_scoped_usage(
+                state,
+                scope="model",
+                key=model,
+                now=now,
+                request_count=request_count,
+                success_count=0,
+                failure_count=request_count,
+                prompt_tokens=0,
+                completion_tokens=0,
+                prompt_tokens_cached=0,
+                approx_cost=0.0,
+            )
+            if group_key != model:
+                self._update_scoped_usage(
+                    state,
+                    scope="group",
+                    key=group_key,
+                    now=now,
+                    request_count=request_count,
+                    success_count=0,
+                    failure_count=request_count,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    prompt_tokens_cached=0,
+                    approx_cost=0.0,
+                )
 
             # Update per-model request count (for quota group sync)
             state.usage.model_request_counts[model] = (
-                state.usage.model_request_counts.get(model, 0) + 1
+                state.usage.model_request_counts.get(model, 0) + request_count
             )
+
+            # Record failure in windows (counts against quota)
+            for window_def in self._config.windows:
+                scoped_usage = self._get_usage_for_window(
+                    state, window_def, model, group_key
+                )
+                if scoped_usage is None:
+                    continue
+                window = self._windows.record_request(
+                    scoped_usage.windows,
+                    window_def.name,
+                    request_count=request_count,
+                )
+                if window.limit is not None and window.request_count >= window.limit:
+                    if self._config.fair_cycle.enabled:
+                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
 
             # Apply cooldown if specified
             if cooldown_duration is not None and cooldown_duration > 0:
@@ -173,7 +268,14 @@ class TrackingEngine:
 
             # Mark exhausted for fair cycle if requested
             if mark_exhausted:
-                self._mark_exhausted(state, group_key, error_type)
+                self._mark_exhausted(state, fair_cycle_key, error_type)
+
+            if self._config.fair_cycle.enabled:
+                fc_state = state.fair_cycle.get(fair_cycle_key)
+                if not fc_state:
+                    fc_state = FairCycleState(model_or_group=fair_cycle_key)
+                    state.fair_cycle[fair_cycle_key] = fc_state
+                fc_state.cycle_request_count += request_count
 
             state.last_updated = now
 
@@ -214,7 +316,7 @@ class TrackingEngine:
             model: Model that was used
         """
         async with self._lock:
-            state.active_requests = max(0, state.active_requests - 1)
+            return
 
     async def apply_cooldown(
         self,
@@ -375,7 +477,8 @@ class TrackingEngine:
         cooldown_duration = cooldown_until - now
         if cooldown_duration >= self._config.exhaustion_cooldown_threshold:
             if self._config.fair_cycle.enabled and model_or_group:
-                self._mark_exhausted(state, model_or_group, f"cooldown_{reason}")
+                fair_cycle_key = self._resolve_fair_cycle_key(model_or_group)
+                self._mark_exhausted(state, fair_cycle_key, f"cooldown_{reason}")
 
     def _mark_exhausted(
         self,
@@ -400,10 +503,61 @@ class TrackingEngine:
             f"Credential {state.stable_id} marked exhausted for {model_or_group}: {reason}"
         )
 
+    def _resolve_fair_cycle_key(self, group_key: str) -> str:
+        """Resolve fair cycle tracking key based on config."""
+        if self._config.fair_cycle.tracking_mode == TrackingMode.CREDENTIAL:
+            return FAIR_CYCLE_GLOBAL_KEY
+        return group_key
+
+    def _get_usage_for_window(
+        self,
+        state: CredentialState,
+        window_def: WindowDefinition,
+        model: str,
+        group_key: str,
+    ) -> Optional[UsageStats]:
+        """Get usage stats for a window definition's scope."""
+        scope_key = None
+        if window_def.applies_to == "model":
+            scope_key = model
+        elif window_def.applies_to == "group":
+            scope_key = group_key
+        return state.get_usage_for_scope(window_def.applies_to, scope_key)
+
+    def _update_scoped_usage(
+        self,
+        state: CredentialState,
+        scope: str,
+        key: Optional[str],
+        now: float,
+        request_count: int,
+        success_count: int,
+        failure_count: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        prompt_tokens_cached: int,
+        approx_cost: float,
+    ) -> None:
+        """Update scoped usage stats."""
+        usage = state.get_usage_for_scope(scope, key)
+        if not usage:
+            return
+        usage.total_requests += request_count
+        usage.total_successes += success_count
+        usage.total_failures += failure_count
+        usage.total_tokens += prompt_tokens + completion_tokens + prompt_tokens_cached
+        usage.total_prompt_tokens_cached += prompt_tokens_cached
+        usage.total_approx_cost += approx_cost
+        usage.last_used_at = now
+        if usage.first_used_at is None:
+            usage.first_used_at = now
+
     def _update_from_headers(
         self,
         state: CredentialState,
         headers: Dict[str, Any],
+        model: str,
+        group_key: str,
     ) -> None:
         """Update state from API response headers."""
         # Common header patterns for rate limiting
@@ -413,10 +567,26 @@ class TrackingEngine:
         limit = headers.get("x-ratelimit-limit")
 
         # Update primary window if we have limit info
+        primary_def = self._windows.get_primary_definition()
+        if primary_def is None:
+            return
+
+        scope_key = None
+        if primary_def.applies_to == "model":
+            scope_key = model
+        elif primary_def.applies_to == "group":
+            scope_key = group_key
+
+        usage = state.get_usage_for_scope(
+            primary_def.applies_to, scope_key, create=False
+        )
+        if usage is None:
+            return
+
         if limit is not None:
             try:
                 limit_int = int(limit)
-                primary = self._windows.get_primary_window(state.usage.windows)
+                primary = self._windows.get_primary_window(usage.windows)
                 if primary:
                     primary.limit = limit_int
             except (ValueError, TypeError):
@@ -429,7 +599,7 @@ class TrackingEngine:
                 # If it's a small number, it might be seconds until reset
                 if reset_float < 1000000000:  # Less than ~2001, probably relative
                     reset_float = time.time() + reset_float
-                primary = self._windows.get_primary_window(state.usage.windows)
+                primary = self._windows.get_primary_window(usage.windows)
                 if primary:
                     primary.reset_at = reset_float
             except (ValueError, TypeError):

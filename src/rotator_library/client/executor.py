@@ -166,6 +166,11 @@ class RequestExecutor:
         )
         credentials = filter_result.all_usable
 
+        quota_group = usage_manager.get_model_quota_group(model)
+
+        await self._ensure_initialized(usage_manager, context, filter_result)
+        await self._validate_request(provider, model, context.kwargs)
+
         if not credentials:
             raise NoAvailableKeysError(f"No compatible credentials for model {model}")
 
@@ -192,6 +197,7 @@ class RequestExecutor:
             try:
                 async with usage_manager.acquire_credential(
                     model=model,
+                    quota_group=quota_group,
                     candidates=untried,
                     priorities=filter_result.priorities,
                     deadline=deadline,
@@ -245,21 +251,21 @@ class RequestExecutor:
                                     response = await litellm.acompletion(**kwargs)
 
                                 # Success! Extract token usage if available
-                                prompt_tokens = 0
-                                completion_tokens = 0
-                                if hasattr(response, "usage") and response.usage:
-                                    prompt_tokens = (
-                                        getattr(response.usage, "prompt_tokens", 0) or 0
-                                    )
-                                    completion_tokens = (
-                                        getattr(response.usage, "completion_tokens", 0)
-                                        or 0
-                                    )
+                                (
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    prompt_tokens_cached,
+                                ) = self._extract_usage_tokens(response)
+                                approx_cost = self._calculate_cost(
+                                    provider, model, response
+                                )
 
                                 cred_context.mark_success(
                                     response=response,
                                     prompt_tokens=prompt_tokens,
                                     completion_tokens=completion_tokens,
+                                    prompt_tokens_cached=prompt_tokens_cached,
+                                    approx_cost=approx_cost,
                                 )
 
                                 # Log response if transaction logging enabled
@@ -394,6 +400,7 @@ class RequestExecutor:
                 try:
                     async with usage_manager.acquire_credential(
                         model=model,
+                        quota_group=quota_group,
                         candidates=untried,
                         priorities=filter_result.priorities,
                         deadline=deadline,
@@ -419,6 +426,10 @@ class RequestExecutor:
 
                             # Get provider plugin
                             plugin = self._get_plugin_instance(provider)
+                            skip_cost_calculation = bool(
+                                plugin
+                                and getattr(plugin, "skip_cost_calculation", False)
+                            )
 
                             # Add transaction context for provider logging
                             if context.transaction_logger:
@@ -463,6 +474,7 @@ class RequestExecutor:
                                         model,
                                         context.request,
                                         cred_context,
+                                        skip_cost_calculation=skip_cost_calculation,
                                     )
 
                                     # Wrap with transaction logging if enabled
@@ -709,6 +721,79 @@ class RequestExecutor:
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )
         return ErrorAction.ROTATE
+
+    async def _ensure_initialized(
+        self,
+        usage_manager: "UsageManager",
+        context: RequestContext,
+        filter_result: "FilterResult",
+    ) -> None:
+        if usage_manager.initialized:
+            return
+        await usage_manager.initialize(
+            context.credentials,
+            priorities=filter_result.priorities,
+            tiers=filter_result.tier_names,
+        )
+
+    async def _validate_request(
+        self,
+        provider: str,
+        model: str,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        plugin = self._get_plugin_instance(provider)
+        if not plugin or not hasattr(plugin, "validate_request"):
+            return
+
+        result = plugin.validate_request(kwargs, model)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result is False:
+            raise ValueError(f"Request validation failed for {provider}/{model}")
+        if isinstance(result, str):
+            raise ValueError(result)
+
+    def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int]:
+        prompt_tokens = 0
+        completion_tokens = 0
+        cached_tokens = 0
+
+        if hasattr(response, "usage") and response.usage:
+            prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+
+            prompt_details = getattr(response.usage, "prompt_tokens_details", None)
+            if prompt_details:
+                if isinstance(prompt_details, dict):
+                    cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+                else:
+                    cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+
+        uncached_prompt = max(0, prompt_tokens - cached_tokens)
+        return uncached_prompt, completion_tokens, cached_tokens
+
+    def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
+        plugin = self._get_plugin_instance(provider)
+        if plugin and getattr(plugin, "skip_cost_calculation", False):
+            return 0.0
+
+        try:
+            if isinstance(response, litellm.EmbeddingResponse):
+                model_info = litellm.get_model_info(model)
+                input_cost = model_info.get("input_cost_per_token")
+                if input_cost:
+                    return (response.usage.prompt_tokens or 0) * input_cost
+                return 0.0
+
+            cost = litellm.completion_cost(
+                completion_response=response,
+                model=model,
+            )
+            return float(cost) if cost is not None else 0.0
+        except Exception as exc:
+            lib_logger.debug(f"Cost calculation failed for {model}: {exc}")
+            return 0.0
 
     async def _transaction_logging_stream_wrapper(
         self,

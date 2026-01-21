@@ -18,6 +18,8 @@ from ..types import (
     LimitResult,
     FairCycleState,
     GlobalFairCycleState,
+    TrackingMode,
+    FAIR_CYCLE_GLOBAL_KEY,
 )
 from ..config import FairCycleConfig
 from .base import LimitChecker
@@ -68,7 +70,7 @@ class FairCycleChecker(LimitChecker):
         if not self._config.enabled:
             return LimitCheckResult.ok()
 
-        group_key = quota_group or model
+        group_key = self._resolve_tracking_key(model, quota_group)
         fc_state = state.fair_cycle.get(group_key)
 
         # Not exhausted = allowed
@@ -105,16 +107,11 @@ class FairCycleChecker(LimitChecker):
             model: Optional model scope
             quota_group: Optional quota group scope
         """
-        if quota_group:
-            if quota_group in state.fair_cycle:
-                fc_state = state.fair_cycle[quota_group]
-                fc_state.exhausted = False
-                fc_state.exhausted_at = None
-                fc_state.exhausted_reason = None
-                fc_state.cycle_request_count = 0
-        elif model:
-            if model in state.fair_cycle:
-                fc_state = state.fair_cycle[model]
+        group_key = self._resolve_tracking_key(model or "", quota_group)
+
+        if quota_group or model:
+            if group_key in state.fair_cycle:
+                fc_state = state.fair_cycle[group_key]
                 fc_state.exhausted = False
                 fc_state.exhausted_at = None
                 fc_state.exhausted_reason = None
@@ -213,6 +210,10 @@ class FairCycleChecker(LimitChecker):
 
         lib_logger.info(f"All credentials exhausted for {provider}/{group_key}")
 
+    def get_tracking_key(self, model: str, quota_group: Optional[str]) -> str:
+        """Get the fair cycle tracking key for a request."""
+        return self._resolve_tracking_key(model, quota_group)
+
     # =========================================================================
     # PRIVATE METHODS
     # =========================================================================
@@ -232,6 +233,16 @@ class FairCycleChecker(LimitChecker):
             )
 
         return self._global_state[provider][group_key]
+
+    def _resolve_tracking_key(
+        self,
+        model: str,
+        quota_group: Optional[str],
+    ) -> str:
+        """Resolve tracking key based on fair cycle mode."""
+        if self._config.tracking_mode == TrackingMode.CREDENTIAL:
+            return FAIR_CYCLE_GLOBAL_KEY
+        return quota_group or model
 
     def _should_reset_cycle(self, global_state: GlobalFairCycleState) -> bool:
         """Check if cycle duration has expired."""

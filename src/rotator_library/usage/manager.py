@@ -13,14 +13,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
-from ..core.types import CredentialInfo
+from ..core.types import CredentialInfo, RequestCompleteResult
 from ..error_handler import ClassifiedError, classify_error
 
 from .types import (
     UsageStats,
+    WindowStats,
     CredentialState,
     LimitCheckResult,
     RotationMode,
+    LimitResult,
+    FAIR_CYCLE_GLOBAL_KEY,
+    TrackingMode,
 )
 from .config import (
     ProviderUsageConfig,
@@ -33,6 +37,8 @@ from .tracking.windows import WindowManager
 from .limits.engine import LimitEngine
 from .selection.engine import SelectionEngine
 from .persistence.storage import UsageStorage
+from .integration.hooks import HookDispatcher
+from .integration.api import UsageAPI
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -70,6 +76,7 @@ class CredentialContext:
         self._response: Optional[Any] = None
         self._error: Optional[ClassifiedError] = None
         self._tokens: Dict[str, int] = {}
+        self._approx_cost: float = 0.0
 
     async def __aenter__(self) -> "CredentialContext":
         return self
@@ -78,39 +85,32 @@ class CredentialContext:
         # Always release the credential
         await self._manager._release_credential(self.stable_id, self.model)
 
-        # Record result
+        success = False
+        error = self._error
+        response = self._response
+
         if self._result == "success":
-            await self._manager._record_success(
-                self.stable_id,
-                self.model,
-                self.quota_group,
-                self._tokens.get("prompt", 0),
-                self._tokens.get("completion", 0),
-                self._tokens.get("prompt_cached", 0),
-            )
+            success = True
         elif self._result == "failure":
-            await self._manager._record_failure(
-                self.stable_id,
-                self.model,
-                self.quota_group,
-                self._error,
-            )
+            success = False
         elif exc_val is not None:
-            # Exception occurred without explicit mark
             error = classify_error(exc_val)
-            await self._manager._record_failure(
-                self.stable_id,
-                self.model,
-                self.quota_group,
-                error,
-            )
+            success = False
         else:
-            # No explicit mark and no exception = success without details
-            await self._manager._record_success(
-                self.stable_id,
-                self.model,
-                self.quota_group,
-            )
+            success = True
+
+        await self._manager._handle_request_complete(
+            stable_id=self.stable_id,
+            model=self.model,
+            quota_group=self.quota_group,
+            success=success,
+            response=response,
+            error=error,
+            prompt_tokens=self._tokens.get("prompt", 0),
+            completion_tokens=self._tokens.get("completion", 0),
+            prompt_tokens_cached=self._tokens.get("prompt_cached", 0),
+            approx_cost=self._approx_cost,
+        )
 
         return False  # Don't suppress exceptions
 
@@ -120,6 +120,7 @@ class CredentialContext:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
     ) -> None:
         """Mark request as successful."""
         self._result = "success"
@@ -129,6 +130,7 @@ class CredentialContext:
             "completion": completion_tokens,
             "prompt_cached": prompt_tokens_cached,
         }
+        self._approx_cost = approx_cost
 
     def mark_failure(self, error: ClassifiedError) -> None:
         """Mark request as failed."""
@@ -190,7 +192,11 @@ class UsageManager:
         )
         self._tracking = TrackingEngine(self._window_manager, self._config)
         self._limits = LimitEngine(self._config, self._window_manager)
-        self._selection = SelectionEngine(self._config, self._limits)
+        self._selection = SelectionEngine(
+            self._config, self._limits, self._window_manager
+        )
+        self._hooks = HookDispatcher(self._provider_plugins)
+        self._api = UsageAPI(self)
 
         # Storage
         if file_path:
@@ -222,9 +228,15 @@ class UsageManager:
             tiers: Optional tier overrides (accessor -> tier name)
         """
         async with self._lock:
+            if self._initialized:
+                return
             # Load persisted state
             if self._storage:
-                self._states = await self._storage.load()
+                self._states, fair_cycle_global = await self._storage.load()
+                if fair_cycle_global:
+                    self._limits.fair_cycle_checker.load_global_state_dict(
+                        fair_cycle_global
+                    )
 
             # Register credentials
             for accessor in credentials:
@@ -405,9 +417,9 @@ class UsageManager:
             if best_wait_id is None:
                 # All credentials blocked by cooldown or limits, not just concurrency
                 # Check if waiting for cooldown makes sense
-                soonest_cooldown = self._get_soonest_cooldown_end(
-                    states_to_check, normalized_model
-                )
+                    soonest_cooldown = self._get_soonest_cooldown_end(
+                        states_to_check, normalized_model, quota_group
+                    )
 
                 if soonest_cooldown is not None:
                     remaining_budget = deadline - time.time()
@@ -465,14 +477,16 @@ class UsageManager:
         self,
         states: Dict[str, CredentialState],
         model: str,
+        quota_group: Optional[str],
     ) -> Optional[float]:
         """Get the soonest cooldown end time across all credentials."""
         soonest = None
         now = time.time()
+        group_key = quota_group or model
 
         for state in states.values():
             # Check model-specific cooldown
-            cooldown = state.get_cooldown(model)
+            cooldown = state.get_cooldown(group_key)
             if cooldown and cooldown.until > now:
                 if soonest is None or cooldown.until < soonest:
                     soonest = cooldown.until
@@ -538,6 +552,7 @@ class UsageManager:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
         error: Optional[ClassifiedError] = None,
         quota_group: Optional[str] = None,
     ) -> None:
@@ -566,9 +581,98 @@ class UsageManager:
                 prompt_tokens,
                 completion_tokens,
                 prompt_tokens_cached,
+                approx_cost,
             )
         else:
             await self._record_failure(stable_id, model, quota_group, error)
+
+    async def _handle_request_complete(
+        self,
+        stable_id: str,
+        model: str,
+        quota_group: Optional[str],
+        success: bool,
+        response: Optional[Any],
+        error: Optional[ClassifiedError],
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
+    ) -> None:
+        """Handle provider hooks and record request outcome."""
+        state = self._states.get(stable_id)
+        if not state:
+            return
+
+        normalized_model = self._normalize_model(model)
+        group_key = quota_group or normalized_model
+
+        hook_result: Optional[RequestCompleteResult] = None
+        if self._hooks:
+            hook_result = await self._hooks.dispatch_request_complete(
+                provider=self.provider,
+                credential=state.accessor,
+                model=normalized_model,
+                success=success,
+                response=response,
+                error=error,
+            )
+
+        request_count = 1
+        cooldown_override = None
+        force_exhausted = False
+
+        if hook_result:
+            if hook_result.count_override is not None:
+                request_count = max(0, hook_result.count_override)
+            cooldown_override = hook_result.cooldown_override
+            force_exhausted = hook_result.force_exhausted
+
+        if not success and error and hook_result is None:
+            if error.error_type in {"server_error", "api_connection"}:
+                request_count = 0
+
+        if request_count == 0:
+            prompt_tokens = 0
+            completion_tokens = 0
+            prompt_tokens_cached = 0
+            approx_cost = 0.0
+
+        if cooldown_override:
+            await self._tracking.apply_cooldown(
+                state=state,
+                reason="provider_hook",
+                duration=cooldown_override,
+                model_or_group=group_key,
+                source="provider_hook",
+            )
+
+        if force_exhausted:
+            await self._tracking.mark_exhausted(
+                state=state,
+                model_or_group=self._resolve_fair_cycle_key(group_key),
+                reason="provider_hook",
+            )
+
+        if success:
+            await self._record_success(
+                stable_id,
+                normalized_model,
+                quota_group,
+                prompt_tokens,
+                completion_tokens,
+                prompt_tokens_cached,
+                approx_cost,
+                request_count=request_count,
+            )
+        else:
+            await self._record_failure(
+                stable_id,
+                normalized_model,
+                quota_group,
+                error,
+                request_count=request_count,
+            )
 
     async def apply_cooldown(
         self,
@@ -595,6 +699,7 @@ class UsageManager:
                 duration=duration,
                 model_or_group=model_or_group,
             )
+            await self._save_if_needed()
 
     async def get_availability_stats(
         self,
@@ -652,8 +757,12 @@ class UsageManager:
                     "total_successes": state.usage.total_successes,
                     "total_failures": state.usage.total_failures,
                     "total_tokens": state.usage.total_tokens,
+                    "total_prompt_tokens_cached": state.usage.total_prompt_tokens_cached,
+                    "total_approx_cost": state.usage.total_approx_cost,
                 },
                 "windows": {},
+                "model_usage": {},
+                "group_usage": {},
                 "cooldowns": {},
                 "fair_cycle": {},
             }
@@ -665,7 +774,42 @@ class UsageManager:
                     "limit": window.limit,
                     "remaining": window.remaining,
                     "reset_at": window.reset_at,
+                    "approx_cost": window.approx_cost,
                 }
+
+            for model_key, usage in state.model_usage.items():
+                model_windows = {}
+                for window_name, window in usage.windows.items():
+                    model_windows[window_name] = {
+                        "request_count": window.request_count,
+                        "limit": window.limit,
+                        "remaining": window.remaining,
+                        "reset_at": window.reset_at,
+                        "approx_cost": window.approx_cost,
+                    }
+                if model_windows:
+                    cred_stats["model_usage"][model_key] = {
+                        "windows": model_windows,
+                        "total_requests": usage.total_requests,
+                        "total_tokens": usage.total_tokens,
+                    }
+
+            for group_key, usage in state.group_usage.items():
+                group_windows = {}
+                for window_name, window in usage.windows.items():
+                    group_windows[window_name] = {
+                        "request_count": window.request_count,
+                        "limit": window.limit,
+                        "remaining": window.remaining,
+                        "reset_at": window.reset_at,
+                        "approx_cost": window.approx_cost,
+                    }
+                if group_windows:
+                    cred_stats["group_usage"][group_key] = {
+                        "windows": group_windows,
+                        "total_requests": usage.total_requests,
+                        "total_tokens": usage.total_tokens,
+                    }
 
             # Add active cooldowns
             for key, cooldown in state.cooldowns.items():
@@ -758,6 +902,11 @@ class UsageManager:
 
         return None
 
+    def get_model_quota_group(self, model: str) -> Optional[str]:
+        """Public helper to get quota group for a model."""
+        normalized_model = self._normalize_model(model)
+        return self._get_model_quota_group(normalized_model)
+
     def _get_grouped_models(self, group: str) -> List[str]:
         """
         Get all model names in a quota group (with provider prefix), normalized.
@@ -830,6 +979,34 @@ class UsageManager:
             if grouped_model != model:
                 state.usage.model_request_counts[grouped_model] = current_count
 
+        # Sync per-model windows if configured at model scope
+        source_usage = state.model_usage.get(model)
+        if source_usage:
+            for window_def in self._config.windows:
+                if window_def.applies_to != "model":
+                    continue
+                source_window = source_usage.windows.get(window_def.name)
+                if not source_window:
+                    continue
+                for grouped_model in grouped_models:
+                    if grouped_model == model:
+                        continue
+                    target_usage = state.model_usage.setdefault(
+                        grouped_model, UsageStats()
+                    )
+                    target_usage.windows[window_def.name] = WindowStats(
+                        name=source_window.name,
+                        request_count=source_window.request_count,
+                        total_tokens=source_window.total_tokens,
+                        prompt_tokens=source_window.prompt_tokens,
+                        prompt_tokens_cached=source_window.prompt_tokens_cached,
+                        completion_tokens=source_window.completion_tokens,
+                        approx_cost=source_window.approx_cost,
+                        started_at=source_window.started_at,
+                        reset_at=source_window.reset_at,
+                        limit=source_window.limit,
+                    )
+
         lib_logger.debug(
             f"Synced request_count={current_count} across quota group '{group}' "
             f"({len(grouped_models)} models)"
@@ -894,14 +1071,23 @@ class UsageManager:
         normalized_model = self._normalize_model(model)
         group_key = quota_group or normalized_model
 
-        # Get or create primary window
+        primary_def = self._window_manager.get_primary_definition()
         primary_window = None
-        for window in state.usage.windows.values():
-            primary_window = window
-            break
+
+        if primary_def:
+            scope_key = None
+            if primary_def.applies_to == "model":
+                scope_key = normalized_model
+            elif primary_def.applies_to == "group":
+                scope_key = group_key
+
+            usage = state.get_usage_for_scope(primary_def.applies_to, scope_key)
+            primary_window = self._window_manager.get_or_create_window(
+                usage.windows,
+                primary_def.name,
+            )
 
         if primary_window is None:
-            # Create a window if none exists
             from .types import WindowStats
 
             primary_window = WindowStats(name="api_quota")
@@ -914,9 +1100,13 @@ class UsageManager:
             primary_window.reset_at = quota_reset_ts
         if quota_used is not None:
             primary_window.request_count = quota_used
+            state.usage.model_request_counts[normalized_model] = quota_used
 
         # Mark state as updated
         state.last_updated = time.time()
+
+        if quota_used is not None:
+            await self._sync_quota_group_counts(state, normalized_model)
 
         # Check if we need to apply cooldown (quota exhausted)
         if primary_window.is_exhausted and quota_reset_ts:
@@ -933,11 +1123,15 @@ class UsageManager:
                 f"cooldown until {quota_reset_ts}"
             )
 
+            await self._save_if_needed()
+
             return {
                 "cooldown_until": quota_reset_ts,
                 "reason": "quota_exhausted",
                 "model": model,
             }
+
+        await self._save_if_needed()
 
         return None
 
@@ -954,6 +1148,16 @@ class UsageManager:
     def registry(self) -> CredentialRegistry:
         """Get the credential registry."""
         return self._registry
+
+    @property
+    def api(self) -> UsageAPI:
+        """Get the usage API facade."""
+        return self._api
+
+    @property
+    def initialized(self) -> bool:
+        """Check if the manager is initialized."""
+        return self._initialized
 
     @property
     def tracking(self) -> TrackingEngine:
@@ -979,6 +1183,12 @@ class UsageManager:
     # PRIVATE METHODS
     # =========================================================================
 
+    def _resolve_fair_cycle_key(self, group_key: str) -> str:
+        """Resolve fair cycle tracking key based on config."""
+        if self._config.fair_cycle.tracking_mode == TrackingMode.CREDENTIAL:
+            return FAIR_CYCLE_GLOBAL_KEY
+        return group_key
+
     async def _release_credential(self, stable_id: str, model: str) -> None:
         """Release a credential after use and notify waiting tasks."""
         state = self._states.get(stable_id)
@@ -999,14 +1209,18 @@ class UsageManager:
         else:
             state.active_requests = max(0, state.active_requests - 1)
 
-        # Release in tracking engine
-        await self._tracking.release(state, model)
-
         # Notify all tasks waiting on this credential's condition
         condition = self._key_conditions.get(stable_id)
         if condition:
             async with condition:
                 condition.notify_all()
+
+    async def _save_if_needed(self) -> None:
+        """Persist state if storage is configured."""
+        if not self._storage:
+            return
+        fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
+        await self._storage.save(self._states, fair_cycle_global)
 
     async def _record_success(
         self,
@@ -1016,6 +1230,8 @@ class UsageManager:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
+        approx_cost: float = 0.0,
+        request_count: int = 1,
     ) -> None:
         """Record a successful request."""
         state = self._states.get(stable_id)
@@ -1030,13 +1246,31 @@ class UsageManager:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 prompt_tokens_cached=prompt_tokens_cached,
+                approx_cost=approx_cost,
+                request_count=request_count,
             )
 
             # Sync request_count across quota group (for shared quota pools)
             await self._sync_quota_group_counts(state, normalized_model)
 
-            if self._storage:
-                self._storage.mark_dirty()
+            # Apply custom cap cooldown if exceeded
+            cap_result = self._limits.custom_cap_checker.check(
+                state, normalized_model, quota_group
+            )
+            if (
+                not cap_result.allowed
+                and cap_result.result == LimitResult.BLOCKED_CUSTOM_CAP
+                and cap_result.blocked_until
+            ):
+                await self._tracking.apply_cooldown(
+                    state=state,
+                    reason="custom_cap",
+                    until=cap_result.blocked_until,
+                    model_or_group=quota_group or normalized_model,
+                    source="custom_cap",
+                )
+
+            await self._save_if_needed()
 
     async def _record_failure(
         self,
@@ -1044,6 +1278,7 @@ class UsageManager:
         model: str,
         quota_group: Optional[str] = None,
         error: Optional[ClassifiedError] = None,
+        request_count: int = 1,
     ) -> None:
         """Record a failed request."""
         state = self._states.get(stable_id)
@@ -1078,10 +1313,10 @@ class UsageManager:
             cooldown_duration=cooldown_duration,
             quota_reset_timestamp=quota_reset,
             mark_exhausted=mark_exhausted,
+            request_count=request_count,
         )
 
         # Sync request_count across quota group (for shared quota pools)
         await self._sync_quota_group_counts(state, normalized_model)
 
-        if self._storage:
-            self._storage.mark_dirty()
+        await self._save_if_needed()

@@ -78,8 +78,29 @@ class CustomCapChecker(LimitChecker):
         if cap is None:
             return LimitCheckResult.ok()
 
+        primary_def = self._windows.get_primary_definition()
+        if primary_def is None:
+            return LimitCheckResult.ok()
+
+        usage = None
+        if quota_group and cap.model_or_group == group_key:
+            usage = state.get_usage_for_scope("group", group_key, create=False)
+
+        if usage is None:
+            scope_key = None
+            if primary_def.applies_to == "model":
+                scope_key = model
+            elif primary_def.applies_to == "group":
+                scope_key = group_key
+            usage = state.get_usage_for_scope(
+                primary_def.applies_to, scope_key, create=False
+            )
+
+        if usage is None:
+            return LimitCheckResult.ok()
+
         # Get usage from primary window
-        primary_window = self._windows.get_primary_window(state.usage.windows)
+        primary_window = self._windows.get_primary_window(usage.windows)
         if primary_window is None:
             return LimitCheckResult.ok()
 
@@ -189,17 +210,20 @@ class CustomCapChecker(LimitChecker):
     ) -> Optional[float]:
         """Calculate when the custom cap cooldown ends."""
         now = time.time()
+        natural_reset = window.reset_at
 
         if cap.cooldown_mode == CooldownMode.QUOTA_RESET:
             # Wait until window resets
-            return window.reset_at
+            return natural_reset
 
         elif cap.cooldown_mode == CooldownMode.OFFSET:
             # Add offset to current time
-            return now + cap.cooldown_value
+            calculated = now + cap.cooldown_value
+            return max(calculated, natural_reset) if natural_reset else calculated
 
         elif cap.cooldown_mode == CooldownMode.FIXED:
             # Fixed duration
-            return now + cap.cooldown_value
+            calculated = now + cap.cooldown_value
+            return max(calculated, natural_reset) if natural_reset else calculated
 
         return None

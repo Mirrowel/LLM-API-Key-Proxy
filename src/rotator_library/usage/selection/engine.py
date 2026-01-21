@@ -20,6 +20,7 @@ from ..types import (
 )
 from ..config import ProviderUsageConfig
 from ..limits.engine import LimitEngine
+from ..tracking.windows import WindowManager
 from .strategies.balanced import BalancedStrategy
 from .strategies.sequential import SequentialStrategy
 
@@ -40,6 +41,7 @@ class SelectionEngine:
         self,
         config: ProviderUsageConfig,
         limit_engine: LimitEngine,
+        window_manager: WindowManager,
     ):
         """
         Initialize selection engine.
@@ -50,6 +52,7 @@ class SelectionEngine:
         """
         self._config = config
         self._limits = limit_engine
+        self._windows = window_manager
 
         # Initialize strategies
         self._balanced = BalancedStrategy(config.rotation_tolerance)
@@ -106,7 +109,12 @@ class SelectionEngine:
             # Check if we should reset fair cycle
             if self._config.fair_cycle.enabled:
                 reset_performed = self._try_fair_cycle_reset(
-                    provider, model, quota_group, states, candidates
+                    provider,
+                    model,
+                    quota_group,
+                    states,
+                    candidates,
+                    priorities,
                 )
                 if reset_performed:
                     # Retry selection after reset
@@ -131,7 +139,7 @@ class SelectionEngine:
         usage_counts = {}
         for stable_id in available:
             state = states[stable_id]
-            usage_counts[stable_id] = self._get_usage_count(state)
+            usage_counts[stable_id] = self._get_usage_count(state, model, quota_group)
 
         # Build priorities map
         if priorities is None:
@@ -288,12 +296,30 @@ class SelectionEngine:
         """Get the sequential strategy instance."""
         return self._sequential
 
-    def _get_usage_count(self, state: CredentialState) -> int:
+    def _get_usage_count(
+        self,
+        state: CredentialState,
+        model: str,
+        quota_group: Optional[str],
+    ) -> int:
         """Get the relevant usage count for rotation weighting."""
-        # Use primary window if available, otherwise total
-        for window_name, window in state.usage.windows.items():
-            # Look for primary window (usually "5h")
-            return window.request_count
+        primary_def = self._windows.get_primary_definition()
+        if primary_def:
+            scope_key = None
+            if primary_def.applies_to == "model":
+                scope_key = model
+            elif primary_def.applies_to == "group":
+                scope_key = quota_group or model
+
+            usage = state.get_usage_for_scope(
+                primary_def.applies_to, scope_key, create=False
+            )
+            if usage:
+                window = self._windows.get_active_window(
+                    usage.windows, primary_def.name
+                )
+                if window:
+                    return window.request_count
 
         return state.usage.total_requests
 
@@ -304,6 +330,7 @@ class SelectionEngine:
         quota_group: Optional[str],
         states: Dict[str, CredentialState],
         candidates: List[str],
+        priorities: Optional[Dict[str, int]],
     ) -> bool:
         """
         Try to reset fair cycle if all credentials are exhausted.
@@ -324,6 +351,7 @@ class SelectionEngine:
 
         group_key = quota_group or model
         fair_cycle_checker = self._limits.fair_cycle_checker
+        tracking_key = fair_cycle_checker.get_tracking_key(model, quota_group)
 
         # Check if all candidates are blocked by fair cycle
         all_fair_cycle_blocked = True
@@ -349,18 +377,19 @@ class SelectionEngine:
 
         # Get all candidate states for reset
         candidate_states = [states[sid] for sid in candidates]
+        priority_map = priorities or {sid: states[sid].priority for sid in candidates}
 
         # Tier-aware reset
         if self._config.fair_cycle.cross_tier:
             # Cross-tier: reset all at once
             if fair_cycle_checker.check_all_exhausted(
-                provider, group_key, candidate_states
+                provider, tracking_key, candidate_states, priorities=priority_map
             ):
                 lib_logger.info(
                     f"All credentials fair-cycle exhausted for {provider}/{model} "
                     f"(cross-tier), resetting cycle"
                 )
-                fair_cycle_checker.reset_cycle(provider, group_key, candidate_states)
+                fair_cycle_checker.reset_cycle(provider, tracking_key, candidate_states)
                 return True
         else:
             # Per-tier: group by priority and check each tier
@@ -373,7 +402,7 @@ class SelectionEngine:
             for priority, tier_states in tier_groups.items():
                 # Check if all in this tier are exhausted
                 all_tier_exhausted = all(
-                    state.is_fair_cycle_exhausted(group_key) for state in tier_states
+                    state.is_fair_cycle_exhausted(tracking_key) for state in tier_states
                 )
 
                 if all_tier_exhausted:
@@ -381,7 +410,7 @@ class SelectionEngine:
                         f"All credentials fair-cycle exhausted for {provider}/{model} "
                         f"in tier {priority}, resetting tier cycle"
                     )
-                    fair_cycle_checker.reset_cycle(provider, group_key, tier_states)
+                    fair_cycle_checker.reset_cycle(provider, tracking_key, tier_states)
                     reset_any = True
 
             return reset_any

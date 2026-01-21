@@ -240,7 +240,8 @@ class RotatingClient:
         # Initialize new usage managers
         for provider, manager in self._usage_managers.items():
             credentials = self.all_credentials.get(provider, [])
-            await manager.initialize(credentials)
+            priorities, tiers = self._get_credential_metadata(provider, credentials)
+            await manager.initialize(credentials, priorities=priorities, tiers=tiers)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -483,6 +484,31 @@ class RotatingClient:
                 return None
 
         return self._provider_instances[provider]
+
+    def _get_credential_metadata(
+        self,
+        provider: str,
+        credentials: List[str],
+    ) -> tuple[Dict[str, int], Dict[str, str]]:
+        """Resolve priority and tier metadata for credentials."""
+        plugin = self._get_provider_instance(provider)
+        priorities: Dict[str, int] = {}
+        tiers: Dict[str, str] = {}
+
+        if not plugin:
+            return priorities, tiers
+
+        for credential in credentials:
+            if hasattr(plugin, "get_credential_priority"):
+                priority = plugin.get_credential_priority(credential)
+                if priority is not None:
+                    priorities[credential] = priority
+            if hasattr(plugin, "get_credential_tier_name"):
+                tier_name = plugin.get_credential_tier_name(credential)
+                if tier_name:
+                    tiers[credential] = tier_name
+
+        return priorities, tiers
 
     def get_usage_manager(self, provider: str) -> Optional[NewUsageManager]:
         """

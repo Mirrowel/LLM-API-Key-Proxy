@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 # =============================================================================
 
 
+FAIR_CYCLE_GLOBAL_KEY = "_credential_"
+
+
 class ResetMode(str, Enum):
     """How a usage window resets."""
 
@@ -81,6 +84,7 @@ class WindowStats:
     prompt_tokens: int = 0
     prompt_tokens_cached: int = 0  # Cached prompt tokens (e.g., from Claude)
     completion_tokens: int = 0
+    approx_cost: float = 0.0
     started_at: Optional[float] = None  # Timestamp when window started
     reset_at: Optional[float] = None  # Timestamp when window resets
     limit: Optional[int] = None  # Max requests allowed (None = unlimited)
@@ -114,6 +118,7 @@ class UsageStats:
     total_failures: int = 0
     total_tokens: int = 0
     total_prompt_tokens_cached: int = 0  # Cached prompt tokens (e.g., from Claude)
+    total_approx_cost: float = 0.0
     first_used_at: Optional[float] = None
     last_used_at: Optional[float] = None
 
@@ -214,6 +219,12 @@ class CredentialState:
     # Usage stats
     usage: UsageStats = field(default_factory=UsageStats)
 
+    # Per-model usage stats (for per-model windows)
+    model_usage: Dict[str, UsageStats] = field(default_factory=dict)
+
+    # Per-quota-group usage stats (for shared quota windows)
+    group_usage: Dict[str, UsageStats] = field(default_factory=dict)
+
     # Cooldowns (keyed by model/group or "_global_")
     cooldowns: Dict[str, CooldownInfo] = field(default_factory=dict)
 
@@ -253,6 +264,29 @@ class CredentialState:
         """Check if exhausted for fair cycle purposes."""
         state = self.fair_cycle.get(model_or_group)
         return state.exhausted if state else False
+
+    def get_usage_for_scope(
+        self,
+        scope: str,
+        key: Optional[str] = None,
+        create: bool = True,
+    ) -> Optional[UsageStats]:
+        """Get usage stats for a given scope."""
+        if scope == "credential":
+            return self.usage
+        if scope == "model":
+            if not key:
+                return self.usage
+            if create:
+                return self.model_usage.setdefault(key, UsageStats())
+            return self.model_usage.get(key)
+        if scope == "group":
+            if not key:
+                return self.usage
+            if create:
+                return self.group_usage.setdefault(key, UsageStats())
+            return self.group_usage.get(key)
+        return self.usage
 
 
 # =============================================================================

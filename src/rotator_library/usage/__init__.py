@@ -49,6 +49,7 @@ from .tracking.engine import TrackingEngine
 from .limits.engine import LimitEngine
 from .selection.engine import SelectionEngine
 from .persistence.storage import UsageStorage
+from .integration.api import UsageAPI
 
 # Main facade (imports components above)
 from .manager import UsageManager, CredentialContext
@@ -81,4 +82,5 @@ __all__ = [
     "LimitEngine",
     "SelectionEngine",
     "UsageStorage",
+    "UsageAPI",
 ]
