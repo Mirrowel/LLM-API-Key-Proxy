@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 from typing import Dict, Any
 
 def sanitize_request_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]:

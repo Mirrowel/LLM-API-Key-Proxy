@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 import re
 import json
 import os
@@ -939,86 +942,3 @@ def should_retry_same_key(classified_error: ClassifiedError) -> bool:
         "api_connection",
     }
     return classified_error.error_type in retryable_errors
-
-
-class AllProviders:
-    """
-    A class to handle provider-specific settings, such as custom API bases.
-    Supports custom OpenAI-compatible providers configured via environment variables.
-    """
-
-    def __init__(self):
-        self.providers = {
-            "chutes": {
-                "api_base": "https://llm.chutes.ai/v1",
-                "model_prefix": "openai/",
-            }
-        }
-        # Load custom OpenAI-compatible providers from environment
-        self._load_custom_providers()
-
-    def _load_custom_providers(self):
-        """
-        Loads custom OpenAI-compatible providers from environment variables.
-        Looks for environment variables in the format: PROVIDER_API_BASE
-        where PROVIDER is the name of the custom provider.
-        """
-        import os
-
-        # Get all environment variables that end with _API_BASE
-        for env_var in os.environ:
-            if env_var.endswith("_API_BASE"):
-                provider_name = env_var.split("_API_BASE")[
-                    0
-                ].lower()  # Remove '_API_BASE' suffix and lowercase
-
-                # Skip known providers that are already handled
-                if provider_name in [
-                    "openai",
-                    "anthropic",
-                    "google",
-                    "gemini",
-                    "nvidia",
-                    "mistral",
-                    "cohere",
-                    "groq",
-                    "openrouter",
-                ]:
-                    continue
-
-                api_base = os.getenv(env_var)
-                if api_base:
-                    self.providers[provider_name] = {
-                        "api_base": api_base.rstrip("/") if api_base else "",
-                        "model_prefix": None,  # No prefix for custom providers
-                    }
-
-    def get_provider_kwargs(self, **kwargs) -> Dict[str, Any]:
-        """
-        Returns provider-specific kwargs for a given model.
-        """
-        model = kwargs.get("model")
-        if not model:
-            return kwargs
-
-        provider = self._get_provider_from_model(model)
-        provider_settings = self.providers.get(provider, {})
-
-        if "api_base" in provider_settings:
-            kwargs["api_base"] = provider_settings["api_base"]
-
-        if (
-            "model_prefix" in provider_settings
-            and provider_settings["model_prefix"] is not None
-        ):
-            kwargs["model"] = (
-                f"{provider_settings['model_prefix']}{model.split('/', 1)[1]}"
-            )
-
-        return kwargs
-
-    def _get_provider_from_model(self, model: str) -> str:
-        """
-        Determines the provider from the model name.
-        """
-        return model.split("/")[0]

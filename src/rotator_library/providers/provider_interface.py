@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import (
@@ -8,6 +11,7 @@ from typing import (
     AsyncGenerator,
     Union,
     FrozenSet,
+    Tuple,
     TYPE_CHECKING,
 )
 import os
@@ -16,6 +20,17 @@ import litellm
 
 if TYPE_CHECKING:
     from ..usage_manager import UsageManager
+
+from ..config import (
+    DEFAULT_ROTATION_MODE,
+    DEFAULT_TIER_PRIORITY,
+    DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
+    DEFAULT_FAIR_CYCLE_ENABLED,
+    DEFAULT_FAIR_CYCLE_TRACKING_MODE,
+    DEFAULT_FAIR_CYCLE_CROSS_TIER,
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+)
 
 
 # =============================================================================
@@ -64,7 +79,8 @@ class ProviderInterface(ABC):
     # Default rotation mode for this provider ("balanced" or "sequential")
     # - "balanced": Rotate credentials to distribute load evenly
     # - "sequential": Use one credential until exhausted, then switch to next
-    default_rotation_mode: str = "balanced"
+    # See config/defaults.py for the global default value
+    default_rotation_mode: str = DEFAULT_ROTATION_MODE
 
     # =========================================================================
     # TIER CONFIGURATION - Override in subclass
@@ -81,7 +97,8 @@ class ProviderInterface(ABC):
     tier_priorities: TierPriorityMap = {}
 
     # Default priority for tiers not in tier_priorities mapping
-    default_tier_priority: int = 10
+    # See config/defaults.py for the global default value
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # =========================================================================
     # USAGE RESET CONFIGURATION - Override in subclass
@@ -121,8 +138,81 @@ class ProviderInterface(ABC):
 
     # Fallback multiplier for sequential mode when priority not in default_priority_multipliers
     # This is used for lower-priority tiers in sequential mode to maintain some stickiness
-    # Default: 1 (no multiplier effect)
-    default_sequential_fallback_multiplier: int = 1
+    # See config/defaults.py for the global default value
+    default_sequential_fallback_multiplier: int = DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
+
+    # =========================================================================
+    # FAIR CYCLE ROTATION - Override in subclass
+    # =========================================================================
+
+    # Fair cycle ensures each credential is used at least once before reuse.
+    # When a credential is "exhausted" (long cooldown > threshold), it's marked
+    # and cannot be selected again until all credentials in its tier exhaust.
+
+    # Enable fair cycle rotation for this provider
+    # None = derive from rotation mode (enabled for sequential only, disabled for balanced)
+    # Can be overridden via env: FAIR_CYCLE_{PROVIDER}=true/false
+    default_fair_cycle_enabled: Optional[bool] = DEFAULT_FAIR_CYCLE_ENABLED
+
+    # Tracking mode for fair cycle:
+    # - "model_group": Track exhaustion per quota group (or per model if ungrouped)
+    # - "credential": Track exhaustion per credential globally (ignores model)
+    # Can be overridden via env: FAIR_CYCLE_TRACKING_MODE_{PROVIDER}=model_group/credential
+    default_fair_cycle_tracking_mode: str = DEFAULT_FAIR_CYCLE_TRACKING_MODE
+
+    # Cross-tier tracking:
+    # - False: Each priority tier cycles independently
+    # - True: ALL credentials must exhaust before any can reuse (ignores tier boundaries)
+    # Can be overridden via env: FAIR_CYCLE_CROSS_TIER_{PROVIDER}=true/false
+    default_fair_cycle_cross_tier: bool = DEFAULT_FAIR_CYCLE_CROSS_TIER
+
+    # Cycle duration in seconds (how long before cycle resets from start)
+    # Can be overridden via env: FAIR_CYCLE_DURATION_{PROVIDER}=<seconds>
+    default_fair_cycle_duration: int = DEFAULT_FAIR_CYCLE_DURATION
+
+    # Exhaustion cooldown threshold in seconds
+    # A cooldown must exceed this duration to qualify as "exhausted" for fair cycle
+    # Short rate limits (e.g., 60s) don't trigger exhaustion; only long quota cooldowns do
+    # Can be overridden via env: EXHAUSTION_COOLDOWN_THRESHOLD_{PROVIDER}=<seconds>
+    # Global fallback: EXHAUSTION_COOLDOWN_THRESHOLD=<seconds>
+    default_exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+
+    # =========================================================================
+    # CUSTOM CAPS - Override in subclass
+    # =========================================================================
+
+    # Custom request caps per tier, per model or quota group
+    # Applies to ALL credentials of that tier for this provider
+    #
+    # Keys:
+    #   - int: Single tier priority (e.g., 2 for standard-tier)
+    #   - tuple of ints: Multiple tiers sharing same config (e.g., (2, 3))
+    #   - "default": Fallback for tiers not explicitly configured
+    #
+    # Values: Dict mapping model/group name to config:
+    #   {
+    #       "max_requests": int | str,      # Absolute (100) or percentage ("80%")
+    #       "cooldown_mode": str,           # "quota_reset" | "offset" | "fixed"
+    #       "cooldown_value": int,          # Seconds for offset/fixed (default 0)
+    #   }
+    #
+    # Resolution order: tier+model → tier+group → default+model → default+group
+    #
+    # Clamping (more restrictive only):
+    #   - max_requests: min(custom, actual_max)
+    #   - cooldown: max(calculated, natural_reset_ts)
+    #
+    # Env override format:
+    #   CUSTOM_CAP_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<value>
+    #   CUSTOM_CAP_COOLDOWN_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<mode>:<value>
+    #
+    # Name transformations for env vars:
+    #   - Dashes (-) → Underscores (_)
+    #   - Dots (.) → Underscores (_)
+    #   - All uppercase
+    default_custom_caps: Dict[
+        Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]
+    ] = {}
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # Utilities for provider implementations
 from .base_quota_tracker import BaseQuotaTracker
 from .antigravity_quota_tracker import AntigravityQuotaTracker

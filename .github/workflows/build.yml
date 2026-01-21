@@ -1,5 +1,86 @@
 name: Build and Release Executable
 
+# ╔═══════════════════════════════════════════════════════════════════════════════════════╗
+# ║                              CONFIGURATION SECTION                                     ║
+# ║  Edit the values below to customize build triggers, release contents, and behavior.   ║
+# ║  All user-configurable options are centralized in this section for easy maintenance.  ║
+# ╚═══════════════════════════════════════════════════════════════════════════════════════╝
+
+env:
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ BRANCH CONFIGURATION                                                                  │
+  # │ NOTE: BUILD_BRANCHES is for reference only. To change which branches trigger builds, │
+  # │       you must ALSO update the 'on.push.branches' section below.                      │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  
+  # Branches that trigger automatic builds (for reference - actual triggers are in 'on:' block)
+  BUILD_BRANCHES: "dev,main"
+  
+  # Branches marked as "stable" releases (non-prerelease, marked as "latest")
+  # Branches NOT in this list will be marked as experimental/prerelease
+  STABLE_BRANCHES: "main"
+  
+  # Parent branches to search for tags when current branch has none (space-separated, priority order)
+  # Used for first build on a new branch to find a comparison point
+  FALLBACK_BRANCHES: "main master develop dev"
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ RELEASE FILES - Files to include in release archives                                 │
+  # │ Paths are relative to repository root. Space-separated.                              │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  
+  # Files included in ALL platform archives (Windows, Linux, macOS)
+  RELEASE_FILES_ALL: ".env.example README.md DOCUMENTATION.md LICENSE"
+  
+  # Platform-specific files (in addition to RELEASE_FILES_ALL)
+  RELEASE_FILES_WINDOWS: ""
+  RELEASE_FILES_LINUX: ""
+  RELEASE_FILES_MACOS: ""
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ FILE DESCRIPTIONS - Shown in release notes under "Included Files"                    │
+  # │ Format: One file per line as "filename|description"                                  │
+  # │ Use **text** for bold in descriptions (markdown supported)                           │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  FILE_DESCRIPTIONS: |
+    proxy_app.exe|Main application executable with built-in TUI launcher for **Windows**.
+    proxy_app|Main application executable with built-in TUI launcher for **Linux** and **macOS**.
+    .env.example|Example configuration file. Copy to .env and add your API keys.
+    README.md|Project overview and quick start guide.
+    DOCUMENTATION.md|Detailed configuration and usage documentation.
+    LICENSE|License.
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ EXPERIMENTAL BUILD WARNING                                                            │
+  # │ Shown at the top of release notes for branches NOT in STABLE_BRANCHES                │
+  # │ Placeholders: {BRANCH} = branch name, {VERSION} = build version, {REPO} = owner/repo │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  EXPERIMENTAL_WARNING: |
+    > [!WARNING]
+    > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
+    > |:---------------------------:|
+    > This release is from the [`{BRANCH}`](https://github.com/{REPO}/tree/{BRANCH}) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
+    >
+    > **Do not use in production environments.**
+    >
+    > ---
+    >
+    > **Found an issue?** Please [report it here](https://github.com/{REPO}/issues/new/choose) and include the build version (`{VERSION}`) in your report.
+
+  # ┌───────────────────────────────────────────────────────────────────────────────────────┐
+  # │ RELEASE PRUNING CONFIGURATION                                                         │
+  # │ Automatically clean up old releases to save space                                     │
+  # └───────────────────────────────────────────────────────────────────────────────────────┘
+  PRUNE_ENABLED: "false"
+  PRUNE_PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
+  PRUNE_RETENTION_DAYS: "1"
+  PRUNE_KEEP_DAILY_SNAPSHOT: "true"
+  PRUNE_MAX_COUNT: "10"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#                                    WORKFLOW TRIGGERS
+# ════════════════════════════════════════════════════════════════════════════════════════════
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,14 +94,25 @@ on:
         type: boolean
         default: false
   push:
+    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
+    # │ BRANCHES: Update this list to match BUILD_BRANCHES in the env section above        │
+    # └─────────────────────────────────────────────────────────────────────────────────────┘
     branches:
       - dev
       - main
+    # ┌─────────────────────────────────────────────────────────────────────────────────────┐
+    # │ PATHS: Files/directories that trigger a build when changed                         │
+    # │ The build will only run if changes are made to files matching these patterns       │
+    # └─────────────────────────────────────────────────────────────────────────────────────┘
     paths:
-      - 'src/proxy_app/**'
-      - 'src/rotator_library/**'
-      - '.github/workflows/build.yml'
-      - 'cliff.toml'
+      - 'src/proxy_app/**'       # Main application source code
+      - 'src/rotator_library/**' # Key rotation library
+      - '.github/workflows/build.yml'  # This workflow file
+      - 'cliff.toml'             # Changelog configuration
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#                                         JOBS
+# ════════════════════════════════════════════════════════════════════════════════════════════
 
 jobs:
   build:
@@ -30,7 +122,7 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v4
@@ -117,11 +209,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      WHITELISTED_BRANCHES: "main"
+    # Note: STABLE_BRANCHES is defined in the top-level env section
     steps:
     - name: Check out repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0
 
@@ -175,11 +266,51 @@ jobs:
         for dir in release-assets/proxy-app-build-*; do
             if [ -d "$dir" ]; then
                 os_name=$(basename "$dir" | cut -d'-' -f4)
+                
+                echo "📦 Processing $os_name archive..."
+                
+                # ═══════════════════════════════════════════════════════════
+                # Copy common files (from RELEASE_FILES_ALL config)
+                # ═══════════════════════════════════════════════════════════
+                for file in ${{ env.RELEASE_FILES_ALL }}; do
+                  if [ -f "$file" ]; then
+                    cp "$file" "$dir/"
+                    echo "   ✓ Added: $file"
+                  else
+                    echo "   ⚠ Not found: $file"
+                  fi
+                done
+                
+                # ═══════════════════════════════════════════════════════════
+                # Copy platform-specific files
+                # ═══════════════════════════════════════════════════════════
+                case "$os_name" in
+                  Windows) EXTRA_FILES="${{ env.RELEASE_FILES_WINDOWS }}" ;;
+                  Linux)   EXTRA_FILES="${{ env.RELEASE_FILES_LINUX }}" ;;
+                  macOS)   EXTRA_FILES="${{ env.RELEASE_FILES_MACOS }}" ;;
+                  *)       EXTRA_FILES="" ;;
+                esac
+                
+                if [ -n "$EXTRA_FILES" ]; then
+                  for file in $EXTRA_FILES; do
+                    if [ -f "$file" ]; then
+                      cp "$file" "$dir/"
+                      echo "   ✓ Added ($os_name only): $file"
+                    else
+                      echo "   ⚠ Not found: $file"
+                    fi
+                  done
+                fi
+                
+                # Create the archive
                 archive_name="LLM-API-Key-Proxy-${os_name}-${{ steps.version.outputs.archive_version_part }}.zip"
                 (
                     cd "$dir"
                     zip -r "../../$archive_name" .
                 )
+                
+                echo "   ✅ Created: $archive_name"
+                
                 if [ -z "$ASSET_PATHS" ]; then
                     ASSET_PATHS="$archive_name"
                 else
@@ -217,6 +348,8 @@ jobs:
     - name: Generate Changelog
       id: changelog
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BRANCH_NAME=${{ github.ref_name }}
         if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
@@ -234,6 +367,78 @@ jobs:
             echo "No new format tag found. Falling back to search for any older build tag..."
             LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
           fi
+          
+          # ═══════════════════════════════════════════════════════════
+          # PARENT BRANCH FALLBACK: Find closest parent branch's tag
+          # ═══════════════════════════════════════════════════════════
+          if [ -z "$LAST_TAG" ]; then
+            echo ""
+            echo "⚠️ No tag found for '$BRANCH_NAME', searching parent branches..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Use FALLBACK_BRANCHES from config
+            FALLBACK_BRANCHES="${{ env.FALLBACK_BRANCHES }}"
+            BEST_TAG=""
+            BEST_DISTANCE=999999
+            BEST_PARENT=""
+            
+            for PARENT in $FALLBACK_BRANCHES; do
+              # Skip if same as current branch
+              [ "$PARENT" == "$BRANCH_NAME" ] && continue
+              
+              # Check if branch exists (remote first, then local)
+              if git rev-parse --verify "origin/$PARENT" >/dev/null 2>&1; then
+                BRANCH_REF="origin/$PARENT"
+              elif git rev-parse --verify "$PARENT" >/dev/null 2>&1; then
+                BRANCH_REF="$PARENT"
+              else
+                echo "   $PARENT: doesn't exist, skipping"
+                continue
+              fi
+              
+              # Find merge-base (common ancestor)
+              MERGE_BASE=$(git merge-base HEAD "$BRANCH_REF" 2>/dev/null || true)
+              if [ -z "$MERGE_BASE" ]; then
+                echo "   $PARENT: no common ancestor, skipping"
+                continue
+              fi
+              
+              # Count commits from merge-base to HEAD (distance = how far we've diverged)
+              DISTANCE=$(git rev-list --count "$MERGE_BASE"..HEAD 2>/dev/null || echo "999999")
+              
+              # Find tag at or before merge-base
+              PARENT_TAG=$(git describe --tags --abbrev=0 --match="$PARENT/build-*" "$MERGE_BASE" 2>/dev/null || true)
+              
+              if [ -n "$PARENT_TAG" ]; then
+                echo "   $PARENT: found $PARENT_TAG (distance: $DISTANCE commits)"
+                if [ "$DISTANCE" -lt "$BEST_DISTANCE" ]; then
+                  BEST_DISTANCE=$DISTANCE
+                  BEST_TAG=$PARENT_TAG
+                  BEST_PARENT=$PARENT
+                fi
+              else
+                echo "   $PARENT: no build tag found at merge-base"
+              fi
+            done
+            
+            if [ -n "$BEST_TAG" ]; then
+              LAST_TAG="$BEST_TAG"
+              echo ""
+              echo "✅ Using parent tag: $LAST_TAG (from '$BEST_PARENT', $BEST_DISTANCE commits ago)"
+            fi
+          fi
+          
+          # ═══════════════════════════════════════════════════════════
+          # ULTIMATE FALLBACK: Any ancestor tag
+          # ═══════════════════════════════════════════════════════════
+          if [ -z "$LAST_TAG" ]; then
+            echo ""
+            echo "🔍 No parent branch tag found, trying any ancestor tag..."
+            LAST_TAG=$(git describe --tags --abbrev=0 --match="*/build-*" HEAD 2>/dev/null || true)
+            if [ -n "$LAST_TAG" ]; then
+              echo "✅ Found ancestor tag: $LAST_TAG"
+            fi
+          fi
         fi
         
         echo "✅ Using tag: $LAST_TAG"
@@ -241,8 +446,9 @@ jobs:
         if [ -n "$LAST_TAG" ]; then
           # Standard run: A previous tag was found.
           echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
-        git-cliff \
-          --config .github/cliff.toml \
+          git-cliff \
+            --config .github/cliff.toml \
+            --github-repo "${{ github.repository }}" \
             --strip all \
             --output changelog.md \
             "$LAST_TAG..HEAD"
@@ -265,6 +471,264 @@ jobs:
           # This is now a true error condition
           echo "❌ Critical error: Changelog is empty after generation."
           echo "has_changelog=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Resolve GitHub Usernames in Changelog
+      id: resolve_usernames
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔍 Resolving GitHub Usernames in Changelog"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Exit early if no changelog
+        if [ ! -s changelog.md ]; then
+          echo "ℹ️ No changelog to process, skipping username resolution"
+          exit 0
+        fi
+        
+        PREV_TAG="${{ steps.changelog.outputs.previous_tag }}"
+        CURRENT_SHA="${{ github.sha }}"
+        
+        echo "📋 Configuration:"
+        echo "   Previous tag: ${PREV_TAG:-'(none)'}"
+        echo "   Current SHA: $CURRENT_SHA"
+        echo ""
+        
+        # Count placeholders before processing
+        TOTAL_PLACEHOLDERS=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md | wc -l || echo "0")
+        echo "📊 Found $TOTAL_PLACEHOLDERS author placeholders to resolve"
+        echo ""
+        
+        if [ "$TOTAL_PLACEHOLDERS" -eq 0 ]; then
+          echo "ℹ️ No placeholders found, skipping"
+          exit 0
+        fi
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER B-1: Compare API (single call, up to 250 commits)
+        # ═══════════════════════════════════════════════════════════
+        LAYER_B1_RESOLVED=0
+        if [ -n "$PREV_TAG" ]; then
+          echo "🔍 Layer B-1: Fetching authors via Compare API..."
+          echo "   Endpoint: repos/${{ github.repository }}/compare/$PREV_TAG...$CURRENT_SHA"
+          
+          AUTHOR_MAP=$(gh api "repos/${{ github.repository }}/compare/$PREV_TAG...$CURRENT_SHA" \
+            --jq '[.commits[] | {sha: .sha, username: .author.login}] | map(select(.username != null))' 2>/dev/null || echo "[]")
+          
+          COMPARE_COUNT=$(echo "$AUTHOR_MAP" | jq 'length')
+          echo "   Retrieved $COMPARE_COUNT commits with linked GitHub accounts"
+          
+          # Apply replacements from Compare API
+          while read -r entry; do
+            if [ -n "$entry" ] && [ "$entry" != "null" ]; then
+              SHA=$(echo "$entry" | jq -r '.sha')
+              USERNAME=$(echo "$entry" | jq -r '.username')
+              if [ -n "$SHA" ] && [ -n "$USERNAME" ] && [ "$USERNAME" != "null" ]; then
+                # Replace [[SHA|...|...]] with @username
+                if grep -q "\[\[$SHA" changelog.md 2>/dev/null; then
+                  sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                  LAYER_B1_RESOLVED=$((LAYER_B1_RESOLVED + 1))
+                fi
+              fi
+            fi
+          done < <(echo "$AUTHOR_MAP" | jq -c '.[]' 2>/dev/null || true)
+          
+          echo "   ✅ Layer B-1 resolved: $LAYER_B1_RESOLVED authors"
+        else
+          echo "⚠️ Layer B-1: Skipped (no previous tag available)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER B-2: Per-commit API (for remaining unresolved)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_B2=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_B2_COUNT=$(echo "$REMAINING_B2" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_B2_RESOLVED=0
+        
+        if [ "$REMAINING_B2_COUNT" -gt 0 ] && [ -n "$REMAINING_B2" ]; then
+          echo "🔍 Layer B-2: Resolving $REMAINING_B2_COUNT remaining via per-commit API..."
+          
+          # Get unique SHAs only
+          UNIQUE_SHAS=$(echo "$REMAINING_B2" | grep -oE '\[\[[a-f0-9]{40}' | sed 's/\[\[//' | sort -u)
+          
+          while read -r SHA; do
+            if [ -n "$SHA" ]; then
+              USERNAME=$(gh api "repos/${{ github.repository }}/commits/$SHA" \
+                --jq '.author.login // empty' 2>/dev/null || true)
+              
+              if [ -n "$USERNAME" ]; then
+                sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                LAYER_B2_RESOLVED=$((LAYER_B2_RESOLVED + 1))
+                echo "   ✅ $SHA -> @$USERNAME"
+              else
+                echo "   ⚠️ $SHA -> (no GitHub account linked)"
+              fi
+            fi
+          done <<< "$UNIQUE_SHAS"
+          
+          echo "   ✅ Layer B-2 resolved: $LAYER_B2_RESOLVED authors"
+        else
+          echo "ℹ️ Layer B-2: Skipped (no remaining placeholders)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER D: Noreply email extraction (no API needed)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_D=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_D_COUNT=$(echo "$REMAINING_D" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_D_RESOLVED=0
+        
+        if [ "$REMAINING_D_COUNT" -gt 0 ] && [ -n "$REMAINING_D" ]; then
+          echo "🔍 Layer D: Extracting usernames from noreply emails..."
+          
+          echo "$REMAINING_D" | while read -r placeholder; do
+            if [ -n "$placeholder" ]; then
+              # Extract SHA, email, and name from [[sha|email|name]]
+              SHA=$(echo "$placeholder" | sed 's/\[\[\([^|]*\)|.*/\1/')
+              EMAIL=$(echo "$placeholder" | sed 's/\[\[[^|]*|\([^|]*\)|.*/\1/')
+              NAME=$(echo "$placeholder" | sed 's/\[\[[^|]*|[^|]*|\([^]]*\)\]\]/\1/')
+              
+              USERNAME=""
+              # Pattern 1: ID+username@users.noreply.github.com
+              if [[ "$EMAIL" =~ ^[0-9]+\+([^@]+)@users\.noreply\.github\.com$ ]]; then
+                USERNAME="${BASH_REMATCH[1]}"
+              # Pattern 2: username@users.noreply.github.com (no ID)
+              elif [[ "$EMAIL" =~ ^([^@+\[]+)@users\.noreply\.github\.com$ ]]; then
+                USERNAME="${BASH_REMATCH[1]}"
+              fi
+              
+              if [ -n "$USERNAME" ]; then
+                sed -i "s|\[\[$SHA[^]]*\]\]|@$USERNAME|g" changelog.md
+                echo "   ✅ Extracted @$USERNAME from $EMAIL"
+              fi
+            fi
+          done
+          
+          # Recount after Layer D
+          AFTER_D=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null | wc -l || echo "0")
+          LAYER_D_RESOLVED=$((REMAINING_D_COUNT - AFTER_D))
+          echo "   ✅ Layer D resolved: $LAYER_D_RESOLVED authors"
+        else
+          echo "ℹ️ Layer D: Skipped (no remaining placeholders)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER FINAL: Git author name fallback (no @)
+        # ═══════════════════════════════════════════════════════════
+        REMAINING_FINAL=$(grep -oE '\[\[[a-f0-9]{40}\|[^]]*\]\]' changelog.md 2>/dev/null || true)
+        REMAINING_FINAL_COUNT=$(echo "$REMAINING_FINAL" | grep -c '\[\[' 2>/dev/null || echo "0")
+        LAYER_FINAL_COUNT=0
+        
+        if [ "$REMAINING_FINAL_COUNT" -gt 0 ] && [ -n "$REMAINING_FINAL" ]; then
+          echo "⚠️ Final fallback: Using git author names for $REMAINING_FINAL_COUNT unresolved..."
+          
+          echo "$REMAINING_FINAL" | while read -r placeholder; do
+            if [ -n "$placeholder" ]; then
+              # Extract name from [[sha|email|name]]
+              SHA=$(echo "$placeholder" | sed 's/\[\[\([^|]*\)|.*/\1/')
+              NAME=$(echo "$placeholder" | sed 's/\[\[[^|]*|[^|]*|\([^]]*\)\]\]/\1/')
+              
+              sed -i "s|\[\[$SHA[^]]*\]\]|$NAME|g" changelog.md
+              echo "   ⚠️ Using fallback: $NAME"
+            fi
+          done
+          
+          LAYER_FINAL_COUNT=$REMAINING_FINAL_COUNT
+        else
+          echo "ℹ️ Final fallback: Not needed (all resolved)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # LAYER PR: Generate Community Contributions section
+        # ═══════════════════════════════════════════════════════════
+        PR_COUNT=0
+        if [ -n "$PREV_TAG" ]; then
+          echo "🔍 Layer PR: Generating Community Contributions section..."
+          
+          # Get all merge commits in the range
+          MERGE_COMMITS=$(git log "$PREV_TAG".."$CURRENT_SHA" --oneline --grep="Merge pull request" 2>/dev/null || true)
+          
+          if [ -n "$MERGE_COMMITS" ]; then
+            PR_SECTION=""
+            
+            while IFS= read -r commit_line; do
+              if [ -n "$commit_line" ]; then
+                # Extract PR number from "Merge pull request #XX from ..."
+                PR_NUM=$(echo "$commit_line" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+                
+                if [ -n "$PR_NUM" ]; then
+                  # Fetch PR info from GitHub API
+                  PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
+                    --jq '{title: .title, author: .user.login}' 2>/dev/null || echo "{}")
+                  
+                  PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
+                  PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
+                  
+                  if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ]; then
+                    PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUM"
+                    PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
+                    PR_COUNT=$((PR_COUNT + 1))
+                    echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
+                  else
+                    echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
+                  fi
+                fi
+              fi
+            done <<< "$MERGE_COMMITS"
+            
+            if [ "$PR_COUNT" -gt 0 ]; then
+              # Append PR section to changelog
+              {
+                echo ""
+                echo "### 💜 Community Contributions"
+                echo ""
+                echo "Thank you to our community contributors!"
+                echo ""
+                echo "$PR_SECTION"
+              } >> changelog.md
+              echo "   ✅ Added $PR_COUNT PRs to Community Contributions section"
+            fi
+          else
+            echo "   ℹ️ No merge commits found in range"
+          fi
+        else
+          echo "⚠️ Layer PR: Skipped (no previous tag available)"
+        fi
+        echo ""
+        
+        # ═══════════════════════════════════════════════════════════
+        # Summary
+        # ═══════════════════════════════════════════════════════════
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📊 Resolution Summary"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "   Total placeholders:     $TOTAL_PLACEHOLDERS"
+        echo "   Layer B-1 (Compare):    $LAYER_B1_RESOLVED"
+        echo "   Layer B-2 (Per-commit): $LAYER_B2_RESOLVED"
+        echo "   Layer D (Noreply):      $LAYER_D_RESOLVED"
+        echo "   Fallback (name only):   $LAYER_FINAL_COUNT"
+        echo "   Community PRs:          $PR_COUNT"
+        echo ""
+        
+        # Verify no placeholders remain
+        REMAINING_CHECK=$(grep -c '\[\[[a-f0-9]\{40\}|' changelog.md 2>/dev/null || echo "0")
+        if [ "$REMAINING_CHECK" -eq 0 ]; then
+          echo "✅ All author placeholders resolved successfully!"
+        else
+          echo "⚠️ Warning: $REMAINING_CHECK placeholders may still remain"
+        fi
+        
+        # Re-encode the changelog for the next step
+        if [ -s changelog.md ]; then
+          CHANGELOG_B64=$(base64 -w 0 changelog.md)
+          echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
         fi
 
     - name: Debug artifact contents
@@ -348,8 +812,11 @@ jobs:
     - name: Create Release
       shell: bash
       run: |
-        # Prepare changelog content
-        if [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
+        # Prepare changelog content - prefer resolved version if available
+        if [ -n "${{ steps.resolve_usernames.outputs.changelog_b64 }}" ]; then
+          echo "${{ steps.resolve_usernames.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
+          CHANGELOG_CONTENT=$(cat decoded_changelog.md)
+        elif [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
           echo "${{ steps.changelog.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
           CHANGELOG_CONTENT=$(cat decoded_changelog.md)
         else
@@ -363,11 +830,16 @@ jobs:
           CHANGELOG_URL=""
         fi
 
-        # Generate file descriptions
+        # Generate file descriptions table from FILE_DESCRIPTIONS config
         FILE_TABLE="| File | Description |
-        |------|-------------|
-        | \`proxy_app.exe\` | Main application executable with built-in TUI launcher for **Windows**. |
-        | \`proxy_app\` | Main application executable with built-in TUI launcher for **Linux** and **macOS**. |"
+        |------|-------------|"
+        while IFS='|' read -r filename description; do
+          # Skip empty lines
+          if [ -n "$filename" ] && [ -n "$description" ]; then
+            FILE_TABLE="$FILE_TABLE
+        | \`$filename\` | $description |"
+          fi
+        done <<< "${{ env.FILE_DESCRIPTIONS }}"
 
         # List archives
         WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
@@ -417,23 +889,16 @@ jobs:
         LATEST_FLAG="--latest"
         EXPERIMENTAL_NOTE=""
 
-        # Check if the current branch is in the comma-separated whitelist
-        if ! [[ ",${{ env.WHITELISTED_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
+        # Check if the current branch is in the stable branches list
+        if ! [[ ",${{ env.STABLE_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
           PRERELEASE_FLAG="--prerelease"
-          LATEST_FLAG="" # Do not mark non-whitelisted branches as 'latest'
-          EXPERIMENTAL_NOTE=$(cat <<-EOF
-        > [!WARNING]
-        > | ⚠️ **EXPERIMENTAL BUILD** ⚠️ |
-        > |:---------------------------:|
-        > This release is from the [\`$CURRENT_BRANCH\`](https://github.com/${{ github.repository }}/tree/$CURRENT_BRANCH) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
-        >
-        > **Do not use in production environments.**
-        >
-        > ---
-        >
-        > **Found an issue?** Please [report it here](https://github.com/${{ github.repository }}/issues/new/choose) and include the build version (\`${{ steps.version.outputs.version }}\`) in your report.
-        EOF
-          )
+          LATEST_FLAG="" # Do not mark non-stable branches as 'latest'
+          
+          # Generate experimental warning from template with placeholder substitution
+          EXPERIMENTAL_NOTE=$(echo '${{ env.EXPERIMENTAL_WARNING }}' | \
+            sed "s|{BRANCH}|$CURRENT_BRANCH|g" | \
+            sed "s|{VERSION}|${{ steps.version.outputs.version }}|g" | \
+            sed "s|{REPO}|${{ github.repository }}|g")
         fi
 
         # Prepend the experimental note if it exists
@@ -463,11 +928,12 @@ jobs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        PRUNE_ENABLED: false
-        PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
-        RETENTION_DAYS_FULL: 1
-        RETENTION_KEEP_ONE_DAILY_OLDER: true
-        RETENTION_MAX_COUNT: 10
+        # Pruning config from top-level env section
+        PRUNE_ENABLED: ${{ env.PRUNE_ENABLED }}
+        PROTECTED_BRANCHES: ${{ env.PRUNE_PROTECTED_BRANCHES }}
+        RETENTION_DAYS_FULL: ${{ env.PRUNE_RETENTION_DAYS }}
+        RETENTION_KEEP_ONE_DAILY_OLDER: ${{ env.PRUNE_KEEP_DAILY_SNAPSHOT }}
+        RETENTION_MAX_COUNT: ${{ env.PRUNE_MAX_COUNT }}
         DRY_RUN: ${{ github.event.inputs.dry_run }}
         CURRENT_TAG: ${{ steps.version.outputs.release_tag }}
       run: |

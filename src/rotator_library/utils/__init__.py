@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/utils/__init__.py
 
 from .headless_detection import is_headless_environment
@@ -16,6 +19,7 @@ from .resilient_io import (
     safe_log_write,
     safe_mkdir,
 )
+from .suppress_litellm_warnings import suppress_litellm_serialization_warnings
 
 __all__ = [
     "is_headless_environment",
@@ -31,4 +35,5 @@ __all__ = [
     "safe_write_json",
     "safe_log_write",
     "safe_mkdir",
+    "suppress_litellm_serialization_warnings",
 ]

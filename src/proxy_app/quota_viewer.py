@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 """
 Lightweight Quota Stats Viewer TUI.
 
@@ -123,7 +126,7 @@ def create_progress_bar(percent: Optional[int], width: int = 10) -> str:
 
 def is_local_host(host: str) -> bool:
     """Check if host is a local/private address (should use http, not https)."""
-    if host in ("localhost", "127.0.0.1", "::1"):
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::"):
         return True
     # Private IP ranges
     if host.startswith("192.168.") or host.startswith("10."):
@@ -137,6 +140,20 @@ def is_local_host(host: str) -> bool:
         except (ValueError, IndexError):
             pass
     return False
+
+
+def normalize_host_for_connection(host: str) -> str:
+    """
+    Convert bind addresses to connectable addresses.
+
+    0.0.0.0 and :: are valid for binding a server to all interfaces,
+    but clients cannot connect to them. Translate to loopback addresses.
+    """
+    if host == "0.0.0.0":
+        return "127.0.0.1"
+    if host == "::":
+        return "::1"
+    return host
 
 
 def get_scheme_for_host(host: str, port: int) -> str:
@@ -215,6 +232,7 @@ class QuotaViewer:
         if not self.current_remote:
             return "http://127.0.0.1:8000"
         host = self.current_remote.get("host", "127.0.0.1")
+        host = normalize_host_for_connection(host)
 
         # If host is a full URL, use it directly (strip trailing slash)
         if is_full_url(host):
@@ -280,6 +298,7 @@ class QuotaViewer:
             Tuple of (is_online, status_message)
         """
         host = remote.get("host", "127.0.0.1")
+        host = normalize_host_for_connection(host)
 
         # If host is a full URL, extract scheme and netloc to hit root
         if is_full_url(host):
@@ -547,23 +566,61 @@ class QuotaViewer:
     # DISPLAY SCREENS
     # =========================================================================
 
-    def show_connection_error(self):
-        """Display connection error screen."""
+    def show_connection_error(self) -> str:
+        """
+        Display connection error screen with options to configure remotes.
+
+        Returns:
+            User choice: 's' (switch), 'm' (manage), 'r' (retry), 'b' (back/exit)
+        """
         clear_screen()
+
+        remote_name = (
+            self.current_remote.get("name", "Unknown")
+            if self.current_remote
+            else "None"
+        )
+        remote_host = self.current_remote.get("host", "") if self.current_remote else ""
+        remote_port = self.current_remote.get("port", "") if self.current_remote else ""
+
+        # Format connection display - handle full URLs
+        if is_full_url(remote_host):
+            connection_display = remote_host
+        elif remote_port:
+            connection_display = f"{remote_host}:{remote_port}"
+        else:
+            connection_display = remote_host
+
         self.console.print(
             Panel(
                 Text.from_markup(
                     "[bold red]Connection Error[/bold red]\n\n"
-                    f"{self.last_error or 'Unknown error'}\n\n"
+                    f"Remote: [bold]{remote_name}[/bold] ({connection_display})\n"
+                    f"Error: {self.last_error or 'Unknown error'}\n\n"
                     "[bold]This tool requires the proxy to be running.[/bold]\n"
-                    "Start the proxy first, then try again.\n\n"
+                    "Start the proxy first, or configure a different remote.\n\n"
                     "[dim]Tip: Select option 1 from the main menu to run the proxy.[/dim]"
                 ),
                 border_style="red",
                 expand=False,
             )
         )
-        Prompt.ask("\nPress Enter to return to main menu", default="")
+
+        self.console.print()
+        self.console.print("━" * 78)
+        self.console.print()
+        self.console.print("   S. Switch to a different remote")
+        self.console.print("   M. Manage remotes (add/edit/delete)")
+        self.console.print("   R. Retry connection")
+        self.console.print("   B. Back to main menu")
+        self.console.print()
+        self.console.print("━" * 78)
+
+        choice = Prompt.ask("Select option", default="B").strip().lower()
+
+        if choice in ("s", "m", "r", "b"):
+            return choice
+        return "b"  # Default to back for invalid input
 
     def show_summary_screen(self):
         """Display the main summary screen with all providers."""
@@ -1488,21 +1545,41 @@ class QuotaViewer:
             self.console.print("[red]No remotes configured.[/red]")
             return
 
-        # For Local remote, try to get API key from .env if not set
-        if self.current_remote["name"] == "Local" and not self.current_remote.get(
-            "api_key"
-        ):
-            env_key = self.config.get_api_key_from_env()
-            if env_key:
-                self.current_remote["api_key"] = env_key
+        # Connection loop - allows retry after configuring remotes
+        while True:
+            # For Local remote, try to get API key from .env if not set
+            if self.current_remote["name"] == "Local" and not self.current_remote.get(
+                "api_key"
+            ):
+                env_key = self.config.get_api_key_from_env()
+                if env_key:
+                    self.current_remote["api_key"] = env_key
 
-        # Initial fetch
-        with self.console.status("[bold]Connecting to proxy...", spinner="dots"):
-            stats = self.fetch_stats()
+            # Try to connect
+            with self.console.status("[bold]Connecting to proxy...", spinner="dots"):
+                stats = self.fetch_stats()
 
-        if stats is None:
-            self.show_connection_error()
-            return
+            if stats is not None:
+                break  # Connected successfully
+
+            # Connection failed - show error with options
+            choice = self.show_connection_error()
+
+            if choice == "b":
+                return  # Exit to main menu
+            elif choice == "s":
+                self.show_switch_remote_screen()
+            elif choice == "m":
+                self.show_manage_remotes_screen()
+            elif choice == "r":
+                continue  # Retry connection
+
+            # After switch/manage, refresh current_remote from config
+            # (it may have been changed)
+            if self.current_remote:
+                updated = self.config.get_remote_by_name(self.current_remote["name"])
+                if updated:
+                    self.current_remote = updated
 
         # Main loop
         while self.running:

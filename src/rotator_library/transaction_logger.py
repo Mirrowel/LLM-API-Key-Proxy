@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/transaction_logger.py
 """
 Unified transaction logging for the rotator library.
@@ -98,11 +101,19 @@ class TransactionLogger:
         "provider",
         "model",
         "streaming",
+        "api_format",
         "_dir_available",
         "_context",
     )
 
-    def __init__(self, provider: str, model: str, enabled: bool = True):
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        enabled: bool = True,
+        api_format: str = "oai",
+        parent_dir: Optional[Path] = None,
+    ):
         """
         Initialize transaction logger.
 
@@ -110,11 +121,14 @@ class TransactionLogger:
             provider: Provider name (e.g., 'antigravity', 'openai')
             model: Model name (will be sanitized for filesystem)
             enabled: Whether logging is enabled
+            api_format: API format prefix ('oai' for OpenAI, 'ant' for Anthropic)
+            parent_dir: Optional parent directory for nested logging
         """
         self.enabled = enabled
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())[:8]  # 8-char short ID
         self.provider = provider
+        self.api_format = api_format
 
         # Strip provider prefix from model if present
         # e.g., "antigravity/claude-opus-4.5" → "claude-opus-4.5"
@@ -131,12 +145,19 @@ class TransactionLogger:
         if not enabled:
             return
 
-        # Create directory: MMDD_HHMMSS_{provider}_{model}_{request_id}
+        # Create directory based on whether we have a parent directory
         timestamp = datetime.now().strftime("%m%d_%H%M%S")
         safe_provider = _sanitize_name(provider)
-        dir_name = f"{timestamp}_{safe_provider}_{self.model}_{self.request_id}"
 
-        self.log_dir = _get_transactions_dir() / dir_name
+        if parent_dir:
+            # Nested logging: create subdirectory inside parent
+            # e.g., parent_dir/openai/ for OpenAI translation layer
+            subdir_name = "openai" if api_format == "oai" else api_format
+            self.log_dir = parent_dir / subdir_name
+        else:
+            # Root-level logging: MMDD_HHMMSS_{api_format}_{provider}_{model}_{request_id}
+            dir_name = f"{timestamp}_{api_format}_{safe_provider}_{self.model}_{self.request_id}"
+            self.log_dir = _get_transactions_dir() / dir_name
 
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -162,12 +183,15 @@ class TransactionLogger:
             )
         return self._context
 
-    def log_request(self, request_data: Dict[str, Any]) -> None:
+    def log_request(
+        self, request_data: Dict[str, Any], filename: str = "request.json"
+    ) -> None:
         """
-        Log the OpenAI-compatible request received by client.py.
+        Log the request received by client.py.
 
         Args:
             request_data: The request data dict (messages, model, etc.)
+            filename: Custom filename for the log file (default: request.json)
         """
         if not self.enabled or not self._dir_available:
             return
@@ -179,7 +203,7 @@ class TransactionLogger:
             "timestamp_utc": datetime.utcnow().isoformat(),
             "data": request_data,
         }
-        self._write_json("request.json", data)
+        self._write_json(filename, data)
 
     def log_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
@@ -203,14 +227,16 @@ class TransactionLogger:
         response_data: Dict[str, Any],
         status_code: int = 200,
         headers: Optional[Dict[str, Any]] = None,
+        filename: str = "response.json",
     ) -> None:
         """
-        Log the OpenAI-compatible response returned by client.py.
+        Log the response returned by client.py.
 
         Args:
             response_data: The response data dict
             status_code: HTTP status code (default 200)
             headers: Optional response headers
+            filename: Custom filename for the log file (default: response.json)
         """
         if not self.enabled or not self._dir_available:
             return
@@ -226,7 +252,7 @@ class TransactionLogger:
             "headers": dict(headers) if headers else None,
             "data": response_data,
         }
-        self._write_json("response.json", data)
+        self._write_json(filename, data)
 
         # Also write metadata
         self._log_metadata(response_data, status_code, duration_ms)

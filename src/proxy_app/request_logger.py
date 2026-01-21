@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 import json
 import os
 from datetime import datetime

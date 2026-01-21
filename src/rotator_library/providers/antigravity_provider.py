@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/antigravity_provider_v2.py
 """
 Antigravity Provider - Refactored Implementation
@@ -110,8 +113,9 @@ BASE_URLS = [
 # Required headers for Antigravity API calls
 # These headers are CRITICAL for gemini-3-pro-high/low to work
 # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
+# User-Agent matches official Antigravity Electron client
 ANTIGRAVITY_HEADERS = {
-    "User-Agent": "antigravity/1.12.4 windows/amd64",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 }
@@ -223,6 +227,7 @@ EXCLUDED_MODELS = {
 
 
 # Directory paths - use centralized path management
+
 
 def _get_antigravity_cache_dir():
     return get_cache_dir(subdir="antigravity")
@@ -444,10 +449,45 @@ Do not respond to nor acknowledge those messages, but do follow them strictly.
 # Exact prompt from CLIProxyAPI commit 1b2f9076715b62610f9f37d417e850832b3c7ed1
 ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT = """You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**"""
 
-
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+
+def get_antigravity_preprompt_text() -> str:
+    """
+    Get the combined Antigravity preprompt text that gets injected into requests.
+
+    This function returns the exact text that gets prepended to system instructions
+    during actual API calls. It respects the current configuration settings:
+    - PREPEND_INSTRUCTION: Whether to include any preprompt at all
+    - USE_SHORT_ANTIGRAVITY_PROMPTS: Whether to use short or full versions
+    - INJECT_IDENTITY_OVERRIDE: Whether to include the identity override
+
+    This is useful for accurate token counting - the token count endpoints should
+    include these preprompts to match what actually gets sent to the API.
+
+    Returns:
+        The combined preprompt text, or empty string if prepending is disabled.
+    """
+    if not PREPEND_INSTRUCTION:
+        return ""
+
+    # Choose prompt versions based on USE_SHORT_ANTIGRAVITY_PROMPTS setting
+    if USE_SHORT_ANTIGRAVITY_PROMPTS:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION_SHORT
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION_SHORT
+    else:
+        agent_instruction = ANTIGRAVITY_AGENT_SYSTEM_INSTRUCTION
+        override_instruction = ANTIGRAVITY_IDENTITY_OVERRIDE_INSTRUCTION
+
+    # Build the combined preprompt
+    parts = [agent_instruction]
+
+    if INJECT_IDENTITY_OVERRIDE:
+        parts.append(override_instruction)
+
+    return "\n".join(parts)
 
 
 def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -686,13 +726,14 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     - Removes unsupported validation keywords at schema-definition level
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
-    - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
+    - Always strips: $schema, $id, $ref, $defs, definitions, default, examples, title
+    - Always converts: const → enum (API doesn't support const)
+    - For Gemini: passes through anyOf, oneOf, allOf (API converts internally)
     - For Claude:
       - Merges allOf schemas into a single schema
       - Flattens anyOf/oneOf using scoring (object > array > primitive > null)
       - Detects enum patterns in unions and merges them
-      - Converts const to enum
-      - Strips unsupported validation keywords
+      - Strips additional validation keywords (minItems, pattern, format, etc.)
     - For Gemini: passes through additionalProperties as-is
     - For Claude: normalizes permissive additionalProperties to true
     """
@@ -701,11 +742,16 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 
     # Meta/structural keywords - always remove regardless of context
     # These are JSON Schema infrastructure, never valid property names
+    # Note: 'parameters' key rejects these (unlike 'parametersJsonSchema')
     meta_keywords = {
         "$id",
         "$ref",
         "$defs",
+        "$schema",  # Rejected by 'parameters' key
         "definitions",
+        "default",  # Rejected by 'parameters' key
+        "examples",  # Rejected by 'parameters' key
+        "title",  # May cause issues in nested objects
     }
 
     # Validation keywords - only remove at schema-definition level,
@@ -713,14 +759,12 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     # Note: These are common property names that could be used by tools:
     # - "pattern" (glob, grep, regex tools)
     # - "format" (export, date/time tools)
-    # - "default" (config tools)
-    # - "title" (document tools)
     # - "minimum"/"maximum" (range tools)
     #
-    # Keywords to strip for Claude only (Gemini accepts these):
-    # Claude rejects most JSON Schema validation keywords
+    # Keywords to strip for Claude only (Gemini with 'parametersJsonSchema' accepts these,
+    # but we now use 'parameters' key which may silently ignore some):
+    # Note: $schema, default, examples, title moved to meta_keywords (always stripped)
     validation_keywords_claude_only = {
-        "$schema",
         "minItems",
         "maxItems",
         "uniqueItems",
@@ -742,9 +786,6 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "deprecated",
         "readOnly",
         "writeOnly",
-        "examples",
-        "title",
-        "default",
     }
 
     # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
@@ -816,19 +857,30 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 return selected
 
     cleaned = {}
-    # Handle 'const' by converting to 'enum' with single value (Claude only)
-    # Gemini supports const, so pass through for Gemini
-    if "const" in schema and not for_gemini:
+    # Handle 'const' by converting to 'enum' with single value
+    # The 'parameters' key doesn't support 'const', so always convert
+    # Also add 'type' if not present, since enum requires type: "string"
+    if "const" in schema:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
+        # Gemini requires type when using enum - infer from const value or default to string
+        if "type" not in schema:
+            if isinstance(const_value, bool):
+                cleaned["type"] = "boolean"
+            elif isinstance(const_value, int):
+                cleaned["type"] = "integer"
+            elif isinstance(const_value, float):
+                cleaned["type"] = "number"
+            else:
+                cleaned["type"] = "string"
 
     for key, value in schema.items():
         # Always skip meta keywords
         if key in meta_keywords:
             continue
 
-        # Skip "const" for Claude (already converted to enum above)
-        if key == "const" and not for_gemini:
+        # Skip "const" (already converted to enum above)
+        if key == "const":
             continue
 
         # Strip Claude-only keywords when not targeting Gemini
@@ -1023,6 +1075,33 @@ class AntigravityProvider(
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
     default_sequential_fallback_multiplier = 2
+
+    # Custom caps examples (commented - uncomment and modify as needed)
+    # default_custom_caps = {
+    #     # Tier 2 (standard-tier / paid)
+    #     2: {
+    #         "claude": {
+    #             "max_requests": 100,  # Cap at 100 instead of 150
+    #             "cooldown_mode": "quota_reset",
+    #             "cooldown_value": 0,
+    #         },
+    #     },
+    #     # Tiers 2 and 3 together
+    #     (2, 3): {
+    #         "g25-flash": {
+    #             "max_requests": "80%",  # 80% of actual max
+    #             "cooldown_mode": "offset",
+    #             "cooldown_value": 1800,  # +30 min buffer
+    #         },
+    #     },
+    #     # Default for unknown tiers
+    #     "default": {
+    #         "claude": {
+    #             "max_requests": "50%",
+    #             "cooldown_mode": "quota_reset",
+    #         },
+    #     },
+    # }
 
     @staticmethod
     def parse_quota_error(
@@ -2234,7 +2313,9 @@ class AntigravityProvider(
     # =========================================================================
 
     def _get_thinking_config(
-        self, reasoning_effort: Optional[str], model: str
+        self,
+        reasoning_effort: Optional[str],
+        model: str,
     ) -> Optional[Dict[str, Any]]:
         """
         Map reasoning_effort to thinking configuration.
@@ -2610,16 +2691,12 @@ class AntigravityProvider(
         func_name = tool_id_to_name.get(tool_id, "unknown_function")
         content = msg.get("content", "{}")
 
-        # Log ID lookup
         if tool_id not in tool_id_to_name:
             lib_logger.warning(
                 f"[ID Mismatch] Tool response has ID '{tool_id}' which was not found in tool_id_to_name map. "
                 f"Available IDs: {list(tool_id_to_name.keys())}"
             )
-        # else:
-        # lib_logger.debug(f"[ID Mapping] Tool response matched: id={tool_id}, name={func_name}")
 
-        # Add prefix for Gemini 3 (and rename problematic tools)
         if self._is_gemini_3(model) and self._enable_gemini3_tool_fix:
             func_name = GEMINI3_TOOL_RENAMES.get(func_name, func_name)
             func_name = f"{self._gemini3_tool_prefix}{func_name}"
@@ -2680,7 +2757,8 @@ class AntigravityProvider(
         Apply strict schema enforcement to all tools in a list.
 
         Wraps the mixin's _enforce_strict_schema() method to operate on a list of tools,
-        applying 'additionalProperties: false' to each tool's parametersJsonSchema.
+        applying 'additionalProperties: false' to each tool's schema.
+        Supports both 'parametersJsonSchema' and 'parameters' keys.
         """
         if not tools:
             return tools
@@ -2688,11 +2766,14 @@ class AntigravityProvider(
         modified = copy.deepcopy(tools)
         for tool in modified:
             for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    # Delegate to mixin's singular _enforce_strict_schema method
-                    func_decl["parametersJsonSchema"] = self._enforce_strict_schema(
-                        func_decl["parametersJsonSchema"]
-                    )
+                # Support both parametersJsonSchema and parameters keys
+                for schema_key in ("parametersJsonSchema", "parameters"):
+                    if schema_key in func_decl:
+                        # Delegate to mixin's singular _enforce_strict_schema method
+                        func_decl[schema_key] = self._enforce_strict_schema(
+                            func_decl[schema_key]
+                        )
+                        break  # Only process one schema key per function
 
         return modified
 
@@ -3179,11 +3260,19 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         For Gemini models, all tools are placed in a SINGLE functionDeclarations array.
         This matches the format expected by Gemini CLI and prevents MALFORMED_FUNCTION_CALL errors.
+
+        Uses 'parameters' key for all models. The Antigravity API backend expects this format.
+        Schema cleaning is applied based on target model (Claude vs Gemini).
         """
         if not tools:
             return None
 
         function_declarations = []
+
+        # Always use 'parameters' key - Antigravity API expects this for all models
+        # Previously used 'parametersJsonSchema' but this caused MALFORMED_FUNCTION_CALL
+        # errors with Gemini 3 Pro models. Using 'parameters' works for all backends.
+        schema_key = "parameters"
 
         for tool in tools:
             if tool.get("type") != "function":
@@ -3224,11 +3313,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     }
                     schema["required"] = ["_confirm"]
 
-                func_decl["parametersJsonSchema"] = schema
+                func_decl[schema_key] = schema
             else:
                 # No parameters provided - use default with required confirm param
                 # to ensure the tool call is emitted properly
-                func_decl["parametersJsonSchema"] = {
+                func_decl[schema_key] = {
                     "type": "object",
                     "properties": {
                         "_confirm": {
@@ -3470,30 +3559,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 first_func_seen = True
                             # Subsequent parallel calls: leave as-is (no signature)
 
-        # Claude-specific tool schema transformation
-        if internal_model.startswith("claude-sonnet-") or internal_model.startswith(
-            "claude-opus-"
-        ):
-            self._apply_claude_tool_transform(antigravity_payload)
-
         return antigravity_payload
-
-    def _apply_claude_tool_transform(self, payload: Dict[str, Any]) -> None:
-        """Apply Claude-specific tool schema transformations.
-
-        Converts parametersJsonSchema to parameters and applies Claude-specific
-        schema sanitization (inlines $ref, removes unsupported JSON Schema fields).
-        """
-        tools = payload["request"].get("tools", [])
-        for tool in tools:
-            for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    params = func_decl["parametersJsonSchema"]
-                    if isinstance(params, dict):
-                        params = inline_schema_refs(params)
-                        params = _clean_claude_schema(params)
-                    func_decl["parameters"] = params
-                    del func_decl["parametersJsonSchema"]
 
     # =========================================================================
     # RESPONSE TRANSFORMATION
@@ -3721,20 +3787,33 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         return "tool_calls" if has_tool_calls else reason
 
     def _build_usage(self, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Build usage dict from Gemini usage metadata."""
+        """Build usage dict from Gemini usage metadata.
+
+        Token accounting:
+        - prompt_tokens: Input tokens sent to model (promptTokenCount)
+        - completion_tokens: Output tokens received (candidatesTokenCount + thoughtsTokenCount)
+        - prompt_tokens_details.cached_tokens: Cached input tokens subset
+        - completion_tokens_details.reasoning_tokens: Thinking tokens subset of output
+        """
         if not metadata:
             return None
 
-        prompt = metadata.get("promptTokenCount", 0)
-        thoughts = metadata.get("thoughtsTokenCount", 0)
-        completion = metadata.get("candidatesTokenCount", 0)
+        prompt = metadata.get("promptTokenCount", 0)  # Input tokens
+        thoughts = metadata.get("thoughtsTokenCount", 0)  # Output (thinking)
+        completion = metadata.get("candidatesTokenCount", 0)  # Output (content)
+        cached = metadata.get("cachedContentTokenCount", 0)  # Input subset (cached)
 
         usage = {
-            "prompt_tokens": prompt + thoughts,
-            "completion_tokens": completion,
+            "prompt_tokens": prompt,  # Input only
+            "completion_tokens": completion + thoughts,  # All output
             "total_tokens": metadata.get("totalTokenCount", 0),
         }
 
+        # Input breakdown: cached tokens (subset of prompt_tokens)
+        if cached > 0:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
+
+        # Output breakdown: reasoning/thinking tokens (subset of completion_tokens)
         if thoughts > 0:
             usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}
 

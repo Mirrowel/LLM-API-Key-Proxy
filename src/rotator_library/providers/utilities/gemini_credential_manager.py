@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/utilities/gemini_credential_manager.py
 """
 Shared credential and tier management mixin for Gemini-based providers.

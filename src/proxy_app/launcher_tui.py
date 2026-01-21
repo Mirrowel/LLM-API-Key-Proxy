@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 """
 Interactive TUI launcher for the LLM API Key Proxy.
 Provides a beautiful Rich-based interface for configuration and execution.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/gemini_cli_provider.py
 
 import copy
@@ -20,6 +23,7 @@ from .utilities.gemini_shared_utils import (
     GEMINI3_TOOL_RENAMES_REVERSE,
     FINISH_REASON_MAP,
     CODE_ASSIST_ENDPOINT,
+    GEMINI_CLI_ENDPOINT_FALLBACKS,
 )
 from ..transaction_logger import ProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -33,6 +37,8 @@ from ..error_handler import extract_retry_after_from_body
 import os
 from pathlib import Path
 import uuid
+import secrets
+import hashlib
 from datetime import datetime
 
 lib_logger = logging.getLogger("rotator_library")
@@ -407,6 +413,7 @@ class GeminiCliProvider(
         self._learned_costs: Dict[str, Dict[str, float]] = {}
         self._learned_costs_loaded: bool = False
 
+
     # =========================================================================
     # CREDENTIAL TIER LOOKUP (Provider-specific - uses cache)
     # =========================================================================
@@ -460,6 +467,104 @@ class GeminiCliProvider(
         """Check if model is Gemini 3 (requires special handling)."""
         model_name = model.split("/")[-1].replace(":thinking", "")
         return model_name.startswith("gemini-3-")
+
+    def _generate_user_prompt_id(self) -> str:
+        """
+        Generate a unique prompt ID matching native gemini-cli format.
+
+        Native JS: Math.random().toString(16).slice(2) produces 13-14 hex chars.
+        Python equivalent using secrets for cryptographic randomness.
+        """
+        return secrets.token_hex(7)  # 14 hex characters
+
+    def _generate_stable_session_id(self, contents: List[Dict[str, Any]]) -> str:
+        """
+        Generate a stable session ID based on the first user message.
+
+        This ensures:
+        - Same conversation = same session_id (even across server restarts)
+        - Different conversations = different session_ids
+        - Multi-user scenarios are properly isolated
+
+        Uses SHA256 hash of the first user message to create a deterministic
+        UUID-formatted session ID. Falls back to random UUID if no user message.
+
+        This approach mirrors Antigravity's _generate_stable_session_id() but
+        uses UUID format instead of the -{number} format to match native
+        gemini-cli's crypto.randomUUID() output format.
+
+        Args:
+            contents: List of message contents in Gemini format
+
+        Returns:
+            UUID-formatted session ID string
+        """
+        # Find first user message text
+        for content in contents:
+            if content.get("role") == "user":
+                parts = content.get("parts", [])
+                for part in parts:
+                    if isinstance(part, dict):
+                        text = part.get("text", "")
+                        if text:
+                            # SHA256 hash and use first 16 bytes to create UUID
+                            h = hashlib.sha256(text.encode("utf-8")).digest()
+                            # Format as UUID (8-4-4-4-12 hex chars)
+                            return f"{h[:4].hex()}-{h[4:6].hex()}-{h[6:8].hex()}-{h[8:10].hex()}-{h[10:16].hex()}"
+
+        # Fallback to random UUID if no user message found
+        return str(uuid.uuid4())
+
+    def _get_gemini_cli_request_headers(self, model: str) -> Dict[str, str]:
+        """
+        Build request headers matching native gemini-cli client.
+
+        For the OAuth/Code Assist path, native gemini-cli only sends:
+        - Content-Type: application/json (handled by httpx)
+        - Authorization: Bearer <token> (handled by auth_header)
+        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch})
+
+        Headers NOT sent by native CLI (confirmed via explore agent analysis):
+        - X-Goog-Api-Client: Not used in Code Assist path (only in SDK/API key path)
+        - Client-Metadata: Not sent as HTTP header (only in request body for management endpoints)
+        - X-Goog-User-Project: Only used in MCP path, causes 403 errors in Code Assist
+
+        Source: gemini-cli/packages/core/src/code_assist/server.ts:332
+        Source: gemini-cli/packages/core/src/core/contentGenerator.ts:129
+        """
+        model_name = model.split("/")[-1].replace(":thinking", "")
+
+        # Hardcoded to Windows x64 platform (matching common development environment)
+        # Native format: GeminiCLI/${version}/${model} (${platform}; ${arch})
+        user_agent = f"GeminiCLI/0.26.0/{model_name} (win32; x64)"
+
+        # =========================================================================
+        # COMMENTED OUT HEADERS - Not sent by native gemini-cli for Code Assist path
+        # Keeping these for reference as they worked well for SDK mimicry.
+        # Uncomment if rate limiting issues arise and you want to try SDK fingerprinting.
+        # =========================================================================
+
+        # X-Goog-Api-Client: Mimics @google/genai SDK but native CLI doesn't send this
+        # for OAuth/Code Assist path (only set when using API key authentication)
+        # x_goog_api_client = "gl-node/22.17.0 gdcl/1.30.0"
+
+        # Client-Metadata: Native CLI sends this in REQUEST BODY for management endpoints
+        # (loadCodeAssist, onboardUser, listExperiments, recordCodeAssistMetrics)
+        # but NOT as an HTTP header for generateContent requests.
+        # client_metadata = (
+        #     "ideType=IDE_UNSPECIFIED,"
+        #     "pluginType=GEMINI,"
+        #     "ideVersion=0.26.0,"
+        #     "platform=WINDOWS_AMD64,"
+        #     "updateChannel=stable"
+        # )
+
+        return {
+            "User-Agent": user_agent,
+            # "X-Goog-Api-Client": x_goog_api_client,  # Not sent by native CLI
+            # "Client-Metadata": client_metadata,      # Not sent as header by native CLI
+            # "Accept": "application/json",            # Not explicitly sent by native CLI
+        }
 
     def _get_available_models(self) -> List[str]:
         """
@@ -957,24 +1062,33 @@ class GeminiCliProvider(
 
             if "usageMetadata" in response_data:
                 usage = response_data["usageMetadata"]
-                prompt_tokens = usage.get("promptTokenCount", 0)
-                thoughts_tokens = usage.get("thoughtsTokenCount", 0)
-                candidate_tokens = usage.get("candidatesTokenCount", 0)
+                prompt_tokens = usage.get("promptTokenCount", 0)  # Input
+                thoughts_tokens = usage.get(
+                    "thoughtsTokenCount", 0
+                )  # Output (thinking)
+                candidate_tokens = usage.get(
+                    "candidatesTokenCount", 0
+                )  # Output (content)
+                cached_tokens = usage.get("cachedContentTokenCount", 0)  # Input subset
 
                 openai_chunk["usage"] = {
-                    "prompt_tokens": prompt_tokens
-                    + thoughts_tokens,  # Include thoughts in prompt tokens
-                    "completion_tokens": candidate_tokens,
+                    "prompt_tokens": prompt_tokens,  # Input only
+                    "completion_tokens": candidate_tokens
+                    + thoughts_tokens,  # All output
                     "total_tokens": usage.get("totalTokenCount", 0),
                 }
 
-                # Add reasoning tokens details if present (OpenAI o1 format)
+                # Add input breakdown: cached tokens
+                if cached_tokens > 0:
+                    openai_chunk["usage"]["prompt_tokens_details"] = {
+                        "cached_tokens": cached_tokens
+                    }
+
+                # Add output breakdown: reasoning tokens
                 if thoughts_tokens > 0:
-                    if "completion_tokens_details" not in openai_chunk["usage"]:
-                        openai_chunk["usage"]["completion_tokens_details"] = {}
-                    openai_chunk["usage"]["completion_tokens_details"][
-                        "reasoning_tokens"
-                    ] = thoughts_tokens
+                    openai_chunk["usage"]["completion_tokens_details"] = {
+                        "reasoning_tokens": thoughts_tokens
+                    }
 
             yield openai_chunk
 
@@ -1327,12 +1441,20 @@ class GeminiCliProvider(
             # Fix tool response grouping (handles ID mismatches, missing responses)
             contents = self._fix_tool_response_grouping(contents)
 
+            # Generate unique prompt ID for this request (matches native gemini-cli)
+            # Source: gemini-cli/packages/cli/src/gemini.tsx line 668
+            user_prompt_id = self._generate_user_prompt_id()
+
+            # Build payload matching native gemini-cli structure
+            # Source: gemini-cli/packages/core/src/code_assist/converter.ts lines 31-48
             request_payload = {
                 "model": model_name,
                 "project": project_id,
+                "user_prompt_id": user_prompt_id,
                 "request": {
                     "contents": contents,
                     "generationConfig": gen_config,
+                    "session_id": self._generate_stable_session_id(contents),
                 },
             }
 
@@ -1377,8 +1499,6 @@ class GeminiCliProvider(
             # lib_logger.debug(f"Gemini CLI Request Payload: {json.dumps(request_payload, indent=2)}")
             file_logger.log_request(request_payload)
 
-            url = f"{CODE_ASSIST_ENDPOINT}:streamGenerateContent"
-
             async def stream_handler():
                 # Track state across chunks for tool indexing
                 accumulator = {
@@ -1387,119 +1507,165 @@ class GeminiCliProvider(
                     "is_complete": False,
                 }
 
+                # Build headers matching native gemini-cli client fingerprint
                 final_headers = auth_header.copy()
-                final_headers.update(
-                    {
-                        "User-Agent": "google-api-nodejs-client/9.15.1",
-                        "X-Goog-Api-Client": "gl-node/22.17.0",
-                        "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-                        "Accept": "application/json",
-                    }
-                )
-                try:
-                    async with client.stream(
-                        "POST",
-                        url,
-                        headers=final_headers,
-                        json=request_payload,
-                        params={"alt": "sse"},
-                        timeout=TimeoutConfig.streaming(),
-                    ) as response:
-                        # Read and log error body before raise_for_status for better debugging
-                        if response.status_code >= 400:
+                final_headers.update(self._get_gemini_cli_request_headers(model_name))
+
+                # Endpoint fallback loop: try sandbox first, then production
+                # This mirrors the opencode-antigravity-auth plugin behavior
+                last_endpoint_error = None
+                for endpoint_idx, base_endpoint in enumerate(
+                    GEMINI_CLI_ENDPOINT_FALLBACKS
+                ):
+                    url = f"{base_endpoint}:streamGenerateContent"
+                    is_fallback = endpoint_idx > 0
+
+                    if is_fallback:
+                        lib_logger.debug(
+                            f"Endpoint fallback: trying {base_endpoint} after previous endpoint failed"
+                        )
+
+                    try:
+                        async with client.stream(
+                            "POST",
+                            url,
+                            headers=final_headers,
+                            json=request_payload,
+                            params={"alt": "sse"},
+                            timeout=TimeoutConfig.streaming(),
+                        ) as response:
+                            # Read and log error body before raise_for_status for better debugging
+                            if response.status_code >= 400:
+                                try:
+                                    error_body = await response.aread()
+                                    lib_logger.error(
+                                        f"Gemini CLI API error {response.status_code}: {error_body.decode()}"
+                                    )
+                                    file_logger.log_error(
+                                        f"API error {response.status_code}: {error_body.decode()}"
+                                    )
+                                except Exception:
+                                    pass
+
+                            # This will raise an HTTPStatusError for 4xx/5xx responses
+                            response.raise_for_status()
+
+                            async for line in response.aiter_lines():
+                                file_logger.log_response_chunk(line)
+                                if line.startswith("data: "):
+                                    data_str = line[6:]
+                                    if data_str == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(data_str)
+                                        for (
+                                            openai_chunk
+                                        ) in self._convert_chunk_to_openai(
+                                            chunk, model, accumulator
+                                        ):
+                                            yield litellm.ModelResponse(**openai_chunk)
+                                    except json.JSONDecodeError:
+                                        lib_logger.warning(
+                                            f"Could not decode JSON from Gemini CLI: {line}"
+                                        )
+
+                            # Emit final chunk if stream ended without usageMetadata
+                            # Client will determine the correct finish_reason
+                            if not accumulator.get("is_complete"):
+                                final_chunk = {
+                                    "id": f"chatcmpl-geminicli-{time.time()}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [
+                                        {"index": 0, "delta": {}, "finish_reason": None}
+                                    ],
+                                    # Include minimal usage to signal this is the final chunk
+                                    "usage": {
+                                        "prompt_tokens": 0,
+                                        "completion_tokens": 1,
+                                        "total_tokens": 1,
+                                    },
+                                }
+                                yield litellm.ModelResponse(**final_chunk)
+
+                            # Success - exit the endpoint fallback loop
+                            return
+
+                    except httpx.HTTPStatusError as e:
+                        error_body = None
+                        if e.response is not None:
                             try:
-                                error_body = await response.aread()
-                                lib_logger.error(
-                                    f"Gemini CLI API error {response.status_code}: {error_body.decode()}"
-                                )
-                                file_logger.log_error(
-                                    f"API error {response.status_code}: {error_body.decode()}"
-                                )
+                                error_body = e.response.text
                             except Exception:
                                 pass
 
-                        # This will raise an HTTPStatusError for 4xx/5xx responses
-                        response.raise_for_status()
-
-                        async for line in response.aiter_lines():
-                            file_logger.log_response_chunk(line)
-                            if line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data_str)
-                                    for openai_chunk in self._convert_chunk_to_openai(
-                                        chunk, model, accumulator
-                                    ):
-                                        yield litellm.ModelResponse(**openai_chunk)
-                                except json.JSONDecodeError:
-                                    lib_logger.warning(
-                                        f"Could not decode JSON from Gemini CLI: {line}"
-                                    )
-
-                        # Emit final chunk if stream ended without usageMetadata
-                        # Client will determine the correct finish_reason
-                        if not accumulator.get("is_complete"):
-                            final_chunk = {
-                                "id": f"chatcmpl-geminicli-{time.time()}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [
-                                    {"index": 0, "delta": {}, "finish_reason": None}
-                                ],
-                                # Include minimal usage to signal this is the final chunk
-                                "usage": {
-                                    "prompt_tokens": 0,
-                                    "completion_tokens": 1,
-                                    "total_tokens": 1,
-                                },
-                            }
-                            yield litellm.ModelResponse(**final_chunk)
-
-                except httpx.HTTPStatusError as e:
-                    error_body = None
-                    if e.response is not None:
-                        try:
-                            error_body = e.response.text
-                        except Exception:
-                            pass
-
-                    # Only log to file logger (for detailed logging)
-                    if error_body:
-                        file_logger.log_error(
-                            f"HTTPStatusError {e.response.status_code}: {error_body}"
-                        )
-                    else:
-                        file_logger.log_error(
-                            f"HTTPStatusError {e.response.status_code}: {str(e)}"
-                        )
-
-                    if e.response.status_code == 429:
-                        # Extract retry-after time from the error body
-                        retry_after = extract_retry_after_from_body(error_body)
-                        retry_info = (
-                            f" (retry after {retry_after}s)" if retry_after else ""
-                        )
-                        error_msg = f"Gemini CLI rate limit exceeded{retry_info}"
+                        # Only log to file logger (for detailed logging)
                         if error_body:
-                            error_msg = f"{error_msg} | {error_body}"
-                        # Only log at debug level - rotation happens silently
-                        lib_logger.debug(
-                            f"Gemini CLI 429 rate limit: retry_after={retry_after}s"
+                            file_logger.log_error(
+                                f"HTTPStatusError {e.response.status_code}: {error_body}"
+                            )
+                        else:
+                            file_logger.log_error(
+                                f"HTTPStatusError {e.response.status_code}: {str(e)}"
+                            )
+
+                        # 429 rate limit - don't fallback to next endpoint, let rotator handle it
+                        if e.response.status_code == 429:
+                            # Extract retry-after time from the error body
+                            retry_after = extract_retry_after_from_body(error_body)
+                            retry_info = (
+                                f" (retry after {retry_after}s)" if retry_after else ""
+                            )
+                            error_msg = f"Gemini CLI rate limit exceeded{retry_info}"
+                            if error_body:
+                                error_msg = f"{error_msg} | {error_body}"
+                            # Only log at debug level - rotation happens silently
+                            lib_logger.debug(
+                                f"Gemini CLI 429 rate limit: retry_after={retry_after}s"
+                            )
+                            raise RateLimitError(
+                                message=error_msg,
+                                llm_provider="gemini_cli",
+                                model=model,
+                                response=e.response,
+                            )
+
+                        # 5xx server errors - try next endpoint if available
+                        if e.response.status_code >= 500:
+                            last_endpoint_error = e
+                            if endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1:
+                                lib_logger.warning(
+                                    f"Endpoint {base_endpoint} returned {e.response.status_code}, trying fallback"
+                                )
+                                continue
+                            # No more endpoints to try
+                            raise e
+
+                        # Other 4xx errors - don't fallback, re-raise
+                        raise e
+
+                    except (httpx.ConnectError, httpx.TimeoutException) as e:
+                        # Connection/timeout errors - try next endpoint if available
+                        last_endpoint_error = e
+                        file_logger.log_error(
+                            f"Connection error to {base_endpoint}: {str(e)}"
                         )
-                        raise RateLimitError(
-                            message=error_msg,
-                            llm_provider="gemini_cli",
-                            model=model,
-                            response=e.response,
-                        )
-                    # Re-raise other status errors to be handled by the main acompletion logic
-                    raise e
-                except Exception as e:
-                    file_logger.log_error(f"Stream handler exception: {str(e)}")
-                    raise
+                        if endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1:
+                            lib_logger.warning(
+                                f"Connection error to {base_endpoint}, trying fallback endpoint"
+                            )
+                            continue
+                        # No more endpoints to try
+                        raise e
+
+                    except Exception as e:
+                        file_logger.log_error(f"Stream handler exception: {str(e)}")
+                        raise
+
+                # If we get here, all endpoints failed (shouldn't happen due to raise in loop)
+                if last_endpoint_error:
+                    raise last_endpoint_error
 
             async def logging_stream_wrapper():
                 """Wraps the stream to log the final reassembled response."""
@@ -1617,10 +1783,14 @@ class GeminiCliProvider(
         # Fix tool response grouping (handles ID mismatches, missing responses)
         contents = self._fix_tool_response_grouping(contents)
 
-        # Build request payload
+        # Build request payload matching native gemini-cli structure
         request_payload = {
+            "model": model_name,
+            "project": project_id,
+            "user_prompt_id": self._generate_user_prompt_id(),
             "request": {
                 "contents": contents,
+                "session_id": self._generate_stable_session_id(contents),
             },
         }
 
@@ -1634,37 +1804,54 @@ class GeminiCliProvider(
                     {"functionDeclarations": function_declarations}
                 ]
 
-        # Make the request
-        url = f"{CODE_ASSIST_ENDPOINT}:countTokens"
+        # Build headers matching native gemini-cli client fingerprint
         headers = auth_header.copy()
-        headers.update(
-            {
-                "User-Agent": "google-api-nodejs-client/9.15.1",
-                "X-Goog-Api-Client": "gl-node/22.17.0",
-                "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-                "Accept": "application/json",
-            }
-        )
+        headers.update(self._get_gemini_cli_request_headers(model_name))
 
-        try:
-            response = await client.post(
-                url, headers=headers, json=request_payload, timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
+        # Endpoint fallback loop: try sandbox first, then production
+        for endpoint_idx, base_endpoint in enumerate(GEMINI_CLI_ENDPOINT_FALLBACKS):
+            url = f"{base_endpoint}:countTokens"
+            try:
+                response = await client.post(
+                    url, headers=headers, json=request_payload, timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
 
-            # Extract token counts from response
-            total_tokens = data.get("totalTokens", 0)
+                # Extract token counts from response
+                total_tokens = data.get("totalTokens", 0)
 
-            return {
-                "prompt_tokens": total_tokens,
-                "total_tokens": total_tokens,
-            }
+                return {
+                    "prompt_tokens": total_tokens,
+                    "total_tokens": total_tokens,
+                }
 
-        except httpx.HTTPStatusError as e:
-            lib_logger.error(f"Failed to count tokens: {e}")
-            # Return 0 on error rather than raising
-            return {"prompt_tokens": 0, "total_tokens": 0}
+            except httpx.HTTPStatusError as e:
+                # 5xx errors - try next endpoint if available
+                if (
+                    e.response.status_code >= 500
+                    and endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1
+                ):
+                    lib_logger.warning(
+                        f"countTokens: endpoint {base_endpoint} returned {e.response.status_code}, trying fallback"
+                    )
+                    continue
+                lib_logger.error(f"Failed to count tokens: {e}")
+                # Return 0 on error rather than raising
+                return {"prompt_tokens": 0, "total_tokens": 0}
+
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                # Connection errors - try next endpoint if available
+                if endpoint_idx < len(GEMINI_CLI_ENDPOINT_FALLBACKS) - 1:
+                    lib_logger.warning(
+                        f"countTokens: connection error to {base_endpoint}, trying fallback"
+                    )
+                    continue
+                lib_logger.error(f"Failed to count tokens: {e}")
+                return {"prompt_tokens": 0, "total_tokens": 0}
+
+        # Shouldn't reach here, but return 0 as fallback
+        return {"prompt_tokens": 0, "total_tokens": 0}
 
     # Use the shared GeminiAuthBase for auth logic
     async def get_models(self, credential: str, client: httpx.AsyncClient) -> List[str]:

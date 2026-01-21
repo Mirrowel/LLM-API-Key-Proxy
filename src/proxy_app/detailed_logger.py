@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 # src/proxy_app/detailed_logger.py
 """
 Raw I/O Logger for the Proxy Layer.

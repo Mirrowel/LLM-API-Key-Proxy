@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 import asyncio
 from typing import List, Dict, Any, Tuple
 import time

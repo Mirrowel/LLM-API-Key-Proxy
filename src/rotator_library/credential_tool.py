@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/credential_tool.py
 
 import asyncio
@@ -17,6 +20,12 @@ from rich.table import Table
 from rich.text import Text
 
 from .utils.paths import get_oauth_dir, get_data_file
+from .provider_config import LITELLM_PROVIDERS, PROVIDER_CATEGORIES, PROVIDER_BLACKLIST
+from .litellm_providers import (
+    SCRAPED_PROVIDERS,
+    get_provider_api_key_var,
+    get_provider_display_name,
+)
 
 
 def _get_oauth_base_dir() -> Path:
@@ -302,6 +311,105 @@ def _get_all_credentials_summary() -> dict:
         "api_keys": _get_api_keys_from_env(),
         "oauth": _get_oauth_credentials_summary(),
     }
+
+
+def _get_existing_custom_providers() -> list:
+    """
+    Scan the .env file for existing custom OpenAI-compatible providers.
+
+    Custom providers are identified by *_API_BASE entries where the provider
+    name is NOT a known LiteLLM provider.
+
+    Returns:
+        List of dicts with provider info:
+        [{"name": "myserver", "api_base": "http://...", "has_key": True}, ...]
+    """
+    from .provider_config import KNOWN_PROVIDERS
+
+    custom_providers = []
+    env_file = _get_env_file()
+
+    if not env_file.is_file():
+        return custom_providers
+
+    try:
+        # First pass: collect all _API_BASE entries
+        api_bases = {}
+        api_keys = set()
+
+        with open(env_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key_name, _, value = line.partition("=")
+                key_name = key_name.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key_name.endswith("_API_BASE") and value:
+                    provider_name = key_name[:-9].lower()  # Remove _API_BASE
+                    # Only include if NOT a known provider
+                    if provider_name not in KNOWN_PROVIDERS:
+                        api_bases[provider_name] = value
+                elif "_API_KEY" in key_name and value:
+                    # Extract provider name from API key
+                    provider_prefix = key_name.split("_API_KEY")[0].lower()
+                    api_keys.add(provider_prefix)
+
+        # Build result list
+        for provider_name, api_base in sorted(api_bases.items()):
+            custom_providers.append(
+                {
+                    "name": provider_name,
+                    "api_base": api_base,
+                    "has_key": provider_name in api_keys,
+                }
+            )
+
+    except Exception as e:
+        console.print(f"[bold red]Error reading .env file: {e}[/bold red]")
+
+    return custom_providers
+
+
+def _display_custom_providers_summary():
+    """
+    Display a summary of existing custom OpenAI-compatible providers.
+    """
+    custom_providers = _get_existing_custom_providers()
+
+    if not custom_providers:
+        console.print(
+            "[dim]No custom OpenAI-compatible providers configured yet.[/dim]\n"
+        )
+        return
+
+    table = Table(
+        title="Existing Custom Providers",
+        box=None,
+        padding=(0, 2),
+        title_style="bold cyan",
+    )
+    table.add_column("Provider", style="yellow", no_wrap=True)
+    table.add_column("API Base", style="dim")
+    table.add_column("API Key", style="green", justify="center")
+
+    for provider in custom_providers:
+        name = provider["name"].upper()
+        api_base = provider["api_base"]
+        # Truncate long URLs
+        if len(api_base) > 40:
+            api_base = api_base[:37] + "..."
+        has_key = "✓" if provider["has_key"] else "✗"
+        key_style = "green" if provider["has_key"] else "red"
+        table.add_row(name, api_base, Text(has_key, style=key_style))
+
+    console.print(table)
+    console.print()
 
 
 def _display_credentials_summary():
@@ -1026,151 +1134,268 @@ def ensure_env_defaults():
         set_key(str(_get_env_file()), "PROXY_API_KEY", default_key)
 
 
+# =============================================================================
+# LiteLLM Provider Configuration
+# Auto-generated from LiteLLM documentation. For full provider docs, visit:
+# https://docs.litellm.ai/docs/providers
+#
+# Structure: Each provider has:
+#   - api_key: Environment variable for API key (None if not needed)
+#   - category: Provider category for display grouping
+#   - note: (optional) Configuration notes shown to user
+#   - extra_vars: (optional) Additional env vars needed [(name, label, default), ...]
+#
+# Note: Adding multiple API base URLs per provider is not yet supported.
+# =============================================================================
+
+
+def _search_providers(query: str, providers: dict) -> list:
+    """Search providers by substring match (case-insensitive).
+
+    Searches both the provider key and display name.
+    """
+    query_lower = query.lower()
+    matches = []
+    for provider_key, config in providers.items():
+        display_name = config.get("display_name", provider_key)
+        if query_lower in provider_key.lower() or query_lower in display_name.lower():
+            matches.append((provider_key, config))
+    return matches
+
+
+def _get_providers_by_category(providers: dict) -> dict:
+    """Group providers by category."""
+    by_category = {}
+    for name, config in providers.items():
+        category = config.get("category", "other")
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append((name, config))
+    return by_category
+
+
 async def setup_api_key():
     """
     Interactively sets up a new API key for a provider.
+    Supports search, categorized display, and additional configuration variables.
     """
     clear_screen("Add API Key")
 
-    # Debug toggle: Set to True to see env var names next to each provider
-    SHOW_ENV_VAR_NAMES = True
-
-    # Verified list of LiteLLM providers with their friendly names and API key variables
-    LITELLM_PROVIDERS = {
-        "OpenAI": "OPENAI_API_KEY",
-        "Anthropic": "ANTHROPIC_API_KEY",
-        "Google AI Studio (Gemini)": "GEMINI_API_KEY",
-        "Azure OpenAI": "AZURE_API_KEY",
-        "Vertex AI": "GOOGLE_API_KEY",
-        "AWS Bedrock": "AWS_ACCESS_KEY_ID",
-        "Cohere": "COHERE_API_KEY",
-        "Chutes": "CHUTES_API_KEY",
-        "Mistral AI": "MISTRAL_API_KEY",
-        "Codestral (Mistral)": "CODESTRAL_API_KEY",
-        "Groq": "GROQ_API_KEY",
-        "Perplexity": "PERPLEXITYAI_API_KEY",
-        "xAI": "XAI_API_KEY",
-        "Together AI": "TOGETHERAI_API_KEY",
-        "Fireworks AI": "FIREWORKS_AI_API_KEY",
-        "Replicate": "REPLICATE_API_KEY",
-        "Hugging Face": "HUGGINGFACE_API_KEY",
-        "Anyscale": "ANYSCALE_API_KEY",
-        "NVIDIA NIM": "NVIDIA_NIM_API_KEY",
-        "Deepseek": "DEEPSEEK_API_KEY",
-        "AI21": "AI21_API_KEY",
-        "Cerebras": "CEREBRAS_API_KEY",
-        "Moonshot": "MOONSHOT_API_KEY",
-        "Ollama": "OLLAMA_API_KEY",
-        "Xinference": "XINFERENCE_API_KEY",
-        "Infinity": "INFINITY_API_KEY",
-        "OpenRouter": "OPENROUTER_API_KEY",
-        "Deepinfra": "DEEPINFRA_API_KEY",
-        "Cloudflare": "CLOUDFLARE_API_KEY",
-        "Baseten": "BASETEN_API_KEY",
-        "Modal": "MODAL_API_KEY",
-        "Databricks": "DATABRICKS_API_KEY",
-        "AWS SageMaker": "AWS_ACCESS_KEY_ID",
-        "IBM watsonx.ai": "WATSONX_APIKEY",
-        "Predibase": "PREDIBASE_API_KEY",
-        "Clarifai": "CLARIFAI_API_KEY",
-        "NLP Cloud": "NLP_CLOUD_API_KEY",
-        "Voyage AI": "VOYAGE_API_KEY",
-        "Jina AI": "JINA_API_KEY",
-        "Hyperbolic": "HYPERBOLIC_API_KEY",
-        "Morph": "MORPH_API_KEY",
-        "Lambda AI": "LAMBDA_API_KEY",
-        "Novita AI": "NOVITA_API_KEY",
-        "Aleph Alpha": "ALEPH_ALPHA_API_KEY",
-        "SambaNova": "SAMBANOVA_API_KEY",
-        "FriendliAI": "FRIENDLI_TOKEN",
-        "Galadriel": "GALADRIEL_API_KEY",
-        "CompactifAI": "COMPACTIFAI_API_KEY",
-        "Lemonade": "LEMONADE_API_KEY",
-        "GradientAI": "GRADIENTAI_API_KEY",
-        "Featherless AI": "FEATHERLESS_AI_API_KEY",
-        "Nebius AI Studio": "NEBIUS_API_KEY",
-        "Dashscope (Qwen)": "DASHSCOPE_API_KEY",
-        "Bytez": "BYTEZ_API_KEY",
-        "Oracle OCI": "OCI_API_KEY",
-        "DataRobot": "DATAROBOT_API_KEY",
-        "OVHCloud": "OVHCLOUD_API_KEY",
-        "Volcengine": "VOLCENGINE_API_KEY",
-        "Snowflake": "SNOWFLAKE_API_KEY",
-        "Nscale": "NSCALE_API_KEY",
-        "Recraft": "RECRAFT_API_KEY",
-        "v0": "V0_API_KEY",
-        "Vercel": "VERCEL_AI_GATEWAY_API_KEY",
-        "Topaz": "TOPAZ_API_KEY",
-        "ElevenLabs": "ELEVENLABS_API_KEY",
-        "Deepgram": "DEEPGRAM_API_KEY",
-        "GitHub Models": "GITHUB_TOKEN",
-        "GitHub Copilot": "GITHUB_COPILOT_API_KEY",
-    }
-
-    # Discover custom providers and add them to the list
-    # Note: gemini_cli and antigravity are OAuth-only
-    # qwen_code API key support is a fallback
-    # iflow API key support is a feature
-    _, PROVIDER_PLUGINS = _ensure_providers_loaded()
-
-    # Build a set of environment variables already in LITELLM_PROVIDERS
-    # to avoid duplicates based on the actual API key names
-    litellm_env_vars = set(LITELLM_PROVIDERS.values())
-
-    # Providers to exclude from API key list
-    exclude_providers = {
-        "gemini_cli",  # OAuth-only
-        "antigravity",  # OAuth-only
-        "qwen_code",  # API key is fallback, OAuth is primary - don't advertise
-        "openai_compatible",  # Base class, not a real provider
-    }
-
-    discovered_providers = {}
-    for provider_key in PROVIDER_PLUGINS.keys():
-        if provider_key in exclude_providers:
-            continue
-
-        # Create environment variable name
-        env_var = provider_key.upper() + "_API_KEY"
-
-        # Check if this env var already exists in LITELLM_PROVIDERS
-        # This catches duplicates like GEMINI_API_KEY, MISTRAL_API_KEY, etc.
-        if env_var in litellm_env_vars:
-            # Already in LITELLM_PROVIDERS with better name, skip this one
-            continue
-
-        # Create display name for this custom provider
-        display_name = provider_key.replace("_", " ").title()
-        discovered_providers[display_name] = env_var
-
-    # LITELLM_PROVIDERS takes precedence (comes first in merge)
-    combined_providers = {**LITELLM_PROVIDERS, **discovered_providers}
-    provider_display_list = sorted(combined_providers.keys())
-
-    provider_text = Text()
-    for i, provider_name in enumerate(provider_display_list):
-        if SHOW_ENV_VAR_NAMES:
-            # Extract env var prefix (before _API_KEY)
-            env_var = combined_providers[provider_name]
-            prefix = env_var.replace("_API_KEY", "").replace("_", " ")
-            provider_text.append(f"  {i + 1}. {provider_name} ({prefix})\n")
-        else:
-            provider_text.append(f"  {i + 1}. {provider_name}\n")
-
+    # Show info panel
     console.print(
         Panel(
-            provider_text,
-            title="Available Providers for API Key",
-            style="bold blue",
+            Text.from_markup(
+                "[bold]This list is powered by the LiteLLM library.[/bold]\n"
+                "Some providers require additional configuration (API base URL, etc.)\n\n"
+                "[dim]Full documentation: https://docs.litellm.ai/docs/providers[/dim]\n"
+                "[dim]Note: Adding multiple API base URLs per provider is not yet supported.[/dim]"
+            ),
+            style="blue",
+            title="Provider Information",
+            expand=False,
         )
     )
+    console.print()
 
+    # -------------------------------------------------------------------------
+    # Discover custom providers from project's provider registry
+    # -------------------------------------------------------------------------
+    _, PROVIDER_PLUGINS = _ensure_providers_loaded()
+    from .providers import DynamicOpenAICompatibleProvider
+    from .providers.provider_interface import ProviderInterface
+
+    # Build a set of API key env vars already in SCRAPED_PROVIDERS
+    litellm_api_keys = set()
+    for info in SCRAPED_PROVIDERS.values():
+        for api_key_var in info.get("api_key_env_vars", []):
+            litellm_api_keys.add(api_key_var)
+
+    # OAuth-only providers to exclude entirely from API key setup
+    oauth_only_providers = {
+        "gemini_cli",  # OAuth-only
+        "antigravity",  # OAuth-only
+        "qwen_code",  # OAuth is primary, don't advertise API key
+        "iflow",  # OAuth is primary
+    }
+
+    # Base classes to exclude
+    base_classes = {
+        "openai_compatible",
+    }
+
+    # Create combined providers dict with scraped data + UI config
+    # Key is the provider route key, value includes display_name, api_key, category, etc.
+    all_providers = {}
+
+    # Add all scraped providers with their UI config
+    for provider_key in SCRAPED_PROVIDERS:
+        # Skip blacklisted providers
+        if provider_key in PROVIDER_BLACKLIST:
+            continue
+
+        scraped_info = SCRAPED_PROVIDERS[provider_key]
+        ui_config = LITELLM_PROVIDERS.get(provider_key, {"category": "other"})
+
+        # Skip providers without API keys (OAuth-only or no auth)
+        api_key_vars = scraped_info.get("api_key_env_vars", [])
+        if not api_key_vars:
+            continue
+
+        # Prefer *_API_KEY pattern, fall back to first
+        api_key_var = None
+        for var in api_key_vars:
+            if var.endswith("_API_KEY"):
+                api_key_var = var
+                break
+        if not api_key_var:
+            api_key_var = api_key_vars[0]
+
+        all_providers[provider_key] = {
+            "display_name": scraped_info.get("display_name", provider_key),
+            "api_key": api_key_var,
+            "category": ui_config.get("category", "other"),
+            "note": ui_config.get("note"),
+            "extra_vars": ui_config.get("extra_vars", []),
+        }
+
+    # Add custom providers from PROVIDER_PLUGINS
+    for provider_key, provider_class in PROVIDER_PLUGINS.items():
+        # Skip OAuth-only providers
+        if provider_key in oauth_only_providers:
+            continue
+
+        # Skip base classes
+        if provider_key in base_classes:
+            continue
+
+        # Skip if already in scraped providers
+        if provider_key in all_providers:
+            continue
+
+        # Check if this is a dynamic OpenAI-compatible provider
+        try:
+            is_dynamic = isinstance(provider_class, type) and issubclass(
+                provider_class, DynamicOpenAICompatibleProvider
+            )
+        except TypeError:
+            is_dynamic = False
+
+        env_var = f"{provider_key.upper()}_API_KEY"
+
+        # Skip if API key already covered
+        if env_var in litellm_api_keys:
+            continue
+
+        display_name = provider_key.replace("_", " ").title()
+
+        if is_dynamic:
+            # Dynamic OpenAI-compatible provider uses _API_BASE pattern
+            all_providers[provider_key] = {
+                "display_name": display_name,
+                "api_key": env_var,
+                "category": "custom_openai",
+                "note": "Custom OpenAI-compatible provider.",
+                "extra_vars": [
+                    (f"{provider_key.upper()}_API_BASE", "API Base URL", None),
+                ],
+            }
+        else:
+            # First-party file-based provider
+            all_providers[provider_key] = {
+                "display_name": display_name,
+                "api_key": env_var,
+                "category": "custom",
+                "note": "First-party provider from the library.",
+            }
+
+    # Search prompt
+    search_query = Prompt.ask(
+        "[bold]Search providers[/bold] [dim](or press Enter to see all)[/dim]",
+        default="",
+    )
+
+    # Build provider list based on search
+    if search_query.strip():
+        # Search mode
+        matches = _search_providers(search_query, all_providers)
+        if not matches:
+            console.print(
+                f"[bold yellow]No providers found matching '{search_query}'[/bold yellow]"
+            )
+            console.print("[dim]Press Enter to continue...[/dim]")
+            input()
+            return
+
+        # Build numbered list from search results
+        provider_list = []
+        provider_text = Text()
+        provider_text.append(
+            f"\nMatching providers for '{search_query}':\n\n", style="bold cyan"
+        )
+
+        for i, (provider_key, config) in enumerate(matches, 1):
+            provider_list.append((provider_key, config))
+            display_name = config.get("display_name", provider_key)
+            category = config.get("category", "other")
+            category_label = next(
+                (label for cat, label in PROVIDER_CATEGORIES if cat == category),
+                "Other",
+            )
+            api_key_var = config.get("api_key")
+            if api_key_var:
+                key_prefix = (
+                    api_key_var.replace("_API_KEY", "")
+                    .replace("_TOKEN", "")
+                    .replace("_", " ")
+                )
+                provider_text.append(
+                    f"  {i}. {display_name} ({key_prefix}) ", style="white"
+                )
+            else:
+                provider_text.append(f"  {i}. {display_name} ", style="white")
+            provider_text.append(f"[{category_label}]\n", style="dim")
+
+        console.print(provider_text)
+
+    else:
+        # Full categorized list mode
+        by_category = _get_providers_by_category(all_providers)
+        provider_list = []
+        provider_text = Text()
+
+        for category_key, category_label in PROVIDER_CATEGORIES:
+            if category_key not in by_category:
+                continue
+
+            providers_in_cat = by_category[category_key]
+            provider_text.append(f"\n--- {category_label} ---\n", style="bold cyan")
+
+            for provider_key, config in providers_in_cat:
+                idx = len(provider_list) + 1
+                provider_list.append((provider_key, config))
+                display_name = config.get("display_name", provider_key)
+                api_key_var = config.get("api_key")
+                if api_key_var:
+                    key_prefix = (
+                        api_key_var.replace("_API_KEY", "")
+                        .replace("_TOKEN", "")
+                        .replace("_", " ")
+                    )
+                    provider_text.append(f"  {idx}. {display_name} ({key_prefix})\n")
+                else:
+                    provider_text.append(
+                        f"  {idx}. {display_name} [dim](no API key)[/dim]\n"
+                    )
+
+        console.print(provider_text)
+
+    # Provider selection
+    console.print()
     choice = Prompt.ask(
         Text.from_markup(
-            "[bold]Please select a provider or type [red]'b'[/red] to go back[/bold]"
+            "[bold]Select a provider number or type [red]'b'[/red] to go back[/bold]"
         ),
-        choices=[str(i + 1) for i in range(len(provider_display_list))] + ["b"],
-        show_choices=False,
+        default="b",
     )
 
     if choice.lower() == "b":
@@ -1178,88 +1403,318 @@ async def setup_api_key():
 
     try:
         choice_index = int(choice) - 1
-        if 0 <= choice_index < len(provider_display_list):
-            display_name = provider_display_list[choice_index]
-            api_var_base = combined_providers[display_name]
+        if choice_index < 0 or choice_index >= len(provider_list):
+            console.print("[bold red]Invalid choice.[/bold red]")
+            return
 
-            api_key = Prompt.ask(f"Enter the API key for {display_name}")
+        provider_key, provider_config = provider_list[choice_index]
+        display_name = provider_config.get("display_name", provider_key)
+        api_key_var = provider_config.get("api_key")
+        note = provider_config.get("note")
+        extra_vars = provider_config.get("extra_vars", [])
 
-            # Check for duplicate API key value
-            if _get_env_file().is_file():
-                with open(_get_env_file(), "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith(api_var_base) and "=" in line:
-                            existing_key_name, _, existing_key_value = line.partition(
-                                "="
-                            )
-                            if existing_key_value == api_key:
-                                warning_text = Text.from_markup(
-                                    f"This API key already exists as [bold yellow]'{existing_key_name}'[/bold yellow]. Overwriting..."
-                                )
-                                console.print(
-                                    Panel(
-                                        warning_text,
-                                        style="bold yellow",
-                                        title="Updating API Key",
-                                    )
-                                )
+        # Get additional info from scraped data
+        scraped_info = SCRAPED_PROVIDERS.get(provider_key, {})
+        route = scraped_info.get("route", "").rstrip("/")
+        api_base_url = scraped_info.get("api_base_url")
 
-                                set_key(
-                                    str(_get_env_file()), existing_key_name, api_key
-                                )
+        console.print()
 
-                                success_text = Text.from_markup(
-                                    f"Successfully updated existing key [bold yellow]'{existing_key_name}'[/bold yellow]."
-                                )
-                                console.print(
-                                    Panel(
-                                        success_text,
-                                        style="bold green",
-                                        title="Success",
-                                    )
-                                )
-                                return
+        # Build and show provider info panel
+        info_lines = []
+        if route:
+            info_lines.append(f"Route: [cyan]{route}/[/cyan]")
+            info_lines.append(f"Example: [dim]{route}/model-name[/dim]")
+        if api_base_url:
+            info_lines.append(f"API Base: [dim]{api_base_url}[/dim]")
+        if api_key_var:
+            info_lines.append(f"Env Variable: [green]{api_key_var}[/green]")
 
-            # Special handling for AWS
-            if display_name in ["AWS Bedrock", "AWS SageMaker"]:
-                console.print(
-                    Panel(
-                        Text.from_markup(
-                            "This provider requires both an Access Key ID and a Secret Access Key.\n"
-                            f"The key you entered will be saved as [bold yellow]{api_var_base}_1[/bold yellow].\n"
-                            "Please manually add the [bold cyan]AWS_SECRET_ACCESS_KEY_1[/bold cyan] to your .env file."
-                        ),
-                        title="[bold yellow]Additional Step Required[/bold yellow]",
-                        border_style="yellow",
-                    )
+        if info_lines:
+            console.print(
+                Panel(
+                    "\n".join(info_lines),
+                    title=f"[bold]{display_name}[/bold]",
+                    expand=False,
+                    border_style="blue",
                 )
-
-            key_index = 1
-            while True:
-                key_name = f"{api_var_base}_{key_index}"
-                if _get_env_file().is_file():
-                    with open(_get_env_file(), "r") as f:
-                        if not any(line.startswith(f"{key_name}=") for line in f):
-                            break
-                else:
-                    break
-                key_index += 1
-
-            key_name = f"{api_var_base}_{key_index}"
-            set_key(str(_get_env_file()), key_name, api_key)
-
-            success_text = Text.from_markup(
-                f"Successfully added {display_name} API key as [bold yellow]'{key_name}'[/bold yellow]."
             )
-            console.print(Panel(success_text, style="bold green", title="Success"))
+            console.print()
 
+        # Show provider note if exists
+        if note:
+            console.print(
+                Panel(
+                    note,
+                    style="yellow",
+                    title="Configuration Note",
+                    expand=False,
+                )
+            )
+            console.print()
+
+        saved_vars = []
+
+        # Prompt for API key (if provider has one)
+        if api_key_var:
+            api_key = Prompt.ask(
+                f"[bold]Enter {api_key_var}[/bold] [dim](or press Enter to skip)[/dim]",
+                default="",
+            )
+
+            if api_key.strip():
+                # Find next available key index
+                key_index = 1
+                while True:
+                    key_name = f"{api_key_var}_{key_index}"
+                    if _get_env_file().is_file():
+                        with open(_get_env_file(), "r") as f:
+                            if not any(line.startswith(f"{key_name}=") for line in f):
+                                break
+                    else:
+                        break
+                    key_index += 1
+
+                key_name = f"{api_key_var}_{key_index}"
+                set_key(str(_get_env_file()), key_name, api_key.strip())
+                saved_vars.append((key_name, api_key.strip()))
+
+        # Prompt for extra variables
+        if extra_vars:
+            console.print("\n[bold]Additional configuration:[/bold]")
+            for env_var_name, label, default_value in extra_vars:
+                if default_value:
+                    # Pre-fill with default
+                    value = Prompt.ask(
+                        f"  {label}",
+                        default=default_value,
+                    )
+                else:
+                    value = Prompt.ask(
+                        f"  {label} [dim](or press Enter to skip)[/dim]",
+                        default="",
+                    )
+
+                if value.strip():
+                    set_key(str(_get_env_file()), env_var_name, value.strip())
+                    saved_vars.append((env_var_name, value.strip()))
+
+        # Show success message
+        if saved_vars:
+            success_lines = [f"Successfully configured [bold]{display_name}[/bold]:\n"]
+            for var_name, var_value in saved_vars:
+                if len(var_value) > 8:
+                    masked = f"{var_value[:4]}...{var_value[-4:]}"
+                elif len(var_value) > 4:
+                    masked = f"****{var_value[-4:]}"
+                else:
+                    masked = "****"
+                success_lines.append(f"  [yellow]{var_name}[/yellow] = {masked}")
+
+            console.print(
+                Panel(
+                    Text.from_markup("\n".join(success_lines)),
+                    style="bold green",
+                    title="Success",
+                    expand=False,
+                )
+            )
         else:
-            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
+            console.print("[dim]No values configured (all skipped).[/dim]")
+
+        # Wait for user to read the result
+        console.print("\n[dim]Press Enter to continue...[/dim]")
+        input()
+
     except ValueError:
         console.print(
             "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
         )
+        console.print("\n[dim]Press Enter to continue...[/dim]")
+        input()
+
+
+async def setup_custom_openai_provider():
+    """
+    Interactively sets up a custom OpenAI-compatible provider.
+
+    This adds a new provider that uses the standard OpenAI API format but points
+    to a custom endpoint (LM Studio, Ollama, vLLM, custom server, etc.).
+    """
+    clear_screen("Add Custom OpenAI-Compatible Provider")
+
+    # Show info panel
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]Custom OpenAI-Compatible Providers[/bold]\n\n"
+                "Add a custom endpoint that uses the OpenAI API format.\n"
+                "This works with: LM Studio, Ollama, vLLM, text-generation-webui, "
+                "and other OpenAI-compatible servers.\n\n"
+                "[dim]The library will automatically discover available models from your endpoint.[/dim]\n"
+                "[dim]You can also override built-in providers (e.g., OPENAI) to route traffic elsewhere.[/dim]\n\n"
+                "[yellow]Please consult the provider's documentation for the correct API base URL.[/yellow]"
+            ),
+            style="blue",
+            title="Custom Provider Setup",
+            expand=False,
+        )
+    )
+    console.print()
+
+    # Show existing custom providers
+    _display_custom_providers_summary()
+
+    # Prompt for provider name
+    console.print("[dim]Provider name will be used for environment variables.[/dim]")
+    console.print(
+        "[dim]Use alphanumeric characters and underscores only (e.g., MY_LOCAL_LLM).[/dim]\n"
+    )
+
+    while True:
+        provider_name = Prompt.ask(
+            "[bold]Enter provider name[/bold] [dim](or 'b' to go back)[/dim]",
+            default="",
+        )
+
+        if provider_name.lower() == "b" or not provider_name.strip():
+            return
+
+        provider_name = provider_name.strip().upper()
+
+        # Validate name (alphanumeric + underscores only)
+        import re
+
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", provider_name):
+            console.print(
+                "[bold red]Invalid name. Use letters, numbers, and underscores only. "
+                "Must start with a letter.[/bold red]"
+            )
+            continue
+
+        # Check for conflict with built-in LiteLLM providers
+        conflict_provider = None
+        for litellm_name, config in LITELLM_PROVIDERS.items():
+            api_key_var = config.get("api_key", "")
+            if api_key_var:
+                # Extract prefix from API key var (e.g., OPENAI_API_KEY -> OPENAI)
+                prefix = api_key_var.replace("_API_KEY", "").replace("_TOKEN", "")
+                if prefix == provider_name:
+                    conflict_provider = litellm_name
+                    break
+
+        if conflict_provider:
+            console.print(
+                f"\n[bold yellow]Warning:[/bold yellow] '{provider_name}' matches the built-in "
+                f"'{conflict_provider}' provider."
+            )
+            console.print(
+                "If you continue, requests to this provider will be routed to your custom endpoint "
+                "instead of the official API.\n"
+            )
+            override_confirm = Prompt.ask(
+                "[bold]Do you want to override the built-in provider?[/bold]",
+                choices=["y", "n"],
+                default="n",
+            )
+            if override_confirm.lower() != "y":
+                continue
+
+        break
+
+    # Prompt for API Base URL (required)
+    console.print()
+    console.print("[dim]The API base URL is where requests will be sent.[/dim]")
+    console.print(
+        "[dim]Common examples: http://localhost:1234/v1, http://localhost:11434/v1[/dim]\n"
+    )
+
+    while True:
+        api_base = Prompt.ask(
+            "[bold]Enter API Base URL[/bold] [dim](required)[/dim]",
+            default="",
+        )
+
+        if not api_base.strip():
+            console.print("[bold red]API Base URL is required.[/bold red]")
+            continue
+
+        api_base = api_base.strip()
+
+        # Validate URL format
+        if not api_base.startswith(("http://", "https://")):
+            console.print(
+                "[bold red]Invalid URL. Must start with http:// or https://[/bold red]"
+            )
+            continue
+
+        break
+
+    # Prompt for API Key (required)
+    console.print()
+    console.print("[dim]Enter the API key for authentication.[/dim]")
+    console.print(
+        "[dim]If your server doesn't require authentication, enter any placeholder value.[/dim]\n"
+    )
+
+    while True:
+        api_key = Prompt.ask(
+            "[bold]Enter API Key[/bold] [dim](required)[/dim]",
+            default="",
+        )
+
+        if not api_key.strip():
+            console.print("[bold red]API Key is required.[/bold red]")
+            continue
+
+        api_key = api_key.strip()
+        break
+
+    # Save to .env file
+    env_file = _get_env_file()
+
+    # Save API Base URL
+    api_base_var = f"{provider_name}_API_BASE"
+    set_key(str(env_file), api_base_var, api_base)
+
+    # Save API Key (find next available index)
+    api_key_var_base = f"{provider_name}_API_KEY"
+    key_index = 1
+    if env_file.is_file():
+        with open(env_file, "r") as f:
+            content = f.read()
+            while f"{api_key_var_base}_{key_index}=" in content:
+                key_index += 1
+
+    api_key_var = f"{api_key_var_base}_{key_index}"
+    set_key(str(env_file), api_key_var, api_key)
+
+    # Mask the API key for display
+    if len(api_key) > 8:
+        masked_key = f"{api_key[:4]}...{api_key[-4:]}"
+    elif len(api_key) > 4:
+        masked_key = f"****{api_key[-4:]}"
+    else:
+        masked_key = "****"
+
+    # Show success message
+    console.print(
+        Panel(
+            Text.from_markup(
+                f"Successfully configured custom provider [bold]{provider_name}[/bold]:\n\n"
+                f"  [yellow]{api_base_var}[/yellow] = {api_base}\n"
+                f"  [yellow]{api_key_var}[/yellow] = {masked_key}\n\n"
+                "[dim]The library will automatically fetch available models from your endpoint.[/dim]\n"
+                "[dim]Use launcher menu option 4 'List Available Models' to verify the setup.[/dim]"
+            ),
+            style="bold green",
+            title="Success",
+            expand=False,
+        )
+    )
+
+    console.print("\n[dim]Press Enter to continue...[/dim]")
+    input()
 
 
 async def setup_new_credential(provider_name: str):
@@ -2108,9 +2563,10 @@ async def main(clear_on_start=True):
                 Text.from_markup(
                     "1. Add OAuth Credential\n"
                     "2. Add API Key\n"
-                    "3. Export Credentials\n"
-                    "4. View Credentials\n"
-                    "5. Manage Credentials"
+                    "3. Add Custom OpenAI-Compatible Provider\n"
+                    "4. Export Credentials\n"
+                    "5. View Credentials\n"
+                    "6. Manage Credentials"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -2121,7 +2577,7 @@ async def main(clear_on_start=True):
             Text.from_markup(
                 "[bold]Please select an option or type [red]'q'[/red] to quit[/bold]"
             ),
-            choices=["1", "2", "3", "4", "5", "q"],
+            choices=["1", "2", "3", "4", "5", "6", "q"],
             show_choices=False,
         )
 
@@ -2197,12 +2653,15 @@ async def main(clear_on_start=True):
             # input()
 
         elif setup_type == "3":
-            await export_credentials_submenu()
+            await setup_custom_openai_provider()
 
         elif setup_type == "4":
-            await view_credentials_menu()
+            await export_credentials_submenu()
 
         elif setup_type == "5":
+            await view_credentials_menu()
+
+        elif setup_type == "6":
             await manage_credentials_submenu()
 
 

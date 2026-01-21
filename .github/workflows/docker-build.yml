@@ -1,0 +1,134 @@
+#
+name: Create and publish a Docker image
+
+# Configures this workflow to run every time a change is pushed to the branch called `main` or `dev`.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or commit SHA). Leave empty for default.'
+        required: false
+        default: ''
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - "src/proxy_app/**"
+      - "src/rotator_library/**"
+      - ".github/workflows/docker-build.yml"
+      - "Dockerfile"
+      - "requirements.txt"
+
+# Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# There is a single job in this workflow. It's configured to run on the latest available version of Ubuntu.
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    # Sets the permissions granted to the `GITHUB_TOKEN` for the actions in this job.
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+      #
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Uses the `docker/login-action` action to log in to the Container registry registry using the account and password that will publish the packages. Once published, the packages are scoped to the account defined here.
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Generate version tags based on branch and commit info
+      - name: Generate image tags
+        id: tags
+        run: |
+          # Get branch name
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+
+          # Generate date-time version (YYYYMMDD-HHMMSS)
+          DATE_VERSION=$(date -u +'%Y%m%d-%H%M%S')
+
+          # Generate short SHA version
+          SHORT_SHA=${GITHUB_SHA::7}
+
+          # Combined version tag
+          VERSION_TAG="${DATE_VERSION}-${SHORT_SHA}"
+
+          # Determine the latest tag based on branch
+          if [ "$BRANCH_NAME" == "main" ]; then
+            LATEST_TAG="latest"
+          else
+            LATEST_TAG="${BRANCH_NAME}-latest"
+          fi
+
+          # Set outputs
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version_tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+          echo "Generated tags:"
+          echo "  Latest: $LATEST_TAG"
+          echo "  Version: $VERSION_TAG"
+
+      # This step uses [docker/metadata-action](https://github.com/docker/metadata-action#about) to extract tags and labels that will be applied to the specified image. The `id` "meta" allows the output of this step to be referenced in a subsequent step. The `images` value provides the base name for the tags and labels.
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.tags.outputs.latest_tag }}
+            type=raw,value=${{ steps.tags.outputs.version_tag }}
+      # This step uses the `docker/build-push-action` action to build the image, based on your repository's `Dockerfile`. If the build succeeds, it pushes the image to GitHub Packages.
+      # It uses the `context` parameter to define the build's context as the set of files located in the specified path. For more information, see [Usage](https://github.com/docker/build-push-action#usage) in the README of the `docker/build-push-action` repository.
+      # It uses the `tags` and `labels` parameters to tag and label the image with the output from the "meta" step.
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+
+      # This step generates an artifact attestation for the image, which is an unforgeable statement about where and how it was built. It increases supply chain security for people who consume the image. For more information, see [Using artifact attestations to establish provenance for builds](/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: false
+
+  # Cleanup old container images to keep only the most recent versions
+  cleanup-old-images:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old container images
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: llm-api-key-proxy
+          package-type: container
+          min-versions-to-keep: 20
+          delete-only-untagged-versions: false
+          ignore-versions: ".*latest.*"

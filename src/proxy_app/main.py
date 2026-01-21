@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 import time
+import uuid
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
@@ -106,7 +110,7 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
@@ -218,6 +222,13 @@ class EnrichedModelList(BaseModel):
 
     object: str = "list"
     data: List[EnrichedModelCard]
+
+
+# --- Anthropic API Models (imported from library) ---
+from rotator_library.anthropic_compat import (
+    AnthropicMessagesRequest,
+    AnthropicCountTokensRequest,
+)
 
 
 # Calculate total loading time
@@ -576,11 +587,15 @@ async def lifespan(app: FastAPI):
         "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
     }
 
+    # Load global timeout from environment (default 30 seconds)
+    global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
+
     # The client now uses the root logger configuration
     client = RotatingClient(
         api_keys=api_keys,
         oauth_credentials=oauth_credentials,  # Pass OAuth config
         configure_logging=True,
+        global_timeout=global_timeout,
         litellm_provider_params=litellm_provider_params,
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,
@@ -674,6 +689,27 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
+
+
+# --- Anthropic API Key Header ---
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+async def verify_anthropic_api_key(
+    x_api_key: str = Depends(anthropic_api_key_header),
+    auth: str = Depends(api_key_header),
+):
+    """
+    Dependency to verify API key for Anthropic endpoints.
+    Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
+    """
+    # Check x-api-key first (Anthropic style)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return x_api_key
+    # Fall back to Bearer token (OpenAI style)
+    if auth and auth == f"Bearer {PROXY_API_KEY}":
+        return auth
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 async def streaming_response_wrapper(
@@ -969,11 +1005,168 @@ async def chat_completions(
                 request_data = await request.json()
             except json.JSONDecodeError:
                 request_data = {"error": "Could not parse request body"}
-            if logger:
-                logger.log_final_response(
+            if raw_logger:
+                raw_logger.log_final_response(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Anthropic Messages API Endpoint ---
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    body: AnthropicMessagesRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible Messages API endpoint.
+
+    Accepts requests in Anthropic's format and returns responses in Anthropic's format.
+    Internally translates to OpenAI format for processing via LiteLLM.
+
+    This endpoint is compatible with Claude Code and other Anthropic API clients.
+    """
+    # Initialize raw I/O logger if enabled (for debugging proxy boundary)
+    logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+
+    # Log raw Anthropic request if raw logging is enabled
+    if logger:
+        logger.log_request(
+            headers=dict(request.headers),
+            body=body.model_dump(exclude_none=True),
+        )
+
+    try:
+        # Log the request to console
+        log_request_to_console(
+            url=str(request.url),
+            headers=dict(request.headers),
+            client_info=(
+                request.client.host if request.client else "unknown",
+                request.client.port if request.client else 0,
+            ),
+            request_data=body.model_dump(exclude_none=True),
+        )
+
+        # Use the library method to handle the request
+        result = await client.anthropic_messages(body, raw_request=request)
+
+        if body.stream:
+            # Streaming response
+            return StreamingResponse(
+                result,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            # Non-streaming response
+            if logger:
+                logger.log_final_response(
+                    status_code=200,
+                    headers=None,
+                    body=result,
+                )
+            return JSONResponse(content=result)
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=400, detail=error_response)
+    except litellm.AuthenticationError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=401, detail=error_response)
+    except litellm.RateLimitError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=429, detail=error_response)
+    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=503, detail=error_response)
+    except litellm.Timeout as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": f"Request timed out: {str(e)}"},
+        }
+        raise HTTPException(status_code=504, detail=error_response)
+    except Exception as e:
+        logging.error(f"Anthropic messages endpoint error: {e}")
+        if logger:
+            logger.log_final_response(
+                status_code=500,
+                headers=None,
+                body={"error": str(e)},
+            )
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=500, detail=error_response)
+
+
+# --- Anthropic Count Tokens Endpoint ---
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request,
+    body: AnthropicCountTokensRequest,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_anthropic_api_key),
+):
+    """
+    Anthropic-compatible count_tokens endpoint.
+
+    Counts the number of tokens that would be used by a Messages API request.
+    This is useful for estimating costs and managing context windows.
+
+    Accepts requests in Anthropic's format and returns token count in Anthropic's format.
+    """
+    try:
+        # Use the library method to handle the request
+        result = await client.anthropic_count_tokens(body)
+        return JSONResponse(content=result)
+
+    except (
+        litellm.InvalidRequestError,
+        ValueError,
+        litellm.ContextWindowExceededError,
+    ) as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=400, detail=error_response)
+    except litellm.AuthenticationError as e:
+        error_response = {
+            "type": "error",
+            "error": {"type": "authentication_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=401, detail=error_response)
+    except Exception as e:
+        logging.error(f"Anthropic count_tokens endpoint error: {e}")
+        error_response = {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
+        }
+        raise HTTPException(status_code=500, detail=error_response)
 
 
 @app.post("/v1/embeddings")

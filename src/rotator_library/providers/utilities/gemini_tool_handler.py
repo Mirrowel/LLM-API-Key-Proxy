@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/utilities/gemini_tool_handler.py
 """
 Shared tool handling mixin for Gemini-based providers.
@@ -456,13 +459,17 @@ class GeminiToolHandler:
         to help Gemini 3 use the correct parameter names.
 
         Args:
-            func_decl: Function declaration dict with name, description, parametersJsonSchema
+            func_decl: Function declaration dict with name, description, and schema
+                      (either 'parametersJsonSchema' or 'parameters' key)
             description_prompt: Template string with {params} placeholder
 
         Returns:
             Modified function declaration with signature appended to description
         """
-        schema = func_decl.get("parametersJsonSchema", {})
+        # Support both parametersJsonSchema and parameters keys
+        schema = func_decl.get("parametersJsonSchema") or func_decl.get(
+            "parameters", {}
+        )
         if not schema:
             return func_decl
 

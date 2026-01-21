@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 import asyncio
 import fnmatch
 import json
@@ -12,7 +15,7 @@ from litellm.exceptions import APIConnectionError
 from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, AsyncGenerator, Optional, Union
+from typing import List, Dict, Any, AsyncGenerator, Optional, Union, Tuple
 
 lib_logger = logging.getLogger("rotator_library")
 # Ensure the logger is configured to propagate to the root logger
@@ -26,13 +29,13 @@ from .error_handler import (
     PreRequestCallbackError,
     CredentialNeedsReauthError,
     classify_error,
-    AllProviders,
     NoAvailableKeysError,
     should_rotate_on_error,
     should_retry_same_key,
     RequestErrorAccumulator,
     mask_credential,
 )
+from .provider_config import ProviderConfig
 from .providers import PROVIDER_PLUGINS
 from .providers.openai_compatible_provider import OpenAICompatibleProvider
 from .request_sanitizer import sanitize_request_payload
@@ -42,6 +45,15 @@ from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
+from .utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
+from .config import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_GLOBAL_TIMEOUT,
+    DEFAULT_ROTATION_TOLERANCE,
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
+)
 
 
 class StreamedAPIError(Exception):
@@ -62,17 +74,17 @@ class RotatingClient:
         self,
         api_keys: Optional[Dict[str, List[str]]] = None,
         oauth_credentials: Optional[Dict[str, List[str]]] = None,
-        max_retries: int = 2,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         usage_file_path: Optional[Union[str, Path]] = None,
         configure_logging: bool = True,
-        global_timeout: int = 30,
+        global_timeout: int = DEFAULT_GLOBAL_TIMEOUT,
         abort_on_callback_error: bool = True,
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         ignore_models: Optional[Dict[str, List[str]]] = None,
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
-        rotation_tolerance: float = 3.0,
+        rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
     ):
         """
@@ -110,6 +122,12 @@ class RotatingClient:
         os.environ["LITELLM_LOG"] = "ERROR"
         litellm.set_verbose = False
         litellm.drop_params = True
+
+        # Suppress harmless Pydantic serialization warnings from litellm
+        # See: https://github.com/BerriAI/litellm/issues/11759
+        # TODO: Remove this workaround once litellm patches the issue
+        suppress_litellm_serialization_warnings()
+
         if configure_logging:
             # When True, this allows logs from this library to be handled
             # by the parent application's logging configuration.
@@ -200,7 +218,9 @@ class RotatingClient:
                 # Get sequential fallback from provider class
                 if hasattr(provider_class, "default_sequential_fallback_multiplier"):
                     fallback = provider_class.default_sequential_fallback_multiplier
-                    if fallback != 1:  # Only store if different from global default
+                    if (
+                        fallback != DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
+                    ):  # Only store if different from global default
                         sequential_fallback_multipliers[provider] = fallback
 
             # Override with environment variables
@@ -261,6 +281,213 @@ class RotatingClient:
                 f"Provider '{provider}' sequential fallback multiplier: {fallback}x"
             )
 
+        # Build fair cycle configuration
+        fair_cycle_enabled: Dict[str, bool] = {}
+        fair_cycle_tracking_mode: Dict[str, str] = {}
+        fair_cycle_cross_tier: Dict[str, bool] = {}
+        fair_cycle_duration: Dict[str, int] = {}
+
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+            rotation_mode = provider_rotation_modes.get(provider, "balanced")
+
+            # Fair cycle enabled - check env, then provider default, then derive from rotation mode
+            env_key = f"FAIR_CYCLE_{provider.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val is not None:
+                fair_cycle_enabled[provider] = env_val.lower() in ("true", "1", "yes")
+            elif provider_class and hasattr(
+                provider_class, "default_fair_cycle_enabled"
+            ):
+                default_val = provider_class.default_fair_cycle_enabled
+                if default_val is not None:
+                    fair_cycle_enabled[provider] = default_val
+                # None means use global default (enabled for all modes)
+            # Default: enabled for all rotation modes (not stored, handled in UsageManager)
+
+            # Tracking mode - check env, then provider default
+            env_key = f"FAIR_CYCLE_TRACKING_MODE_{provider.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val is not None and env_val.lower() in ("model_group", "credential"):
+                fair_cycle_tracking_mode[provider] = env_val.lower()
+            elif provider_class and hasattr(
+                provider_class, "default_fair_cycle_tracking_mode"
+            ):
+                fair_cycle_tracking_mode[provider] = (
+                    provider_class.default_fair_cycle_tracking_mode
+                )
+
+            # Cross-tier - check env, then provider default
+            env_key = f"FAIR_CYCLE_CROSS_TIER_{provider.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val is not None:
+                fair_cycle_cross_tier[provider] = env_val.lower() in (
+                    "true",
+                    "1",
+                    "yes",
+                )
+            elif provider_class and hasattr(
+                provider_class, "default_fair_cycle_cross_tier"
+            ):
+                if provider_class.default_fair_cycle_cross_tier:
+                    fair_cycle_cross_tier[provider] = True
+
+            # Duration - check provider-specific env, then provider default
+            env_key = f"FAIR_CYCLE_DURATION_{provider.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val is not None:
+                try:
+                    fair_cycle_duration[provider] = int(env_val)
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid {env_key}: {env_val}. Must be integer."
+                    )
+            elif provider_class and hasattr(
+                provider_class, "default_fair_cycle_duration"
+            ):
+                duration = provider_class.default_fair_cycle_duration
+                if (
+                    duration != DEFAULT_FAIR_CYCLE_DURATION
+                ):  # Only store if different from global default
+                    fair_cycle_duration[provider] = duration
+
+        # Build exhaustion cooldown threshold per provider
+        # Check global env first, then per-provider env, then provider class default
+        exhaustion_cooldown_threshold: Dict[str, int] = {}
+        global_threshold_str = os.getenv("EXHAUSTION_COOLDOWN_THRESHOLD")
+        global_threshold = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+        if global_threshold_str:
+            try:
+                global_threshold = int(global_threshold_str)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid EXHAUSTION_COOLDOWN_THRESHOLD: {global_threshold_str}. Using default {DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD}."
+                )
+
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+
+            # Check per-provider env var first
+            env_key = f"EXHAUSTION_COOLDOWN_THRESHOLD_{provider.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val is not None:
+                try:
+                    exhaustion_cooldown_threshold[provider] = int(env_val)
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid {env_key}: {env_val}. Must be integer."
+                    )
+            elif provider_class and hasattr(
+                provider_class, "default_exhaustion_cooldown_threshold"
+            ):
+                threshold = provider_class.default_exhaustion_cooldown_threshold
+                if (
+                    threshold != DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+                ):  # Only store if different from global default
+                    exhaustion_cooldown_threshold[provider] = threshold
+            elif global_threshold != DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD:
+                # Use global threshold if set and different from default
+                exhaustion_cooldown_threshold[provider] = global_threshold
+
+        # Log fair cycle configuration
+        for provider, enabled in fair_cycle_enabled.items():
+            if not enabled:
+                lib_logger.info(f"Provider '{provider}' fair cycle: disabled")
+        for provider, mode in fair_cycle_tracking_mode.items():
+            if mode != "model_group":
+                lib_logger.info(
+                    f"Provider '{provider}' fair cycle tracking mode: {mode}"
+                )
+        for provider, cross_tier in fair_cycle_cross_tier.items():
+            if cross_tier:
+                lib_logger.info(f"Provider '{provider}' fair cycle cross-tier: enabled")
+
+        # Build custom caps configuration
+        # Format: CUSTOM_CAP_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<value>
+        # Format: CUSTOM_CAP_COOLDOWN_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<mode>:<value>
+        custom_caps: Dict[
+            str, Dict[Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]]
+        ] = {}
+
+        for provider in self.all_credentials.keys():
+            provider_class = self._provider_plugins.get(provider)
+            provider_upper = provider.upper()
+
+            # Start with provider class defaults
+            if provider_class and hasattr(provider_class, "default_custom_caps"):
+                default_caps = provider_class.default_custom_caps
+                if default_caps:
+                    custom_caps[provider] = {}
+                    for tier_key, models_config in default_caps.items():
+                        custom_caps[provider][tier_key] = dict(models_config)
+
+            # Parse environment variable overrides
+            cap_prefix = f"CUSTOM_CAP_{provider_upper}_T"
+            cooldown_prefix = f"CUSTOM_CAP_COOLDOWN_{provider_upper}_T"
+
+            for env_key, env_value in os.environ.items():
+                if env_key.startswith(cap_prefix) and not env_key.startswith(
+                    cooldown_prefix
+                ):
+                    # Parse cap value
+                    remainder = env_key[len(cap_prefix) :]
+                    tier_key, model_key = self._parse_custom_cap_env_key(remainder)
+                    if tier_key is None:
+                        continue
+
+                    if provider not in custom_caps:
+                        custom_caps[provider] = {}
+                    if tier_key not in custom_caps[provider]:
+                        custom_caps[provider][tier_key] = {}
+                    if model_key not in custom_caps[provider][tier_key]:
+                        custom_caps[provider][tier_key][model_key] = {}
+
+                    # Store max_requests value
+                    custom_caps[provider][tier_key][model_key]["max_requests"] = (
+                        env_value
+                    )
+
+                elif env_key.startswith(cooldown_prefix):
+                    # Parse cooldown config
+                    remainder = env_key[len(cooldown_prefix) :]
+                    tier_key, model_key = self._parse_custom_cap_env_key(remainder)
+                    if tier_key is None:
+                        continue
+
+                    # Parse mode:value format
+                    if ":" in env_value:
+                        mode, value_str = env_value.split(":", 1)
+                        try:
+                            value = int(value_str)
+                        except ValueError:
+                            lib_logger.warning(
+                                f"Invalid cooldown value in {env_key}: {env_value}"
+                            )
+                            continue
+                    else:
+                        mode = env_value
+                        value = 0
+
+                    if provider not in custom_caps:
+                        custom_caps[provider] = {}
+                    if tier_key not in custom_caps[provider]:
+                        custom_caps[provider][tier_key] = {}
+                    if model_key not in custom_caps[provider][tier_key]:
+                        custom_caps[provider][tier_key][model_key] = {}
+
+                    custom_caps[provider][tier_key][model_key]["cooldown_mode"] = mode
+                    custom_caps[provider][tier_key][model_key]["cooldown_value"] = value
+
+        # Log custom caps configuration
+        for provider, tier_configs in custom_caps.items():
+            for tier_key, models_config in tier_configs.items():
+                for model_key, config in models_config.items():
+                    max_req = config.get("max_requests", "default")
+                    cooldown = config.get("cooldown_mode", "quota_reset")
+                    lib_logger.info(
+                        f"Custom cap: {provider}/T{tier_key}/{model_key} = {max_req}, cooldown={cooldown}"
+                    )
+
         # Resolve usage file path - use provided path or default to data_dir
         if usage_file_path is not None:
             resolved_usage_path = Path(usage_file_path)
@@ -275,10 +502,16 @@ class RotatingClient:
             priority_multipliers=priority_multipliers,
             priority_multipliers_by_mode=priority_multipliers_by_mode,
             sequential_fallback_multipliers=sequential_fallback_multipliers,
+            fair_cycle_enabled=fair_cycle_enabled,
+            fair_cycle_tracking_mode=fair_cycle_tracking_mode,
+            fair_cycle_cross_tier=fair_cycle_cross_tier,
+            fair_cycle_duration=fair_cycle_duration,
+            exhaustion_cooldown_threshold=exhaustion_cooldown_threshold,
+            custom_caps=custom_caps,
         )
         self._model_list_cache = {}
         self.http_client = httpx.AsyncClient()
-        self.all_providers = AllProviders()
+        self.provider_config = ProviderConfig()
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
         self.ignore_models = ignore_models or {}
@@ -295,6 +528,61 @@ class RotatingClient:
                     f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
                 )
                 self.max_concurrent_requests_per_key[provider] = 1
+
+    def _parse_custom_cap_env_key(
+        self, remainder: str
+    ) -> Tuple[Optional[Union[int, Tuple[int, ...], str]], Optional[str]]:
+        """
+        Parse the tier and model/group from a custom cap env var remainder.
+
+        Args:
+            remainder: String after "CUSTOM_CAP_{PROVIDER}_T" prefix
+                       e.g., "2_CLAUDE" or "2_3_CLAUDE" or "DEFAULT_CLAUDE"
+
+        Returns:
+            (tier_key, model_key) tuple, or (None, None) if parse fails
+        """
+        if not remainder:
+            return None, None
+
+        remaining_parts = remainder.split("_")
+        if len(remaining_parts) < 2:
+            return None, None
+
+        tier_key: Union[int, Tuple[int, ...], str, None] = None
+        model_key: Optional[str] = None
+
+        # Tiers are numeric or "DEFAULT"
+        tier_parts: List[int] = []
+
+        for i, part in enumerate(remaining_parts):
+            if part == "DEFAULT":
+                tier_key = "default"
+                model_key = "_".join(remaining_parts[i + 1 :])
+                break
+            elif part.isdigit():
+                tier_parts.append(int(part))
+            else:
+                # First non-numeric part is start of model name
+                if len(tier_parts) == 0:
+                    return None, None
+                elif len(tier_parts) == 1:
+                    tier_key = tier_parts[0]
+                else:
+                    tier_key = tuple(tier_parts)
+                model_key = "_".join(remaining_parts[i:])
+                break
+        else:
+            # All parts were tier parts, no model
+            return None, None
+
+        if model_key:
+            # Convert model_key back to original format (for matching)
+            # Env vars use underscores, but we store with original names
+            # The matching in UsageManager will handle this
+            model_key = model_key.lower().replace("_", "-")
+
+        return tier_key, model_key
 
     def _is_model_ignored(self, provider: str, model_id: str) -> bool:
         """
@@ -456,49 +744,6 @@ class RotatingClient:
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()
 
-    def _convert_model_params(self, **kwargs) -> Dict[str, Any]:
-        """
-        Converts model parameters for specific providers.
-        For example, the 'chutes' provider requires the model name to be prepended
-        with 'openai/' and a specific 'api_base'.
-        """
-        model = kwargs.get("model")
-        if not model:
-            return kwargs
-
-        provider = model.split("/")[0]
-        if provider == "chutes":
-            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-            kwargs["api_base"] = "https://llm.chutes.ai/v1"
-
-        return kwargs
-
-    def _convert_model_params_for_litellm(self, **kwargs) -> Dict[str, Any]:
-        """
-        Converts model parameters specifically for LiteLLM calls.
-        This is called right before calling LiteLLM to handle custom providers.
-        """
-        model = kwargs.get("model")
-        if not model:
-            return kwargs
-
-        provider = model.split("/")[0]
-
-        # Handle custom OpenAI-compatible providers
-        # Check if this is a custom provider by looking for API_BASE environment variable
-        import os
-
-        api_base_env = f"{provider.upper()}_API_BASE"
-        if os.getenv(api_base_env):
-            # For custom providers, tell LiteLLM to use openai provider with custom model name
-            # This preserves original model name in logs but converts for LiteLLM
-            kwargs = kwargs.copy()  # Don't modify original
-            kwargs["model"] = f"openai/{model.split('/', 1)[1]}"
-            kwargs["api_base"] = os.getenv(api_base_env).rstrip("/")
-            kwargs["custom_llm_provider"] = "openai"
-
-        return kwargs
-
     def _apply_default_safety_settings(
         self, litellm_kwargs: Dict[str, Any], provider: str
     ):
@@ -563,12 +808,14 @@ class RotatingClient:
         return self.oauth_credentials
 
     def _is_custom_openai_compatible_provider(self, provider_name: str) -> bool:
-        """Checks if a provider is a custom OpenAI-compatible provider."""
-        import os
+        """
+        Checks if a provider is a custom OpenAI-compatible provider.
 
-        # Check if the provider has an API_BASE environment variable
-        api_base_env = f"{provider_name.upper()}_API_BASE"
-        return os.getenv(api_base_env) is not None
+        Custom providers are identified by:
+        1. Having a _API_BASE environment variable set, AND
+        2. NOT being in the list of known LiteLLM providers
+        """
+        return self.provider_config.is_custom_provider(provider_name)
 
     def _get_provider_instance(self, provider_name: str):
         """
@@ -942,13 +1189,22 @@ class RotatingClient:
                 f"No API keys or OAuth credentials configured for provider: {provider}"
             )
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Establish a global deadline for the entire request lifecycle.
         deadline = time.time() + self.global_timeout
 
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         # Create a mutable copy of the keys and shuffle it to ensure
@@ -972,7 +1228,6 @@ class RotatingClient:
 
         tried_creds = set()
         last_exception = None
-        kwargs = self._convert_model_params(**kwargs)
 
         # The main rotation loop. It continues as long as there are untried credentials and the global deadline has not been exceeded.
 
@@ -1095,16 +1350,28 @@ class RotatingClient:
                     break
 
                 # Get count of credentials not on cooldown for this model
-                available_creds = (
-                    await self.usage_manager.get_available_credentials_for_model(
-                        creds_to_try, model
+                availability_stats = (
+                    await self.usage_manager.get_credential_availability_stats(
+                        creds_to_try, model, credential_priorities
                     )
                 )
-                available_count = len(available_creds)
+                available_count = availability_stats["available"]
                 total_count = len(credentials_for_provider)
+                on_cooldown = availability_stats["on_cooldown"]
+                fc_excluded = availability_stats["fair_cycle_excluded"]
+
+                # Build compact exclusion breakdown
+                exclusion_parts = []
+                if on_cooldown > 0:
+                    exclusion_parts.append(f"cd:{on_cooldown}")
+                if fc_excluded > 0:
+                    exclusion_parts.append(f"fc:{fc_excluded}")
+                exclusion_str = (
+                    f",{','.join(exclusion_parts)}" if exclusion_parts else ""
+                )
 
                 lib_logger.info(
-                    f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{available_count}({total_count})"
+                    f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
                 )
                 max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
                 current_cred = await self.usage_manager.acquire_key(
@@ -1114,11 +1381,12 @@ class RotatingClient:
                     max_concurrent=max_concurrent,
                     credential_priorities=credential_priorities,
                     credential_tier_names=credential_tier_names,
+                    all_provider_credentials=credentials_for_provider,
                 )
                 key_acquired = True
                 tried_creds.add(current_cred)
 
-                litellm_kwargs = self.all_providers.get_provider_kwargs(**kwargs.copy())
+                litellm_kwargs = kwargs.copy()
 
                 # [NEW] Merge provider-specific params
                 if provider in self.litellm_provider_params:
@@ -1414,7 +1682,7 @@ class RotatingClient:
                                         )
 
                             # Convert model parameters for custom providers right before LiteLLM call
-                            final_kwargs = self._convert_model_params_for_litellm(
+                            final_kwargs = self.provider_config.convert_for_litellm(
                                 **litellm_kwargs
                             )
 
@@ -1686,6 +1954,9 @@ class RotatingClient:
         model = kwargs.get("model")
         provider = model.split("/")[0]
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
         # Create a mutable copy of the keys and shuffle it.
         credentials_for_provider = list(self.all_credentials[provider])
         random.shuffle(credentials_for_provider)
@@ -1708,12 +1979,17 @@ class RotatingClient:
         # Create transaction logger if request logging is enabled
         transaction_logger = None
         if self.enable_request_logging:
-            transaction_logger = TransactionLogger(provider, model, enabled=True)
+            transaction_logger = TransactionLogger(
+                provider,
+                model,
+                enabled=True,
+                api_format="oai",
+                parent_dir=parent_log_dir,
+            )
             transaction_logger.log_request(kwargs)
 
         tried_creds = set()
         last_exception = None
-        kwargs = self._convert_model_params(**kwargs)
 
         consecutive_quota_failures = 0
 
@@ -1837,16 +2113,28 @@ class RotatingClient:
                         break
 
                     # Get count of credentials not on cooldown for this model
-                    available_creds = (
-                        await self.usage_manager.get_available_credentials_for_model(
-                            creds_to_try, model
+                    availability_stats = (
+                        await self.usage_manager.get_credential_availability_stats(
+                            creds_to_try, model, credential_priorities
                         )
                     )
-                    available_count = len(available_creds)
+                    available_count = availability_stats["available"]
                     total_count = len(credentials_for_provider)
+                    on_cooldown = availability_stats["on_cooldown"]
+                    fc_excluded = availability_stats["fair_cycle_excluded"]
+
+                    # Build compact exclusion breakdown
+                    exclusion_parts = []
+                    if on_cooldown > 0:
+                        exclusion_parts.append(f"cd:{on_cooldown}")
+                    if fc_excluded > 0:
+                        exclusion_parts.append(f"fc:{fc_excluded}")
+                    exclusion_str = (
+                        f",{','.join(exclusion_parts)}" if exclusion_parts else ""
+                    )
 
                     lib_logger.info(
-                        f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{available_count}({total_count})"
+                        f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
                     )
                     max_concurrent = self.max_concurrent_requests_per_key.get(
                         provider, 1
@@ -1858,13 +2146,12 @@ class RotatingClient:
                         max_concurrent=max_concurrent,
                         credential_priorities=credential_priorities,
                         credential_tier_names=credential_tier_names,
+                        all_provider_credentials=credentials_for_provider,
                     )
                     key_acquired = True
                     tried_creds.add(current_cred)
 
-                    litellm_kwargs = self.all_providers.get_provider_kwargs(
-                        **kwargs.copy()
-                    )
+                    litellm_kwargs = kwargs.copy()
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
 
@@ -2174,7 +2461,7 @@ class RotatingClient:
 
                             # lib_logger.info(f"DEBUG: litellm.acompletion kwargs: {litellm_kwargs}")
                             # Convert model parameters for custom providers right before LiteLLM call
-                            final_kwargs = self._convert_model_params_for_litellm(
+                            final_kwargs = self.provider_config.convert_for_litellm(
                                 **litellm_kwargs
                             )
 
@@ -2567,20 +2854,46 @@ class RotatingClient:
         )
 
     def token_count(self, **kwargs) -> int:
-        """Calculates the number of tokens for a given text or list of messages."""
-        kwargs = self._convert_model_params(**kwargs)
+        """Calculates the number of tokens for a given text or list of messages.
+
+        For Antigravity provider models, this also includes the preprompt tokens
+        that get injected during actual API calls (agent instruction + identity override).
+        This ensures token counts match actual usage.
+        """
         model = kwargs.get("model")
         text = kwargs.get("text")
         messages = kwargs.get("messages")
 
         if not model:
             raise ValueError("'model' is a required parameter.")
+
+        # Calculate base token count
         if messages:
-            return token_counter(model=model, messages=messages)
+            base_count = token_counter(model=model, messages=messages)
         elif text:
-            return token_counter(model=model, text=text)
+            base_count = token_counter(model=model, text=text)
         else:
             raise ValueError("Either 'text' or 'messages' must be provided.")
+
+        # Add preprompt tokens for Antigravity provider
+        # The Antigravity provider injects system instructions during actual API calls,
+        # so we need to account for those tokens in the count
+        provider = model.split("/")[0] if "/" in model else ""
+        if provider == "antigravity":
+            try:
+                from .providers.antigravity_provider import (
+                    get_antigravity_preprompt_text,
+                )
+
+                preprompt_text = get_antigravity_preprompt_text()
+                if preprompt_text:
+                    preprompt_tokens = token_counter(model=model, text=preprompt_text)
+                    base_count += preprompt_tokens
+            except ImportError:
+                # Provider not available, skip preprompt token counting
+                pass
+
+        return base_count
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Returns a list of available models for a specific provider, with caching."""
@@ -2812,7 +3125,9 @@ class RotatingClient:
                         )
                     else:
                         group_stats["total_requests_remaining"] = 0
-                        group_stats["total_remaining_pct"] = None
+                        # Fallback to avg_remaining_pct when max_requests unavailable
+                        # This handles providers like Firmware that only provide percentage
+                        group_stats["total_remaining_pct"] = group_stats.get("avg_remaining_pct")
 
                     prov_stats["quota_groups"][group_name] = group_stats
 
@@ -2878,14 +3193,22 @@ class RotatingClient:
                             requests_remaining = (
                                 max(0, max_req - req_count) if max_req else 0
                             )
+
+                            # Determine display format
+                            # Priority: requests (if max known) > percentage (if baseline available) > unknown
+                            if max_req:
+                                display = f"{requests_remaining}/{max_req}"
+                            elif remaining_pct is not None:
+                                display = f"{remaining_pct}%"
+                            else:
+                                display = "?/?"
+
                             cred["model_groups"][group_name] = {
                                 "remaining_pct": remaining_pct,
                                 "requests_used": req_count,
                                 "requests_remaining": requests_remaining,
                                 "requests_max": max_req,
-                                "display": f"{requests_remaining}/{max_req}"
-                                if max_req
-                                else f"?/?",
+                                "display": display,
                                 "is_exhausted": is_exhausted,
                                 "reset_time_iso": reset_iso,
                                 "models": group_models,
@@ -3091,3 +3414,168 @@ class RotatingClient:
 
         result["duration_ms"] = int((time.time() - start_time) * 1000)
         return result
+
+    # --- Anthropic API Compatibility Methods ---
+
+    async def anthropic_messages(
+        self,
+        request: "AnthropicMessagesRequest",
+        raw_request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+    ) -> Any:
+        """
+        Handle Anthropic Messages API requests.
+
+        This method accepts requests in Anthropic's format, translates them to
+        OpenAI format internally, processes them through the existing acompletion
+        method, and returns responses in Anthropic's format.
+
+        Args:
+            request: An AnthropicMessagesRequest object
+            raw_request: Optional raw request object for disconnect checks
+            pre_request_callback: Optional async callback before each API request
+
+        Returns:
+            For non-streaming: dict in Anthropic Messages format
+            For streaming: AsyncGenerator yielding Anthropic SSE format strings
+        """
+        from .anthropic_compat import (
+            translate_anthropic_request,
+            openai_to_anthropic_response,
+            anthropic_streaming_wrapper,
+        )
+        import uuid
+
+        request_id = f"msg_{uuid.uuid4().hex[:24]}"
+        original_model = request.model
+
+        # Extract provider from model for logging
+        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+
+        # Create Anthropic transaction logger if request logging is enabled
+        anthropic_logger = None
+        if self.enable_request_logging:
+            anthropic_logger = TransactionLogger(
+                provider,
+                original_model,
+                enabled=True,
+                api_format="ant",
+            )
+            # Log original Anthropic request
+            anthropic_logger.log_request(
+                request.model_dump(exclude_none=True),
+                filename="anthropic_request.json",
+            )
+
+        # Translate Anthropic request to OpenAI format
+        openai_request = translate_anthropic_request(request)
+
+        # Pass parent log directory to acompletion for nested logging
+        if anthropic_logger and anthropic_logger.log_dir:
+            openai_request["_parent_log_dir"] = anthropic_logger.log_dir
+
+        if request.stream:
+            # Streaming response
+            response_generator = self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Create disconnect checker if raw_request provided
+            is_disconnected = None
+            if raw_request is not None and hasattr(raw_request, "is_disconnected"):
+                is_disconnected = raw_request.is_disconnected
+
+            # Return the streaming wrapper
+            # Note: For streaming, the anthropic response logging happens in the wrapper
+            return anthropic_streaming_wrapper(
+                openai_stream=response_generator,
+                original_model=original_model,
+                request_id=request_id,
+                is_disconnected=is_disconnected,
+                transaction_logger=anthropic_logger,
+            )
+        else:
+            # Non-streaming response
+            response = await self.acompletion(
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                **openai_request,
+            )
+
+            # Convert OpenAI response to Anthropic format
+            openai_response = (
+                response.model_dump()
+                if hasattr(response, "model_dump")
+                else dict(response)
+            )
+            anthropic_response = openai_to_anthropic_response(
+                openai_response, original_model
+            )
+
+            # Override the ID with our request ID
+            anthropic_response["id"] = request_id
+
+            # Log Anthropic response
+            if anthropic_logger:
+                anthropic_logger.log_response(
+                    anthropic_response,
+                    filename="anthropic_response.json",
+                )
+
+            return anthropic_response
+
+    async def anthropic_count_tokens(
+        self,
+        request: "AnthropicCountTokensRequest",
+    ) -> dict:
+        """
+        Handle Anthropic count_tokens API requests.
+
+        Counts the number of tokens that would be used by a Messages API request.
+        This is useful for estimating costs and managing context windows.
+
+        Args:
+            request: An AnthropicCountTokensRequest object
+
+        Returns:
+            Dict with input_tokens count in Anthropic format
+        """
+        from .anthropic_compat import (
+            anthropic_to_openai_messages,
+            anthropic_to_openai_tools,
+        )
+        import json
+
+        anthropic_request = request.model_dump(exclude_none=True)
+
+        openai_messages = anthropic_to_openai_messages(
+            anthropic_request.get("messages", []), anthropic_request.get("system")
+        )
+
+        # Count tokens for messages
+        message_tokens = self.token_count(
+            model=request.model,
+            messages=openai_messages,
+        )
+
+        # Count tokens for tools if present
+        tool_tokens = 0
+        if request.tools:
+            # Tools add tokens based on their definitions
+            # Convert to JSON string and count tokens for tool definitions
+            openai_tools = anthropic_to_openai_tools(
+                [tool.model_dump() for tool in request.tools]
+            )
+            if openai_tools:
+                # Serialize tools to count their token contribution
+                tools_text = json.dumps(openai_tools)
+                tool_tokens = self.token_count(
+                    model=request.model,
+                    text=tools_text,
+                )
+
+        total_tokens = message_tokens + tool_tokens
+
+        return {"input_tokens": total_tokens}

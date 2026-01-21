@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 """
 Base Quota Tracking Mixin
 
@@ -42,9 +45,20 @@ if TYPE_CHECKING:
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
 
+# =============================================================================
+# CONFIGURATION DEFAULTS
+# =============================================================================
+
 # Delay before fetching quota after a request (API needs time to update)
 # Used for manual cost discovery
-QUOTA_DISCOVERY_DELAY_SECONDS = 3.0
+QUOTA_DISCOVERY_DELAY_SECONDS: float = 3.0
+
+# Maximum concurrent quota fetch requests (prevents overwhelming API)
+QUOTA_FETCH_CONCURRENCY: int = 5
+
+# Upper limit for environment variable credential discovery
+# Checks for {PREFIX}_1_ACCESS_TOKEN through {PREFIX}_N_ACCESS_TOKEN
+ENV_CREDENTIAL_DISCOVERY_LIMIT: int = 100
 
 
 class BaseQuotaTracker:
@@ -366,7 +380,7 @@ class BaseQuotaTracker:
         env_prefix = self.provider_env_prefix
         provider_name = self.cache_subdir  # e.g., "gemini_cli", "antigravity"
 
-        for i in range(1, 100):  # Reasonable upper limit
+        for i in range(1, ENV_CREDENTIAL_DISCOVERY_LIMIT):  # Upper limit
             if os.getenv(f"{env_prefix}_{i}_ACCESS_TOKEN"):
                 credentials.append(f"env://{provider_name}/{i}")
             else:
@@ -409,7 +423,7 @@ class BaseQuotaTracker:
         results = {}
 
         # Use semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(5)
+        semaphore = asyncio.Semaphore(QUOTA_FETCH_CONCURRENCY)
 
         async def fetch_with_semaphore(cred_path: str):
             async with semaphore:
