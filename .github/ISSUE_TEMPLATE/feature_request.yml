@@ -1,0 +1,65 @@
+name: Feature Request
+description: Suggest a new feature, enhancement, or provider
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement! Please describe what you'd like to see.
+
+  - type: dropdown
+    id: feature_type
+    attributes:
+      label: Feature Type
+      description: What kind of feature is this?
+      options:
+        - New provider
+        - Enhancement to existing feature
+        - New functionality
+        - Other
+      default: 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the feature you'd like to see
+      placeholder: I would like...
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use Case
+      description: Why do you need this feature? What problem does it solve?
+      placeholder: This would help me...
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: |
+        Any other information that might help.
+        
+        For new provider requests, please include if available:
+        - Link to provider API documentation
+        - Authentication type (API key, OAuth, etc.)
+        - Example endpoints or API format
+        - Similar implementations in other projects
+      placeholder: |
+        API docs: https://...
+        Auth type: API key
+        ...
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true

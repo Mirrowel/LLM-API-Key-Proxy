@@ -1,0 +1,121 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us investigate.
+
+  - type: dropdown
+    id: branch
+    attributes:
+      label: Branch
+      description: Which branch are you using?
+      options:
+        - main
+        - dev
+        - other (specify below)
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: branch_other
+    attributes:
+      label: Branch (if other)
+      description: If you selected "other" above, specify the branch name
+      placeholder: e.g., feature/my-branch
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / Tag / Commit
+      description: Release version, git tag, or commit hash. Enter "latest" if using the latest release.
+      placeholder: e.g., v1.15, latest, abc1234
+
+  - type: input
+    id: providers
+    attributes:
+      label: Provider(s) Affected
+      description: Which LLM provider(s) are you experiencing issues with?
+      placeholder: e.g., Gemini, OpenRouter, Antigravity
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment Method
+      description: How are you running the proxy?
+      options:
+        - Binary (exe/executable)
+        - Docker
+        - From source (python)
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: e.g., Windows 11, Ubuntu 22.04, macOS 14
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python Version (if running from source)
+      placeholder: e.g., 3.11.5
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear description of what the bug is
+      placeholder: Describe the issue...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this issue?
+      placeholder: |
+        1. Configure provider X with...
+        2. Send request to...
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Logs / Messages
+      description: Paste any relevant error messages or logs. This will be formatted as code.
+      render: text
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
