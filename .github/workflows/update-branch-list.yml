@@ -119,7 +119,7 @@ jobs:
                       "provider": {{
                         "llm-proxy": {{
                           "api": "openai",
-                          "baseUrl": "$LLM_PROXY_URL",
+                          "url": "$LLM_PROXY_URL",
                           "models": {{ "$MODEL": {{}} }},
                           "options": {{ "apiKey": "$LLM_PROXY_API_KEY" }}
                         }}
