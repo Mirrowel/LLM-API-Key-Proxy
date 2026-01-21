@@ -27,10 +27,8 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        github.event.comment.user.login != 'mirrobot' &&
-        github.event.comment.user.login != 'mirrobot-agent' &&
-        github.event.comment.user.login != 'mirrobot-agent[bot]' &&
-        (contains(github.event.comment.body, '/mirrobot-review') || contains(github.event.comment.body, '/mirrobot_review'))
+        github.event.comment.user.login != 'github-actions[bot]' &&
+        (contains(github.event.comment.body, '/ai-review') || contains(github.event.comment.body, '/ai_review'))
       )
     runs-on: ubuntu-latest
     permissions:
@@ -39,7 +37,7 @@ jobs:
 
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.prNumber }}
-      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      BOT_NAMES_JSON: '["github-actions[bot]"]'
       IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
       COMMENT_FETCH_LIMIT: '20'
       REVIEW_FETCH_LIMIT: '30'
@@ -84,8 +82,8 @@ jobs:
           echo "---"
           
           # Check for trigger words in clean text
-          # Trigger: /mirrobot-review or /mirrobot_review
-          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]review'; then
+          # Trigger: /ai-review or /ai_review
+          if echo "$CLEAN_BODY" | grep -qE '/ai[-_]review'; then
             echo "::notice::Valid trigger found in non-quoted, non-code text."
             echo "should_proceed=true" >> $GITHUB_OUTPUT
           else
@@ -96,23 +94,47 @@ jobs:
       - name: Checkout repository
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
-
-      - name: Bot Setup
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
-        id: setup
-        uses: ./.github/actions/bot-setup
         with:
-          bot-app-id: ${{ secrets.BOT_APP_ID }}
-          bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
-          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
-          opencode-model: ${{ secrets.OPENCODE_MODEL }}
-          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
-          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure Git
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install Opencode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Configure Opencode for LLM Proxy
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        env:
+          LLM_PROXY_URL: ${{ secrets.LLM_PROXY_URL }}
+          LLM_PROXY_API_KEY: ${{ secrets.LLM_PROXY_API_KEY }}
+          LLM_PROXY_MODEL: ${{ secrets.LLM_PROXY_MODEL }}
+        run: |
+          mkdir -p ~/.config/opencode
+          DOLLAR='$'
+          MODEL="${LLM_PROXY_MODEL:-nano_gpt/zai-org/glm-4.7}"
+          cat > ~/.config/opencode/opencode.json <<EOFCFG
+          {
+            "${DOLLAR}schema": "https://opencode.ai/config.json",
+            "provider": {
+              "llm-proxy": {
+                "api": "openai",
+                "models": { "$MODEL": {} },
+                "options": { "apiKey": "$LLM_PROXY_API_KEY", "baseURL": "$LLM_PROXY_URL" }
+              }
+            },
+            "model": "llm-proxy/$MODEL"
+          }
+          EOFCFG
 
       - name: Clear pending bot review
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           pending_review_ids=$(gh api --paginate \
@@ -140,7 +162,7 @@ jobs:
       - name: Add reaction to PR
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           IGNORE_BOT_NAMES_JSON: ${{ env.IGNORE_BOT_NAMES_JSON }}
         run: |
@@ -154,7 +176,7 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: pr_meta
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           # Fetch core PR metadata (comments and reviews fetched via GraphQL below)
           pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
@@ -445,7 +467,7 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: review_type
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           # Robust last summary detection:
@@ -527,7 +549,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.PR_HEAD_SHA }}
-          token: ${{ steps.setup.outputs.token }}
+          token: ${{ secrets.GH_PAT }}
           fetch-depth: 0  # Full history needed for diff generation
 
       - name: Generate PR Diff for First Review
@@ -663,7 +685,7 @@ jobs:
       - name: Review PR with OpenCode
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
-          GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           OPENCODE_PERMISSION: |
             {
               "bash": {
@@ -688,7 +710,7 @@ jobs:
         if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true')
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           PR_NUMBER: ${{ env.PR_NUMBER }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
