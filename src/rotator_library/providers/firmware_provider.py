@@ -35,9 +35,9 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
     """
 
     # Quota groups for tracking 5-hour rolling window limits
-    # Uses a virtual model "_quota" for credential-level quota tracking
+    # Uses a virtual model "firmware/_quota" for credential-level quota tracking
     model_quota_groups = {
-        "firmware_global": ["_quota"],
+        "firmware_global": ["firmware/_quota"],
     }
 
     def __init__(self, *args, **kwargs):
@@ -80,7 +80,7 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
         """
         Get all models in a quota group.
 
-        For Firmware.ai, we use a virtual model "_quota" to track the
+        For Firmware.ai, we use a virtual model "firmware/_quota" to track the
         credential-level 5-hour rolling window quota.
 
         Args:
@@ -90,7 +90,7 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
             List of model names in the group
         """
         if group == "firmware_global":
-            return ["_quota"]
+            return ["firmware/_quota"]
         return []
 
     def get_usage_reset_config(self, credential: str) -> Optional[Dict[str, Any]]:
