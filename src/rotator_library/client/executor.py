@@ -73,6 +73,7 @@ class RequestExecutor:
         credential_filter: CredentialFilter,
         provider_transforms: ProviderTransforms,
         provider_plugins: Dict[str, Any],
+        http_client: httpx.AsyncClient,
         max_retries: int = DEFAULT_MAX_RETRIES,
         global_timeout: int = 30,
         abort_on_callback_error: bool = True,
@@ -86,6 +87,7 @@ class RequestExecutor:
             credential_filter: CredentialFilter instance
             provider_transforms: ProviderTransforms instance
             provider_plugins: Dict mapping provider names to plugin classes
+            http_client: Shared httpx.AsyncClient for provider requests
             max_retries: Max retries per credential
             global_timeout: Global request timeout in seconds
             abort_on_callback_error: Abort on pre-request callback errors
@@ -96,6 +98,7 @@ class RequestExecutor:
         self._transforms = provider_transforms
         self._plugins = provider_plugins
         self._plugin_instances: Dict[str, Any] = {}
+        self._http_client = http_client
         self._max_retries = max_retries
         self._global_timeout = global_timeout
         self._abort_on_callback_error = abort_on_callback_error
@@ -234,7 +237,7 @@ class RequestExecutor:
                                 if plugin and plugin.has_custom_logic():
                                     kwargs["credential_identifier"] = cred
                                     response = await plugin.acompletion(
-                                        httpx.AsyncClient(), **kwargs
+                                        self._http_client, **kwargs
                                     )
                                 else:
                                     # Standard LiteLLM call
@@ -445,7 +448,7 @@ class RequestExecutor:
                                     if plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = cred
                                         stream = await plugin.acompletion(
-                                            httpx.AsyncClient(), **kwargs
+                                            self._http_client, **kwargs
                                         )
                                     else:
                                         kwargs["api_key"] = cred

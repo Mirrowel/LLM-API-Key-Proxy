@@ -60,6 +60,7 @@ class TrackingEngine:
         quota_group: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
         response_headers: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
@@ -71,6 +72,7 @@ class TrackingEngine:
             quota_group: Quota group for this model (None = use model name)
             prompt_tokens: Prompt tokens used
             completion_tokens: Completion tokens used
+            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
             response_headers: Optional response headers with rate limit info
         """
         async with self._lock:
@@ -82,9 +84,15 @@ class TrackingEngine:
             usage.total_requests += 1
             usage.total_successes += 1
             usage.total_tokens += prompt_tokens + completion_tokens
+            usage.total_prompt_tokens_cached += prompt_tokens_cached
             usage.last_used_at = now
             if usage.first_used_at is None:
                 usage.first_used_at = now
+
+            # Update per-model request count (for quota group sync)
+            usage.model_request_counts[model] = (
+                usage.model_request_counts.get(model, 0) + 1
+            )
 
             # Record in all windows
             for window_def in self._config.windows:
@@ -93,6 +101,7 @@ class TrackingEngine:
                     window_def.name,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    prompt_tokens_cached=prompt_tokens_cached,
                 )
 
             # Update from response headers if provided
@@ -136,6 +145,11 @@ class TrackingEngine:
             state.usage.total_requests += 1
             state.usage.total_failures += 1
             state.usage.last_used_at = now
+
+            # Update per-model request count (for quota group sync)
+            state.usage.model_request_counts[model] = (
+                state.usage.model_request_counts.get(model, 0) + 1
+            )
 
             # Apply cooldown if specified
             if cooldown_duration is not None and cooldown_duration > 0:

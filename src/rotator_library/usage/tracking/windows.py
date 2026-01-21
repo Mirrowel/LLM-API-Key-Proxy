@@ -117,6 +117,7 @@ class WindowManager:
         window_name: str,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
         limit: Optional[int] = None,
     ) -> WindowStats:
         """
@@ -127,6 +128,7 @@ class WindowManager:
             window_name: Name of window to record in
             prompt_tokens: Prompt tokens used
             completion_tokens: Completion tokens used
+            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
             limit: Optional request limit for the window
 
         Returns:
@@ -136,6 +138,7 @@ class WindowManager:
 
         window.request_count += 1
         window.prompt_tokens += prompt_tokens
+        window.prompt_tokens_cached += prompt_tokens_cached
         window.completion_tokens += completion_tokens
         window.total_tokens += prompt_tokens + completion_tokens
 

@@ -228,6 +228,7 @@ class RotatingClient:
             credential_filter=self._credential_filter,
             provider_transforms=self._provider_transforms,
             provider_plugins=PROVIDER_PLUGINS,
+            http_client=self.http_client,
             max_retries=max_retries,
             global_timeout=global_timeout,
             abort_on_callback_error=abort_on_callback_error,
@@ -335,7 +336,12 @@ class RotatingClient:
         return self._executor.execute(context)
 
     def token_count(self, **kwargs) -> int:
-        """Calculate token count for text or messages."""
+        """Calculate token count for text or messages.
+
+        For Antigravity provider models, this also includes the preprompt tokens
+        that get injected during actual API calls (agent instruction + identity override).
+        This ensures token counts match actual usage.
+        """
         model = kwargs.get("model")
         text = kwargs.get("text")
         messages = kwargs.get("messages")
@@ -343,12 +349,33 @@ class RotatingClient:
         if not model:
             raise ValueError("'model' is required")
 
+        # Calculate base token count
         if messages:
-            return token_counter(model=model, messages=messages)
+            base_count = token_counter(model=model, messages=messages)
         elif text:
-            return token_counter(model=model, text=text)
+            base_count = token_counter(model=model, text=text)
         else:
             raise ValueError("Either 'text' or 'messages' must be provided")
+
+        # Add preprompt tokens for Antigravity provider
+        # The Antigravity provider injects system instructions during actual API calls,
+        # so we need to account for those tokens in the count
+        provider = model.split("/")[0] if "/" in model else ""
+        if provider == "antigravity":
+            try:
+                from ..providers.antigravity_provider import (
+                    get_antigravity_preprompt_text,
+                )
+
+                preprompt_text = get_antigravity_preprompt_text()
+                if preprompt_text:
+                    preprompt_tokens = token_counter(model=model, text=preprompt_text)
+                    base_count += preprompt_tokens
+            except ImportError:
+                # Provider not available, skip preprompt token counting
+                pass
+
+        return base_count
 
     async def get_available_models(self, provider: str) -> List[str]:
         """Get available models for a provider with caching."""

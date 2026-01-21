@@ -86,6 +86,7 @@ class CredentialContext:
                 self.quota_group,
                 self._tokens.get("prompt", 0),
                 self._tokens.get("completion", 0),
+                self._tokens.get("prompt_cached", 0),
             )
         elif self._result == "failure":
             await self._manager._record_failure(
@@ -118,11 +119,16 @@ class CredentialContext:
         response: Any = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
     ) -> None:
         """Mark request as successful."""
         self._result = "success"
         self._response = response
-        self._tokens = {"prompt": prompt_tokens, "completion": completion_tokens}
+        self._tokens = {
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "prompt_cached": prompt_tokens_cached,
+        }
 
     def mark_failure(self, error: ClassifiedError) -> None:
         """Mark request as failed."""
@@ -197,6 +203,10 @@ class UsageManager:
         self._initialized = False
         self._lock = asyncio.Lock()
 
+        # Concurrency control: per-credential locks and conditions for waiting
+        self._key_locks: Dict[str, asyncio.Lock] = {}
+        self._key_conditions: Dict[str, asyncio.Condition] = {}
+
     async def initialize(
         self,
         credentials: List[str],
@@ -252,7 +262,7 @@ class UsageManager:
                 f"UsageManager initialized for {self.provider} with {len(credentials)} credentials"
             )
 
-    def acquire_credential(
+    async def acquire_credential(
         self,
         model: str,
         quota_group: Optional[str] = None,
@@ -266,6 +276,9 @@ class UsageManager:
 
         Returns a context manager that automatically releases
         the credential and records success/failure.
+
+        This method will wait for credentials to become available if all are
+        currently busy (at max_concurrent), up until the deadline.
 
         Args:
             model: Model to use
@@ -281,8 +294,10 @@ class UsageManager:
             CredentialContext for use with async with
 
         Raises:
-            NoAvailableKeysError: If no credentials available
+            NoAvailableKeysError: If no credentials available within deadline
         """
+        from ..error_handler import NoAvailableKeysError
+
         # Convert accessor-based exclude to stable_id-based
         exclude_ids = set()
         if exclude:
@@ -312,36 +327,163 @@ class UsageManager:
                 stable_id = self._registry.get_stable_id(accessor, self.provider)
                 priority_overrides[stable_id] = priority
 
-        # Select credential
-        stable_id = self._selection.select(
-            provider=self.provider,
-            model=model,
-            states=states_to_check,
-            quota_group=quota_group,
-            exclude=exclude_ids,
-            priorities=priority_overrides,
-            deadline=deadline,
-        )
+        # Normalize model name for consistent tracking and selection
+        normalized_model = self._normalize_model(model)
 
-        if stable_id is None:
-            from ..error_handler import NoAvailableKeysError
+        # Ensure key conditions exist for all candidates
+        for stable_id in states_to_check:
+            if stable_id not in self._key_conditions:
+                self._key_conditions[stable_id] = asyncio.Condition()
+                self._key_locks[stable_id] = asyncio.Lock()
 
-            raise NoAvailableKeysError(
-                f"No available credentials for {self.provider}/{model}"
+        # Main acquisition loop - continues until deadline
+        while time.time() < deadline:
+            # Try to select a credential
+            stable_id = self._selection.select(
+                provider=self.provider,
+                model=normalized_model,
+                states=states_to_check,
+                quota_group=quota_group,
+                exclude=exclude_ids,
+                priorities=priority_overrides,
+                deadline=deadline,
             )
 
-        state = self._states[stable_id]
+            if stable_id is not None:
+                state = self._states[stable_id]
+                lock = self._key_locks.get(stable_id)
 
-        # Increment active count
-        state.active_requests += 1
+                if lock:
+                    async with lock:
+                        # Double-check availability after acquiring lock
+                        if (
+                            state.max_concurrent is None
+                            or state.active_requests < state.max_concurrent
+                        ):
+                            state.active_requests += 1
+                            lib_logger.debug(
+                                f"Acquired credential {self._mask_accessor(state.accessor)} "
+                                f"for {model} (active: {state.active_requests}"
+                                f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
+                            )
+                            return CredentialContext(
+                                manager=self,
+                                credential=state.accessor,
+                                stable_id=stable_id,
+                                model=normalized_model,
+                                quota_group=quota_group,
+                            )
+                else:
+                    # No lock configured, just increment
+                    state.active_requests += 1
+                    return CredentialContext(
+                        manager=self,
+                        credential=state.accessor,
+                        stable_id=stable_id,
+                        model=normalized_model,
+                        quota_group=quota_group,
+                    )
 
-        return CredentialContext(
-            manager=self,
-            credential=state.accessor,
-            stable_id=stable_id,
-            model=model,
-            quota_group=quota_group,
+            # No credential available - need to wait
+            # Find the best credential to wait for (prefer lowest usage)
+            best_wait_id = None
+            best_usage = float("inf")
+
+            for sid, state in states_to_check.items():
+                if sid in exclude_ids:
+                    continue
+                if (
+                    state.max_concurrent is not None
+                    and state.active_requests >= state.max_concurrent
+                ):
+                    # This one is busy but might become free
+                    usage = state.usage.total_requests
+                    if usage < best_usage:
+                        best_usage = usage
+                        best_wait_id = sid
+
+            if best_wait_id is None:
+                # All credentials blocked by cooldown or limits, not just concurrency
+                # Check if waiting for cooldown makes sense
+                soonest_cooldown = self._get_soonest_cooldown_end(
+                    states_to_check, normalized_model
+                )
+
+                if soonest_cooldown is not None:
+                    remaining_budget = deadline - time.time()
+                    wait_needed = soonest_cooldown - time.time()
+
+                    if wait_needed > remaining_budget:
+                        # No credential will be available in time
+                        lib_logger.warning(
+                            f"All credentials on cooldown. Soonest in {wait_needed:.1f}s, "
+                            f"budget {remaining_budget:.1f}s. Failing fast."
+                        )
+                        break
+
+                    # Wait for cooldown to expire
+                    lib_logger.info(
+                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s..."
+                    )
+                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
+                    continue
+
+                # No cooldowns and no busy keys - truly no keys available
+                break
+
+            # Wait on the best credential's condition
+            condition = self._key_conditions.get(best_wait_id)
+            if condition:
+                lib_logger.debug(
+                    f"All credentials busy. Waiting for {self._mask_accessor(self._states[best_wait_id].accessor)}..."
+                )
+                try:
+                    async with condition:
+                        remaining_budget = deadline - time.time()
+                        if remaining_budget <= 0:
+                            break
+                        # Wait for notification or timeout (max 1 second to re-check)
+                        await asyncio.wait_for(
+                            condition.wait(),
+                            timeout=min(1.0, remaining_budget),
+                        )
+                    lib_logger.debug("Credential released. Re-evaluating...")
+                except asyncio.TimeoutError:
+                    # Timeout is normal, just retry the loop
+                    lib_logger.debug("Wait timed out. Re-evaluating...")
+            else:
+                # No condition, just sleep briefly and retry
+                await asyncio.sleep(0.1)
+
+        # Deadline exceeded
+        raise NoAvailableKeysError(
+            f"Could not acquire a credential for {self.provider}/{model} "
+            f"within the time budget."
         )
+
+    def _get_soonest_cooldown_end(
+        self,
+        states: Dict[str, CredentialState],
+        model: str,
+    ) -> Optional[float]:
+        """Get the soonest cooldown end time across all credentials."""
+        soonest = None
+        now = time.time()
+
+        for state in states.values():
+            # Check model-specific cooldown
+            cooldown = state.get_cooldown(model)
+            if cooldown and cooldown.until > now:
+                if soonest is None or cooldown.until < soonest:
+                    soonest = cooldown.until
+
+            # Check global cooldown
+            global_cooldown = state.get_cooldown()
+            if global_cooldown and global_cooldown.until > now:
+                if soonest is None or global_cooldown.until < soonest:
+                    soonest = global_cooldown.until
+
+        return soonest
 
     async def get_best_credential(
         self,
@@ -371,9 +513,12 @@ class UsageManager:
                 stable_id = self._registry.get_stable_id(accessor, self.provider)
                 exclude_ids.add(stable_id)
 
+        # Normalize model name for consistent selection
+        normalized_model = self._normalize_model(model)
+
         stable_id = self._selection.select(
             provider=self.provider,
-            model=model,
+            model=normalized_model,
             states=self._states,
             quota_group=quota_group,
             exclude=exclude_ids,
@@ -392,6 +537,7 @@ class UsageManager:
         success: bool,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
         error: Optional[ClassifiedError] = None,
         quota_group: Optional[str] = None,
     ) -> None:
@@ -406,6 +552,7 @@ class UsageManager:
             success: Whether request succeeded
             prompt_tokens: Prompt tokens used
             completion_tokens: Completion tokens used
+            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
             error: Classified error if failed
             quota_group: Quota group
         """
@@ -413,7 +560,12 @@ class UsageManager:
 
         if success:
             await self._record_success(
-                stable_id, model, quota_group, prompt_tokens, completion_tokens
+                stable_id,
+                model,
+                quota_group,
+                prompt_tokens,
+                completion_tokens,
+                prompt_tokens_cached,
             )
         else:
             await self._record_failure(stable_id, model, quota_group, error)
@@ -550,6 +702,139 @@ class UsageManager:
         else:
             return "***"
 
+    def _get_provider_plugin_instance(self) -> Optional[Any]:
+        """Get the provider plugin instance for the current provider."""
+        if not self._provider_plugins:
+            return None
+
+        # Provider plugins dict maps provider name -> plugin class or instance
+        plugin = self._provider_plugins.get(self.provider)
+        if plugin is None:
+            return None
+
+        # If it's a class, instantiate it; if already an instance, use directly
+        if isinstance(plugin, type):
+            return plugin()
+        return plugin
+
+    def _normalize_model(self, model: str) -> str:
+        """
+        Normalize model name using provider's mapping.
+
+        Converts internal model names (e.g., claude-sonnet-4-5-thinking) to
+        public-facing names (e.g., claude-sonnet-4.5) for consistent storage
+        and tracking.
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Normalized model name (provider prefix preserved if present)
+        """
+        plugin_instance = self._get_provider_plugin_instance()
+
+        if plugin_instance and hasattr(plugin_instance, "normalize_model_for_tracking"):
+            return plugin_instance.normalize_model_for_tracking(model)
+
+        return model
+
+    def _get_model_quota_group(self, model: str) -> Optional[str]:
+        """
+        Get the quota group for a model, if the provider defines one.
+
+        Models in the same quota group share a single quota pool.
+        For example, all Claude models in Antigravity share the same daily quota.
+
+        Args:
+            model: Model name (with or without provider prefix)
+
+        Returns:
+            Group name (e.g., "claude") or None if not grouped
+        """
+        plugin_instance = self._get_provider_plugin_instance()
+
+        if plugin_instance and hasattr(plugin_instance, "get_model_quota_group"):
+            return plugin_instance.get_model_quota_group(model)
+
+        return None
+
+    def _get_grouped_models(self, group: str) -> List[str]:
+        """
+        Get all model names in a quota group (with provider prefix), normalized.
+
+        Returns only public-facing model names, deduplicated. Internal variants
+        (e.g., claude-sonnet-4-5-thinking) are normalized to their public name
+        (e.g., claude-sonnet-4.5).
+
+        Args:
+            group: Group name (e.g., "claude")
+
+        Returns:
+            List of normalized, deduplicated model names with provider prefix
+            (e.g., ["antigravity/claude-sonnet-4.5", "antigravity/claude-opus-4.5"])
+        """
+        plugin_instance = self._get_provider_plugin_instance()
+
+        if plugin_instance and hasattr(plugin_instance, "get_models_in_quota_group"):
+            models = plugin_instance.get_models_in_quota_group(group)
+
+            # Normalize and deduplicate
+            if hasattr(plugin_instance, "normalize_model_for_tracking"):
+                seen: Set[str] = set()
+                normalized: List[str] = []
+                for m in models:
+                    prefixed = f"{self.provider}/{m}"
+                    norm = plugin_instance.normalize_model_for_tracking(prefixed)
+                    if norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+                return normalized
+
+            # Fallback: just add provider prefix
+            return [f"{self.provider}/{m}" for m in models]
+
+        return []
+
+    async def _sync_quota_group_counts(
+        self,
+        state: CredentialState,
+        model: str,
+    ) -> None:
+        """
+        Synchronize request counts across models in the same quota group.
+
+        For providers with shared quota pools (e.g., Antigravity), all models
+        in a quota group share the same daily limit. When one model's count
+        increases, we sync that count to all other models in the group so
+        selection correctly accounts for the shared quota.
+
+        Args:
+            state: Credential state that was just updated
+            model: The normalized model that was just used
+        """
+        # Check if this model is in a quota group
+        group = self._get_model_quota_group(model)
+        if not group:
+            return
+
+        # Get all models in the group
+        grouped_models = self._get_grouped_models(group)
+        if len(grouped_models) <= 1:
+            return
+
+        # Get the current request count for the used model
+        current_count = state.usage.model_request_counts.get(model, 0)
+
+        # Sync to all other models in the group
+        for grouped_model in grouped_models:
+            if grouped_model != model:
+                state.usage.model_request_counts[grouped_model] = current_count
+
+        lib_logger.debug(
+            f"Synced request_count={current_count} across quota group '{group}' "
+            f"({len(grouped_models)} models)"
+        )
+
     async def save(self, force: bool = False) -> bool:
         """
         Save usage data to file.
@@ -605,7 +890,9 @@ class UsageManager:
             )
             return None
 
-        group_key = quota_group or model
+        # Normalize model name for consistent tracking
+        normalized_model = self._normalize_model(model)
+        group_key = quota_group or normalized_model
 
         # Get or create primary window
         primary_window = None
@@ -693,10 +980,33 @@ class UsageManager:
     # =========================================================================
 
     async def _release_credential(self, stable_id: str, model: str) -> None:
-        """Release a credential after use."""
+        """Release a credential after use and notify waiting tasks."""
         state = self._states.get(stable_id)
-        if state:
-            await self._tracking.release(state, model)
+        if not state:
+            return
+
+        # Decrement active requests
+        lock = self._key_locks.get(stable_id)
+        if lock:
+            async with lock:
+                state.active_requests = max(0, state.active_requests - 1)
+                remaining = state.active_requests
+                lib_logger.debug(
+                    f"Released credential {self._mask_accessor(state.accessor)} "
+                    f"from {model} (remaining: {remaining}"
+                    f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
+                )
+        else:
+            state.active_requests = max(0, state.active_requests - 1)
+
+        # Release in tracking engine
+        await self._tracking.release(state, model)
+
+        # Notify all tasks waiting on this credential's condition
+        condition = self._key_conditions.get(stable_id)
+        if condition:
+            async with condition:
+                condition.notify_all()
 
     async def _record_success(
         self,
@@ -705,17 +1015,26 @@ class UsageManager:
         quota_group: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        prompt_tokens_cached: int = 0,
     ) -> None:
         """Record a successful request."""
         state = self._states.get(stable_id)
         if state:
+            # Normalize model name for consistent tracking
+            normalized_model = self._normalize_model(model)
+
             await self._tracking.record_success(
                 state=state,
-                model=model,
+                model=normalized_model,
                 quota_group=quota_group,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                prompt_tokens_cached=prompt_tokens_cached,
             )
+
+            # Sync request_count across quota group (for shared quota pools)
+            await self._sync_quota_group_counts(state, normalized_model)
+
             if self._storage:
                 self._storage.mark_dirty()
 
@@ -730,6 +1049,9 @@ class UsageManager:
         state = self._states.get(stable_id)
         if not state:
             return
+
+        # Normalize model name for consistent tracking
+        normalized_model = self._normalize_model(model)
 
         # Determine cooldown from error
         cooldown_duration = None
@@ -750,13 +1072,16 @@ class UsageManager:
 
         await self._tracking.record_failure(
             state=state,
-            model=model,
+            model=normalized_model,
             error_type=error.error_type if error else "unknown",
             quota_group=quota_group,
             cooldown_duration=cooldown_duration,
             quota_reset_timestamp=quota_reset,
             mark_exhausted=mark_exhausted,
         )
+
+        # Sync request_count across quota group (for shared quota pools)
+        await self._sync_quota_group_counts(state, normalized_model)
 
         if self._storage:
             self._storage.mark_dirty()
