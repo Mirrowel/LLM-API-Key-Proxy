@@ -25,6 +25,7 @@ from .types import (
     LimitResult,
     FAIR_CYCLE_GLOBAL_KEY,
     TrackingMode,
+    ResetMode,
 )
 from .config import (
     ProviderUsageConfig,
@@ -217,6 +218,8 @@ class UsageManager:
         self._quota_exhausted_summary: Dict[str, Dict[str, float]] = {}
         self._quota_exhausted_task: Optional[asyncio.Task] = None
         self._quota_exhausted_lock = asyncio.Lock()
+        self._save_task: Optional[asyncio.Task] = None
+        self._save_lock = asyncio.Lock()
 
         # Concurrency control: per-credential locks and conditions for waiting
         self._key_locks: Dict[str, asyncio.Lock] = {}
@@ -764,13 +767,46 @@ class UsageManager:
             "credentials": {},
         }
 
+        stats.update(
+            {
+                "active_count": 0,
+                "exhausted_count": 0,
+                "total_requests": 0,
+                "tokens": {
+                    "input_cached": 0,
+                    "input_uncached": 0,
+                    "input_cache_pct": 0,
+                    "output": 0,
+                },
+                "approx_cost": None,
+                "quota_groups": {},
+            }
+        )
+
         for stable_id, state in self._states.items():
+            status = "active"
+            now = time.time()
+            if state.cooldowns:
+                for cooldown in state.cooldowns.values():
+                    if cooldown.until > now:
+                        status = "cooldown"
+                        break
+            if status == "active" and state.fair_cycle:
+                for fc_state in state.fair_cycle.values():
+                    if fc_state.exhausted:
+                        status = "exhausted"
+                        break
+
             cred_stats = {
                 "stable_id": stable_id,
                 "accessor_masked": self._mask_accessor(state.accessor),
+                "full_path": state.accessor,
+                "identifier": self._mask_accessor(state.accessor),
+                "email": state.display_name,
                 "tier": state.tier,
                 "priority": state.priority,
                 "active_requests": state.active_requests,
+                "status": status,
                 "usage": {
                     "total_requests": state.usage.total_requests,
                     "total_successes": state.usage.total_successes,
@@ -785,6 +821,22 @@ class UsageManager:
                 "cooldowns": {},
                 "fair_cycle": {},
             }
+
+            stats["total_requests"] += state.usage.total_requests
+            stats["tokens"]["output"] += state.usage.total_tokens
+            stats["tokens"]["input_cached"] += state.usage.total_prompt_tokens_cached
+            stats["tokens"]["input_uncached"] += (
+                state.usage.total_tokens - state.usage.total_prompt_tokens_cached
+            )
+            if state.usage.total_approx_cost:
+                stats["approx_cost"] = (stats["approx_cost"] or 0.0) + (
+                    state.usage.total_approx_cost
+                )
+
+            if status == "active":
+                stats["active_count"] += 1
+            elif status == "exhausted":
+                stats["exhausted_count"] += 1
 
             # Add window stats
             for window_name, window in state.usage.windows.items():
@@ -830,6 +882,34 @@ class UsageManager:
                         "total_tokens": usage.total_tokens,
                     }
 
+                    group_stats = stats["quota_groups"].setdefault(
+                        group_key,
+                        {
+                            "total_requests_used": 0,
+                            "total_requests_remaining": 0,
+                            "total_requests_max": 0,
+                            "total_remaining_pct": None,
+                            "tiers": {},
+                        },
+                    )
+                    for window in group_windows.values():
+                        if window.get("limit") is not None:
+                            limit = window["limit"]
+                            used = window["request_count"]
+                            remaining = max(0, limit - used)
+                            group_stats["total_requests_used"] += used
+                            group_stats["total_requests_remaining"] += remaining
+                            group_stats["total_requests_max"] += limit
+
+                    tier_key = state.tier or "unknown"
+                    tier_stats = group_stats["tiers"].setdefault(
+                        tier_key,
+                        {"priority": state.priority or 0, "total": 0, "active": 0},
+                    )
+                    tier_stats["total"] += 1
+                    if status == "active":
+                        tier_stats["active"] += 1
+
             # Add active cooldowns
             for key, cooldown in state.cooldowns.items():
                 if cooldown.is_active:
@@ -849,6 +929,24 @@ class UsageManager:
                 }
 
             stats["credentials"][stable_id] = cred_stats
+
+        for group_stats in stats["quota_groups"].values():
+            if group_stats["total_requests_max"] > 0:
+                group_stats["total_remaining_pct"] = round(
+                    group_stats["total_requests_remaining"]
+                    / group_stats["total_requests_max"]
+                    * 100,
+                    1,
+                )
+
+        total_input = (
+            stats["tokens"]["input_cached"] + stats["tokens"]["input_uncached"]
+        )
+        stats["tokens"]["input_cache_pct"] = (
+            round(stats["tokens"]["input_cached"] / total_input * 100, 1)
+            if total_input > 0
+            else 0
+        )
 
         return stats
 
@@ -1048,6 +1146,7 @@ class UsageManager:
     def _backfill_group_usage(self) -> None:
         """Backfill group usage windows and cooldowns from model data."""
         for state in self._states.values():
+            self._backfill_model_usage(state)
             self._backfill_group_usage_for_state(state)
             self._backfill_group_cooldowns(state)
 
@@ -1124,6 +1223,37 @@ class UsageManager:
                     reset_at=reset_at,
                     limit=limit,
                 )
+
+    def _backfill_model_usage(self, state: CredentialState) -> None:
+        if not state.usage.model_request_counts:
+            return
+        primary_def = self._window_manager.get_primary_definition()
+        if not primary_def:
+            return
+        now = time.time()
+        for model, count in state.usage.model_request_counts.items():
+            usage = state.model_usage.setdefault(model, UsageStats())
+            window = usage.windows.get(primary_def.name)
+            if not window:
+                base_time = state.last_updated or state.created_at or now
+                reset_at = None
+                if primary_def:
+                    if primary_def.mode == ResetMode.ROLLING:
+                        reset_at = base_time + primary_def.duration_seconds
+                    else:
+                        reset_at = self._window_manager._calculate_reset_time(
+                            primary_def, base_time
+                        )
+                window = WindowStats(
+                    name=primary_def.name,
+                    request_count=count,
+                    started_at=base_time,
+                    reset_at=reset_at,
+                    limit=None,
+                )
+                usage.windows[primary_def.name] = window
+            elif window.request_count == 0:
+                window.request_count = count
 
     def _backfill_group_cooldowns(self, state: CredentialState) -> None:
         for model, cooldown in list(state.cooldowns.items()):
@@ -1249,6 +1379,10 @@ class UsageManager:
         if quota_used is not None:
             primary_window.request_count = quota_used
             state.usage.model_request_counts[normalized_model] = quota_used
+        else:
+            state.usage.model_request_counts.setdefault(normalized_model, 0)
+            if primary_window.request_count == 0:
+                primary_window.request_count = 0
 
         if group_key != normalized_model:
             group_usage = state.get_usage_for_scope("group", group_key)
@@ -1263,6 +1397,8 @@ class UsageManager:
                 group_window.reset_at = quota_reset_ts
             if quota_used is not None:
                 group_window.request_count = quota_used
+            else:
+                group_window.request_count = group_window.request_count or 0
 
         # Mark state as updated
         state.last_updated = time.time()
@@ -1384,13 +1520,18 @@ class UsageManager:
             async with lock:
                 state.active_requests = max(0, state.active_requests - 1)
                 remaining = state.active_requests
-                lib_logger.debug(
+                lib_logger.info(
                     f"Released credential {self._mask_accessor(state.accessor)} "
-                    f"from {model} (remaining: {remaining}"
+                    f"from {model} (remaining concurrent: {remaining}"
                     f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
                 )
         else:
             state.active_requests = max(0, state.active_requests - 1)
+            lib_logger.info(
+                f"Released credential {self._mask_accessor(state.accessor)} "
+                f"from {model} (remaining concurrent: {state.active_requests}"
+                f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
+            )
 
         # Notify all tasks waiting on this credential's condition
         condition = self._key_conditions.get(stable_id)
@@ -1437,7 +1578,22 @@ class UsageManager:
         if not self._storage:
             return
         fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
-        await self._storage.save(self._states, fair_cycle_global)
+        saved = await self._storage.save(self._states, fair_cycle_global)
+        if not saved:
+            await self._schedule_save_flush()
+
+    async def _schedule_save_flush(self) -> None:
+        if self._save_task and not self._save_task.done():
+            return
+        self._save_task = asyncio.create_task(self._flush_save())
+
+    async def _flush_save(self) -> None:
+        async with self._save_lock:
+            await asyncio.sleep(self._storage.save_debounce_seconds)
+            if not self._storage:
+                return
+            fair_cycle_global = self._limits.fair_cycle_checker.get_global_state_dict()
+            await self._storage.save_if_dirty(self._states, fair_cycle_global)
 
     async def _record_success(
         self,

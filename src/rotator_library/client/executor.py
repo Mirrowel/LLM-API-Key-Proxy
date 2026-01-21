@@ -198,11 +198,31 @@ class RequestExecutor:
                 )
                 break
 
+            availability = usage_manager.get_availability_stats(model, quota_group)
+            blocked = availability.get("blocked_by", {})
+            blocked_parts = []
+            if blocked.get("cooldowns"):
+                blocked_parts.append(f"cd:{blocked['cooldowns']}")
+            if blocked.get("fair_cycle"):
+                blocked_parts.append(f"fc:{blocked['fair_cycle']}")
+            if blocked.get("custom_caps"):
+                blocked_parts.append(f"cap:{blocked['custom_caps']}")
+            if blocked.get("window_limits"):
+                blocked_parts.append(f"wl:{blocked['window_limits']}")
+            if blocked.get("concurrent"):
+                blocked_parts.append(f"con:{blocked['concurrent']}")
+            blocked_str = f"({', '.join(blocked_parts)})" if blocked_parts else ""
+            lib_logger.info(
+                f"Acquiring key for model {model}. Tried keys: {len(retry_state.tried_credentials)}/"
+                f"{availability.get('available', 0)}({availability.get('total', 0)}{blocked_str})"
+            )
+
             # Wait for provider cooldown
             await self._wait_for_cooldown(provider, deadline)
 
             # Acquire credential using context manager
             try:
+                availability = usage_manager.get_availability_stats(model, quota_group)
                 async with await usage_manager.acquire_credential(
                     model=model,
                     quota_group=quota_group,
@@ -212,6 +232,42 @@ class RequestExecutor:
                 ) as cred_context:
                     cred = cred_context.credential
                     retry_state.record_attempt(cred)
+
+                    state = getattr(usage_manager, "states", {}).get(
+                        cred_context.stable_id
+                    )
+                    tier = state.tier if state else None
+                    priority = state.priority if state else None
+                    selection_mode = availability.get("rotation_mode")
+                    quota_display = "?/?"
+                    primary_def = None
+                    if state and getattr(usage_manager, "limits", None):
+                        primary_def = (
+                            usage_manager.limits.windows.get_primary_definition()
+                        )
+                    if state and primary_def:
+                        scope_key = (
+                            quota_group if primary_def.applies_to == "group" else model
+                        )
+                        usage = state.get_usage_for_scope(
+                            primary_def.applies_to, scope_key, create=False
+                        )
+                        if usage:
+                            window = usage.windows.get(primary_def.name)
+                            if window and window.limit is not None:
+                                remaining = max(0, window.limit - window.request_count)
+                                pct = (
+                                    round(remaining / window.limit * 100)
+                                    if window.limit
+                                    else 0
+                                )
+                                quota_display = (
+                                    f"{window.request_count}/{window.limit} [{pct}%]"
+                                )
+                    lib_logger.info(
+                        f"Acquired key {mask_credential(cred)} for model {model} "
+                        f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+                    )
 
                     try:
                         # Apply transforms
@@ -237,6 +293,10 @@ class RequestExecutor:
                         # Execute request with retries
                         for attempt in range(self._max_retries):
                             try:
+                                lib_logger.info(
+                                    f"Attempting call with credential {mask_credential(cred)} "
+                                    f"(Attempt {attempt + 1}/{self._max_retries})"
+                                )
                                 # Pre-request callback
                                 if context.pre_request_callback:
                                     try:
@@ -282,6 +342,10 @@ class RequestExecutor:
                                     prompt_tokens_cached=prompt_tokens_cached,
                                     approx_cost=approx_cost,
                                     response_headers=response_headers,
+                                )
+
+                                lib_logger.info(
+                                    f"Recorded usage from response object for key {mask_credential(cred)}"
                                 )
 
                                 # Log response if transaction logging enabled
@@ -404,6 +468,25 @@ class RequestExecutor:
         last_exception: Optional[Exception] = None
 
         try:
+            availability = usage_manager.get_availability_stats(model, quota_group)
+            blocked = availability.get("blocked_by", {})
+            blocked_parts = []
+            if blocked.get("cooldowns"):
+                blocked_parts.append(f"cd:{blocked['cooldowns']}")
+            if blocked.get("fair_cycle"):
+                blocked_parts.append(f"fc:{blocked['fair_cycle']}")
+            if blocked.get("custom_caps"):
+                blocked_parts.append(f"cap:{blocked['custom_caps']}")
+            if blocked.get("window_limits"):
+                blocked_parts.append(f"wl:{blocked['window_limits']}")
+            if blocked.get("concurrent"):
+                blocked_parts.append(f"con:{blocked['concurrent']}")
+            blocked_str = f"({', '.join(blocked_parts)})" if blocked_parts else ""
+            lib_logger.info(
+                f"Acquiring credential for model {model}. Tried credentials: {len(retry_state.tried_credentials)}/"
+                f"{availability.get('available', 0)}({availability.get('total', 0)}{blocked_str})"
+            )
+
             while time.time() < deadline:
                 # Check for untried credentials
                 untried = [
@@ -423,6 +506,9 @@ class RequestExecutor:
 
                 # Acquire credential using context manager
                 try:
+                    availability = usage_manager.get_availability_stats(
+                        model, quota_group
+                    )
                     async with await usage_manager.acquire_credential(
                         model=model,
                         quota_group=quota_group,
@@ -432,6 +518,44 @@ class RequestExecutor:
                     ) as cred_context:
                         cred = cred_context.credential
                         retry_state.record_attempt(cred)
+
+                        state = getattr(usage_manager, "states", {}).get(
+                            cred_context.stable_id
+                        )
+                        tier = state.tier if state else None
+                        priority = state.priority if state else None
+                        selection_mode = availability.get("rotation_mode")
+                        quota_display = "?/?"
+                        primary_def = None
+                        if state and getattr(usage_manager, "limits", None):
+                            primary_def = (
+                                usage_manager.limits.windows.get_primary_definition()
+                            )
+                        if state and primary_def:
+                            scope_key = (
+                                quota_group
+                                if primary_def.applies_to == "group"
+                                else model
+                            )
+                            usage = state.get_usage_for_scope(
+                                primary_def.applies_to, scope_key, create=False
+                            )
+                            if usage:
+                                window = usage.windows.get(primary_def.name)
+                                if window and window.limit is not None:
+                                    remaining = max(
+                                        0, window.limit - window.request_count
+                                    )
+                                    pct = (
+                                        round(remaining / window.limit * 100)
+                                        if window.limit
+                                        else 0
+                                    )
+                                    quota_display = f"{window.request_count}/{window.limit} [{pct}%]"
+                        lib_logger.info(
+                            f"Acquired key {mask_credential(cred)} for model {model} "
+                            f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+                        )
 
                         try:
                             # Apply transforms
@@ -468,6 +592,10 @@ class RequestExecutor:
                             # Execute request with retries
                             for attempt in range(self._max_retries):
                                 try:
+                                    lib_logger.info(
+                                        f"Attempting stream with credential {mask_credential(cred)} "
+                                        f"(Attempt {attempt + 1}/{self._max_retries})"
+                                    )
                                     # Pre-request callback
                                     if context.pre_request_callback:
                                         try:
@@ -504,6 +632,11 @@ class RequestExecutor:
                                         context.request,
                                         cred_context,
                                         skip_cost_calculation=skip_cost_calculation,
+                                    )
+
+                                    lib_logger.info(
+                                        f"Stream connection established for credential {mask_credential(cred)}. "
+                                        "Processing response."
                                     )
 
                                     # Wrap with transaction logging if enabled

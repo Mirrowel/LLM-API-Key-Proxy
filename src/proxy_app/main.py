@@ -958,7 +958,9 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = client.acompletion(request=request, **request_data)
+            response_generator = await client.acompletion(
+                request=request, **request_data
+            )
             return StreamingResponse(
                 streaming_response_wrapper(
                     request, request_data, response_generator, raw_logger

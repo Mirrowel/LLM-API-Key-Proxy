@@ -292,7 +292,7 @@ class RotatingClient:
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()
 
-    def acompletion(
+    async def acompletion(
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
@@ -343,7 +343,7 @@ class RotatingClient:
             transaction_logger=transaction_logger,
         )
 
-        return self._executor.execute(context)
+        return await self._executor.execute(context)
 
     def aembedding(
         self,
@@ -494,14 +494,62 @@ class RotatingClient:
         Returns:
             Dict with stats per provider
         """
-        result = {}
+        providers = {}
 
         for provider, manager in self._usage_managers.items():
             if provider_filter and provider != provider_filter:
                 continue
-            result[provider] = await manager.get_stats_for_endpoint()
+            providers[provider] = await manager.get_stats_for_endpoint()
 
-        return result
+        summary = {
+            "total_providers": len(providers),
+            "total_credentials": 0,
+            "active_credentials": 0,
+            "exhausted_credentials": 0,
+            "total_requests": 0,
+            "tokens": {
+                "input_cached": 0,
+                "input_uncached": 0,
+                "input_cache_pct": 0,
+                "output": 0,
+            },
+            "approx_total_cost": None,
+        }
+
+        for prov in providers.values():
+            summary["total_credentials"] += prov.get("credential_count", 0)
+            summary["active_credentials"] += prov.get("active_count", 0)
+            summary["exhausted_credentials"] += prov.get("exhausted_count", 0)
+            summary["total_requests"] += prov.get("total_requests", 0)
+            tokens = prov.get("tokens", {})
+            summary["tokens"]["input_cached"] += tokens.get("input_cached", 0)
+            summary["tokens"]["input_uncached"] += tokens.get("input_uncached", 0)
+            summary["tokens"]["output"] += tokens.get("output", 0)
+
+        total_input = (
+            summary["tokens"]["input_cached"] + summary["tokens"]["input_uncached"]
+        )
+        summary["tokens"]["input_cache_pct"] = (
+            round(summary["tokens"]["input_cached"] / total_input * 100, 1)
+            if total_input > 0
+            else 0
+        )
+
+        approx_total_cost = 0.0
+        has_cost = False
+        for prov in providers.values():
+            cost = prov.get("approx_cost")
+            if cost:
+                approx_total_cost += cost
+                has_cost = True
+        summary["approx_total_cost"] = approx_total_cost if has_cost else None
+
+        return {
+            "providers": providers,
+            "summary": summary,
+            "data_source": "cache",
+            "timestamp": time.time(),
+        }
 
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         """Get discovered OAuth credentials."""
