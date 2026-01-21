@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/utilities/gemini_shared_utils.py
 """
 Shared utility functions and constants for Gemini-based providers.

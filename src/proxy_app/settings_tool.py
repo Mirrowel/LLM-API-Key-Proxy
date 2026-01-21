@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mirrowel
+
 """
 Advanced settings configuration tool for the LLM API Key Proxy.
 Provides interactive configuration for custom providers, model definitions, and concurrency limits.

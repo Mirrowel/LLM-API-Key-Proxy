@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/utilities/gemini_tool_handler.py
 """
 Shared tool handling mixin for Gemini-based providers.
