@@ -4,10 +4,14 @@ run-name: Merging branches into dev by @${{ github.actor }}
 on:
   workflow_dispatch:
     inputs:
+      reset_dev:
+        description: 'Reset dev to main before merging (destroys existing dev)'
+        type: boolean
+        default: false
       custom_branches:
         description: 'Branches to merge (comma-separated)'
         type: string
-        required: true
+        required: false
 
 concurrency:
   group: ai-merge-dev
@@ -76,12 +80,20 @@ jobs:
           if [ -z "$branches" ]; then echo "::error::No branches selected"; exit 1; fi
 
       - name: Prepare Dev Branch
+        env:
+          RESET_DEV: ${{ github.event.inputs.reset_dev }}
         run: |
           echo "## AI Multi-Branch Merge" >> $GITHUB_STEP_SUMMARY
           git fetch origin main:main
           if git ls-remote --heads origin dev | grep -q dev; then
-            git checkout dev && git reset --hard origin/main
-            echo "Reset 'dev' to 'main'." >> $GITHUB_STEP_SUMMARY
+            git checkout dev
+            git pull origin dev
+            if [ "$RESET_DEV" = "true" ]; then
+              git reset --hard origin/main
+              echo ":warning: Reset 'dev' to 'main'." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Continuing from existing 'dev' branch." >> $GITHUB_STEP_SUMMARY
+            fi
           else
             git checkout -b dev origin/main
             echo "Created 'dev' from 'main'." >> $GITHUB_STEP_SUMMARY

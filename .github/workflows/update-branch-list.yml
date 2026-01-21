@@ -57,6 +57,10 @@ jobs:
           branches = [b.strip() for b in branches_str.split('\n') if b.strip()]
 
           inputs_lines = []
+          inputs_lines.append("      reset_dev:")
+          inputs_lines.append("        description: 'Reset dev to main before merging (destroys existing dev)'")
+          inputs_lines.append("        type: boolean")
+          inputs_lines.append("        default: false")
           for branch in branches:
               input_name = re.sub(r'[^a-zA-Z0-9]', '_', branch)
               inputs_lines.append(f"      branch_{input_name}:")
@@ -146,12 +150,20 @@ jobs:
                     if [ -z "$branches" ]; then echo "::error::No branches selected"; exit 1; fi
 
                 - name: Prepare Dev Branch
+                  env:
+                    RESET_DEV: {gha(" github.event.inputs.reset_dev ")}
                   run: |
                     echo "## AI Multi-Branch Merge" >> $GITHUB_STEP_SUMMARY
                     git fetch origin main:main
                     if git ls-remote --heads origin dev | grep -q dev; then
-                      git checkout dev && git reset --hard origin/main
-                      echo "Reset 'dev' to 'main'." >> $GITHUB_STEP_SUMMARY
+                      git checkout dev
+                      git pull origin dev
+                      if [ "$RESET_DEV" = "true" ]; then
+                        git reset --hard origin/main
+                        echo ":warning: Reset 'dev' to 'main'." >> $GITHUB_STEP_SUMMARY
+                      else
+                        echo "Continuing from existing 'dev' branch." >> $GITHUB_STEP_SUMMARY
+                      fi
                     else
                       git checkout -b dev origin/main
                       echo "Created 'dev' from 'main'." >> $GITHUB_STEP_SUMMARY
