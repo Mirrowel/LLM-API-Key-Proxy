@@ -45,7 +45,7 @@ env:
   FILE_DESCRIPTIONS: |
     proxy_app.exe|Main application executable with built-in TUI launcher for **Windows**.
     proxy_app|Main application executable with built-in TUI launcher for **Linux** and **macOS**.
-    .env.example|Example configuration file. Copy to `.env` and add your API keys.
+    .env.example|Example configuration file. Copy to .env and add your API keys.
     README.md|Project overview and quick start guide.
     DOCUMENTATION.md|Detailed configuration and usage documentation.
     LICENSE|License.
