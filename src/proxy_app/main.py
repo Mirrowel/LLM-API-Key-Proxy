@@ -1005,8 +1005,8 @@ async def chat_completions(
                 request_data = await request.json()
             except json.JSONDecodeError:
                 request_data = {"error": "Could not parse request body"}
-            if logger:
-                logger.log_final_response(
+            if raw_logger:
+                raw_logger.log_final_response(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
         raise HTTPException(status_code=500, detail=str(e))
