@@ -1486,6 +1486,67 @@ async def refresh_quota_stats(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/force-credential")
+async def force_credential(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """
+    Force the proxy to use a specific credential for all requests.
+    
+    This overrides the normal rotation logic and always selects the specified
+    credential (if available and not on cooldown). Used by the TUI for manual
+    credential selection.
+    
+    Request body:
+        {
+            "credential": "path/to/credential.json" | null,
+            "provider": "antigravity"  // optional, for display/logging only
+        }
+    
+    Set credential to null to clear the override and resume normal rotation.
+    
+    Returns:
+        {
+            "status": "forced" | "cleared",
+            "credential": "path/to/credential.json" | null,
+            "message": "..."
+        }
+    """
+    try:
+        data = await request.json()
+        credential = data.get("credential")
+        provider = data.get("provider", "unknown")
+        
+        # Set or clear forced credential
+        await client.usage_manager.set_forced_credential(credential)
+        
+        if credential:
+            # Extract a friendly display name from the credential path
+            if "/" in credential or "\\" in credential:
+                display_name = credential.split("/")[-1].split("\\")[-1]
+            else:
+                display_name = credential
+            
+            return {
+                "status": "forced",
+                "credential": credential,
+                "provider": provider,
+                "message": f"Now forcing credential: {display_name}"
+            }
+        else:
+            return {
+                "status": "cleared",
+                "credential": None,
+                "message": "Forced credential cleared. Resuming normal rotation."
+            }
+    
+    except Exception as e:
+        logging.error(f"Failed to set forced credential: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/token-count")
 async def token_count(
     request: Request,
