@@ -83,7 +83,6 @@ class TrackingEngine:
             now = time.time()
             group_key = quota_group or model
             fair_cycle_key = self._resolve_fair_cycle_key(group_key)
-            fair_cycle_key = self._resolve_fair_cycle_key(group_key)
 
             # Update usage stats
             usage = state.usage
@@ -191,6 +190,7 @@ class TrackingEngine:
         async with self._lock:
             now = time.time()
             group_key = quota_group or model
+            fair_cycle_key = self._resolve_fair_cycle_key(group_key)
 
             # Update failure stats
             state.usage.total_requests += request_count

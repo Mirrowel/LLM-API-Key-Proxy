@@ -16,6 +16,7 @@ with all complexity moved to specialized modules.
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -55,7 +56,7 @@ from ..failure_logger import configure_failure_logger
 
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
-from ..usage.config import load_provider_usage_config
+from ..usage.config import load_provider_usage_config, WindowDefinition
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -147,6 +148,7 @@ class RotatingClient:
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
         self.litellm_provider_params = litellm_provider_params or {}
+        self._litellm_logger_fn = self._litellm_logger_callback
         self.enable_request_logging = enable_request_logging
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
 
@@ -207,6 +209,8 @@ class RotatingClient:
             # Override tolerance from constructor param
             config.rotation_tolerance = rotation_tolerance
 
+            self._apply_usage_reset_config(provider, credentials, config)
+
             usage_file = self._usage_base_path / f"usage_{provider}.json"
 
             # Get max concurrent for this provider
@@ -232,6 +236,8 @@ class RotatingClient:
             max_retries=max_retries,
             global_timeout=global_timeout,
             abort_on_callback_error=abort_on_callback_error,
+            litellm_provider_params=self.litellm_provider_params,
+            litellm_logger_fn=self._litellm_logger_fn,
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
@@ -526,3 +532,108 @@ class RotatingClient:
     def usage_managers(self) -> Dict[str, NewUsageManager]:
         """Get all new usage managers."""
         return self._usage_managers
+
+    def _apply_usage_reset_config(
+        self,
+        provider: str,
+        credentials: List[str],
+        config: Any,
+    ) -> None:
+        """Apply provider-specific usage reset config to window definitions."""
+        if not credentials:
+            return
+
+        plugin = self._get_provider_instance(provider)
+        if not plugin or not hasattr(plugin, "get_usage_reset_config"):
+            return
+
+        try:
+            reset_config = plugin.get_usage_reset_config(credentials[0])
+        except Exception as exc:
+            lib_logger.debug(f"Failed to load usage reset config for {provider}: {exc}")
+            return
+
+        if not reset_config:
+            return
+
+        window_seconds = reset_config.get("window_seconds")
+        if not window_seconds:
+            return
+
+        mode = reset_config.get("mode", "credential")
+        applies_to = "credential" if mode == "credential" else "model"
+
+        if window_seconds == 86400:
+            window_name = "daily"
+        elif window_seconds % 3600 == 0:
+            window_name = f"{window_seconds // 3600}h"
+        else:
+            window_name = "window"
+
+        config.windows = [
+            WindowDefinition.rolling(
+                name=window_name,
+                duration_seconds=int(window_seconds),
+                is_primary=True,
+                applies_to=applies_to,
+            ),
+            WindowDefinition.total(name="total", applies_to=applies_to),
+        ]
+
+    def _sanitize_litellm_log(self, log_data: dict) -> dict:
+        """Remove large/sensitive fields from LiteLLM logs."""
+        if not isinstance(log_data, dict):
+            return log_data
+
+        keys_to_pop = [
+            "messages",
+            "input",
+            "response",
+            "data",
+            "api_key",
+            "api_base",
+            "original_response",
+            "additional_args",
+        ]
+        nested_keys = ["kwargs", "litellm_params", "model_info", "proxy_server_request"]
+
+        clean_data = json.loads(json.dumps(log_data, default=str))
+
+        def clean_recursively(data_dict: dict) -> None:
+            for key in keys_to_pop:
+                data_dict.pop(key, None)
+            for key in nested_keys:
+                if key in data_dict and isinstance(data_dict[key], dict):
+                    clean_recursively(data_dict[key])
+            for value in list(data_dict.values()):
+                if isinstance(value, dict):
+                    clean_recursively(value)
+
+        clean_recursively(clean_data)
+        return clean_data
+
+    def _litellm_logger_callback(self, log_data: dict) -> None:
+        """Redirect LiteLLM logs into rotator library logger."""
+        log_event_type = log_data.get("log_event_type")
+        if log_event_type in ["pre_api_call", "post_api_call"]:
+            return
+
+        if not log_data.get("exception"):
+            sanitized_log = self._sanitize_litellm_log(log_data)
+            lib_logger.debug(f"LiteLLM Log: {sanitized_log}")
+            return
+
+        model = log_data.get("model", "N/A")
+        error_info = log_data.get("standard_logging_object", {}).get(
+            "error_information", {}
+        )
+        error_class = error_info.get("error_class", "UnknownError")
+        error_message = error_info.get(
+            "error_message", str(log_data.get("exception", ""))
+        )
+        error_message = " ".join(error_message.split())
+
+        lib_logger.debug(
+            f"LiteLLM Callback Handled Error: Model={model} | "
+            f"Type={error_class} | Message='{error_message}'"
+        )

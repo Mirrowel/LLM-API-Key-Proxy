@@ -74,6 +74,7 @@ class CredentialContext:
         self._acquired_at = time.time()
         self._result: Optional[Literal["success", "failure"]] = None
         self._response: Optional[Any] = None
+        self._response_headers: Optional[Dict[str, Any]] = None
         self._error: Optional[ClassifiedError] = None
         self._tokens: Dict[str, int] = {}
         self._approx_cost: float = 0.0
@@ -105,6 +106,7 @@ class CredentialContext:
             quota_group=self.quota_group,
             success=success,
             response=response,
+            response_headers=self._response_headers,
             error=error,
             prompt_tokens=self._tokens.get("prompt", 0),
             completion_tokens=self._tokens.get("completion", 0),
@@ -121,10 +123,12 @@ class CredentialContext:
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
         approx_cost: float = 0.0,
+        response_headers: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mark request as successful."""
         self._result = "success"
         self._response = response
+        self._response_headers = response_headers
         self._tokens = {
             "prompt": prompt_tokens,
             "completion": completion_tokens,
@@ -417,9 +421,9 @@ class UsageManager:
             if best_wait_id is None:
                 # All credentials blocked by cooldown or limits, not just concurrency
                 # Check if waiting for cooldown makes sense
-                    soonest_cooldown = self._get_soonest_cooldown_end(
-                        states_to_check, normalized_model, quota_group
-                    )
+                soonest_cooldown = self._get_soonest_cooldown_end(
+                    states_to_check, normalized_model, quota_group
+                )
 
                 if soonest_cooldown is not None:
                     remaining_budget = deadline - time.time()
@@ -593,6 +597,7 @@ class UsageManager:
         quota_group: Optional[str],
         success: bool,
         response: Optional[Any],
+        response_headers: Optional[Dict[str, Any]],
         error: Optional[ClassifiedError],
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
@@ -663,6 +668,7 @@ class UsageManager:
                 completion_tokens,
                 prompt_tokens_cached,
                 approx_cost,
+                response_headers=response_headers,
                 request_count=request_count,
             )
         else:
@@ -1231,6 +1237,7 @@ class UsageManager:
         completion_tokens: int = 0,
         prompt_tokens_cached: int = 0,
         approx_cost: float = 0.0,
+        response_headers: Optional[Dict[str, Any]] = None,
         request_count: int = 1,
     ) -> None:
         """Record a successful request."""
@@ -1247,6 +1254,7 @@ class UsageManager:
                 completion_tokens=completion_tokens,
                 prompt_tokens_cached=prompt_tokens_cached,
                 approx_cost=approx_cost,
+                response_headers=response_headers,
                 request_count=request_count,
             )
 

@@ -43,6 +43,7 @@ from ..core.errors import (
 from ..core.constants import DEFAULT_MAX_RETRIES
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
+from ..failure_logger import log_failure
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
@@ -77,6 +78,8 @@ class RequestExecutor:
         max_retries: int = DEFAULT_MAX_RETRIES,
         global_timeout: int = 30,
         abort_on_callback_error: bool = True,
+        litellm_provider_params: Optional[Dict[str, Any]] = None,
+        litellm_logger_fn: Optional[Any] = None,
     ):
         """
         Initialize RequestExecutor.
@@ -102,6 +105,8 @@ class RequestExecutor:
         self._max_retries = max_retries
         self._global_timeout = global_timeout
         self._abort_on_callback_error = abort_on_callback_error
+        self._litellm_provider_params = litellm_provider_params or {}
+        self._litellm_logger_fn = litellm_logger_fn
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
 
@@ -177,6 +182,9 @@ class RequestExecutor:
         error_accumulator = RequestErrorAccumulator()
         error_accumulator.model = model
         error_accumulator.provider = provider
+        request_headers = (
+            dict(context.request.headers) if context.request is not None else {}
+        )
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
@@ -195,7 +203,7 @@ class RequestExecutor:
 
             # Acquire credential using context manager
             try:
-                async with usage_manager.acquire_credential(
+                async with await usage_manager.acquire_credential(
                     model=model,
                     quota_group=quota_group,
                     candidates=untried,
@@ -214,12 +222,15 @@ class RequestExecutor:
                         # Sanitize request payload
                         kwargs = sanitize_request_payload(kwargs, model)
 
+                        # Apply provider-specific LiteLLM params
+                        self._apply_litellm_provider_params(provider, kwargs)
+
                         # Get provider plugin
                         plugin = self._get_plugin_instance(provider)
 
                         # Add transaction context for provider logging
                         if context.transaction_logger:
-                            kwargs["_transaction_context"] = (
+                            kwargs["transaction_context"] = (
                                 context.transaction_logger.get_context()
                             )
 
@@ -248,6 +259,7 @@ class RequestExecutor:
                                 else:
                                     # Standard LiteLLM call
                                     kwargs["api_key"] = cred
+                                    self._apply_litellm_logger(kwargs)
                                     response = await litellm.acompletion(**kwargs)
 
                                 # Success! Extract token usage if available
@@ -259,6 +271,9 @@ class RequestExecutor:
                                 approx_cost = self._calculate_cost(
                                     provider, model, response
                                 )
+                                response_headers = self._extract_response_headers(
+                                    response
+                                )
 
                                 cred_context.mark_success(
                                     response=response,
@@ -266,6 +281,7 @@ class RequestExecutor:
                                     completion_tokens=completion_tokens,
                                     prompt_tokens_cached=prompt_tokens_cached,
                                     approx_cost=approx_cost,
+                                    response_headers=response_headers,
                                 )
 
                                 # Log response if transaction logging enabled
@@ -296,6 +312,7 @@ class RequestExecutor:
                                     attempt,
                                     error_accumulator,
                                     retry_state,
+                                    request_headers,
                                 )
 
                                 if action == ErrorAction.RETRY_SAME:
@@ -359,6 +376,14 @@ class RequestExecutor:
             context.credentials, model, provider
         )
         credentials = filter_result.all_usable
+        quota_group = usage_manager.get_model_quota_group(model)
+
+        await self._ensure_initialized(usage_manager, context, filter_result)
+        await self._validate_request(provider, model, context.kwargs)
+
+        request_headers = (
+            dict(context.request.headers) if context.request is not None else {}
+        )
 
         if not credentials:
             error_data = {
@@ -398,7 +423,7 @@ class RequestExecutor:
 
                 # Acquire credential using context manager
                 try:
-                    async with usage_manager.acquire_credential(
+                    async with await usage_manager.acquire_credential(
                         model=model,
                         quota_group=quota_group,
                         candidates=untried,
@@ -417,6 +442,9 @@ class RequestExecutor:
                             # Sanitize request payload
                             kwargs = sanitize_request_payload(kwargs, model)
 
+                            # Apply provider-specific LiteLLM params
+                            self._apply_litellm_provider_params(provider, kwargs)
+
                             # Add stream options (but not for iflow - it returns 406)
                             if provider != "iflow":
                                 if "stream_options" not in kwargs:
@@ -433,7 +461,7 @@ class RequestExecutor:
 
                             # Add transaction context for provider logging
                             if context.transaction_logger:
-                                kwargs["_transaction_context"] = (
+                                kwargs["transaction_context"] = (
                                     context.transaction_logger.get_context()
                                 )
 
@@ -464,6 +492,7 @@ class RequestExecutor:
                                     else:
                                         kwargs["api_key"] = cred
                                         kwargs["stream"] = True
+                                        self._apply_litellm_logger(kwargs)
                                         stream = await litellm.acompletion(**kwargs)
 
                                     # Hand off to streaming handler with cred_context
@@ -496,6 +525,13 @@ class RequestExecutor:
                                     last_exception = e
                                     original = getattr(e, "data", e)
                                     classified = classify_error(original, provider)
+                                    log_failure(
+                                        api_key=cred,
+                                        model=model,
+                                        attempt=attempt + 1,
+                                        error=e,
+                                        request_headers=request_headers,
+                                    )
                                     error_accumulator.record_error(
                                         cred, classified, str(original)[:150]
                                     )
@@ -531,6 +567,13 @@ class RequestExecutor:
                                 except (RateLimitError, httpx.HTTPStatusError) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    log_failure(
+                                        api_key=cred,
+                                        model=model,
+                                        attempt=attempt + 1,
+                                        error=e,
+                                        request_headers=request_headers,
+                                    )
                                     error_accumulator.record_error(
                                         cred, classified, str(e)[:150]
                                     )
@@ -570,6 +613,13 @@ class RequestExecutor:
                                 ) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    log_failure(
+                                        api_key=cred,
+                                        model=model,
+                                        attempt=attempt + 1,
+                                        error=e,
+                                        request_headers=request_headers,
+                                    )
 
                                     if attempt >= self._max_retries - 1:
                                         error_accumulator.record_error(
@@ -592,6 +642,13 @@ class RequestExecutor:
                                 except Exception as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    log_failure(
+                                        api_key=cred,
+                                        model=model,
+                                        attempt=attempt + 1,
+                                        error=e,
+                                        request_headers=request_headers,
+                                    )
                                     error_accumulator.record_error(
                                         cred, classified, str(e)[:150]
                                     )
@@ -630,6 +687,34 @@ class RequestExecutor:
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
 
+    def _apply_litellm_provider_params(
+        self, provider: str, kwargs: Dict[str, Any]
+    ) -> None:
+        """Merge provider-specific LiteLLM parameters into request kwargs."""
+        params = self._litellm_provider_params.get(provider)
+        if not params:
+            return
+        kwargs["litellm_params"] = {
+            **params,
+            **kwargs.get("litellm_params", {}),
+        }
+
+    def _apply_litellm_logger(self, kwargs: Dict[str, Any]) -> None:
+        """Attach LiteLLM logger callback if configured."""
+        if self._litellm_logger_fn and "logger_fn" not in kwargs:
+            kwargs["logger_fn"] = self._litellm_logger_fn
+
+    def _extract_response_headers(self, response: Any) -> Optional[Dict[str, Any]]:
+        """Extract response headers from LiteLLM response objects."""
+        if hasattr(response, "response") and response.response is not None:
+            headers = getattr(response.response, "headers", None)
+            if headers is not None:
+                return dict(headers)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            return dict(headers)
+        return None
+
     async def _wait_for_cooldown(
         self,
         provider: str,
@@ -665,6 +750,7 @@ class RequestExecutor:
         attempt: int,
         error_accumulator: RequestErrorAccumulator,
         retry_state: RetryState,
+        request_headers: Dict[str, Any],
     ) -> str:
         """
         Handle an error and determine next action.
@@ -684,6 +770,14 @@ class RequestExecutor:
         classified = classify_error(error, provider)
         error_message = str(error)[:150]
         credential = cred_context.credential
+
+        log_failure(
+            api_key=credential,
+            model=model,
+            attempt=attempt + 1,
+            error=error,
+            request_headers=request_headers,
+        )
 
         # Check for quota errors
         if classified.error_type == "quota_exceeded":
