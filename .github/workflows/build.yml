@@ -98,7 +98,6 @@ on:
     # │ BRANCHES: Update this list to match BUILD_BRANCHES in the env section above        │
     # └─────────────────────────────────────────────────────────────────────────────────────┘
     branches:
-      - dev
       - main
     # ┌─────────────────────────────────────────────────────────────────────────────────────┐
     # │ PATHS: Files/directories that trigger a build when changed                         │

@@ -10,7 +10,7 @@ on:
         required: false
         default: ''
   push:
-    branches: ["main", "dev"]
+    branches: ["main"]
     paths:
       - "src/proxy_app/**"
       - "src/rotator_library/**"
