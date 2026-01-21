@@ -155,6 +155,7 @@ class UsageManager:
         file_path: Optional[Union[str, Path]] = None,
         provider_plugins: Optional[Dict[str, Any]] = None,
         config: Optional[ProviderUsageConfig] = None,
+        max_concurrent_per_key: Optional[int] = None,
     ):
         """
         Initialize UsageManager.
@@ -164,9 +165,11 @@ class UsageManager:
             file_path: Path to usage.json file
             provider_plugins: Dict of provider plugin classes
             config: Optional pre-built configuration
+            max_concurrent_per_key: Max concurrent requests per credential
         """
         self.provider = provider
         self._provider_plugins = provider_plugins or {}
+        self._max_concurrent_per_key = max_concurrent_per_key
 
         # Load configuration
         if config:
@@ -234,6 +237,15 @@ class UsageManager:
                     self._states[stable_id].priority = priorities[accessor]
                 if tiers and accessor in tiers:
                     self._states[stable_id].tier = tiers[accessor]
+
+                # Set max concurrent if configured, applying priority multiplier
+                if self._max_concurrent_per_key is not None:
+                    base_concurrent = self._max_concurrent_per_key
+                    # Apply priority multiplier from config
+                    priority = self._states[stable_id].priority
+                    multiplier = self._config.get_effective_multiplier(priority)
+                    effective_concurrent = base_concurrent * multiplier
+                    self._states[stable_id].max_concurrent = effective_concurrent
 
             self._initialized = True
             lib_logger.info(
@@ -558,6 +570,89 @@ class UsageManager:
     async def shutdown(self) -> None:
         """Shutdown and save any pending data."""
         await self.save(force=True)
+
+    async def update_quota_baseline(
+        self,
+        accessor: str,
+        model: str,
+        quota_max_requests: Optional[int] = None,
+        quota_reset_ts: Optional[float] = None,
+        quota_used: Optional[int] = None,
+        quota_group: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Update quota baseline from provider API response.
+
+        Called by provider plugins after receiving rate limit headers or
+        quota information from API responses.
+
+        Args:
+            accessor: Credential accessor (path or key)
+            model: Model name
+            quota_max_requests: Max requests allowed in window
+            quota_reset_ts: When quota resets (Unix timestamp)
+            quota_used: Current used count from API
+            quota_group: Optional quota group (uses model if None)
+
+        Returns:
+            Cooldown info dict if cooldown was applied, None otherwise
+        """
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state:
+            lib_logger.warning(
+                f"update_quota_baseline: Unknown credential {accessor[:20]}..."
+            )
+            return None
+
+        group_key = quota_group or model
+
+        # Get or create primary window
+        primary_window = None
+        for window in state.usage.windows.values():
+            primary_window = window
+            break
+
+        if primary_window is None:
+            # Create a window if none exists
+            from .types import WindowStats
+
+            primary_window = WindowStats(name="api_quota")
+            state.usage.windows["api_quota"] = primary_window
+
+        # Update baseline values
+        if quota_max_requests is not None:
+            primary_window.limit = quota_max_requests
+        if quota_reset_ts is not None:
+            primary_window.reset_at = quota_reset_ts
+        if quota_used is not None:
+            primary_window.request_count = quota_used
+
+        # Mark state as updated
+        state.last_updated = time.time()
+
+        # Check if we need to apply cooldown (quota exhausted)
+        if primary_window.is_exhausted and quota_reset_ts:
+            await self._tracking.apply_cooldown(
+                state=state,
+                reason="quota_exhausted",
+                until=quota_reset_ts,
+                model_or_group=group_key,
+                source="api_quota",
+            )
+
+            lib_logger.info(
+                f"Quota exhausted for {self._mask_accessor(accessor)}/{model}, "
+                f"cooldown until {quota_reset_ts}"
+            )
+
+            return {
+                "cooldown_until": quota_reset_ts,
+                "reason": "quota_exhausted",
+                "model": model,
+            }
+
+        return None
 
     # =========================================================================
     # PROPERTIES

@@ -77,75 +77,110 @@ class StreamingHandler:
         """
         last_usage = None
         stream_completed = False
-        json_buffer = ""
+        error_buffer = StreamBuffer()  # Use StreamBuffer for JSON reassembly
         accumulated_finish_reason: Optional[str] = None
         has_tool_calls = False
         prompt_tokens = 0
         completion_tokens = 0
 
+        # Use manual iteration to allow continue after partial JSON errors
+        stream_iterator = stream.__aiter__()
+
         try:
-            async for chunk in stream:
-                # Check client disconnect
-                if request and await request.is_disconnected():
-                    lib_logger.info(
-                        f"Client disconnected. Aborting stream for model {model}."
+            while True:
+                try:
+                    # Check client disconnect before waiting for next chunk
+                    if request and await request.is_disconnected():
+                        lib_logger.info(
+                            f"Client disconnected. Aborting stream for model {model}."
+                        )
+                        break
+
+                    chunk = await stream_iterator.__anext__()
+
+                    # Clear error buffer on successful chunk receipt
+                    error_buffer.reset()
+
+                    # Process chunk
+                    processed = self._process_chunk(
+                        chunk,
+                        accumulated_finish_reason,
+                        has_tool_calls,
                     )
+
+                    # Update tracking state
+                    if processed.has_tool_calls:
+                        has_tool_calls = True
+                        accumulated_finish_reason = "tool_calls"
+                    if processed.finish_reason and not has_tool_calls:
+                        # Only update if not already tool_calls (highest priority)
+                        accumulated_finish_reason = processed.finish_reason
+                    if processed.usage:
+                        last_usage = processed.usage
+                        # Extract token counts
+                        if isinstance(processed.usage, dict):
+                            prompt_tokens = processed.usage.get("prompt_tokens", 0)
+                            completion_tokens = processed.usage.get(
+                                "completion_tokens", 0
+                            )
+
+                    yield processed.sse_string
+
+                except StopAsyncIteration:
+                    # Stream ended normally
+                    stream_completed = True
                     break
 
-                # Clear buffer on successful chunk receipt
-                if json_buffer:
-                    lib_logger.warning(
-                        f"Discarding incomplete JSON buffer: {json_buffer[:100]}..."
-                    )
-                    json_buffer = ""
+                except CredentialNeedsReauthError as e:
+                    # Credential needs re-auth - wrap for outer retry loop
+                    if cred_context:
+                        from ..error_handler import classify_error
 
-                # Process chunk
-                processed = self._process_chunk(
-                    chunk,
-                    accumulated_finish_reason,
-                    has_tool_calls,
-                )
+                        cred_context.mark_failure(classify_error(e))
+                    raise StreamedAPIError("Credential needs re-authentication", data=e)
 
-                # Update tracking state
-                if processed.has_tool_calls:
-                    has_tool_calls = True
-                    accumulated_finish_reason = "tool_calls"
-                if processed.finish_reason and not has_tool_calls:
-                    # Only update if not already tool_calls (highest priority)
-                    accumulated_finish_reason = processed.finish_reason
-                if processed.usage:
-                    last_usage = processed.usage
-                    # Extract token counts
-                    if isinstance(processed.usage, dict):
-                        prompt_tokens = processed.usage.get("prompt_tokens", 0)
-                        completion_tokens = processed.usage.get("completion_tokens", 0)
+                except json.JSONDecodeError as e:
+                    # Partial JSON - accumulate and continue
+                    error_buffer.append(str(e))
+                    if error_buffer.is_complete:
+                        # We have complete JSON now
+                        raise StreamedAPIError(
+                            "Provider error", data=error_buffer.content
+                        )
+                    # Continue waiting for more chunks
+                    continue
 
-                yield processed.sse_string
+                except Exception as e:
+                    # Try to extract JSON from fragmented response
+                    error_str = str(e)
+                    error_buffer.append(error_str)
 
-            stream_completed = True
+                    # Check if buffer now has complete JSON
+                    if error_buffer.is_complete:
+                        if cred_context:
+                            from ..error_handler import classify_error
 
-        except CredentialNeedsReauthError as e:
-            # Credential needs re-auth but re-auth is already queued
-            # Wrap for outer retry loop to handle
-            if cred_context:
-                from ..error_handler import classify_error
+                            cred_context.mark_failure(classify_error(e))
+                        raise StreamedAPIError(
+                            "Provider error in stream", data=error_buffer.content
+                        )
 
-                cred_context.mark_failure(classify_error(e))
-            raise StreamedAPIError("Credential needs re-authentication", data=e)
+                    # Try pattern matching for error extraction
+                    extracted = self._try_extract_error(e, error_buffer.content)
+                    if extracted:
+                        if cred_context:
+                            from ..error_handler import classify_error
+
+                            cred_context.mark_failure(classify_error(e))
+                        raise StreamedAPIError(
+                            "Provider error in stream", data=extracted
+                        )
+
+                    # Not a JSON-related error, re-raise
+                    raise
 
         except StreamedAPIError:
             # Re-raise for retry loop
-            raise
-
-        except Exception as e:
-            # Try to extract JSON from fragmented response
-            extracted = self._try_extract_error(e, json_buffer)
-            if extracted:
-                if cred_context:
-                    from ..error_handler import classify_error
-
-                    cred_context.mark_failure(classify_error(e))
-                raise StreamedAPIError("Provider error in stream", data=extracted)
             raise
 
         finally:
@@ -163,6 +198,9 @@ class StreamingHandler:
                         await self._record_usage(credential, model, last_usage)
                     else:
                         await self._usage.record_success(credential, model)
+
+                # Yield [DONE] for completed streams
+                yield "data: [DONE]\n\n"
 
     def _process_chunk(
         self,

@@ -209,11 +209,15 @@ class RotatingClient:
 
             usage_file = self._usage_base_path / f"usage_{provider}.json"
 
+            # Get max concurrent for this provider
+            max_concurrent = self.max_concurrent_requests_per_key.get(provider)
+
             manager = NewUsageManager(
                 provider=provider,
                 file_path=usage_file,
                 provider_plugins=PROVIDER_PLUGINS,
                 config=config,
+                max_concurrent_per_key=max_concurrent,
             )
             self._usage_managers[provider] = manager
 
@@ -274,6 +278,16 @@ class RotatingClient:
         resolved_model = self._model_resolver.resolve_model_id(model, provider)
         kwargs["model"] = resolved_model
 
+        # Create transaction logger if enabled
+        transaction_logger = None
+        if self.enable_request_logging:
+            transaction_logger = TransactionLogger(
+                provider=provider,
+                model=resolved_model,
+                enabled=True,
+            )
+            transaction_logger.log_request(kwargs)
+
         # Build request context
         context = RequestContext(
             model=resolved_model,
@@ -284,6 +298,7 @@ class RotatingClient:
             deadline=time.time() + self.global_timeout,
             request=request,
             pre_request_callback=pre_request_callback,
+            transaction_logger=transaction_logger,
         )
 
         return self._executor.execute(context)

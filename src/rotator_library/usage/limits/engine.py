@@ -15,6 +15,7 @@ from ..types import CredentialState, LimitCheckResult, LimitResult
 from ..config import ProviderUsageConfig
 from ..tracking.windows import WindowManager
 from .base import LimitChecker
+from .concurrent import ConcurrentLimitChecker
 from .window_limits import WindowLimitChecker
 from .cooldowns import CooldownChecker
 from .fair_cycle import FairCycleChecker
@@ -47,7 +48,9 @@ class LimitEngine:
         self._window_manager = window_manager
 
         # Initialize all limit checkers
+        # Order matters: concurrent first (fast check), then others
         self._checkers: List[LimitChecker] = [
+            ConcurrentLimitChecker(),
             CooldownChecker(),
             WindowLimitChecker(window_manager),
             CustomCapChecker(config.custom_caps, window_manager),
@@ -55,10 +58,11 @@ class LimitEngine:
         ]
 
         # Quick access to specific checkers
-        self._cooldown_checker = self._checkers[0]
-        self._window_checker = self._checkers[1]
-        self._custom_cap_checker = self._checkers[2]
-        self._fair_cycle_checker = self._checkers[3]
+        self._concurrent_checker = self._checkers[0]
+        self._cooldown_checker = self._checkers[1]
+        self._window_checker = self._checkers[2]
+        self._custom_cap_checker = self._checkers[3]
+        self._fair_cycle_checker = self._checkers[4]
 
     def check_all(
         self,
@@ -181,6 +185,11 @@ class LimitEngine:
         """
         for checker in self._checkers:
             checker.reset(state, model, quota_group)
+
+    @property
+    def concurrent_checker(self) -> ConcurrentLimitChecker:
+        """Get the concurrent limit checker."""
+        return self._concurrent_checker
 
     @property
     def cooldown_checker(self) -> CooldownChecker:

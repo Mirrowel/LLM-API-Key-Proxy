@@ -160,8 +160,16 @@ class CustomCapChecker(LimitChecker):
         cap: CustomCapConfig,
         window_limit: Optional[int],
     ) -> int:
-        """Resolve max requests, handling percentage values."""
+        """
+        Resolve max requests, handling percentage values.
+
+        Custom caps can only be MORE restrictive than API limits,
+        so the result is clamped to window_limit if available.
+        """
         if cap.max_requests >= 0:
+            # Absolute value - clamp to window limit if known
+            if window_limit is not None:
+                return min(cap.max_requests, window_limit)
             return cap.max_requests
 
         # Negative value indicates percentage
@@ -170,7 +178,9 @@ class CustomCapChecker(LimitChecker):
             return 1000
 
         percentage = -cap.max_requests
-        return int(window_limit * percentage / 100)
+        calculated = int(window_limit * percentage / 100)
+        # Clamp to window limit (already is <= since percentage < 100 typically)
+        return min(calculated, window_limit)
 
     def _calculate_cooldown_until(
         self,

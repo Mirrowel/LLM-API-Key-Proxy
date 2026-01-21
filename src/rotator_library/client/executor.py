@@ -41,6 +41,8 @@ from ..core.errors import (
     mask_credential,
 )
 from ..core.constants import DEFAULT_MAX_RETRIES
+from ..request_sanitizer import sanitize_request_payload
+from ..transaction_logger import TransactionLogger
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
@@ -200,8 +202,17 @@ class RequestExecutor:
                             provider, model, cred, context.kwargs.copy()
                         )
 
+                        # Sanitize request payload
+                        kwargs = sanitize_request_payload(kwargs, model)
+
                         # Get provider plugin
                         plugin = self._get_plugin_instance(provider)
+
+                        # Add transaction context for provider logging
+                        if context.transaction_logger:
+                            kwargs["_transaction_context"] = (
+                                context.transaction_logger.get_context()
+                            )
 
                         # Execute request with retries
                         for attempt in range(self._max_retries):
@@ -247,6 +258,23 @@ class RequestExecutor:
                                     prompt_tokens=prompt_tokens,
                                     completion_tokens=completion_tokens,
                                 )
+
+                                # Log response if transaction logging enabled
+                                if context.transaction_logger:
+                                    try:
+                                        response_data = (
+                                            response.model_dump()
+                                            if hasattr(response, "model_dump")
+                                            else response
+                                        )
+                                        context.transaction_logger.log_response(
+                                            response_data
+                                        )
+                                    except Exception as log_err:
+                                        lib_logger.debug(
+                                            f"Failed to log response: {log_err}"
+                                        )
+
                                 return response
 
                             except Exception as e:
@@ -376,14 +404,24 @@ class RequestExecutor:
                                 provider, model, cred, context.kwargs.copy()
                             )
 
-                            # Add stream options
-                            if "stream_options" not in kwargs:
-                                kwargs["stream_options"] = {}
-                            if "include_usage" not in kwargs["stream_options"]:
-                                kwargs["stream_options"]["include_usage"] = True
+                            # Sanitize request payload
+                            kwargs = sanitize_request_payload(kwargs, model)
+
+                            # Add stream options (but not for iflow - it returns 406)
+                            if provider != "iflow":
+                                if "stream_options" not in kwargs:
+                                    kwargs["stream_options"] = {}
+                                if "include_usage" not in kwargs["stream_options"]:
+                                    kwargs["stream_options"]["include_usage"] = True
 
                             # Get provider plugin
                             plugin = self._get_plugin_instance(provider)
+
+                            # Add transaction context for provider logging
+                            if context.transaction_logger:
+                                kwargs["_transaction_context"] = (
+                                    context.transaction_logger.get_context()
+                                )
 
                             # Execute request with retries
                             for attempt in range(self._max_retries):
@@ -416,16 +454,27 @@ class RequestExecutor:
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion
-                                    async for (
-                                        chunk
-                                    ) in self._streaming_handler.wrap_stream(
+                                    base_stream = self._streaming_handler.wrap_stream(
                                         stream,
                                         cred,
                                         model,
                                         context.request,
                                         cred_context,
-                                    ):
-                                        yield chunk
+                                    )
+
+                                    # Wrap with transaction logging if enabled
+                                    if context.transaction_logger:
+                                        async for (
+                                            chunk
+                                        ) in self._transaction_logging_stream_wrapper(
+                                            base_stream,
+                                            context.transaction_logger,
+                                            context.kwargs,
+                                        ):
+                                            yield chunk
+                                    else:
+                                        async for chunk in base_stream:
+                                            yield chunk
                                     return
 
                                 except StreamedAPIError as e:
@@ -435,6 +484,27 @@ class RequestExecutor:
                                     error_accumulator.record_error(
                                         cred, classified, str(original)[:150]
                                     )
+
+                                    # Track consecutive quota failures
+                                    if classified.error_type == "quota_exceeded":
+                                        retry_state.increment_quota_failures()
+                                        if retry_state.consecutive_quota_failures >= 3:
+                                            lib_logger.error(
+                                                "3 consecutive quota errors in streaming - "
+                                                "request may be too large"
+                                            )
+                                            cred_context.mark_failure(classified)
+                                            error_data = {
+                                                "error": {
+                                                    "message": "Request exceeds quota for all credentials",
+                                                    "type": "quota_exhausted",
+                                                }
+                                            }
+                                            yield f"data: {json.dumps(error_data)}\n\n"
+                                            yield "data: [DONE]\n\n"
+                                            return
+                                    else:
+                                        retry_state.reset_quota_failures()
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
@@ -449,6 +519,27 @@ class RequestExecutor:
                                     error_accumulator.record_error(
                                         cred, classified, str(e)[:150]
                                     )
+
+                                    # Track consecutive quota failures
+                                    if classified.error_type == "quota_exceeded":
+                                        retry_state.increment_quota_failures()
+                                        if retry_state.consecutive_quota_failures >= 3:
+                                            lib_logger.error(
+                                                "3 consecutive quota errors in streaming - "
+                                                "request may be too large"
+                                            )
+                                            cred_context.mark_failure(classified)
+                                            error_data = {
+                                                "error": {
+                                                    "message": "Request exceeds quota for all credentials",
+                                                    "type": "quota_exhausted",
+                                                }
+                                            }
+                                            yield f"data: {json.dumps(error_data)}\n\n"
+                                            yield "data: [DONE]\n\n"
+                                            return
+                                    else:
+                                        retry_state.reset_quota_failures()
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
@@ -615,3 +706,52 @@ class RequestExecutor:
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )
         return ErrorAction.ROTATE
+
+    async def _transaction_logging_stream_wrapper(
+        self,
+        stream: AsyncGenerator[str, None],
+        transaction_logger: TransactionLogger,
+        request_kwargs: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """
+        Wrap a stream to log chunks and final response to TransactionLogger.
+
+        Yields all chunks unchanged while accumulating them for final logging.
+
+        Args:
+            stream: The SSE stream from wrap_stream
+            transaction_logger: TransactionLogger instance
+            request_kwargs: Original request kwargs for context
+
+        Yields:
+            SSE-formatted strings unchanged
+        """
+        chunks = []
+
+        async for sse_line in stream:
+            yield sse_line
+
+            # Parse and accumulate for final logging
+            if sse_line.startswith("data: ") and not sse_line.startswith(
+                "data: [DONE]"
+            ):
+                try:
+                    content = sse_line[6:].strip()
+                    if content:
+                        chunk_data = json.loads(content)
+                        chunks.append(chunk_data)
+                        transaction_logger.log_stream_chunk(chunk_data)
+                except json.JSONDecodeError:
+                    lib_logger.debug(
+                        f"Failed to parse chunk for logging: {sse_line[:100]}"
+                    )
+
+        # Log assembled final response
+        if chunks:
+            try:
+                final_response = TransactionLogger.assemble_streaming_response(chunks)
+                transaction_logger.log_response(final_response)
+            except Exception as e:
+                lib_logger.debug(
+                    f"Failed to assemble/log final streaming response: {e}"
+                )

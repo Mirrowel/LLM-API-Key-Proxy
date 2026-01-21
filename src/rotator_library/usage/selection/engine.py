@@ -103,6 +103,23 @@ class SelectionEngine:
                 available.append(stable_id)
 
         if not available:
+            # Check if we should reset fair cycle
+            if self._config.fair_cycle.enabled:
+                reset_performed = self._try_fair_cycle_reset(
+                    provider, model, quota_group, states, candidates
+                )
+                if reset_performed:
+                    # Retry selection after reset
+                    return self.select(
+                        provider,
+                        model,
+                        states,
+                        quota_group,
+                        exclude,
+                        priorities,
+                        deadline,
+                    )
+
             lib_logger.debug(
                 f"No available credentials for {provider}/{model} "
                 f"(all {len(candidates)} blocked by limits)"
@@ -279,3 +296,94 @@ class SelectionEngine:
             return window.request_count
 
         return state.usage.total_requests
+
+    def _try_fair_cycle_reset(
+        self,
+        provider: str,
+        model: str,
+        quota_group: Optional[str],
+        states: Dict[str, CredentialState],
+        candidates: List[str],
+    ) -> bool:
+        """
+        Try to reset fair cycle if all credentials are exhausted.
+
+        Tier-aware: If cross_tier is disabled, checks each tier separately.
+
+        Args:
+            provider: Provider name
+            model: Model being requested
+            quota_group: Quota group for this model
+            states: All credential states
+            candidates: Candidate stable_ids
+
+        Returns:
+            True if reset was performed, False otherwise
+        """
+        from ..types import LimitResult
+
+        group_key = quota_group or model
+        fair_cycle_checker = self._limits.fair_cycle_checker
+
+        # Check if all candidates are blocked by fair cycle
+        all_fair_cycle_blocked = True
+        fair_cycle_blocked_count = 0
+
+        for stable_id in candidates:
+            state = states[stable_id]
+            result = self._limits.check_all(state, model, quota_group)
+
+            if result.allowed:
+                # Some credential is available - no need to reset
+                return False
+
+            if result.result == LimitResult.BLOCKED_FAIR_CYCLE:
+                fair_cycle_blocked_count += 1
+            else:
+                # Blocked by something other than fair cycle
+                all_fair_cycle_blocked = False
+
+        # If no credentials blocked by fair cycle, can't help
+        if fair_cycle_blocked_count == 0:
+            return False
+
+        # Get all candidate states for reset
+        candidate_states = [states[sid] for sid in candidates]
+
+        # Tier-aware reset
+        if self._config.fair_cycle.cross_tier:
+            # Cross-tier: reset all at once
+            if fair_cycle_checker.check_all_exhausted(
+                provider, group_key, candidate_states
+            ):
+                lib_logger.info(
+                    f"All credentials fair-cycle exhausted for {provider}/{model} "
+                    f"(cross-tier), resetting cycle"
+                )
+                fair_cycle_checker.reset_cycle(provider, group_key, candidate_states)
+                return True
+        else:
+            # Per-tier: group by priority and check each tier
+            tier_groups: Dict[int, List[CredentialState]] = {}
+            for state in candidate_states:
+                priority = state.priority
+                tier_groups.setdefault(priority, []).append(state)
+
+            reset_any = False
+            for priority, tier_states in tier_groups.items():
+                # Check if all in this tier are exhausted
+                all_tier_exhausted = all(
+                    state.is_fair_cycle_exhausted(group_key) for state in tier_states
+                )
+
+                if all_tier_exhausted:
+                    lib_logger.info(
+                        f"All credentials fair-cycle exhausted for {provider}/{model} "
+                        f"in tier {priority}, resetting tier cycle"
+                    )
+                    fair_cycle_checker.reset_cycle(provider, group_key, tier_states)
+                    reset_any = True
+
+            return reset_any
+
+        return False
