@@ -844,7 +844,7 @@ class UsageManager:
         - OAuth: "oauth_creds/antigravity_oauth_15.json" -> "antigravity"
         - OAuth: "C:\\...\\oauth_creds\\gemini_cli_oauth_1.json" -> "gemini_cli"
         - OAuth filename only: "antigravity_oauth_1.json" -> "antigravity"
-        - API key style: stored with provider prefix metadata
+        - API key style: extracted from model names in usage data (e.g., "firmware/model" -> "firmware")
 
         Args:
             credential: The credential identifier (path or key)
@@ -891,6 +891,30 @@ class UsageManager:
         for prefix, provider in api_key_prefixes.items():
             if credential.startswith(prefix):
                 return provider
+
+        # Fallback: For raw API keys, extract provider from model names in usage data
+        # This handles providers like firmware, chutes, nanogpt that use credential-level quota
+        if self._usage_data and credential in self._usage_data:
+            cred_data = self._usage_data[credential]
+
+            # Check "models" section first (for per_model mode and quota tracking)
+            models_data = cred_data.get("models", {})
+            if models_data:
+                # Get first model name and extract provider prefix
+                first_model = next(iter(models_data.keys()), None)
+                if first_model and "/" in first_model:
+                    provider = first_model.split("/")[0].lower()
+                    return provider
+
+            # Fallback to "daily" section (legacy structure)
+            daily_data = cred_data.get("daily", {})
+            daily_models = daily_data.get("models", {})
+            if daily_models:
+                # Get first model name and extract provider prefix
+                first_model = next(iter(daily_models.keys()), None)
+                if first_model and "/" in first_model:
+                    provider = first_model.split("/")[0].lower()
+                    return provider
 
         return None
 

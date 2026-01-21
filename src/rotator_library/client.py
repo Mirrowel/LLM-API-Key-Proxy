@@ -3125,7 +3125,9 @@ class RotatingClient:
                         )
                     else:
                         group_stats["total_requests_remaining"] = 0
-                        group_stats["total_remaining_pct"] = None
+                        # Fallback to avg_remaining_pct when max_requests unavailable
+                        # This handles providers like Firmware that only provide percentage
+                        group_stats["total_remaining_pct"] = group_stats.get("avg_remaining_pct")
 
                     prov_stats["quota_groups"][group_name] = group_stats
 
@@ -3191,14 +3193,22 @@ class RotatingClient:
                             requests_remaining = (
                                 max(0, max_req - req_count) if max_req else 0
                             )
+
+                            # Determine display format
+                            # Priority: requests (if max known) > percentage (if baseline available) > unknown
+                            if max_req:
+                                display = f"{requests_remaining}/{max_req}"
+                            elif remaining_pct is not None:
+                                display = f"{remaining_pct}%"
+                            else:
+                                display = "?/?"
+
                             cred["model_groups"][group_name] = {
                                 "remaining_pct": remaining_pct,
                                 "requests_used": req_count,
                                 "requests_remaining": requests_remaining,
                                 "requests_max": max_req,
-                                "display": f"{requests_remaining}/{max_req}"
-                                if max_req
-                                else f"?/?",
+                                "display": display,
                                 "is_exhausted": is_exhausted,
                                 "reset_time_iso": reset_iso,
                                 "models": group_models,
