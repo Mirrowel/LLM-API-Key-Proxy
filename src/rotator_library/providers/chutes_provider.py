@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import os
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from .provider_interface import ProviderInterface
+from .provider_interface import ProviderInterface, UsageResetConfigDef
 from .utilities.chutes_quota_tracker import ChutesQuotaTracker
 
 if TYPE_CHECKING:
@@ -21,6 +21,25 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
     """
     Provider implementation for the chutes.ai API with quota tracking.
     """
+
+    # Enable environment variable overrides (e.g., QUOTA_GROUPS_CHUTES_GLOBAL)
+    provider_env_name = "chutes"
+
+    # Quota groups for tracking daily limits
+    # Uses a virtual model "_quota" for credential-level quota tracking
+    model_quota_groups = {
+        "chutes_global": ["_quota"],
+    }
+
+    # Usage reset configuration for daily quota
+    usage_reset_configs = {
+        "default": UsageResetConfigDef(
+            window_seconds=86400,  # 24 hours (daily quota reset)
+            mode="per_model",
+            description="Chutes daily quota",
+            field_name="daily",
+        )
+    }
 
     def __init__(self, *args, **kwargs):
         """Initialize ChutesProvider with quota tracking."""
