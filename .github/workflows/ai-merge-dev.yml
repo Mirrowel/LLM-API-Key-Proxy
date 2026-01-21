@@ -38,20 +38,23 @@ jobs:
         env:
           LLM_PROXY_URL: ${{ secrets.LLM_PROXY_URL }}
           LLM_PROXY_API_KEY: ${{ secrets.LLM_PROXY_API_KEY }}
+          LLM_PROXY_MODEL: ${{ secrets.LLM_PROXY_MODEL }}
         run: |
           mkdir -p ~/.config/opencode
+          DOLLAR='$'
+          MODEL="${LLM_PROXY_MODEL:-claude-sonnet-4-20250514}"
           cat > ~/.config/opencode/opencode.json <<EOFCFG
           {
-            "\$schema": "https://opencode.ai/config.json",
+            "${DOLLAR}schema": "https://opencode.ai/config.json",
             "provider": {
               "llm-proxy": {
                 "api": "openai",
                 "baseUrl": "$LLM_PROXY_URL",
-                "models": { "claude-sonnet-4-20250514": {} },
+                "models": { "$MODEL": {} },
                 "options": { "apiKey": "$LLM_PROXY_API_KEY" }
               }
             },
-            "model": "llm-proxy/claude-sonnet-4-20250514"
+            "model": "llm-proxy/$MODEL"
           }
           EOFCFG
 
