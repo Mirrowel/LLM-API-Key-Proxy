@@ -237,6 +237,48 @@ The manager supports loading credentials from two sources, with a clear priority
 - This is the key to "Stateless Deployment" for platforms like Railway, Render, Heroku
 - Credentials are referenced internally using `env://` URIs (e.g., `env://gemini_cli/1`)
 
+#### 2.6.4. Remote Host Authentication (SSH Port Forwarding)
+
+When the proxy is deployed on a remote host (VPS, cloud server, etc.), OAuth authentication requires special handling because OAuth callbacks are sent to `localhost`, which on the remote server refers to the server itself, not your local machine.
+
+**The Problem:**
+
+- Proxy runs on remote VPS at `your-vps-ip`
+- You attempt to add OAuth credentials using the credential tool on the VPS
+- OAuth provider redirects to `http://localhost:PORT/callback`
+- On the VPS, `localhost` points to the VPS's localhost, not your local browser
+- The callback fails because your browser cannot connect to the VPS's localhost
+
+**The Solution: SSH Port Forwarding**
+
+Create an SSH tunnel to forward OAuth callback ports from the VPS to your local machine:
+
+```bash
+# Single provider examples
+ssh -L 8085:localhost:8085 user@your-vps-ip          # Gemini CLI
+ssh -L 51121:localhost:51121 user@your-vps-ip        # Antigravity
+ssh -L 11451:localhost:11451 user@your-vps-ip        # iFlow
+
+# Multiple providers simultaneously
+ssh -L 8085:localhost:8085 -L 51121:localhost:51121 -L 11451:localhost:11451 user@your-vps-ip
+```
+
+**Workflow:**
+
+1. **Establish SSH tunnel** (keep this connection open)
+2. **Run credential tool on VPS** (in separate SSH session)
+3. **Complete browser-based OAuth** - callbacks are forwarded via tunnel
+4. **Close SSH tunnel** after authentication completes
+
+**Alternative Approach: Local Authentication + Export**
+
+If SSH port forwarding is not feasible:
+1. Complete OAuth flows locally on your machine
+2. Export credentials to environment variables using credential tool's export feature
+3. Deploy `.env` file to remote server
+
+This approach uses the credential tool's export functionality to generate environment variable representations of OAuth credentials, which can then be deployed to stateless environments without requiring SSH tunnels.
+
 **Gemini CLI Environment Variables:**
 
 Single credential (legacy format):
