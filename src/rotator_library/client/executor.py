@@ -17,7 +17,17 @@ import json
 import logging
 import random
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Set, TYPE_CHECKING, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Set,
+    TYPE_CHECKING,
+    Tuple,
+    Union,
+)
 
 import httpx
 import litellm
@@ -143,6 +153,35 @@ class RequestExecutor:
         else:
             return await self._execute_non_streaming(context)
 
+    async def _prepare_execution(
+        self,
+        context: RequestContext,
+    ) -> Tuple["UsageManager", Any, List[str], Optional[str], Dict[str, Any]]:
+        provider = context.provider
+        model = context.model
+
+        usage_manager = self._usage_managers.get(provider)
+        if not usage_manager:
+            raise NoAvailableKeysError(f"No UsageManager for provider {provider}")
+
+        filter_result = self._filter.filter_by_tier(
+            context.credentials, model, provider
+        )
+        credentials = filter_result.all_usable
+        quota_group = usage_manager.get_model_quota_group(model)
+
+        await self._ensure_initialized(usage_manager, context, filter_result)
+        await self._validate_request(provider, model, context.kwargs)
+
+        if not credentials:
+            raise NoAvailableKeysError(f"No compatible credentials for model {model}")
+
+        request_headers = (
+            dict(context.request.headers) if context.request is not None else {}
+        )
+
+        return usage_manager, filter_result, credentials, quota_group, request_headers
+
     async def _execute_non_streaming(
         self,
         context: RequestContext,
@@ -160,31 +199,17 @@ class RequestExecutor:
         model = context.model
         deadline = context.deadline
 
-        # Get the UsageManager for this provider
-        usage_manager = self._usage_managers.get(provider)
-        if not usage_manager:
-            raise NoAvailableKeysError(f"No UsageManager for provider {provider}")
-
-        # Filter credentials by tier
-        filter_result = self._filter.filter_by_tier(
-            context.credentials, model, provider
-        )
-        credentials = filter_result.all_usable
-
-        quota_group = usage_manager.get_model_quota_group(model)
-
-        await self._ensure_initialized(usage_manager, context, filter_result)
-        await self._validate_request(provider, model, context.kwargs)
-
-        if not credentials:
-            raise NoAvailableKeysError(f"No compatible credentials for model {model}")
+        (
+            usage_manager,
+            filter_result,
+            credentials,
+            quota_group,
+            request_headers,
+        ) = await self._prepare_execution(context)
 
         error_accumulator = RequestErrorAccumulator()
         error_accumulator.model = model
         error_accumulator.provider = provider
-        request_headers = (
-            dict(context.request.headers) if context.request is not None else {}
-        )
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
@@ -430,37 +455,18 @@ class RequestExecutor:
         model = context.model
         deadline = context.deadline
 
-        # Get the UsageManager for this provider
-        usage_manager = self._usage_managers.get(provider)
-        if not usage_manager:
+        try:
+            (
+                usage_manager,
+                filter_result,
+                credentials,
+                quota_group,
+                request_headers,
+            ) = await self._prepare_execution(context)
+        except NoAvailableKeysError as exc:
             error_data = {
                 "error": {
-                    "message": f"No UsageManager for provider {provider}",
-                    "type": "proxy_error",
-                }
-            }
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        # Filter credentials by tier
-        filter_result = self._filter.filter_by_tier(
-            context.credentials, model, provider
-        )
-        credentials = filter_result.all_usable
-        quota_group = usage_manager.get_model_quota_group(model)
-
-        await self._ensure_initialized(usage_manager, context, filter_result)
-        await self._validate_request(provider, model, context.kwargs)
-
-        request_headers = (
-            dict(context.request.headers) if context.request is not None else {}
-        )
-
-        if not credentials:
-            error_data = {
-                "error": {
-                    "message": f"No compatible credentials for {model}",
+                    "message": str(exc),
                     "type": "proxy_error",
                 }
             }

@@ -354,21 +354,6 @@ class TrackingEngine:
             state.active_requests += 1
             return True
 
-    async def release(
-        self,
-        state: CredentialState,
-        model: str,
-    ) -> None:
-        """
-        Release a credential after request completes.
-
-        Args:
-            state: Credential state
-            model: Model that was used
-        """
-        async with self._lock:
-            return
-
     async def apply_cooldown(
         self,
         state: CredentialState,
