@@ -331,6 +331,8 @@ class RequestExecutor:
                                     prompt_tokens,
                                     completion_tokens,
                                     prompt_tokens_cached,
+                                    prompt_tokens_cache_write,
+                                    thinking_tokens,
                                 ) = self._extract_usage_tokens(response)
                                 approx_cost = self._calculate_cost(
                                     provider, model, response
@@ -343,7 +345,9 @@ class RequestExecutor:
                                     response=response,
                                     prompt_tokens=prompt_tokens,
                                     completion_tokens=completion_tokens,
-                                    prompt_tokens_cached=prompt_tokens_cached,
+                                    thinking_tokens=thinking_tokens,
+                                    prompt_tokens_cache_read=prompt_tokens_cached,
+                                    prompt_tokens_cache_write=prompt_tokens_cache_write,
                                     approx_cost=approx_cost,
                                     response_headers=response_headers,
                                 )
@@ -987,10 +991,12 @@ class RequestExecutor:
         if isinstance(result, str):
             raise ValueError(result)
 
-    def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int]:
+    def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
+        cache_write_tokens = 0
+        thinking_tokens = 0
 
         if hasattr(response, "usage") and response.usage:
             prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
@@ -1000,11 +1006,46 @@ class RequestExecutor:
             if prompt_details:
                 if isinstance(prompt_details, dict):
                     cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+                    cache_write_tokens = (
+                        prompt_details.get("cache_creation_tokens", 0) or 0
+                    )
                 else:
                     cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+                    cache_write_tokens = (
+                        getattr(prompt_details, "cache_creation_tokens", 0) or 0
+                    )
+
+            completion_details = getattr(
+                response.usage, "completion_tokens_details", None
+            )
+            if completion_details:
+                if isinstance(completion_details, dict):
+                    thinking_tokens = completion_details.get("reasoning_tokens", 0) or 0
+                else:
+                    thinking_tokens = (
+                        getattr(completion_details, "reasoning_tokens", 0) or 0
+                    )
+
+            cache_read_tokens = getattr(response.usage, "cache_read_tokens", None)
+            if cache_read_tokens is not None:
+                cached_tokens = cache_read_tokens or 0
+            cache_creation_tokens = getattr(
+                response.usage, "cache_creation_tokens", None
+            )
+            if cache_creation_tokens is not None:
+                cache_write_tokens = cache_creation_tokens or 0
+
+            if thinking_tokens and completion_tokens >= thinking_tokens:
+                completion_tokens = completion_tokens - thinking_tokens
 
         uncached_prompt = max(0, prompt_tokens - cached_tokens)
-        return uncached_prompt, completion_tokens, cached_tokens
+        return (
+            uncached_prompt,
+            completion_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            thinking_tokens,
+        )
 
     def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
         plugin = self._get_plugin_instance(provider)

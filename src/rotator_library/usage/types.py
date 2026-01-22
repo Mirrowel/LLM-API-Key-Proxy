@@ -80,10 +80,15 @@ class WindowStats:
 
     name: str  # Window identifier (e.g., "5h", "daily")
     request_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
     total_tokens: int = 0
     prompt_tokens: int = 0
-    prompt_tokens_cached: int = 0  # Cached prompt tokens (e.g., from Claude)
     completion_tokens: int = 0
+    thinking_tokens: int = 0
+    output_tokens: int = 0
+    prompt_tokens_cache_read: int = 0
+    prompt_tokens_cache_write: int = 0
     approx_cost: float = 0.0
     started_at: Optional[float] = None  # Timestamp when window started
     reset_at: Optional[float] = None  # Timestamp when window resets
@@ -117,7 +122,12 @@ class UsageStats:
     total_successes: int = 0
     total_failures: int = 0
     total_tokens: int = 0
-    total_prompt_tokens_cached: int = 0  # Cached prompt tokens (e.g., from Claude)
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_thinking_tokens: int = 0
+    total_output_tokens: int = 0
+    total_prompt_tokens_cache_read: int = 0
+    total_prompt_tokens_cache_write: int = 0
     total_approx_cost: float = 0.0
     first_used_at: Optional[float] = None
     last_used_at: Optional[float] = None

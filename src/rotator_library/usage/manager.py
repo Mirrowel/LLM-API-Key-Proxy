@@ -111,7 +111,9 @@ class CredentialContext:
             error=error,
             prompt_tokens=self._tokens.get("prompt", 0),
             completion_tokens=self._tokens.get("completion", 0),
-            prompt_tokens_cached=self._tokens.get("prompt_cached", 0),
+            thinking_tokens=self._tokens.get("thinking", 0),
+            prompt_tokens_cache_read=self._tokens.get("prompt_cached", 0),
+            prompt_tokens_cache_write=self._tokens.get("prompt_cache_write", 0),
             approx_cost=self._approx_cost,
         )
 
@@ -122,7 +124,9 @@ class CredentialContext:
         response: Any = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        prompt_tokens_cached: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
         approx_cost: float = 0.0,
         response_headers: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -133,7 +137,9 @@ class CredentialContext:
         self._tokens = {
             "prompt": prompt_tokens,
             "completion": completion_tokens,
-            "prompt_cached": prompt_tokens_cached,
+            "thinking": thinking_tokens,
+            "prompt_cached": prompt_tokens_cache_read,
+            "prompt_cache_write": prompt_tokens_cache_write,
         }
         self._approx_cost = approx_cost
 
@@ -571,7 +577,9 @@ class UsageManager:
         success: bool,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        prompt_tokens_cached: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
         approx_cost: float = 0.0,
         error: Optional[ClassifiedError] = None,
         quota_group: Optional[str] = None,
@@ -600,11 +608,25 @@ class UsageManager:
                 quota_group,
                 prompt_tokens,
                 completion_tokens,
-                prompt_tokens_cached,
+                thinking_tokens,
+                prompt_tokens_cache_read,
+                prompt_tokens_cache_write,
                 approx_cost,
             )
         else:
-            await self._record_failure(stable_id, model, quota_group, error)
+            await self._record_failure(
+                stable_id,
+                model,
+                quota_group,
+                error,
+                request_count=1,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                thinking_tokens=thinking_tokens,
+                prompt_tokens_cache_read=prompt_tokens_cache_read,
+                prompt_tokens_cache_write=prompt_tokens_cache_write,
+                approx_cost=approx_cost,
+            )
 
     async def _handle_request_complete(
         self,
@@ -617,7 +639,9 @@ class UsageManager:
         error: Optional[ClassifiedError],
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        prompt_tokens_cached: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
         approx_cost: float = 0.0,
     ) -> None:
         """Handle provider hooks and record request outcome."""
@@ -656,7 +680,9 @@ class UsageManager:
         if request_count == 0:
             prompt_tokens = 0
             completion_tokens = 0
-            prompt_tokens_cached = 0
+            thinking_tokens = 0
+            prompt_tokens_cache_read = 0
+            prompt_tokens_cache_write = 0
             approx_cost = 0.0
 
         if cooldown_override:
@@ -682,7 +708,9 @@ class UsageManager:
                 quota_group,
                 prompt_tokens,
                 completion_tokens,
-                prompt_tokens_cached,
+                thinking_tokens,
+                prompt_tokens_cache_read,
+                prompt_tokens_cache_write,
                 approx_cost,
                 response_headers=response_headers,
                 request_count=request_count,
@@ -694,6 +722,12 @@ class UsageManager:
                 quota_group,
                 error,
                 request_count=request_count,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                thinking_tokens=thinking_tokens,
+                prompt_tokens_cache_read=prompt_tokens_cache_read,
+                prompt_tokens_cache_write=prompt_tokens_cache_write,
+                approx_cost=approx_cost,
             )
 
     async def apply_cooldown(
@@ -812,7 +846,12 @@ class UsageManager:
                     "total_successes": state.usage.total_successes,
                     "total_failures": state.usage.total_failures,
                     "total_tokens": state.usage.total_tokens,
-                    "total_prompt_tokens_cached": state.usage.total_prompt_tokens_cached,
+                    "total_prompt_tokens": state.usage.total_prompt_tokens,
+                    "total_completion_tokens": state.usage.total_completion_tokens,
+                    "total_thinking_tokens": state.usage.total_thinking_tokens,
+                    "total_output_tokens": state.usage.total_output_tokens,
+                    "total_prompt_tokens_cache_read": state.usage.total_prompt_tokens_cache_read,
+                    "total_prompt_tokens_cache_write": state.usage.total_prompt_tokens_cache_write,
                     "total_approx_cost": state.usage.total_approx_cost,
                 },
                 "windows": {},
@@ -823,10 +862,14 @@ class UsageManager:
             }
 
             stats["total_requests"] += state.usage.total_requests
-            stats["tokens"]["output"] += state.usage.total_tokens
-            stats["tokens"]["input_cached"] += state.usage.total_prompt_tokens_cached
-            stats["tokens"]["input_uncached"] += (
-                state.usage.total_tokens - state.usage.total_prompt_tokens_cached
+            stats["tokens"]["output"] += state.usage.total_output_tokens
+            stats["tokens"]["input_cached"] += (
+                state.usage.total_prompt_tokens_cache_read
+            )
+            stats["tokens"]["input_uncached"] += max(
+                0,
+                state.usage.total_prompt_tokens
+                - state.usage.total_prompt_tokens_cache_read,
             )
             if state.usage.total_approx_cost:
                 stats["approx_cost"] = (stats["approx_cost"] or 0.0) + (
@@ -842,6 +885,15 @@ class UsageManager:
             for window_name, window in state.usage.windows.items():
                 cred_stats["windows"][window_name] = {
                     "request_count": window.request_count,
+                    "success_count": window.success_count,
+                    "failure_count": window.failure_count,
+                    "prompt_tokens": window.prompt_tokens,
+                    "completion_tokens": window.completion_tokens,
+                    "thinking_tokens": window.thinking_tokens,
+                    "output_tokens": window.output_tokens,
+                    "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
+                    "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
+                    "total_tokens": window.total_tokens,
                     "limit": window.limit,
                     "remaining": window.remaining,
                     "reset_at": window.reset_at,
@@ -853,6 +905,15 @@ class UsageManager:
                 for window_name, window in usage.windows.items():
                     model_windows[window_name] = {
                         "request_count": window.request_count,
+                        "success_count": window.success_count,
+                        "failure_count": window.failure_count,
+                        "prompt_tokens": window.prompt_tokens,
+                        "completion_tokens": window.completion_tokens,
+                        "thinking_tokens": window.thinking_tokens,
+                        "output_tokens": window.output_tokens,
+                        "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
+                        "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
+                        "total_tokens": window.total_tokens,
                         "limit": window.limit,
                         "remaining": window.remaining,
                         "reset_at": window.reset_at,
@@ -863,6 +924,12 @@ class UsageManager:
                         "windows": model_windows,
                         "total_requests": usage.total_requests,
                         "total_tokens": usage.total_tokens,
+                        "total_prompt_tokens": usage.total_prompt_tokens,
+                        "total_completion_tokens": usage.total_completion_tokens,
+                        "total_thinking_tokens": usage.total_thinking_tokens,
+                        "total_output_tokens": usage.total_output_tokens,
+                        "total_prompt_tokens_cache_read": usage.total_prompt_tokens_cache_read,
+                        "total_prompt_tokens_cache_write": usage.total_prompt_tokens_cache_write,
                     }
 
             for group_key, usage in state.group_usage.items():
@@ -870,6 +937,15 @@ class UsageManager:
                 for window_name, window in usage.windows.items():
                     group_windows[window_name] = {
                         "request_count": window.request_count,
+                        "success_count": window.success_count,
+                        "failure_count": window.failure_count,
+                        "prompt_tokens": window.prompt_tokens,
+                        "completion_tokens": window.completion_tokens,
+                        "thinking_tokens": window.thinking_tokens,
+                        "output_tokens": window.output_tokens,
+                        "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
+                        "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
+                        "total_tokens": window.total_tokens,
                         "limit": window.limit,
                         "remaining": window.remaining,
                         "reset_at": window.reset_at,
@@ -880,6 +956,12 @@ class UsageManager:
                         "windows": group_windows,
                         "total_requests": usage.total_requests,
                         "total_tokens": usage.total_tokens,
+                        "total_prompt_tokens": usage.total_prompt_tokens,
+                        "total_completion_tokens": usage.total_completion_tokens,
+                        "total_thinking_tokens": usage.total_thinking_tokens,
+                        "total_output_tokens": usage.total_output_tokens,
+                        "total_prompt_tokens_cache_read": usage.total_prompt_tokens_cache_read,
+                        "total_prompt_tokens_cache_write": usage.total_prompt_tokens_cache_write,
                     }
 
                     group_stats = stats["quota_groups"].setdefault(
@@ -1114,10 +1196,15 @@ class UsageManager:
                     target_usage.windows[window_def.name] = WindowStats(
                         name=source_window.name,
                         request_count=source_window.request_count,
+                        success_count=source_window.success_count,
+                        failure_count=source_window.failure_count,
                         total_tokens=source_window.total_tokens,
                         prompt_tokens=source_window.prompt_tokens,
-                        prompt_tokens_cached=source_window.prompt_tokens_cached,
                         completion_tokens=source_window.completion_tokens,
+                        thinking_tokens=source_window.thinking_tokens,
+                        output_tokens=source_window.output_tokens,
+                        prompt_tokens_cache_read=source_window.prompt_tokens_cache_read,
+                        prompt_tokens_cache_write=source_window.prompt_tokens_cache_write,
                         approx_cost=source_window.approx_cost,
                         started_at=source_window.started_at,
                         reset_at=source_window.reset_at,
@@ -1128,10 +1215,15 @@ class UsageManager:
                 group_usage.windows[window_def.name] = WindowStats(
                     name=source_window.name,
                     request_count=source_window.request_count,
+                    success_count=source_window.success_count,
+                    failure_count=source_window.failure_count,
                     total_tokens=source_window.total_tokens,
                     prompt_tokens=source_window.prompt_tokens,
-                    prompt_tokens_cached=source_window.prompt_tokens_cached,
                     completion_tokens=source_window.completion_tokens,
+                    thinking_tokens=source_window.thinking_tokens,
+                    output_tokens=source_window.output_tokens,
+                    prompt_tokens_cache_read=source_window.prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=source_window.prompt_tokens_cache_write,
                     approx_cost=source_window.approx_cost,
                     started_at=source_window.started_at,
                     reset_at=source_window.reset_at,
@@ -1162,9 +1254,14 @@ class UsageManager:
                     window_name,
                     {
                         "counts": [],
+                        "successes": [],
+                        "failures": [],
                         "prompt_tokens": [],
                         "completion_tokens": [],
-                        "prompt_tokens_cached": [],
+                        "thinking_tokens": [],
+                        "output_tokens": [],
+                        "prompt_tokens_cache_read": [],
+                        "prompt_tokens_cache_write": [],
                         "total_tokens": [],
                         "approx_cost": [],
                         "started_at": [],
@@ -1173,9 +1270,18 @@ class UsageManager:
                     },
                 )
                 bucket["counts"].append(window.request_count)
+                bucket["successes"].append(window.success_count)
+                bucket["failures"].append(window.failure_count)
                 bucket["prompt_tokens"].append(window.prompt_tokens)
                 bucket["completion_tokens"].append(window.completion_tokens)
-                bucket["prompt_tokens_cached"].append(window.prompt_tokens_cached)
+                bucket["thinking_tokens"].append(window.thinking_tokens)
+                bucket["output_tokens"].append(window.output_tokens)
+                bucket["prompt_tokens_cache_read"].append(
+                    window.prompt_tokens_cache_read
+                )
+                bucket["prompt_tokens_cache_write"].append(
+                    window.prompt_tokens_cache_write
+                )
                 bucket["total_tokens"].append(window.total_tokens)
                 bucket["approx_cost"].append(window.approx_cost)
                 if window.started_at is not None:
@@ -1194,16 +1300,26 @@ class UsageManager:
                 synced = all(count == counts[0] for count in counts)
                 if synced:
                     request_count = counts[0]
+                    success_count = bucket["successes"][0]
+                    failure_count = bucket["failures"][0]
                     prompt_tokens = bucket["prompt_tokens"][0]
                     completion_tokens = bucket["completion_tokens"][0]
-                    prompt_tokens_cached = bucket["prompt_tokens_cached"][0]
+                    thinking_tokens = bucket["thinking_tokens"][0]
+                    output_tokens = bucket["output_tokens"][0]
+                    prompt_tokens_cache_read = bucket["prompt_tokens_cache_read"][0]
+                    prompt_tokens_cache_write = bucket["prompt_tokens_cache_write"][0]
                     total_tokens = bucket["total_tokens"][0]
                     approx_cost = bucket["approx_cost"][0]
                 else:
                     request_count = sum(counts)
+                    success_count = sum(bucket["successes"])
+                    failure_count = sum(bucket["failures"])
                     prompt_tokens = sum(bucket["prompt_tokens"])
                     completion_tokens = sum(bucket["completion_tokens"])
-                    prompt_tokens_cached = sum(bucket["prompt_tokens_cached"])
+                    thinking_tokens = sum(bucket["thinking_tokens"])
+                    output_tokens = sum(bucket["output_tokens"])
+                    prompt_tokens_cache_read = sum(bucket["prompt_tokens_cache_read"])
+                    prompt_tokens_cache_write = sum(bucket["prompt_tokens_cache_write"])
                     total_tokens = sum(bucket["total_tokens"])
                     approx_cost = sum(bucket["approx_cost"])
 
@@ -1214,10 +1330,15 @@ class UsageManager:
                 group_usage.windows[window_name] = WindowStats(
                     name=window_name,
                     request_count=request_count,
+                    success_count=success_count,
+                    failure_count=failure_count,
                     total_tokens=total_tokens,
                     prompt_tokens=prompt_tokens,
-                    prompt_tokens_cached=prompt_tokens_cached,
                     completion_tokens=completion_tokens,
+                    thinking_tokens=thinking_tokens,
+                    output_tokens=output_tokens,
+                    prompt_tokens_cache_read=prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=prompt_tokens_cache_write,
                     approx_cost=approx_cost,
                     started_at=started_at,
                     reset_at=reset_at,
@@ -1607,7 +1728,9 @@ class UsageManager:
         quota_group: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        prompt_tokens_cached: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
         approx_cost: float = 0.0,
         response_headers: Optional[Dict[str, Any]] = None,
         request_count: int = 1,
@@ -1624,7 +1747,9 @@ class UsageManager:
                 quota_group=quota_group,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                prompt_tokens_cached=prompt_tokens_cached,
+                thinking_tokens=thinking_tokens,
+                prompt_tokens_cache_read=prompt_tokens_cache_read,
+                prompt_tokens_cache_write=prompt_tokens_cache_write,
                 approx_cost=approx_cost,
                 response_headers=response_headers,
                 request_count=request_count,
@@ -1659,6 +1784,12 @@ class UsageManager:
         quota_group: Optional[str] = None,
         error: Optional[ClassifiedError] = None,
         request_count: int = 1,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
+        approx_cost: float = 0.0,
     ) -> None:
         """Record a failed request."""
         state = self._states.get(stable_id)
@@ -1694,6 +1825,12 @@ class UsageManager:
             quota_reset_timestamp=quota_reset,
             mark_exhausted=mark_exhausted,
             request_count=request_count,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            thinking_tokens=thinking_tokens,
+            prompt_tokens_cache_read=prompt_tokens_cache_read,
+            prompt_tokens_cache_write=prompt_tokens_cache_write,
+            approx_cost=approx_cost,
         )
 
         # Sync request_count across quota group (for shared quota pools)

@@ -73,8 +73,10 @@ class StreamingHandler:
         has_tool_calls = False
         prompt_tokens = 0
         prompt_tokens_cached = 0
+        prompt_tokens_cache_write = 0
         prompt_tokens_uncached = 0
         completion_tokens = 0
+        thinking_tokens = 0
 
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
@@ -118,10 +120,40 @@ class StreamingHandler:
                                 prompt_tokens_cached = (
                                     prompt_details.get("cached_tokens", 0) or 0
                                 )
+                                prompt_tokens_cache_write = (
+                                    prompt_details.get("cache_creation_tokens", 0) or 0
+                                )
                             else:
                                 prompt_tokens_cached = (
                                     getattr(prompt_details, "cached_tokens", 0) or 0
                                 )
+                                prompt_tokens_cache_write = (
+                                    getattr(prompt_details, "cache_creation_tokens", 0)
+                                    or 0
+                                )
+                        completion_details = processed.usage.get(
+                            "completion_tokens_details"
+                        )
+                        if completion_details:
+                            if isinstance(completion_details, dict):
+                                thinking_tokens = (
+                                    completion_details.get("reasoning_tokens", 0) or 0
+                                )
+                            else:
+                                thinking_tokens = (
+                                    getattr(completion_details, "reasoning_tokens", 0)
+                                    or 0
+                                )
+                        if processed.usage.get("cache_read_tokens") is not None:
+                            prompt_tokens_cached = (
+                                processed.usage.get("cache_read_tokens") or 0
+                            )
+                        if processed.usage.get("cache_creation_tokens") is not None:
+                            prompt_tokens_cache_write = (
+                                processed.usage.get("cache_creation_tokens") or 0
+                            )
+                        if thinking_tokens and completion_tokens >= thinking_tokens:
+                            completion_tokens = completion_tokens - thinking_tokens
                         prompt_tokens_uncached = max(
                             0, prompt_tokens - prompt_tokens_cached
                         )
@@ -194,12 +226,14 @@ class StreamingHandler:
                         approx_cost = self._calculate_stream_cost(
                             model,
                             prompt_tokens_uncached + prompt_tokens_cached,
-                            completion_tokens,
+                            completion_tokens + thinking_tokens,
                         )
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens_uncached,
                         completion_tokens=completion_tokens,
-                        prompt_tokens_cached=prompt_tokens_cached,
+                        thinking_tokens=thinking_tokens,
+                        prompt_tokens_cache_read=prompt_tokens_cached,
+                        prompt_tokens_cache_write=prompt_tokens_cache_write,
                         approx_cost=approx_cost,
                     )
 

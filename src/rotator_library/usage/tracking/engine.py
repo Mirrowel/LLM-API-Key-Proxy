@@ -62,7 +62,9 @@ class TrackingEngine:
         quota_group: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        prompt_tokens_cached: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
+        thinking_tokens: int = 0,
         approx_cost: float = 0.0,
         request_count: int = 1,
         response_headers: Optional[Dict[str, Any]] = None,
@@ -88,10 +90,20 @@ class TrackingEngine:
             usage = state.usage
             usage.total_requests += request_count
             usage.total_successes += request_count
+            output_tokens = completion_tokens + thinking_tokens
             usage.total_tokens += (
-                prompt_tokens + completion_tokens + prompt_tokens_cached
+                prompt_tokens
+                + completion_tokens
+                + thinking_tokens
+                + prompt_tokens_cache_read
+                + prompt_tokens_cache_write
             )
-            usage.total_prompt_tokens_cached += prompt_tokens_cached
+            usage.total_prompt_tokens += prompt_tokens
+            usage.total_completion_tokens += completion_tokens
+            usage.total_thinking_tokens += thinking_tokens
+            usage.total_output_tokens += output_tokens
+            usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
+            usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
             usage.total_approx_cost += approx_cost
             usage.last_used_at = now
             if usage.first_used_at is None:
@@ -107,7 +119,9 @@ class TrackingEngine:
                 failure_count=0,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                prompt_tokens_cached=prompt_tokens_cached,
+                prompt_tokens_cache_read=prompt_tokens_cache_read,
+                prompt_tokens_cache_write=prompt_tokens_cache_write,
+                thinking_tokens=thinking_tokens,
                 approx_cost=approx_cost,
             )
             if group_key != model:
@@ -121,7 +135,9 @@ class TrackingEngine:
                     failure_count=0,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    prompt_tokens_cached=prompt_tokens_cached,
+                    prompt_tokens_cache_read=prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=prompt_tokens_cache_write,
+                    thinking_tokens=thinking_tokens,
                     approx_cost=approx_cost,
                 )
 
@@ -142,9 +158,12 @@ class TrackingEngine:
                     window_def.name,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    prompt_tokens_cached=prompt_tokens_cached,
+                    prompt_tokens_cache_read=prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=prompt_tokens_cache_write,
+                    thinking_tokens=thinking_tokens,
                     approx_cost=approx_cost,
                     request_count=request_count,
+                    success_count=request_count,
                 )
                 if window.limit is not None and window.request_count >= window.limit:
                     if self._config.fair_cycle.enabled:
@@ -174,6 +193,12 @@ class TrackingEngine:
         quota_reset_timestamp: Optional[float] = None,
         mark_exhausted: bool = False,
         request_count: int = 1,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        thinking_tokens: int = 0,
+        prompt_tokens_cache_read: int = 0,
+        prompt_tokens_cache_write: int = 0,
+        approx_cost: float = 0.0,
     ) -> None:
         """
         Record a failed request.
@@ -195,6 +220,21 @@ class TrackingEngine:
             # Update failure stats
             state.usage.total_requests += request_count
             state.usage.total_failures += request_count
+            output_tokens = completion_tokens + thinking_tokens
+            state.usage.total_tokens += (
+                prompt_tokens
+                + completion_tokens
+                + thinking_tokens
+                + prompt_tokens_cache_read
+                + prompt_tokens_cache_write
+            )
+            state.usage.total_prompt_tokens += prompt_tokens
+            state.usage.total_completion_tokens += completion_tokens
+            state.usage.total_thinking_tokens += thinking_tokens
+            state.usage.total_output_tokens += output_tokens
+            state.usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
+            state.usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
+            state.usage.total_approx_cost += approx_cost
             state.usage.last_used_at = now
 
             self._update_scoped_usage(
@@ -205,10 +245,12 @@ class TrackingEngine:
                 request_count=request_count,
                 success_count=0,
                 failure_count=request_count,
-                prompt_tokens=0,
-                completion_tokens=0,
-                prompt_tokens_cached=0,
-                approx_cost=0.0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                prompt_tokens_cache_read=prompt_tokens_cache_read,
+                prompt_tokens_cache_write=prompt_tokens_cache_write,
+                thinking_tokens=thinking_tokens,
+                approx_cost=approx_cost,
             )
             if group_key != model:
                 self._update_scoped_usage(
@@ -219,10 +261,12 @@ class TrackingEngine:
                     request_count=request_count,
                     success_count=0,
                     failure_count=request_count,
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    prompt_tokens_cached=0,
-                    approx_cost=0.0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    prompt_tokens_cache_read=prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=prompt_tokens_cache_write,
+                    thinking_tokens=thinking_tokens,
+                    approx_cost=approx_cost,
                 )
 
             # Update per-model request count (for quota group sync)
@@ -241,6 +285,13 @@ class TrackingEngine:
                     scoped_usage.windows,
                     window_def.name,
                     request_count=request_count,
+                    failure_count=request_count,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    prompt_tokens_cache_read=prompt_tokens_cache_read,
+                    prompt_tokens_cache_write=prompt_tokens_cache_write,
+                    thinking_tokens=thinking_tokens,
+                    approx_cost=approx_cost,
                 )
                 if window.limit is not None and window.request_count >= window.limit:
                     if self._config.fair_cycle.enabled:
@@ -535,18 +586,32 @@ class TrackingEngine:
         failure_count: int,
         prompt_tokens: int,
         completion_tokens: int,
-        prompt_tokens_cached: int,
+        prompt_tokens_cache_read: int,
+        prompt_tokens_cache_write: int,
+        thinking_tokens: int,
         approx_cost: float,
     ) -> None:
         """Update scoped usage stats."""
         usage = state.get_usage_for_scope(scope, key)
         if not usage:
             return
+        output_tokens = completion_tokens + thinking_tokens
         usage.total_requests += request_count
         usage.total_successes += success_count
         usage.total_failures += failure_count
-        usage.total_tokens += prompt_tokens + completion_tokens + prompt_tokens_cached
-        usage.total_prompt_tokens_cached += prompt_tokens_cached
+        usage.total_tokens += (
+            prompt_tokens
+            + completion_tokens
+            + thinking_tokens
+            + prompt_tokens_cache_read
+            + prompt_tokens_cache_write
+        )
+        usage.total_prompt_tokens += prompt_tokens
+        usage.total_completion_tokens += completion_tokens
+        usage.total_thinking_tokens += thinking_tokens
+        usage.total_output_tokens += output_tokens
+        usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
+        usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
         usage.total_approx_cost += approx_cost
         usage.last_used_at = now
         if usage.first_used_at is None:
