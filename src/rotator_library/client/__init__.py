@@ -28,6 +28,7 @@ from .filters import CredentialFilter
 from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
+from .anthropic import AnthropicHandler
 from .types import AvailabilityStats, RetryState, ExecutionResult
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "ModelResolver",
     "ProviderTransforms",
     "StreamingHandler",
+    "AnthropicHandler",
     # Types
     "AvailabilityStats",
     "RetryState",

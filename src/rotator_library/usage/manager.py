@@ -1432,6 +1432,53 @@ class UsageManager:
         """Shutdown and save any pending data."""
         await self.save(force=True)
 
+    async def reload_from_disk(self) -> None:
+        """
+        Force reload usage data from disk.
+
+        Useful when wanting fresh stats without making external API calls.
+        This reloads persisted state while preserving current credential registrations.
+        """
+        if not self._storage:
+            lib_logger.debug(
+                f"reload_from_disk: No storage configured for {self.provider}"
+            )
+            return
+
+        async with self._lock:
+            # Load persisted state
+            loaded_states, fair_cycle_global, _ = await self._storage.load()
+
+            # Merge loaded state with current state
+            # Keep current accessors but update usage data
+            for stable_id, loaded_state in loaded_states.items():
+                if stable_id in self._states:
+                    # Update usage data from loaded state
+                    current = self._states[stable_id]
+                    current.usage = loaded_state.usage
+                    current.model_usage = loaded_state.model_usage
+                    current.group_usage = loaded_state.group_usage
+                    current.cooldowns = loaded_state.cooldowns
+                    current.fair_cycle = loaded_state.fair_cycle
+                    current.last_updated = loaded_state.last_updated
+                else:
+                    # New credential from disk, add it
+                    self._states[stable_id] = loaded_state
+
+            # Reload fair cycle global state
+            if fair_cycle_global:
+                self._limits.fair_cycle_checker.load_global_state_dict(
+                    fair_cycle_global
+                )
+
+            # Backfill group usage for consistency
+            self._backfill_group_usage()
+
+            lib_logger.info(
+                f"Reloaded usage data from disk for {self.provider}: "
+                f"{len(self._states)} credentials"
+            )
+
     async def update_quota_baseline(
         self,
         accessor: str,

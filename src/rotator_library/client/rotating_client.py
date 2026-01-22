@@ -22,7 +22,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union, TYPE_CHECKING
 
 import httpx
 import litellm
@@ -41,6 +41,7 @@ from .filters import CredentialFilter
 from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .executor import RequestExecutor
+from .anthropic import AnthropicHandler
 
 # Import providers and other dependencies
 from ..providers import PROVIDER_PLUGINS
@@ -57,6 +58,9 @@ from ..failure_logger import configure_failure_logger
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
 from ..usage.config import load_provider_usage_config, WindowDefinition
+
+if TYPE_CHECKING:
+    from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -247,6 +251,9 @@ class RotatingClient:
         self._model_list_cache: Dict[str, List[str]] = {}
         self._usage_initialized = False
         self._usage_init_lock = asyncio.Lock()
+
+        # Initialize Anthropic compatibility handler
+        self._anthropic_handler = AnthropicHandler(self)
 
     async def __aenter__(self):
         await self.initialize_usage_managers()
@@ -715,3 +722,170 @@ class RotatingClient:
             f"LiteLLM Callback Handled Error: Model={model} | "
             f"Type={error_class} | Message='{error_message}'"
         )
+
+    # =========================================================================
+    # USAGE MANAGEMENT METHODS
+    # =========================================================================
+
+    async def reload_usage_from_disk(self) -> None:
+        """
+        Force reload usage data from disk.
+
+        Useful when wanting fresh stats without making external API calls.
+        """
+        for manager in self._usage_managers.values():
+            await manager.reload_from_disk()
+
+    async def force_refresh_quota(
+        self,
+        provider: Optional[str] = None,
+        credential: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Force refresh quota from external API.
+
+        For Antigravity, this fetches live quota data from the API.
+        For other providers, this is a no-op (just reloads from disk).
+
+        Args:
+            provider: If specified, only refresh this provider
+            credential: If specified, only refresh this specific credential
+
+        Returns:
+            Refresh result dict with success/failure info
+        """
+        result = {
+            "action": "force_refresh",
+            "scope": "credential"
+            if credential
+            else ("provider" if provider else "all"),
+            "provider": provider,
+            "credential": credential,
+            "credentials_refreshed": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "duration_ms": 0,
+            "errors": [],
+        }
+
+        start_time = time.time()
+
+        # Determine which providers to refresh
+        if provider:
+            providers_to_refresh = (
+                [provider] if provider in self.all_credentials else []
+            )
+        else:
+            providers_to_refresh = list(self.all_credentials.keys())
+
+        for prov in providers_to_refresh:
+            provider_class = self._provider_plugins.get(prov)
+            if not provider_class:
+                continue
+
+            # Get or create provider instance
+            provider_instance = self._get_provider_instance(prov)
+            if not provider_instance:
+                continue
+
+            # Check if provider supports quota refresh (like Antigravity)
+            if hasattr(provider_instance, "fetch_initial_baselines"):
+                # Get credentials to refresh
+                if credential:
+                    # Find full path for this credential
+                    creds_to_refresh = []
+                    for cred_path in self.all_credentials.get(prov, []):
+                        if cred_path.endswith(credential) or cred_path == credential:
+                            creds_to_refresh.append(cred_path)
+                            break
+                else:
+                    creds_to_refresh = self.all_credentials.get(prov, [])
+
+                if not creds_to_refresh:
+                    continue
+
+                try:
+                    # Fetch live quota from API for ALL specified credentials
+                    quota_results = await provider_instance.fetch_initial_baselines(
+                        creds_to_refresh
+                    )
+
+                    # Store baselines in usage manager
+                    usage_manager = self._usage_managers.get(prov)
+                    if usage_manager and hasattr(
+                        provider_instance, "_store_baselines_to_usage_manager"
+                    ):
+                        stored = (
+                            await provider_instance._store_baselines_to_usage_manager(
+                                quota_results, usage_manager, force=True
+                            )
+                        )
+                        result["success_count"] += stored
+
+                    result["credentials_refreshed"] += len(creds_to_refresh)
+
+                    # Count failures
+                    for cred_path, data in quota_results.items():
+                        if data.get("status") != "success":
+                            result["failed_count"] += 1
+                            result["errors"].append(
+                                f"{Path(cred_path).name}: {data.get('error', 'Unknown error')}"
+                            )
+
+                except Exception as e:
+                    lib_logger.error(f"Failed to refresh quota for {prov}: {e}")
+                    result["errors"].append(f"{prov}: {str(e)}")
+                    result["failed_count"] += len(creds_to_refresh)
+
+        result["duration_ms"] = int((time.time() - start_time) * 1000)
+        return result
+
+    # =========================================================================
+    # ANTHROPIC API COMPATIBILITY METHODS
+    # =========================================================================
+
+    async def anthropic_messages(
+        self,
+        request: "AnthropicMessagesRequest",
+        raw_request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+    ) -> Any:
+        """
+        Handle Anthropic Messages API requests.
+
+        This method accepts requests in Anthropic's format, translates them to
+        OpenAI format internally, processes them through the existing acompletion
+        method, and returns responses in Anthropic's format.
+
+        Args:
+            request: An AnthropicMessagesRequest object
+            raw_request: Optional raw request object for disconnect checks
+            pre_request_callback: Optional async callback before each API request
+
+        Returns:
+            For non-streaming: dict in Anthropic Messages format
+            For streaming: AsyncGenerator yielding Anthropic SSE format strings
+        """
+        return await self._anthropic_handler.messages(
+            request=request,
+            raw_request=raw_request,
+            pre_request_callback=pre_request_callback,
+        )
+
+    async def anthropic_count_tokens(
+        self,
+        request: "AnthropicCountTokensRequest",
+    ) -> dict:
+        """
+        Handle Anthropic count_tokens API requests.
+
+        Counts the number of tokens that would be used by a Messages API request.
+        This is useful for estimating costs and managing context windows.
+
+        Args:
+            request: An AnthropicCountTokensRequest object
+
+        Returns:
+            Dict with input_tokens count in Anthropic format
+        """
+        return await self._anthropic_handler.count_tokens(request=request)
