@@ -1149,141 +1149,96 @@ class UsageManager:
         model: str,
     ) -> None:
         """
-        Synchronize request counts across models in the same quota group.
+        Synchronize quota-group and credential windows for model usage.
 
-        For providers with shared quota pools (e.g., Antigravity), all models
-        in a quota group share the same daily limit. When one model's count
-        increases, we sync that count to all other models in the group so
-        selection correctly accounts for the shared quota.
+        For providers with shared quota pools (e.g., Antigravity), we aggregate
+        per-model windows into group windows for shared quota tracking. We also
+        aggregate per-model windows into credential-level windows for display.
 
         Args:
             state: Credential state that was just updated
             model: The normalized model that was just used
         """
-        # Check if this model is in a quota group
+        model_window_names = {
+            window_def.name
+            for window_def in self._config.windows
+            if window_def.applies_to == "model"
+        }
+
+        if model_window_names:
+            self._sync_credential_windows(state, model_window_names)
+
+        # Aggregate windows for quota groups
         group = self._get_model_quota_group(model)
         if not group:
             return
 
-        # Get all models in the group
         grouped_models = self._get_grouped_models(group)
-        if len(grouped_models) <= 1:
+        if not grouped_models:
             return
 
-        # Get the current request count for the used model
-        current_count = state.usage.model_request_counts.get(model, 0)
+        group_usages = [
+            state.model_usage[m] for m in grouped_models if m in state.model_usage
+        ]
+        if not group_usages:
+            return
 
-        # Sync to all other models in the group
-        for grouped_model in grouped_models:
-            if grouped_model != model:
-                state.usage.model_request_counts[grouped_model] = current_count
+        aggregated = self._aggregate_model_windows(group_usages, model_window_names)
+        if not aggregated:
+            return
 
-        # Sync per-model windows if configured at model scope
-        source_usage = state.model_usage.get(model)
-        if source_usage:
-            for window_def in self._config.windows:
-                if window_def.applies_to != "model":
-                    continue
-                source_window = source_usage.windows.get(window_def.name)
-                if not source_window:
-                    continue
-                for grouped_model in grouped_models:
-                    if grouped_model == model:
-                        continue
-                    target_usage = state.model_usage.setdefault(
-                        grouped_model, UsageStats()
-                    )
-                    target_usage.windows[window_def.name] = WindowStats(
-                        name=source_window.name,
-                        request_count=source_window.request_count,
-                        success_count=source_window.success_count,
-                        failure_count=source_window.failure_count,
-                        total_tokens=source_window.total_tokens,
-                        prompt_tokens=source_window.prompt_tokens,
-                        completion_tokens=source_window.completion_tokens,
-                        thinking_tokens=source_window.thinking_tokens,
-                        output_tokens=source_window.output_tokens,
-                        prompt_tokens_cache_read=source_window.prompt_tokens_cache_read,
-                        prompt_tokens_cache_write=source_window.prompt_tokens_cache_write,
-                        approx_cost=source_window.approx_cost,
-                        started_at=source_window.started_at,
-                        reset_at=source_window.reset_at,
-                        limit=source_window.limit,
-                    )
-
-                group_usage = state.group_usage.setdefault(group, UsageStats())
-                group_usage.windows[window_def.name] = WindowStats(
-                    name=source_window.name,
-                    request_count=source_window.request_count,
-                    success_count=source_window.success_count,
-                    failure_count=source_window.failure_count,
-                    total_tokens=source_window.total_tokens,
-                    prompt_tokens=source_window.prompt_tokens,
-                    completion_tokens=source_window.completion_tokens,
-                    thinking_tokens=source_window.thinking_tokens,
-                    output_tokens=source_window.output_tokens,
-                    prompt_tokens_cache_read=source_window.prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=source_window.prompt_tokens_cache_write,
-                    approx_cost=source_window.approx_cost,
-                    started_at=source_window.started_at,
-                    reset_at=source_window.reset_at,
-                    limit=source_window.limit,
-                )
-
-        lib_logger.debug(
-            f"Synced request_count={current_count} across quota group '{group}' "
-            f"({len(grouped_models)} models)"
-        )
+        group_usage = state.group_usage.setdefault(group, UsageStats())
+        group_usage.windows.update(aggregated)
 
     def _backfill_group_usage(self) -> None:
         """Backfill group usage windows and cooldowns from model data."""
         for state in self._states.values():
             self._backfill_model_usage(state)
+            self._backfill_credential_windows(state)
             self._backfill_group_usage_for_state(state)
             self._backfill_group_cooldowns(state)
 
-    def _backfill_group_usage_for_state(self, state: CredentialState) -> None:
-        group_windows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    def _aggregate_model_windows(
+        self,
+        usages: List[UsageStats],
+        model_window_names: Set[str],
+    ) -> Dict[str, WindowStats]:
+        buckets: Dict[str, Dict[str, Any]] = {}
 
-        for model, usage in state.model_usage.items():
-            group = self._get_model_quota_group(model)
-            if not group:
-                continue
+        for usage in usages:
             for window_name, window in usage.windows.items():
-                bucket = group_windows.setdefault(group, {}).setdefault(
+                if window_name not in model_window_names:
+                    continue
+                bucket = buckets.setdefault(
                     window_name,
                     {
-                        "counts": [],
-                        "successes": [],
-                        "failures": [],
-                        "prompt_tokens": [],
-                        "completion_tokens": [],
-                        "thinking_tokens": [],
-                        "output_tokens": [],
-                        "prompt_tokens_cache_read": [],
-                        "prompt_tokens_cache_write": [],
-                        "total_tokens": [],
-                        "approx_cost": [],
+                        "request_count": 0,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "thinking_tokens": 0,
+                        "output_tokens": 0,
+                        "prompt_tokens_cache_read": 0,
+                        "prompt_tokens_cache_write": 0,
+                        "total_tokens": 0,
+                        "approx_cost": 0.0,
                         "started_at": [],
                         "reset_at": [],
                         "limit": [],
                     },
                 )
-                bucket["counts"].append(window.request_count)
-                bucket["successes"].append(window.success_count)
-                bucket["failures"].append(window.failure_count)
-                bucket["prompt_tokens"].append(window.prompt_tokens)
-                bucket["completion_tokens"].append(window.completion_tokens)
-                bucket["thinking_tokens"].append(window.thinking_tokens)
-                bucket["output_tokens"].append(window.output_tokens)
-                bucket["prompt_tokens_cache_read"].append(
-                    window.prompt_tokens_cache_read
-                )
-                bucket["prompt_tokens_cache_write"].append(
-                    window.prompt_tokens_cache_write
-                )
-                bucket["total_tokens"].append(window.total_tokens)
-                bucket["approx_cost"].append(window.approx_cost)
+                bucket["request_count"] += window.request_count
+                bucket["success_count"] += window.success_count
+                bucket["failure_count"] += window.failure_count
+                bucket["prompt_tokens"] += window.prompt_tokens
+                bucket["completion_tokens"] += window.completion_tokens
+                bucket["thinking_tokens"] += window.thinking_tokens
+                bucket["output_tokens"] += window.output_tokens
+                bucket["prompt_tokens_cache_read"] += window.prompt_tokens_cache_read
+                bucket["prompt_tokens_cache_write"] += window.prompt_tokens_cache_write
+                bucket["total_tokens"] += window.total_tokens
+                bucket["approx_cost"] += window.approx_cost
                 if window.started_at is not None:
                     bucket["started_at"].append(window.started_at)
                 if window.reset_at is not None:
@@ -1291,59 +1246,89 @@ class UsageManager:
                 if window.limit is not None:
                     bucket["limit"].append(window.limit)
 
-        for group, windows in group_windows.items():
+        aggregated: Dict[str, WindowStats] = {}
+        for window_name, bucket in buckets.items():
+            success_count = bucket["success_count"]
+            failure_count = bucket["failure_count"]
+            request_count = success_count + failure_count
+            if request_count == 0:
+                request_count = bucket["request_count"]
+                if request_count > 0:
+                    success_count = request_count
+            started_at = min(bucket["started_at"]) if bucket["started_at"] else None
+            reset_at = max(bucket["reset_at"]) if bucket["reset_at"] else None
+            limit = max(bucket["limit"]) if bucket["limit"] else None
+            aggregated[window_name] = WindowStats(
+                name=window_name,
+                request_count=request_count,
+                success_count=success_count,
+                failure_count=failure_count,
+                total_tokens=bucket["total_tokens"],
+                prompt_tokens=bucket["prompt_tokens"],
+                completion_tokens=bucket["completion_tokens"],
+                thinking_tokens=bucket["thinking_tokens"],
+                output_tokens=bucket["output_tokens"],
+                prompt_tokens_cache_read=bucket["prompt_tokens_cache_read"],
+                prompt_tokens_cache_write=bucket["prompt_tokens_cache_write"],
+                approx_cost=bucket["approx_cost"],
+                started_at=started_at,
+                reset_at=reset_at,
+                limit=limit,
+            )
+
+        return aggregated
+
+    def _sync_credential_windows(
+        self,
+        state: CredentialState,
+        model_window_names: Set[str],
+    ) -> None:
+        if not model_window_names:
+            return
+        usages = list(state.model_usage.values())
+        if not usages:
+            return
+        aggregated = self._aggregate_model_windows(usages, model_window_names)
+        if not aggregated:
+            return
+        state.usage.windows.update(aggregated)
+
+    def _backfill_group_usage_for_state(self, state: CredentialState) -> None:
+        model_window_names = {
+            window_def.name
+            for window_def in self._config.windows
+            if window_def.applies_to == "model"
+        }
+        if not model_window_names:
+            return
+
+        for model in state.model_usage.keys():
+            group = self._get_model_quota_group(model)
+            if not group:
+                continue
             group_usage = state.group_usage.setdefault(group, UsageStats())
-            for window_name, bucket in windows.items():
-                counts = bucket["counts"]
-                if not counts:
-                    continue
-                synced = all(count == counts[0] for count in counts)
-                if synced:
-                    request_count = counts[0]
-                    success_count = bucket["successes"][0]
-                    failure_count = bucket["failures"][0]
-                    prompt_tokens = bucket["prompt_tokens"][0]
-                    completion_tokens = bucket["completion_tokens"][0]
-                    thinking_tokens = bucket["thinking_tokens"][0]
-                    output_tokens = bucket["output_tokens"][0]
-                    prompt_tokens_cache_read = bucket["prompt_tokens_cache_read"][0]
-                    prompt_tokens_cache_write = bucket["prompt_tokens_cache_write"][0]
-                    total_tokens = bucket["total_tokens"][0]
-                    approx_cost = bucket["approx_cost"][0]
-                else:
-                    request_count = sum(counts)
-                    success_count = sum(bucket["successes"])
-                    failure_count = sum(bucket["failures"])
-                    prompt_tokens = sum(bucket["prompt_tokens"])
-                    completion_tokens = sum(bucket["completion_tokens"])
-                    thinking_tokens = sum(bucket["thinking_tokens"])
-                    output_tokens = sum(bucket["output_tokens"])
-                    prompt_tokens_cache_read = sum(bucket["prompt_tokens_cache_read"])
-                    prompt_tokens_cache_write = sum(bucket["prompt_tokens_cache_write"])
-                    total_tokens = sum(bucket["total_tokens"])
-                    approx_cost = sum(bucket["approx_cost"])
+            grouped_models = self._get_grouped_models(group)
+            group_usages = [
+                state.model_usage[m] for m in grouped_models if m in state.model_usage
+            ]
+            aggregated = self._aggregate_model_windows(group_usages, model_window_names)
+            if aggregated:
+                group_usage.windows.update(aggregated)
 
-                started_at = min(bucket["started_at"]) if bucket["started_at"] else None
-                reset_at = max(bucket["reset_at"]) if bucket["reset_at"] else None
-                limit = max(bucket["limit"]) if bucket["limit"] else None
-
-                group_usage.windows[window_name] = WindowStats(
-                    name=window_name,
-                    request_count=request_count,
-                    success_count=success_count,
-                    failure_count=failure_count,
-                    total_tokens=total_tokens,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    thinking_tokens=thinking_tokens,
-                    output_tokens=output_tokens,
-                    prompt_tokens_cache_read=prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                    approx_cost=approx_cost,
-                    started_at=started_at,
-                    reset_at=reset_at,
-                    limit=limit,
-                )
+    def _backfill_credential_windows(self, state: CredentialState) -> None:
+        model_window_names = {
+            window_def.name
+            for window_def in self._config.windows
+            if window_def.applies_to == "model"
+        }
+        if not model_window_names:
+            return
+        usages = list(state.model_usage.values())
+        if not usages:
+            return
+        aggregated = self._aggregate_model_windows(usages, model_window_names)
+        if aggregated:
+            state.usage.windows.update(aggregated)
 
     def _backfill_model_usage(self, state: CredentialState) -> None:
         if not state.usage.model_request_counts:
@@ -1395,6 +1380,24 @@ class UsageManager:
                 existing = state.cooldowns.get(grouped_model)
                 if not existing or existing.until < cooldown.until:
                     state.cooldowns[grouped_model] = cooldown
+
+    def _reconcile_window_counts(self, window: WindowStats, request_count: int) -> None:
+        local_total = window.success_count + window.failure_count
+        window.request_count = request_count
+        if local_total == 0 and request_count > 0:
+            window.success_count = request_count
+            window.failure_count = 0
+            return
+
+        if request_count < local_total:
+            failure_count = min(window.failure_count, request_count)
+            success_count = max(0, request_count - failure_count)
+            window.success_count = success_count
+            window.failure_count = failure_count
+            return
+
+        if request_count > local_total:
+            window.success_count += request_count - local_total
 
     async def save(self, force: bool = False) -> bool:
         """
@@ -1558,8 +1561,12 @@ class UsageManager:
             if force:
                 synced_count = quota_used
             else:
-                synced_count = max(primary_window.request_count, quota_used)
-            primary_window.request_count = synced_count
+                synced_count = max(
+                    primary_window.request_count,
+                    quota_used,
+                    primary_window.success_count + primary_window.failure_count,
+                )
+            self._reconcile_window_counts(primary_window, synced_count)
             state.usage.model_request_counts[normalized_model] = synced_count
         else:
             state.usage.model_request_counts.setdefault(normalized_model, 0)
@@ -1580,11 +1587,14 @@ class UsageManager:
             if quota_used is not None:
                 # Same stale-data protection for group windows
                 if force:
-                    group_window.request_count = quota_used
+                    synced_count = quota_used
                 else:
-                    group_window.request_count = max(
-                        group_window.request_count, quota_used
+                    synced_count = max(
+                        group_window.request_count,
+                        quota_used,
+                        group_window.success_count + group_window.failure_count,
                     )
+                self._reconcile_window_counts(group_window, synced_count)
             else:
                 group_window.request_count = group_window.request_count or 0
 
