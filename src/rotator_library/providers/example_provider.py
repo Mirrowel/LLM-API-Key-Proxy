@@ -72,6 +72,7 @@ WindowStats (per time window: "5h", "daily", "total"):
 import asyncio
 import logging
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -86,6 +87,39 @@ from ..usage import UsageManager, ProviderUsageConfig, WindowDefinition
 from ..usage.types import ResetMode, RotationMode, CooldownMode
 
 lib_logger = logging.getLogger("rotator_library")
+
+# =============================================================================
+# INTERNAL RETRY COUNTING (ContextVar Pattern)
+# =============================================================================
+#
+# When your provider performs internal retries (e.g., for transient errors,
+# empty responses, or rate limits), each retry is an API call that should be
+# counted for accurate usage tracking.
+#
+# The challenge: Instance variables (self.count) are shared across concurrent
+# requests, so they can't be used safely. ContextVar solves this by giving
+# each async task its own isolated value.
+#
+# Usage pattern:
+#   1. Reset to 1 at the start of your retry loop
+#   2. Increment before each retry
+#   3. Read in on_request_complete() to report the actual count
+#
+# Example:
+#   _attempt_count.set(1)  # Reset
+#   for attempt in range(max_attempts):
+#       try:
+#           result = await api_call()
+#           return result
+#       except RetryableError:
+#           _attempt_count.set(_attempt_count.get() + 1)  # Increment
+#           continue
+#
+# Then on_request_complete returns RequestCompleteResult(count_override=_attempt_count.get())
+#
+_example_attempt_count: ContextVar[int] = ContextVar(
+    "example_provider_attempt_count", default=1
+)
 
 
 # =============================================================================
@@ -336,7 +370,7 @@ class ExampleProvider(ProviderPlugin):
             - Don't count server errors as quota usage
             - Apply custom cooldowns based on error type
             - Force credential exhaustion for fair cycle
-            - Adjust request count based on response
+            - Count internal retries accurately (see ContextVar pattern below)
 
         Args:
             credential: The credential accessor (file path or API key)
@@ -362,7 +396,38 @@ class ExampleProvider(ProviderPlugin):
                     - True = Mark credential as exhausted for fair cycle
                     - Useful for quota errors even without long cooldown
         """
-        # Example: Don't count server errors (5xx) as requests
+        # =====================================================================
+        # PATTERN: Counting Internal Retries with ContextVar
+        # =====================================================================
+        # If your provider performs internal retries, report the actual count:
+        #
+        # 1. At module level, define:
+        #    _attempt_count: ContextVar[int] = ContextVar('my_attempt_count', default=1)
+        #
+        # 2. In your retry loop:
+        #    _attempt_count.set(1)  # Reset at start
+        #    for attempt in range(max_attempts):
+        #        try:
+        #            return await api_call()
+        #        except RetryableError:
+        #            _attempt_count.set(_attempt_count.get() + 1)  # Increment before retry
+        #            continue
+        #
+        # 3. Here, report the count:
+        attempt_count = _example_attempt_count.get()
+        _example_attempt_count.set(1)  # Reset for safety
+
+        if attempt_count > 1:
+            lib_logger.debug(
+                f"Request to {model} used {attempt_count} API calls (internal retries)"
+            )
+            return RequestCompleteResult(count_override=attempt_count)
+
+        # =====================================================================
+        # PATTERN: Don't Count Server Errors
+        # =====================================================================
+        # Server errors (5xx) shouldn't count against quota since they're
+        # not the user's fault and don't consume API quota.
         if not success and error:
             error_type = getattr(error, "error_type", None)
             if error_type in ("server_error", "api_connection"):
@@ -371,7 +436,9 @@ class ExampleProvider(ProviderPlugin):
                 )
                 return RequestCompleteResult(count_override=0)
 
-        # Example: Apply custom cooldown for rate limits
+        # =====================================================================
+        # PATTERN: Custom Cooldown for Rate Limits
+        # =====================================================================
         if not success and error:
             error_type = getattr(error, "error_type", None)
             if error_type == "rate_limit":
@@ -387,7 +454,9 @@ class ExampleProvider(ProviderPlugin):
                     # Short rate limit - just cooldown
                     return RequestCompleteResult(cooldown_override=retry_after)
 
-        # Example: Quota exceeded - force exhaustion even without cooldown info
+        # =====================================================================
+        # PATTERN: Force Exhaustion on Quota Exceeded
+        # =====================================================================
         if not success and error:
             error_type = getattr(error, "error_type", None)
             if error_type == "quota_exceeded":

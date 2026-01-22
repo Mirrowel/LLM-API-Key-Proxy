@@ -29,6 +29,7 @@ import os
 import random
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -166,6 +167,30 @@ EMPTY_RESPONSE_RETRY_DELAY = env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3
 # inject corrective messages and retry up to this many times
 MALFORMED_CALL_MAX_RETRIES = max(1, env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
 MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
+
+# =============================================================================
+# INTERNAL RETRY COUNTING (for usage tracking)
+# =============================================================================
+# Tracks the number of API attempts made per request, including internal retries
+# for empty responses, bare 429s, and malformed function calls.
+#
+# Uses ContextVar for thread-safety: each async task (request) gets its own
+# isolated value, so concurrent requests don't interfere with each other.
+#
+# The count is:
+# - Reset to 1 at the start of _streaming_with_retry
+# - Incremented each time we retry (before the next attempt)
+# - Read by on_request_complete() hook to report actual API call count
+#
+# Example: Request gets bare 429 twice, then succeeds
+#   Attempt 1: bare 429 → count stays 1, increment to 2, retry
+#   Attempt 2: bare 429 → count is 2, increment to 3, retry
+#   Attempt 3: success → count is 3
+#   on_request_complete returns count_override=3
+#
+_internal_attempt_count: ContextVar[int] = ContextVar(
+    "antigravity_attempt_count", default=1
+)
 
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
@@ -4581,6 +4606,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         current_gemini_contents = gemini_contents
         current_payload = payload
 
+        # Reset internal attempt counter for this request (thread-safe via ContextVar)
+        _internal_attempt_count.set(1)
+
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
@@ -4608,6 +4636,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         f"[Antigravity] Empty stream from {model}, "
                         f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                     )
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                     continue
                 else:
@@ -4710,6 +4740,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 malformed_retry_count, current_payload
                             )
 
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
                     continue  # Retry with modified payload
                 else:
@@ -4737,6 +4769,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             lib_logger.warning(
                                 f"[Antigravity] Bare 429 from {model}, "
                                 f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            # Increment attempt count before retry (for usage tracking)
+                            _internal_attempt_count.set(
+                                _internal_attempt_count.get() + 1
                             )
                             await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                             continue
@@ -4829,3 +4865,51 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         except Exception as e:
             lib_logger.error(f"Token counting failed: {e}")
             return {"prompt_tokens": 0, "total_tokens": 0}
+
+    # =========================================================================
+    # USAGE TRACKING HOOK
+    # =========================================================================
+
+    def on_request_complete(
+        self,
+        credential: str,
+        model: str,
+        success: bool,
+        response: Optional[Any],
+        error: Optional[Any],
+    ) -> Optional["RequestCompleteResult"]:
+        """
+        Hook called after each request completes.
+
+        Reports the actual number of API calls made, including internal retries
+        for empty responses, bare 429s, and malformed function calls.
+
+        This uses the ContextVar pattern for thread-safe retry counting:
+        - _internal_attempt_count is set to 1 at start of _streaming_with_retry
+        - Incremented before each retry
+        - Read here to report the actual count
+
+        Example: Request gets 2 bare 429s then succeeds
+            → 3 API calls made
+            → Returns count_override=3
+            → Usage manager records 3 requests instead of 1
+
+        Returns:
+            RequestCompleteResult with count_override set to actual attempt count
+        """
+        from ..core.types import RequestCompleteResult
+
+        # Get the attempt count for this request
+        attempt_count = _internal_attempt_count.get()
+
+        # Reset for safety (though ContextVar should isolate per-task)
+        _internal_attempt_count.set(1)
+
+        # Log if we made extra attempts
+        if attempt_count > 1:
+            lib_logger.debug(
+                f"[Antigravity] Request to {model} used {attempt_count} API calls "
+                f"(includes internal retries)"
+            )
+
+        return RequestCompleteResult(count_override=attempt_count)
