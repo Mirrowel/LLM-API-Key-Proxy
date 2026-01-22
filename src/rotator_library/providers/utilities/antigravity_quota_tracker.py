@@ -990,6 +990,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         self,
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
+        force: bool = False,
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
@@ -997,6 +998,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         Args:
             quota_results: Dict from fetch_quota_from_api or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
+            force: If True, always use API values (for manual refresh)
 
         Returns:
             Number of baselines successfully stored
@@ -1065,6 +1067,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                     quota_reset_ts=reset_timestamp,
                     quota_used=quota_used,
                     quota_group=quota_group,
+                    force=force,
                 )
 
                 # Aggregate cooldown info if returned

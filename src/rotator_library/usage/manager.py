@@ -1440,6 +1440,7 @@ class UsageManager:
         quota_reset_ts: Optional[float] = None,
         quota_used: Optional[int] = None,
         quota_group: Optional[str] = None,
+        force: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline from provider API response.
@@ -1454,6 +1455,11 @@ class UsageManager:
             quota_reset_ts: When quota resets (Unix timestamp)
             quota_used: Current used count from API
             quota_group: Optional quota group (uses model if None)
+            force: If True, always use API values (for manual refresh).
+                If False (default), use max(local, api) to prevent stale
+                API data from overwriting accurate local counts during
+                background fetches.
+                See: https://github.com/Mirrowel/LLM-API-Key-Proxy/issues/75
 
         Returns:
             Cooldown info dict if cooldown was applied, None otherwise
@@ -1498,8 +1504,16 @@ class UsageManager:
         if quota_reset_ts is not None:
             primary_window.reset_at = quota_reset_ts
         if quota_used is not None:
-            primary_window.request_count = quota_used
-            state.usage.model_request_counts[normalized_model] = quota_used
+            # Use max() to prevent stale API data from overwriting local count
+            # during background fetches. API updates in ~20% increments so may
+            # return stale cached values. Force mode (manual refresh) trusts API.
+            # See: https://github.com/Mirrowel/LLM-API-Key-Proxy/issues/75
+            if force:
+                synced_count = quota_used
+            else:
+                synced_count = max(primary_window.request_count, quota_used)
+            primary_window.request_count = synced_count
+            state.usage.model_request_counts[normalized_model] = synced_count
         else:
             state.usage.model_request_counts.setdefault(normalized_model, 0)
             if primary_window.request_count == 0:
@@ -1517,7 +1531,13 @@ class UsageManager:
             if quota_reset_ts is not None:
                 group_window.reset_at = quota_reset_ts
             if quota_used is not None:
-                group_window.request_count = quota_used
+                # Same stale-data protection for group windows
+                if force:
+                    group_window.request_count = quota_used
+                else:
+                    group_window.request_count = max(
+                        group_window.request_count, quota_used
+                    )
             else:
                 group_window.request_count = group_window.request_count or 0
 

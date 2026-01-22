@@ -510,6 +510,7 @@ class BaseQuotaTracker:
         self,
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
+        force: bool = False,
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
@@ -517,6 +518,7 @@ class BaseQuotaTracker:
         Args:
             quota_results: Dict from _fetch_quota_for_credential or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
+            force: If True, always use API values (for manual refresh)
 
         Returns:
             Number of baselines successfully stored
@@ -553,6 +555,7 @@ class BaseQuotaTracker:
                     quota_max_requests=max_requests,
                     quota_used=quota_used,
                     quota_group=quota_group,
+                    force=force,
                 )
                 stored_count += 1
 
