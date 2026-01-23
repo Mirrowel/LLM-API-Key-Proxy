@@ -267,6 +267,7 @@ class GeminiCredentialManager:
                 f"{provider_name}: Fetching initial quota baselines for {len(credentials)} credentials..."
             )
             quota_results = await self.fetch_initial_baselines(credentials)
+            is_initial_fetch = True
             self._initial_quota_fetch_done = True
         else:
             # Subsequent runs: only recently used credentials (incremental updates)
@@ -274,13 +275,19 @@ class GeminiCredentialManager:
             quota_results = await self.refresh_active_quota_baselines(
                 credentials, usage_data
             )
+            is_initial_fetch = False
 
         if not quota_results:
             return
 
         # Store new baselines in UsageManager
+        # On initial fetch: force=True overwrites with API data, is_initial_fetch enables exhaustion check
+        # On subsequent: force=False uses max logic, no exhaustion check
         stored = await self._store_baselines_to_usage_manager(
-            quota_results, usage_manager
+            quota_results,
+            usage_manager,
+            force=is_initial_fetch,  # Force on initial fetch
+            is_initial_fetch=is_initial_fetch,
         )
         if stored > 0:
             lib_logger.debug(
@@ -320,7 +327,11 @@ class GeminiCredentialManager:
         )
 
     async def _store_baselines_to_usage_manager(
-        self, quota_results: Dict[str, Any], usage_manager: "UsageManager"
+        self,
+        quota_results: Dict[str, Any],
+        usage_manager: "UsageManager",
+        force: bool = False,
+        is_initial_fetch: bool = False,
     ) -> int:
         """Store quota baselines to usage manager. Must be implemented by quota tracker."""
         raise NotImplementedError(

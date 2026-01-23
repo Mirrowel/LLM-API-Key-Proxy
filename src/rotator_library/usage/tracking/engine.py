@@ -580,6 +580,11 @@ class TrackingEngine:
             )
 
         fc_state = state.fair_cycle[model_or_group]
+
+        # Idempotency check: skip if already exhausted (avoid duplicate logging)
+        if fc_state.exhausted:
+            return
+
         fc_state.exhausted = True
         fc_state.exhausted_at = now
         fc_state.exhausted_reason = reason

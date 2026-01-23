@@ -1236,6 +1236,7 @@ class UsageManager:
         quota_used: Optional[int] = None,
         quota_group: Optional[str] = None,
         force: bool = False,
+        apply_exhaustion: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline from provider API response.
@@ -1254,6 +1255,10 @@ class UsageManager:
                 If False (default), use max(local, api) to prevent stale
                 API data from overwriting accurate local counts during
                 background fetches.
+            apply_exhaustion: If True, apply cooldown for exhausted quota.
+                Provider controls when this is set based on its semantics
+                (e.g., Antigravity only on initial fetch, others always
+                when remaining == 0).
 
         Returns:
             Cooldown info dict if cooldown was applied, None otherwise
@@ -1298,41 +1303,40 @@ class UsageManager:
         # Mark state as updated
         state.last_updated = time.time()
 
-        # Check if we need to apply cooldown (quota exhausted)
-        check_window = None
-        if group_key:
-            group_stats = state.get_group_stats(group_key, create=False)
-            if group_stats and primary_def:
-                check_window = group_stats.windows.get(primary_def.name)
-        if check_window is None:
-            model_stats = state.get_model_stats(normalized_model, create=False)
-            if model_stats and primary_def:
-                check_window = model_stats.windows.get(primary_def.name)
-
-        if check_window and check_window.is_exhausted and quota_reset_ts and force:
+        # Apply cooldown if provider indicates exhaustion
+        # Provider controls when apply_exhaustion is set based on its semantics
+        if apply_exhaustion:
             cooldown_target = group_key or normalized_model
-            await self._tracking.apply_cooldown(
-                state=state,
-                reason="quota_exhausted",
-                until=quota_reset_ts,
-                model_or_group=cooldown_target,
-                source="api_quota",
-            )
+            if quota_reset_ts:
+                await self._tracking.apply_cooldown(
+                    state=state,
+                    reason="quota_exhausted",
+                    until=quota_reset_ts,
+                    model_or_group=cooldown_target,
+                    source="api_quota",
+                )
 
-            await self._queue_quota_exhausted_log(
-                accessor=accessor,
-                group_key=cooldown_target,
-                quota_reset_ts=quota_reset_ts,
-            )
+                await self._queue_quota_exhausted_log(
+                    accessor=accessor,
+                    group_key=cooldown_target,
+                    quota_reset_ts=quota_reset_ts,
+                )
 
-            await self._save_if_needed()
+                await self._save_if_needed()
 
-            return {
-                "cooldown_until": quota_reset_ts,
-                "reason": "quota_exhausted",
-                "model": model,
-                "cooldown_hours": max(0.0, (quota_reset_ts - time.time()) / 3600),
-            }
+                return {
+                    "cooldown_until": quota_reset_ts,
+                    "reason": "quota_exhausted",
+                    "model": model,
+                    "cooldown_hours": max(0.0, (quota_reset_ts - time.time()) / 3600),
+                }
+            else:
+                # ERROR: Provider says exhausted but no reset timestamp!
+                lib_logger.error(
+                    f"Quota exhausted for {cooldown_target} on "
+                    f"{self._mask_accessor(accessor)} but no reset_timestamp "
+                    f"provided by API - cannot apply cooldown"
+                )
 
         await self._save_if_needed()
 

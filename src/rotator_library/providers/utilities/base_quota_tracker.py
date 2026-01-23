@@ -511,6 +511,7 @@ class BaseQuotaTracker:
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
         force: bool = False,
+        is_initial_fetch: bool = False,
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
@@ -519,6 +520,9 @@ class BaseQuotaTracker:
             quota_results: Dict from _fetch_quota_for_credential or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
             force: If True, always use API values (for manual refresh)
+            is_initial_fetch: If True, this is the first fetch on startup.
+                For default providers (API is authoritative), exhaustion
+                is applied whenever remaining == 0.0 regardless of this flag.
 
         Returns:
             Number of baselines successfully stored
@@ -549,17 +553,42 @@ class BaseQuotaTracker:
                 if max_requests is not None:
                     quota_used = int((1.0 - remaining) * max_requests)
                 quota_group = self.get_model_quota_group(user_model)
+
+                # Only use reset_timestamp when quota is actually used
+                # (remaining == 1.0 means 100% left, timer is bogus)
+                bucket = self._find_bucket_for_model(quota_data, user_model)
+                reset_timestamp = bucket.get("reset_timestamp") if bucket else None
+                valid_reset_ts = reset_timestamp if remaining < 1.0 else None
+
+                # DEFAULT: Always apply exhaustion if remaining == 0.0 exactly
+                # (API is authoritative for most providers)
+                apply_exhaustion = remaining == 0.0
+
                 await usage_manager.update_quota_baseline(
                     cred_path,
                     prefixed_model,
                     quota_max_requests=max_requests,
+                    quota_reset_ts=valid_reset_ts,
                     quota_used=quota_used,
                     quota_group=quota_group,
                     force=force,
+                    apply_exhaustion=apply_exhaustion,
                 )
                 stored_count += 1
 
         return stored_count
+
+    def _find_bucket_for_model(
+        self, quota_data: Dict[str, Any], user_model: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find the bucket data for a specific model in quota response."""
+        for bucket in quota_data.get("buckets", []):
+            model_id = bucket.get("model_id")
+            if model_id:
+                bucket_user_model = self._api_to_user_model(model_id)
+                if bucket_user_model == user_model:
+                    return bucket
+        return None
 
     # =========================================================================
     # QUOTA COST DISCOVERY

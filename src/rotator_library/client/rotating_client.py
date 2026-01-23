@@ -820,10 +820,11 @@ class RotatingClient:
                     if usage_manager and hasattr(
                         provider_instance, "_store_baselines_to_usage_manager"
                     ):
-                        stored = (
-                            await provider_instance._store_baselines_to_usage_manager(
-                                quota_results, usage_manager, force=True
-                            )
+                        stored = await provider_instance._store_baselines_to_usage_manager(
+                            quota_results,
+                            usage_manager,
+                            force=True,
+                            is_initial_fetch=True,  # Manual refresh checks exhaustion
                         )
                         result["success_count"] += stored
 
