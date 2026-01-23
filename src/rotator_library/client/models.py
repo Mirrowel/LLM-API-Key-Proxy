@@ -33,6 +33,7 @@ class ModelResolver:
         model_definitions: Optional[Any] = None,
         ignore_models: Optional[Dict[str, List[str]]] = None,
         whitelist_models: Optional[Dict[str, List[str]]] = None,
+        provider_instances: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the ModelResolver.
@@ -42,9 +43,13 @@ class ModelResolver:
             model_definitions: ModelDefinitions instance for ID mapping
             ignore_models: Models to ignore/blacklist per provider
             whitelist_models: Models to explicitly whitelist per provider
+            provider_instances: Shared dict for caching provider instances.
+                If None, creates a new dict (not recommended - leads to duplicate instances).
         """
         self._plugins = provider_plugins
-        self._plugin_instances: Dict[str, Any] = {}
+        self._plugin_instances: Dict[str, Any] = (
+            provider_instances if provider_instances is not None else {}
+        )
         self._definitions = model_definitions
         self._ignore = ignore_models or {}
         self._whitelist = whitelist_models or {}

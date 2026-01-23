@@ -90,6 +90,7 @@ class RequestExecutor:
         abort_on_callback_error: bool = True,
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         litellm_logger_fn: Optional[Any] = None,
+        provider_instances: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize RequestExecutor.
@@ -104,13 +105,17 @@ class RequestExecutor:
             max_retries: Max retries per credential
             global_timeout: Global request timeout in seconds
             abort_on_callback_error: Abort on pre-request callback errors
+            provider_instances: Shared dict for caching provider instances.
+                If None, creates a new dict (not recommended - leads to duplicate instances).
         """
         self._usage_managers = usage_managers
         self._cooldown = cooldown_manager
         self._filter = credential_filter
         self._transforms = provider_transforms
         self._plugins = provider_plugins
-        self._plugin_instances: Dict[str, Any] = {}
+        self._plugin_instances: Dict[str, Any] = (
+            provider_instances if provider_instances is not None else {}
+        )
         self._http_client = http_client
         self._max_retries = max_retries
         self._global_timeout = global_timeout

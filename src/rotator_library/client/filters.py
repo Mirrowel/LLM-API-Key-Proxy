@@ -24,15 +24,23 @@ class CredentialFilter:
     duplicated in both _execute_with_retry and _streaming_acompletion_with_retry.
     """
 
-    def __init__(self, provider_plugins: Dict[str, Any]):
+    def __init__(
+        self,
+        provider_plugins: Dict[str, Any],
+        provider_instances: Optional[Dict[str, Any]] = None,
+    ):
         """
         Initialize the CredentialFilter.
 
         Args:
             provider_plugins: Dict mapping provider names to plugin classes/instances
+            provider_instances: Shared dict for caching provider instances.
+                If None, creates a new dict (not recommended - leads to duplicate instances).
         """
         self._plugins = provider_plugins
-        self._plugin_instances: Dict[str, Any] = {}
+        self._plugin_instances: Dict[str, Any] = (
+            provider_instances if provider_instances is not None else {}
+        )
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
         """

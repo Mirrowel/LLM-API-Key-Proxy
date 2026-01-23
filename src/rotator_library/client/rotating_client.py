@@ -179,16 +179,21 @@ class RotatingClient:
         self.http_client = httpx.AsyncClient()
 
         # Initialize extracted components
-        self._credential_filter = CredentialFilter(PROVIDER_PLUGINS)
+        self._credential_filter = CredentialFilter(
+            PROVIDER_PLUGINS,
+            provider_instances=self._provider_instances,
+        )
         self._model_resolver = ModelResolver(
             PROVIDER_PLUGINS,
             self.model_definitions,
             ignore_models or {},
             whitelist_models or {},
+            provider_instances=self._provider_instances,
         )
         self._provider_transforms = ProviderTransforms(
             PROVIDER_PLUGINS,
             self.provider_config,
+            provider_instances=self._provider_instances,
         )
 
         # Initialize UsageManagers (one per provider) using new usage package
@@ -246,6 +251,7 @@ class RotatingClient:
             abort_on_callback_error=abort_on_callback_error,
             litellm_provider_params=self.litellm_provider_params,
             litellm_logger_fn=self._litellm_logger_fn,
+            provider_instances=self._provider_instances,
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}

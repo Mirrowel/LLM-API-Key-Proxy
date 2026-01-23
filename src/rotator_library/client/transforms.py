@@ -35,6 +35,7 @@ class ProviderTransforms:
         self,
         provider_plugins: Dict[str, Any],
         provider_config: Optional[Any] = None,
+        provider_instances: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize ProviderTransforms.
@@ -42,9 +43,13 @@ class ProviderTransforms:
         Args:
             provider_plugins: Dict mapping provider names to plugin classes
             provider_config: ProviderConfig instance for LiteLLM conversions
+            provider_instances: Shared dict for caching provider instances.
+                If None, creates a new dict (not recommended - leads to duplicate instances).
         """
         self._plugins = provider_plugins
-        self._plugin_instances: Dict[str, Any] = {}
+        self._plugin_instances: Dict[str, Any] = (
+            provider_instances if provider_instances is not None else {}
+        )
         self._config = provider_config
 
         # Registry of built-in transforms
