@@ -86,6 +86,14 @@ DEFAULT_FAIR_CYCLE_DURATION: int = 604800  # 7 days
 # Global fallback: EXHAUSTION_COOLDOWN_THRESHOLD=<seconds>
 DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD: int = 300  # 5 minutes
 
+# Cross-provider fallback cooldown controls
+# Apply a short provider-wide cooldown to the primary provider after fallback.
+# Override: FALLBACK_COOLDOWN_MULTIPLIER_{PROVIDER}=<float>
+# Override: FALLBACK_COOLDOWN_MIN_SECONDS_{PROVIDER}=<int>
+# Global fallback: FALLBACK_COOLDOWN_MULTIPLIER / FALLBACK_COOLDOWN_MIN_SECONDS
+DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER: float = 1.5
+DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS: int = 60
+
 # =============================================================================
 # CUSTOM CAPS DEFAULTS
 # =============================================================================

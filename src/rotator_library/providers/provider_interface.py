@@ -30,6 +30,8 @@ from ..config import (
     DEFAULT_FAIR_CYCLE_CROSS_TIER,
     DEFAULT_FAIR_CYCLE_DURATION,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER,
+    DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS,
 )
 
 
@@ -176,6 +178,16 @@ class ProviderInterface(ABC):
     # Can be overridden via env: EXHAUSTION_COOLDOWN_THRESHOLD_{PROVIDER}=<seconds>
     # Global fallback: EXHAUSTION_COOLDOWN_THRESHOLD=<seconds>
     default_exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+
+    # Fallback cooldown controls
+    # Used to temporarily pause a primary provider after switching to a fallback.
+    # Can be overridden via env:
+    #   FALLBACK_COOLDOWN_MULTIPLIER_{PROVIDER}=<float>
+    #   FALLBACK_COOLDOWN_MIN_SECONDS_{PROVIDER}=<int>
+    # Global fallback:
+    #   FALLBACK_COOLDOWN_MULTIPLIER / FALLBACK_COOLDOWN_MIN_SECONDS
+    default_fallback_cooldown_multiplier: float = DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER
+    default_fallback_cooldown_min_seconds: int = DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS
 
     # =========================================================================
     # CUSTOM CAPS - Override in subclass

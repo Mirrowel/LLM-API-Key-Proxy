@@ -52,6 +52,8 @@ from .config import (
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_FAIR_CYCLE_DURATION,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER,
+    DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
 )
 
@@ -364,6 +366,29 @@ class RotatingClient:
                     f"Invalid EXHAUSTION_COOLDOWN_THRESHOLD: {global_threshold_str}. Using default {DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD}."
                 )
 
+        # Fallback cooldown settings
+        fallback_cooldown_multiplier: Dict[str, float] = {}
+        fallback_cooldown_min_seconds: Dict[str, int] = {}
+        global_multiplier_str = os.getenv("FALLBACK_COOLDOWN_MULTIPLIER")
+        global_multiplier = DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER
+        if global_multiplier_str:
+            try:
+                global_multiplier = float(global_multiplier_str)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid FALLBACK_COOLDOWN_MULTIPLIER: {global_multiplier_str}. Using default {DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER}."
+                )
+
+        global_min_seconds_str = os.getenv("FALLBACK_COOLDOWN_MIN_SECONDS")
+        global_min_seconds = DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS
+        if global_min_seconds_str:
+            try:
+                global_min_seconds = int(global_min_seconds_str)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid FALLBACK_COOLDOWN_MIN_SECONDS: {global_min_seconds_str}. Using default {DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS}."
+                )
+
         for provider in self.all_credentials.keys():
             provider_class = self._provider_plugins.get(provider)
 
@@ -389,6 +414,46 @@ class RotatingClient:
                 # Use global threshold if set and different from default
                 exhaustion_cooldown_threshold[provider] = global_threshold
 
+            # Fallback cooldown multiplier
+            multiplier_key = f"FALLBACK_COOLDOWN_MULTIPLIER_{provider.upper()}"
+            multiplier_val = os.getenv(multiplier_key)
+            if multiplier_val is not None:
+                try:
+                    fallback_cooldown_multiplier[provider] = float(multiplier_val)
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid {multiplier_key}: {multiplier_val}. Must be float."
+                    )
+            elif provider_class and hasattr(
+                provider_class, "default_fallback_cooldown_multiplier"
+            ):
+                default_multiplier = provider_class.default_fallback_cooldown_multiplier
+                if default_multiplier != DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER:
+                    fallback_cooldown_multiplier[provider] = default_multiplier
+            elif global_multiplier != DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER:
+                fallback_cooldown_multiplier[provider] = global_multiplier
+
+            # Fallback cooldown minimum seconds
+            min_seconds_key = f"FALLBACK_COOLDOWN_MIN_SECONDS_{provider.upper()}"
+            min_seconds_val = os.getenv(min_seconds_key)
+            if min_seconds_val is not None:
+                try:
+                    fallback_cooldown_min_seconds[provider] = int(min_seconds_val)
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid {min_seconds_key}: {min_seconds_val}. Must be integer."
+                    )
+            elif provider_class and hasattr(
+                provider_class, "default_fallback_cooldown_min_seconds"
+            ):
+                default_min_seconds = (
+                    provider_class.default_fallback_cooldown_min_seconds
+                )
+                if default_min_seconds != DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS:
+                    fallback_cooldown_min_seconds[provider] = default_min_seconds
+            elif global_min_seconds != DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS:
+                fallback_cooldown_min_seconds[provider] = global_min_seconds
+
         # Log fair cycle configuration
         for provider, enabled in fair_cycle_enabled.items():
             if not enabled:
@@ -401,6 +466,16 @@ class RotatingClient:
         for provider, cross_tier in fair_cycle_cross_tier.items():
             if cross_tier:
                 lib_logger.info(f"Provider '{provider}' fair cycle cross-tier: enabled")
+        for provider, multiplier in fallback_cooldown_multiplier.items():
+            if multiplier != DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER:
+                lib_logger.info(
+                    f"Provider '{provider}' fallback cooldown multiplier: {multiplier}"
+                )
+        for provider, min_seconds in fallback_cooldown_min_seconds.items():
+            if min_seconds != DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS:
+                lib_logger.info(
+                    f"Provider '{provider}' fallback cooldown min seconds: {min_seconds}"
+                )
 
         # Build custom caps configuration
         # Format: CUSTOM_CAP_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<value>
@@ -494,6 +569,9 @@ class RotatingClient:
         else:
             resolved_usage_path = self.data_dir / "key_usage.json"
 
+        self.exhaustion_cooldown_threshold = exhaustion_cooldown_threshold
+        self.fallback_cooldown_multiplier = fallback_cooldown_multiplier
+        self.fallback_cooldown_min_seconds = fallback_cooldown_min_seconds
         self.usage_manager = UsageManager(
             file_path=resolved_usage_path,
             rotation_tolerance=rotation_tolerance,
@@ -518,6 +596,13 @@ class RotatingClient:
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
         self.model_definitions = ModelDefinitions()
+
+        # [NEW] Provider Compatibility Map for Cross-Provider Fallback
+        # Defines bidirectional compatibility between providers for smart model fallback
+        self.provider_compatibility = {
+            "gemini_cli": "antigravity",
+            "antigravity": "gemini_cli",
+        }
 
         # Store and validate max concurrent requests per key
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
@@ -1934,6 +2019,26 @@ class RotatingClient:
             # Log concise summary for server logs
             lib_logger.error(error_accumulator.build_log_message())
 
+            # [Cross-Provider Fallback]
+            # If all credentials failed, try fallback provider if available
+            fallback_model = await self._get_fallback_model(model)
+            # Only fallback if we haven't already (prevent infinite recursion)
+            if fallback_model and not kwargs.get("_is_fallback_attempt"):
+                fallback_provider = fallback_model.split("/", 1)[0]
+                lib_logger.warning(
+                    f"Cross-Provider Fallback: {model} exhausted (all keys failed). "
+                    f"Switching to {fallback_model}."
+                )
+                await self._apply_fallback_cooldown(provider, fallback_provider)
+                # Update model and mark as fallback attempt
+                kwargs["model"] = fallback_model
+                kwargs["_is_fallback_attempt"] = True
+
+                # Recursive call with fallback model
+                return await self._execute_with_retry(
+                    api_call, request, pre_request_callback, **kwargs
+                )
+
             # Return the structured error response for the client
             return error_accumulator.build_client_error_response()
 
@@ -2737,6 +2842,24 @@ class RotatingClient:
                 # Log concise summary for server logs
                 lib_logger.error(error_accumulator.build_log_message())
 
+                # [Cross-Provider Fallback]
+                fallback_model = await self._get_fallback_model(model)
+                if fallback_model and not kwargs.get("_is_fallback_attempt"):
+                    fallback_provider = fallback_model.split("/", 1)[0]
+                    lib_logger.warning(
+                        f"Cross-Provider Fallback: {model} exhausted (all keys failed). "
+                        f"Switching to {fallback_model}."
+                    )
+                    await self._apply_fallback_cooldown(provider, fallback_provider)
+                    kwargs["model"] = fallback_model
+                    kwargs["_is_fallback_attempt"] = True
+
+                    async for chunk in self._streaming_acompletion_with_retry(
+                        request, pre_request_callback, **kwargs
+                    ):
+                        yield chunk
+                    return
+
                 # Build structured error response for client
                 error_response = error_accumulator.build_client_error_response()
                 error_data = error_response
@@ -2758,6 +2881,25 @@ class RotatingClient:
             yield "data: [DONE]\n\n"
 
         except NoAvailableKeysError as e:
+            # [Cross-Provider Fallback]
+            fallback_model = await self._get_fallback_model(model)
+            if fallback_model and not kwargs.get("_is_fallback_attempt"):
+                fallback_provider = fallback_model.split("/", 1)[0]
+                lib_logger.warning(
+                    f"Cross-Provider Fallback: {model} exhausted (NoAvailableKeysError). "
+                    f"Switching to {fallback_model}."
+                )
+                await self._apply_fallback_cooldown(provider, fallback_provider)
+                kwargs["model"] = fallback_model
+                kwargs["_is_fallback_attempt"] = True
+
+                # Delegate to new stream generator
+                async for chunk in self._streaming_acompletion_with_retry(
+                    request, pre_request_callback, **kwargs
+                ):
+                    yield chunk
+                return
+
             lib_logger.error(
                 f"A streaming request failed because no keys were available within the time budget: {e}"
             )
@@ -2778,6 +2920,91 @@ class RotatingClient:
             }
             yield f"data: {json.dumps(error_data)}\n\n"
             yield "data: [DONE]\n\n"
+
+    async def _get_fallback_model(self, model: str) -> Optional[str]:
+        """
+        Resolve a fallback model from a compatible provider if available.
+        Uses smart ID matching (e.g. gemini_cli/gemini-pro -> antigravity/gemini-pro).
+        """
+        if "/" not in model:
+            return None
+
+        provider, model_name = model.split("/", 1)
+
+        # Check if we have a compatible fallback provider
+        fallback_provider = self.provider_compatibility.get(provider)
+        if not fallback_provider:
+            return None
+
+        # Check if we have credentials for the fallback provider
+        # We need to check both API keys and OAuth credentials
+        has_creds = (
+            fallback_provider in self.api_keys
+            or fallback_provider in self.oauth_credentials
+        )
+
+        if not has_creds:
+            return None
+
+        fallback_model = f"{fallback_provider}/{model_name}"
+        if self._is_model_ignored(fallback_provider, fallback_model):
+            lib_logger.info(
+                f"Fallback model {fallback_model} is ignored for provider {fallback_provider}."
+            )
+            return None
+
+        if fallback_provider in self.whitelist_models and not self._is_model_whitelisted(
+            fallback_provider, fallback_model
+        ):
+            lib_logger.info(
+                f"Fallback model {fallback_model} is not whitelisted for provider {fallback_provider}."
+            )
+            return None
+
+        available_models = await self.get_available_models(fallback_provider)
+        if available_models:
+            if fallback_model not in available_models and model_name not in available_models:
+                if not any(
+                    candidate.endswith(f"/{model_name}")
+                    for candidate in available_models
+                ):
+                    lib_logger.info(
+                        f"Fallback model {fallback_model} is not available for provider {fallback_provider}."
+                    )
+                    return None
+        else:
+            lib_logger.info(
+                f"Fallback provider {fallback_provider} reported no available models."
+            )
+            return None
+
+        # Construct fallback model ID
+        # We assume model names (suffixes) are consistent across compatible providers
+        return fallback_model
+
+    async def _apply_fallback_cooldown(
+        self, primary_provider: str, fallback_provider: str
+    ) -> None:
+        if not primary_provider or primary_provider == fallback_provider:
+            return
+
+        cooldown_threshold = self.exhaustion_cooldown_threshold.get(
+            primary_provider, DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
+        )
+        cooldown_multiplier = self.fallback_cooldown_multiplier.get(
+            primary_provider, DEFAULT_FALLBACK_COOLDOWN_MULTIPLIER
+        )
+        cooldown_min_seconds = self.fallback_cooldown_min_seconds.get(
+            primary_provider, DEFAULT_FALLBACK_COOLDOWN_MIN_SECONDS
+        )
+        cooldown_seconds = max(
+            int(cooldown_threshold * cooldown_multiplier),
+            cooldown_min_seconds,
+        )
+        await self.cooldown_manager.start_cooldown(primary_provider, cooldown_seconds)
+        lib_logger.info(
+            f"Applied fallback cooldown for {primary_provider}: {cooldown_seconds}s."
+        )
 
     def acompletion(
         self,

@@ -493,6 +493,17 @@ ANTIGRAVITY_SETTINGS = {
         "default": ANTIGRAVITY_DEFAULT_OAUTH_PORT,
         "description": "Local port for OAuth callback server during authentication",
     },
+    # Cross-provider fallback tuning (extend for additional providers if needed)
+    "FALLBACK_COOLDOWN_MULTIPLIER_ANTIGRAVITY": {
+        "type": "float",
+        "default": 1.5,
+        "description": "Multiplier applied to exhaustion cooldown when fallback triggers",
+    },
+    "FALLBACK_COOLDOWN_MIN_SECONDS_ANTIGRAVITY": {
+        "type": "int",
+        "default": 60,
+        "description": "Minimum fallback cooldown duration after switching providers",
+    },
 }
 
 # Gemini CLI provider environment variables
@@ -541,6 +552,17 @@ GEMINI_CLI_SETTINGS = {
         "type": "int",
         "default": GEMINI_CLI_DEFAULT_OAUTH_PORT,
         "description": "Local port for OAuth callback server during authentication",
+    },
+    # Cross-provider fallback tuning (extend for additional providers if needed)
+    "FALLBACK_COOLDOWN_MULTIPLIER_GEMINI_CLI": {
+        "type": "float",
+        "default": 1.5,
+        "description": "Multiplier applied to exhaustion cooldown when fallback triggers",
+    },
+    "FALLBACK_COOLDOWN_MIN_SECONDS_GEMINI_CLI": {
+        "type": "int",
+        "default": 60,
+        "description": "Minimum fallback cooldown duration after switching providers",
     },
 }
 
