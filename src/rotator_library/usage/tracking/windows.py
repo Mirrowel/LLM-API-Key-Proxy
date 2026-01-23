@@ -95,6 +95,20 @@ class WindowManager:
         if window is not None:
             return window
 
+        # Preserve max_recorded_requests from expired window (if exists)
+        old_max = None
+        old_max_at = None
+        old_window = windows.get(window_name)
+        if old_window is not None:
+            # Take max of the old window's recorded max and its final request count
+            old_recorded_max = old_window.max_recorded_requests or 0
+            if old_window.request_count > old_recorded_max:
+                old_max = old_window.request_count
+                old_max_at = old_window.last_used_at or time.time()
+            elif old_recorded_max > 0:
+                old_max = old_recorded_max
+                old_max_at = old_window.max_recorded_at
+
         # Create new window
         definition = self.definitions.get(window_name)
         now = time.time()
@@ -106,6 +120,8 @@ class WindowManager:
             if definition
             else None,
             limit=limit,
+            max_recorded_requests=old_max,  # Carry forward historical max
+            max_recorded_at=old_max_at,
         )
 
         windows[window_name] = new_window

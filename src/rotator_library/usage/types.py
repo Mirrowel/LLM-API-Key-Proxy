@@ -99,6 +99,12 @@ class WindowStats:
     reset_at: Optional[float] = None  # When window resets
     limit: Optional[int] = None  # Max requests allowed (None = unlimited)
 
+    # Historical max tracking (persists across window resets)
+    max_recorded_requests: Optional[int] = (
+        None  # Highest request_count ever in any window period
+    )
+    max_recorded_at: Optional[float] = None  # When the max was recorded
+
     # Usage timing (for smart selection)
     first_used_at: Optional[float] = None  # First request in this window
     last_used_at: Optional[float] = None  # Last request in this window

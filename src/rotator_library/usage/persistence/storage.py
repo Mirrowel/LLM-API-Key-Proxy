@@ -256,6 +256,8 @@ class UsageStorage:
             started_at=data.get("started_at"),
             reset_at=data.get("reset_at"),
             limit=data.get("limit"),
+            max_recorded_requests=data.get("max_recorded_requests"),
+            max_recorded_at=data.get("max_recorded_at"),
             first_used_at=data.get("first_used_at"),
             last_used_at=data.get("last_used_at"),
         )
@@ -279,6 +281,9 @@ class UsageStorage:
             "reset_at": window.reset_at,
             "reset_at_human": _format_timestamp(window.reset_at),
             "limit": window.limit,
+            "max_recorded_requests": window.max_recorded_requests,
+            "max_recorded_at": window.max_recorded_at,
+            "max_recorded_at_human": _format_timestamp(window.max_recorded_at),
             "first_used_at": window.first_used_at,
             "first_used_at_human": _format_timestamp(window.first_used_at),
             "last_used_at": window.last_used_at,

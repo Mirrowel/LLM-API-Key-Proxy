@@ -480,6 +480,14 @@ class TrackingEngine:
         if window.first_used_at is None:
             window.first_used_at = now
 
+        # Update max recorded requests (historical high-water mark)
+        if (
+            window.max_recorded_requests is None
+            or window.request_count > window.max_recorded_requests
+        ):
+            window.max_recorded_requests = window.request_count
+            window.max_recorded_at = now
+
     def _apply_to_totals(
         self,
         totals: TotalStats,
