@@ -32,7 +32,17 @@ QUOTA_FETCH_CONCURRENCY = 5
 class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
     """
     Provider implementation for the Firmware.ai API with quota tracking.
+
+    Firmware.ai is OpenAI-compatible, so requests are routed through LiteLLM's
+    OpenAI provider with api_base override. This class provides:
+    - Quota tracking via the FirmwareQuotaTracker mixin
+    - Model discovery from Firmware.ai's /models endpoint
+    - Cost calculation is skipped since Firmware models aren't in LiteLLM's pricing DB
     """
+
+    # Skip LiteLLM cost calculation - Firmware.ai models use custom naming
+    # (e.g., firmware/anthropic/claude-sonnet-4-5) not in LiteLLM's pricing database
+    skip_cost_calculation: bool = True
 
     # Quota groups for tracking 5-hour rolling window limits
     # Uses a virtual model "firmware/_quota" for credential-level quota tracking
