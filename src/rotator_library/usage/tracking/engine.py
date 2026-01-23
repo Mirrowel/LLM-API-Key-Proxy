@@ -114,22 +114,24 @@ class TrackingEngine:
                     group_stats.totals, update, now, total_tokens, output_tokens
                 )
 
-                # Check group window limits for exhaustion
-                for window in group_stats.windows.values():
-                    if window.is_exhausted and self._config.fair_cycle.enabled:
-                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
-                        break
+                # Check group window limits for exhaustion (only if window_limits_enabled)
+                if self._config.window_limits_enabled:
+                    for window in group_stats.windows.values():
+                        if window.is_exhausted and self._config.fair_cycle.enabled:
+                            self._mark_exhausted(state, fair_cycle_key, "window_limit")
+                            break
 
             # 3. Update credential totals
             self._apply_to_totals(
                 state.totals, update, now, total_tokens, output_tokens
             )
 
-            # 4. Check model window limits for exhaustion
-            for window in model_stats.windows.values():
-                if window.is_exhausted and self._config.fair_cycle.enabled:
-                    self._mark_exhausted(state, fair_cycle_key, "window_limit")
-                    break
+            # 4. Check model window limits for exhaustion (only if window_limits_enabled)
+            if self._config.window_limits_enabled:
+                for window in model_stats.windows.values():
+                    if window.is_exhausted and self._config.fair_cycle.enabled:
+                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
+                        break
 
             # 5. Update fair cycle request count
             if self._config.fair_cycle.enabled:
