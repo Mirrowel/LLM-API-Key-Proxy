@@ -294,6 +294,7 @@ The proxy is powered by a standalone Python library that you can use directly in
 - **Intelligent key selection** with tiered, model-aware locking
 - **Deadline-driven requests** with configurable global timeout
 - **Automatic failover** between keys on errors
+- **Cross-provider fallback** — pool credentials from multiple providers for the same model
 - **OAuth support** for Gemini CLI, Antigravity, Qwen, iFlow
 - **Stateless deployment ready** — load credentials from environment variables
 

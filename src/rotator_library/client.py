@@ -44,6 +44,7 @@ from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
+from .fallback_groups import FallbackGroupManager
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
 from .utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
 from .config import (
@@ -86,6 +87,7 @@ class RotatingClient:
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
+        model_fallback_groups: Optional[List[List[str]]] = None,
     ):
         """
         Initialize the RotatingClient with intelligent credential rotation.
@@ -109,6 +111,11 @@ class RotatingClient:
                 - 5.0+: High randomness, more unpredictable selection patterns
             data_dir: Root directory for all data files (logs, cache, oauth_creds, key_usage.json).
                       If None, auto-detects: EXE directory if frozen, else current working directory.
+            model_fallback_groups: List of fallback groups for cross-provider model pooling.
+                Each group is a list of "provider/model" strings. When a request matches
+                any entry in a group, all entries become fallback candidates.
+                Order matters: earlier entries have higher priority within each tier.
+                Can also be configured via MODEL_FALLBACK_GROUPS environment variable.
         """
         # Resolve data_dir early - this becomes the root for all file operations
         if data_dir is not None:
@@ -528,6 +535,9 @@ class RotatingClient:
                     f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
                 )
                 self.max_concurrent_requests_per_key[provider] = 1
+
+        # Initialize cross-provider fallback groups
+        self.fallback_manager = FallbackGroupManager(model_fallback_groups)
 
     def _parse_custom_cap_env_key(
         self, remainder: str
@@ -1178,7 +1188,14 @@ class RotatingClient:
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Any:
-        """A generic retry mechanism for non-streaming API calls."""
+        """A generic retry mechanism for non-streaming API calls.
+
+        Args:
+            api_call: The API call function to execute
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            **kwargs: Additional arguments for the API call
+        """
         model = kwargs.get("model")
         if not model:
             raise ValueError("'model' is a required parameter.")
@@ -1944,13 +1961,211 @@ class RotatingClient:
         )
         return None
 
+    async def _execute_with_fallback(
+        self,
+        api_call: callable,
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+        fallback_entries: List[str],
+        **kwargs,
+    ) -> Any:
+        """
+        Execute request with cross-provider fallback.
+
+        Tries each provider in the fallback group sequentially. Each provider
+        uses its own tier rotation internally (via _execute_with_retry).
+        When one provider is exhausted, moves to the next.
+
+        Args:
+            api_call: The API call function (litellm.acompletion)
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            fallback_entries: Ordered list of "provider/model" to try
+            **kwargs: Additional arguments for the API call
+
+        Returns:
+            API response on success, error response on failure
+        """
+        original_model = kwargs.get("model", fallback_entries[0])
+        lib_logger.debug(
+            f"Cross-provider fallback activated for {original_model}. "
+            f"Group: {', '.join(fallback_entries[:3])}{'...' if len(fallback_entries) > 3 else ''}"
+        )
+
+        last_result = None
+
+        for entry in fallback_entries:
+            parts = entry.split("/", 1)
+            if len(parts) != 2:
+                lib_logger.warning(f"Invalid fallback entry format: {entry}")
+                continue
+
+            provider = parts[0]
+
+            # Check if provider has credentials
+            if (
+                provider not in self.all_credentials
+                or not self.all_credentials[provider]
+            ):
+                lib_logger.debug(f"No credentials for provider '{provider}', skipping")
+                continue
+
+            lib_logger.debug(f"Fallback: trying {entry}")
+
+            # Update kwargs with this entry's model
+            entry_kwargs = kwargs.copy()
+            entry_kwargs["model"] = entry
+
+            # Call existing retry logic - it handles tier rotation internally
+            result = await self._execute_with_retry(
+                api_call,
+                request,
+                pre_request_callback,
+                **entry_kwargs,
+            )
+
+            # Check if result is successful (not an error response)
+            if result is not None:
+                if isinstance(result, dict) and "error" in result:
+                    last_result = result
+                    lib_logger.info(f"Fallback entry {entry} exhausted, trying next")
+                    continue
+                else:
+                    lib_logger.info(f"Fallback succeeded with {entry}")
+                    return result
+
+        # All entries exhausted
+        lib_logger.warning(f"All fallback entries exhausted for {original_model}")
+
+        if last_result is not None:
+            return last_result
+
+        return {
+            "error": {
+                "message": f"All fallback entries exhausted for {original_model}",
+                "type": "no_available_keys",
+                "code": 503,
+            }
+        }
+
+    async def _streaming_with_fallback(
+        self,
+        request: Optional[Any],
+        pre_request_callback: Optional[callable],
+        fallback_entries: List[str],
+        **kwargs,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Execute streaming request with cross-provider fallback.
+
+        Tries each provider in the fallback group sequentially. Each provider
+        uses its own tier rotation internally (via _streaming_acompletion_with_retry).
+        When one provider is exhausted, moves to the next.
+
+        Args:
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            fallback_entries: Ordered list of "provider/model" to try
+            **kwargs: Additional arguments for the API call
+
+        Yields:
+            SSE formatted strings
+        """
+        original_model = kwargs.get("model", fallback_entries[0])
+        lib_logger.debug(
+            f"Cross-provider fallback (streaming) activated for {original_model}. "
+            f"Group: {', '.join(fallback_entries[:3])}{'...' if len(fallback_entries) > 3 else ''}"
+        )
+
+        last_error = None
+
+        for entry in fallback_entries:
+            parts = entry.split("/", 1)
+            if len(parts) != 2:
+                lib_logger.warning(f"Invalid fallback entry format: {entry}")
+                continue
+
+            provider = parts[0]
+
+            # Check if provider has credentials
+            if (
+                provider not in self.all_credentials
+                or not self.all_credentials[provider]
+            ):
+                lib_logger.debug(f"No credentials for provider '{provider}', skipping")
+                continue
+
+            lib_logger.debug(f"Fallback (streaming): trying {entry}")
+
+            # Update kwargs with this entry's model
+            entry_kwargs = kwargs.copy()
+            entry_kwargs["model"] = entry
+
+            # Call existing streaming logic - it handles tier rotation internally
+            stream = self._streaming_acompletion_with_retry(
+                request,
+                pre_request_callback,
+                **entry_kwargs,
+            )
+
+            # Consume the stream
+            chunks_yielded = 0
+            async for chunk in stream:
+                # Check if this is an error response
+                if chunk.startswith("data: ") and chunks_yielded == 0:
+                    try:
+                        content = chunk[6:].strip()
+                        if content and content != "[DONE]":
+                            data = json.loads(content)
+                            if isinstance(data, dict) and "error" in data:
+                                # This is an error - don't yield, try next entry
+                                last_error = data
+                                lib_logger.info(
+                                    f"Fallback entry {entry} (streaming) returned error, trying next"
+                                )
+                                break
+                    except json.JSONDecodeError:
+                        pass
+
+                # Not an error, yield the chunk
+                yield chunk
+                chunks_yielded += 1
+
+            # Check if stream completed successfully
+            if chunks_yielded > 0:
+                lib_logger.info(f"Fallback (streaming) succeeded with {entry}")
+                return
+
+        # All entries exhausted
+        lib_logger.warning(
+            f"All fallback entries exhausted for {original_model} (streaming)"
+        )
+
+        if last_error:
+            yield f"data: {json.dumps(last_error)}\n\n"
+        else:
+            error_data = {
+                "error": {
+                    "message": f"All fallback entries exhausted for {original_model}",
+                    "type": "no_available_keys",
+                }
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+        yield "data: [DONE]\n\n"
+
     async def _streaming_acompletion_with_retry(
         self,
         request: Optional[Any],
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
-        """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
+        """A dedicated generator for retrying streaming completions with full request preparation and per-key retries.
+
+        Args:
+            request: The request object for disconnect detection
+            pre_request_callback: Optional callback before each request
+            **kwargs: Additional arguments for the API call
+        """
         model = kwargs.get("model")
         provider = model.split("/")[0]
 
@@ -2808,6 +3023,9 @@ class RotatingClient:
             )
             kwargs.pop("stream_options", None)
 
+        # Check for cross-provider fallback group
+        fallback_entries = self.fallback_manager.get_fallback_group(model)
+
         if kwargs.get("stream"):
             # Only add stream_options for providers that support it (excluding iflow)
             if provider != "iflow":
@@ -2816,16 +3034,33 @@ class RotatingClient:
                 if "include_usage" not in kwargs["stream_options"]:
                     kwargs["stream_options"]["include_usage"] = True
 
-            return self._streaming_acompletion_with_retry(
-                request=request, pre_request_callback=pre_request_callback, **kwargs
-            )
+            if fallback_entries:
+                return self._streaming_with_fallback(
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    fallback_entries=fallback_entries,
+                    **kwargs,
+                )
+            else:
+                return self._streaming_acompletion_with_retry(
+                    request=request, pre_request_callback=pre_request_callback, **kwargs
+                )
         else:
-            return self._execute_with_retry(
-                litellm.acompletion,
-                request=request,
-                pre_request_callback=pre_request_callback,
-                **kwargs,
-            )
+            if fallback_entries:
+                return self._execute_with_fallback(
+                    litellm.acompletion,
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    fallback_entries=fallback_entries,
+                    **kwargs,
+                )
+            else:
+                return self._execute_with_retry(
+                    litellm.acompletion,
+                    request=request,
+                    pre_request_callback=pre_request_callback,
+                    **kwargs,
+                )
 
     def aembedding(
         self,

@@ -60,6 +60,7 @@ client = RotatingClient(
 -   `enable_request_logging` (`bool`, default: `False`): If `True`, enables detailed per-request file logging.
 -   `max_concurrent_requests_per_key` (`Optional[Dict[str, int]]`, default: `None`): Max concurrent requests allowed for a single API key per provider.
 -   `rotation_tolerance` (`float`, default: `3.0`): Controls the credential rotation strategy. See Section 2.2 for details.
+-   `model_fallback_groups` (`Optional[List[List[str]]]`, default: `None`): Cross-provider fallback groups. See Section 2.22 for details.
 
 #### Core Responsibilities
 
@@ -918,6 +919,83 @@ async def anthropic_count_tokens(self, request):
 The proxy accepts both Anthropic and OpenAI authentication styles:
 - `x-api-key` header (Anthropic style)
 - `Authorization: Bearer` header (OpenAI style)
+
+### 2.22. Cross-Provider Fallback Groups (`fallback_groups.py`)
+
+The `FallbackGroupManager` enables pooling credentials from multiple providers for equivalent models, with automatic fallback when one provider's credentials are exhausted.
+
+#### Configuration
+
+**Environment Variable:**
+```bash
+MODEL_FALLBACK_GROUPS='[
+  ["gemini/gemini-2.5-pro", "gemini_cli/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"],
+  ["antigravity/claude-sonnet-4.5", "openrouter/anthropic/claude-3.5-sonnet"]
+]'
+```
+
+**Constructor Parameter:**
+```python
+client = RotatingClient(
+    model_fallback_groups=[
+        ["gemini/gemini-2.5-pro", "gemini_cli/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"],
+    ]
+)
+```
+
+#### Key Concepts
+
+- **Fallback Group**: A list of `provider/model` combinations that are considered equivalent
+- **Target Promotion**: When a request matches an entry in a group, that entry is moved to the front
+- **Sequential Provider Rotation**: Each provider is tried completely (with its internal tier rotation) before moving to the next
+- **Provider Priority**: Providers are tried in the order specified in the configuration
+
+#### Algorithm
+
+Given a request for `gemini_cli/gemini-2.5-pro` with fallback group:
+`["gemini/gemini-2.5-pro", "gemini_cli/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"]`
+
+1. **Find matching group**: Scan all groups for exact match `gemini_cli/gemini-2.5-pro`
+2. **Reorder with target first**: `["gemini_cli/gemini-2.5-pro", "gemini/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro"]`
+3. **Try each provider sequentially**:
+   - Try `gemini_cli/gemini-2.5-pro` with all its credentials (tier-2 first, then tier-1 - internal rotation)
+   - If exhausted, try `gemini/gemini-2.5-pro` with all its credentials
+   - If exhausted, try `openrouter/google/gemini-2.5-pro` with all its credentials
+4. **Success stops iteration**: First successful response is returned immediately
+
+#### Implementation Details
+
+The fallback system reuses existing retry logic completely:
+
+```
+For each entry in fallback group (in order):
+    Call existing _execute_with_retry() with entry's provider/model
+    If success: return response
+    If exhausted: continue to next entry
+```
+
+**Key Benefits:**
+- Simple, predictable provider ordering
+- Each provider uses its own internal tier rotation
+- Existing cooldown, fair cycle, and rotation logic remains intact
+- Provider-specific settings (like concurrency limits) are respected
+- No changes needed to `UsageManager` - orchestration is at client level
+
+#### Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| Request not in any group | Single-provider mode (existing behavior) |
+| Same provider, different models | Both entries tried in order |
+| Provider has no credentials | Entry skipped silently |
+| All entries exhausted | Returns error response with details |
+
+#### Logging
+
+- `DEBUG`: When fallback activated, which entry being tried
+- `INFO`: When entry exhausted and moving to next
+- `INFO`: When fallback succeeds with a specific entry
+- `WARNING`: When all entries exhausted
 
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
