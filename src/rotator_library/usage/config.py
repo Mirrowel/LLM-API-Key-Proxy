@@ -180,6 +180,10 @@ class ProviderUsageConfig:
     # Exhaustion threshold (cooldown must exceed this to count as "exhausted")
     exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
 
+    # Window limits blocking (if True, block credentials when window quota exhausted locally)
+    # Default False: only API errors (cooldowns) should block, not local tracking
+    window_limits_enabled: bool = False
+
     # Window definitions
     windows: List[WindowDefinition] = field(default_factory=list)
 

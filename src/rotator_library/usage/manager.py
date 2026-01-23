@@ -10,6 +10,7 @@ This is the main public API for the usage tracking system.
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
@@ -1306,7 +1307,7 @@ class UsageManager:
             if model_stats and primary_def:
                 check_window = model_stats.windows.get(primary_def.name)
 
-        if check_window and check_window.is_exhausted and quota_reset_ts:
+        if check_window and check_window.is_exhausted and quota_reset_ts and force:
             cooldown_target = group_key or normalized_model
             await self._tracking.apply_cooldown(
                 state=state,
@@ -1628,6 +1629,24 @@ class UsageManager:
                 ):
                     mark_exhausted = True
 
+                    # Log quota exhaustion like legacy system
+                    masked = self._mask_accessor(state.accessor)
+                    cooldown_target = group_key or normalized_model
+
+                    if quota_reset:
+                        reset_dt = datetime.fromtimestamp(quota_reset, tz=timezone.utc)
+                        hours = max(0.0, (quota_reset - time.time()) / 3600)
+                        lib_logger.info(
+                            f"Quota exhausted for '{cooldown_target}' on {masked}. "
+                            f"Resets at {reset_dt.isoformat()} ({hours:.1f}h)"
+                        )
+                    elif cooldown_duration:
+                        hours = cooldown_duration / 3600
+                        lib_logger.info(
+                            f"Quota exhausted on {masked} for '{cooldown_target}'. "
+                            f"Cooldown: {cooldown_duration:.0f}s ({hours:.1f}h)"
+                        )
+
         await self._tracking.record_failure(
             state=state,
             model=normalized_model,
@@ -1644,5 +1663,21 @@ class UsageManager:
             prompt_tokens_cache_write=prompt_tokens_cache_write,
             approx_cost=approx_cost,
         )
+
+        # Log fair cycle marking like legacy system
+        if mark_exhausted and self._config.fair_cycle.enabled:
+            fc_key = group_key or normalized_model
+            # Resolve fair cycle tracking key based on config
+            if self._config.fair_cycle.tracking_mode == TrackingMode.CREDENTIAL:
+                fc_key = FAIR_CYCLE_GLOBAL_KEY
+            exhausted_count = sum(
+                1
+                for s in self._states.values()
+                if fc_key in s.fair_cycle and s.fair_cycle[fc_key].exhausted
+            )
+            masked = self._mask_accessor(state.accessor)
+            lib_logger.info(
+                f"Fair cycle: marked {masked} exhausted for {fc_key} ({exhausted_count} total)"
+            )
 
         await self._save_if_needed()

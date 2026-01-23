@@ -49,20 +49,27 @@ class LimitEngine:
 
         # Initialize all limit checkers
         # Order matters: concurrent first (fast check), then others
+        # Note: WindowLimitChecker is optional - only included if window_limits_enabled
         self._checkers: List[LimitChecker] = [
             ConcurrentLimitChecker(),
             CooldownChecker(),
-            WindowLimitChecker(window_manager),
-            CustomCapChecker(config.custom_caps, window_manager),
-            FairCycleChecker(config.fair_cycle),
         ]
+
+        # Window limit checker - kept as reference for info purposes,
+        # only added to blocking checkers if explicitly enabled
+        self._window_checker = WindowLimitChecker(window_manager)
+        if config.window_limits_enabled:
+            self._checkers.append(self._window_checker)
+
+        # Custom caps and fair cycle always active
+        self._custom_cap_checker = CustomCapChecker(config.custom_caps, window_manager)
+        self._fair_cycle_checker = FairCycleChecker(config.fair_cycle)
+        self._checkers.append(self._custom_cap_checker)
+        self._checkers.append(self._fair_cycle_checker)
 
         # Quick access to specific checkers
         self._concurrent_checker = self._checkers[0]
         self._cooldown_checker = self._checkers[1]
-        self._window_checker = self._checkers[2]
-        self._custom_cap_checker = self._checkers[3]
-        self._fair_cycle_checker = self._checkers[4]
 
     def check_all(
         self,
