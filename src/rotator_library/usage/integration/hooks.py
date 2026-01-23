@@ -185,19 +185,15 @@ class HookDispatcher:
                               Classes are lazily instantiated on first hook call.
         """
         self._plugins = provider_plugins or {}
-        self._instances: Dict[str, Any] = {}
 
     def _get_instance(self, provider: str) -> Optional[Any]:
-        """Get or create a provider plugin instance."""
-        if provider not in self._instances:
-            plugin_class = self._plugins.get(provider)
-            if not plugin_class:
-                return None
-            if isinstance(plugin_class, type):
-                self._instances[provider] = plugin_class()
-            else:
-                self._instances[provider] = plugin_class
-        return self._instances[provider]
+        """Get provider plugin instance (singleton via metaclass)."""
+        plugin_class = self._plugins.get(provider)
+        if not plugin_class:
+            return None
+        if isinstance(plugin_class, type):
+            return plugin_class()  # Singleton - always returns same instance
+        return plugin_class
 
     async def dispatch_request_complete(
         self,

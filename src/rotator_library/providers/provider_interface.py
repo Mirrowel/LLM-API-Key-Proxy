@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from dataclasses import dataclass
 from typing import (
     List,
@@ -20,6 +20,32 @@ import litellm
 
 if TYPE_CHECKING:
     from ..usage import UsageManager
+
+
+# =============================================================================
+# SINGLETON METACLASS FOR PROVIDERS
+# =============================================================================
+
+
+class SingletonABCMeta(ABCMeta):
+    """
+    Metaclass that combines ABC functionality with singleton pattern.
+
+    All classes using this metaclass (including subclasses of ProviderInterface)
+    will be singletons - only one instance per class exists.
+
+    This prevents the bug where multiple provider instances are created
+    by different components (RotatingClient, UsageManager, Hooks, etc.),
+    each with their own caches and state.
+    """
+
+    _instances: Dict[type, Any] = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in SingletonABCMeta._instances:
+            SingletonABCMeta._instances[cls] = super().__call__(*args, **kwargs)
+        return SingletonABCMeta._instances[cls]
+
 
 from ..config import (
     DEFAULT_ROTATION_MODE,
@@ -68,7 +94,7 @@ UsageConfigMap = Dict[UsageConfigKey, UsageResetConfigDef]  # priority_set -> co
 QuotaGroupMap = Dict[str, List[str]]  # group_name -> [models]
 
 
-class ProviderInterface(ABC):
+class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     """
     An interface for API provider-specific functionality, including model
     discovery and custom API call handling for non-standard providers.

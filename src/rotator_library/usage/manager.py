@@ -1050,7 +1050,7 @@ class UsageManager:
             return "***"
 
     def _get_provider_plugin_instance(self) -> Optional[Any]:
-        """Get the provider plugin instance for the current provider."""
+        """Get provider plugin instance for the current provider."""
         if not self._provider_plugins:
             return None
 
@@ -1059,7 +1059,7 @@ class UsageManager:
         if plugin is None:
             return None
 
-        # If it's a class, instantiate it; if already an instance, use directly
+        # If it's a class, instantiate it (singleton via metaclass); if already an instance, use directly
         if isinstance(plugin, type):
             return plugin()
         return plugin
