@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..types import (
-    UsageStats,
     WindowStats,
+    TotalStats,
+    ModelStats,
+    GroupStats,
     CredentialState,
     CooldownInfo,
     FairCycleState,
@@ -70,7 +72,7 @@ class UsageStorage:
         Load usage data from file.
 
         Returns:
-            Dict of stable_id -> CredentialState
+            Tuple of (states dict, fair_cycle_global dict, loaded_from_file bool)
         """
         if not self.file_path.exists():
             return {}, {}, False
@@ -201,20 +203,6 @@ class UsageStorage:
         """Get a lock for file operations."""
         return self._save_lock
 
-    async def _read_file(self) -> str:
-        """Deprecated: use safe_read_json instead."""
-        data = safe_read_json(self.file_path, lib_logger, parse_json=True)
-        return json.dumps(data) if data is not None else ""
-
-    async def _write_file(self, content: str) -> None:
-        """Deprecated: writes handled by ResilientStateWriter."""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = None
-        if data is not None:
-            self._writer.write(data)
-
     def _migrate(self, data: Dict[str, Any], from_version: int) -> Dict[str, Any]:
         """Migrate data from older schema versions."""
         if from_version == 1:
@@ -238,87 +226,123 @@ class UsageStorage:
 
         return data
 
-    def _parse_usage_stats(self, data: Dict[str, Any]) -> UsageStats:
-        """Parse usage stats from storage data."""
-        windows = {}
-        for name, wdata in data.get("windows", {}).items():
-            windows[name] = WindowStats(
-                name=name,
-                request_count=wdata.get("request_count", 0),
-                success_count=wdata.get("success_count", 0),
-                failure_count=wdata.get("failure_count", 0),
-                total_tokens=wdata.get("total_tokens", 0),
-                prompt_tokens=wdata.get("prompt_tokens", 0),
-                completion_tokens=wdata.get("completion_tokens", 0),
-                thinking_tokens=wdata.get("thinking_tokens", 0),
-                output_tokens=wdata.get("output_tokens", 0),
-                prompt_tokens_cache_read=wdata.get("prompt_tokens_cache_read", 0),
-                prompt_tokens_cache_write=wdata.get("prompt_tokens_cache_write", 0),
-                approx_cost=wdata.get("approx_cost", 0.0),
-                started_at=wdata.get("started_at"),
-                reset_at=wdata.get("reset_at"),
-                limit=wdata.get("limit"),
-            )
-
-        return UsageStats(
-            windows=windows,
-            total_requests=data.get("total_requests", 0),
-            total_successes=data.get("total_successes", 0),
-            total_failures=data.get("total_failures", 0),
+    def _parse_window_stats(self, name: str, data: Dict[str, Any]) -> WindowStats:
+        """Parse window stats from storage data."""
+        return WindowStats(
+            name=name,
+            request_count=data.get("request_count", 0),
+            success_count=data.get("success_count", 0),
+            failure_count=data.get("failure_count", 0),
+            prompt_tokens=data.get("prompt_tokens", 0),
+            completion_tokens=data.get("completion_tokens", 0),
+            thinking_tokens=data.get("thinking_tokens", 0),
+            output_tokens=data.get("output_tokens", 0),
+            prompt_tokens_cache_read=data.get("prompt_tokens_cache_read", 0),
+            prompt_tokens_cache_write=data.get("prompt_tokens_cache_write", 0),
             total_tokens=data.get("total_tokens", 0),
-            total_prompt_tokens=data.get("total_prompt_tokens", 0),
-            total_completion_tokens=data.get("total_completion_tokens", 0),
-            total_thinking_tokens=data.get("total_thinking_tokens", 0),
-            total_output_tokens=data.get("total_output_tokens", 0),
-            total_prompt_tokens_cache_read=data.get(
-                "total_prompt_tokens_cache_read", 0
-            ),
-            total_prompt_tokens_cache_write=data.get(
-                "total_prompt_tokens_cache_write", 0
-            ),
-            total_approx_cost=data.get("total_approx_cost", 0.0),
+            approx_cost=data.get("approx_cost", 0.0),
+            started_at=data.get("started_at"),
+            reset_at=data.get("reset_at"),
+            limit=data.get("limit"),
             first_used_at=data.get("first_used_at"),
             last_used_at=data.get("last_used_at"),
-            model_request_counts=dict(data.get("model_request_counts", {})),
         )
 
-    def _serialize_usage_stats(self, usage: UsageStats) -> Dict[str, Any]:
-        """Serialize usage stats for storage."""
-        windows = {}
-        for name, window in usage.windows.items():
-            windows[name] = {
-                "request_count": window.request_count,
-                "success_count": window.success_count,
-                "failure_count": window.failure_count,
-                "total_tokens": window.total_tokens,
-                "prompt_tokens": window.prompt_tokens,
-                "completion_tokens": window.completion_tokens,
-                "thinking_tokens": window.thinking_tokens,
-                "output_tokens": window.output_tokens,
-                "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
-                "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
-                "approx_cost": window.approx_cost,
-                "started_at": window.started_at,
-                "reset_at": window.reset_at,
-                "limit": window.limit,
-            }
-
+    def _serialize_window_stats(self, window: WindowStats) -> Dict[str, Any]:
+        """Serialize window stats for storage."""
         return {
-            "windows": windows,
-            "total_requests": usage.total_requests,
-            "total_successes": usage.total_successes,
-            "total_failures": usage.total_failures,
-            "total_tokens": usage.total_tokens,
-            "total_prompt_tokens": usage.total_prompt_tokens,
-            "total_completion_tokens": usage.total_completion_tokens,
-            "total_thinking_tokens": usage.total_thinking_tokens,
-            "total_output_tokens": usage.total_output_tokens,
-            "total_prompt_tokens_cache_read": usage.total_prompt_tokens_cache_read,
-            "total_prompt_tokens_cache_write": usage.total_prompt_tokens_cache_write,
-            "total_approx_cost": usage.total_approx_cost,
-            "first_used_at": usage.first_used_at,
-            "last_used_at": usage.last_used_at,
-            "model_request_counts": usage.model_request_counts,
+            "request_count": window.request_count,
+            "success_count": window.success_count,
+            "failure_count": window.failure_count,
+            "prompt_tokens": window.prompt_tokens,
+            "completion_tokens": window.completion_tokens,
+            "thinking_tokens": window.thinking_tokens,
+            "output_tokens": window.output_tokens,
+            "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
+            "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
+            "total_tokens": window.total_tokens,
+            "approx_cost": window.approx_cost,
+            "started_at": window.started_at,
+            "reset_at": window.reset_at,
+            "limit": window.limit,
+            "first_used_at": window.first_used_at,
+            "last_used_at": window.last_used_at,
+        }
+
+    def _parse_total_stats(self, data: Dict[str, Any]) -> TotalStats:
+        """Parse total stats from storage data."""
+        return TotalStats(
+            request_count=data.get("request_count", 0),
+            success_count=data.get("success_count", 0),
+            failure_count=data.get("failure_count", 0),
+            prompt_tokens=data.get("prompt_tokens", 0),
+            completion_tokens=data.get("completion_tokens", 0),
+            thinking_tokens=data.get("thinking_tokens", 0),
+            output_tokens=data.get("output_tokens", 0),
+            prompt_tokens_cache_read=data.get("prompt_tokens_cache_read", 0),
+            prompt_tokens_cache_write=data.get("prompt_tokens_cache_write", 0),
+            total_tokens=data.get("total_tokens", 0),
+            approx_cost=data.get("approx_cost", 0.0),
+            first_used_at=data.get("first_used_at"),
+            last_used_at=data.get("last_used_at"),
+        )
+
+    def _serialize_total_stats(self, totals: TotalStats) -> Dict[str, Any]:
+        """Serialize total stats for storage."""
+        return {
+            "request_count": totals.request_count,
+            "success_count": totals.success_count,
+            "failure_count": totals.failure_count,
+            "prompt_tokens": totals.prompt_tokens,
+            "completion_tokens": totals.completion_tokens,
+            "thinking_tokens": totals.thinking_tokens,
+            "output_tokens": totals.output_tokens,
+            "prompt_tokens_cache_read": totals.prompt_tokens_cache_read,
+            "prompt_tokens_cache_write": totals.prompt_tokens_cache_write,
+            "total_tokens": totals.total_tokens,
+            "approx_cost": totals.approx_cost,
+            "first_used_at": totals.first_used_at,
+            "last_used_at": totals.last_used_at,
+        }
+
+    def _parse_model_stats(self, data: Dict[str, Any]) -> ModelStats:
+        """Parse model stats from storage data."""
+        windows = {}
+        for name, wdata in data.get("windows", {}).items():
+            windows[name] = self._parse_window_stats(name, wdata)
+
+        totals = self._parse_total_stats(data.get("totals", {}))
+
+        return ModelStats(windows=windows, totals=totals)
+
+    def _serialize_model_stats(self, stats: ModelStats) -> Dict[str, Any]:
+        """Serialize model stats for storage."""
+        return {
+            "windows": {
+                name: self._serialize_window_stats(window)
+                for name, window in stats.windows.items()
+            },
+            "totals": self._serialize_total_stats(stats.totals),
+        }
+
+    def _parse_group_stats(self, data: Dict[str, Any]) -> GroupStats:
+        """Parse group stats from storage data."""
+        windows = {}
+        for name, wdata in data.get("windows", {}).items():
+            windows[name] = self._parse_window_stats(name, wdata)
+
+        totals = self._parse_total_stats(data.get("totals", {}))
+
+        return GroupStats(windows=windows, totals=totals)
+
+    def _serialize_group_stats(self, stats: GroupStats) -> Dict[str, Any]:
+        """Serialize group stats for storage."""
+        return {
+            "windows": {
+                name: self._serialize_window_stats(window)
+                for name, window in stats.windows.items()
+            },
+            "totals": self._serialize_total_stats(stats.totals),
         }
 
     def _parse_credential_state(
@@ -328,16 +352,18 @@ class UsageStorage:
     ) -> Optional[CredentialState]:
         """Parse a credential state from storage data."""
         try:
-            usage = self._parse_usage_stats(data)
+            # Parse model_usage
+            model_usage = {}
+            for key, usage_data in data.get("model_usage", {}).items():
+                model_usage[key] = self._parse_model_stats(usage_data)
 
-            model_usage = {
-                key: self._parse_usage_stats(usage_data)
-                for key, usage_data in data.get("model_usage", {}).items()
-            }
-            group_usage = {
-                key: self._parse_usage_stats(usage_data)
-                for key, usage_data in data.get("group_usage", {}).items()
-            }
+            # Parse group_usage
+            group_usage = {}
+            for key, usage_data in data.get("group_usage", {}).items():
+                group_usage[key] = self._parse_group_stats(usage_data)
+
+            # Parse credential-level totals
+            totals = self._parse_total_stats(data.get("totals", {}))
 
             # Parse cooldowns
             cooldowns = {}
@@ -369,9 +395,9 @@ class UsageStorage:
                 display_name=data.get("display_name"),
                 tier=data.get("tier"),
                 priority=data.get("priority", 999),
-                usage=usage,
                 model_usage=model_usage,
                 group_usage=group_usage,
+                totals=totals,
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
                 active_requests=0,  # Always starts at 0
@@ -416,15 +442,15 @@ class UsageStorage:
             "display_name": state.display_name,
             "tier": state.tier,
             "priority": state.priority,
-            **self._serialize_usage_stats(state.usage),
             "model_usage": {
-                key: self._serialize_usage_stats(usage)
-                for key, usage in state.model_usage.items()
+                key: self._serialize_model_stats(stats)
+                for key, stats in state.model_usage.items()
             },
             "group_usage": {
-                key: self._serialize_usage_stats(usage)
-                for key, usage in state.group_usage.items()
+                key: self._serialize_group_stats(stats)
+                for key, stats in state.group_usage.items()
             },
+            "totals": self._serialize_total_stats(state.totals),
             "cooldowns": cooldowns,
             "fair_cycle": fair_cycle,
             "max_concurrent": state.max_concurrent,

@@ -278,9 +278,10 @@ class RequestExecutor:
                         scope_key = (
                             quota_group if primary_def.applies_to == "group" else model
                         )
-                        usage = state.get_usage_for_scope(
-                            primary_def.applies_to, scope_key, create=False
-                        )
+                        if primary_def.applies_to == "group":
+                            usage = state.get_group_stats(scope_key, create=False)
+                        else:
+                            usage = state.get_model_stats(scope_key, create=False)
                         if usage:
                             window = usage.windows.get(primary_def.name)
                             if window and window.limit is not None:
@@ -553,9 +554,10 @@ class RequestExecutor:
                                 if primary_def.applies_to == "group"
                                 else model
                             )
-                            usage = state.get_usage_for_scope(
-                                primary_def.applies_to, scope_key, create=False
-                            )
+                            if primary_def.applies_to == "group":
+                                usage = state.get_group_stats(scope_key, create=False)
+                            else:
+                                usage = state.get_model_stats(scope_key, create=False)
                             if usage:
                                 window = usage.windows.get(primary_def.name)
                                 if window and window.limit is not None:

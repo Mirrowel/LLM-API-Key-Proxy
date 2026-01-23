@@ -11,7 +11,7 @@ import time
 import logging
 from typing import Dict, List, Optional
 
-from ..types import CredentialState, LimitCheckResult, LimitResult
+from ..types import CredentialState, LimitCheckResult, LimitResult, WindowStats
 from ..config import CustomCapConfig, CooldownMode
 from ..tracking.windows import WindowManager
 from .base import LimitChecker
@@ -82,25 +82,31 @@ class CustomCapChecker(LimitChecker):
         if primary_def is None:
             return LimitCheckResult.ok()
 
-        usage = None
+        # Get windows based on scope
+        windows = None
+
+        # Check group first if cap applies to group
         if quota_group and cap.model_or_group == group_key:
-            usage = state.get_usage_for_scope("group", group_key, create=False)
+            group_stats = state.get_group_stats(group_key, create=False)
+            if group_stats:
+                windows = group_stats.windows
 
-        if usage is None:
-            scope_key = None
+        # Fall back to model or primary scope
+        if windows is None:
             if primary_def.applies_to == "model":
-                scope_key = model
+                model_stats = state.get_model_stats(model, create=False)
+                if model_stats:
+                    windows = model_stats.windows
             elif primary_def.applies_to == "group":
-                scope_key = group_key
-            usage = state.get_usage_for_scope(
-                primary_def.applies_to, scope_key, create=False
-            )
+                group_stats = state.get_group_stats(group_key, create=False)
+                if group_stats:
+                    windows = group_stats.windows
 
-        if usage is None:
+        if windows is None:
             return LimitCheckResult.ok()
 
         # Get usage from primary window
-        primary_window = self._windows.get_primary_window(usage.windows)
+        primary_window = self._windows.get_primary_window(windows)
         if primary_window is None:
             return LimitCheckResult.ok()
 
@@ -206,7 +212,7 @@ class CustomCapChecker(LimitChecker):
     def _calculate_cooldown_until(
         self,
         cap: CustomCapConfig,
-        window: "WindowStats",
+        window: WindowStats,
     ) -> Optional[float]:
         """Calculate when the custom cap cooldown ends."""
         now = time.time()

@@ -111,57 +111,6 @@ class WindowManager:
         windows[window_name] = new_window
         return new_window
 
-    def record_request(
-        self,
-        windows: Dict[str, WindowStats],
-        window_name: str,
-        prompt_tokens: int = 0,
-        completion_tokens: int = 0,
-        prompt_tokens_cache_read: int = 0,
-        prompt_tokens_cache_write: int = 0,
-        thinking_tokens: int = 0,
-        approx_cost: float = 0.0,
-        request_count: int = 1,
-        success_count: int = 0,
-        failure_count: int = 0,
-        limit: Optional[int] = None,
-    ) -> WindowStats:
-        """
-        Record a request in a window.
-
-        Args:
-            windows: Current windows dict for a credential
-            window_name: Name of window to record in
-            prompt_tokens: Prompt tokens used
-            completion_tokens: Completion tokens used
-            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
-            limit: Optional request limit for the window
-
-        Returns:
-            Updated WindowStats
-        """
-        window = self.get_or_create_window(windows, window_name, limit)
-
-        window.request_count += request_count
-        window.success_count += success_count
-        window.failure_count += failure_count
-        window.prompt_tokens += prompt_tokens
-        window.prompt_tokens_cache_read += prompt_tokens_cache_read
-        window.prompt_tokens_cache_write += prompt_tokens_cache_write
-        window.completion_tokens += completion_tokens
-        window.thinking_tokens += thinking_tokens
-        window.output_tokens += completion_tokens + thinking_tokens
-        window.approx_cost += approx_cost
-        window.total_tokens += (
-            prompt_tokens
-            + completion_tokens
-            + thinking_tokens
-            + prompt_tokens_cache_read
-            + prompt_tokens_cache_write
-        )
-
-        return window
-
     def get_primary_window(
         self,
         windows: Dict[str, WindowStats],

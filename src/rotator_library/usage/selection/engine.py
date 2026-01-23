@@ -305,23 +305,24 @@ class SelectionEngine:
         """Get the relevant usage count for rotation weighting."""
         primary_def = self._windows.get_primary_definition()
         if primary_def:
-            scope_key = None
-            if primary_def.applies_to == "model":
-                scope_key = model
-            elif primary_def.applies_to == "group":
-                scope_key = quota_group or model
+            windows = None
 
-            usage = state.get_usage_for_scope(
-                primary_def.applies_to, scope_key, create=False
-            )
-            if usage:
-                window = self._windows.get_active_window(
-                    usage.windows, primary_def.name
-                )
+            if primary_def.applies_to == "model":
+                model_stats = state.get_model_stats(model, create=False)
+                if model_stats:
+                    windows = model_stats.windows
+            elif primary_def.applies_to == "group":
+                group_key = quota_group or model
+                group_stats = state.get_group_stats(group_key, create=False)
+                if group_stats:
+                    windows = group_stats.windows
+
+            if windows:
+                window = self._windows.get_active_window(windows, primary_def.name)
                 if window:
                     return window.request_count
 
-        return state.usage.total_requests
+        return state.totals.request_count
 
     def _try_fair_cycle_reset(
         self,

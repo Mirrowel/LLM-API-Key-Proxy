@@ -66,33 +66,42 @@ class CooldownMode(str, Enum):
 
 
 # =============================================================================
-# WINDOW TYPES
+# WINDOW STATS
 # =============================================================================
 
 
 @dataclass
 class WindowStats:
     """
-    Statistics for a single usage window.
+    Statistics for a single time-based usage window (e.g., 5h, daily).
 
-    Tracks usage within a specific time window (e.g., 5-hour, daily).
+    Tracks usage within a specific time window for quota management.
     """
 
     name: str  # Window identifier (e.g., "5h", "daily")
     request_count: int = 0
     success_count: int = 0
     failure_count: int = 0
-    total_tokens: int = 0
+
+    # Token stats
     prompt_tokens: int = 0
     completion_tokens: int = 0
     thinking_tokens: int = 0
-    output_tokens: int = 0
+    output_tokens: int = 0  # completion + thinking
     prompt_tokens_cache_read: int = 0
     prompt_tokens_cache_write: int = 0
+    total_tokens: int = 0
+
     approx_cost: float = 0.0
-    started_at: Optional[float] = None  # Timestamp when window started
-    reset_at: Optional[float] = None  # Timestamp when window resets
+
+    # Window timing
+    started_at: Optional[float] = None  # When window period started
+    reset_at: Optional[float] = None  # When window resets
     limit: Optional[int] = None  # Max requests allowed (None = unlimited)
+
+    # Usage timing (for smart selection)
+    first_used_at: Optional[float] = None  # First request in this window
+    last_used_at: Optional[float] = None  # Last request in this window
 
     @property
     def remaining(self) -> Optional[int]:
@@ -109,32 +118,68 @@ class WindowStats:
         return self.request_count >= self.limit
 
 
-@dataclass
-class UsageStats:
-    """
-    Aggregated usage statistics for a credential.
+# =============================================================================
+# TOTAL STATS
+# =============================================================================
 
-    Contains both per-window and global (all-time) statistics.
+
+@dataclass
+class TotalStats:
+    """
+    All-time totals for a model, group, or credential.
+
+    Tracks cumulative usage across all time (never resets).
+    """
+
+    request_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+
+    # Token stats
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    output_tokens: int = 0  # completion + thinking
+    prompt_tokens_cache_read: int = 0
+    prompt_tokens_cache_write: int = 0
+    total_tokens: int = 0
+
+    approx_cost: float = 0.0
+
+    # Timestamps
+    first_used_at: Optional[float] = None  # All-time first use
+    last_used_at: Optional[float] = None  # All-time last use
+
+
+# =============================================================================
+# MODEL & GROUP STATS CONTAINERS
+# =============================================================================
+
+
+@dataclass
+class ModelStats:
+    """
+    Stats for a single model (own usage only).
+
+    Contains time-based windows and all-time totals.
+    Each model only tracks its own usage, not shared quota.
     """
 
     windows: Dict[str, WindowStats] = field(default_factory=dict)
-    total_requests: int = 0
-    total_successes: int = 0
-    total_failures: int = 0
-    total_tokens: int = 0
-    total_prompt_tokens: int = 0
-    total_completion_tokens: int = 0
-    total_thinking_tokens: int = 0
-    total_output_tokens: int = 0
-    total_prompt_tokens_cache_read: int = 0
-    total_prompt_tokens_cache_write: int = 0
-    total_approx_cost: float = 0.0
-    first_used_at: Optional[float] = None
-    last_used_at: Optional[float] = None
+    totals: TotalStats = field(default_factory=TotalStats)
 
-    # Per-model request counts (for quota group synchronization)
-    # Key: normalized model name, Value: request count
-    model_request_counts: Dict[str, int] = field(default_factory=dict)
+
+@dataclass
+class GroupStats:
+    """
+    Stats for a quota group (shared usage).
+
+    Contains time-based windows and all-time totals.
+    Updated when ANY model in the group is used.
+    """
+
+    windows: Dict[str, WindowStats] = field(default_factory=dict)
+    totals: TotalStats = field(default_factory=TotalStats)
 
 
 # =============================================================================
@@ -206,6 +251,31 @@ class GlobalFairCycleState:
 
 
 # =============================================================================
+# USAGE UPDATE (for consolidated tracking)
+# =============================================================================
+
+
+@dataclass
+class UsageUpdate:
+    """
+    All data for a single usage update.
+
+    Used by TrackingEngine.record_usage() to apply updates atomically.
+    """
+
+    request_count: int = 1
+    success: bool = True
+
+    # Tokens (optional)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    thinking_tokens: int = 0
+    prompt_tokens_cache_read: int = 0
+    prompt_tokens_cache_write: int = 0
+    approx_cost: float = 0.0
+
+
+# =============================================================================
 # CREDENTIAL STATE
 # =============================================================================
 
@@ -226,14 +296,10 @@ class CredentialState:
     tier: Optional[str] = None
     priority: int = 999  # Lower = higher priority
 
-    # Usage stats
-    usage: UsageStats = field(default_factory=UsageStats)
-
-    # Per-model usage stats (for per-model windows)
-    model_usage: Dict[str, UsageStats] = field(default_factory=dict)
-
-    # Per-quota-group usage stats (for shared quota windows)
-    group_usage: Dict[str, UsageStats] = field(default_factory=dict)
+    # Stats - source of truth
+    model_usage: Dict[str, ModelStats] = field(default_factory=dict)
+    group_usage: Dict[str, GroupStats] = field(default_factory=dict)
+    totals: TotalStats = field(default_factory=TotalStats)  # Credential-level totals
 
     # Cooldowns (keyed by model/group or "_global_")
     cooldowns: Dict[str, CooldownInfo] = field(default_factory=dict)
@@ -275,28 +341,35 @@ class CredentialState:
         state = self.fair_cycle.get(model_or_group)
         return state.exhausted if state else False
 
-    def get_usage_for_scope(
-        self,
-        scope: str,
-        key: Optional[str] = None,
-        create: bool = True,
-    ) -> Optional[UsageStats]:
-        """Get usage stats for a given scope."""
-        if scope == "credential":
-            return self.usage
-        if scope == "model":
-            if not key:
-                return self.usage
-            if create:
-                return self.model_usage.setdefault(key, UsageStats())
-            return self.model_usage.get(key)
-        if scope == "group":
-            if not key:
-                return self.usage
-            if create:
-                return self.group_usage.setdefault(key, UsageStats())
-            return self.group_usage.get(key)
-        return self.usage
+    def get_model_stats(self, model: str, create: bool = True) -> Optional[ModelStats]:
+        """Get model stats, optionally creating if not exists."""
+        if create:
+            return self.model_usage.setdefault(model, ModelStats())
+        return self.model_usage.get(model)
+
+    def get_group_stats(self, group: str, create: bool = True) -> Optional[GroupStats]:
+        """Get group stats, optionally creating if not exists."""
+        if create:
+            return self.group_usage.setdefault(group, GroupStats())
+        return self.group_usage.get(group)
+
+    def get_window_for_model(
+        self, model: str, window_name: str
+    ) -> Optional[WindowStats]:
+        """Get a specific window for a model."""
+        model_stats = self.model_usage.get(model)
+        if model_stats:
+            return model_stats.windows.get(window_name)
+        return None
+
+    def get_window_for_group(
+        self, group: str, window_name: str
+    ) -> Optional[WindowStats]:
+        """Get a specific window for a group."""
+        group_stats = self.group_usage.get(group)
+        if group_stats:
+            return group_stats.windows.get(window_name)
+        return None
 
 
 # =============================================================================

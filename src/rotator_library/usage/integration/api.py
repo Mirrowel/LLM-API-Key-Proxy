@@ -36,14 +36,14 @@ Reading State
     # Get state for a specific credential
     state = api.get_state("path/to/credential.json")
     if state:
-        print(f"Total requests: {state.usage.total_requests}")
-        print(f"Total successes: {state.usage.total_successes}")
-        print(f"Total failures: {state.usage.total_failures}")
+        print(f"Total requests: {state.totals.request_count}")
+        print(f"Total successes: {state.totals.success_count}")
+        print(f"Total failures: {state.totals.failure_count}")
 
     # Get all credential states
     all_states = api.get_all_states()
     for stable_id, state in all_states.items():
-        print(f"{stable_id}: {state.usage.total_requests} requests")
+        print(f"{stable_id}: {state.totals.request_count} requests")
 
     # Check remaining quota in a window
     remaining = api.get_window_remaining(
@@ -90,29 +90,33 @@ CredentialState contains:
     state.priority           # Priority level (1 = highest)
     state.active_requests    # Currently in-flight requests
 
-    state.usage              # UsageStats - global totals
-    state.model_usage        # Dict[model, UsageStats]
-    state.group_usage        # Dict[group, UsageStats]
+    state.totals             # TotalStats - credential-level totals
+    state.model_usage        # Dict[model, ModelStats]
+    state.group_usage        # Dict[group, GroupStats]
 
     state.cooldowns          # Dict[key, CooldownState]
     state.fair_cycle         # Dict[key, FairCycleState]
 
-UsageStats contains:
+ModelStats / GroupStats contain:
 
-    usage.total_requests
-    usage.total_successes
-    usage.total_failures
-    usage.total_tokens
-    usage.total_prompt_tokens
-    usage.total_completion_tokens
-    usage.total_thinking_tokens
-    usage.total_output_tokens
-    usage.total_prompt_tokens_cache_read
-    usage.total_prompt_tokens_cache_write
-    usage.total_approx_cost
-    usage.first_used_at
-    usage.last_used_at
-    usage.windows            # Dict[name, WindowStats]
+    stats.windows            # Dict[name, WindowStats] - time-based windows
+    stats.totals             # TotalStats - all-time totals for this scope
+
+TotalStats contains:
+
+    totals.request_count
+    totals.success_count
+    totals.failure_count
+    totals.prompt_tokens
+    totals.completion_tokens
+    totals.thinking_tokens
+    totals.output_tokens
+    totals.prompt_tokens_cache_read
+    totals.prompt_tokens_cache_write
+    totals.total_tokens
+    totals.approx_cost
+    totals.first_used_at
+    totals.last_used_at
 
 WindowStats contains:
 
@@ -156,9 +160,9 @@ EXAMPLE: BUILDING AN ADMIN ENDPOINT
                 "accessor": state.accessor,
                 "tier": state.tier,
                 "priority": state.priority,
-                "requests": state.usage.total_requests,
-                "successes": state.usage.total_successes,
-                "failures": state.usage.total_failures,
+                "requests": state.totals.request_count,
+                "successes": state.totals.success_count,
+                "failures": state.totals.failure_count,
                 "cooldowns": [
                     {"key": k, "remaining": v.remaining_seconds}
                     for k, v in state.cooldowns.items()
@@ -224,7 +228,7 @@ class UsageAPI:
         Example:
             state = api.get_state("oauth_creds/my_cred.json")
             if state:
-                print(f"Requests: {state.usage.total_requests}")
+                print(f"Requests: {state.totals.request_count}")
         """
         stable_id = self._manager.registry.get_stable_id(
             accessor, self._manager.provider
@@ -240,7 +244,7 @@ class UsageAPI:
 
         Example:
             for stable_id, state in api.get_all_states().items():
-                print(f"{stable_id}: {state.usage.total_requests} requests")
+                print(f"{stable_id}: {state.totals.request_count} requests")
         """
         return dict(self._manager.states)
 

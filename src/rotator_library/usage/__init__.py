@@ -21,11 +21,14 @@ Components (for advanced usage):
 
 # Types first (no dependencies on other modules)
 from .types import (
-    UsageStats,
     WindowStats,
+    TotalStats,
+    ModelStats,
+    GroupStats,
     CredentialState,
     CooldownInfo,
     FairCycleState,
+    UsageUpdate,
     SelectionContext,
     LimitCheckResult,
     RotationMode,
@@ -59,9 +62,13 @@ __all__ = [
     "UsageManager",
     "CredentialContext",
     # Types
-    "UsageStats",
     "WindowStats",
+    "TotalStats",
+    "ModelStats",
+    "GroupStats",
     "CredentialState",
+    "UsageUpdate",
+    "UsageUpdate",
     "CooldownInfo",
     "FairCycleState",
     "SelectionContext",

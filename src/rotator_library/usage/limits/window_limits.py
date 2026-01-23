@@ -7,7 +7,7 @@ Window limit checker.
 Checks if a credential has exceeded its request quota for a window.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ..types import CredentialState, LimitCheckResult, LimitResult, WindowStats
 from ..tracking.windows import WindowManager
@@ -56,23 +56,25 @@ class WindowLimitChecker(LimitChecker):
 
         # Check all configured windows
         for definition in self._windows.definitions.values():
-            scope_key = None
-            if definition.applies_to == "model":
-                scope_key = model
-            elif definition.applies_to == "group":
-                scope_key = group_key
+            windows = None
 
-            usage = state.get_usage_for_scope(
-                definition.applies_to, scope_key, create=False
-            )
-            if usage is None:
+            if definition.applies_to == "model":
+                model_stats = state.get_model_stats(model, create=False)
+                if model_stats:
+                    windows = model_stats.windows
+            elif definition.applies_to == "group":
+                group_stats = state.get_group_stats(group_key, create=False)
+                if group_stats:
+                    windows = group_stats.windows
+
+            if windows is None:
                 continue
 
-            window = usage.windows.get(definition.name)
+            window = windows.get(definition.name)
             if window is None or window.limit is None:
                 continue
 
-            active = self._windows.get_active_window(usage.windows, definition.name)
+            active = self._windows.get_active_window(windows, definition.name)
             if active is None:
                 continue
 
@@ -101,40 +103,44 @@ class WindowLimitChecker(LimitChecker):
         Args:
             state: Credential state
             window_name: Name of window to check
+            model: Model to check
+            quota_group: Quota group to check
 
         Returns:
             Remaining requests, or None if unlimited/unknown
         """
         group_key = quota_group or model or ""
         definition = self._windows.definitions.get(window_name)
-        if not definition:
-            return self._windows.get_window_remaining(state.usage.windows, window_name)
 
-        scope_key = None
-        if definition.applies_to == "model":
-            scope_key = model
-        elif definition.applies_to == "group":
-            scope_key = group_key
+        windows = None
+        if definition:
+            if definition.applies_to == "model" and model:
+                model_stats = state.get_model_stats(model, create=False)
+                if model_stats:
+                    windows = model_stats.windows
+            elif definition.applies_to == "group":
+                group_stats = state.get_group_stats(group_key, create=False)
+                if group_stats:
+                    windows = group_stats.windows
 
-        usage = state.get_usage_for_scope(
-            definition.applies_to, scope_key, create=False
-        )
-        if not usage:
+        if windows is None:
             return None
 
-        return self._windows.get_window_remaining(usage.windows, window_name)
+        return self._windows.get_window_remaining(windows, window_name)
 
     def get_all_remaining(
         self,
         state: CredentialState,
         model: Optional[str] = None,
         quota_group: Optional[str] = None,
-    ) -> dict[str, Optional[int]]:
+    ) -> Dict[str, Optional[int]]:
         """
         Get remaining requests for all windows.
 
         Args:
             state: Credential state
+            model: Model to check
+            quota_group: Quota group to check
 
         Returns:
             Dict of window_name -> remaining (None if unlimited)

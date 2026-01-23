@@ -13,12 +13,15 @@ import time
 from typing import Any, Dict, List, Optional, Set
 
 from ..types import (
-    UsageStats,
     WindowStats,
+    TotalStats,
+    ModelStats,
+    GroupStats,
     CredentialState,
     CooldownInfo,
     FairCycleState,
     TrackingMode,
+    UsageUpdate,
     FAIR_CYCLE_GLOBAL_KEY,
 )
 from ..config import WindowDefinition, ProviderUsageConfig
@@ -55,6 +58,93 @@ class TrackingEngine:
         self._config = config
         self._lock = asyncio.Lock()
 
+    async def record_usage(
+        self,
+        state: CredentialState,
+        model: str,
+        update: UsageUpdate,
+        group: Optional[str] = None,
+        response_headers: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record usage for a request (consolidated function).
+
+        Updates:
+        - model_usage[model].windows[*] + totals
+        - group_usage[group].windows[*] + totals (if group provided)
+        - credential.totals
+
+        Args:
+            state: Credential state to update
+            model: Model that was used
+            update: UsageUpdate with all metrics
+            group: Quota group for this model (None = no group tracking)
+            response_headers: Optional response headers with rate limit info
+        """
+        async with self._lock:
+            now = time.time()
+            fair_cycle_key = self._resolve_fair_cycle_key(group or model)
+
+            # Calculate derived values
+            output_tokens = update.completion_tokens + update.thinking_tokens
+            total_tokens = (
+                update.prompt_tokens
+                + update.completion_tokens
+                + update.thinking_tokens
+                + update.prompt_tokens_cache_read
+                + update.prompt_tokens_cache_write
+            )
+
+            # 1. Update model stats
+            model_stats = state.get_model_stats(model)
+            self._apply_to_windows(
+                model_stats.windows, update, now, total_tokens, output_tokens
+            )
+            self._apply_to_totals(
+                model_stats.totals, update, now, total_tokens, output_tokens
+            )
+
+            # 2. Update group stats (if applicable)
+            if group:
+                group_stats = state.get_group_stats(group)
+                self._apply_to_windows(
+                    group_stats.windows, update, now, total_tokens, output_tokens
+                )
+                self._apply_to_totals(
+                    group_stats.totals, update, now, total_tokens, output_tokens
+                )
+
+                # Check group window limits for exhaustion
+                for window in group_stats.windows.values():
+                    if window.is_exhausted and self._config.fair_cycle.enabled:
+                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
+                        break
+
+            # 3. Update credential totals
+            self._apply_to_totals(
+                state.totals, update, now, total_tokens, output_tokens
+            )
+
+            # 4. Check model window limits for exhaustion
+            for window in model_stats.windows.values():
+                if window.is_exhausted and self._config.fair_cycle.enabled:
+                    self._mark_exhausted(state, fair_cycle_key, "window_limit")
+                    break
+
+            # 5. Update fair cycle request count
+            if self._config.fair_cycle.enabled:
+                fc_state = state.fair_cycle.get(fair_cycle_key)
+                if not fc_state:
+                    fc_state = FairCycleState(model_or_group=fair_cycle_key)
+                    state.fair_cycle[fair_cycle_key] = fc_state
+                fc_state.cycle_request_count += update.request_count
+
+            # 6. Update from response headers if provided
+            if response_headers:
+                self._update_from_headers(state, response_headers, model, group)
+
+            state.last_updated = now
+
     async def record_success(
         self,
         state: CredentialState,
@@ -78,110 +168,30 @@ class TrackingEngine:
             quota_group: Quota group for this model (None = use model name)
             prompt_tokens: Prompt tokens used
             completion_tokens: Completion tokens used
-            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
+            prompt_tokens_cache_read: Cached prompt tokens read
+            prompt_tokens_cache_write: Cached prompt tokens written
+            thinking_tokens: Thinking tokens used
+            approx_cost: Approximate cost
+            request_count: Number of requests to record
             response_headers: Optional response headers with rate limit info
         """
-        async with self._lock:
-            now = time.time()
-            group_key = quota_group or model
-            fair_cycle_key = self._resolve_fair_cycle_key(group_key)
-
-            # Update usage stats
-            usage = state.usage
-            usage.total_requests += request_count
-            usage.total_successes += request_count
-            output_tokens = completion_tokens + thinking_tokens
-            usage.total_tokens += (
-                prompt_tokens
-                + completion_tokens
-                + thinking_tokens
-                + prompt_tokens_cache_read
-                + prompt_tokens_cache_write
-            )
-            usage.total_prompt_tokens += prompt_tokens
-            usage.total_completion_tokens += completion_tokens
-            usage.total_thinking_tokens += thinking_tokens
-            usage.total_output_tokens += output_tokens
-            usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
-            usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
-            usage.total_approx_cost += approx_cost
-            usage.last_used_at = now
-            if usage.first_used_at is None:
-                usage.first_used_at = now
-
-            self._update_scoped_usage(
-                state,
-                scope="model",
-                key=model,
-                now=now,
-                request_count=request_count,
-                success_count=request_count,
-                failure_count=0,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                prompt_tokens_cache_read=prompt_tokens_cache_read,
-                prompt_tokens_cache_write=prompt_tokens_cache_write,
-                thinking_tokens=thinking_tokens,
-                approx_cost=approx_cost,
-            )
-            if group_key != model:
-                self._update_scoped_usage(
-                    state,
-                    scope="group",
-                    key=group_key,
-                    now=now,
-                    request_count=request_count,
-                    success_count=request_count,
-                    failure_count=0,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    prompt_tokens_cache_read=prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                    thinking_tokens=thinking_tokens,
-                    approx_cost=approx_cost,
-                )
-
-            # Update per-model request count (for quota group sync)
-            usage.model_request_counts[model] = (
-                usage.model_request_counts.get(model, 0) + request_count
-            )
-
-            # Record in all windows
-            for window_def in self._config.windows:
-                scoped_usage = self._get_usage_for_window(
-                    state, window_def, model, group_key
-                )
-                if scoped_usage is None:
-                    continue
-                window = self._windows.record_request(
-                    scoped_usage.windows,
-                    window_def.name,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    prompt_tokens_cache_read=prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                    thinking_tokens=thinking_tokens,
-                    approx_cost=approx_cost,
-                    request_count=request_count,
-                    success_count=request_count,
-                )
-                if window.limit is not None and window.request_count >= window.limit:
-                    if self._config.fair_cycle.enabled:
-                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
-
-            # Update from response headers if provided
-            if response_headers:
-                self._update_from_headers(state, response_headers, model, group_key)
-
-            # Update fair cycle request count
-            if self._config.fair_cycle.enabled:
-                fc_state = state.fair_cycle.get(fair_cycle_key)
-                if not fc_state:
-                    fc_state = FairCycleState(model_or_group=fair_cycle_key)
-                    state.fair_cycle[fair_cycle_key] = fc_state
-                fc_state.cycle_request_count += request_count
-
-            state.last_updated = now
+        update = UsageUpdate(
+            request_count=request_count,
+            success=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            thinking_tokens=thinking_tokens,
+            prompt_tokens_cache_read=prompt_tokens_cache_read,
+            prompt_tokens_cache_write=prompt_tokens_cache_write,
+            approx_cost=approx_cost,
+        )
+        await self.record_usage(
+            state=state,
+            model=model,
+            update=update,
+            group=quota_group,
+            response_headers=response_headers,
+        )
 
     async def record_failure(
         self,
@@ -211,91 +221,36 @@ class TrackingEngine:
             cooldown_duration: How long to cool down (if applicable)
             quota_reset_timestamp: When quota resets (from API)
             mark_exhausted: Whether to mark as exhausted for fair cycle
+            request_count: Number of requests to record
+            prompt_tokens: Prompt tokens used
+            completion_tokens: Completion tokens used
+            thinking_tokens: Thinking tokens used
+            prompt_tokens_cache_read: Cached prompt tokens read
+            prompt_tokens_cache_write: Cached prompt tokens written
+            approx_cost: Approximate cost
         """
+        update = UsageUpdate(
+            request_count=request_count,
+            success=False,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            thinking_tokens=thinking_tokens,
+            prompt_tokens_cache_read=prompt_tokens_cache_read,
+            prompt_tokens_cache_write=prompt_tokens_cache_write,
+            approx_cost=approx_cost,
+        )
+
+        # Record the usage
+        await self.record_usage(
+            state=state,
+            model=model,
+            update=update,
+            group=quota_group,
+        )
+
         async with self._lock:
-            now = time.time()
             group_key = quota_group or model
             fair_cycle_key = self._resolve_fair_cycle_key(group_key)
-
-            # Update failure stats
-            state.usage.total_requests += request_count
-            state.usage.total_failures += request_count
-            output_tokens = completion_tokens + thinking_tokens
-            state.usage.total_tokens += (
-                prompt_tokens
-                + completion_tokens
-                + thinking_tokens
-                + prompt_tokens_cache_read
-                + prompt_tokens_cache_write
-            )
-            state.usage.total_prompt_tokens += prompt_tokens
-            state.usage.total_completion_tokens += completion_tokens
-            state.usage.total_thinking_tokens += thinking_tokens
-            state.usage.total_output_tokens += output_tokens
-            state.usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
-            state.usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
-            state.usage.total_approx_cost += approx_cost
-            state.usage.last_used_at = now
-
-            self._update_scoped_usage(
-                state,
-                scope="model",
-                key=model,
-                now=now,
-                request_count=request_count,
-                success_count=0,
-                failure_count=request_count,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                prompt_tokens_cache_read=prompt_tokens_cache_read,
-                prompt_tokens_cache_write=prompt_tokens_cache_write,
-                thinking_tokens=thinking_tokens,
-                approx_cost=approx_cost,
-            )
-            if group_key != model:
-                self._update_scoped_usage(
-                    state,
-                    scope="group",
-                    key=group_key,
-                    now=now,
-                    request_count=request_count,
-                    success_count=0,
-                    failure_count=request_count,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    prompt_tokens_cache_read=prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                    thinking_tokens=thinking_tokens,
-                    approx_cost=approx_cost,
-                )
-
-            # Update per-model request count (for quota group sync)
-            state.usage.model_request_counts[model] = (
-                state.usage.model_request_counts.get(model, 0) + request_count
-            )
-
-            # Record failure in windows (counts against quota)
-            for window_def in self._config.windows:
-                scoped_usage = self._get_usage_for_window(
-                    state, window_def, model, group_key
-                )
-                if scoped_usage is None:
-                    continue
-                window = self._windows.record_request(
-                    scoped_usage.windows,
-                    window_def.name,
-                    request_count=request_count,
-                    failure_count=request_count,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    prompt_tokens_cache_read=prompt_tokens_cache_read,
-                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                    thinking_tokens=thinking_tokens,
-                    approx_cost=approx_cost,
-                )
-                if window.limit is not None and window.request_count >= window.limit:
-                    if self._config.fair_cycle.enabled:
-                        self._mark_exhausted(state, fair_cycle_key, "window_limit")
 
             # Apply cooldown if specified
             if cooldown_duration is not None and cooldown_duration > 0:
@@ -320,15 +275,6 @@ class TrackingEngine:
             # Mark exhausted for fair cycle if requested
             if mark_exhausted:
                 self._mark_exhausted(state, fair_cycle_key, error_type)
-
-            if self._config.fair_cycle.enabled:
-                fc_state = state.fair_cycle.get(fair_cycle_key)
-                if not fc_state:
-                    fc_state = FairCycleState(model_or_group=fair_cycle_key)
-                    state.fair_cycle[fair_cycle_key] = fc_state
-                fc_state.cycle_request_count += request_count
-
-            state.last_updated = now
 
     async def acquire(
         self,
@@ -442,6 +388,8 @@ class TrackingEngine:
         self,
         state: CredentialState,
         window_name: str,
+        model: Optional[str] = None,
+        group: Optional[str] = None,
     ) -> int:
         """
         Get request count for a specific window.
@@ -449,29 +397,128 @@ class TrackingEngine:
         Args:
             state: Credential state
             window_name: Name of window
+            model: Model to check (optional)
+            group: Group to check (optional)
 
         Returns:
             Request count (0 if window doesn't exist)
         """
-        window = self._windows.get_active_window(state.usage.windows, window_name)
-        return window.request_count if window else 0
+        # Check group first if provided
+        if group:
+            group_stats = state.group_usage.get(group)
+            if group_stats:
+                window = self._windows.get_active_window(
+                    group_stats.windows, window_name
+                )
+                if window:
+                    return window.request_count
 
-    def get_primary_window_usage(self, state: CredentialState) -> int:
+        # Check model if provided
+        if model:
+            model_stats = state.model_usage.get(model)
+            if model_stats:
+                window = self._windows.get_active_window(
+                    model_stats.windows, window_name
+                )
+                if window:
+                    return window.request_count
+
+        return 0
+
+    def get_primary_window_usage(
+        self,
+        state: CredentialState,
+        model: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> int:
         """
         Get request count for the primary window.
 
         Args:
             state: Credential state
+            model: Model to check (optional)
+            group: Group to check (optional)
 
         Returns:
             Request count (0 if no primary window)
         """
-        window = self._windows.get_primary_window(state.usage.windows)
-        return window.request_count if window else 0
+        primary_def = self._windows.get_primary_definition()
+        if primary_def is None:
+            return 0
+        return self.get_window_usage(state, primary_def.name, model, group)
 
     # =========================================================================
     # PRIVATE METHODS
     # =========================================================================
+
+    def _apply_to_windows(
+        self,
+        windows: Dict[str, WindowStats],
+        update: UsageUpdate,
+        now: float,
+        total_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Apply update to all configured windows."""
+        for window_def in self._config.windows:
+            window = self._windows.get_or_create_window(windows, window_def.name)
+            self._apply_to_window(window, update, now, total_tokens, output_tokens)
+
+    def _apply_to_window(
+        self,
+        window: WindowStats,
+        update: UsageUpdate,
+        now: float,
+        total_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Apply update to a single window."""
+        window.request_count += update.request_count
+        if update.success:
+            window.success_count += update.request_count
+        else:
+            window.failure_count += update.request_count
+
+        window.prompt_tokens += update.prompt_tokens
+        window.completion_tokens += update.completion_tokens
+        window.thinking_tokens += update.thinking_tokens
+        window.output_tokens += output_tokens
+        window.prompt_tokens_cache_read += update.prompt_tokens_cache_read
+        window.prompt_tokens_cache_write += update.prompt_tokens_cache_write
+        window.total_tokens += total_tokens
+        window.approx_cost += update.approx_cost
+
+        window.last_used_at = now
+        if window.first_used_at is None:
+            window.first_used_at = now
+
+    def _apply_to_totals(
+        self,
+        totals: TotalStats,
+        update: UsageUpdate,
+        now: float,
+        total_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Apply update to totals."""
+        totals.request_count += update.request_count
+        if update.success:
+            totals.success_count += update.request_count
+        else:
+            totals.failure_count += update.request_count
+
+        totals.prompt_tokens += update.prompt_tokens
+        totals.completion_tokens += update.completion_tokens
+        totals.thinking_tokens += update.thinking_tokens
+        totals.output_tokens += output_tokens
+        totals.prompt_tokens_cache_read += update.prompt_tokens_cache_read
+        totals.prompt_tokens_cache_write += update.prompt_tokens_cache_write
+        totals.total_tokens += total_tokens
+        totals.approx_cost += update.approx_cost
+
+        totals.last_used_at = now
+        if totals.first_used_at is None:
+            totals.first_used_at = now
 
     def _apply_cooldown(
         self,
@@ -545,69 +592,12 @@ class TrackingEngine:
             return FAIR_CYCLE_GLOBAL_KEY
         return group_key
 
-    def _get_usage_for_window(
-        self,
-        state: CredentialState,
-        window_def: WindowDefinition,
-        model: str,
-        group_key: str,
-    ) -> Optional[UsageStats]:
-        """Get usage stats for a window definition's scope."""
-        scope_key = None
-        if window_def.applies_to == "model":
-            scope_key = model
-        elif window_def.applies_to == "group":
-            scope_key = group_key
-        return state.get_usage_for_scope(window_def.applies_to, scope_key)
-
-    def _update_scoped_usage(
-        self,
-        state: CredentialState,
-        scope: str,
-        key: Optional[str],
-        now: float,
-        request_count: int,
-        success_count: int,
-        failure_count: int,
-        prompt_tokens: int,
-        completion_tokens: int,
-        prompt_tokens_cache_read: int,
-        prompt_tokens_cache_write: int,
-        thinking_tokens: int,
-        approx_cost: float,
-    ) -> None:
-        """Update scoped usage stats."""
-        usage = state.get_usage_for_scope(scope, key)
-        if not usage:
-            return
-        output_tokens = completion_tokens + thinking_tokens
-        usage.total_requests += request_count
-        usage.total_successes += success_count
-        usage.total_failures += failure_count
-        usage.total_tokens += (
-            prompt_tokens
-            + completion_tokens
-            + thinking_tokens
-            + prompt_tokens_cache_read
-            + prompt_tokens_cache_write
-        )
-        usage.total_prompt_tokens += prompt_tokens
-        usage.total_completion_tokens += completion_tokens
-        usage.total_thinking_tokens += thinking_tokens
-        usage.total_output_tokens += output_tokens
-        usage.total_prompt_tokens_cache_read += prompt_tokens_cache_read
-        usage.total_prompt_tokens_cache_write += prompt_tokens_cache_write
-        usage.total_approx_cost += approx_cost
-        usage.last_used_at = now
-        if usage.first_used_at is None:
-            usage.first_used_at = now
-
     def _update_from_headers(
         self,
         state: CredentialState,
         headers: Dict[str, Any],
         model: str,
-        group_key: str,
+        group: Optional[str],
     ) -> None:
         """Update state from API response headers."""
         # Common header patterns for rate limiting
@@ -616,29 +606,35 @@ class TrackingEngine:
         reset = headers.get("x-ratelimit-reset")
         limit = headers.get("x-ratelimit-limit")
 
-        # Update primary window if we have limit info
         primary_def = self._windows.get_primary_definition()
         if primary_def is None:
             return
 
-        scope_key = None
-        if primary_def.applies_to == "model":
-            scope_key = model
-        elif primary_def.applies_to == "group":
-            scope_key = group_key
+        # Update group windows if group is provided
+        if group:
+            group_stats = state.get_group_stats(group, create=False)
+            if group_stats:
+                window = group_stats.windows.get(primary_def.name)
+                if window:
+                    self._apply_header_updates(window, limit, reset)
 
-        usage = state.get_usage_for_scope(
-            primary_def.applies_to, scope_key, create=False
-        )
-        if usage is None:
-            return
+        # Update model windows
+        model_stats = state.get_model_stats(model, create=False)
+        if model_stats:
+            window = model_stats.windows.get(primary_def.name)
+            if window:
+                self._apply_header_updates(window, limit, reset)
 
+    def _apply_header_updates(
+        self,
+        window: WindowStats,
+        limit: Optional[Any],
+        reset: Optional[Any],
+    ) -> None:
+        """Apply header updates to a window."""
         if limit is not None:
             try:
-                limit_int = int(limit)
-                primary = self._windows.get_primary_window(usage.windows)
-                if primary:
-                    primary.limit = limit_int
+                window.limit = int(limit)
             except (ValueError, TypeError):
                 pass
 
@@ -649,8 +645,6 @@ class TrackingEngine:
                 # If it's a small number, it might be seconds until reset
                 if reset_float < 1000000000:  # Less than ~2001, probably relative
                     reset_float = time.time() + reset_float
-                primary = self._windows.get_primary_window(usage.windows)
-                if primary:
-                    primary.reset_at = reset_float
+                window.reset_at = reset_float
             except (ValueError, TypeError):
                 pass

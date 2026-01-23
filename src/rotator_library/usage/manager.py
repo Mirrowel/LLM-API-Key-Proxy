@@ -17,8 +17,10 @@ from ..core.types import CredentialInfo, RequestCompleteResult
 from ..error_handler import ClassifiedError, classify_error
 
 from .types import (
-    UsageStats,
     WindowStats,
+    TotalStats,
+    ModelStats,
+    GroupStats,
     CredentialState,
     LimitCheckResult,
     RotationMode,
@@ -293,8 +295,6 @@ class UsageManager:
                     effective_concurrent = base_concurrent * multiplier
                     self._states[stable_id].max_concurrent = effective_concurrent
 
-            self._backfill_group_usage()
-
             self._initialized = True
             lib_logger.debug(
                 f"UsageManager initialized for {self.provider} with {len(credentials)} credentials"
@@ -435,7 +435,7 @@ class UsageManager:
                     and state.active_requests >= state.max_concurrent
                 ):
                     # This one is busy but might become free
-                    usage = state.usage.total_requests
+                    usage = state.totals.request_count
                     if usage < best_usage:
                         best_usage = usage
                         best_wait_id = sid
@@ -595,7 +595,10 @@ class UsageManager:
             success: Whether request succeeded
             prompt_tokens: Prompt tokens used
             completion_tokens: Completion tokens used
-            prompt_tokens_cached: Cached prompt tokens (e.g., from Claude)
+            thinking_tokens: Thinking tokens used
+            prompt_tokens_cache_read: Cached prompt tokens read
+            prompt_tokens_cache_write: Cached prompt tokens written
+            approx_cost: Approximate cost
             error: Classified error if failed
             quota_group: Quota group
         """
@@ -650,7 +653,7 @@ class UsageManager:
             return
 
         normalized_model = self._normalize_model(model)
-        group_key = quota_group or normalized_model
+        group_key = quota_group or self._get_model_quota_group(normalized_model)
 
         hook_result: Optional[RequestCompleteResult] = None
         if self._hooks:
@@ -697,7 +700,9 @@ class UsageManager:
         if force_exhausted:
             await self._tracking.mark_exhausted(
                 state=state,
-                model_or_group=self._resolve_fair_cycle_key(group_key),
+                model_or_group=self._resolve_fair_cycle_key(
+                    group_key or normalized_model
+                ),
                 reason="provider_hook",
             )
 
@@ -841,68 +846,48 @@ class UsageManager:
                 "priority": state.priority,
                 "active_requests": state.active_requests,
                 "status": status,
-                "usage": {
-                    "total_requests": state.usage.total_requests,
-                    "total_successes": state.usage.total_successes,
-                    "total_failures": state.usage.total_failures,
-                    "total_tokens": state.usage.total_tokens,
-                    "total_prompt_tokens": state.usage.total_prompt_tokens,
-                    "total_completion_tokens": state.usage.total_completion_tokens,
-                    "total_thinking_tokens": state.usage.total_thinking_tokens,
-                    "total_output_tokens": state.usage.total_output_tokens,
-                    "total_prompt_tokens_cache_read": state.usage.total_prompt_tokens_cache_read,
-                    "total_prompt_tokens_cache_write": state.usage.total_prompt_tokens_cache_write,
-                    "total_approx_cost": state.usage.total_approx_cost,
+                "totals": {
+                    "request_count": state.totals.request_count,
+                    "success_count": state.totals.success_count,
+                    "failure_count": state.totals.failure_count,
+                    "prompt_tokens": state.totals.prompt_tokens,
+                    "completion_tokens": state.totals.completion_tokens,
+                    "thinking_tokens": state.totals.thinking_tokens,
+                    "output_tokens": state.totals.output_tokens,
+                    "prompt_tokens_cache_read": state.totals.prompt_tokens_cache_read,
+                    "prompt_tokens_cache_write": state.totals.prompt_tokens_cache_write,
+                    "total_tokens": state.totals.total_tokens,
+                    "approx_cost": state.totals.approx_cost,
+                    "first_used_at": state.totals.first_used_at,
+                    "last_used_at": state.totals.last_used_at,
                 },
-                "windows": {},
                 "model_usage": {},
                 "group_usage": {},
                 "cooldowns": {},
                 "fair_cycle": {},
             }
 
-            stats["total_requests"] += state.usage.total_requests
-            stats["tokens"]["output"] += state.usage.total_output_tokens
-            stats["tokens"]["input_cached"] += (
-                state.usage.total_prompt_tokens_cache_read
-            )
+            stats["total_requests"] += state.totals.request_count
+            stats["tokens"]["output"] += state.totals.output_tokens
+            stats["tokens"]["input_cached"] += state.totals.prompt_tokens_cache_read
             stats["tokens"]["input_uncached"] += max(
                 0,
-                state.usage.total_prompt_tokens
-                - state.usage.total_prompt_tokens_cache_read,
+                state.totals.prompt_tokens - state.totals.prompt_tokens_cache_read,
             )
-            if state.usage.total_approx_cost:
-                stats["approx_cost"] = (stats["approx_cost"] or 0.0) + (
-                    state.usage.total_approx_cost
-                )
+            if state.totals.approx_cost:
+                stats["approx_cost"] = (
+                    stats["approx_cost"] or 0.0
+                ) + state.totals.approx_cost
 
             if status == "active":
                 stats["active_count"] += 1
             elif status == "exhausted":
                 stats["exhausted_count"] += 1
 
-            # Add window stats
-            for window_name, window in state.usage.windows.items():
-                cred_stats["windows"][window_name] = {
-                    "request_count": window.request_count,
-                    "success_count": window.success_count,
-                    "failure_count": window.failure_count,
-                    "prompt_tokens": window.prompt_tokens,
-                    "completion_tokens": window.completion_tokens,
-                    "thinking_tokens": window.thinking_tokens,
-                    "output_tokens": window.output_tokens,
-                    "prompt_tokens_cache_read": window.prompt_tokens_cache_read,
-                    "prompt_tokens_cache_write": window.prompt_tokens_cache_write,
-                    "total_tokens": window.total_tokens,
-                    "limit": window.limit,
-                    "remaining": window.remaining,
-                    "reset_at": window.reset_at,
-                    "approx_cost": window.approx_cost,
-                }
-
-            for model_key, usage in state.model_usage.items():
+            # Add model usage stats
+            for model_key, model_stats in state.model_usage.items():
                 model_windows = {}
-                for window_name, window in usage.windows.items():
+                for window_name, window in model_stats.windows.items():
                     model_windows[window_name] = {
                         "request_count": window.request_count,
                         "success_count": window.success_count,
@@ -918,23 +903,32 @@ class UsageManager:
                         "remaining": window.remaining,
                         "reset_at": window.reset_at,
                         "approx_cost": window.approx_cost,
+                        "first_used_at": window.first_used_at,
+                        "last_used_at": window.last_used_at,
                     }
-                if model_windows:
-                    cred_stats["model_usage"][model_key] = {
-                        "windows": model_windows,
-                        "total_requests": usage.total_requests,
-                        "total_tokens": usage.total_tokens,
-                        "total_prompt_tokens": usage.total_prompt_tokens,
-                        "total_completion_tokens": usage.total_completion_tokens,
-                        "total_thinking_tokens": usage.total_thinking_tokens,
-                        "total_output_tokens": usage.total_output_tokens,
-                        "total_prompt_tokens_cache_read": usage.total_prompt_tokens_cache_read,
-                        "total_prompt_tokens_cache_write": usage.total_prompt_tokens_cache_write,
-                    }
+                cred_stats["model_usage"][model_key] = {
+                    "windows": model_windows,
+                    "totals": {
+                        "request_count": model_stats.totals.request_count,
+                        "success_count": model_stats.totals.success_count,
+                        "failure_count": model_stats.totals.failure_count,
+                        "prompt_tokens": model_stats.totals.prompt_tokens,
+                        "completion_tokens": model_stats.totals.completion_tokens,
+                        "thinking_tokens": model_stats.totals.thinking_tokens,
+                        "output_tokens": model_stats.totals.output_tokens,
+                        "prompt_tokens_cache_read": model_stats.totals.prompt_tokens_cache_read,
+                        "prompt_tokens_cache_write": model_stats.totals.prompt_tokens_cache_write,
+                        "total_tokens": model_stats.totals.total_tokens,
+                        "approx_cost": model_stats.totals.approx_cost,
+                        "first_used_at": model_stats.totals.first_used_at,
+                        "last_used_at": model_stats.totals.last_used_at,
+                    },
+                }
 
-            for group_key, usage in state.group_usage.items():
+            # Add group usage stats
+            for group_key, group_stats in state.group_usage.items():
                 group_windows = {}
-                for window_name, window in usage.windows.items():
+                for window_name, window in group_stats.windows.items():
                     group_windows[window_name] = {
                         "request_count": window.request_count,
                         "success_count": window.success_count,
@@ -950,47 +944,56 @@ class UsageManager:
                         "remaining": window.remaining,
                         "reset_at": window.reset_at,
                         "approx_cost": window.approx_cost,
+                        "first_used_at": window.first_used_at,
+                        "last_used_at": window.last_used_at,
                     }
-                if group_windows:
-                    cred_stats["group_usage"][group_key] = {
-                        "windows": group_windows,
-                        "total_requests": usage.total_requests,
-                        "total_tokens": usage.total_tokens,
-                        "total_prompt_tokens": usage.total_prompt_tokens,
-                        "total_completion_tokens": usage.total_completion_tokens,
-                        "total_thinking_tokens": usage.total_thinking_tokens,
-                        "total_output_tokens": usage.total_output_tokens,
-                        "total_prompt_tokens_cache_read": usage.total_prompt_tokens_cache_read,
-                        "total_prompt_tokens_cache_write": usage.total_prompt_tokens_cache_write,
-                    }
+                cred_stats["group_usage"][group_key] = {
+                    "windows": group_windows,
+                    "totals": {
+                        "request_count": group_stats.totals.request_count,
+                        "success_count": group_stats.totals.success_count,
+                        "failure_count": group_stats.totals.failure_count,
+                        "prompt_tokens": group_stats.totals.prompt_tokens,
+                        "completion_tokens": group_stats.totals.completion_tokens,
+                        "thinking_tokens": group_stats.totals.thinking_tokens,
+                        "output_tokens": group_stats.totals.output_tokens,
+                        "prompt_tokens_cache_read": group_stats.totals.prompt_tokens_cache_read,
+                        "prompt_tokens_cache_write": group_stats.totals.prompt_tokens_cache_write,
+                        "total_tokens": group_stats.totals.total_tokens,
+                        "approx_cost": group_stats.totals.approx_cost,
+                        "first_used_at": group_stats.totals.first_used_at,
+                        "last_used_at": group_stats.totals.last_used_at,
+                    },
+                }
 
-                    group_stats = stats["quota_groups"].setdefault(
-                        group_key,
-                        {
-                            "total_requests_used": 0,
-                            "total_requests_remaining": 0,
-                            "total_requests_max": 0,
-                            "total_remaining_pct": None,
-                            "tiers": {},
-                        },
-                    )
-                    for window in group_windows.values():
-                        if window.get("limit") is not None:
-                            limit = window["limit"]
-                            used = window["request_count"]
-                            remaining = max(0, limit - used)
-                            group_stats["total_requests_used"] += used
-                            group_stats["total_requests_remaining"] += remaining
-                            group_stats["total_requests_max"] += limit
+                # Aggregate quota group stats
+                group_agg = stats["quota_groups"].setdefault(
+                    group_key,
+                    {
+                        "total_requests_used": 0,
+                        "total_requests_remaining": 0,
+                        "total_requests_max": 0,
+                        "total_remaining_pct": None,
+                        "tiers": {},
+                    },
+                )
+                for window in group_windows.values():
+                    if window.get("limit") is not None:
+                        limit = window["limit"]
+                        used = window["request_count"]
+                        remaining = max(0, limit - used)
+                        group_agg["total_requests_used"] += used
+                        group_agg["total_requests_remaining"] += remaining
+                        group_agg["total_requests_max"] += limit
 
-                    tier_key = state.tier or "unknown"
-                    tier_stats = group_stats["tiers"].setdefault(
-                        tier_key,
-                        {"priority": state.priority or 0, "total": 0, "active": 0},
-                    )
-                    tier_stats["total"] += 1
-                    if status == "active":
-                        tier_stats["active"] += 1
+                tier_key = state.tier or "unknown"
+                tier_stats = group_agg["tiers"].setdefault(
+                    tier_key,
+                    {"priority": state.priority or 0, "total": 0, "active": 0},
+                )
+                tier_stats["total"] += 1
+                if status == "active":
+                    tier_stats["active"] += 1
 
             # Add active cooldowns
             for key, cooldown in state.cooldowns.items():
@@ -1143,262 +1146,6 @@ class UsageManager:
 
         return []
 
-    async def _sync_quota_group_counts(
-        self,
-        state: CredentialState,
-        model: str,
-    ) -> None:
-        """
-        Synchronize quota-group and credential windows for model usage.
-
-        For providers with shared quota pools (e.g., Antigravity), we aggregate
-        per-model windows into group windows for shared quota tracking. We also
-        aggregate per-model windows into credential-level windows for display.
-
-        Args:
-            state: Credential state that was just updated
-            model: The normalized model that was just used
-        """
-        model_window_names = {
-            window_def.name
-            for window_def in self._config.windows
-            if window_def.applies_to == "model"
-        }
-
-        if model_window_names:
-            self._sync_credential_windows(state, model_window_names)
-
-        # Aggregate windows for quota groups
-        group = self._get_model_quota_group(model)
-        if not group:
-            return
-
-        grouped_models = self._get_grouped_models(group)
-        if not grouped_models:
-            return
-
-        group_usages = [
-            state.model_usage[m] for m in grouped_models if m in state.model_usage
-        ]
-        if not group_usages:
-            return
-
-        aggregated = self._aggregate_model_windows(group_usages, model_window_names)
-        if not aggregated:
-            return
-
-        group_usage = state.group_usage.setdefault(group, UsageStats())
-        group_usage.windows.update(aggregated)
-
-    def _backfill_group_usage(self) -> None:
-        """Backfill group usage windows and cooldowns from model data."""
-        for state in self._states.values():
-            self._backfill_model_usage(state)
-            self._backfill_credential_windows(state)
-            self._backfill_group_usage_for_state(state)
-            self._backfill_group_cooldowns(state)
-
-    def _aggregate_model_windows(
-        self,
-        usages: List[UsageStats],
-        model_window_names: Set[str],
-    ) -> Dict[str, WindowStats]:
-        buckets: Dict[str, Dict[str, Any]] = {}
-
-        for usage in usages:
-            for window_name, window in usage.windows.items():
-                if window_name not in model_window_names:
-                    continue
-                bucket = buckets.setdefault(
-                    window_name,
-                    {
-                        "request_count": 0,
-                        "success_count": 0,
-                        "failure_count": 0,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "thinking_tokens": 0,
-                        "output_tokens": 0,
-                        "prompt_tokens_cache_read": 0,
-                        "prompt_tokens_cache_write": 0,
-                        "total_tokens": 0,
-                        "approx_cost": 0.0,
-                        "started_at": [],
-                        "reset_at": [],
-                        "limit": [],
-                    },
-                )
-                bucket["request_count"] += window.request_count
-                bucket["success_count"] += window.success_count
-                bucket["failure_count"] += window.failure_count
-                bucket["prompt_tokens"] += window.prompt_tokens
-                bucket["completion_tokens"] += window.completion_tokens
-                bucket["thinking_tokens"] += window.thinking_tokens
-                bucket["output_tokens"] += window.output_tokens
-                bucket["prompt_tokens_cache_read"] += window.prompt_tokens_cache_read
-                bucket["prompt_tokens_cache_write"] += window.prompt_tokens_cache_write
-                bucket["total_tokens"] += window.total_tokens
-                bucket["approx_cost"] += window.approx_cost
-                if window.started_at is not None:
-                    bucket["started_at"].append(window.started_at)
-                if window.reset_at is not None:
-                    bucket["reset_at"].append(window.reset_at)
-                if window.limit is not None:
-                    bucket["limit"].append(window.limit)
-
-        aggregated: Dict[str, WindowStats] = {}
-        for window_name, bucket in buckets.items():
-            success_count = bucket["success_count"]
-            failure_count = bucket["failure_count"]
-            request_count = success_count + failure_count
-            if request_count == 0:
-                request_count = bucket["request_count"]
-                if request_count > 0:
-                    success_count = request_count
-            started_at = min(bucket["started_at"]) if bucket["started_at"] else None
-            reset_at = max(bucket["reset_at"]) if bucket["reset_at"] else None
-            limit = max(bucket["limit"]) if bucket["limit"] else None
-            aggregated[window_name] = WindowStats(
-                name=window_name,
-                request_count=request_count,
-                success_count=success_count,
-                failure_count=failure_count,
-                total_tokens=bucket["total_tokens"],
-                prompt_tokens=bucket["prompt_tokens"],
-                completion_tokens=bucket["completion_tokens"],
-                thinking_tokens=bucket["thinking_tokens"],
-                output_tokens=bucket["output_tokens"],
-                prompt_tokens_cache_read=bucket["prompt_tokens_cache_read"],
-                prompt_tokens_cache_write=bucket["prompt_tokens_cache_write"],
-                approx_cost=bucket["approx_cost"],
-                started_at=started_at,
-                reset_at=reset_at,
-                limit=limit,
-            )
-
-        return aggregated
-
-    def _sync_credential_windows(
-        self,
-        state: CredentialState,
-        model_window_names: Set[str],
-    ) -> None:
-        if not model_window_names:
-            return
-        usages = list(state.model_usage.values())
-        if not usages:
-            return
-        aggregated = self._aggregate_model_windows(usages, model_window_names)
-        if not aggregated:
-            return
-        state.usage.windows.update(aggregated)
-
-    def _backfill_group_usage_for_state(self, state: CredentialState) -> None:
-        model_window_names = {
-            window_def.name
-            for window_def in self._config.windows
-            if window_def.applies_to == "model"
-        }
-        if not model_window_names:
-            return
-
-        for model in state.model_usage.keys():
-            group = self._get_model_quota_group(model)
-            if not group:
-                continue
-            group_usage = state.group_usage.setdefault(group, UsageStats())
-            grouped_models = self._get_grouped_models(group)
-            group_usages = [
-                state.model_usage[m] for m in grouped_models if m in state.model_usage
-            ]
-            aggregated = self._aggregate_model_windows(group_usages, model_window_names)
-            if aggregated:
-                group_usage.windows.update(aggregated)
-
-    def _backfill_credential_windows(self, state: CredentialState) -> None:
-        model_window_names = {
-            window_def.name
-            for window_def in self._config.windows
-            if window_def.applies_to == "model"
-        }
-        if not model_window_names:
-            return
-        usages = list(state.model_usage.values())
-        if not usages:
-            return
-        aggregated = self._aggregate_model_windows(usages, model_window_names)
-        if aggregated:
-            state.usage.windows.update(aggregated)
-
-    def _backfill_model_usage(self, state: CredentialState) -> None:
-        if not state.usage.model_request_counts:
-            return
-        primary_def = self._window_manager.get_primary_definition()
-        if not primary_def:
-            return
-        now = time.time()
-        for model, count in state.usage.model_request_counts.items():
-            usage = state.model_usage.setdefault(model, UsageStats())
-            window = usage.windows.get(primary_def.name)
-            if not window:
-                base_time = state.last_updated or state.created_at or now
-                reset_at = None
-                if primary_def:
-                    if primary_def.mode == ResetMode.ROLLING:
-                        reset_at = base_time + primary_def.duration_seconds
-                    else:
-                        reset_at = self._window_manager._calculate_reset_time(
-                            primary_def, base_time
-                        )
-                window = WindowStats(
-                    name=primary_def.name,
-                    request_count=count,
-                    started_at=base_time,
-                    reset_at=reset_at,
-                    limit=None,
-                )
-                usage.windows[primary_def.name] = window
-            elif window.request_count == 0:
-                window.request_count = count
-
-    def _backfill_group_cooldowns(self, state: CredentialState) -> None:
-        for model, cooldown in list(state.cooldowns.items()):
-            if model in {"_global_"}:
-                continue
-            group = self._get_model_quota_group(model)
-            if not group:
-                continue
-            existing = state.cooldowns.get(group)
-            if not existing or existing.until < cooldown.until:
-                state.cooldowns[group] = cooldown
-
-        for group in list(state.group_usage.keys()):
-            cooldown = state.cooldowns.get(group)
-            if not cooldown:
-                continue
-            for grouped_model in self._get_grouped_models(group):
-                existing = state.cooldowns.get(grouped_model)
-                if not existing or existing.until < cooldown.until:
-                    state.cooldowns[grouped_model] = cooldown
-
-    def _reconcile_window_counts(self, window: WindowStats, request_count: int) -> None:
-        local_total = window.success_count + window.failure_count
-        window.request_count = request_count
-        if local_total == 0 and request_count > 0:
-            window.success_count = request_count
-            window.failure_count = 0
-            return
-
-        if request_count < local_total:
-            failure_count = min(window.failure_count, request_count)
-            success_count = max(0, request_count - failure_count)
-            window.success_count = success_count
-            window.failure_count = failure_count
-            return
-
-        if request_count > local_total:
-            window.success_count += request_count - local_total
-
     async def save(self, force: bool = False) -> bool:
         """
         Save usage data to file.
@@ -1427,7 +1174,7 @@ class UsageManager:
             snapshot: Dict[str, Dict[str, Any]] = {}
             for state in self._states.values():
                 snapshot[state.accessor] = {
-                    "last_used_ts": state.usage.last_used_at or 0,
+                    "last_used_ts": state.totals.last_used_at or 0,
                 }
             return snapshot
 
@@ -1458,9 +1205,9 @@ class UsageManager:
                 if stable_id in self._states:
                     # Update usage data from loaded state
                     current = self._states[stable_id]
-                    current.usage = loaded_state.usage
                     current.model_usage = loaded_state.model_usage
                     current.group_usage = loaded_state.group_usage
+                    current.totals = loaded_state.totals
                     current.cooldowns = loaded_state.cooldowns
                     current.fair_cycle = loaded_state.fair_cycle
                     current.last_updated = loaded_state.last_updated
@@ -1473,9 +1220,6 @@ class UsageManager:
                 self._limits.fair_cycle_checker.load_global_state_dict(
                     fair_cycle_global
                 )
-
-            # Backfill group usage for consistency
-            self._backfill_group_usage()
 
             lib_logger.info(
                 f"Reloaded usage data from disk for {self.provider}: "
@@ -1509,7 +1253,6 @@ class UsageManager:
                 If False (default), use max(local, api) to prevent stale
                 API data from overwriting accurate local counts during
                 background fetches.
-                See: https://github.com/Mirrowel/LLM-API-Key-Proxy/issues/75
 
         Returns:
             Cooldown info dict if cooldown was applied, None otherwise
@@ -1524,108 +1267,58 @@ class UsageManager:
 
         # Normalize model name for consistent tracking
         normalized_model = self._normalize_model(model)
-        group_key = quota_group or normalized_model
+        group_key = quota_group or self._get_model_quota_group(normalized_model)
 
         primary_def = self._window_manager.get_primary_definition()
-        primary_window = None
 
-        if primary_def:
-            scope_key = None
-            if primary_def.applies_to == "model":
-                scope_key = normalized_model
-            elif primary_def.applies_to == "group":
-                scope_key = group_key
-
-            usage = state.get_usage_for_scope(primary_def.applies_to, scope_key)
-            primary_window = self._window_manager.get_or_create_window(
-                usage.windows,
-                primary_def.name,
-            )
-
-        if primary_window is None:
-            from .types import WindowStats
-
-            primary_window = WindowStats(name="api_quota")
-            state.usage.windows["api_quota"] = primary_window
-
-        # Update baseline values
-        if quota_max_requests is not None:
-            primary_window.limit = quota_max_requests
-        if quota_reset_ts is not None:
-            primary_window.reset_at = quota_reset_ts
-        if quota_used is not None:
-            # Use max() to prevent stale API data from overwriting local count
-            # during background fetches. API updates in ~20% increments so may
-            # return stale cached values. Force mode (manual refresh) trusts API.
-            # See: https://github.com/Mirrowel/LLM-API-Key-Proxy/issues/75
-            if force:
-                synced_count = quota_used
-            else:
-                synced_count = max(
-                    primary_window.request_count,
-                    quota_used,
-                    primary_window.success_count + primary_window.failure_count,
+        # Update group windows if group is provided
+        if group_key:
+            group_stats = state.get_group_stats(group_key)
+            if primary_def:
+                group_window = self._window_manager.get_or_create_window(
+                    group_stats.windows, primary_def.name
                 )
-            self._reconcile_window_counts(primary_window, synced_count)
-            state.usage.model_request_counts[normalized_model] = synced_count
-        else:
-            state.usage.model_request_counts.setdefault(normalized_model, 0)
-            if primary_window.request_count == 0:
-                primary_window.request_count = 0
+                self._apply_quota_update(
+                    group_window, quota_max_requests, quota_reset_ts, quota_used, force
+                )
 
-        if group_key != normalized_model:
-            group_usage = state.get_usage_for_scope("group", group_key)
-            window_name = primary_def.name if primary_def else primary_window.name
-            group_window = self._window_manager.get_or_create_window(
-                group_usage.windows,
-                window_name,
+        # Update model windows
+        model_stats = state.get_model_stats(normalized_model)
+        if primary_def:
+            model_window = self._window_manager.get_or_create_window(
+                model_stats.windows, primary_def.name
             )
-            if quota_max_requests is not None:
-                group_window.limit = quota_max_requests
-            if quota_reset_ts is not None:
-                group_window.reset_at = quota_reset_ts
-            if quota_used is not None:
-                # Same stale-data protection for group windows
-                if force:
-                    synced_count = quota_used
-                else:
-                    synced_count = max(
-                        group_window.request_count,
-                        quota_used,
-                        group_window.success_count + group_window.failure_count,
-                    )
-                self._reconcile_window_counts(group_window, synced_count)
-            else:
-                group_window.request_count = group_window.request_count or 0
+            self._apply_quota_update(
+                model_window, quota_max_requests, quota_reset_ts, quota_used, force
+            )
 
         # Mark state as updated
         state.last_updated = time.time()
 
-        if quota_used is not None:
-            await self._sync_quota_group_counts(state, normalized_model)
-
         # Check if we need to apply cooldown (quota exhausted)
-        if primary_window.is_exhausted and quota_reset_ts:
+        check_window = None
+        if group_key:
+            group_stats = state.get_group_stats(group_key, create=False)
+            if group_stats and primary_def:
+                check_window = group_stats.windows.get(primary_def.name)
+        if check_window is None:
+            model_stats = state.get_model_stats(normalized_model, create=False)
+            if model_stats and primary_def:
+                check_window = model_stats.windows.get(primary_def.name)
+
+        if check_window and check_window.is_exhausted and quota_reset_ts:
+            cooldown_target = group_key or normalized_model
             await self._tracking.apply_cooldown(
                 state=state,
                 reason="quota_exhausted",
                 until=quota_reset_ts,
-                model_or_group=group_key,
+                model_or_group=cooldown_target,
                 source="api_quota",
             )
 
-            if group_key != normalized_model:
-                await self._tracking.apply_cooldown(
-                    state=state,
-                    reason="quota_exhausted",
-                    until=quota_reset_ts,
-                    model_or_group=normalized_model,
-                    source="api_quota",
-                )
-
             await self._queue_quota_exhausted_log(
                 accessor=accessor,
-                group_key=group_key,
+                group_key=cooldown_target,
                 quota_reset_ts=quota_reset_ts,
             )
 
@@ -1641,6 +1334,49 @@ class UsageManager:
         await self._save_if_needed()
 
         return None
+
+    def _apply_quota_update(
+        self,
+        window: WindowStats,
+        quota_max_requests: Optional[int],
+        quota_reset_ts: Optional[float],
+        quota_used: Optional[int],
+        force: bool,
+    ) -> None:
+        """Apply quota update to a window."""
+        if quota_max_requests is not None:
+            window.limit = quota_max_requests
+        if quota_reset_ts is not None:
+            window.reset_at = quota_reset_ts
+        if quota_used is not None:
+            if force:
+                synced_count = quota_used
+            else:
+                synced_count = max(
+                    window.request_count,
+                    quota_used,
+                    window.success_count + window.failure_count,
+                )
+            self._reconcile_window_counts(window, synced_count)
+
+    def _reconcile_window_counts(self, window: WindowStats, request_count: int) -> None:
+        """Reconcile window counts after quota sync."""
+        local_total = window.success_count + window.failure_count
+        window.request_count = request_count
+        if local_total == 0 and request_count > 0:
+            window.success_count = request_count
+            window.failure_count = 0
+            return
+
+        if request_count < local_total:
+            failure_count = min(window.failure_count, request_count)
+            success_count = max(0, request_count - failure_count)
+            window.success_count = success_count
+            window.failure_count = failure_count
+            return
+
+        if request_count > local_total:
+            window.success_count += request_count - local_total
 
     # =========================================================================
     # PROPERTIES
@@ -1817,11 +1553,12 @@ class UsageManager:
         if state:
             # Normalize model name for consistent tracking
             normalized_model = self._normalize_model(model)
+            group_key = quota_group or self._get_model_quota_group(normalized_model)
 
             await self._tracking.record_success(
                 state=state,
                 model=normalized_model,
-                quota_group=quota_group,
+                quota_group=group_key,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 thinking_tokens=thinking_tokens,
@@ -1832,12 +1569,9 @@ class UsageManager:
                 request_count=request_count,
             )
 
-            # Sync request_count across quota group (for shared quota pools)
-            await self._sync_quota_group_counts(state, normalized_model)
-
             # Apply custom cap cooldown if exceeded
             cap_result = self._limits.custom_cap_checker.check(
-                state, normalized_model, quota_group
+                state, normalized_model, group_key
             )
             if (
                 not cap_result.allowed
@@ -1848,7 +1582,7 @@ class UsageManager:
                     state=state,
                     reason="custom_cap",
                     until=cap_result.blocked_until,
-                    model_or_group=quota_group or normalized_model,
+                    model_or_group=group_key or normalized_model,
                     source="custom_cap",
                 )
 
@@ -1875,6 +1609,7 @@ class UsageManager:
 
         # Normalize model name for consistent tracking
         normalized_model = self._normalize_model(model)
+        group_key = quota_group or self._get_model_quota_group(normalized_model)
 
         # Determine cooldown from error
         cooldown_duration = None
@@ -1897,7 +1632,7 @@ class UsageManager:
             state=state,
             model=normalized_model,
             error_type=error.error_type if error else "unknown",
-            quota_group=quota_group,
+            quota_group=group_key,
             cooldown_duration=cooldown_duration,
             quota_reset_timestamp=quota_reset,
             mark_exhausted=mark_exhausted,
@@ -1909,8 +1644,5 @@ class UsageManager:
             prompt_tokens_cache_write=prompt_tokens_cache_write,
             approx_cost=approx_cost,
         )
-
-        # Sync request_count across quota group (for shared quota pools)
-        await self._sync_quota_group_counts(state, normalized_model)
 
         await self._save_if_needed()
