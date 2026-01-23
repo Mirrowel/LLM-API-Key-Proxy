@@ -523,13 +523,13 @@ SSH tunnels forward ports from your local machine to the remote VPS, allowing yo
 From your **local machine**, open a terminal and run:
 
 ```bash
-# Forward all OAuth callback ports at once
-ssh -L 51121:localhost:51121 -L 8085:localhost:8085 -L 11451:localhost:11451 user@your-vps-ip
+# Forward all OAuth callback ports at once (recommended)
+ssh -L 8085:localhost:8085 -L 51121:localhost:51121 -L 11451:localhost:11451 user@your-vps-ip
 
 # Alternative: Forward ports individually as needed
-ssh -L 51121:localhost:51121 user@your-vps-ip  # For Antigravity
 ssh -L 8085:localhost:8085 user@your-vps-ip    # For Gemini CLI
-ssh -L 11451:localhost:11451 user@your-vps-ip  # For iFlow
+ssh -L 51121:localhost:51121 user@your-vps-ip   # For Antigravity
+ssh -L 11451:localhost:11451 user@your-vps-ip    # For iFlow
 ```
 
 **Keep this SSH session open** during the entire authentication process.
