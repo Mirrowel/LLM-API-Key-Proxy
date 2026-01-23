@@ -219,11 +219,11 @@ def get_default_windows() -> List[WindowDefinition]:
     Get default window definitions.
 
     Most providers use a 5-hour rolling window as primary.
+    Daily is a 24h rolling window as fallback.
     """
     return [
         WindowDefinition.rolling("5h", 18000, is_primary=True, applies_to="model"),
-        WindowDefinition.daily("daily", applies_to="model"),
-        WindowDefinition.total("total", applies_to="model"),
+        WindowDefinition.rolling("daily", 86400, applies_to="model"),
     ]
 
 

@@ -31,6 +31,18 @@ from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 lib_logger = logging.getLogger("rotator_library")
 
 
+def _format_timestamp(ts: Optional[float]) -> Optional[str]:
+    """Format a unix timestamp as a human-readable local time string."""
+    if ts is None:
+        return None
+    try:
+        # Use local timezone for human readability
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OSError):
+        return None
+
+
 class UsageStorage:
     """
     Handles persistence of usage data to JSON files.
@@ -263,10 +275,14 @@ class UsageStorage:
             "total_tokens": window.total_tokens,
             "approx_cost": window.approx_cost,
             "started_at": window.started_at,
+            "started_at_human": _format_timestamp(window.started_at),
             "reset_at": window.reset_at,
+            "reset_at_human": _format_timestamp(window.reset_at),
             "limit": window.limit,
             "first_used_at": window.first_used_at,
+            "first_used_at_human": _format_timestamp(window.first_used_at),
             "last_used_at": window.last_used_at,
+            "last_used_at_human": _format_timestamp(window.last_used_at),
         }
 
     def _parse_total_stats(self, data: Dict[str, Any]) -> TotalStats:
@@ -302,13 +318,18 @@ class UsageStorage:
             "total_tokens": totals.total_tokens,
             "approx_cost": totals.approx_cost,
             "first_used_at": totals.first_used_at,
+            "first_used_at_human": _format_timestamp(totals.first_used_at),
             "last_used_at": totals.last_used_at,
+            "last_used_at_human": _format_timestamp(totals.last_used_at),
         }
 
     def _parse_model_stats(self, data: Dict[str, Any]) -> ModelStats:
         """Parse model stats from storage data."""
         windows = {}
         for name, wdata in data.get("windows", {}).items():
+            # Skip legacy "total" window - now tracked in totals
+            if name == "total":
+                continue
             windows[name] = self._parse_window_stats(name, wdata)
 
         totals = self._parse_total_stats(data.get("totals", {}))
@@ -329,6 +350,9 @@ class UsageStorage:
         """Parse group stats from storage data."""
         windows = {}
         for name, wdata in data.get("windows", {}).items():
+            # Skip legacy "total" window - now tracked in totals
+            if name == "total":
+                continue
             windows[name] = self._parse_window_stats(name, wdata)
 
         totals = self._parse_total_stats(data.get("totals", {}))
@@ -420,7 +444,9 @@ class UsageStorage:
                 cooldowns[key] = {
                     "reason": cd.reason,
                     "until": cd.until,
+                    "until_human": _format_timestamp(cd.until),
                     "started_at": cd.started_at,
+                    "started_at_human": _format_timestamp(cd.started_at),
                     "source": cd.source,
                     "model_or_group": cd.model_or_group,
                     "backoff_count": cd.backoff_count,
@@ -432,6 +458,7 @@ class UsageStorage:
             fair_cycle[key] = {
                 "exhausted": fc.exhausted,
                 "exhausted_at": fc.exhausted_at,
+                "exhausted_at_human": _format_timestamp(fc.exhausted_at),
                 "exhausted_reason": fc.exhausted_reason,
                 "cycle_request_count": fc.cycle_request_count,
             }
@@ -455,5 +482,7 @@ class UsageStorage:
             "fair_cycle": fair_cycle,
             "max_concurrent": state.max_concurrent,
             "created_at": state.created_at,
+            "created_at_human": _format_timestamp(state.created_at),
             "last_updated": state.last_updated,
+            "last_updated_human": _format_timestamp(state.last_updated),
         }
