@@ -70,20 +70,6 @@ class WindowDefinition:
             applies_to=applies_to,
         )
 
-    @classmethod
-    def total(
-        cls,
-        name: str = "total",
-        applies_to: str = "model",
-    ) -> "WindowDefinition":
-        """Create a total/infinite window definition."""
-        return cls(
-            name=name,
-            duration_seconds=None,
-            reset_mode=ResetMode.ROLLING,
-            applies_to=applies_to,
-        )
-
 
 # =============================================================================
 # FAIR CYCLE CONFIGURATION
@@ -218,12 +204,11 @@ def get_default_windows() -> List[WindowDefinition]:
     """
     Get default window definitions.
 
-    Most providers use a 5-hour rolling window as primary.
-    Daily is a 24h rolling window as fallback.
+    Only used when provider doesn't define custom windows via
+    usage_reset_configs or get_usage_reset_config().
     """
     return [
-        WindowDefinition.rolling("5h", 18000, is_primary=True, applies_to="model"),
-        WindowDefinition.rolling("daily", 86400, applies_to="model"),
+        WindowDefinition.rolling("daily", 86400, is_primary=True, applies_to="model"),
     ]
 
 

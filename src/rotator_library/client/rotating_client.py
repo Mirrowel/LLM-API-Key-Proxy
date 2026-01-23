@@ -662,7 +662,6 @@ class RotatingClient:
                 is_primary=True,
                 applies_to=applies_to,
             ),
-            WindowDefinition.total(name="total", applies_to=applies_to),
         ]
 
     def _sanitize_litellm_log(self, log_data: dict) -> dict:
