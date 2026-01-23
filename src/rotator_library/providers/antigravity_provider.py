@@ -747,16 +747,19 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
         "$id",
         "$ref",
         "$defs",
-        "$schema",  # Rejected by 'parameters' key
+        "$schema",
+        "$comment",
+        "$vocabulary",
+        "$dynamicRef",
+        "$dynamicAnchor",
         "definitions",
-        "default",  # Rejected by 'parameters' key
-        "examples",  # Rejected by 'parameters' key
+        "default",  # Rejected by 'parameters' key, sometimes
+        "examples",  # Rejected by 'parameters' key, sometimes
         "title",  # May cause issues in nested objects
     }
 
-    # Validation keywords - only remove at schema-definition level,
-    # NOT when they appear as property names under "properties"
-    # Note: These are common property names that could be used by tools:
+    # Validation keywords to strip ONLY for Claude (Gemini accepts these)
+    # These are common property names that could be used by tools:
     # - "pattern" (glob, grep, regex tools)
     # - "format" (export, date/time tools)
     # - "minimum"/"maximum" (range tools)
@@ -765,27 +768,55 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     # but we now use 'parameters' key which may silently ignore some):
     # Note: $schema, default, examples, title moved to meta_keywords (always stripped)
     validation_keywords_claude_only = {
+        # Array validation - Gemini accepts
         "minItems",
         "maxItems",
-        "uniqueItems",
+        # String validation - Gemini accepts
         "pattern",
         "minLength",
         "maxLength",
+        "format",
+        # Number validation - Gemini accepts
         "minimum",
         "maximum",
+        # Object validation - Gemini accepts
+        "minProperties",
+        "maxProperties",
+        # Composition - Gemini accepts
+        "not",
+        "prefixItems",
+    }
+
+    # Validation keywords to strip for ALL models (Gemini and Claude)
+    validation_keywords_all_models = {
+        # Number validation - Gemini rejects
         "exclusiveMinimum",
         "exclusiveMaximum",
         "multipleOf",
-        "format",
-        "minProperties",
-        "maxProperties",
+        # Array validation - Gemini rejects
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        # Object validation - Gemini rejects
         "propertyNames",
+        "unevaluatedProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        # Content validation - Gemini rejects
         "contentEncoding",
         "contentMediaType",
         "contentSchema",
+        # Meta annotations - Gemini rejects
+        "examples",
         "deprecated",
         "readOnly",
         "writeOnly",
+        # Conditional - Gemini rejects
+        "if",
+        "then",
+        "else",
     }
 
     # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
@@ -889,6 +920,10 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 # Gemini accepts these - preserve them
                 cleaned[key] = value
             # For Claude: skip - not supported
+            continue
+
+        # Strip keywords unsupported by ALL models (both Gemini and Claude)
+        if key in validation_keywords_all_models:
             continue
 
         # Special handling for additionalProperties:
