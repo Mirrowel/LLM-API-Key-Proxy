@@ -1272,7 +1272,9 @@ class UsageManager:
 
         primary_def = self._window_manager.get_primary_definition()
 
-        # Update group windows if group is provided
+        # Update windows based on quota scope
+        # If group_key exists, quota is at group level - only update group stats
+        # We can't know which model the requests went to from API-level quota
         if group_key:
             group_stats = state.get_group_stats(group_key)
             if primary_def:
@@ -1282,16 +1284,16 @@ class UsageManager:
                 self._apply_quota_update(
                     group_window, quota_max_requests, quota_reset_ts, quota_used, force
                 )
-
-        # Update model windows
-        model_stats = state.get_model_stats(normalized_model)
-        if primary_def:
-            model_window = self._window_manager.get_or_create_window(
-                model_stats.windows, primary_def.name
-            )
-            self._apply_quota_update(
-                model_window, quota_max_requests, quota_reset_ts, quota_used, force
-            )
+        else:
+            # No quota group - model IS the quota scope, update model stats
+            model_stats = state.get_model_stats(normalized_model)
+            if primary_def:
+                model_window = self._window_manager.get_or_create_window(
+                    model_stats.windows, primary_def.name
+                )
+                self._apply_quota_update(
+                    model_window, quota_max_requests, quota_reset_ts, quota_used, force
+                )
 
         # Mark state as updated
         state.last_updated = time.time()
