@@ -165,6 +165,10 @@ class UsageManager:
         # Resilient writer for usage data persistence
         self._state_writer = ResilientStateWriter(file_path, lib_logger)
 
+        # Forced credential for manual override (TUI control)
+        self._forced_credential: Optional[str] = None
+        self._forced_credential_lock = asyncio.Lock()
+
         if daily_reset_time_utc:
             hour, minute = map(int, daily_reset_time_utc.split(":"))
             self.daily_reset_time_utc = dt_time(
@@ -184,6 +188,37 @@ class UsageManager:
             "balanced" or "sequential"
         """
         return self.provider_rotation_modes.get(provider, "balanced")
+
+    # =========================================================================
+    # FORCED CREDENTIAL (TUI OVERRIDE)
+    # =========================================================================
+
+    async def set_forced_credential(self, credential: Optional[str]) -> None:
+        """
+        Force the usage manager to use a specific credential for all requests.
+        
+        This overrides the normal rotation logic and always selects the specified
+        credential, if it's available and not on cooldown.
+        
+        Args:
+            credential: Full credential path/identifier, or None to clear the override
+        """
+        async with self._forced_credential_lock:
+            self._forced_credential = credential
+            if credential:
+                lib_logger.info(f"Forced credential set to: {mask_credential(credential)}")
+            else:
+                lib_logger.info("Forced credential cleared")
+
+    async def get_forced_credential(self) -> Optional[str]:
+        """
+        Get the currently forced credential, if any.
+        
+        Returns:
+            The forced credential path/identifier, or None if no override is active
+        """
+        async with self._forced_credential_lock:
+            return self._forced_credential
 
     # =========================================================================
     # FAIR CYCLE ROTATION HELPERS
@@ -2200,6 +2235,64 @@ class UsageManager:
         normalized_model = (
             self._normalize_model(available_keys[0], model) if available_keys else model
         )
+
+        # Check if a specific credential is forced (TUI override)
+        forced_cred = await self.get_forced_credential()
+        if forced_cred:
+            # Find matching credential - support both full path and filename matching
+            matched_cred = None
+            if forced_cred in available_keys:
+                matched_cred = forced_cred
+            else:
+                # Try matching by filename (basename)
+                for key in available_keys:
+                    if key.endswith(forced_cred) or Path(key).name == forced_cred:
+                        matched_cred = key
+                        break
+            
+            if matched_cred:
+                now = time.time()
+                async with self._data_lock:
+                    key_data = self._usage_data.get(matched_cred, {})
+                    # Check if forced credential is available (not on cooldown)
+                    is_on_cooldown = (
+                        (key_data.get("key_cooldown_until") or 0) > now or
+                        (key_data.get("model_cooldowns", {}).get(normalized_model) or 0) > now
+                    )
+                
+                if not is_on_cooldown:
+                    # Try to acquire the forced credential
+                    state = self.key_states[matched_cred]
+                    async with state["lock"]:
+                        current_count = state["models_in_use"].get(model, 0)
+                        if current_count < max_concurrent:
+                            state["models_in_use"][model] = current_count + 1
+                            tier_name = (
+                                credential_tier_names.get(matched_cred, "unknown")
+                                if credential_tier_names
+                                else "unknown"
+                            )
+                            quota_display = self._get_quota_display(matched_cred, model)
+                            lib_logger.info(
+                                f"Acquired FORCED key {mask_credential(matched_cred)} for model {model} "
+                                f"(tier: {tier_name}, {quota_display})"
+                            )
+                            return matched_cred
+                        else:
+                            lib_logger.warning(
+                                f"Forced credential {mask_credential(matched_cred)} is at max concurrency "
+                                f"({current_count}/{max_concurrent}), falling back to normal rotation"
+                            )
+                else:
+                    lib_logger.warning(
+                        f"Forced credential {mask_credential(matched_cred)} is on cooldown, "
+                        f"falling back to normal rotation"
+                    )
+            else:
+                lib_logger.warning(
+                    f"Forced credential {mask_credential(forced_cred)} not found in available credentials, "
+                    f"falling back to normal rotation"
+                )
 
         # This loop continues as long as the global deadline has not been met.
         while time.time() < deadline:

@@ -915,6 +915,9 @@ class QuotaViewer:
             self.console.print("   G.  Toggle view mode (current/global)")
             self.console.print("   R.  Reload stats (from proxy cache)")
             self.console.print("   RA. Reload all stats")
+            self.console.print()
+            self.console.print("   [cyan]1-9. Force use of credential [N] (locks rotation)[/cyan]")
+            self.console.print("   C.  Clear forced credential (resume normal rotation)")
 
             # Force refresh options (only for providers that support it)
             has_quota_groups = bool(
@@ -967,6 +970,84 @@ class QuotaViewer:
                     "[bold]Reloading all stats...", spinner="dots"
                 ):
                     self.post_action("reload", scope="all")
+            elif choice.isdigit() and 1 <= int(choice) <= 9:
+                # Handle numeric selection (force credential)
+                idx = int(choice)
+                credentials = (
+                    self.cached_stats.get("providers", {})
+                    .get(provider, {})
+                    .get("credentials", [])
+                    if self.cached_stats
+                    else []
+                )
+                # Sort credentials naturally to match display order
+                credentials = sorted(credentials, key=natural_sort_key)
+                
+                if idx <= len(credentials):
+                    cred = credentials[idx - 1]
+                    # Use full_path for matching, fall back to identifier
+                    cred_identifier = cred.get("full_path", cred.get("identifier", ""))
+                    cred_email = cred.get("email", cred.get("identifier", ""))
+                    
+                    # Call API to force this credential
+                    url = self._build_endpoint_url("/v1/force-credential")
+                    payload = {
+                        "credential": cred_identifier,
+                        "provider": provider
+                    }
+                    
+                    try:
+                        with httpx.Client(timeout=10.0) as http_client:
+                            response = http_client.post(
+                                url,
+                                headers=self._get_headers(),
+                                json=payload
+                            )
+                            
+                            if response.status_code == 200:
+                                result = response.json()
+                                self.console.print(
+                                    f"\n[green]✓ Forced credential:[/green] [{idx}] {cred_email}"
+                                )
+                                self.console.print(
+                                    "[dim]All requests will now use this credential (if available)[/dim]"
+                                )
+                            else:
+                                self.console.print(
+                                    f"\n[red]Failed to force credential: HTTP {response.status_code}[/red]"
+                                )
+                    except Exception as e:
+                        self.console.print(f"\n[red]Error: {e}[/red]")
+                    
+                    Prompt.ask("Press Enter to continue", default="")
+                else:
+                    self.console.print(f"\n[red]Invalid selection. Only {len(credentials)} credentials available.[/red]")
+                    Prompt.ask("Press Enter to continue", default="")
+            elif choice == "C":
+                # Clear forced credential
+                url = self._build_endpoint_url("/v1/force-credential")
+                payload = {"credential": None}
+                
+                try:
+                    with httpx.Client(timeout=10.0) as http_client:
+                        response = http_client.post(
+                            url,
+                            headers=self._get_headers(),
+                            json=payload
+                        )
+                        
+                        if response.status_code == 200:
+                            self.console.print(
+                                "\n[green]✓ Forced credential cleared. Resuming normal rotation.[/green]"
+                            )
+                        else:
+                            self.console.print(
+                                f"\n[red]Failed to clear forced credential: HTTP {response.status_code}[/red]"
+                            )
+                except Exception as e:
+                    self.console.print(f"\n[red]Error: {e}[/red]")
+                
+                Prompt.ask("Press Enter to continue", default="")
             elif choice == "F" and has_quota_groups:
                 result = None
                 with self.console.status(
