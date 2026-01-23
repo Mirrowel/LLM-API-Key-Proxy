@@ -63,7 +63,7 @@ class LimitEngine:
 
         # Custom caps and fair cycle always active
         self._custom_cap_checker = CustomCapChecker(config.custom_caps, window_manager)
-        self._fair_cycle_checker = FairCycleChecker(config.fair_cycle)
+        self._fair_cycle_checker = FairCycleChecker(config.fair_cycle, window_manager)
         self._checkers.append(self._custom_cap_checker)
         self._checkers.append(self._fair_cycle_checker)
 

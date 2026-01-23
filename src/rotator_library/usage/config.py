@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..core.constants import (
     DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
@@ -90,11 +91,163 @@ class FairCycleConfig:
     tracking_mode: TrackingMode = TrackingMode.MODEL_GROUP
     cross_tier: bool = False  # Track across all tiers
     duration: int = DEFAULT_FAIR_CYCLE_DURATION  # Cycle duration in seconds
+    quota_threshold: float = (
+        DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD  # Multiplier of window limit for exhaustion
+    )
 
 
 # =============================================================================
 # CUSTOM CAP CONFIGURATION
 # =============================================================================
+
+
+def _parse_duration_string(duration_str: str) -> Optional[int]:
+    """
+    Parse duration strings in various formats to total seconds.
+
+    Handles:
+    - Plain seconds (no unit): '300', '562476'
+    - Simple durations: '3600s', '60m', '2h', '1d'
+    - Compound durations: '2h30m', '1h30m45s', '2d1h30m'
+
+    Args:
+        duration_str: Duration string to parse
+
+    Returns:
+        Total seconds as integer, or None if parsing fails.
+    """
+    import re
+
+    if not duration_str:
+        return None
+
+    remaining = duration_str.strip().lower()
+
+    # Try parsing as plain number first (no units)
+    try:
+        return int(float(remaining))
+    except ValueError:
+        pass
+
+    total_seconds = 0.0
+
+    # Parse days component
+    day_match = re.match(r"(\d+)d", remaining)
+    if day_match:
+        total_seconds += int(day_match.group(1)) * 86400
+        remaining = remaining[day_match.end() :]
+
+    # Parse hours component
+    hour_match = re.match(r"(\d+)h", remaining)
+    if hour_match:
+        total_seconds += int(hour_match.group(1)) * 3600
+        remaining = remaining[hour_match.end() :]
+
+    # Parse minutes component - use negative lookahead to avoid matching 'ms'
+    min_match = re.match(r"(\d+)m(?!s)", remaining)
+    if min_match:
+        total_seconds += int(min_match.group(1)) * 60
+        remaining = remaining[min_match.end() :]
+
+    # Parse seconds component (including decimals)
+    sec_match = re.match(r"([\d.]+)s", remaining)
+    if sec_match:
+        total_seconds += float(sec_match.group(1))
+
+    if total_seconds > 0:
+        return int(total_seconds)
+    return None
+
+
+def _parse_cooldown_config(
+    mode: Optional[str],
+    value: Any,
+) -> Tuple[CooldownMode, int]:
+    """
+    Parse cooldown configuration from config dict values.
+
+    Supports comprehensive cooldown_value parsing:
+    - Flat duration: 300, "300", "1h", "30m", "1h30m", "2d1h30m" → fixed seconds
+    - Offset with sign: "+300", "+1h30m", "-300", "-5m" → offset from natural reset
+    - Percentage: "+50%", "-20%" → percentage of window duration as offset
+      (stored as negative value with special encoding: -1000 - percentage)
+    - String "quota_reset" → use natural reset time
+
+    The cooldown_mode is auto-detected from the value format if not explicitly set:
+    - Starts with '+' or '-' → CooldownMode.OFFSET
+    - Just a duration → CooldownMode.FIXED
+    - "quota_reset" string → CooldownMode.QUOTA_RESET
+
+    Args:
+        mode: Explicit cooldown mode string, or None to auto-detect
+        value: Cooldown value (int, str, or various formats)
+
+    Returns:
+        Tuple of (CooldownMode, cooldown_value in seconds)
+    """
+    # Handle explicit mode with simple value
+    if mode is not None:
+        try:
+            cooldown_mode = CooldownMode(mode)
+        except ValueError:
+            cooldown_mode = CooldownMode.QUOTA_RESET
+
+        # Parse value
+        if isinstance(value, int):
+            return cooldown_mode, value
+        elif isinstance(value, str):
+            parsed = _parse_duration_string(value.lstrip("+-"))
+            return cooldown_mode, parsed or 0
+        else:
+            return cooldown_mode, 0
+
+    # Auto-detect mode from value format
+    if isinstance(value, int):
+        if value == 0:
+            return CooldownMode.QUOTA_RESET, 0
+        return CooldownMode.FIXED, value
+
+    if isinstance(value, str):
+        value = value.strip()
+
+        # Check for "quota_reset" string
+        if value.lower() in ("quota_reset", "quota-reset", "quotareset"):
+            return CooldownMode.QUOTA_RESET, 0
+
+        # Check for percentage format: "+50%", "-20%"
+        if value.endswith("%"):
+            sign = 1
+            val_str = value.rstrip("%")
+            if val_str.startswith("+"):
+                val_str = val_str[1:]
+            elif val_str.startswith("-"):
+                sign = -1
+                val_str = val_str[1:]
+            try:
+                percentage = int(val_str)
+                # Encode percentage as special value: -1000 - (sign * percentage)
+                # This allows the custom_caps checker to detect and handle percentages
+                # Range: -1001 to -1100 for +1% to +100%, -999 to -900 for -1% to -100%
+                encoded = -1000 - (sign * percentage)
+                return CooldownMode.OFFSET, encoded
+            except ValueError:
+                pass
+
+        # Check for offset format: "+300", "+1h30m", "-5m"
+        if value.startswith("+") or value.startswith("-"):
+            sign = 1 if value.startswith("+") else -1
+            duration_str = value[1:]
+            parsed = _parse_duration_string(duration_str)
+            if parsed is not None:
+                return CooldownMode.OFFSET, sign * parsed
+            return CooldownMode.OFFSET, 0
+
+        # Plain duration: "300", "1h30m"
+        parsed = _parse_duration_string(value)
+        if parsed is not None:
+            return CooldownMode.FIXED, parsed
+
+    return CooldownMode.QUOTA_RESET, 0
 
 
 @dataclass
@@ -115,7 +268,20 @@ class CustomCapConfig:
     def from_dict(
         cls, tier_key: str, model_or_group: str, config: Dict[str, Any]
     ) -> "CustomCapConfig":
-        """Create from dictionary config."""
+        """
+        Create from dictionary config.
+
+        Supports comprehensive cooldown_value parsing:
+        - Flat duration: 300, "300", "1h", "30m", "1h30m", "2d1h30m" → fixed seconds
+        - Offset with sign: "+300", "+1h30m", "-300", "-5m" → offset from natural reset
+        - Percentage: "+50%", "-20%" → percentage of window duration as offset
+        - String "quota_reset" → use natural reset time
+
+        The cooldown_mode is auto-detected from the value format:
+        - Starts with '+' or '-' → CooldownMode.OFFSET
+        - Just a duration → CooldownMode.FIXED
+        - "quota_reset" string → CooldownMode.QUOTA_RESET
+        """
         max_requests = config.get("max_requests", 0)
 
         # Handle percentage strings like "80%"
@@ -124,12 +290,18 @@ class CustomCapConfig:
             # Will be resolved later when actual limit is known
             max_requests = -int(max_requests.rstrip("%"))
 
+        # Parse cooldown configuration
+        cooldown_mode, cooldown_value = _parse_cooldown_config(
+            config.get("cooldown_mode"),
+            config.get("cooldown_value", 0),
+        )
+
         return cls(
             tier_key=tier_key,
             model_or_group=model_or_group,
             max_requests=max_requests,
-            cooldown_mode=CooldownMode(config.get("cooldown_mode", "quota_reset")),
-            cooldown_value=config.get("cooldown_value", 0),
+            cooldown_mode=cooldown_mode,
+            cooldown_value=cooldown_value,
         )
 
 
@@ -277,6 +449,9 @@ def load_provider_usage_config(
                 ),
                 cross_tier=fc_config.get("cross_tier", False),
                 duration=fc_config.get("duration", DEFAULT_FAIR_CYCLE_DURATION),
+                quota_threshold=fc_config.get(
+                    "quota_threshold", DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD
+                ),
             )
         else:
             if hasattr(plugin_class, "default_fair_cycle_enabled"):
@@ -291,6 +466,10 @@ def load_provider_usage_config(
                 )
             if hasattr(plugin_class, "default_fair_cycle_duration"):
                 config.fair_cycle.duration = plugin_class.default_fair_cycle_duration
+            if hasattr(plugin_class, "default_fair_cycle_quota_threshold"):
+                config.fair_cycle.quota_threshold = (
+                    plugin_class.default_fair_cycle_quota_threshold
+                )
 
         # Custom caps
         if hasattr(plugin_class, "default_custom_caps"):
@@ -367,6 +546,14 @@ def load_provider_usage_config(
     if env_fc_duration:
         try:
             config.fair_cycle.duration = int(env_fc_duration)
+        except ValueError:
+            pass
+
+    # Fair cycle quota threshold from env
+    env_fc_quota = os.getenv(f"FAIR_CYCLE_QUOTA_THRESHOLD_{provider_upper}")
+    if env_fc_quota:
+        try:
+            config.fair_cycle.quota_threshold = float(env_fc_quota)
         except ValueError:
             pass
 

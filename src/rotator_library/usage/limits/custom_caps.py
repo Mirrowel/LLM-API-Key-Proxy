@@ -4,7 +4,7 @@
 """
 Custom cap limit checker.
 
-Enforces user-defined limits that are stricter than API limits.
+Enforces user-defined limits on API usage.
 """
 
 import time
@@ -23,8 +23,8 @@ class CustomCapChecker(LimitChecker):
     """
     Checks custom cap limits.
 
-    Custom caps allow users to set limits more restrictive than
-    what the API allows, for cost control or other reasons.
+    Custom caps allow users to set custom usage limits per tier/model/group.
+    Limits can be absolute numbers or percentages of API limits.
     """
 
     def __init__(
@@ -190,13 +190,11 @@ class CustomCapChecker(LimitChecker):
         """
         Resolve max requests, handling percentage values.
 
-        Custom caps can only be MORE restrictive than API limits,
-        so the result is clamped to window_limit if available.
+        Custom caps can be ANY value - higher or lower than API limits.
+        Negative values indicate percentage of the window limit.
         """
         if cap.max_requests >= 0:
-            # Absolute value - clamp to window limit if known
-            if window_limit is not None:
-                return min(cap.max_requests, window_limit)
+            # Absolute value - use as-is (no clamping)
             return cap.max_requests
 
         # Negative value indicates percentage
@@ -206,15 +204,21 @@ class CustomCapChecker(LimitChecker):
 
         percentage = -cap.max_requests
         calculated = int(window_limit * percentage / 100)
-        # Clamp to window limit (already is <= since percentage < 100 typically)
-        return min(calculated, window_limit)
+        return calculated
 
     def _calculate_cooldown_until(
         self,
         cap: CustomCapConfig,
         window: WindowStats,
     ) -> Optional[float]:
-        """Calculate when the custom cap cooldown ends."""
+        """
+        Calculate when the custom cap cooldown ends.
+
+        Modes:
+        - QUOTA_RESET: Wait until natural window reset
+        - OFFSET: Add/subtract offset from natural reset (clamped to >= reset)
+        - FIXED: Fixed duration from now
+        """
         now = time.time()
         natural_reset = window.reset_at
 
@@ -223,13 +227,20 @@ class CustomCapChecker(LimitChecker):
             return natural_reset
 
         elif cap.cooldown_mode == CooldownMode.OFFSET:
-            # Add offset to current time
-            calculated = now + cap.cooldown_value
-            return max(calculated, natural_reset) if natural_reset else calculated
+            # Offset from natural reset time
+            # Positive offset = wait AFTER reset
+            # Negative offset = wait BEFORE reset (clamped to >= reset for safety)
+            if natural_reset:
+                calculated = natural_reset + cap.cooldown_value
+                # Always clamp to at least natural_reset (can't end before quota resets)
+                return max(calculated, natural_reset)
+            else:
+                # No natural reset known, use absolute offset from now
+                return now + abs(cap.cooldown_value)
 
         elif cap.cooldown_mode == CooldownMode.FIXED:
-            # Fixed duration
+            # Fixed duration from now
             calculated = now + cap.cooldown_value
-            return max(calculated, natural_reset) if natural_reset else calculated
+            return calculated
 
         return None

@@ -86,6 +86,20 @@ DEFAULT_FAIR_CYCLE_DURATION: int = 604800  # 7 days
 # Global fallback: EXHAUSTION_COOLDOWN_THRESHOLD=<seconds>
 DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD: int = 300  # 5 minutes
 
+# Fair cycle quota threshold - multiplier of window limit
+# 1.0 = credential exhausts after using 1 full window's worth of quota
+# 0.5 = credential exhausts after using 50% of window quota
+# 2.0 = credential exhausts after using 2x window quota
+# Override: FAIR_CYCLE_QUOTA_THRESHOLD_{PROVIDER}=<float>
+DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD: float = 1.0
+
+# Fair cycle quota threshold - multiplier of window limit
+# 1.0 = credential exhausts after using 1 full window's worth of quota
+# 0.5 = credential exhausts after using 50% of window quota
+# 2.0 = credential exhausts after using 2x window quota
+# Override: FAIR_CYCLE_QUOTA_THRESHOLD_{PROVIDER}=<float>
+DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD: float = 1.0
+
 # =============================================================================
 # CUSTOM CAPS DEFAULTS
 # =============================================================================

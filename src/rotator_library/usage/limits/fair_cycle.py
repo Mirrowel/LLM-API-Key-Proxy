@@ -22,6 +22,7 @@ from ..types import (
     FAIR_CYCLE_GLOBAL_KEY,
 )
 from ..config import FairCycleConfig
+from ..tracking.windows import WindowManager
 from .base import LimitChecker
 
 lib_logger = logging.getLogger("rotator_library")
@@ -35,14 +36,18 @@ class FairCycleChecker(LimitChecker):
     until all credentials in the pool have been exhausted, then resets the cycle.
     """
 
-    def __init__(self, config: FairCycleConfig):
+    def __init__(
+        self, config: FairCycleConfig, window_manager: Optional[WindowManager] = None
+    ):
         """
         Initialize fair cycle checker.
 
         Args:
             config: Fair cycle configuration
+            window_manager: WindowManager for getting window limits (optional)
         """
         self._config = config
+        self._window_manager = window_manager
         # Global cycle state per provider
         self._global_state: Dict[str, Dict[str, GlobalFairCycleState]] = {}
 
@@ -72,6 +77,24 @@ class FairCycleChecker(LimitChecker):
 
         group_key = self._resolve_tracking_key(model, quota_group)
         fc_state = state.fair_cycle.get(group_key)
+
+        # Check quota-based exhaustion (cycle_request_count >= window.limit * threshold)
+        # This is separate from explicit exhaustion marking
+        if fc_state and not fc_state.exhausted:
+            quota_limit = self._get_quota_limit(state, model, quota_group)
+            if quota_limit is not None:
+                threshold = int(quota_limit * self._config.quota_threshold)
+                if fc_state.cycle_request_count >= threshold:
+                    # Mark as exhausted due to quota threshold
+                    now = time.time()
+                    fc_state.exhausted = True
+                    fc_state.exhausted_at = now
+                    fc_state.exhausted_reason = "quota_threshold"
+                    lib_logger.debug(
+                        f"Credential {state.stable_id} exhausted for {group_key}: "
+                        f"cycle_request_count ({fc_state.cycle_request_count}) >= "
+                        f"quota_threshold ({threshold})"
+                    )
 
         # Not exhausted = allowed
         if fc_state is None or not fc_state.exhausted:
@@ -248,6 +271,66 @@ class FairCycleChecker(LimitChecker):
         """Check if cycle duration has expired."""
         now = time.time()
         return now >= global_state.cycle_start + self._config.duration
+
+    def _get_quota_limit(
+        self,
+        state: CredentialState,
+        model: str,
+        quota_group: Optional[str],
+    ) -> Optional[int]:
+        """
+        Get the quota limit for fair cycle comparison.
+
+        Uses the smallest window limit available (most restrictive).
+
+        Args:
+            state: Credential state
+            model: Model name
+            quota_group: Quota group (optional)
+
+        Returns:
+            The quota limit, or None if unknown
+        """
+        if self._window_manager is None:
+            return None
+
+        primary_def = self._window_manager.get_primary_definition()
+        if primary_def is None:
+            return None
+
+        group_key = quota_group or model
+        windows = None
+
+        # Check group first if quota_group is specified
+        if quota_group:
+            group_stats = state.get_group_stats(quota_group, create=False)
+            if group_stats:
+                windows = group_stats.windows
+
+        # Fall back to model
+        if windows is None:
+            model_stats = state.get_model_stats(model, create=False)
+            if model_stats:
+                windows = model_stats.windows
+
+        if windows is None:
+            return None
+
+        # Get limit from primary window
+        primary_window = self._window_manager.get_active_window(
+            windows, primary_def.name
+        )
+        if primary_window and primary_window.limit:
+            return primary_window.limit
+
+        # If no primary window limit, try to find smallest limit from any window
+        smallest_limit: Optional[int] = None
+        for window in windows.values():
+            if window.limit is not None:
+                if smallest_limit is None or window.limit < smallest_limit:
+                    smallest_limit = window.limit
+
+        return smallest_limit
 
     def _all_exhausted_in_group(
         self,
