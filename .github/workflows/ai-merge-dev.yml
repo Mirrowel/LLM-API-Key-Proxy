@@ -32,6 +32,14 @@ on:
         description: 'feature/nanogpt-quota-system'
         type: boolean
         default: false
+      branch_fix_firmware_cost_calculation:
+        description: 'fix/firmware-cost-calculation'
+        type: boolean
+        default: false
+      branch_fix_firmware_tui_credential_manager:
+        description: 'fix/firmware-tui-credential-manager'
+        type: boolean
+        default: false
       custom_branches:
         description: 'Additional branches (comma-separated, optional)'
         type: string
@@ -102,7 +110,7 @@ jobs:
           if [ -n "$custom" ]; then branches="${branches:+$branches, }$custom"; fi
           echo "Selected branches: $branches"
           echo "branches=$branches" >> $GITHUB_OUTPUT
-          echo "has_branches=$( [ -n "$branches" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+          echo "has_branches=$( [ -n \"$branches\" ] && echo true || echo false )" >> $GITHUB_OUTPUT
           if [ -z "$branches" ] && [ "$SYNC_UPSTREAM" != "true" ]; then
             echo "::error::No branches selected and upstream sync not enabled"
             exit 1
@@ -129,9 +137,9 @@ jobs:
           fi
 
       - name: Sync with Upstream
-        if: github.event.inputs.sync_upstream == 'true'
+        if: ${{  github.event.inputs.sync_upstream == 'true'  }}
         env:
-          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch }}
+          UPSTREAM_BRANCH: ${{  github.event.inputs.upstream_branch  }}
         run: |
           echo "### Upstream Sync" >> $GITHUB_STEP_SUMMARY
           git remote add upstream https://github.com/Mirrowel/LLM-API-Key-Proxy.git 2>/dev/null || true
@@ -158,7 +166,7 @@ jobs:
           fi
 
       - name: Merge Branches
-        if: steps.collect.outputs.has_branches == 'true'
+        if: ${{  steps.collect.outputs.has_branches == 'true'  }}
         env:
           BRANCHES_INPUT: ${{  steps.collect.outputs.branches  }}
         run: |
