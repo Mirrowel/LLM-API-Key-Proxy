@@ -235,6 +235,10 @@ class UsageManager:
         self._key_locks: Dict[str, asyncio.Lock] = {}
         self._key_conditions: Dict[str, asyncio.Condition] = {}
 
+        # Track which credentials are currently active in the proxy session
+        # (vs. historical data loaded from storage)
+        self._active_stable_ids: Set[str] = set()
+
     async def initialize(
         self,
         credentials: List[str],
@@ -266,9 +270,11 @@ class UsageManager:
                         fair_cycle_global
                     )
 
-            # Register credentials
+            # Register credentials and track active ones
+            self._active_stable_ids.clear()
             for accessor in credentials:
                 stable_id = self._registry.get_stable_id(accessor, self.provider)
+                self._active_stable_ids.add(stable_id)
 
                 # Create or update state
                 if stable_id not in self._states:
@@ -830,7 +836,7 @@ class UsageManager:
         """
         stats = {
             "provider": self.provider,
-            "credential_count": len(self._states),
+            "credential_count": len(self._active_stable_ids),
             "rotation_mode": self._config.rotation_mode.value,
             "credentials": {},
         }
@@ -852,6 +858,10 @@ class UsageManager:
         )
 
         for stable_id, state in self._states.items():
+            # Skip credentials not currently active in the proxy
+            if stable_id not in self._active_stable_ids:
+                continue
+
             now = time.time()
 
             # Determine credential status with proper granularity
