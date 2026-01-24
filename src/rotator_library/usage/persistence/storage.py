@@ -27,6 +27,7 @@ from ..types import (
     StorageSchema,
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
+from ...error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -436,7 +437,9 @@ class UsageStorage:
             )
 
         except Exception as e:
-            lib_logger.warning(f"Failed to parse credential {stable_id}: {e}")
+            lib_logger.warning(
+                f"Failed to parse credential {mask_credential(stable_id, style='full')}: {e}"
+            )
             return None
 
     def _serialize_credential_state(self, state: CredentialState) -> Dict[str, Any]:

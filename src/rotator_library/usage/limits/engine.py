@@ -20,6 +20,8 @@ from .window_limits import WindowLimitChecker
 from .cooldowns import CooldownChecker
 from .fair_cycle import FairCycleChecker
 from .custom_caps import CustomCapChecker
+from ...error_handler import mask_credential
+from ...error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -95,7 +97,7 @@ class LimitEngine:
             result = checker.check(state, model, quota_group)
             if not result.allowed:
                 lib_logger.debug(
-                    f"Credential {state.stable_id} blocked by {checker.name}: {result.reason}"
+                    f"Credential {mask_credential(state.accessor, style='full')} blocked by {checker.name}: {result.reason}"
                 )
                 return result
 

@@ -26,6 +26,8 @@ from ..types import (
 )
 from ..config import WindowDefinition, ProviderUsageConfig
 from .windows import WindowManager
+from ...error_handler import mask_credential
+from ...error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -619,8 +621,9 @@ class TrackingEngine:
         fc_state.exhausted_at = now
         fc_state.exhausted_reason = reason
 
-        lib_logger.debug(
-            f"Credential {state.stable_id} marked exhausted for {model_or_group}: {reason}"
+        lib_logger.info(
+            f"Credential {mask_credential(state.accessor, style='full')} marked fair-cycle exhausted "
+            f"for {model_or_group}: {reason}"
         )
 
     def _resolve_fair_cycle_key(self, group_key: str) -> str:

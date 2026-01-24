@@ -258,12 +258,36 @@ def mask_credential(credential: str, style: str = "short") -> str:
     Returns:
         Masked credential string:
         - For OAuth file paths: shows just the filename (e.g., "oauth_1.json")
+        - For emails: preserves structure (e.g., "sco***05@***.com")
         - For API keys with style="short": shows last 6 chars (e.g., "...xyz123")
         - For API keys with style="full": shows first 4 + last 4 (e.g., "AIza...3456")
     """
+    # File paths: show just filename
     if os.path.isfile(credential) or credential.endswith(".json"):
         return os.path.basename(credential)
 
+    # Email addresses: preserve structure with masking
+    if "@" in credential and "." in credential.split("@")[-1]:
+        local, domain = credential.rsplit("@", 1)
+
+        # Mask local part: first 3 + *** + last 2 (if long enough)
+        if len(local) > 5:
+            masked_local = f"{local[:3]}***{local[-2:]}"
+        elif len(local) > 2:
+            masked_local = f"{local[:2]}***"
+        else:
+            masked_local = "***"
+
+        # Mask domain: keep only TLD
+        if "." in domain:
+            tld = domain.rsplit(".", 1)[1]
+            masked_domain = f"***.{tld}"
+        else:
+            masked_domain = "***"
+
+        return f"{masked_local}@{masked_domain}"
+
+    # API keys: original masking logic
     if style == "full" and len(credential) > 12:
         return f"{credential[:4]}...{credential[-4:]}"
     elif len(credential) > 6:

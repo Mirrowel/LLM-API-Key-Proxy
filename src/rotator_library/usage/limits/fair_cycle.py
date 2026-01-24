@@ -23,6 +23,8 @@ from ..types import (
 )
 from ..config import FairCycleConfig
 from ..tracking.windows import WindowManager
+from ...error_handler import mask_credential
+from ...error_handler import mask_credential
 from .base import LimitChecker
 
 lib_logger = logging.getLogger("rotator_library")
@@ -90,8 +92,8 @@ class FairCycleChecker(LimitChecker):
                     fc_state.exhausted = True
                     fc_state.exhausted_at = now
                     fc_state.exhausted_reason = "quota_threshold"
-                    lib_logger.debug(
-                        f"Credential {state.stable_id} exhausted for {group_key}: "
+                    lib_logger.info(
+                        f"Credential {mask_credential(state.accessor, style='full')} fair-cycle exhausted for {group_key}: "
                         f"cycle_request_count ({fc_state.cycle_request_count}) >= "
                         f"quota_threshold ({threshold})"
                     )

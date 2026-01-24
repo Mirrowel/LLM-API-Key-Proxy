@@ -12,6 +12,8 @@ import logging
 from typing import Dict, List, Optional
 
 from ...types import CredentialState, SelectionContext, RotationMode
+from ....error_handler import mask_credential
+from ....error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -84,7 +86,12 @@ class SequentialStrategy:
         # Make it sticky
         if selected:
             self._current[key] = selected
-            lib_logger.debug(f"Sequential: switched to credential {selected} for {key}")
+            masked = (
+                mask_credential(states[selected].accessor, style="full")
+                if selected in states
+                else mask_credential(selected, style="full")
+            )
+            lib_logger.debug(f"Sequential: switched to credential {masked} for {key}")
 
         return selected
 
@@ -100,7 +107,9 @@ class SequentialStrategy:
         if key in self._current:
             old = self._current[key]
             del self._current[key]
-            lib_logger.debug(f"Sequential: marked {old} exhausted for {key}")
+            lib_logger.debug(
+                f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
+            )
 
     def get_current(self, provider: str, model_or_group: str) -> Optional[str]:
         """
