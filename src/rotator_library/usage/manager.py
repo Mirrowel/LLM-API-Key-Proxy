@@ -1552,7 +1552,7 @@ class UsageManager:
             group_window: The authoritative group window
             window_name: Name of the window to sync (e.g., "5h")
         """
-        models_in_group = self.get_models_in_quota_group(group_key)
+        models_in_group = self._get_grouped_models(group_key)
         for model_name in models_in_group:
             model_stats = state.get_model_stats(model_name, create=False)
             if model_stats:
