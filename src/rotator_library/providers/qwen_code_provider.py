@@ -298,20 +298,51 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             }
             return
 
-        # Handle usage-only chunks
-        if usage_data:
-            yield {
-                "choices": [],
-                "model": model_id,
-                "object": "chat.completion.chunk",
-                "id": chunk_id,
-                "created": chunk_created,
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
-            }
+        # Handle usage-only chunks (Qwen API sends finish_reason and usage separately)
+        # Check if we have a buffered finish_reason chunk to combine with
+        if usage_data and not choices:
+            pending = stream_state.pop("pending_final_chunk", None)
+            if pending:
+                # Combine buffered finish_reason chunk with this usage chunk
+                finish_reason = pending["finish_reason"]
+                # Apply tool_calls priority
+                if stream_state.get("has_tool_calls"):
+                    finish_reason = "tool_calls"
+                elif not finish_reason:
+                    finish_reason = "stop"
+
+                yield {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": pending["delta"],
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "model": model_id,
+                    "object": "chat.completion.chunk",
+                    "id": pending.get("id", chunk_id),
+                    "created": pending.get("created", chunk_created),
+                    "usage": {
+                        "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                        "completion_tokens": usage_data.get("completion_tokens", 0),
+                        "total_tokens": usage_data.get("total_tokens", 0),
+                    },
+                }
+            else:
+                # No pending chunk - yield usage-only as fallback
+                yield {
+                    "choices": [],
+                    "model": model_id,
+                    "object": "chat.completion.chunk",
+                    "id": chunk_id,
+                    "created": chunk_created,
+                    "usage": {
+                        "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                        "completion_tokens": usage_data.get("completion_tokens", 0),
+                        "total_tokens": usage_data.get("total_tokens", 0),
+                    },
+                }
             return
 
         # Handle content-only chunks
@@ -333,6 +364,18 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             and finish_reason != "tool_calls"
         ):
             finish_reason = "tool_calls"
+
+        # If this chunk has finish_reason but no usage, buffer it for combining with usage chunk
+        # Qwen API sends finish_reason and usage in separate chunks
+        if finish_reason:
+            stream_state["pending_final_chunk"] = {
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "id": chunk_id,
+                "created": chunk_created,
+            }
+            # Don't yield yet - wait for usage chunk to combine
+            return
 
         # Handle <think> tags for reasoning content
         content = delta.get("content")
@@ -366,11 +409,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     "created": chunk_created,
                 }
         else:
-            # Standard content chunk
+            # Standard content chunk (no finish_reason)
             yield {
-                "choices": [
-                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
-                ],
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk_id,
