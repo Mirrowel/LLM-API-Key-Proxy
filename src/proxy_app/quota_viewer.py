@@ -33,13 +33,13 @@ from .quota_viewer_config import QuotaViewerConfig
 # Summary screen table column widths
 TABLE_PROVIDER_WIDTH = 12
 TABLE_CREDS_WIDTH = 3
-TABLE_QUOTA_STATUS_WIDTH = 58
+TABLE_QUOTA_STATUS_WIDTH = 62
 TABLE_REQUESTS_WIDTH = 5
 TABLE_TOKENS_WIDTH = 20
 TABLE_COST_WIDTH = 6
 
 # Quota status formatting in summary screen
-QUOTA_NAME_WIDTH = 11  # Width for quota group name (e.g., "claude:")
+QUOTA_NAME_WIDTH = 15  # Width for quota group name (e.g., "claude:")
 QUOTA_USAGE_WIDTH = 11  # Width for usage ratio (e.g., "2071/2700")
 QUOTA_PCT_WIDTH = 6  # Width for percentage (e.g., "76.7%")
 QUOTA_BAR_WIDTH = 10  # Width for progress bar

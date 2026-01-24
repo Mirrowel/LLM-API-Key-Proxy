@@ -673,7 +673,7 @@ class SettingsTool:
     def _get_pending_status_text(self) -> str:
         """Get formatted pending changes status text for main menu."""
         if not self.settings.has_pending():
-            return "[dim]ℹ️  No pending changes[/dim]"
+            return "[dim]:information_source:  No pending changes[/dim]"
 
         counts = self.settings.get_pending_counts()
         parts = []
@@ -690,7 +690,7 @@ class SettingsTool:
                 f"[red]{counts['remove']} removal{'s' if counts['remove'] > 1 else ''}[/red]"
             )
 
-        return f"[bold]ℹ️  Pending changes: {', '.join(parts)}[/bold]"
+        return f"[bold]:information_source:  Pending changes: {', '.join(parts)}[/bold]"
         self.running = True
 
     def get_available_providers(self) -> List[str]:
@@ -739,21 +739,21 @@ class SettingsTool:
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]🔧 Advanced Settings Configuration[/bold cyan]",
+                "[bold cyan]:wrench: Advanced Settings Configuration[/bold cyan]",
                 border_style="cyan",
             )
         )
 
         self.console.print()
-        self.console.print("[bold]⚙️  Configuration Categories[/bold]")
+        self.console.print("[bold]:gear:  Configuration Categories[/bold]")
         self.console.print()
-        self.console.print("   1. 🌐 Custom Provider API Bases")
+        self.console.print("   1. :globe_with_meridians: Custom Provider API Bases")
         self.console.print("   2. 📦 Provider Model Definitions")
         self.console.print("   3. ⚡ Concurrency Limits")
-        self.console.print("   4. 🔄 Rotation Modes")
+        self.console.print("   4. :arrows_counterclockwise: Rotation Modes")
         self.console.print("   5. 🔬 Provider-Specific Settings")
-        self.console.print("   6. 🎯 Model Filters (Ignore/Whitelist)")
-        self.console.print("   7. 💾 Save & Exit")
+        self.console.print("   6. :dart: Model Filters (Ignore/Whitelist)")
+        self.console.print("   7. :floppy_disk: Save & Exit")
         self.console.print("   8. 🚫 Exit Without Saving")
 
         self.console.print()
@@ -796,13 +796,13 @@ class SettingsTool:
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]🌐 Custom Provider API Bases[/bold cyan]",
+                    "[bold cyan]:globe_with_meridians: Custom Provider API Bases[/bold cyan]",
                     border_style="cyan",
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Configured Custom Providers[/bold]")
+            self.console.print("[bold]:clipboard: Configured Custom Providers[/bold]")
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -853,11 +853,11 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Add New Custom Provider")
             self.console.print("   2. ✏️  Edit Existing Provider")
-            self.console.print("   3. 🗑️  Remove Provider")
+            self.console.print("   3. :wastebasket:  Remove Provider")
             self.console.print("   4. ↩️  Back to Settings Menu")
 
             self.console.print()
@@ -875,7 +875,7 @@ class SettingsTool:
                     if api_base:
                         self.provider_mgr.add_provider(name, api_base)
                         self.console.print(
-                            f"\n[green]✅ Custom provider '{name}' staged![/green]"
+                            f"\n[green]:white_check_mark: Custom provider '{name}' staged![/green]"
                         )
                         self.console.print(
                             f"   To use: set {name.upper()}_API_KEY in credentials"
@@ -915,7 +915,7 @@ class SettingsTool:
                 if new_base and new_base != current_base:
                     self.provider_mgr.edit_provider(name, new_base)
                     self.console.print(
-                        f"\n[green]✅ Custom provider '{name}' updated![/green]"
+                        f"\n[green]:white_check_mark: Custom provider '{name}' updated![/green]"
                     )
                 else:
                     self.console.print("\n[yellow]No changes made[/yellow]")
@@ -962,12 +962,12 @@ class SettingsTool:
                         key = f"{name.upper()}_API_BASE"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending addition of '{name}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending addition of '{name}' cancelled![/green]"
                         )
                     else:
                         self.provider_mgr.remove_provider(name)
                         self.console.print(
-                            f"\n[green]✅ Provider '{name}' marked for removal![/green]"
+                            f"\n[green]:white_check_mark: Provider '{name}' marked for removal![/green]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -990,7 +990,7 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Configured Provider Models[/bold]")
+            self.console.print("[bold]:clipboard: Configured Provider Models[/bold]")
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -1063,12 +1063,12 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Add Models for Provider")
             self.console.print("   2. ✏️  Edit Provider Models")
             self.console.print("   3. 👁️  View Provider Models")
-            self.console.print("   4. 🗑️  Remove Provider Models")
+            self.console.print("   4. :wastebasket:  Remove Provider Models")
             self.console.print("   5. ↩️  Back to Settings Menu")
 
             self.console.print()
@@ -1141,12 +1141,12 @@ class SettingsTool:
                         key = f"{provider.upper()}{suffix}"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending models for '{provider}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending models for '{provider}' cancelled![/green]"
                         )
                     else:
                         self.model_mgr.remove_models(provider)
                         self.console.print(
-                            f"\n[green]✅ Model definitions marked for removal for '{provider}'![/green]"
+                            f"\n[green]:white_check_mark: Model definitions marked for removal for '{provider}'![/green]"
                         )
                     input("\nPress Enter to continue...")
             elif choice == "5":
@@ -1244,7 +1244,7 @@ class SettingsTool:
         if models:
             self.model_mgr.set_models(provider, models)
             self.console.print(
-                f"\n[green]✅ Model definitions saved for '{provider}'![/green]"
+                f"\n[green]:white_check_mark: Model definitions saved for '{provider}'![/green]"
             )
         else:
             self.console.print("\n[yellow]No models added[/yellow]")
@@ -1343,7 +1343,9 @@ class SettingsTool:
 
         if current_models:
             self.model_mgr.set_models(provider, current_models)
-            self.console.print(f"\n[green]✅ Models updated for '{provider}'![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: Models updated for '{provider}'![/green]"
+            )
         else:
             self.console.print(
                 "\n[yellow]No models left - removing definition[/yellow]"
@@ -1433,7 +1435,7 @@ class SettingsTool:
 
             self.console.print()
             self.console.print(
-                "[bold]📋 Available Providers with Custom Settings[/bold]"
+                "[bold]:clipboard: Available Providers with Custom Settings[/bold]"
             )
             self.console.print("━" * 70)
 
@@ -1450,7 +1452,7 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Select Provider to Configure[/bold]")
+            self.console.print("[bold]:gear:  Select Provider to Configure[/bold]")
             self.console.print()
 
             for idx, provider in enumerate(available_providers, 1):
@@ -1492,7 +1494,7 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Settings[/bold]")
+            self.console.print("[bold]:clipboard: Current Settings[/bold]")
             self.console.print("━" * 70)
 
             # Display all settings with current values and pending changes
@@ -1587,11 +1589,13 @@ class SettingsTool:
                 "[dim]* = modified from default, + = pending add, ~ = pending edit, - = pending reset[/dim]"
             )
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   E. ✏️  Edit a Setting")
-            self.console.print("   R. 🔄 Reset Setting to Default")
-            self.console.print("   A. 🔄 Reset All to Defaults")
+            self.console.print(
+                "   R. :arrows_counterclockwise: Reset Setting to Default"
+            )
+            self.console.print("   A. :arrows_counterclockwise: Reset All to Defaults")
             self.console.print("   B. ↩️  Back to Provider Selection")
 
             self.console.print()
@@ -1641,18 +1645,24 @@ class SettingsTool:
             new_value = Confirm.ask("\nEnable this setting?", default=current)
             self.provider_settings_mgr.set_value(key, new_value, definition)
             status = "enabled" if new_value else "disabled"
-            self.console.print(f"\n[green]✅ {short_key} {status}![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} {status}![/green]"
+            )
         elif setting_type == "int":
             new_value = IntPrompt.ask("\nNew value", default=current)
             self.provider_settings_mgr.set_value(key, new_value, definition)
-            self.console.print(f"\n[green]✅ {short_key} set to {new_value}![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} set to {new_value}![/green]"
+            )
         else:
             new_value = Prompt.ask(
                 "\nNew value", default=str(current) if current else ""
             ).strip()
             if new_value:
                 self.provider_settings_mgr.set_value(key, new_value, definition)
-                self.console.print(f"\n[green]✅ {short_key} updated![/green]")
+                self.console.print(
+                    f"\n[green]:white_check_mark: {short_key} updated![/green]"
+                )
             else:
                 self.console.print("\n[yellow]No changes made[/yellow]")
 
@@ -1677,7 +1687,9 @@ class SettingsTool:
 
         if Confirm.ask(f"\nReset {short_key} to default ({default})?"):
             self.provider_settings_mgr.reset_to_default(key)
-            self.console.print(f"\n[green]✅ {short_key} reset to default![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} reset to default![/green]"
+            )
         else:
             self.console.print("\n[yellow]No changes made[/yellow]")
 
@@ -1693,7 +1705,7 @@ class SettingsTool:
             for key in settings_list:
                 self.provider_settings_mgr.reset_to_default(key)
             self.console.print(
-                f"\n[green]✅ All {display_name} settings reset to defaults![/green]"
+                f"\n[green]:white_check_mark: All {display_name} settings reset to defaults![/green]"
             )
         else:
             self.console.print("\n[yellow]No changes made[/yellow]")
@@ -1711,13 +1723,13 @@ class SettingsTool:
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]🔄 Credential Rotation Mode Configuration[/bold cyan]",
+                    "[bold cyan]:arrows_counterclockwise: Credential Rotation Mode Configuration[/bold cyan]",
                     border_style="cyan",
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Rotation Modes Explained[/bold]")
+            self.console.print("[bold]:clipboard: Rotation Modes Explained[/bold]")
             self.console.print("━" * 70)
             self.console.print(
                 "   [cyan]balanced[/cyan]   - Rotate credentials evenly across requests (default)"
@@ -1726,7 +1738,9 @@ class SettingsTool:
                 "   [cyan]sequential[/cyan] - Use one credential until exhausted (429), then switch"
             )
             self.console.print()
-            self.console.print("[bold]📋 Current Rotation Mode Settings[/bold]")
+            self.console.print(
+                "[bold]:clipboard: Current Rotation Mode Settings[/bold]"
+            )
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -1821,10 +1835,10 @@ class SettingsTool:
                 "[dim]* = custom setting (differs from provider default)[/dim]"
             )
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Set Rotation Mode for Provider")
-            self.console.print("   2. 🗑️  Reset to Provider Default")
+            self.console.print("   2. :wastebasket:  Reset to Provider Default")
             self.console.print("   3. ⚡ Configure Priority Concurrency Multipliers")
             self.console.print("   4. ↩️  Back to Settings Menu")
 
@@ -1888,7 +1902,7 @@ class SettingsTool:
 
                     self.rotation_mgr.set_mode(provider, new_mode)
                     self.console.print(
-                        f"\n[green]✅ Rotation mode for '{provider}' staged as {new_mode}![/green]"
+                        f"\n[green]:white_check_mark: Rotation mode for '{provider}' staged as {new_mode}![/green]"
                     )
                     input("\nPress Enter to continue...")
 
@@ -1935,12 +1949,12 @@ class SettingsTool:
                         key = f"{prefix}{provider.upper()}"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending mode for '{provider}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending mode for '{provider}' cancelled![/green]"
                         )
                     else:
                         self.rotation_mgr.remove_mode(provider)
                         self.console.print(
-                            f"\n[green]✅ Rotation mode for '{provider}' marked for reset to default ({default_mode})![/green]"
+                            f"\n[green]:white_check_mark: Rotation mode for '{provider}' marked for reset to default ({default_mode})![/green]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -1965,7 +1979,9 @@ class SettingsTool:
         )
 
         self.console.print()
-        self.console.print("[bold]📋 Current Priority Multiplier Settings[/bold]")
+        self.console.print(
+            "[bold]:clipboard: Current Priority Multiplier Settings[/bold]"
+        )
         self.console.print("━" * 70)
 
         # Show all providers with their priority multipliers
@@ -2009,7 +2025,9 @@ class SettingsTool:
             self.console.print("   [dim]No priority multipliers configured[/dim]")
 
         self.console.print()
-        self.console.print("[bold]ℹ️  About Priority Multipliers:[/bold]")
+        self.console.print(
+            "[bold]:information_source:  About Priority Multipliers:[/bold]"
+        )
         self.console.print(
             "   Higher priority tiers (lower numbers) can have higher multipliers."
         )
@@ -2018,7 +2036,7 @@ class SettingsTool:
         self.console.print("━" * 70)
         self.console.print()
         self.console.print("   1. ✏️  Set Priority Multiplier")
-        self.console.print("   2. 🔄 Reset to Provider Default")
+        self.console.print("   2. :arrows_counterclockwise: Reset to Provider Default")
         self.console.print("   3. ↩️  Back")
 
         choice = Prompt.ask(
@@ -2059,7 +2077,7 @@ class SettingsTool:
                     provider, priority, multiplier
                 )
                 self.console.print(
-                    f"\n[green]✅ Priority {priority} multiplier for '{provider}' set to {multiplier}x[/green]"
+                    f"\n[green]:white_check_mark: Priority {priority} multiplier for '{provider}' set to {multiplier}x[/green]"
                 )
             else:
                 self.console.print(
@@ -2101,7 +2119,7 @@ class SettingsTool:
                     provider, priority
                 )
                 self.console.print(
-                    f"\n[green]✅ Reset priority {priority} for '{provider}' to default ({default}x)[/green]"
+                    f"\n[green]:white_check_mark: Reset priority {priority} for '{provider}' to default ({default}x)[/green]"
                 )
             else:
                 self.console.print(
@@ -2125,7 +2143,7 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Concurrency Settings[/bold]")
+            self.console.print("[bold]:clipboard: Current Concurrency Settings[/bold]")
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -2185,11 +2203,11 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Add Concurrency Limit for Provider")
             self.console.print("   2. ✏️  Edit Existing Limit")
-            self.console.print("   3. 🗑️  Remove Limit (reset to default)")
+            self.console.print("   3. :wastebasket:  Remove Limit (reset to default)")
             self.console.print("   4. ↩️  Back to Settings Menu")
 
             self.console.print()
@@ -2236,11 +2254,11 @@ class SettingsTool:
                     if 1 <= limit <= 100:
                         self.concurrency_mgr.set_limit(provider, limit)
                         self.console.print(
-                            f"\n[green]✅ Concurrency limit staged for '{provider}': {limit} requests/key[/green]"
+                            f"\n[green]:white_check_mark: Concurrency limit staged for '{provider}': {limit} requests/key[/green]"
                         )
                     else:
                         self.console.print(
-                            "\n[red]❌ Limit must be between 1-100[/red]"
+                            "\n[red]:x: Limit must be between 1-100[/red]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -2278,7 +2296,7 @@ class SettingsTool:
                     if new_limit != current_limit:
                         self.concurrency_mgr.set_limit(provider, new_limit)
                         self.console.print(
-                            f"\n[green]✅ Concurrency limit updated for '{provider}': {new_limit} requests/key[/green]"
+                            f"\n[green]:white_check_mark: Concurrency limit updated for '{provider}': {new_limit} requests/key[/green]"
                         )
                     else:
                         self.console.print("\n[yellow]No changes made[/yellow]")
@@ -2330,12 +2348,12 @@ class SettingsTool:
                         key = f"{prefix}{provider.upper()}"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending limit for '{provider}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending limit for '{provider}' cancelled![/green]"
                         )
                     else:
                         self.concurrency_mgr.remove_limit(provider)
                         self.console.print(
-                            f"\n[green]✅ Limit marked for removal for '{provider}'[/green]"
+                            f"\n[green]:white_check_mark: Limit marked for removal for '{provider}'[/green]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -2346,7 +2364,7 @@ class SettingsTool:
         """Display categorized summary of all pending changes."""
         self.console.print(
             Panel.fit(
-                "[bold cyan]📋 Pending Changes Summary[/bold cyan]",
+                "[bold cyan]:clipboard: Pending Changes Summary[/bold cyan]",
                 border_style="cyan",
             )
         )
@@ -2439,7 +2457,9 @@ class SettingsTool:
 
             if Confirm.ask("\n[bold yellow]Save all pending changes?[/bold yellow]"):
                 self.settings.save()
-                self.console.print("\n[green]✅ All changes saved to .env![/green]")
+                self.console.print(
+                    "\n[green]:white_check_mark: All changes saved to .env![/green]"
+                )
                 input("\nPress Enter to return to launcher...")
             else:
                 self.console.print("\n[yellow]Changes not saved[/yellow]")
