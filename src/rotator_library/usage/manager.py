@@ -1413,8 +1413,21 @@ class UsageManager:
         """Apply quota update to a window."""
         if quota_max_requests is not None:
             window.limit = quota_max_requests
-        if quota_reset_ts is not None:
-            window.reset_at = quota_reset_ts
+
+        # Determine if there's actual usage (either API-reported or local)
+        has_usage = (
+            quota_used is not None and quota_used > 0
+        ) or window.request_count > 0
+
+        # Only set started_at and reset_at if there's actual usage
+        # This prevents bogus reset times for unused windows
+        if has_usage:
+            if quota_reset_ts is not None:
+                window.reset_at = quota_reset_ts
+            # Set started_at to now if not already set (API shows usage we don't have locally)
+            if window.started_at is None:
+                window.started_at = time.time()
+
         if quota_used is not None:
             if force:
                 synced_count = quota_used

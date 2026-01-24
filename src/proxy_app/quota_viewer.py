@@ -1379,7 +1379,7 @@ class QuotaViewer:
                         usage_str = f"{request_count} req"
                         pct_str = ""
 
-                    line = f"  [{color}]{display_name:<20} {usage_str:<12} {pct_str:>5} {bar}[/{color}]"
+                    line = f"  [{color}]{display_name:<12} {usage_str:<12} {pct_str:>6} {bar}[/{color}]"
 
                     if reset_time_str:
                         line += f"  Resets: {reset_time_str}"

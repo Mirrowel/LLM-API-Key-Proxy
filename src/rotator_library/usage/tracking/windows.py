@@ -110,15 +110,12 @@ class WindowManager:
                 old_max_at = old_window.max_recorded_at
 
         # Create new window
-        definition = self.definitions.get(window_name)
-        now = time.time()
-
+        # Note: started_at and reset_at are left as None until first actual usage
+        # This prevents bogus reset times from being displayed for unused windows
         new_window = WindowStats(
             name=window_name,
-            started_at=now,
-            reset_at=self._calculate_reset_time(definition, now)
-            if definition
-            else None,
+            started_at=None,
+            reset_at=None,
             limit=limit,
             max_recorded_requests=old_max,  # Carry forward historical max
             max_recorded_at=old_max_at,
@@ -242,9 +239,9 @@ class WindowManager:
         if window.reset_at is not None:
             return now >= window.reset_at
 
-        # If window has no start time, it needs reset
+        # If window has no start time, it hasn't been used yet - no need to reset
         if window.started_at is None:
-            return True
+            return False
 
         # Check based on reset mode
         if definition.reset_mode == ResetMode.ROLLING:

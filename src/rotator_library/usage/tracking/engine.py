@@ -480,6 +480,14 @@ class TrackingEngine:
         if window.first_used_at is None:
             window.first_used_at = now
 
+        # Set started_at on first usage and calculate reset_at
+        if window.started_at is None:
+            window.started_at = now
+            # Calculate reset_at based on window definition
+            window_def = self._windows.definitions.get(window.name)
+            if window_def and window.reset_at is None:
+                window.reset_at = self._windows._calculate_reset_time(window_def, now)
+
         # Update max recorded requests (historical high-water mark)
         if (
             window.max_recorded_requests is None
