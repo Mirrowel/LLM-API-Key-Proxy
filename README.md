@@ -53,6 +53,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/usage:/app/usage \
   -e SKIP_OAUTH_INIT_CHECK=true \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
 ```
@@ -60,13 +61,13 @@ docker run -d \
 **Using Docker Compose:**
 
 ```bash
-# Create your .env file and key_usage.json first, then:
+# Create your .env file and usage directory first, then:
 cp .env.example .env
-touch key_usage.json
+mkdir usage
 docker compose up -d
 ```
 
-> **Important:** You must create both `.env` and `key_usage.json` files before running Docker Compose. If `key_usage.json` doesn't exist, Docker will create it as a directory instead of a file, causing errors.
+> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
 
 > **Note:** For OAuth providers, complete authentication locally first using the credential tool, then mount the `oauth_creds/` directory or export credentials to environment variables.
 
@@ -335,10 +336,11 @@ The proxy includes a powerful text-based UI for configuration and management.
 ### TUI Features
 
 - **🚀 Run Proxy** — Start the server with saved settings
-- **⚙️ Configure Settings** — Host, port, API key, request logging
+- **⚙️ Configure Settings** — Host, port, API key, request logging, raw I/O logging
 - **🔑 Manage Credentials** — Add/edit API keys and OAuth credentials
-- **📊 View Status** — See configured providers and credential counts
-- **🔧 Advanced Settings** — Custom providers, model definitions, concurrency
+- **📊 View Provider & Advanced Settings** — Inspect providers and launch the settings tool
+- **📈 View Quota & Usage Stats (Alpha)** — Usage, quota windows, fair-cycle status
+- **🔄 Reload Configuration** — Refresh settings without restarting
 
 ### Configuration Files
 
@@ -346,6 +348,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 |------|----------|
 | `.env` | All credentials and advanced settings |
 | `launcher_config.json` | TUI-specific settings (host, port, logging) |
+| `quota_viewer_config.json` | Quota viewer remotes + per-provider display toggles |
+| `usage/usage_<provider>.json` | Usage persistence per provider |
 
 ---
 
@@ -446,6 +450,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>📝 Logging & Debugging</b></summary>
 
 - **Per-request file logging** with `--enable-request-logging`
+- **Raw I/O logging** with `--enable-raw-logging` (proxy boundary payloads)
 - **Unique request directories** with full transaction details
 - **Streaming chunk capture** for debugging
 - **Performance metadata** (duration, tokens, model used)
@@ -801,6 +806,7 @@ Options:
   --host TEXT                Host to bind (default: 0.0.0.0)
   --port INTEGER             Port to run on (default: 8000)
   --enable-request-logging   Enable detailed per-request logging
+  --enable-raw-logging       Capture raw proxy I/O payloads
   --add-credential           Launch interactive credential setup tool
 ```
 
@@ -812,6 +818,9 @@ python src/proxy_app/main.py --host 127.0.0.1 --port 9000
 
 # Run with logging
 python src/proxy_app/main.py --enable-request-logging
+
+# Run with raw I/O logging
+python src/proxy_app/main.py --enable-raw-logging
 
 # Add credentials without starting proxy
 python src/proxy_app/main.py --add-credential
@@ -850,8 +859,8 @@ The proxy is available as a multi-architecture Docker image (amd64/arm64) from G
 cp .env.example .env
 nano .env
 
-# 2. Create key_usage.json file (required before first run)
-touch key_usage.json
+# 2. Create usage directory (usage_*.json files are created automatically)
+mkdir usage
 
 # 3. Start the proxy
 docker compose up -d
@@ -860,13 +869,13 @@ docker compose up -d
 docker compose logs -f
 ```
 
-> **Important:** You must create `key_usage.json` before running Docker Compose. If this file doesn't exist on the host, Docker will create it as a directory instead of a file, causing the container to fail.
+> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
 
 **Manual Docker Run:**
 
 ```bash
-# Create key_usage.json if it doesn't exist
-touch key_usage.json
+# Create usage directory if it doesn't exist
+mkdir usage
 
 docker run -d \
   --name llm-api-proxy \
@@ -875,7 +884,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/key_usage.json:/app/key_usage.json \
+  -v $(pwd)/usage:/app/usage \
   -e SKIP_OAUTH_INIT_CHECK=true \
   -e PYTHONUNBUFFERED=1 \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
@@ -895,7 +904,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 | `.env`           | Configuration and API keys (read-only) |
 | `oauth_creds/`   | OAuth credential files (persistent)    |
 | `logs/`          | Request logs and detailed logging      |
-| `key_usage.json` | Usage statistics persistence           |
+| `usage/`       | Usage statistics persistence (`usage_*.json`) |
 
 **Image Tags:**
 

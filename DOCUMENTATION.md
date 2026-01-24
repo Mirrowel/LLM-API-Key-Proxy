@@ -22,9 +22,9 @@ This architecture cleanly separates the API interface from the resilience logic,
 
 This library is the heart of the project, containing all the logic for managing a pool of API keys, tracking their usage, and handling provider interactions to ensure application resilience.
 
-### 2.1. `client.py` - The `RotatingClient`
+### 2.1. `client/rotating_client.py` - The `RotatingClient`
 
-The `RotatingClient` is the central class that orchestrates all operations. It is designed as a long-lived, async-native object.
+The `RotatingClient` is the central class that orchestrates all operations. It is now a slim facade that delegates to modular components (executor, filters, transforms) while remaining a long-lived, async-native object.
 
 #### Initialization
 
@@ -35,7 +35,7 @@ client = RotatingClient(
     api_keys=api_keys,
     oauth_credentials=oauth_credentials,
     max_retries=2,
-    usage_file_path="key_usage.json",
+    usage_file_path="usage.json",
     configure_logging=True,
     global_timeout=30,
     abort_on_callback_error=True,
@@ -50,7 +50,7 @@ client = RotatingClient(
 -   `api_keys` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of API keys.
 -   `oauth_credentials` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of file paths to OAuth credential JSON files.
 -   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error occurs.
--   `usage_file_path` (`str`, default: `"key_usage.json"`): The path to the JSON file where usage statistics are persisted.
+-   `usage_file_path` (`str`, optional): Base path for usage persistence (defaults to `usage/` in the data directory). The client stores per-provider files under `usage/usage_<provider>.json`.
 -   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger.
 -   `global_timeout` (`int`, default: `30`): A hard time limit (in seconds) for the entire request lifecycle.
 -   `abort_on_callback_error` (`bool`, default: `True`): If `True`, any exception raised by `pre_request_callback` will abort the request.
@@ -96,9 +96,9 @@ The `_safe_streaming_wrapper` is a critical component for stability. It:
 *   **Error Interception**: Detects if a chunk contains an API error (like a quota limit) instead of content, and raises a specific `StreamedAPIError`.
 *   **Quota Handling**: If a specific "quota exceeded" error is detected mid-stream multiple times, it can terminate the stream gracefully to prevent infinite retry loops on oversized inputs.
 
-### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management
+### 2.2. `usage/manager.py` - Stateful Concurrency & Usage Management
 
-This class is the stateful core of the library, managing concurrency, usage tracking, cooldowns, and quota resets.
+This class is the stateful core of the library, managing concurrency, usage tracking, cooldowns, and quota resets. Usage tracking now lives in the `rotator_library/usage/` package with per-provider managers and `usage/usage_<provider>.json` storage.
 
 #### Key Concepts
 
@@ -419,7 +419,7 @@ The `CooldownManager` handles IP or account-level rate limiting that affects all
 - All subsequent `acquire_key()` calls for that provider will wait until the cooldown expires
 
 
-### 2.10. Credential Prioritization System (`client.py` & `usage_manager.py`)
+### 2.10. Credential Prioritization System (`client/rotating_client.py` & `usage/manager.py`)
 
 The library now includes an intelligent credential prioritization system that automatically detects credential tiers and ensures optimal credential selection for each request.
 
@@ -762,7 +762,7 @@ Acquiring key for model antigravity/claude-opus-4.5. Tried keys: 0/12(17,cd:3,fc
 ```
 
 **Persistence:**
-Cycle state is persisted in `key_usage.json` under the `__fair_cycle__` key.
+Cycle state is persisted alongside usage data in `usage/usage_<provider>.json`.
 
 ### 2.20. Custom Caps
 
@@ -1773,7 +1773,7 @@ The system follows a strict hierarchy of survival:
 
 2. **Credential Management (Level 2)**: OAuth tokens are cached in memory first. If credential files are deleted, the proxy continues using cached tokens. If a token refresh succeeds but the file cannot be written, the new token is buffered for retry and saved on shutdown.
 
-3. **Usage Tracking (Level 3)**: Usage statistics (`key_usage.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
+3. **Usage Tracking (Level 3)**: Usage statistics (`usage/usage_<provider>.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
 
 4. **Provider Cache (Level 4)**: The provider cache tracks disk health and continues operating in memory-only mode if disk writes fail. Has its own shutdown mechanism.
 
@@ -1813,7 +1813,7 @@ INFO:rotator_library.resilient_io:Shutdown flush: all 2 write(s) succeeded
 This architecture supports a robust development workflow:
 
 - **Log Cleanup**: You can safely run `rm -rf logs/` while the proxy is serving traffic. The system will recreate the directory structure on the next request.
-- **Config Reset**: Deleting `key_usage.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
+- **Config Reset**: Deleting `usage/usage_<provider>.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
 - **File Recovery**: If you delete a critical file, the system attempts directory auto-recreation before every write operation.
 - **Safe Exit**: Ctrl+C triggers graceful shutdown with final data flush attempt.
 
