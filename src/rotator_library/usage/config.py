@@ -18,7 +18,7 @@ from ..core.constants import (
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
 )
-from .types import ResetMode, RotationMode, TrackingMode, CooldownMode
+from .types import ResetMode, RotationMode, TrackingMode, CooldownMode, CapMode
 
 
 # =============================================================================
@@ -250,45 +250,190 @@ def _parse_cooldown_config(
     return CooldownMode.QUOTA_RESET, 0
 
 
+import logging
+
+_config_logger = logging.getLogger("rotator_library")
+
+
+def _parse_max_requests(
+    raw_value: Any, tier_key: str, model_or_group: str
+) -> Optional[Tuple[int, "CapMode"]]:
+    """
+    Parse max_requests value and determine its mode.
+
+    Formats supported:
+    - 130 (int) → ABSOLUTE, 130
+    - "130" → ABSOLUTE, 130
+    - "-130" → OFFSET, -130 (means max - 130)
+    - "+130" → OFFSET, +130 (means max + 130)
+    - "80%" → PERCENTAGE, 80
+
+    Returns:
+        Tuple of (value, mode) or None if invalid (logs error).
+    """
+    # Handle None or missing
+    if raw_value is None:
+        _config_logger.error(
+            f"Custom cap for tier={tier_key} model={model_or_group}: "
+            "max_requests is None, skipping cap"
+        )
+        return None
+
+    # Already an int
+    if isinstance(raw_value, int):
+        return (raw_value, CapMode.ABSOLUTE)
+
+    # Float - convert to int
+    if isinstance(raw_value, float):
+        return (int(raw_value), CapMode.ABSOLUTE)
+
+    # Must be a string from here
+    if not isinstance(raw_value, str):
+        _config_logger.error(
+            f"Custom cap for tier={tier_key} model={model_or_group}: "
+            f"max_requests has invalid type {type(raw_value).__name__}, skipping cap"
+        )
+        return None
+
+    # Strip whitespace
+    value_str = raw_value.strip()
+
+    # Empty string is invalid
+    if not value_str:
+        _config_logger.error(
+            f"Custom cap for tier={tier_key} model={model_or_group}: "
+            "max_requests is empty string, skipping cap"
+        )
+        return None
+
+    # Percentage format: "80%"
+    if value_str.endswith("%"):
+        try:
+            percentage = int(value_str.rstrip("%"))
+            if percentage < 0 or percentage > 100:
+                _config_logger.error(
+                    f"Custom cap for tier={tier_key} model={model_or_group}: "
+                    f"percentage {percentage}% out of range (0-100), skipping cap"
+                )
+                return None
+            return (percentage, CapMode.PERCENTAGE)
+        except ValueError:
+            _config_logger.error(
+                f"Custom cap for tier={tier_key} model={model_or_group}: "
+                f"invalid percentage '{value_str}', skipping cap"
+            )
+            return None
+
+    # Offset format: "+130" or "-130"
+    if value_str.startswith("+") or value_str.startswith("-"):
+        try:
+            offset = int(value_str)
+            return (offset, CapMode.OFFSET)
+        except ValueError:
+            # Try float conversion
+            try:
+                offset = int(float(value_str))
+                return (offset, CapMode.OFFSET)
+            except ValueError:
+                _config_logger.error(
+                    f"Custom cap for tier={tier_key} model={model_or_group}: "
+                    f"invalid offset '{value_str}', skipping cap"
+                )
+                return None
+
+    # Absolute format: plain number string "130"
+    try:
+        value = int(value_str)
+        return (value, CapMode.ABSOLUTE)
+    except ValueError:
+        # Try float conversion
+        try:
+            value = int(float(value_str))
+            return (value, CapMode.ABSOLUTE)
+        except ValueError:
+            _config_logger.error(
+                f"Custom cap for tier={tier_key} model={model_or_group}: "
+                f"invalid value '{value_str}', skipping cap"
+            )
+            return None
+
+
 @dataclass
 class CustomCapConfig:
     """
     Custom cap configuration for a tier/model combination.
 
-    Allows setting usage limits more restrictive than actual API limits.
+    Allows setting usage limits that can be absolute, offset from API limits,
+    or percentage of API limits.
     """
 
     tier_key: str  # Priority as string or "default"
     model_or_group: str  # Model name or quota group name
-    max_requests: int  # Maximum requests allowed
+    max_requests: int  # The numeric value
+    max_requests_mode: CapMode = CapMode.ABSOLUTE  # How to interpret max_requests
     cooldown_mode: CooldownMode = CooldownMode.QUOTA_RESET
     cooldown_value: int = 0  # Seconds for offset/fixed modes
 
     @classmethod
     def from_dict(
         cls, tier_key: str, model_or_group: str, config: Dict[str, Any]
-    ) -> "CustomCapConfig":
+    ) -> Optional["CustomCapConfig"]:
         """
         Create from dictionary config.
 
-        Supports comprehensive cooldown_value parsing:
+        max_requests formats:
+        - 130 or "130" → ABSOLUTE mode, exactly 130 requests
+        - "-130" → OFFSET mode, max - 130 requests
+        - "+130" → OFFSET mode, max + 130 requests
+        - "80%" → PERCENTAGE mode, 80% of max requests
+
+        cooldown_value formats:
         - Flat duration: 300, "300", "1h", "30m", "1h30m", "2d1h30m" → fixed seconds
         - Offset with sign: "+300", "+1h30m", "-300", "-5m" → offset from natural reset
-        - Percentage: "+50%", "-20%" → percentage of window duration as offset
         - String "quota_reset" → use natural reset time
 
-        The cooldown_mode is auto-detected from the value format:
-        - Starts with '+' or '-' → CooldownMode.OFFSET
-        - Just a duration → CooldownMode.FIXED
-        - "quota_reset" string → CooldownMode.QUOTA_RESET
+        Returns:
+            CustomCapConfig instance, or None if max_requests is invalid.
         """
-        max_requests = config.get("max_requests", 0)
+        raw_max_requests = config.get("max_requests")
 
-        # Handle percentage strings like "80%"
-        if isinstance(max_requests, str) and max_requests.endswith("%"):
-            # Store as negative to indicate percentage
-            # Will be resolved later when actual limit is known
-            max_requests = -int(max_requests.rstrip("%"))
+        # Check if mode is already explicitly provided (for round-trip serialization)
+        explicit_mode = config.get("max_requests_mode")
+        if explicit_mode is not None:
+            # Mode was explicitly provided - use it directly
+            try:
+                if isinstance(explicit_mode, CapMode):
+                    max_requests_mode = explicit_mode
+                else:
+                    max_requests_mode = CapMode(explicit_mode)
+                # Still need to validate max_requests is a valid number
+                if isinstance(raw_max_requests, int):
+                    max_requests_value = raw_max_requests
+                elif isinstance(raw_max_requests, float):
+                    max_requests_value = int(raw_max_requests)
+                elif isinstance(raw_max_requests, str):
+                    try:
+                        max_requests_value = int(
+                            float(raw_max_requests.lstrip("+-").rstrip("%"))
+                        )
+                    except ValueError:
+                        _config_logger.error(
+                            f"Custom cap for tier={tier_key} model={model_or_group}: "
+                            f"invalid max_requests value '{raw_max_requests}', skipping cap"
+                        )
+                        return None
+                else:
+                    max_requests_value = 0
+            except ValueError:
+                # Invalid mode string, fall through to parsing
+                explicit_mode = None
+
+        if explicit_mode is None:
+            # Parse max_requests with mode detection
+            parsed = _parse_max_requests(raw_max_requests, tier_key, model_or_group)
+            if parsed is None:
+                return None
+            max_requests_value, max_requests_mode = parsed
 
         # Parse cooldown configuration
         cooldown_mode, cooldown_value = _parse_cooldown_config(
@@ -299,7 +444,8 @@ class CustomCapConfig:
         return cls(
             tier_key=tier_key,
             model_or_group=model_or_group,
-            max_requests=max_requests,
+            max_requests=max_requests_value,
+            max_requests_mode=max_requests_mode,
             cooldown_mode=cooldown_mode,
             cooldown_value=cooldown_value,
         )
@@ -481,11 +627,13 @@ def load_provider_usage_config(
                     tier_keys = (tier_key,)
                 for model_or_group, cap_config in models.items():
                     for resolved_tier in tier_keys:
-                        config.custom_caps.append(
-                            CustomCapConfig.from_dict(
-                                str(resolved_tier), model_or_group, cap_config
-                            )
+                        cap = CustomCapConfig.from_dict(
+                            str(resolved_tier), model_or_group, cap_config
                         )
+                        if cap is not None:
+                            config.custom_caps.append(cap)
+                        if cap is not None:
+                            config.custom_caps.append(cap)
 
         # Windows
         if hasattr(plugin_class, "usage_window_definitions"):
@@ -599,6 +747,7 @@ def load_provider_usage_config(
             cap_entry = cap_map.setdefault(str(cap.tier_key), {})
             cap_entry[cap.model_or_group] = {
                 "max_requests": cap.max_requests,
+                "max_requests_mode": cap.max_requests_mode.value,
                 "cooldown_mode": cap.cooldown_mode.value,
                 "cooldown_value": cap.cooldown_value,
             }
@@ -636,9 +785,9 @@ def load_provider_usage_config(
         config.custom_caps = []
         for tier_key, models in cap_map.items():
             for model_or_group, cap_config in models.items():
-                config.custom_caps.append(
-                    CustomCapConfig.from_dict(tier_key, model_or_group, cap_config)
-                )
+                cap = CustomCapConfig.from_dict(tier_key, model_or_group, cap_config)
+                if cap is not None:
+                    config.custom_caps.append(cap)
 
     # Derive fair cycle enabled from rotation mode if not explicitly set
     if config.fair_cycle.enabled is None:

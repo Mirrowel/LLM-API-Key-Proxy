@@ -65,6 +65,14 @@ class CooldownMode(str, Enum):
     FIXED = "fixed"  # Use fixed duration
 
 
+class CapMode(str, Enum):
+    """How custom cap max_requests values are interpreted."""
+
+    ABSOLUTE = "absolute"  # e.g., 130 → exactly 130 requests
+    OFFSET = "offset"  # e.g., -130 → max - 130, +130 → max + 130
+    PERCENTAGE = "percentage"  # e.g., 80% → 80% of max
+
+
 # =============================================================================
 # WINDOW STATS
 # =============================================================================

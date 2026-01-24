@@ -12,7 +12,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from ..types import CredentialState, LimitCheckResult, LimitResult, WindowStats
-from ..config import CustomCapConfig, CooldownMode
+from ..config import CustomCapConfig, CooldownMode, CapMode, CapMode, CapMode
 from ..tracking.windows import WindowManager
 from .base import LimitChecker
 
@@ -301,23 +301,37 @@ class CustomCapChecker(LimitChecker):
         window_limit: Optional[int],
     ) -> int:
         """
-        Resolve max requests, handling percentage values.
+        Resolve max requests based on mode.
 
-        Custom caps can be ANY value - higher or lower than API limits.
-        Negative values indicate percentage of the window limit.
+        Modes:
+        - ABSOLUTE: Use value as-is (e.g., 130 → 130)
+        - OFFSET: Add/subtract from window limit (e.g., -130 → max - 130)
+        - PERCENTAGE: Percentage of window limit (e.g., 80 → 80% of max)
+
+        Always clamps result to >= 0.
         """
-        if cap.max_requests >= 0:
-            # Absolute value - use as-is (no clamping)
-            return cap.max_requests
+        if cap.max_requests_mode == CapMode.ABSOLUTE:
+            return max(0, cap.max_requests)
 
-        # Negative value indicates percentage
+        # For OFFSET and PERCENTAGE, we need window_limit
         if window_limit is None:
-            # No window limit known, use a high default
+            # No limit known - fallback behavior
+            if cap.max_requests_mode == CapMode.OFFSET:
+                # Can't apply offset without knowing the max
+                # Use absolute value as fallback
+                return max(0, abs(cap.max_requests))
+            # PERCENTAGE with no limit - use safe default
             return 1000
 
-        percentage = -cap.max_requests
-        calculated = int(window_limit * percentage / 100)
-        return calculated
+        if cap.max_requests_mode == CapMode.OFFSET:
+            # +130 means max + 130, -130 means max - 130
+            return max(0, window_limit + cap.max_requests)
+
+        if cap.max_requests_mode == CapMode.PERCENTAGE:
+            return max(0, int(window_limit * cap.max_requests / 100))
+
+        # Fallback (shouldn't happen)
+        return max(0, cap.max_requests)
 
     def _calculate_cooldown_until(
         self,

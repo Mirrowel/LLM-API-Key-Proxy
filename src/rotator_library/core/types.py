@@ -132,12 +132,14 @@ class CustomCapConfig:
     """
     Custom cap configuration for a tier/model combination.
 
-    Allows setting usage limits more restrictive than actual API limits.
+    Allows setting usage limits that can be absolute, offset from API limits,
+    or percentage of API limits.
     """
 
     tier_key: Union[int, Tuple[int, ...], str]  # Priority(s) or "default"
     model_or_group: str  # Model name or quota group name
-    max_requests: Union[int, str]  # Absolute value or percentage ("80%")
+    max_requests: Union[int, str]  # Absolute value, offset, or percentage
+    max_requests_mode: str = "absolute"  # "absolute", "offset", "percentage"
     cooldown_mode: str = "quota_reset"  # "quota_reset", "offset", "fixed"
     cooldown_value: int = 0  # Seconds for offset/fixed modes
 

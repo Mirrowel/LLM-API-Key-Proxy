@@ -34,6 +34,7 @@ from .config import (
     ProviderUsageConfig,
     load_provider_usage_config,
     get_default_windows,
+    CapMode,
 )
 from .identity.registry import CredentialRegistry
 from .tracking.engine import TrackingEngine
@@ -1032,15 +1033,20 @@ class UsageManager:
                         primary_window.get("request_count", 0) if primary_window else 0
                     )
                     cap_limit = cap.max_requests
-                    # Handle percentage-based caps (negative means percentage)
-                    if cap_limit < 0:
-                        api_limit = (
-                            primary_window.get("limit") if primary_window else None
-                        )
+                    # Resolve cap limit based on mode
+                    api_limit = primary_window.get("limit") if primary_window else None
+                    if cap.max_requests_mode == CapMode.OFFSET:
                         if api_limit:
-                            cap_limit = int(api_limit * (-cap_limit) / 100)
+                            cap_limit = max(0, api_limit + cap.max_requests)
+                        else:
+                            cap_limit = max(0, abs(cap.max_requests))
+                    elif cap.max_requests_mode == CapMode.PERCENTAGE:
+                        if api_limit:
+                            cap_limit = max(0, int(api_limit * cap.max_requests / 100))
                         else:
                             cap_limit = 0
+                    else:  # ABSOLUTE
+                        cap_limit = max(0, cap.max_requests)
                     group_data["custom_cap"] = {
                         "limit": cap_limit,
                         "used": cap_used,
