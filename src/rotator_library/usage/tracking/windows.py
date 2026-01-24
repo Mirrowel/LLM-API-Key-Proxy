@@ -95,11 +95,15 @@ class WindowManager:
         if window is not None:
             return window
 
-        # Preserve max_recorded_requests from expired window (if exists)
+        # Preserve fields from expired window (if exists)
         old_max = None
         old_max_at = None
+        old_limit = None
         old_window = windows.get(window_name)
         if old_window is not None:
+            # Preserve limit across window resets (until new API baseline arrives)
+            old_limit = old_window.limit
+
             # Take max of the old window's recorded max and its final request count
             old_recorded_max = old_window.max_recorded_requests or 0
             if old_window.request_count > old_recorded_max:
@@ -116,7 +120,7 @@ class WindowManager:
             name=window_name,
             started_at=None,
             reset_at=None,
-            limit=limit,
+            limit=limit or old_limit,  # Use passed limit, fall back to preserved limit
             max_recorded_requests=old_max,  # Carry forward historical max
             max_recorded_at=old_max_at,
         )

@@ -114,6 +114,12 @@ class TrackingEngine:
                     group_stats.totals, update, now, total_tokens, output_tokens
                 )
 
+                # Sync model window timing from group (group is authoritative)
+                # All models in a quota group share the same started_at/reset_at
+                self._sync_window_timing_from_group(
+                    model_stats.windows, group_stats.windows
+                )
+
             # 3. Update credential totals
             self._apply_to_totals(
                 state.totals, update, now, total_tokens, output_tokens
@@ -523,6 +529,28 @@ class TrackingEngine:
         totals.last_used_at = now
         if totals.first_used_at is None:
             totals.first_used_at = now
+
+    def _sync_window_timing_from_group(
+        self,
+        model_windows: Dict[str, WindowStats],
+        group_windows: Dict[str, WindowStats],
+    ) -> None:
+        """
+        Sync timing fields from group windows to model windows.
+
+        Group window is authoritative for started_at and reset_at.
+        All models in a quota group share the same timing to ensure
+        consistent quota tracking and window resets.
+
+        Args:
+            model_windows: The model's windows dict to update
+            group_windows: The group's windows dict (authoritative)
+        """
+        for window_name, group_window in group_windows.items():
+            model_window = model_windows.get(window_name)
+            if model_window:
+                model_window.started_at = group_window.started_at
+                model_window.reset_at = group_window.reset_at
 
     def _apply_cooldown(
         self,

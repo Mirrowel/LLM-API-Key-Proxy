@@ -1417,6 +1417,12 @@ class UsageManager:
                 self._apply_quota_update(
                     group_window, quota_max_requests, quota_reset_ts, quota_used, force
                 )
+
+                # Sync timing to all model windows in this group
+                # All models share the same started_at/reset_at/limit as the group
+                self._sync_group_timing_to_models(
+                    state, group_key, group_window, primary_def.name
+                )
         else:
             # No quota group - model IS the quota scope, update model stats
             model_stats = state.get_model_stats(normalized_model)
@@ -1525,6 +1531,37 @@ class UsageManager:
 
         if request_count > local_total:
             window.success_count += request_count - local_total
+
+    def _sync_group_timing_to_models(
+        self,
+        state: "CredentialState",
+        group_key: str,
+        group_window: "WindowStats",
+        window_name: str,
+    ) -> None:
+        """
+        Sync timing from group window to all model windows in the group.
+
+        Called after updating a group window to ensure all models have
+        consistent started_at, reset_at, and limit values. All models
+        in a quota group share the same timing since they share API quota.
+
+        Args:
+            state: Credential state containing model stats
+            group_key: Quota group name
+            group_window: The authoritative group window
+            window_name: Name of the window to sync (e.g., "5h")
+        """
+        models_in_group = self.get_models_in_quota_group(group_key)
+        for model_name in models_in_group:
+            model_stats = state.get_model_stats(model_name, create=False)
+            if model_stats:
+                model_window = model_stats.windows.get(window_name)
+                if model_window:
+                    model_window.started_at = group_window.started_at
+                    model_window.reset_at = group_window.reset_at
+                    if group_window.limit is not None:
+                        model_window.limit = group_window.limit
 
     # =========================================================================
     # PROPERTIES
