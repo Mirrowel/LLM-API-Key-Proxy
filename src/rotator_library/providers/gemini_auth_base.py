@@ -22,6 +22,9 @@ from .antigravity_auth_base import (
     is_paid_tier,
 )
 
+# Service Usage API for checking enabled APIs
+SERVICE_USAGE_API = "https://serviceusage.googleapis.com/v1"
+
 lib_logger = logging.getLogger("rotator_library")
 
 # Headers for Gemini CLI auth/discovery calls (loadCodeAssist, onboardUser, etc.)
@@ -83,6 +86,168 @@ class GeminiAuthBase(GoogleOAuthBase):
         # Project and tier caches - shared between auth base and provider
         self.project_id_cache: Dict[str, str] = {}
         self.project_tier_cache: Dict[str, str] = {}
+
+    # =========================================================================
+    # PROJECT ID EXTRACTION HELPERS
+    # =========================================================================
+
+    def _extract_project_id_from_response(
+        self, data: Dict[str, Any], key: str = "cloudaicompanionProject"
+    ) -> Optional[str]:
+        """
+        Extract project ID from API response, handling both string and object formats.
+
+        The API may return cloudaicompanionProject as either:
+        - A string: "project-id-123"
+        - An object: {"id": "project-id-123", ...}
+
+        Args:
+            data: API response data
+            key: Key to extract from (default: "cloudaicompanionProject")
+
+        Returns:
+            Project ID string or None if not found
+        """
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            return value.get("id")
+        return None
+
+    async def _scan_gcp_projects_for_code_assist(
+        self, access_token: str, headers: Dict[str, str]
+    ) -> Optional[tuple]:
+        """
+        Scan GCP projects to find one with cloudaicompanion.googleapis.com enabled.
+
+        This is used as a fallback when loadCodeAssist doesn't return a project
+        (e.g., for accounts with manually created projects that have Code Assist enabled).
+
+        Args:
+            access_token: Valid OAuth access token
+            headers: Request headers for Code Assist API calls
+
+        Returns:
+            Tuple of (project_id, tier) if found, or (None, None) if not found
+        """
+        lib_logger.debug("Scanning GCP projects for Code Assist API...")
+
+        async with httpx.AsyncClient() as client:
+            # Step 1: List all active GCP projects
+            try:
+                response = await client.get(
+                    "https://cloudresourcemanager.googleapis.com/v1/projects",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=20,
+                )
+                if response.status_code != 200:
+                    lib_logger.debug(
+                        f"Failed to list GCP projects: {response.status_code}"
+                    )
+                    return None, None
+
+                projects = [
+                    p
+                    for p in response.json().get("projects", [])
+                    if p.get("lifecycleState") == "ACTIVE"
+                ]
+                lib_logger.debug(f"Found {len(projects)} active GCP projects")
+
+                if not projects:
+                    return None, None
+
+            except Exception as e:
+                lib_logger.debug(f"Error listing GCP projects: {e}")
+                return None, None
+
+            # Step 2: Check which projects have cloudaicompanion.googleapis.com enabled
+            candidate_projects = []
+            for project in projects:
+                project_id = project.get("projectId")
+                service_url = f"{SERVICE_USAGE_API}/projects/{project_id}/services/cloudaicompanion.googleapis.com"
+
+                try:
+                    svc_response = await client.get(
+                        service_url,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        timeout=10,
+                    )
+                    if svc_response.status_code == 200:
+                        state = svc_response.json().get("state", "")
+                        if state == "ENABLED":
+                            lib_logger.debug(
+                                f"Project '{project_id}' has cloudaicompanion.googleapis.com ENABLED"
+                            )
+                            candidate_projects.append(project_id)
+                        else:
+                            lib_logger.debug(
+                                f"Project '{project_id}' cloudaicompanion state: {state}"
+                            )
+                except Exception as e:
+                    lib_logger.debug(
+                        f"Error checking cloudaicompanion API for '{project_id}': {e}"
+                    )
+
+            if not candidate_projects:
+                lib_logger.debug(
+                    "No GCP projects with cloudaicompanion.googleapis.com enabled found"
+                )
+                return None, None
+
+            # Step 3: Test candidate projects with loadCodeAssist to verify and get tier
+            lib_logger.debug(
+                f"Testing {len(candidate_projects)} candidate projects with loadCodeAssist..."
+            )
+
+            for project_id in candidate_projects:
+                try:
+                    test_request = {
+                        "cloudaicompanionProject": project_id,
+                        "metadata": {
+                            "ideType": "IDE_UNSPECIFIED",
+                            "platform": "PLATFORM_UNSPECIFIED",
+                            "pluginType": "GEMINI",
+                            "duetProject": project_id,
+                        },
+                    }
+
+                    response = await client.post(
+                        f"{CODE_ASSIST_ENDPOINT}:loadCodeAssist",
+                        headers=headers,
+                        json=test_request,
+                        timeout=15,
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        current_tier = data.get("currentTier", {})
+                        paid_tier = data.get("paidTier", {})
+
+                        # Determine effective tier (paidTier > currentTier)
+                        effective_tier_id = None
+                        if paid_tier and paid_tier.get("id"):
+                            effective_tier_id = paid_tier.get("id")
+                        elif current_tier and current_tier.get("id"):
+                            effective_tier_id = current_tier.get("id")
+
+                        if effective_tier_id:
+                            canonical_tier = (
+                                normalize_tier_name(effective_tier_id)
+                                or effective_tier_id
+                            )
+                            lib_logger.info(
+                                f"Found Code Assist project via GCP scan: {project_id} (tier={canonical_tier})"
+                            )
+                            return project_id, canonical_tier
+
+                except Exception as e:
+                    lib_logger.debug(
+                        f"Error testing project '{project_id}' with loadCodeAssist: {e}"
+                    )
+
+            lib_logger.debug("No working Code Assist projects found via GCP scan")
+            return None, None
 
     # =========================================================================
     # POST-AUTH DISCOVERY HOOK
@@ -275,7 +440,9 @@ class GeminiAuthBase(GoogleOAuthBase):
                 # Canonical prioritizes paidTier over currentTier for accurate subscription detection
                 allowed_tiers = data.get("allowedTiers", [])
                 current_tier = data.get("currentTier")
-                paid_tier = data.get("paidTier")  # Added: Canonical-style tier detection
+                paid_tier = data.get(
+                    "paidTier"
+                )  # Added: Canonical-style tier detection
 
                 lib_logger.debug(f"=== Tier Information ===")
                 lib_logger.debug(f"paidTier: {paid_tier}")
@@ -312,10 +479,10 @@ class GeminiAuthBase(GoogleOAuthBase):
                 # Check if user is already known to server (has tier info)
                 if effective_tier_id:
                     # User has tier info - check for project from server
-                    server_project = data.get("cloudaicompanionProject")
+                    # Use helper to handle both string and object formats
+                    server_project = self._extract_project_id_from_response(data)
 
-                    # Project selection: server > configured > onboarding
-                    # (Note: Gemini CLI needs proper onboarding, unlike Antigravity which uses fallback)
+                    # Project selection: server > configured > GCP scan > onboarding
                     if server_project:
                         project_id = server_project
                         lib_logger.debug(f"Server returned project: {project_id}")
@@ -323,12 +490,31 @@ class GeminiAuthBase(GoogleOAuthBase):
                         project_id = configured_project_id
                         lib_logger.debug(f"Using configured project: {project_id}")
                     else:
-                        # No project available - will fall through to onboarding
-                        # This is different from Antigravity which uses a fallback project
+                        # No project from server or config - try scanning GCP projects
+                        # This handles accounts with manually created Code Assist projects
                         lib_logger.debug(
-                            f"Tier '{effective_tier_id}' detected but no project - will try onboarding"
+                            f"Tier '{effective_tier_id}' detected but no project - scanning GCP projects..."
                         )
-                        project_id = None
+                        (
+                            scanned_project,
+                            scanned_tier,
+                        ) = await self._scan_gcp_projects_for_code_assist(
+                            access_token, headers
+                        )
+                        if scanned_project:
+                            project_id = scanned_project
+                            # Use scanned tier if available, otherwise use what we have
+                            if scanned_tier:
+                                effective_tier_id = scanned_tier
+                            lib_logger.info(
+                                f"Discovered project via GCP scan: {project_id}"
+                            )
+                        else:
+                            # No project found via GCP scan either - will fall through to onboarding
+                            lib_logger.debug(
+                                f"No Code Assist project found via GCP scan - will try onboarding"
+                            )
+                            project_id = None
 
                     if project_id:
                         # Cache tier info - use canonical tier name for consistency
@@ -398,6 +584,25 @@ class GeminiAuthBase(GoogleOAuthBase):
                 # PAID tier: cloudaicompanionProject = configured_project_id (user must provide)
                 tier_is_free = is_free_tier(tier_id)
 
+                # For paid tiers that require a project, try GCP scan if no configured project
+                onboard_project_id = configured_project_id
+                if (
+                    not tier_is_free
+                    and not onboard_project_id
+                    and requires_user_project
+                ):
+                    lib_logger.debug(
+                        "Paid tier requires project but none configured - trying GCP scan..."
+                    )
+                    scanned_project, _ = await self._scan_gcp_projects_for_code_assist(
+                        access_token, headers
+                    )
+                    if scanned_project:
+                        onboard_project_id = scanned_project
+                        lib_logger.info(
+                            f"Found existing Code Assist project for onboarding: {scanned_project}"
+                        )
+
                 if tier_is_free:
                     # Free tier uses server-managed project
                     onboard_request = {
@@ -410,23 +615,24 @@ class GeminiAuthBase(GoogleOAuthBase):
                     )
                 else:
                     # Paid/legacy tier requires user-provided project
-                    if not configured_project_id and requires_user_project:
+                    if not onboard_project_id and requires_user_project:
                         raise ValueError(
-                            f"Tier '{tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
+                            f"Tier '{tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable "
+                            "or having a GCP project with cloudaicompanion.googleapis.com API enabled. "
                             "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
                         )
                     onboard_request = {
                         "tierId": tier_id,
-                        "cloudaicompanionProject": configured_project_id,
+                        "cloudaicompanionProject": onboard_project_id,
                         "metadata": {
                             **core_client_metadata,
-                            "duetProject": configured_project_id,
+                            "duetProject": onboard_project_id,
                         }
-                        if configured_project_id
+                        if onboard_project_id
                         else core_client_metadata,
                     }
                     lib_logger.debug(
-                        f"Paid tier onboarding: using project {configured_project_id}"
+                        f"Paid tier onboarding: using project {onboard_project_id}"
                     )
 
                 lib_logger.debug("Initiating onboardUser request...")
@@ -471,15 +677,10 @@ class GeminiAuthBase(GoogleOAuthBase):
                         "Onboarding process timed out after 5 minutes. Please try again or contact support."
                     )
 
-                # Extract project ID from LRO response
-                # Note: onboardUser returns response.cloudaicompanionProject as an object with .id
+                # Extract project ID from LRO response using helper
+                # This handles both string and object formats for cloudaicompanionProject
                 lro_response_data = lro_data.get("response", {})
-                lro_project_obj = lro_response_data.get("cloudaicompanionProject", {})
-                project_id = (
-                    lro_project_obj.get("id")
-                    if isinstance(lro_project_obj, dict)
-                    else None
-                )
+                project_id = self._extract_project_id_from_response(lro_response_data)
 
                 # Fallback to configured project if LRO didn't return one
                 if not project_id and configured_project_id:

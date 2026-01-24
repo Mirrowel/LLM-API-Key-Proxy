@@ -4887,7 +4887,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
                     if "MODEL_CAPACITY_EXHAUSTED" in error_body:
                         if attempt < CAPACITY_EXHAUSTED_MAX_ATTEMPTS - 1:
-                            lib_logger.info(
+                            lib_logger.warning(
                                 f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED from {model}, "
                                 f"attempt {attempt + 1}/{CAPACITY_EXHAUSTED_MAX_ATTEMPTS}. "
                                 f"Waiting {CAPACITY_EXHAUSTED_RETRY_DELAY}s..."
