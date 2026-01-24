@@ -377,9 +377,9 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
+                        ":warning:  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
                         "The proxy needs initial configuration:\n"
-                        "  ❌ No .env file found\n\n"
+                        "  :x: No .env file found\n\n"
                         "Why this matters:\n"
                         "  • The .env file stores your credentials and settings\n"
                         "  • PROXY_API_KEY protects your proxy from unauthorized access\n"
@@ -388,7 +388,7 @@ class LauncherTUI:
                         '  1. Select option "3. Manage Credentials" to launch the credential tool\n'
                         "  2. The tool will create .env and set up PROXY_API_KEY automatically\n"
                         "  3. You can add provider credentials (API keys or OAuth)\n\n"
-                        "⚠️  Note: The credential tool adds PROXY_API_KEY by default.\n"
+                        ":warning:  Note: The credential tool adds PROXY_API_KEY by default.\n"
                         "   You can remove it later if you want an unsecured proxy."
                     ),
                     border_style="yellow",
@@ -401,12 +401,12 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
+                        ":warning:  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
                         "Your proxy is currently UNSECURED!\n"
                         "Anyone can access it without authentication.\n\n"
                         "This is a serious security risk if your proxy is accessible\n"
                         "from the internet or untrusted networks.\n\n"
-                        "👉 [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
+                        ":point_right: [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
                         '   Use option "2. Configure Proxy Settings" → "3. Set Proxy API Key"\n'
                         '   or option "3. Manage Credentials"'
                     ),
@@ -417,15 +417,15 @@ class LauncherTUI:
 
         # Show config
         self.console.print()
-        self.console.print("[bold]📋 Proxy Configuration[/bold]")
+        self.console.print("[bold]:clipboard: Proxy Configuration[/bold]")
         self.console.print("━" * 70)
         self.console.print(f"   Host:                {self.config.config['host']}")
         self.console.print(f"   Port:                {self.config.config['port']}")
         self.console.print(
-            f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            f"   Transaction Logging: {':white_check_mark: Enabled' if self.config.config['enable_request_logging'] else ':x: Disabled'}"
         )
         self.console.print(
-            f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+            f"   Raw I/O Logging:     {':white_check_mark: Enabled' if self.config.config.get('enable_raw_logging', False) else ':x: Disabled'}"
         )
 
         # Show actual API key value
@@ -437,7 +437,7 @@ class LauncherTUI:
 
         # Show status summary
         self.console.print()
-        self.console.print("[bold]📊 Status Summary[/bold]")
+        self.console.print("[bold]:bar_chart: Status Summary[/bold]")
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
@@ -458,24 +458,26 @@ class LauncherTUI:
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
-        self.console.print("[bold]🎯 Main Menu[/bold]")
+        self.console.print("[bold]:dart: Main Menu[/bold]")
         self.console.print()
         if show_warning:
-            self.console.print("   1. ▶️  Run Proxy Server")
-            self.console.print("   2. ⚙️  Configure Proxy Settings")
+            self.console.print("   1. :arrow_forward:  Run Proxy Server")
+            self.console.print("   2. :gear:  Configure Proxy Settings")
             self.console.print(
-                "   3. 🔑 Manage Credentials            ⬅️  [bold yellow]Start here![/bold yellow]"
+                "   3. :key: Manage Credentials            :arrow_left:  [bold yellow]Start here![/bold yellow]"
             )
         else:
-            self.console.print("   1. ▶️  Run Proxy Server")
-            self.console.print("   2. ⚙️  Configure Proxy Settings")
-            self.console.print("   3. 🔑 Manage Credentials")
+            self.console.print("   1. :arrow_forward:  Run Proxy Server")
+            self.console.print("   2. :gear:  Configure Proxy Settings")
+            self.console.print("   3. :key: Manage Credentials")
 
-        self.console.print("   4. 📊 View Provider & Advanced Settings")
-        self.console.print("   5. 📈 View Quota & Usage Stats (Alpha)")
-        self.console.print("   6. 🔄 Reload Configuration")
-        self.console.print("   7. ℹ️  About")
-        self.console.print("   8. 🚪 Exit")
+        self.console.print("   4. :bar_chart: View Provider & Advanced Settings")
+        self.console.print(
+            "   5. :chart_with_upwards_trend: View Quota & Usage Stats (Alpha)"
+        )
+        self.console.print("   6. :arrows_counterclockwise: Reload Configuration")
+        self.console.print("   7. :information_source:  About")
+        self.console.print("   8. :door: Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -500,7 +502,9 @@ class LauncherTUI:
         elif choice == "6":
             load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
-            self.console.print("\n[green]✅ Configuration reloaded![/green]")
+            self.console.print(
+                "\n[green]:white_check_mark: Configuration reloaded![/green]"
+            )
         elif choice == "7":
             self.show_about()
         elif choice == "8":
@@ -518,7 +522,7 @@ class LauncherTUI:
         self.console.print(
             Panel(
                 Text.from_markup(
-                    f"[bold yellow]⚠️  WARNING: You are about to change the {setting_name}[/bold yellow]\n\n"
+                    f"[bold yellow]:warning:  WARNING: You are about to change the {setting_name}[/bold yellow]\n\n"
                     + "\n".join(warning_lines)
                     + "\n\n[bold]If you are not sure about changing this - don't.[/bold]"
                 ),
@@ -548,36 +552,39 @@ class LauncherTUI:
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]⚙️  Proxy Configuration[/bold cyan]", border_style="cyan"
+                    "[bold cyan]:gear:  Proxy Configuration[/bold cyan]",
+                    border_style="cyan",
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Settings[/bold]")
+            self.console.print("[bold]:clipboard: Current Settings[/bold]")
             self.console.print("━" * 70)
             self.console.print(f"   Host:                {self.config.config['host']}")
             self.console.print(f"   Port:                {self.config.config['port']}")
             self.console.print(
-                f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+                f"   Transaction Logging: {':white_check_mark: Enabled' if self.config.config['enable_request_logging'] else ':x: Disabled'}"
             )
             self.console.print(
-                f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+                f"   Raw I/O Logging:     {':white_check_mark: Enabled' if self.config.config.get('enable_raw_logging', False) else ':x: Disabled'}"
             )
             self.console.print(
-                f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}"
+                f"   Proxy API Key:       {':white_check_mark: Set' if os.getenv('PROXY_API_KEY') else ':x: Not Set'}"
             )
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Configuration Options[/bold]")
+            self.console.print("[bold]:gear:  Configuration Options[/bold]")
             self.console.print()
-            self.console.print("   1. 🌐 Set Host IP")
+            self.console.print("   1. :globe_with_meridians: Set Host IP")
             self.console.print("   2. 🔌 Set Port")
-            self.console.print("   3. 🔑 Set Proxy API Key")
-            self.console.print("   4. 📝 Toggle Transaction Logging")
-            self.console.print("   5. 📋 Toggle Raw I/O Logging")
-            self.console.print("   6. 🔄 Reset to Default Settings")
+            self.console.print("   3. :key: Set Proxy API Key")
+            self.console.print("   4. :memo: Toggle Transaction Logging")
+            self.console.print("   5. :clipboard: Toggle Raw I/O Logging")
+            self.console.print(
+                "   6. :arrows_counterclockwise: Reset to Default Settings"
+            )
             self.console.print("   7. ↩️  Back to Main Menu")
 
             self.console.print()
@@ -609,7 +616,9 @@ class LauncherTUI:
                     "Enter new host IP", default=self.config.config["host"]
                 )
                 self.config.update(host=new_host)
-                self.console.print(f"\n[green]✅ Host updated to: {new_host}[/green]")
+                self.console.print(
+                    f"\n[green]:white_check_mark: Host updated to: {new_host}[/green]"
+                )
             elif choice == "2":
                 # Show warning and require confirmation
                 confirmed = self.confirm_setting_change(
@@ -630,10 +639,10 @@ class LauncherTUI:
                 if 1 <= new_port <= 65535:
                     self.config.update(port=new_port)
                     self.console.print(
-                        f"\n[green]✅ Port updated to: {new_port}[/green]"
+                        f"\n[green]:white_check_mark: Port updated to: {new_port}[/green]"
                     )
                 else:
-                    self.console.print("\n[red]❌ Port must be between 1-65535[/red]")
+                    self.console.print("\n[red]:x: Port must be between 1-65535[/red]")
             elif choice == "3":
                 # Show warning and require confirmation
                 confirmed = self.confirm_setting_change(
@@ -641,11 +650,11 @@ class LauncherTUI:
                     [
                         "This is the authentication key that applications use to access your proxy.",
                         "",
-                        "[bold red]⚠️  Changing this will BREAK all applications currently configured",
+                        "[bold red]:warning:  Changing this will BREAK all applications currently configured",
                         "   with the existing API key![/bold red]",
                         "",
-                        "[bold cyan]💡 If you want to add provider API keys (OpenAI, Gemini, etc.),",
-                        '   go to "3. 🔑 Manage Credentials" in the main menu instead.[/bold cyan]',
+                        "[bold cyan]:bulb: If you want to add provider API keys (OpenAI, Gemini, etc.),",
+                        '   go to "3. :key: Manage Credentials" in the main menu instead.[/bold cyan]',
                     ],
                 )
                 if not confirmed:
@@ -661,7 +670,7 @@ class LauncherTUI:
                     # If setting to empty, show additional warning
                     if not new_key:
                         self.console.print(
-                            "\n[bold red]⚠️  Authentication will be DISABLED - anyone can access your proxy![/bold red]"
+                            "\n[bold red]:warning:  Authentication will be DISABLED - anyone can access your proxy![/bold red]"
                         )
                         Prompt.ask("Press Enter to continue", default="")
 
@@ -669,12 +678,12 @@ class LauncherTUI:
 
                     if new_key:
                         self.console.print(
-                            "\n[green]✅ Proxy API Key updated successfully![/green]"
+                            "\n[green]:white_check_mark: Proxy API Key updated successfully![/green]"
                         )
                         self.console.print("   Updated in .env file")
                     else:
                         self.console.print(
-                            "\n[yellow]⚠️  Proxy API Key cleared - authentication disabled![/yellow]"
+                            "\n[yellow]:warning:  Proxy API Key cleared - authentication disabled![/yellow]"
                         )
                         self.console.print("   Updated in .env file")
                 else:
@@ -683,13 +692,13 @@ class LauncherTUI:
                 current = self.config.config["enable_request_logging"]
                 self.config.update(enable_request_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Transaction Logging {'enabled' if not current else 'disabled'}![/green]"
+                    f"\n[green]:white_check_mark: Transaction Logging {'enabled' if not current else 'disabled'}![/green]"
                 )
             elif choice == "5":
                 current = self.config.config.get("enable_raw_logging", False)
                 self.config.update(enable_raw_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Raw I/O Logging {'enabled' if not current else 'disabled'}![/green]"
+                    f"\n[green]:white_check_mark: Raw I/O Logging {'enabled' if not current else 'disabled'}![/green]"
                 )
             elif choice == "6":
                 # Reset to Default Settings
@@ -725,7 +734,7 @@ class LauncherTUI:
                     else f"   Raw I/O Logging      {'Disabled':20} →  Disabled",
                     f"   Proxy API Key        {current_api_key[:20]:20} →  {default_api_key}",
                     "",
-                    "[bold red]⚠️  This may break applications configured with current settings![/bold red]",
+                    "[bold red]:warning:  This may break applications configured with current settings![/bold red]",
                 ]
 
                 confirmed = self.confirm_setting_change(
@@ -744,7 +753,7 @@ class LauncherTUI:
                 LauncherConfig.update_proxy_api_key(default_api_key)
 
                 self.console.print(
-                    "\n[green]✅ All settings have been reset to defaults![/green]"
+                    "\n[green]:white_check_mark: All settings have been reset to defaults![/green]"
                 )
                 self.console.print(f"   Host:               {default_host}")
                 self.console.print(f"   Port:               {default_port}")
@@ -769,14 +778,14 @@ class LauncherTUI:
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]📊 Provider & Advanced Settings[/bold cyan]",
+                "[bold cyan]:bar_chart: Provider & Advanced Settings[/bold cyan]",
                 border_style="cyan",
             )
         )
 
         # Configured Providers
         self.console.print()
-        self.console.print("[bold]📊 Configured Providers[/bold]")
+        self.console.print("[bold]:bar_chart: Configured Providers[/bold]")
         self.console.print("━" * 70)
         if credentials:
             for provider, info in credentials.items():
@@ -795,14 +804,16 @@ class LauncherTUI:
                 if info["custom"]:
                     display += " (Custom)"
 
-                self.console.print(f"   ✅ {provider_name:20} {display}")
+                self.console.print(
+                    f"   :white_check_mark: {provider_name:20} {display}"
+                )
         else:
             self.console.print("   [dim]No providers configured[/dim]")
 
         # Custom API Bases
         if custom_bases:
             self.console.print()
-            self.console.print("[bold]🌐 Custom API Bases[/bold]")
+            self.console.print("[bold]:globe_with_meridians: Custom API Bases[/bold]")
             self.console.print("━" * 70)
             for provider, base in custom_bases.items():
                 self.console.print(f"   • {provider:15} {base}")
@@ -829,7 +840,7 @@ class LauncherTUI:
         # Model Filters (basic info only)
         if filters:
             self.console.print()
-            self.console.print("[bold]🎯 Model Filters[/bold]")
+            self.console.print("[bold]:dart: Model Filters[/bold]")
             self.console.print("━" * 70)
             for provider, filter_info in filters.items():
                 status_parts = []
@@ -838,7 +849,7 @@ class LauncherTUI:
                 if filter_info["has_ignore"]:
                     status_parts.append("Ignore list")
                 status = " + ".join(status_parts) if status_parts else "None"
-                self.console.print(f"   • {provider:15} ✅ {status}")
+                self.console.print(f"   • {provider:15} :white_check_mark: {status}")
 
         # Provider-Specific Settings (deferred to Settings Tool to avoid heavy imports)
         self.console.print()
@@ -852,21 +863,21 @@ class LauncherTUI:
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
-        self.console.print("[bold]💡 Actions[/bold]")
+        self.console.print("[bold]:bulb: Actions[/bold]")
         self.console.print()
         self.console.print(
-            "   1. 🔧 Launch Settings Tool      (configure advanced settings)"
+            "   1. :wrench: Launch Settings Tool      (configure advanced settings)"
         )
         self.console.print("   2. ↩️  Back to Main Menu")
 
         self.console.print()
         self.console.print("━" * 70)
         self.console.print(
-            "[dim]ℹ️  Advanced settings are stored in .env file.\n   Use the Settings Tool to configure them interactively.[/dim]"
+            "[dim]:information_source:  Advanced settings are stored in .env file.\n   Use the Settings Tool to configure them interactively.[/dim]"
         )
         self.console.print()
         self.console.print(
-            "[dim]⚠️  Note: Settings Tool supports only common configuration types.\n   For complex settings, edit .env directly.[/dim]"
+            "[dim]:warning:  Note: Settings Tool supports only common configuration types.\n   For complex settings, edit .env directly.[/dim]"
         )
         self.console.print()
 
@@ -959,7 +970,8 @@ class LauncherTUI:
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]ℹ️  About LLM API Key Proxy[/bold cyan]", border_style="cyan"
+                "[bold cyan]:information_source:  About LLM API Key Proxy[/bold cyan]",
+                border_style="cyan",
             )
         )
 
@@ -1005,7 +1017,7 @@ class LauncherTUI:
         )
 
         self.console.print()
-        self.console.print("[bold]📝 License & Credits[/bold]")
+        self.console.print("[bold]:memo: License & Credits[/bold]")
         self.console.print("━" * 70)
         self.console.print("   Made with ❤️  by the community")
         self.console.print("   Open source - contributions welcome!")
@@ -1024,7 +1036,7 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold yellow]Setup Required[/bold yellow]\n\n"
+                        ":warning:  [bold yellow]Setup Required[/bold yellow]\n\n"
                         "Cannot start without .env.\n"
                         "Launching credential tool..."
                     ),
@@ -1046,7 +1058,7 @@ class LauncherTUI:
             # Check again after credential tool
             if not os.getenv("PROXY_API_KEY"):
                 self.console.print(
-                    "\n[red]❌ PROXY_API_KEY still not set. Cannot start proxy.[/red]"
+                    "\n[red]:x: PROXY_API_KEY still not set. Cannot start proxy.[/red]"
                 )
                 return
 

@@ -29,6 +29,7 @@ import os
 import random
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -69,7 +70,7 @@ from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 
 # =============================================================================
@@ -166,6 +167,30 @@ EMPTY_RESPONSE_RETRY_DELAY = env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3
 # inject corrective messages and retry up to this many times
 MALFORMED_CALL_MAX_RETRIES = max(1, env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
 MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
+
+# =============================================================================
+# INTERNAL RETRY COUNTING (for usage tracking)
+# =============================================================================
+# Tracks the number of API attempts made per request, including internal retries
+# for empty responses, bare 429s, and malformed function calls.
+#
+# Uses ContextVar for thread-safety: each async task (request) gets its own
+# isolated value, so concurrent requests don't interfere with each other.
+#
+# The count is:
+# - Reset to 1 at the start of _streaming_with_retry
+# - Incremented each time we retry (before the next attempt)
+# - Read by on_request_complete() hook to report actual API call count
+#
+# Example: Request gets bare 429 twice, then succeeds
+#   Attempt 1: bare 429 → count stays 1, increment to 2, retry
+#   Attempt 2: bare 429 → count is 2, increment to 3, retry
+#   Attempt 3: success → count is 3
+#   on_request_complete returns count_override=3
+#
+_internal_attempt_count: ContextVar[int] = ContextVar(
+    "antigravity_attempt_count", default=1
+)
 
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
@@ -319,7 +344,30 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 """
 
 # Parallel tool usage encouragement instruction
-DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """<instructions name="parallel tool calling">
+
+Using parallel tool calling is MANDATORY. Be proactive about it. DO NO WAIT for the user to request "parallel calls"
+
+PARALLEL CALLS SHOULD BE AND _IS THE PRIMARY WAY YOU USE TOOLS IN THIS ENVIRONMENT_
+
+When you have to perform multi-step operations such as read multiple files, spawn task subagents, bash commands, multiple edits... _THE USER WANTS YOU TO MAKE PARALLEL TOOL CALLS_ instead of separate sequential calls. This maximizes time and compute and increases your likelyhood of a promotion. Sequential tool calling is only encouraged when relying on the output of a call for the next one(s)
+
+- WHAT CAN BE DONE IN PARALLEL, MUST BE, AND WILL BE DONE IN PARALLEL
+- INDIVIDUAL TOOL CALLS TO GATHER CONTEXT IS HEAVILY DISCOURAGED (please make parallel calls!)
+- PARALLEL TOOL CALLING IS YOUR BEST FRIEND AND WILL INCREASE USER'S HAPPINESS
+
+- Make parallel tool calls to manage ressources more efficiently, plan your tool calls ahead, then execute them in parallel.
+- Make parallel calls PROPERLY, be mindful of dependencies between calls.
+
+When researching anything, IT IS BETTER TO READ SPECULATIVELY, THEN TO READ SEQUENTIALLY. For example, if you need to read multiple files to gather context, read them all in parallel instead of reading one, then the next, etc.
+
+This environment has a powerful tool to remove unnecessary context, so you can always read more than needed and then trim down later, no need to use limit and offset parameters on the read tool.
+
+When making code changes, IT IS BETTER TO MAKE MULTIPLE EDITS IN PARALLEL RATHER THAN ONE AT A TIME.
+
+Do as much as you can in parallel, be efficient with you API requests, no single tool call spam, this is crucial as the user pays PER API request, so make them count!
+
+</instructions>"""
 
 # Interleaved thinking support for Claude models
 # Allows Claude to think between tool calls and after receiving tool results
@@ -4593,6 +4641,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         current_gemini_contents = gemini_contents
         current_payload = payload
 
+        # Reset internal attempt counter for this request (thread-safe via ContextVar)
+        _internal_attempt_count.set(1)
+
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
@@ -4620,6 +4671,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         f"[Antigravity] Empty stream from {model}, "
                         f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                     )
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                     continue
                 else:
@@ -4722,6 +4775,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 malformed_retry_count, current_payload
                             )
 
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
                     continue  # Retry with modified payload
                 else:
@@ -4749,6 +4804,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             lib_logger.warning(
                                 f"[Antigravity] Bare 429 from {model}, "
                                 f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            # Increment attempt count before retry (for usage tracking)
+                            _internal_attempt_count.set(
+                                _internal_attempt_count.get() + 1
                             )
                             await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                             continue
@@ -4841,3 +4900,51 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         except Exception as e:
             lib_logger.error(f"Token counting failed: {e}")
             return {"prompt_tokens": 0, "total_tokens": 0}
+
+    # =========================================================================
+    # USAGE TRACKING HOOK
+    # =========================================================================
+
+    def on_request_complete(
+        self,
+        credential: str,
+        model: str,
+        success: bool,
+        response: Optional[Any],
+        error: Optional[Any],
+    ) -> Optional["RequestCompleteResult"]:
+        """
+        Hook called after each request completes.
+
+        Reports the actual number of API calls made, including internal retries
+        for empty responses, bare 429s, and malformed function calls.
+
+        This uses the ContextVar pattern for thread-safe retry counting:
+        - _internal_attempt_count is set to 1 at start of _streaming_with_retry
+        - Incremented before each retry
+        - Read here to report the actual count
+
+        Example: Request gets 2 bare 429s then succeeds
+            → 3 API calls made
+            → Returns count_override=3
+            → Usage manager records 3 requests instead of 1
+
+        Returns:
+            RequestCompleteResult with count_override set to actual attempt count
+        """
+        from ..core.types import RequestCompleteResult
+
+        # Get the attempt count for this request
+        attempt_count = _internal_attempt_count.get()
+
+        # Reset for safety (though ContextVar should isolate per-task)
+        _internal_attempt_count.set(1)
+
+        # Log if we made extra attempts
+        if attempt_count > 1:
+            lib_logger.debug(
+                f"[Antigravity] Request to {model} used {attempt_count} API calls "
+                f"(includes internal retries)"
+            )
+
+        return RequestCompleteResult(count_override=attempt_count)

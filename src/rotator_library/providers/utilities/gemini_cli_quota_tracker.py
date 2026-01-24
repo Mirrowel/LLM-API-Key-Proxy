@@ -39,7 +39,7 @@ from .base_quota_tracker import BaseQuotaTracker
 from .gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")

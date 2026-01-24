@@ -603,6 +603,8 @@ async def lifespan(app: FastAPI):
         max_concurrent_requests_per_key=max_concurrent_requests_per_key,
     )
 
+    await client.initialize_usage_managers()
+
     # Log loaded credentials summary (compact, always visible for deployment verification)
     # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
     # _oauth_summary = ', '.join([f"{p}:{len(c)}" for p, c in oauth_credentials.items()]) if oauth_credentials else "none"
@@ -956,7 +958,9 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = client.acompletion(request=request, **request_data)
+            response_generator = await client.acompletion(
+                request=request, **request_data
+            )
             return StreamingResponse(
                 streaming_response_wrapper(
                     request, request_data, response_generator, raw_logger
@@ -1649,10 +1653,10 @@ if __name__ == "__main__":
                 border_style="cyan",
             )
         )
-        console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
+        console.print("[bold yellow]:warning:  Configuration Required[/bold yellow]\n")
 
         console.print("The proxy needs initial configuration:")
-        console.print("  [red]❌ No .env file found[/red]")
+        console.print("  [red]:x: No .env file found[/red]")
 
         console.print("\n[bold]Why this matters:[/bold]")
         console.print("  • The .env file stores your credentials and settings")
@@ -1665,7 +1669,7 @@ if __name__ == "__main__":
         console.print("  3. The proxy will then start normally")
 
         console.print(
-            "\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
+            "\n[bold yellow]:warning:  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
         )
         console.print("   You can remove it later if you want an unsecured proxy.\n")
 
@@ -1708,13 +1712,15 @@ if __name__ == "__main__":
 
             # Verify onboarding is complete
             if needs_onboarding():
-                console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
+                console.print("\n[bold red]:x: Configuration incomplete.[/bold red]")
                 console.print(
                     "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
                 )
                 sys.exit(1)
             else:
-                console.print("\n[bold green]✅ Configuration complete![/bold green]")
+                console.print(
+                    "\n[bold green]:white_check_mark: Configuration complete![/bold green]"
+                )
                 console.print("\nStarting proxy server...\n")
 
         import uvicorn

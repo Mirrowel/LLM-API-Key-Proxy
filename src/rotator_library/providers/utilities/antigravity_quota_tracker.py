@@ -34,7 +34,7 @@ import httpx
 from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -990,13 +990,22 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         self,
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
+        force: bool = False,
+        is_initial_fetch: bool = False,
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
 
+        Antigravity-specific override: API quota only updates in ~20% increments,
+        so local tracking is more accurate. Exhaustion check is only applied on
+        initial fetch (restart), not on subsequent background refreshes.
+
         Args:
             quota_results: Dict from fetch_quota_from_api or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
+            force: If True, always use API values (for manual refresh)
+            is_initial_fetch: If True, this is the first fetch on startup.
+                Exhaustion check is only applied when this is True.
 
         Returns:
             Number of baselines successfully stored
@@ -1052,16 +1061,37 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                 # Extract reset_timestamp (already parsed to float in fetch_quota_from_api)
                 reset_timestamp = model_info.get("reset_timestamp")
 
+                # Only use reset_timestamp when quota is actually used
+                # (remaining == 1.0 means 100% left, timer is bogus)
+                valid_reset_ts = reset_timestamp if remaining < 1.0 else None
+
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
+                quota_used = None
+                if max_requests is not None:
+                    quota_used = int((1.0 - remaining) * max_requests)
+                quota_group = self.get_model_quota_group(user_model)
+
+                # ANTIGRAVITY-SPECIFIC: Only apply exhaustion on initial fetch
+                # (API only updates in ~20% increments, so we rely on local tracking
+                # for subsequent refreshes)
+                apply_exhaustion = is_initial_fetch and (remaining == 0.0)
+
                 cooldown_info = await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests, reset_timestamp
+                    cred_path,
+                    prefixed_model,
+                    quota_max_requests=max_requests,
+                    quota_reset_ts=valid_reset_ts,
+                    quota_used=quota_used,
+                    quota_group=quota_group,
+                    force=force,
+                    apply_exhaustion=apply_exhaustion,
                 )
 
                 # Aggregate cooldown info if returned
                 if cooldown_info:
-                    group_or_model = cooldown_info["group_or_model"]
-                    hours = cooldown_info["hours_until_reset"]
+                    group_or_model = cooldown_info["model"]
+                    hours = cooldown_info["cooldown_hours"]
                     if short_cred not in cooldowns_by_cred:
                         cooldowns_by_cred[short_cred] = {}
                     # Only keep first occurrence per group/model (avoids duplicates)
@@ -1073,12 +1103,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
 
         # Log consolidated message for all cooldowns
         if cooldowns_by_cred:
-            # Build message: "oauth_1[claude 3.4h, gemini-3-pro 2.1h], oauth_2[claude 5.2h]"
-            parts = []
-            for cred_name, groups in sorted(cooldowns_by_cred.items()):
-                group_strs = [f"{g} {h:.1f}h" for g, h in sorted(groups.items())]
-                parts.append(f"{cred_name}[{', '.join(group_strs)}]")
-            lib_logger.info(f"Antigravity quota exhausted: {', '.join(parts)}")
+            lib_logger.debug("Antigravity quota baseline refresh: cooldowns recorded")
         else:
             lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
 

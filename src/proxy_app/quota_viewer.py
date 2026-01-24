@@ -6,42 +6,6 @@ Lightweight Quota Stats Viewer TUI.
 
 Connects to a running proxy to display quota and usage statistics.
 Uses only httpx + rich (no heavy rotator_library imports).
-
-TODO: Missing Features & Improvements
-======================================
-
-Display Improvements:
-- [ ] Add color legend/help screen explaining status colors and symbols
-- [ ] Show credential email/project ID if available (currently just filename)
-- [ ] Add keyboard shortcut hints (e.g., "Press ? for help")
-- [ ] Support terminal resize / responsive layout
-
-Global Stats Fix:
-- [ ] HACK: Global requests currently set to current period requests only
-      (see client.py get_quota_stats). This doesn't include archived stats.
-      Fix requires tracking archived requests per quota group in usage_manager.py
-      to avoid double-counting models that share quota groups.
-
-Data & Refresh:
-- [ ] Auto-refresh option (configurable interval)
-- [ ] Show last refresh timestamp more prominently
-- [ ] Cache invalidation when switching between current/global view
-- [ ] Support for non-OAuth providers (API keys like nvapi-*, gsk_*, etc.)
-
-Remote Management:
-- [ ] Test connection before saving remote
-- [ ] Import/export remote configurations
-- [ ] SSH tunnel support for remote proxies
-
-Quota Groups:
-- [ ] Show which models are in each quota group (expandable)
-- [ ] Historical quota usage graphs (if data available)
-- [ ] Alerts/notifications when quota is low
-
-Credential Details:
-- [ ] Show per-model breakdown within quota groups
-- [ ] Edit credential priority/tier manually
-- [ ] Disable/enable individual credentials
 """
 
 import os
@@ -60,6 +24,56 @@ from rich.table import Table
 from rich.text import Text
 
 from .quota_viewer_config import QuotaViewerConfig
+
+
+# =============================================================================
+# DISPLAY CONFIGURATION - Adjust these values to customize the layout
+# =============================================================================
+
+# Summary screen table column widths
+TABLE_PROVIDER_WIDTH = 12
+TABLE_CREDS_WIDTH = 3
+TABLE_QUOTA_STATUS_WIDTH = 62
+TABLE_REQUESTS_WIDTH = 5
+TABLE_TOKENS_WIDTH = 20
+TABLE_COST_WIDTH = 6
+
+# Quota status formatting in summary screen
+QUOTA_NAME_WIDTH = 15  # Width for quota group name (e.g., "claude:")
+QUOTA_USAGE_WIDTH = 11  # Width for usage ratio (e.g., "2071/2700")
+QUOTA_PCT_WIDTH = 6  # Width for percentage (e.g., "76.7%")
+QUOTA_BAR_WIDTH = 10  # Width for progress bar
+
+# Detail view credential panel formatting
+DETAIL_GROUP_NAME_WIDTH = (
+    18  # Width for group name in detail view (handles "g25-flash (daily)")
+)
+DETAIL_USAGE_WIDTH = (
+    16  # Width for usage ratio in detail view (handles "3000/3000(5000)")
+)
+DETAIL_PCT_WIDTH = 7  # Width for percentage in detail view
+
+# =============================================================================
+# STATUS DISPLAY CONFIGURATION
+# =============================================================================
+
+# Credential status icons and colors: (icon, label, color)
+# Using Rich emoji markup :name: for consistent width handling
+STATUS_DISPLAY = {
+    "active": (":white_check_mark:", "Active", "green"),
+    "cooldown": (":stopwatch:", "Cooldown", "yellow"),
+    "exhausted": (":no_entry:", "Exhausted", "red"),
+    "mixed": (":warning:", "Mixed", "yellow"),
+}
+
+# Per-group indicator icons (using Rich emoji markup for proper width handling)
+INDICATOR_ICONS = {
+    "fair_cycle": ":scales:",  # ⚖️ - Rich will handle width
+    "custom_cap": ":bar_chart:",  # 📊
+    "cooldown": ":stopwatch:",  # ⏱️
+}
+
+# =============================================================================
 
 
 def clear_screen():
@@ -187,17 +201,125 @@ def format_cooldown(seconds: int) -> str:
         return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
 
 
-def natural_sort_key(item: Dict[str, Any]) -> List:
+def natural_sort_key(item: Any) -> List:
     """
     Generate a sort key for natural/numeric sorting.
 
     Sorts credentials like proj-1, proj-2, proj-10 correctly
     instead of alphabetically (proj-1, proj-10, proj-2).
+
+    Handles both dict items (new API format) and strings.
     """
-    identifier = item.get("identifier", "")
+    if isinstance(item, dict):
+        identifier = item.get("identifier", item.get("stable_id", ""))
+    else:
+        identifier = str(item)
     # Split into text and numeric parts
     parts = re.split(r"(\d+)", identifier)
     return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def get_credentials_list(prov_stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Convert credentials from dict format to list.
+
+    The new API returns credentials as a dict keyed by stable_id.
+    This function converts it to a list for iteration and sorting.
+    """
+    credentials = prov_stats.get("credentials", {})
+    if isinstance(credentials, list):
+        return credentials
+    if isinstance(credentials, dict):
+        return list(credentials.values())
+    return []
+
+
+def get_credential_stats(
+    cred: Dict[str, Any], view_mode: str = "current"
+) -> Dict[str, Any]:
+    """
+    Extract display stats from a credential with field name adaptation.
+
+    Maps new API field names to what the viewer expects:
+    - totals.request_count -> requests
+    - totals.last_used_at -> last_used_ts
+    - totals.approx_cost -> approx_cost
+    - Derive tokens from totals
+    """
+    totals = cred.get("totals", {})
+
+    # For global view mode, we'd need global totals (currently same as totals)
+    if view_mode == "global":
+        stats_source = cred.get("global", totals)
+        if stats_source == totals:
+            stats_source = totals
+    else:
+        stats_source = totals
+
+    # Calculate proper token stats
+    prompt_tokens = stats_source.get("prompt_tokens", 0)
+    cache_read = stats_source.get("prompt_tokens_cache_read", 0)
+    output_tokens = stats_source.get("output_tokens", 0)
+
+    # Total input = uncached (prompt_tokens) + cached (cache_read)
+    input_total = prompt_tokens + cache_read
+    input_cached = cache_read
+    input_uncached = prompt_tokens
+
+    cache_pct = round(input_cached / input_total * 100, 1) if input_total > 0 else 0
+
+    return {
+        "requests": stats_source.get("request_count", 0),
+        "last_used_ts": stats_source.get("last_used_at"),
+        "approx_cost": stats_source.get("approx_cost"),
+        "tokens": {
+            "input_cached": input_cached,
+            "input_uncached": input_uncached,
+            "input_cache_pct": cache_pct,
+            "output": output_tokens,
+        },
+    }
+
+
+def provider_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple:
+    """
+    Sort key for providers.
+
+    Order: has quota_groups -> has activity -> request count -> credential count
+    """
+    name, stats = item
+    has_quota_groups = bool(stats.get("quota_groups"))
+    has_activity = stats.get("total_requests", 0) > 0
+    return (
+        not has_quota_groups,  # False (has groups) sorts first
+        not has_activity,  # False (has activity) sorts first
+        -stats.get("total_requests", 0),  # Higher requests first
+        -stats.get("credential_count", 0),  # Higher creds first
+        name.lower(),  # Alphabetically last
+    )
+
+
+def quota_group_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple:
+    """
+    Sort key for quota groups.
+
+    Order: by total quota limit (lowest first), then alphabetically.
+    Groups without limits sort last.
+    """
+    name, group_stats = item
+    windows = group_stats.get("windows", {})
+
+    if not windows:
+        return (float("inf"), name)  # No windows = sort last
+
+    # Find minimum total_max across windows
+    min_limit = float("inf")
+    for window_stats in windows.values():
+        total_max = window_stats.get("total_max", 0)
+        if total_max > 0:
+            min_limit = min(min_limit, total_max)
+
+    return (min_limit, name)
 
 
 class QuotaViewer:
@@ -210,7 +332,8 @@ class QuotaViewer:
         Args:
             config: Optional config object. If not provided, one will be created.
         """
-        self.console = Console()
+        # Use emoji_variant="text" for more consistent width calculations
+        self.console = Console(emoji_variant="text")
         self.config = config or QuotaViewerConfig()
         self.config.sync_with_launcher_config()
 
@@ -651,18 +774,18 @@ class QuotaViewer:
 
         # View mode indicator
         if self.view_mode == "global":
-            view_label = "[magenta]📊 Global/Lifetime[/magenta]"
+            view_label = "[magenta]:bar_chart: Global/Lifetime[/magenta]"
         else:
-            view_label = "[cyan]📈 Current Period[/cyan]"
+            view_label = "[cyan]:chart_with_upwards_trend: Current Period[/cyan]"
 
         self.console.print("━" * 78)
         self.console.print(
-            f"[bold cyan]📈 Quota & Usage Statistics[/bold cyan]  |  {view_label}"
+            f"[bold cyan]:chart_with_upwards_trend: Quota & Usage Statistics[/bold cyan]  |  {view_label}"
         )
         self.console.print("━" * 78)
         self.console.print(
             f"Connected to: [bold]{remote_name}[/bold] ({connection_display}) "
-            f"[green]✅[/green] | {data_age}"
+            f"[green]:white_check_mark:[/green] | {data_age}"
         )
         self.console.print()
 
@@ -673,17 +796,18 @@ class QuotaViewer:
             table = Table(
                 box=None, show_header=True, header_style="bold", padding=(0, 1)
             )
-            table.add_column("Provider", style="cyan", min_width=10)
-            table.add_column("Creds", justify="center", min_width=5)
-            table.add_column("Quota Status", min_width=28)
-            table.add_column("Requests", justify="right", min_width=8)
-            table.add_column("Tokens (in/out)", min_width=20)
-            table.add_column("Cost", justify="right", min_width=6)
+            table.add_column("Provider", style="cyan", min_width=TABLE_PROVIDER_WIDTH)
+            table.add_column("Creds", justify="center", min_width=TABLE_CREDS_WIDTH)
+            table.add_column("Quota Status", min_width=TABLE_QUOTA_STATUS_WIDTH)
+            table.add_column("Req.", justify="right", min_width=TABLE_REQUESTS_WIDTH)
+            table.add_column("Tok. in/out(cached)", min_width=TABLE_TOKENS_WIDTH)
+            table.add_column("Cost", justify="right", min_width=TABLE_COST_WIDTH)
 
             providers = self.cached_stats.get("providers", {})
-            provider_list = list(providers.keys())
+            # Sort providers: quota_groups -> activity -> requests -> creds
+            sorted_providers = sorted(providers.items(), key=provider_sort_key)
 
-            for idx, (provider, prov_stats) in enumerate(providers.items(), 1):
+            for idx, (provider, prov_stats) in enumerate(sorted_providers, 1):
                 cred_count = prov_stats.get("credential_count", 0)
 
                 # Use global stats if in global mode
@@ -703,7 +827,7 @@ class QuotaViewer:
                 )
                 output = tokens.get("output", 0)
                 cache_pct = tokens.get("input_cache_pct", 0)
-                token_str = f"{format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}% cached)"
+                token_str = f"{format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}%)"
 
                 # Format cost
                 cost_str = format_cost(cost_value)
@@ -712,63 +836,100 @@ class QuotaViewer:
                 quota_groups = prov_stats.get("quota_groups", {})
                 if quota_groups:
                     quota_lines = []
-                    for group_name, group_stats in quota_groups.items():
-                        # Use remaining requests (not used) so percentage matches displayed value
-                        total_remaining = group_stats.get("total_requests_remaining", 0)
-                        total_max = group_stats.get("total_requests_max", 0)
-                        total_pct = group_stats.get("total_remaining_pct")
+                    # Sort quota groups by minimum remaining % (lowest first)
+                    sorted_groups = sorted(
+                        quota_groups.items(), key=quota_group_sort_key
+                    )
+
+                    for group_name, group_stats in sorted_groups:
                         tiers = group_stats.get("tiers", {})
+                        windows = group_stats.get("windows", {})
+                        fc_summary = group_stats.get("fair_cycle_summary", {})
 
-                        # Format tier info: "5(15)f/2s" = 5 active out of 15 free, 2 standard all active
-                        # Sort by priority (lower number = higher priority, appears first)
-                        tier_parts = []
-                        sorted_tiers = sorted(
-                            tiers.items(), key=lambda x: x[1].get("priority", 10)
-                        )
-                        for tier_name, tier_info in sorted_tiers:
-                            if tier_name == "unknown":
-                                continue  # Skip unknown tiers in display
-                            total_t = tier_info.get("total", 0)
-                            active_t = tier_info.get("active", 0)
-                            # Use first letter: standard-tier -> s, free-tier -> f
-                            short = tier_name.replace("-tier", "")[0]
+                        if not windows:
+                            # No windows = no data, skip
+                            continue
 
-                            if active_t < total_t:
-                                # Some exhausted - show active(total)
-                                tier_parts.append(f"{active_t}({total_t}){short}")
+                        # Process each window for this group
+                        for window_name, window_stats in windows.items():
+                            total_remaining = window_stats.get("total_remaining", 0)
+                            total_max = window_stats.get("total_max", 0)
+                            total_pct = window_stats.get("remaining_pct")
+                            tier_availability = window_stats.get(
+                                "tier_availability", {}
+                            )
+
+                            # Format tier info using per-window availability
+                            # "15(18)s" = 15 available out of 18 standard-tier
+                            tier_parts = []
+                            # Sort tiers by priority (from provider-level tiers)
+                            sorted_tier_names = sorted(
+                                tier_availability.keys(),
+                                key=lambda t: tiers.get(t, {}).get("priority", 10),
+                            )
+                            for tier_name in sorted_tier_names:
+                                if tier_name == "unknown":
+                                    continue
+                                avail_info = tier_availability[tier_name]
+                                total_t = avail_info.get("total", 0)
+                                available_t = avail_info.get("available", 0)
+                                # Use first letter: standard-tier -> s, free-tier -> f
+                                short = tier_name.replace("-tier", "")[0]
+
+                                if available_t < total_t:
+                                    tier_parts.append(
+                                        f"{available_t}({total_t}){short}"
+                                    )
+                                else:
+                                    tier_parts.append(f"{total_t}{short}")
+
+                            tier_str = "/".join(tier_parts) if tier_parts else ""
+
+                            # Only show tier info if this group has limits
+                            if total_max == 0:
+                                tier_str = ""
+
+                            # Build FC summary string if any credentials are FC exhausted
+                            fc_str = ""
+                            fc_exhausted = fc_summary.get("exhausted_count", 0)
+                            fc_total = fc_summary.get("total_count", 0)
+                            if fc_exhausted > 0:
+                                fc_str = f"[yellow]{INDICATOR_ICONS['fair_cycle']} {fc_exhausted}/{fc_total}[/yellow]"
+
+                            # Determine color based on remaining percentage and FC status
+                            if total_pct is not None:
+                                if total_pct <= 10:
+                                    color = "red"
+                                elif total_pct < 30 or fc_exhausted > 0:
+                                    color = "yellow"
+                                else:
+                                    color = "green"
                             else:
-                                # All active - just show total
-                                tier_parts.append(f"{total_t}{short}")
-                        tier_str = "/".join(tier_parts) if tier_parts else ""
+                                color = "dim"
 
-                        # Determine color based purely on remaining percentage
-                        if total_pct is not None:
-                            if total_pct <= 10:
-                                color = "red"
-                            elif total_pct < 30:
-                                color = "yellow"
+                            pct_str = f"{total_pct}%" if total_pct is not None else "?"
+
+                            # Format: "group (window): remaining/max pct% bar tier_info fc_info"
+                            # Show window name if multiple windows exist
+                            if len(windows) > 1:
+                                display_name = f"{group_name} ({window_name})"
                             else:
-                                color = "green"
-                        else:
-                            color = "dim"
+                                display_name = group_name
 
-                        bar = create_progress_bar(total_pct)
-                        pct_str = f"{total_pct}%" if total_pct is not None else "?"
+                            display_name_trunc = display_name[: QUOTA_NAME_WIDTH - 1]
+                            usage_str = f"{total_remaining}/{total_max}"
+                            bar = create_progress_bar(total_pct, QUOTA_BAR_WIDTH)
 
-                        # Build status suffix (just tiers now, no outer parens)
-                        status = tier_str
+                            # Build the line with tier info and FC summary
+                            line_parts = [
+                                f"[{color}]{display_name_trunc + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>{QUOTA_PCT_WIDTH}} {bar}[/{color}]"
+                            ]
+                            if tier_str:
+                                line_parts.append(tier_str)
+                            if fc_str:
+                                line_parts.append(fc_str)
 
-                        # Fixed-width format for aligned bars
-                        # Adjust these to change column spacing:
-                        QUOTA_NAME_WIDTH = 10  # name + colon, left-aligned
-                        QUOTA_USAGE_WIDTH = (
-                            12  # remaining/max ratio, right-aligned (handles 100k+)
-                        )
-                        display_name = group_name[: QUOTA_NAME_WIDTH - 1]
-                        usage_str = f"{total_remaining}/{total_max}"
-                        quota_lines.append(
-                            f"[{color}]{display_name + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>4} {bar}[/{color}] {status}"
-                        )
+                            quota_lines.append(" ".join(line_parts))
 
                     # First line goes in the main row
                     first_quota = quota_lines[0] if quota_lines else "-"
@@ -795,9 +956,14 @@ class QuotaViewer:
                     )
 
                 # Add separator between providers (except last)
-                if idx < len(providers):
+                if idx < len(sorted_providers):
                     table.add_row(
-                        "─" * 10, "─" * 4, "─" * 26, "─" * 7, "─" * 20, "─" * 6
+                        "─" * TABLE_PROVIDER_WIDTH,
+                        "─" * TABLE_CREDS_WIDTH,
+                        "─" * TABLE_QUOTA_STATUS_WIDTH,
+                        "─" * TABLE_REQUESTS_WIDTH,
+                        "─" * TABLE_TOKENS_WIDTH,
+                        "─" * TABLE_COST_WIDTH,
                     )
 
             self.console.print(table)
@@ -832,9 +998,10 @@ class QuotaViewer:
         self.console.print("━" * 78)
         self.console.print()
 
-        # Build provider menu options
+        # Build provider menu options (use same sorted order as display)
         providers = self.cached_stats.get("providers", {}) if self.cached_stats else {}
-        provider_list = list(providers.keys())
+        sorted_providers = sorted(providers.items(), key=provider_sort_key)
+        provider_list = [name for name, _ in sorted_providers]
 
         for idx, provider in enumerate(provider_list, 1):
             self.console.print(f"   {idx}. View [cyan]{provider}[/cyan] details")
@@ -886,7 +1053,7 @@ class QuotaViewer:
 
             self.console.print("━" * 78)
             self.console.print(
-                f"[bold cyan]📊 {provider.title()} - Detailed Stats[/bold cyan]  |  {view_label}"
+                f"[bold cyan]:bar_chart: {provider.title()} - Detailed Stats[/bold cyan]  |  {view_label}"
             )
             self.console.print("━" * 78)
             self.console.print()
@@ -895,7 +1062,7 @@ class QuotaViewer:
                 self.console.print("[yellow]No data available.[/yellow]")
             else:
                 prov_stats = self.cached_stats.get("providers", {}).get(provider, {})
-                credentials = prov_stats.get("credentials", [])
+                credentials = get_credentials_list(prov_stats)
 
                 # Sort credentials naturally (1, 2, 10 not 1, 10, 2)
                 credentials = sorted(credentials, key=natural_sort_key)
@@ -913,8 +1080,6 @@ class QuotaViewer:
             self.console.print("━" * 78)
             self.console.print()
             self.console.print("   G.  Toggle view mode (current/global)")
-            self.console.print("   R.  Reload stats (from proxy cache)")
-            self.console.print("   RA. Reload all stats")
 
             # Force refresh options (only for providers that support it)
             has_quota_groups = bool(
@@ -924,18 +1089,29 @@ class QuotaViewer:
                 .get("quota_groups")
             )
 
+            # Model toggle option (only show if provider has quota groups) - MOVED UP
+            if has_quota_groups:
+                show_models_status = (
+                    "ON" if self.config.get_show_models(provider) else "OFF"
+                )
+                self.console.print(
+                    f"   T.  Toggle model details ({show_models_status})"
+                )
+
+            self.console.print("   R.  Reload stats (from proxy cache)")
+            self.console.print("   RA. Reload all stats")
+
             if has_quota_groups:
                 self.console.print()
                 self.console.print(
                     f"   F.  [yellow]Force refresh ALL {provider} quotas from API[/yellow]"
                 )
-                credentials = (
-                    self.cached_stats.get("providers", {})
-                    .get(provider, {})
-                    .get("credentials", [])
+                prov_stats_for_menu = (
+                    self.cached_stats.get("providers", {}).get(provider, {})
                     if self.cached_stats
-                    else []
+                    else {}
                 )
+                credentials = get_credentials_list(prov_stats_for_menu)
                 # Sort credentials naturally
                 credentials = sorted(credentials, key=natural_sort_key)
                 for idx, cred in enumerate(credentials, 1):
@@ -944,6 +1120,14 @@ class QuotaViewer:
                     self.console.print(
                         f"   F{idx}. Force refresh [{idx}] only ({email})"
                     )
+
+            # DEBUG: Add fake window for testing multi-window display
+            if has_quota_groups:
+                self.console.print()
+                self.console.print("   [dim]DEBUG:[/dim]")
+                self.console.print(
+                    "   W.  [dim]Add fake 'daily' window (test multi-window)[/dim]"
+                )
 
             self.console.print()
             self.console.print("   B.  Back to summary")
@@ -957,6 +1141,13 @@ class QuotaViewer:
             elif choice == "G":
                 # Toggle view mode
                 self.view_mode = "global" if self.view_mode == "current" else "current"
+            elif choice == "T" and has_quota_groups:
+                # Toggle show models
+                new_state = self.config.toggle_show_models(provider)
+                status_str = "enabled" if new_state else "disabled"
+                self.console.print(
+                    f"[dim]Model details {status_str} for {provider}[/dim]"
+                )
             elif choice == "R":
                 with self.console.status(
                     f"[bold]Reloading {provider} stats...", spinner="dots"
@@ -987,15 +1178,21 @@ class QuotaViewer:
                         for err in rr["errors"]:
                             self.console.print(f"[red]  Error: {err}[/red]")
                     Prompt.ask("Press Enter to continue", default="")
+            elif choice == "W" and has_quota_groups:
+                # DEBUG: Inject fake "daily" window for testing multi-window display
+                self._inject_fake_daily_window(provider)
+                self.console.print(
+                    "[dim]Injected fake 'daily' window into cached stats[/dim]"
+                )
+                Prompt.ask("Press Enter to continue", default="")
             elif choice.startswith("F") and choice[1:].isdigit() and has_quota_groups:
                 idx = int(choice[1:])
-                credentials = (
-                    self.cached_stats.get("providers", {})
-                    .get(provider, {})
-                    .get("credentials", [])
+                prov_stats_for_refresh = (
+                    self.cached_stats.get("providers", {}).get(provider, {})
                     if self.cached_stats
-                    else []
+                    else {}
                 )
+                credentials = get_credentials_list(prov_stats_for_refresh)
                 # Sort credentials naturally to match display order
                 credentials = sorted(credentials, key=natural_sort_key)
                 if 1 <= idx <= len(credentials):
@@ -1030,44 +1227,46 @@ class QuotaViewer:
         tier = cred.get("tier", "")
         status = cred.get("status", "unknown")
 
-        # Check for active cooldowns
-        key_cooldown = cred.get("key_cooldown_remaining")
-        model_cooldowns = cred.get("model_cooldowns", {})
-        has_cooldown = key_cooldown or model_cooldowns
+        # Check for active cooldowns (new format: cooldowns dict)
+        cooldowns = cred.get("cooldowns", {})
+        has_cooldown = bool(cooldowns)
 
-        # Status indicator
-        if status == "exhausted":
-            status_icon = "[red]⛔ Exhausted[/red]"
-        elif status == "cooldown" or has_cooldown:
-            if key_cooldown:
-                status_icon = f"[yellow]⚠️ Cooldown ({format_cooldown(int(key_cooldown))})[/yellow]"
+        # Check for global cooldown
+        global_cooldown = cooldowns.get("_global_", {})
+        global_cooldown_remaining = (
+            global_cooldown.get("remaining_seconds", 0) if global_cooldown else 0
+        )
+
+        # Status indicator using centralized config
+        status_config = STATUS_DISPLAY.get(status, STATUS_DISPLAY["active"])
+        icon, label, color = status_config
+
+        if status == "cooldown" or (has_cooldown and global_cooldown_remaining > 0):
+            if global_cooldown_remaining > 0:
+                status_icon = f"[{color}]{icon} {label} ({format_cooldown(int(global_cooldown_remaining))})[/{color}]"
             else:
-                status_icon = "[yellow]⚠️ Cooldown[/yellow]"
+                status_icon = f"[{color}]{icon} {label}[/{color}]"
         else:
-            status_icon = "[green]✅ Active[/green]"
+            status_icon = f"[{color}]{icon} {label}[/{color}]"
 
         # Header line
         display_name = email if email else identifier
         tier_str = f" ({tier})" if tier else ""
         header = f"[{idx}] {display_name}{tier_str} {status_icon}"
 
-        # Use global stats if in global mode
-        if self.view_mode == "global":
-            stats_source = cred.get("global", cred)
-        else:
-            stats_source = cred
-
-        # Stats line
-        last_used = format_time_ago(cred.get("last_used_ts"))  # Always from current
-        requests = stats_source.get("requests", 0)
-        tokens = stats_source.get("tokens", {})
+        # Get stats using helper function
+        cred_stats = get_credential_stats(cred, self.view_mode)
+        last_used = format_time_ago(cred_stats.get("last_used_ts"))
+        requests = cred_stats.get("requests", 0)
+        tokens = cred_stats.get("tokens", {})
         input_total = tokens.get("input_cached", 0) + tokens.get("input_uncached", 0)
         output = tokens.get("output", 0)
-        cost = format_cost(stats_source.get("approx_cost"))
+        cache_pct = tokens.get("input_cache_pct", 0)
+        cost = format_cost(cred_stats.get("approx_cost"))
 
         stats_line = (
             f"Last used: {last_used} | Requests: {requests} | "
-            f"Tokens: {format_tokens(input_total)}/{format_tokens(output)}"
+            f"Tokens: {format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}%)"
         )
         if cost != "-":
             stats_line += f" | Cost: {cost}"
@@ -1077,136 +1276,188 @@ class QuotaViewer:
             f"[dim]{stats_line}[/dim]",
         ]
 
-        # Model groups (for providers with quota tracking)
-        model_groups = cred.get("model_groups", {})
+        # Group usage (for providers with quota tracking)
+        group_usage = cred.get("group_usage", {})
 
-        # Show cooldowns grouped by quota group (if model_groups exist)
-        if model_cooldowns:
-            if model_groups:
-                # Group cooldowns by quota group
-                group_cooldowns: Dict[
-                    str, int
-                ] = {}  # group_name -> max_remaining_seconds
-                ungrouped_cooldowns: List[Tuple[str, int]] = []
+        # Show cooldowns
+        if cooldowns:
+            active_cooldowns = []
+            for key, cooldown_info in cooldowns.items():
+                if key == "_global_":
+                    continue  # Already shown in status
+                remaining = cooldown_info.get("remaining_seconds", 0)
+                if remaining > 0:
+                    reason = cooldown_info.get("reason", "")
+                    source = cooldown_info.get("source", "")
+                    active_cooldowns.append((key, remaining, reason, source))
 
-                for model_name, cooldown_info in model_cooldowns.items():
-                    remaining = cooldown_info.get("remaining_seconds", 0)
-                    if remaining <= 0:
-                        continue
-
-                    # Find which group this model belongs to
-                    clean_model = model_name.split("/")[-1]
-                    found_group = None
-                    for group_name, group_info in model_groups.items():
-                        group_models = group_info.get("models", [])
-                        if clean_model in group_models:
-                            found_group = group_name
-                            break
-
-                    if found_group:
-                        group_cooldowns[found_group] = max(
-                            group_cooldowns.get(found_group, 0), remaining
-                        )
-                    else:
-                        ungrouped_cooldowns.append((model_name, remaining))
-
-                if group_cooldowns or ungrouped_cooldowns:
-                    content_lines.append("")
-                    content_lines.append("[yellow]Active Cooldowns:[/yellow]")
-
-                    # Show grouped cooldowns
-                    for group_name in sorted(group_cooldowns.keys()):
-                        remaining = group_cooldowns[group_name]
-                        content_lines.append(
-                            f"  [yellow]⏱️ {group_name}: {format_cooldown(remaining)}[/yellow]"
-                        )
-
-                    # Show ungrouped (shouldn't happen often)
-                    for model_name, remaining in ungrouped_cooldowns:
-                        short_model = model_name.split("/")[-1][:35]
-                        content_lines.append(
-                            f"  [yellow]⏱️ {short_model}: {format_cooldown(remaining)}[/yellow]"
-                        )
-            else:
-                # No model groups - show per-model cooldowns
+            if active_cooldowns:
                 content_lines.append("")
                 content_lines.append("[yellow]Active Cooldowns:[/yellow]")
-                for model_name, cooldown_info in model_cooldowns.items():
-                    remaining = cooldown_info.get("remaining_seconds", 0)
-                    if remaining > 0:
-                        short_model = model_name.split("/")[-1][:35]
-                        content_lines.append(
-                            f"  [yellow]⏱️ {short_model}: {format_cooldown(int(remaining))}[/yellow]"
+                for key, remaining, reason, source in active_cooldowns:
+                    source_str = f" ({source})" if source else ""
+                    content_lines.append(
+                        f"  [yellow]:stopwatch: {key}: {format_cooldown(int(remaining))}{source_str}[/yellow]"
+                    )
+
+        # Display group usage with per-window breakdown
+        # Note: group_usage is pre-sorted by limit (lowest first) from the API
+        if group_usage:
+            content_lines.append("")
+            content_lines.append("[bold]Quota Groups:[/bold]")
+
+            for group_name, group_stats in group_usage.items():
+                windows = group_stats.get("windows", {})
+                if not windows:
+                    continue
+
+                # Get per-group status info
+                fc_exhausted = group_stats.get("fair_cycle_exhausted", False)
+                fc_reason = group_stats.get("fair_cycle_reason")
+                group_cooldown_remaining = group_stats.get("cooldown_remaining")
+                group_cooldown_source = group_stats.get("cooldown_source")
+                custom_cap = group_stats.get("custom_cap")
+
+                for window_name, window_stats in windows.items():
+                    request_count = window_stats.get("request_count", 0)
+                    limit = window_stats.get("limit")
+                    remaining = window_stats.get("remaining")
+                    reset_at = window_stats.get("reset_at")
+                    max_recorded = window_stats.get("max_recorded_requests")
+                    max_recorded_at = window_stats.get("max_recorded_at")
+
+                    # Calculate remaining percentage
+                    if limit is not None and limit > 0:
+                        remaining_val = (
+                            remaining
+                            if remaining is not None
+                            else max(0, limit - request_count)
+                        )
+                        remaining_pct = round(remaining_val / limit * 100, 1)
+                        is_exhausted = remaining_val <= 0
+                    else:
+                        remaining_pct = None
+                        remaining_val = None
+                        is_exhausted = False
+
+                    # Format reset time (only show if there's actual usage or cooldown)
+                    reset_time_str = ""
+                    if reset_at and (request_count > 0 or group_cooldown_remaining):
+                        try:
+                            reset_dt = datetime.fromtimestamp(reset_at)
+                            reset_time_str = reset_dt.strftime("%b %d %H:%M")
+                        except (ValueError, OSError):
+                            reset_time_str = ""
+
+                    # Format max recorded info
+                    max_info = ""
+                    if max_recorded is not None:
+                        max_info = f" Max: {max_recorded}"
+                        if max_recorded_at:
+                            try:
+                                max_dt = datetime.fromtimestamp(max_recorded_at)
+                                max_info += f" @ {max_dt.strftime('%b %d')}"
+                            except (ValueError, OSError):
+                                pass
+
+                    # Build display line
+                    bar = create_progress_bar(remaining_pct)
+
+                    # Determine color (account for fair cycle)
+                    if is_exhausted:
+                        color = "red"
+                    elif fc_exhausted:
+                        color = "yellow"
+                    elif remaining_pct is not None and remaining_pct < 20:
+                        color = "yellow"
+                    else:
+                        color = "green"
+
+                    # Format group name
+                    if len(windows) > 1:
+                        display_name = f"{group_name} ({window_name})"
+                    else:
+                        display_name = group_name
+
+                    # Format usage string with custom cap if applicable
+                    if custom_cap:
+                        cap_remaining = custom_cap.get("remaining", 0)
+                        cap_limit = custom_cap.get("limit", 0)
+                        api_limit = limit if limit else cap_limit
+                        usage_str = f"{cap_remaining}/{cap_limit}({api_limit})"
+                        # Recalculate percentage based on custom cap
+                        if cap_limit > 0:
+                            remaining_pct = round(cap_remaining / cap_limit * 100, 1)
+                            bar = create_progress_bar(remaining_pct)
+                        pct_str = (
+                            f"{remaining_pct}%" if remaining_pct is not None else ""
+                        )
+                    elif limit is not None:
+                        usage_str = f"{remaining_val}/{limit}"
+                        pct_str = f"{remaining_pct}%"
+                    else:
+                        usage_str = f"{request_count} req"
+                        pct_str = ""
+
+                    line = f"  [{color}]{display_name:<{DETAIL_GROUP_NAME_WIDTH}} {usage_str:<{DETAIL_USAGE_WIDTH}} {pct_str:>{DETAIL_PCT_WIDTH}} {bar}[/{color}]"
+
+                    # Add reset time if applicable
+                    if reset_time_str:
+                        line += f"  Resets: {reset_time_str}"
+
+                    # Add indicators
+                    indicators = []
+
+                    # Group cooldown indicator (if not already showing reset time)
+                    if group_cooldown_remaining and not reset_time_str:
+                        indicators.append(
+                            f"[yellow]{INDICATOR_ICONS['cooldown']} {format_cooldown(int(group_cooldown_remaining))}[/yellow]"
                         )
 
-        # Display model groups with quota info
-        if model_groups:
+                    # Fair cycle indicator
+                    if fc_exhausted:
+                        indicators.append(
+                            f"[yellow]{INDICATOR_ICONS['fair_cycle']} FC[/yellow]"
+                        )
+
+                    # Custom cap indicator (only if not on cooldown, just to show cap exists)
+                    if custom_cap and not group_cooldown_remaining and not fc_exhausted:
+                        indicators.append(f"[dim]{INDICATOR_ICONS['custom_cap']}[/dim]")
+
+                    if indicators:
+                        line += "  " + " ".join(indicators)
+
+                    # Add max info at the end
+                    if max_info:
+                        line += f" [dim]{max_info}[/dim]"
+
+                    content_lines.append(line)
+
+        # Model usage (show if no group usage, or if toggle enabled via config)
+        model_usage = cred.get("model_usage", {})
+        # Check config for show_models setting, default to showing only if no group_usage
+        show_models = self.config.get_show_models(provider) if group_usage else True
+
+        if show_models and model_usage:
             content_lines.append("")
-            for group_name, group_stats in model_groups.items():
-                remaining_pct = group_stats.get("remaining_pct")
-                requests_used = group_stats.get("requests_used", 0)
-                requests_max = group_stats.get("requests_max")
-                requests_remaining = group_stats.get("requests_remaining")
-                is_exhausted = group_stats.get("is_exhausted", False)
-                reset_time = format_reset_time(group_stats.get("reset_time_iso"))
-                confidence = group_stats.get("confidence", "low")
+            content_lines.append("[dim]Models used:[/dim]")
+            for model_name, model_stats in model_usage.items():
+                totals = model_stats.get("totals", {})
+                req_count = totals.get("request_count", 0)
+                if req_count == 0:
+                    continue  # Skip models with no usage
 
-                # Format display - use requests_remaining/max format
-                if requests_remaining is None and requests_max:
-                    requests_remaining = max(0, requests_max - requests_used)
-                display = group_stats.get(
-                    "display", f"{requests_remaining or 0}/{requests_max or '?'}"
-                )
-                bar = create_progress_bar(remaining_pct)
+                prompt = totals.get("prompt_tokens", 0)
+                cache_read = totals.get("prompt_tokens_cache_read", 0)
+                output_tokens = totals.get("output_tokens", 0)
+                model_cost = format_cost(totals.get("approx_cost"))
 
-                # Build status text - always show reset time if available
-                has_reset_time = reset_time and reset_time != "-"
-
-                # Color based on status
-                if is_exhausted:
-                    color = "red"
-                    if has_reset_time:
-                        status_text = f"⛔ Resets: {reset_time}"
-                    else:
-                        status_text = "⛔ EXHAUSTED"
-                elif remaining_pct is not None and remaining_pct < 20:
-                    color = "yellow"
-                    if has_reset_time:
-                        status_text = f"⚠️ Resets: {reset_time}"
-                    else:
-                        status_text = "⚠️ LOW"
-                else:
-                    color = "green"
-                    if has_reset_time:
-                        status_text = f"Resets: {reset_time}"
-                    else:
-                        status_text = ""  # Hide if unused/no reset time
-
-                # Confidence indicator
-                conf_indicator = ""
-                if confidence == "low":
-                    conf_indicator = " [dim](~)[/dim]"
-                elif confidence == "medium":
-                    conf_indicator = " [dim](?)[/dim]"
-
-                pct_str = f"{remaining_pct}%" if remaining_pct is not None else "?%"
+                total_input = prompt + cache_read
+                short_name = model_name.split("/")[-1][:30]
                 content_lines.append(
-                    f"  [{color}]{group_name:<18} {display:<10} {pct_str:>4} {bar}[/{color}]  {status_text}{conf_indicator}"
+                    f"    {short_name}: {req_count} req | {format_tokens(total_input)}/{format_tokens(output_tokens)} tokens"
+                    + (f" | {model_cost}" if model_cost != "-" else "")
                 )
-        else:
-            # For providers without quota groups, show model breakdown if available
-            models = cred.get("models", {})
-            if models:
-                content_lines.append("")
-                content_lines.append("  [dim]Models used:[/dim]")
-                for model_name, model_stats in models.items():
-                    req_count = model_stats.get("success_count", 0)
-                    model_cost = format_cost(model_stats.get("approx_cost"))
-                    # Shorten model name for display
-                    short_name = model_name.split("/")[-1][:30]
-                    content_lines.append(
-                        f"    {short_name}: {req_count} requests, {model_cost}"
-                    )
 
         self.console.print(
             Panel(
@@ -1218,12 +1469,86 @@ class QuotaViewer:
             )
         )
 
+    def _inject_fake_daily_window(self, provider: str) -> None:
+        """
+        DEBUG: Inject a fake 'daily' window into cached stats for testing.
+
+        This modifies cached_stats in-place to add a second window to each
+        quota group, simulating multi-window display without needing real
+        multi-window data from the API.
+        """
+        if not self.cached_stats:
+            return
+
+        prov_stats = self.cached_stats.get("providers", {}).get(provider, {})
+        if not prov_stats:
+            return
+
+        # Inject into quota_groups (global view)
+        quota_groups = prov_stats.get("quota_groups", {})
+        for group_name, group_stats in quota_groups.items():
+            windows = group_stats.get("windows", {})
+            if "daily" not in windows and windows:
+                # Copy the first window and modify it
+                first_window = next(iter(windows.values()))
+                daily_window = {
+                    "total_used": int(first_window.get("total_used", 0) * 0.3),
+                    "total_remaining": int(first_window.get("total_max", 100) * 0.7),
+                    "total_max": first_window.get("total_max", 100),
+                    "remaining_pct": 70.0,
+                    "tier_availability": first_window.get("tier_availability", {}),
+                }
+                windows["daily"] = daily_window
+
+        # Inject into credential group_usage (detail view)
+        credentials = prov_stats.get("credentials", {})
+        if isinstance(credentials, dict):
+            cred_list = credentials.values()
+        else:
+            cred_list = credentials
+
+        for cred in cred_list:
+            group_usage = cred.get("group_usage", {})
+            for group_name, group_stats in group_usage.items():
+                windows = group_stats.get("windows", {})
+                if "daily" not in windows and windows:
+                    # Copy the first window and create a daily version
+                    first_window = next(iter(windows.values()))
+                    limit = first_window.get("limit", 100)
+                    daily_window = {
+                        "request_count": int(
+                            first_window.get("request_count", 0) * 0.3
+                        ),
+                        "success_count": int(
+                            first_window.get("success_count", 0) * 0.3
+                        ),
+                        "failure_count": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "thinking_tokens": 0,
+                        "output_tokens": 0,
+                        "prompt_tokens_cache_read": 0,
+                        "prompt_tokens_cache_write": 0,
+                        "total_tokens": 0,
+                        "limit": limit,
+                        "remaining": int(limit * 0.7),
+                        "max_recorded_requests": None,
+                        "max_recorded_at": None,
+                        "reset_at": time.time() + 3600,  # 1 hour from now
+                        "approx_cost": 0.0,
+                        "first_used_at": None,
+                        "last_used_at": None,
+                    }
+                    windows["daily"] = daily_window
+
     def show_switch_remote_screen(self):
         """Display remote selection screen."""
         clear_screen()
 
         self.console.print("━" * 78)
-        self.console.print("[bold cyan]🔄 Switch Remote[/bold cyan]")
+        self.console.print(
+            "[bold cyan]:arrows_counterclockwise: Switch Remote[/bold cyan]"
+        )
         self.console.print("━" * 78)
         self.console.print()
 
@@ -1258,9 +1583,9 @@ class QuotaViewer:
             current_marker = " (current)" if is_current else ""
 
             if is_online:
-                status_icon = "[green]✅ Online[/green]"
+                status_icon = "[green]:white_check_mark: Online[/green]"
             else:
-                status_icon = f"[red]⚠️ {status_msg}[/red]"
+                status_icon = f"[red]:warning: {status_msg}[/red]"
 
             self.console.print(
                 f"   {idx}. {name:<20} {connection_display:<30} {status_icon}{current_marker}"
@@ -1330,7 +1655,7 @@ class QuotaViewer:
             clear_screen()
 
             self.console.print("━" * 78)
-            self.console.print("[bold cyan]⚙️ Manage Remotes[/bold cyan]")
+            self.console.print("[bold cyan]:gear: Manage Remotes[/bold cyan]")
             self.console.print("━" * 78)
             self.console.print()
 

@@ -23,7 +23,7 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Credential Prioritization**: Automatic tier detection and priority-based credential selection (e.g., paid tier credentials used first for models that require them).
 -   **Advanced Model Requirements**: Support for model-tier restrictions (e.g., Gemini 3 requires paid-tier credentials).
 -   **Robust Streaming Support**: Includes a wrapper for streaming responses that reassembles fragmented JSON chunks.
--   **Detailed Usage Tracking**: Tracks daily and global usage for each key, persisted to a JSON file.
+-   **Detailed Usage Tracking**: Tracks daily and global usage for each key, persisted per provider in `usage/usage_<provider>.json`.
 -   **Automatic Daily Resets**: Automatically resets cooldowns and archives stats daily.
 -   **Provider Agnostic**: Works with any provider supported by `litellm`.
 -   **Extensible**: Easily add support for new providers through a simple plugin-based architecture.
@@ -73,7 +73,7 @@ client = RotatingClient(
     api_keys=api_keys,
     oauth_credentials=oauth_credentials,
     max_retries=2,
-    usage_file_path="key_usage.json",
+    usage_file_path="usage.json",
     configure_logging=True,
     global_timeout=30,
     abort_on_callback_error=True,
@@ -91,7 +91,7 @@ client = RotatingClient(
 -   `api_keys` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "openai", "anthropic") to a list of API keys.
 -   `oauth_credentials` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "gemini_cli", "qwen_code") to a list of file paths to OAuth credential JSON files.
 -   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error (e.g., 500, 503) occurs.
--   `usage_file_path` (`str`, default: `"key_usage.json"`): The path to the JSON file where usage statistics (tokens, cost, success counts) are persisted.
+-   `usage_file_path` (`str`, optional): Base path for usage persistence (defaults to `usage/` in the data directory). The client stores per-provider files under `usage/usage_<provider>.json` next to this path.
 -   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger. Set to `False` if you want to handle logging configuration manually.
 -   `global_timeout` (`int`, default: `30`): A hard time limit (in seconds) for the entire request lifecycle. If the request (including all retries) takes longer than this, it is aborted.
 -   `abort_on_callback_error` (`bool`, default: `True`): If `True`, any exception raised by `pre_request_callback` will abort the request. If `False`, the error is logged and the request proceeds.
