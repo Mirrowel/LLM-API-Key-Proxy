@@ -68,7 +68,6 @@ __all__ = [
     "GroupStats",
     "CredentialState",
     "UsageUpdate",
-    "UsageUpdate",
     "CooldownInfo",
     "FairCycleState",
     "SelectionContext",

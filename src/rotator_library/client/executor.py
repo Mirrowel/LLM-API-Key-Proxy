@@ -105,6 +105,9 @@ class RequestExecutor:
             max_retries: Max retries per credential
             global_timeout: Global request timeout in seconds
             abort_on_callback_error: Abort on pre-request callback errors
+            litellm_provider_params: Optional dict of provider-specific LiteLLM
+                parameters to merge into requests (e.g., custom headers, timeouts)
+            litellm_logger_fn: Optional callback function for LiteLLM logging
             provider_instances: Shared dict for caching provider instances.
                 If None, creates a new dict (not recommended - leads to duplicate instances).
         """
@@ -137,6 +140,60 @@ class RequestExecutor:
             else:
                 return None
         return self._plugin_instances[provider]
+
+    def _get_quota_display(
+        self,
+        state: Any,
+        model: str,
+        quota_group: Optional[str],
+        usage_manager: "UsageManager",
+    ) -> str:
+        """
+        Get quota display string for logging.
+
+        Checks group stats first (if quota_group provided), then falls back
+        to model stats. Returns a formatted string like "5/50 [90%]".
+
+        Args:
+            state: CredentialState object
+            model: Model name
+            quota_group: Optional quota group name
+            usage_manager: UsageManager instance
+
+        Returns:
+            Formatted quota display string, or "?/?" if unavailable
+        """
+        if not state:
+            return "?/?"
+
+        window_manager = getattr(usage_manager, "window_manager", None)
+        if not window_manager:
+            return "?/?"
+
+        primary_def = window_manager.get_primary_definition()
+        if not primary_def:
+            return "?/?"
+
+        window = None
+        # Check GROUP first if quota_group provided (shared limits)
+        if quota_group:
+            group_stats = state.get_group_stats(quota_group, create=False)
+            if group_stats:
+                window = group_stats.windows.get(primary_def.name)
+
+        # Fall back to MODEL if no group limit found
+        if window is None or window.limit is None:
+            model_stats = state.get_model_stats(model, create=False)
+            if model_stats:
+                window = model_stats.windows.get(primary_def.name)
+
+        # Display quota if we found a window with a limit
+        if window and window.limit is not None:
+            remaining = max(0, window.limit - window.request_count)
+            pct = round(remaining / window.limit * 100) if window.limit else 0
+            return f"{window.request_count}/{window.limit} [{pct}%]"
+
+        return "?/?"
 
     async def execute(
         self,
@@ -273,62 +330,9 @@ class RequestExecutor:
                     tier = state.tier if state else None
                     priority = state.priority if state else None
                     selection_mode = availability.get("rotation_mode")
-                    quota_display = "?/?"
-                    primary_def = None
-                    if state and getattr(usage_manager, "window_manager", None):
-                        primary_def = (
-                            usage_manager.window_manager.get_primary_definition()
-                        )
-                    if state and primary_def:
-                        window = None
-                        # Check GROUP first if quota_group provided (shared limits)
-                        if quota_group:
-                            group_stats = state.get_group_stats(
-                                quota_group, create=False
-                            )
-                            if group_stats:
-                                window = group_stats.windows.get(primary_def.name)
-                        # Fall back to MODEL if no group limit found
-                        if window is None or window.limit is None:
-                            model_stats = state.get_model_stats(model, create=False)
-                            if model_stats:
-                                window = model_stats.windows.get(primary_def.name)
-                        # Display quota if we found a window with a limit
-                        if window and window.limit is not None:
-                            remaining = max(0, window.limit - window.request_count)
-                            pct = (
-                                round(remaining / window.limit * 100)
-                                if window.limit
-                                else 0
-                            )
-                            quota_display = (
-                                f"{window.request_count}/{window.limit} [{pct}%]"
-                            )
-                    if state and primary_def:
-                        window = None
-                        # Check GROUP first if quota_group provided (shared limits)
-                        if quota_group:
-                            group_stats = state.get_group_stats(
-                                quota_group, create=False
-                            )
-                            if group_stats:
-                                window = group_stats.windows.get(primary_def.name)
-                        # Fall back to MODEL if no group limit found
-                        if window is None or window.limit is None:
-                            model_stats = state.get_model_stats(model, create=False)
-                            if model_stats:
-                                window = model_stats.windows.get(primary_def.name)
-                        # Display quota if we found a window with a limit
-                        if window and window.limit is not None:
-                            remaining = max(0, window.limit - window.request_count)
-                            pct = (
-                                round(remaining / window.limit * 100)
-                                if window.limit
-                                else 0
-                            )
-                            quota_display = (
-                                f"{window.request_count}/{window.limit} [{pct}%]"
-                            )
+                    quota_display = self._get_quota_display(
+                        state, model, quota_group, usage_manager
+                    )
                     lib_logger.info(
                         f"Acquired key {mask_credential(cred)} for model {model} "
                         f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
@@ -577,37 +581,9 @@ class RequestExecutor:
                         tier = state.tier if state else None
                         priority = state.priority if state else None
                         selection_mode = availability.get("rotation_mode")
-                        quota_display = "?/?"
-                        primary_def = None
-                        if state and getattr(usage_manager, "window_manager", None):
-                            primary_def = (
-                                usage_manager.window_manager.get_primary_definition()
-                            )
-                        if state and primary_def:
-                            window = None
-                            # Check GROUP first if quota_group provided (shared limits)
-                            if quota_group:
-                                group_stats = state.get_group_stats(
-                                    quota_group, create=False
-                                )
-                                if group_stats:
-                                    window = group_stats.windows.get(primary_def.name)
-                            # Fall back to MODEL if no group limit found
-                            if window is None or window.limit is None:
-                                model_stats = state.get_model_stats(model, create=False)
-                                if model_stats:
-                                    window = model_stats.windows.get(primary_def.name)
-                            # Display quota if we found a window with a limit
-                            if window and window.limit is not None:
-                                remaining = max(0, window.limit - window.request_count)
-                                pct = (
-                                    round(remaining / window.limit * 100)
-                                    if window.limit
-                                    else 0
-                                )
-                                quota_display = (
-                                    f"{window.request_count}/{window.limit} [{pct}%]"
-                                )
+                        quota_display = self._get_quota_display(
+                            state, model, quota_group, usage_manager
+                        )
                         lib_logger.info(
                             f"Acquired key {mask_credential(cred)} for model {model} "
                             f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
