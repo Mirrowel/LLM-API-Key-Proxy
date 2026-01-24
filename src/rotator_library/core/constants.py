@@ -39,8 +39,6 @@ from ..config import (
     COOLDOWN_RATE_LIMIT_DEFAULT,
     # Small Cooldown Auto-Retry
     DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
-    # Provider/Model 503 Cooldown
-    DEFAULT_PROVIDER_MODEL_503_COOLDOWN,
 )
 
 # =============================================================================
@@ -99,8 +97,6 @@ __all__ = [
     "COOLDOWN_RATE_LIMIT_DEFAULT",
     # Small Cooldown Auto-Retry
     "DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD",
-    # Provider/Model 503 Cooldown
-    "DEFAULT_PROVIDER_MODEL_503_COOLDOWN",
     # Environment variable prefixes
     "ENV_PREFIX_ROTATION_MODE",
     "ENV_PREFIX_FAIR_CYCLE",

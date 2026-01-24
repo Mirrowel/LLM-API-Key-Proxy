@@ -168,6 +168,12 @@ EMPTY_RESPONSE_RETRY_DELAY = env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3
 MALFORMED_CALL_MAX_RETRIES = max(1, env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
 MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
 
+# 503 MODEL_CAPACITY_EXHAUSTED retry configuration
+# When server returns 503 (capacity exhausted), retry with longer delay
+# since rotating credentials is pointless - all credentials are equally affected
+CAPACITY_EXHAUSTED_MAX_ATTEMPTS = max(1, env_int("ANTIGRAVITY_503_MAX_ATTEMPTS", 10))
+CAPACITY_EXHAUSTED_RETRY_DELAY = env_int("ANTIGRAVITY_503_RETRY_DELAY", 5)
+
 # =============================================================================
 # INTERNAL RETRY COUNTING (for usage tracking)
 # =============================================================================
@@ -4868,6 +4874,40 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     return
 
             except httpx.HTTPStatusError as e:
+                # Handle 503 MODEL_CAPACITY_EXHAUSTED - retry internally
+                # since rotating credentials is pointless (affects all equally)
+                if e.response.status_code == 503:
+                    error_body = ""
+                    try:
+                        error_body = (
+                            e.response.text if hasattr(e.response, "text") else ""
+                        )
+                    except Exception:
+                        pass
+
+                    if "MODEL_CAPACITY_EXHAUSTED" in error_body:
+                        if attempt < CAPACITY_EXHAUSTED_MAX_ATTEMPTS - 1:
+                            lib_logger.info(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED from {model}, "
+                                f"attempt {attempt + 1}/{CAPACITY_EXHAUSTED_MAX_ATTEMPTS}. "
+                                f"Waiting {CAPACITY_EXHAUSTED_RETRY_DELAY}s..."
+                            )
+                            # Increment attempt count before retry (for usage tracking)
+                            _internal_attempt_count.set(
+                                _internal_attempt_count.get() + 1
+                            )
+                            await asyncio.sleep(CAPACITY_EXHAUSTED_RETRY_DELAY)
+                            continue
+                        else:
+                            # Max attempts reached - propagate error
+                            lib_logger.warning(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED after "
+                                f"{CAPACITY_EXHAUSTED_MAX_ATTEMPTS} attempts. Giving up."
+                            )
+                            raise
+                    # Other 503 errors - raise immediately
+                    raise
+
                 if e.response.status_code == 429:
                     # Check if this is a bare 429 (no retry info) vs real quota exhaustion
                     quota_info = self.parse_quota_error(e)

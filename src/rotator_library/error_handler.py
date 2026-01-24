@@ -902,9 +902,8 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code=status_code,
             )
         if 500 <= status_code:
-            # 503 errors are handled at provider/model level (not credential level)
-            # because capacity exhaustion affects all credentials equally.
-            # Do NOT apply credential-level cooldown for 503 - let executor handle it.
+            # Log 503 MODEL_CAPACITY_EXHAUSTED for visibility
+            # (Provider-level handling may intercept this before it reaches here)
             if status_code == 503:
                 try:
                     capacity_exhausted = False
@@ -926,15 +925,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 except Exception:
                     pass
 
-                # Return 503 WITHOUT retry_after - executor handles provider/model cooldown
-                return ClassifiedError(
-                    error_type="server_error",
-                    original_exception=e,
-                    status_code=503,
-                    # No retry_after - executor applies provider/model cooldown instead
-                )
-
-            # Apply default 30s cooldown for other server errors (500, 502, 504, etc.)
+            # Apply default 30s cooldown for all server errors
             # This prevents rapid retries against overloaded/erroring servers
             return ClassifiedError(
                 error_type="server_error",

@@ -34,8 +34,6 @@ from .defaults import (
     COOLDOWN_RATE_LIMIT_DEFAULT,
     # Small Cooldown Auto-Retry
     DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
-    # Provider/Model 503 Cooldown
-    DEFAULT_PROVIDER_MODEL_503_COOLDOWN,
 )
 
 __all__ = [
@@ -65,6 +63,4 @@ __all__ = [
     "COOLDOWN_RATE_LIMIT_DEFAULT",
     # Small Cooldown Auto-Retry
     "DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD",
-    # Provider/Model 503 Cooldown
-    "DEFAULT_PROVIDER_MODEL_503_COOLDOWN",
 ]

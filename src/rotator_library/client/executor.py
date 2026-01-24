@@ -54,7 +54,6 @@ from ..core.errors import (
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
-    DEFAULT_PROVIDER_MODEL_503_COOLDOWN,
 )
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
@@ -519,9 +518,6 @@ class RequestExecutor:
             # Wait for provider cooldown
             await self._wait_for_cooldown(provider, deadline)
 
-            # Wait for provider/model cooldown (503 capacity errors)
-            await self._wait_for_model_cooldown(provider, model, deadline)
-
             # Acquire credential using context manager
             try:
                 availability = await usage_manager.get_availability_stats(
@@ -728,9 +724,6 @@ class RequestExecutor:
                     break
                 await self._wait_for_cooldown(provider, deadline)
 
-                # Wait for provider/model cooldown (503 capacity errors)
-                await self._wait_for_model_cooldown(provider, model, deadline)
-
                 # Acquire credential using context manager
                 try:
                     availability = await usage_manager.get_availability_stats(
@@ -911,45 +904,6 @@ class RequestExecutor:
                                     else:
                                         retry_state.reset_quota_failures()
 
-                                    # Handle 503 errors specially - apply provider/model cooldown
-                                    # 503 errors affect all credentials equally, so rotating is pointless
-                                    if classified.status_code == 503:
-                                        cooldown_503 = int(
-                                            os.environ.get(
-                                                "PROVIDER_MODEL_503_COOLDOWN",
-                                                DEFAULT_PROVIDER_MODEL_503_COOLDOWN,
-                                            )
-                                        )
-                                        # Apply provider/model cooldown (not credential cooldown)
-                                        if self._cooldown:
-                                            await self._cooldown.start_model_cooldown(
-                                                provider, model, cooldown_503
-                                            )
-                                        remaining = deadline - time.time()
-                                        if cooldown_503 <= remaining:
-                                            lib_logger.info(
-                                                f"503 error on {provider}/{model} - waiting {cooldown_503}s "
-                                                f"and retrying with same credential {mask_credential(cred)}"
-                                            )
-                                            await asyncio.sleep(cooldown_503)
-                                            continue  # Retry with same credential
-                                        # Not enough time - fail (don't rotate)
-                                        lib_logger.warning(
-                                            f"503 error but cooldown exceeds budget. Failing."
-                                        )
-                                        error_accumulator.record_error(
-                                            cred, classified, str(e)[:150]
-                                        )
-                                        error_data = {
-                                            "error": {
-                                                "message": f"503 capacity error on {provider}/{model}",
-                                                "type": "capacity_exhausted",
-                                            }
-                                        }
-                                        yield f"data: {json.dumps(error_data)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        return
-
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
@@ -1115,39 +1069,6 @@ class RequestExecutor:
             lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
             await asyncio.sleep(remaining)
 
-    async def _wait_for_model_cooldown(
-        self,
-        provider: str,
-        model: str,
-        deadline: float,
-    ) -> None:
-        """
-        Wait for provider/model-level cooldown to end (503 errors).
-
-        This is separate from provider-level cooldowns and is used for
-        capacity exhaustion errors where rotating credentials is pointless.
-
-        Args:
-            provider: Provider name
-            model: Model name
-            deadline: Request deadline
-        """
-        if not self._cooldown:
-            return
-
-        remaining = await self._cooldown.get_model_cooldown_remaining(provider, model)
-        if remaining > 0:
-            budget = deadline - time.time()
-            if remaining > budget:
-                lib_logger.warning(
-                    f"Model cooldown {provider}/{model} ({remaining:.1f}s) exceeds budget ({budget:.1f}s)"
-                )
-                return  # Will fail on no keys available
-            lib_logger.info(
-                f"Waiting {remaining:.1f}s for {provider}/{model} 503 cooldown"
-            )
-            await asyncio.sleep(remaining)
-
     async def _handle_error_with_context(
         self,
         error: Exception,
@@ -1199,44 +1120,6 @@ class RequestExecutor:
                 return ErrorAction.FAIL
         else:
             retry_state.reset_quota_failures()
-
-        # Handle 503 errors specially - apply provider/model cooldown, not credential cooldown
-        # 503 errors (like MODEL_CAPACITY_EXHAUSTED) affect all credentials equally,
-        # so rotating is pointless. Instead, wait and retry with the same credential.
-        if classified.status_code == 503:
-            cooldown_duration = int(
-                os.environ.get(
-                    "PROVIDER_MODEL_503_COOLDOWN", DEFAULT_PROVIDER_MODEL_503_COOLDOWN
-                )
-            )
-
-            # Apply provider/model cooldown (not credential cooldown)
-            if self._cooldown:
-                await self._cooldown.start_model_cooldown(
-                    provider, model, cooldown_duration
-                )
-
-            # Check if we have time to wait
-            remaining_budget = (
-                retry_state.deadline - time.time()
-                if hasattr(retry_state, "deadline")
-                else 30
-            )
-            if cooldown_duration <= remaining_budget:
-                lib_logger.info(
-                    f"503 error on {provider}/{model} - waiting {cooldown_duration}s "
-                    f"and retrying with same credential {mask_credential(credential)}"
-                )
-                await asyncio.sleep(cooldown_duration)
-                return ErrorAction.RETRY_SAME
-
-            # Not enough time budget - fail (don't rotate, it's pointless)
-            lib_logger.warning(
-                f"503 error on {provider}/{model} but cooldown ({cooldown_duration}s) "
-                f"exceeds remaining budget. Failing request."
-            )
-            error_accumulator.record_error(credential, classified, error_message)
-            return ErrorAction.FAIL
 
         # Check if should rotate
         if not should_rotate_on_error(classified):
