@@ -104,7 +104,7 @@ class AnthropicHandler:
 
         if request.stream:
             # Streaming response
-            response_generator = self._client.acompletion(
+            response_generator = await self._client.acompletion(
                 request=raw_request,
                 pre_request_callback=pre_request_callback,
                 **openai_request,
