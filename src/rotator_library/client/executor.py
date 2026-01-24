@@ -141,6 +141,78 @@ class RequestExecutor:
                 return None
         return self._plugin_instances[provider]
 
+    def _has_tier_support(self, provider: str) -> bool:
+        """
+        Check if provider has tier/priority configuration.
+
+        Providers with tier support define tier_priorities mapping
+        (e.g., Antigravity, GeminiCli, NanoGpt).
+
+        Args:
+            provider: Provider name
+
+        Returns:
+            True if provider has tier configuration, False otherwise
+        """
+        plugin = self._get_plugin_instance(provider)
+        if not plugin:
+            return False
+        tier_priorities = getattr(plugin, "tier_priorities", {})
+        return bool(tier_priorities)
+
+    def _get_usage_display(
+        self,
+        state: Any,
+        model: str,
+        quota_group: Optional[str],
+        usage_manager: "UsageManager",
+    ) -> int:
+        """
+        Get usage count from the primary window.
+
+        This returns the same usage count used for credential selection,
+        ensuring consistency between what's logged and what's used for rotation.
+
+        Args:
+            state: CredentialState object
+            model: Model name
+            quota_group: Optional quota group name
+            usage_manager: UsageManager instance
+
+        Returns:
+            Request count from primary window, or 0 if unavailable
+        """
+        if not state:
+            return 0
+
+        window_manager = getattr(usage_manager, "window_manager", None)
+        if not window_manager:
+            return state.totals.request_count
+
+        primary_def = window_manager.get_primary_definition()
+        if not primary_def:
+            return state.totals.request_count
+
+        # Get windows based on what the primary definition applies to
+        # This mirrors the logic in selection/engine.py:_get_usage_count
+        windows = None
+        if primary_def.applies_to == "model":
+            model_stats = state.get_model_stats(model, create=False)
+            if model_stats:
+                windows = model_stats.windows
+        elif primary_def.applies_to == "group":
+            group_key = quota_group or model
+            group_stats = state.get_group_stats(group_key, create=False)
+            if group_stats:
+                windows = group_stats.windows
+
+        if windows:
+            window = window_manager.get_active_window(windows, primary_def.name)
+            if window:
+                return window.request_count
+
+        return state.totals.request_count
+
     def _get_quota_display(
         self,
         state: Any,
@@ -275,6 +347,11 @@ class RequestExecutor:
         """
         Log successful credential acquisition.
 
+        Format varies based on provider capabilities:
+        - Providers with tier support: (tier, priority, selection, quota)
+        - Providers without tiers but with quotas: (selection, quota)
+        - Providers without tiers or quotas: (selection, usage)
+
         Args:
             cred: Credential string
             model: Model name
@@ -283,16 +360,43 @@ class RequestExecutor:
             availability: Availability stats dict
             usage_manager: UsageManager instance
         """
-        tier = state.tier if state else None
-        priority = state.priority if state else None
         selection_mode = availability.get("rotation_mode")
-        quota_display = self._get_quota_display(
-            state, model, quota_group, usage_manager
-        )
-        lib_logger.info(
-            f"Acquired key {mask_credential(cred)} for model {model} "
-            f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
-        )
+
+        # Extract provider from model (e.g., "nvidia_nim" from "nvidia_nim/deepseek-ai/...")
+        provider = model.split("/")[0] if "/" in model else None
+
+        if provider and self._has_tier_support(provider):
+            # Full format with tier/priority/quota for providers with tier configuration
+            tier = state.tier if state else None
+            priority = state.priority if state else None
+            quota_display = self._get_quota_display(
+                state, model, quota_group, usage_manager
+            )
+            lib_logger.info(
+                f"Acquired key {mask_credential(cred)} for model {model} "
+                f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+            )
+        else:
+            # Simple format for providers without tier configuration
+            # Check if there's quota info available (limit set on window)
+            quota_display = self._get_quota_display(
+                state, model, quota_group, usage_manager
+            )
+            if quota_display != "?/?":
+                # Has quota limits - show selection and quota
+                lib_logger.info(
+                    f"Acquired key {mask_credential(cred)} for model {model} "
+                    f"(selection: {selection_mode}, quota: {quota_display})"
+                )
+            else:
+                # No quota limits - show selection and usage from primary window
+                usage = self._get_usage_display(
+                    state, model, quota_group, usage_manager
+                )
+                lib_logger.info(
+                    f"Acquired key {mask_credential(cred)} for model {model} "
+                    f"(selection: {selection_mode}, usage: {usage})"
+                )
 
     async def _run_pre_request_callback(
         self,
