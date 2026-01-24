@@ -4892,10 +4892,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 f"attempt {attempt + 1}/{CAPACITY_EXHAUSTED_MAX_ATTEMPTS}. "
                                 f"Waiting {CAPACITY_EXHAUSTED_RETRY_DELAY}s..."
                             )
-                            # Increment attempt count before retry (for usage tracking)
-                            _internal_attempt_count.set(
-                                _internal_attempt_count.get() + 1
-                            )
+                            # NOTE: Do NOT increment _internal_attempt_count here - 503 capacity
+                            # exhausted errors don't consume quota, so retries are "free"
                             await asyncio.sleep(CAPACITY_EXHAUSTED_RETRY_DELAY)
                             continue
                         else:
