@@ -324,6 +324,50 @@ class SelectionEngine:
 
         return state.totals.request_count
 
+    def _get_shortest_cooldown(
+        self,
+        states: List[CredentialState],
+        group_key: str,
+    ) -> tuple:
+        """
+        Find the shortest remaining cooldown among the given credentials.
+
+        Args:
+            states: List of credential states to check
+            group_key: Model or quota group key for cooldown lookup
+
+        Returns:
+            Tuple of (has_short_cooldown, stable_id, remaining_seconds)
+            where has_short_cooldown is True if any cooldown is under the threshold
+        """
+        import time
+
+        now = time.time()
+        threshold = self._config.fair_cycle.reset_cooldown_threshold
+        shortest_remaining = float("inf")
+        shortest_cred_id = None
+
+        for state in states:
+            # Check group-specific cooldown
+            cooldown = state.cooldowns.get(group_key)
+            if cooldown and cooldown.until > now:
+                remaining = cooldown.until - now
+                if remaining < shortest_remaining:
+                    shortest_remaining = remaining
+                    shortest_cred_id = state.stable_id
+
+            # Also check global cooldown
+            global_cooldown = state.cooldowns.get("_global_")
+            if global_cooldown and global_cooldown.until > now:
+                remaining = global_cooldown.until - now
+                if remaining < shortest_remaining:
+                    shortest_remaining = remaining
+                    shortest_cred_id = state.stable_id
+
+        if shortest_remaining < threshold:
+            return (True, shortest_cred_id, shortest_remaining)
+        return (False, None, shortest_remaining)
+
     def _try_fair_cycle_reset(
         self,
         provider: str,
@@ -386,6 +430,18 @@ class SelectionEngine:
             if fair_cycle_checker.check_all_exhausted(
                 provider, tracking_key, candidate_states, priorities=priority_map
             ):
+                # Before resetting, check if any credential has a short cooldown
+                # that will expire soon - if so, wait instead of resetting
+                has_short, cred_id, remaining = self._get_shortest_cooldown(
+                    candidate_states, group_key
+                )
+                if has_short:
+                    lib_logger.debug(
+                        f"Skipping fair cycle reset for {provider}/{model}: "
+                        f"credential {cred_id} has short cooldown ({remaining:.0f}s remaining)"
+                    )
+                    return False
+
                 lib_logger.info(
                     f"All credentials fair-cycle exhausted for {provider}/{model} "
                     f"(cross-tier), resetting cycle"
@@ -407,6 +463,18 @@ class SelectionEngine:
                 )
 
                 if all_tier_exhausted:
+                    # Before resetting, check if any credential has a short cooldown
+                    # that will expire soon - if so, wait instead of resetting
+                    has_short, cred_id, remaining = self._get_shortest_cooldown(
+                        tier_states, group_key
+                    )
+                    if has_short:
+                        lib_logger.debug(
+                            f"Skipping fair cycle reset for {provider}/{model} tier {priority}: "
+                            f"credential {cred_id} has short cooldown ({remaining:.0f}s remaining)"
+                        )
+                        continue
+
                     lib_logger.info(
                         f"All credentials fair-cycle exhausted for {provider}/{model} "
                         f"in tier {priority}, resetting tier cycle"

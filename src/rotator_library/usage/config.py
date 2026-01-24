@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from ..core.constants import (
     DEFAULT_FAIR_CYCLE_DURATION,
     DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD,
+    DEFAULT_FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
@@ -93,6 +94,9 @@ class FairCycleConfig:
     duration: int = DEFAULT_FAIR_CYCLE_DURATION  # Cycle duration in seconds
     quota_threshold: float = (
         DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD  # Multiplier of window limit for exhaustion
+    )
+    reset_cooldown_threshold: int = (
+        DEFAULT_FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD  # Min cooldown to count for reset
     )
 
 
@@ -598,6 +602,10 @@ def load_provider_usage_config(
                 quota_threshold=fc_config.get(
                     "quota_threshold", DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD
                 ),
+                reset_cooldown_threshold=fc_config.get(
+                    "reset_cooldown_threshold",
+                    DEFAULT_FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD,
+                ),
             )
         else:
             if hasattr(plugin_class, "default_fair_cycle_enabled"):
@@ -702,6 +710,14 @@ def load_provider_usage_config(
     if env_fc_quota:
         try:
             config.fair_cycle.quota_threshold = float(env_fc_quota)
+        except ValueError:
+            pass
+
+    # Fair cycle reset cooldown threshold from env
+    env_fc_reset_cd = os.getenv(f"FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD_{provider_upper}")
+    if env_fc_reset_cd:
+        try:
+            config.fair_cycle.reset_cooldown_threshold = int(env_fc_reset_cd)
         except ValueError:
             pass
 

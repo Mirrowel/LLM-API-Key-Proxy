@@ -93,6 +93,14 @@ DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD: int = 300  # 5 minutes
 # Override: FAIR_CYCLE_QUOTA_THRESHOLD_{PROVIDER}=<float>
 DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD: float = 1.0
 
+# Fair cycle reset cooldown threshold in seconds
+# When all credentials are exhausted, the fair cycle will only reset if ALL
+# credentials have cooldowns longer than this threshold. If any credential has
+# a shorter cooldown, the system will wait for it to expire instead of resetting.
+# This prevents premature cycle resets when credentials have short temporary cooldowns.
+# Override: FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD_{PROVIDER}=<seconds>
+DEFAULT_FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD: int = 90  # 1.5 minutes
+
 # =============================================================================
 # CUSTOM CAPS DEFAULTS
 # =============================================================================
