@@ -226,8 +226,8 @@ class RotatingClient:
 
             usage_file = self._usage_base_path / f"usage_{provider}.json"
 
-            # Get max concurrent for this provider
-            max_concurrent = self.max_concurrent_requests_per_key.get(provider)
+            # Get max concurrent for this provider (default to 1 if not set)
+            max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
 
             manager = NewUsageManager(
                 provider=provider,

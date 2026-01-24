@@ -288,14 +288,20 @@ class UsageManager:
                 if tiers and accessor in tiers:
                     self._states[stable_id].tier = tiers[accessor]
 
-                # Set max concurrent if configured, applying priority multiplier
-                if self._max_concurrent_per_key is not None:
-                    base_concurrent = self._max_concurrent_per_key
-                    # Apply priority multiplier from config
-                    priority = self._states[stable_id].priority
-                    multiplier = self._config.get_effective_multiplier(priority)
-                    effective_concurrent = base_concurrent * multiplier
-                    self._states[stable_id].max_concurrent = effective_concurrent
+                # Debug: Log state before max_concurrent calculation
+                old_max_concurrent = self._states[stable_id].max_concurrent
+
+                # Always set max concurrent, applying priority multiplier
+                # Uses configured value or defaults to 1 if not set
+                base_concurrent = (
+                    self._max_concurrent_per_key
+                    if self._max_concurrent_per_key is not None
+                    else 1
+                )
+                priority = self._states[stable_id].priority
+                multiplier = self._config.get_effective_multiplier(priority)
+                effective_concurrent = base_concurrent * multiplier
+                self._states[stable_id].max_concurrent = effective_concurrent
 
             self._initialized = True
             lib_logger.debug(

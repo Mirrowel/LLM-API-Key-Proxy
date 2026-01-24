@@ -1153,11 +1153,11 @@ class AntigravityProvider(
     # Priority 1 (paid ultra): 5x concurrent requests
     # Priority 2 (standard paid): 3x concurrent requests
     # Others: Use sequential fallback (2x) or balanced default (1x)
-    default_priority_multipliers = {1: 5, 2: 3}
+    default_priority_multipliers = {1: 2, 2: 1}
 
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
-    default_sequential_fallback_multiplier = 2
+    default_sequential_fallback_multiplier = 1
 
     # Custom caps examples (commented - uncomment and modify as needed)
     # default_custom_caps = {
