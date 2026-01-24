@@ -303,6 +303,23 @@ class UsageManager:
                 effective_concurrent = base_concurrent * multiplier
                 self._states[stable_id].max_concurrent = effective_concurrent
 
+            # Clean up stale windows from tier changes
+            # This handles the case where a credential's tier changed and now has
+            # windows from the old tier that should be removed
+            total_removed = 0
+            for stable_id, state in self._states.items():
+                valid_windows = self._get_valid_window_names_for_state(state)
+                removed = self._cleanup_stale_windows_for_state(state, valid_windows)
+                total_removed += removed
+
+            if total_removed > 0:
+                lib_logger.info(
+                    f"Cleaned up {total_removed} stale window(s) for {self.provider}"
+                )
+                # Mark storage dirty so changes get saved
+                if self._storage:
+                    self._storage.mark_dirty()
+
             self._initialized = True
             lib_logger.debug(
                 f"UsageManager initialized for {self.provider} with {len(credentials)} credentials"
@@ -1487,6 +1504,115 @@ class UsageManager:
         await self._save_if_needed()
 
         return None
+
+    # =========================================================================
+    # WINDOW CLEANUP
+    # =========================================================================
+
+    def _get_valid_window_names_for_state(self, state: CredentialState) -> Set[str]:
+        """
+        Get the set of valid window names for a credential based on its tier.
+
+        Uses the provider's usage_reset_configs to determine which window(s)
+        should exist for this credential's tier/priority.
+
+        Args:
+            state: The credential state
+
+        Returns:
+            Set of valid window names (e.g., {"5h"} or {"168h"})
+        """
+        plugin_class = self._provider_plugins.get(self.provider)
+        if not plugin_class:
+            # No plugin - use current config windows as valid
+            return {w.name for w in self._config.windows}
+
+        # Check if provider defines usage_reset_configs
+        usage_reset_configs = getattr(plugin_class, "usage_reset_configs", None)
+        if not usage_reset_configs:
+            # No tier-specific configs - use current config windows
+            return {w.name for w in self._config.windows}
+
+        # Get tier priorities mapping
+        tier_priorities = getattr(plugin_class, "tier_priorities", {})
+        default_priority = getattr(plugin_class, "default_tier_priority", 10)
+
+        # Resolve credential's priority from tier
+        priority = state.priority
+        if priority is None and state.tier:
+            priority = tier_priorities.get(state.tier, default_priority)
+        if priority is None:
+            priority = default_priority
+
+        # Find matching usage config for this priority
+        matching_config = None
+        for key, config in usage_reset_configs.items():
+            if isinstance(key, frozenset) and priority in key:
+                matching_config = config
+                break
+        if matching_config is None:
+            matching_config = usage_reset_configs.get("default")
+
+        if matching_config is None:
+            # No matching config - use current windows
+            return {w.name for w in self._config.windows}
+
+        # Generate window name from window_seconds
+        window_seconds = matching_config.window_seconds
+        if window_seconds == 86400:
+            window_name = "daily"
+        elif window_seconds % 3600 == 0:
+            window_name = f"{window_seconds // 3600}h"
+        else:
+            window_name = "window"
+
+        return {window_name}
+
+    def _cleanup_stale_windows_for_state(
+        self, state: CredentialState, valid_windows: Set[str]
+    ) -> int:
+        """
+        Remove windows that don't match the credential's current tier config.
+
+        This handles the case where a credential's tier changed and now has
+        windows from the old tier that should be cleaned up.
+
+        Args:
+            state: The credential state to clean up
+            valid_windows: Set of valid window names for this credential
+
+        Returns:
+            Number of windows removed
+        """
+        removed_count = 0
+
+        # Clean up model_usage windows
+        for model_name, model_stats in state.model_usage.items():
+            windows_to_remove = [
+                name for name in model_stats.windows.keys() if name not in valid_windows
+            ]
+            for window_name in windows_to_remove:
+                del model_stats.windows[window_name]
+                removed_count += 1
+                lib_logger.debug(
+                    f"Removed stale window '{window_name}' from model "
+                    f"'{model_name}' for {mask_credential(state.accessor, style='full')}"
+                )
+
+        # Clean up group_usage windows
+        for group_name, group_stats in state.group_usage.items():
+            windows_to_remove = [
+                name for name in group_stats.windows.keys() if name not in valid_windows
+            ]
+            for window_name in windows_to_remove:
+                del group_stats.windows[window_name]
+                removed_count += 1
+                lib_logger.debug(
+                    f"Removed stale window '{window_name}' from group "
+                    f"'{group_name}' for {mask_credential(state.accessor, style='full')}"
+                )
+
+        return removed_count
 
     async def clear_cooldown_if_exists(
         self,
