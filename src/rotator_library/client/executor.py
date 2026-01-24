@@ -263,6 +263,60 @@ class RequestExecutor:
 
         return kwargs
 
+    def _log_acquired_credential(
+        self,
+        cred: str,
+        model: str,
+        state: Any,
+        quota_group: Optional[str],
+        availability: Dict[str, Any],
+        usage_manager: "UsageManager",
+    ) -> None:
+        """
+        Log successful credential acquisition.
+
+        Args:
+            cred: Credential string
+            model: Model name
+            state: CredentialState object
+            quota_group: Optional quota group
+            availability: Availability stats dict
+            usage_manager: UsageManager instance
+        """
+        tier = state.tier if state else None
+        priority = state.priority if state else None
+        selection_mode = availability.get("rotation_mode")
+        quota_display = self._get_quota_display(
+            state, model, quota_group, usage_manager
+        )
+        lib_logger.info(
+            f"Acquired key {mask_credential(cred)} for model {model} "
+            f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+        )
+
+    async def _run_pre_request_callback(
+        self,
+        context: "RequestContext",
+        kwargs: Dict[str, Any],
+    ) -> None:
+        """
+        Run pre-request callback if configured.
+
+        Args:
+            context: Request context
+            kwargs: Request kwargs
+
+        Raises:
+            PreRequestCallbackError: If callback fails and abort_on_callback_error is True
+        """
+        if context.pre_request_callback:
+            try:
+                await context.pre_request_callback(context.request, kwargs)
+            except Exception as e:
+                if self._abort_on_callback_error:
+                    raise PreRequestCallbackError(str(e)) from e
+                lib_logger.warning(f"Pre-request callback failed: {e}")
+
     async def execute(
         self,
         context: RequestContext,
@@ -353,13 +407,6 @@ class RequestExecutor:
                 )
                 break
 
-            availability = await usage_manager.get_availability_stats(
-                model, quota_group
-            )
-            self._log_acquiring_credential(
-                model, len(retry_state.tried_credentials), availability
-            )
-
             # Wait for provider cooldown
             await self._wait_for_cooldown(provider, deadline)
 
@@ -367,6 +414,9 @@ class RequestExecutor:
             try:
                 availability = await usage_manager.get_availability_stats(
                     model, quota_group
+                )
+                self._log_acquiring_credential(
+                    model, len(retry_state.tried_credentials), availability
                 )
                 async with await usage_manager.acquire_credential(
                     model=model,
@@ -381,15 +431,8 @@ class RequestExecutor:
                     state = getattr(usage_manager, "states", {}).get(
                         cred_context.stable_id
                     )
-                    tier = state.tier if state else None
-                    priority = state.priority if state else None
-                    selection_mode = availability.get("rotation_mode")
-                    quota_display = self._get_quota_display(
-                        state, model, quota_group, usage_manager
-                    )
-                    lib_logger.info(
-                        f"Acquired key {mask_credential(cred)} for model {model} "
-                        f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+                    self._log_acquired_credential(
+                        cred, model, state, quota_group, availability, usage_manager
                     )
 
                     try:
@@ -409,17 +452,7 @@ class RequestExecutor:
                                     f"(Attempt {attempt + 1}/{self._max_retries})"
                                 )
                                 # Pre-request callback
-                                if context.pre_request_callback:
-                                    try:
-                                        await context.pre_request_callback(
-                                            context.request, kwargs
-                                        )
-                                    except Exception as e:
-                                        if self._abort_on_callback_error:
-                                            raise PreRequestCallbackError(str(e)) from e
-                                        lib_logger.warning(
-                                            f"Pre-request callback failed: {e}"
-                                        )
+                                await self._run_pre_request_callback(context, kwargs)
 
                                 # Make the API call
                                 if plugin and plugin.has_custom_logic():
@@ -564,13 +597,6 @@ class RequestExecutor:
         last_exception: Optional[Exception] = None
 
         try:
-            availability = await usage_manager.get_availability_stats(
-                model, quota_group
-            )
-            self._log_acquiring_credential(
-                model, len(retry_state.tried_credentials), availability
-            )
-
             while time.time() < deadline:
                 # Check for untried credentials
                 untried = [
@@ -593,6 +619,9 @@ class RequestExecutor:
                     availability = await usage_manager.get_availability_stats(
                         model, quota_group
                     )
+                    self._log_acquiring_credential(
+                        model, len(retry_state.tried_credentials), availability
+                    )
                     async with await usage_manager.acquire_credential(
                         model=model,
                         quota_group=quota_group,
@@ -606,15 +635,8 @@ class RequestExecutor:
                         state = getattr(usage_manager, "states", {}).get(
                             cred_context.stable_id
                         )
-                        tier = state.tier if state else None
-                        priority = state.priority if state else None
-                        selection_mode = availability.get("rotation_mode")
-                        quota_display = self._get_quota_display(
-                            state, model, quota_group, usage_manager
-                        )
-                        lib_logger.info(
-                            f"Acquired key {mask_credential(cred)} for model {model} "
-                            f"(tier: {tier}, priority: {priority}, selection: {selection_mode}, quota: {quota_display})"
+                        self._log_acquired_credential(
+                            cred, model, state, quota_group, availability, usage_manager
                         )
 
                         try:
@@ -645,19 +667,9 @@ class RequestExecutor:
                                         f"(Attempt {attempt + 1}/{self._max_retries})"
                                     )
                                     # Pre-request callback
-                                    if context.pre_request_callback:
-                                        try:
-                                            await context.pre_request_callback(
-                                                context.request, kwargs
-                                            )
-                                        except Exception as e:
-                                            if self._abort_on_callback_error:
-                                                raise PreRequestCallbackError(
-                                                    str(e)
-                                                ) from e
-                                            lib_logger.warning(
-                                                f"Pre-request callback failed: {e}"
-                                            )
+                                    await self._run_pre_request_callback(
+                                        context, kwargs
+                                    )
 
                                     # Make the API call
                                     if plugin and plugin.has_custom_logic():
