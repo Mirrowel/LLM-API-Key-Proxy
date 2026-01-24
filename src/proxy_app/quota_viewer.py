@@ -6,42 +6,6 @@ Lightweight Quota Stats Viewer TUI.
 
 Connects to a running proxy to display quota and usage statistics.
 Uses only httpx + rich (no heavy rotator_library imports).
-
-TODO: Missing Features & Improvements
-======================================
-
-Display Improvements:
-- [ ] Add color legend/help screen explaining status colors and symbols
-- [ ] Show credential email/project ID if available (currently just filename)
-- [ ] Add keyboard shortcut hints (e.g., "Press ? for help")
-- [ ] Support terminal resize / responsive layout
-
-Global Stats Fix:
-- [ ] HACK: Global requests currently set to current period requests only
-      (see client.py get_quota_stats). This doesn't include archived stats.
-      Fix requires tracking archived requests per quota group in usage_manager.py
-      to avoid double-counting models that share quota groups.
-
-Data & Refresh:
-- [ ] Auto-refresh option (configurable interval)
-- [ ] Show last refresh timestamp more prominently
-- [ ] Cache invalidation when switching between current/global view
-- [ ] Support for non-OAuth providers (API keys like nvapi-*, gsk_*, etc.)
-
-Remote Management:
-- [ ] Test connection before saving remote
-- [ ] Import/export remote configurations
-- [ ] SSH tunnel support for remote proxies
-
-Quota Groups:
-- [ ] Show which models are in each quota group (expandable)
-- [ ] Historical quota usage graphs (if data available)
-- [ ] Alerts/notifications when quota is low
-
-Credential Details:
-- [ ] Show per-model breakdown within quota groups
-- [ ] Edit credential priority/tier manually
-- [ ] Disable/enable individual credentials
 """
 
 import os
@@ -68,22 +32,46 @@ from .quota_viewer_config import QuotaViewerConfig
 
 # Summary screen table column widths
 TABLE_PROVIDER_WIDTH = 12
-TABLE_CREDS_WIDTH = 5
-TABLE_QUOTA_STATUS_WIDTH = 42
-TABLE_REQUESTS_WIDTH = 8
-TABLE_TOKENS_WIDTH = 24
+TABLE_CREDS_WIDTH = 3
+TABLE_QUOTA_STATUS_WIDTH = 58
+TABLE_REQUESTS_WIDTH = 5
+TABLE_TOKENS_WIDTH = 20
 TABLE_COST_WIDTH = 6
 
 # Quota status formatting in summary screen
-QUOTA_NAME_WIDTH = 12  # Width for quota group name (e.g., "claude:")
+QUOTA_NAME_WIDTH = 11  # Width for quota group name (e.g., "claude:")
 QUOTA_USAGE_WIDTH = 11  # Width for usage ratio (e.g., "2071/2700")
 QUOTA_PCT_WIDTH = 6  # Width for percentage (e.g., "76.7%")
 QUOTA_BAR_WIDTH = 10  # Width for progress bar
 
 # Detail view credential panel formatting
-DETAIL_GROUP_NAME_WIDTH = 20  # Width for group name in detail view
-DETAIL_USAGE_WIDTH = 12  # Width for usage ratio in detail view
+DETAIL_GROUP_NAME_WIDTH = (
+    18  # Width for group name in detail view (handles "g25-flash (daily)")
+)
+DETAIL_USAGE_WIDTH = (
+    16  # Width for usage ratio in detail view (handles "3000/3000(5000)")
+)
 DETAIL_PCT_WIDTH = 7  # Width for percentage in detail view
+
+# =============================================================================
+# STATUS DISPLAY CONFIGURATION
+# =============================================================================
+
+# Credential status icons and colors: (icon, label, color)
+# Using Rich emoji markup :name: for consistent width handling
+STATUS_DISPLAY = {
+    "active": (":white_check_mark:", "Active", "green"),
+    "cooldown": (":stopwatch:", "Cooldown", "yellow"),
+    "exhausted": (":no_entry:", "Exhausted", "red"),
+    "mixed": (":warning:", "Mixed", "yellow"),
+}
+
+# Per-group indicator icons (using Rich emoji markup for proper width handling)
+INDICATOR_ICONS = {
+    "fair_cycle": ":scales:",  # ⚖️ - Rich will handle width
+    "custom_cap": ":bar_chart:",  # 📊
+    "cooldown": ":stopwatch:",  # ⏱️
+}
 
 # =============================================================================
 
@@ -344,7 +332,8 @@ class QuotaViewer:
         Args:
             config: Optional config object. If not provided, one will be created.
         """
-        self.console = Console()
+        # Use emoji_variant="text" for more consistent width calculations
+        self.console = Console(emoji_variant="text")
         self.config = config or QuotaViewerConfig()
         self.config.sync_with_launcher_config()
 
@@ -785,18 +774,18 @@ class QuotaViewer:
 
         # View mode indicator
         if self.view_mode == "global":
-            view_label = "[magenta]📊 Global/Lifetime[/magenta]"
+            view_label = "[magenta]:bar_chart: Global/Lifetime[/magenta]"
         else:
-            view_label = "[cyan]📈 Current Period[/cyan]"
+            view_label = "[cyan]:chart_with_upwards_trend: Current Period[/cyan]"
 
         self.console.print("━" * 78)
         self.console.print(
-            f"[bold cyan]📈 Quota & Usage Statistics[/bold cyan]  |  {view_label}"
+            f"[bold cyan]:chart_with_upwards_trend: Quota & Usage Statistics[/bold cyan]  |  {view_label}"
         )
         self.console.print("━" * 78)
         self.console.print(
             f"Connected to: [bold]{remote_name}[/bold] ({connection_display}) "
-            f"[green]✅[/green] | {data_age}"
+            f"[green]:white_check_mark:[/green] | {data_age}"
         )
         self.console.print()
 
@@ -810,10 +799,8 @@ class QuotaViewer:
             table.add_column("Provider", style="cyan", min_width=TABLE_PROVIDER_WIDTH)
             table.add_column("Creds", justify="center", min_width=TABLE_CREDS_WIDTH)
             table.add_column("Quota Status", min_width=TABLE_QUOTA_STATUS_WIDTH)
-            table.add_column(
-                "Requests", justify="right", min_width=TABLE_REQUESTS_WIDTH
-            )
-            table.add_column("Tokens (in/out)", min_width=TABLE_TOKENS_WIDTH)
+            table.add_column("Req.", justify="right", min_width=TABLE_REQUESTS_WIDTH)
+            table.add_column("Tok. in/out(cached)", min_width=TABLE_TOKENS_WIDTH)
             table.add_column("Cost", justify="right", min_width=TABLE_COST_WIDTH)
 
             providers = self.cached_stats.get("providers", {})
@@ -840,7 +827,7 @@ class QuotaViewer:
                 )
                 output = tokens.get("output", 0)
                 cache_pct = tokens.get("input_cache_pct", 0)
-                token_str = f"{format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}% cached)"
+                token_str = f"{format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}%)"
 
                 # Format cost
                 cost_str = format_cost(cost_value)
@@ -857,6 +844,7 @@ class QuotaViewer:
                     for group_name, group_stats in sorted_groups:
                         tiers = group_stats.get("tiers", {})
                         windows = group_stats.get("windows", {})
+                        fc_summary = group_stats.get("fair_cycle_summary", {})
 
                         if not windows:
                             # No windows = no data, skip
@@ -901,11 +889,18 @@ class QuotaViewer:
                             if total_max == 0:
                                 tier_str = ""
 
-                            # Determine color based on remaining percentage
+                            # Build FC summary string if any credentials are FC exhausted
+                            fc_str = ""
+                            fc_exhausted = fc_summary.get("exhausted_count", 0)
+                            fc_total = fc_summary.get("total_count", 0)
+                            if fc_exhausted > 0:
+                                fc_str = f"[yellow]{INDICATOR_ICONS['fair_cycle']} {fc_exhausted}/{fc_total}[/yellow]"
+
+                            # Determine color based on remaining percentage and FC status
                             if total_pct is not None:
                                 if total_pct <= 10:
                                     color = "red"
-                                elif total_pct < 30:
+                                elif total_pct < 30 or fc_exhausted > 0:
                                     color = "yellow"
                                 else:
                                     color = "green"
@@ -914,7 +909,7 @@ class QuotaViewer:
 
                             pct_str = f"{total_pct}%" if total_pct is not None else "?"
 
-                            # Format: "group (window): remaining/max pct% bar tier_info"
+                            # Format: "group (window): remaining/max pct% bar tier_info fc_info"
                             # Show window name if multiple windows exist
                             if len(windows) > 1:
                                 display_name = f"{group_name} ({window_name})"
@@ -924,9 +919,17 @@ class QuotaViewer:
                             display_name_trunc = display_name[: QUOTA_NAME_WIDTH - 1]
                             usage_str = f"{total_remaining}/{total_max}"
                             bar = create_progress_bar(total_pct, QUOTA_BAR_WIDTH)
-                            quota_lines.append(
-                                f"[{color}]{display_name_trunc + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>{QUOTA_PCT_WIDTH}} {bar}[/{color}] {tier_str}"
-                            )
+
+                            # Build the line with tier info and FC summary
+                            line_parts = [
+                                f"[{color}]{display_name_trunc + ':':<{QUOTA_NAME_WIDTH}}{usage_str:>{QUOTA_USAGE_WIDTH}} {pct_str:>{QUOTA_PCT_WIDTH}} {bar}[/{color}]"
+                            ]
+                            if tier_str:
+                                line_parts.append(tier_str)
+                            if fc_str:
+                                line_parts.append(fc_str)
+
+                            quota_lines.append(" ".join(line_parts))
 
                     # First line goes in the main row
                     first_quota = quota_lines[0] if quota_lines else "-"
@@ -1050,7 +1053,7 @@ class QuotaViewer:
 
             self.console.print("━" * 78)
             self.console.print(
-                f"[bold cyan]📊 {provider.title()} - Detailed Stats[/bold cyan]  |  {view_label}"
+                f"[bold cyan]:bar_chart: {provider.title()} - Detailed Stats[/bold cyan]  |  {view_label}"
             )
             self.console.print("━" * 78)
             self.console.print()
@@ -1234,16 +1237,17 @@ class QuotaViewer:
             global_cooldown.get("remaining_seconds", 0) if global_cooldown else 0
         )
 
-        # Status indicator
-        if status == "exhausted":
-            status_icon = "[red]⛔ Exhausted[/red]"
-        elif status == "cooldown" or has_cooldown:
+        # Status indicator using centralized config
+        status_config = STATUS_DISPLAY.get(status, STATUS_DISPLAY["active"])
+        icon, label, color = status_config
+
+        if status == "cooldown" or (has_cooldown and global_cooldown_remaining > 0):
             if global_cooldown_remaining > 0:
-                status_icon = f"[yellow]⚠️ Cooldown ({format_cooldown(int(global_cooldown_remaining))})[/yellow]"
+                status_icon = f"[{color}]{icon} {label} ({format_cooldown(int(global_cooldown_remaining))})[/{color}]"
             else:
-                status_icon = "[yellow]⚠️ Cooldown[/yellow]"
+                status_icon = f"[{color}]{icon} {label}[/{color}]"
         else:
-            status_icon = "[green]✅ Active[/green]"
+            status_icon = f"[{color}]{icon} {label}[/{color}]"
 
         # Header line
         display_name = email if email else identifier
@@ -1262,7 +1266,7 @@ class QuotaViewer:
 
         stats_line = (
             f"Last used: {last_used} | Requests: {requests} | "
-            f"Tokens: {format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}% cached)"
+            f"Tokens: {format_tokens(input_total)}/{format_tokens(output)} ({cache_pct}%)"
         )
         if cost != "-":
             stats_line += f" | Cost: {cost}"
@@ -1293,7 +1297,7 @@ class QuotaViewer:
                 for key, remaining, reason, source in active_cooldowns:
                     source_str = f" ({source})" if source else ""
                     content_lines.append(
-                        f"  [yellow]⏱️ {key}: {format_cooldown(int(remaining))}{source_str}[/yellow]"
+                        f"  [yellow]:stopwatch: {key}: {format_cooldown(int(remaining))}{source_str}[/yellow]"
                     )
 
         # Display group usage with per-window breakdown
@@ -1306,6 +1310,13 @@ class QuotaViewer:
                 windows = group_stats.get("windows", {})
                 if not windows:
                     continue
+
+                # Get per-group status info
+                fc_exhausted = group_stats.get("fair_cycle_exhausted", False)
+                fc_reason = group_stats.get("fair_cycle_reason")
+                group_cooldown_remaining = group_stats.get("cooldown_remaining")
+                group_cooldown_source = group_stats.get("cooldown_source")
+                custom_cap = group_stats.get("custom_cap")
 
                 for window_name, window_stats in windows.items():
                     request_count = window_stats.get("request_count", 0)
@@ -1329,9 +1340,9 @@ class QuotaViewer:
                         remaining_val = None
                         is_exhausted = False
 
-                    # Format reset time (only show if there's actual usage)
+                    # Format reset time (only show if there's actual usage or cooldown)
                     reset_time_str = ""
-                    if reset_at and request_count > 0:
+                    if reset_at and (request_count > 0 or group_cooldown_remaining):
                         try:
                             reset_dt = datetime.fromtimestamp(reset_at)
                             reset_time_str = reset_dt.strftime("%b %d %H:%M")
@@ -1352,31 +1363,71 @@ class QuotaViewer:
                     # Build display line
                     bar = create_progress_bar(remaining_pct)
 
-                    # Determine color
+                    # Determine color (account for fair cycle)
                     if is_exhausted:
                         color = "red"
+                    elif fc_exhausted:
+                        color = "yellow"
                     elif remaining_pct is not None and remaining_pct < 20:
                         color = "yellow"
                     else:
                         color = "green"
 
-                    # Format: "group (window): used/limit (pct%) bar  Resets: time  Max: N"
+                    # Format group name
                     if len(windows) > 1:
                         display_name = f"{group_name} ({window_name})"
                     else:
                         display_name = group_name
 
-                    if limit is not None:
+                    # Format usage string with custom cap if applicable
+                    if custom_cap:
+                        cap_remaining = custom_cap.get("remaining", 0)
+                        cap_limit = custom_cap.get("limit", 0)
+                        api_limit = limit if limit else cap_limit
+                        usage_str = f"{cap_remaining}/{cap_limit}({api_limit})"
+                        # Recalculate percentage based on custom cap
+                        if cap_limit > 0:
+                            remaining_pct = round(cap_remaining / cap_limit * 100, 1)
+                            bar = create_progress_bar(remaining_pct)
+                        pct_str = (
+                            f"{remaining_pct}%" if remaining_pct is not None else ""
+                        )
+                    elif limit is not None:
                         usage_str = f"{remaining_val}/{limit}"
                         pct_str = f"{remaining_pct}%"
                     else:
                         usage_str = f"{request_count} req"
                         pct_str = ""
 
-                    line = f"  [{color}]{display_name:<12} {usage_str:<12} {pct_str:>6} {bar}[/{color}]"
+                    line = f"  [{color}]{display_name:<{DETAIL_GROUP_NAME_WIDTH}} {usage_str:<{DETAIL_USAGE_WIDTH}} {pct_str:>{DETAIL_PCT_WIDTH}} {bar}[/{color}]"
 
+                    # Add reset time if applicable
                     if reset_time_str:
                         line += f"  Resets: {reset_time_str}"
+
+                    # Add indicators
+                    indicators = []
+
+                    # Group cooldown indicator (if not already showing reset time)
+                    if group_cooldown_remaining and not reset_time_str:
+                        indicators.append(
+                            f"[yellow]{INDICATOR_ICONS['cooldown']} {format_cooldown(int(group_cooldown_remaining))}[/yellow]"
+                        )
+
+                    # Fair cycle indicator
+                    if fc_exhausted:
+                        indicators.append(
+                            f"[yellow]{INDICATOR_ICONS['fair_cycle']} FC[/yellow]"
+                        )
+
+                    # Custom cap indicator (only if not on cooldown, just to show cap exists)
+                    if custom_cap and not group_cooldown_remaining and not fc_exhausted:
+                        indicators.append(f"[dim]{INDICATOR_ICONS['custom_cap']}[/dim]")
+
+                    if indicators:
+                        line += "  " + " ".join(indicators)
+
+                    # Add max info at the end
                     if max_info:
                         line += f" [dim]{max_info}[/dim]"
 
@@ -1495,7 +1546,9 @@ class QuotaViewer:
         clear_screen()
 
         self.console.print("━" * 78)
-        self.console.print("[bold cyan]🔄 Switch Remote[/bold cyan]")
+        self.console.print(
+            "[bold cyan]:arrows_counterclockwise: Switch Remote[/bold cyan]"
+        )
         self.console.print("━" * 78)
         self.console.print()
 
@@ -1530,9 +1583,9 @@ class QuotaViewer:
             current_marker = " (current)" if is_current else ""
 
             if is_online:
-                status_icon = "[green]✅ Online[/green]"
+                status_icon = "[green]:white_check_mark: Online[/green]"
             else:
-                status_icon = f"[red]⚠️ {status_msg}[/red]"
+                status_icon = f"[red]:warning: {status_msg}[/red]"
 
             self.console.print(
                 f"   {idx}. {name:<20} {connection_display:<30} {status_icon}{current_marker}"
@@ -1602,7 +1655,7 @@ class QuotaViewer:
             clear_screen()
 
             self.console.print("━" * 78)
-            self.console.print("[bold cyan]⚙️ Manage Remotes[/bold cyan]")
+            self.console.print("[bold cyan]:gear: Manage Remotes[/bold cyan]")
             self.console.print("━" * 78)
             self.console.print()
 

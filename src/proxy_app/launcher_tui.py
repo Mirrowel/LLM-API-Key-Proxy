@@ -377,9 +377,9 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
+                        ":warning:  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
                         "The proxy needs initial configuration:\n"
-                        "  ❌ No .env file found\n\n"
+                        "  :x: No .env file found\n\n"
                         "Why this matters:\n"
                         "  • The .env file stores your credentials and settings\n"
                         "  • PROXY_API_KEY protects your proxy from unauthorized access\n"
@@ -388,7 +388,7 @@ class LauncherTUI:
                         '  1. Select option "3. Manage Credentials" to launch the credential tool\n'
                         "  2. The tool will create .env and set up PROXY_API_KEY automatically\n"
                         "  3. You can add provider credentials (API keys or OAuth)\n\n"
-                        "⚠️  Note: The credential tool adds PROXY_API_KEY by default.\n"
+                        ":warning:  Note: The credential tool adds PROXY_API_KEY by default.\n"
                         "   You can remove it later if you want an unsecured proxy."
                     ),
                     border_style="yellow",
@@ -401,12 +401,12 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
+                        ":warning:  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
                         "Your proxy is currently UNSECURED!\n"
                         "Anyone can access it without authentication.\n\n"
                         "This is a serious security risk if your proxy is accessible\n"
                         "from the internet or untrusted networks.\n\n"
-                        "👉 [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
+                        ":point_right: [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
                         '   Use option "2. Configure Proxy Settings" → "3. Set Proxy API Key"\n'
                         '   or option "3. Manage Credentials"'
                     ),
@@ -417,15 +417,15 @@ class LauncherTUI:
 
         # Show config
         self.console.print()
-        self.console.print("[bold]📋 Proxy Configuration[/bold]")
+        self.console.print("[bold]:clipboard: Proxy Configuration[/bold]")
         self.console.print("━" * 70)
         self.console.print(f"   Host:                {self.config.config['host']}")
         self.console.print(f"   Port:                {self.config.config['port']}")
         self.console.print(
-            f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            f"   Transaction Logging: {':white_check_mark: Enabled' if self.config.config['enable_request_logging'] else ':x: Disabled'}"
         )
         self.console.print(
-            f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+            f"   Raw I/O Logging:     {':white_check_mark: Enabled' if self.config.config.get('enable_raw_logging', False) else ':x: Disabled'}"
         )
 
         # Show actual API key value
@@ -437,7 +437,7 @@ class LauncherTUI:
 
         # Show status summary
         self.console.print()
-        self.console.print("[bold]📊 Status Summary[/bold]")
+        self.console.print("[bold]:bar_chart: Status Summary[/bold]")
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
@@ -558,10 +558,10 @@ class LauncherTUI:
             self.console.print(f"   Host:                {self.config.config['host']}")
             self.console.print(f"   Port:                {self.config.config['port']}")
             self.console.print(
-                f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+                f"   Transaction Logging: {':white_check_mark: Enabled' if self.config.config['enable_request_logging'] else ':x: Disabled'}"
             )
             self.console.print(
-                f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+                f"   Raw I/O Logging:     {':white_check_mark: Enabled' if self.config.config.get('enable_raw_logging', False) else ':x: Disabled'}"
             )
             self.console.print(
                 f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}"

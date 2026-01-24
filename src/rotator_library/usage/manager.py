@@ -824,18 +824,40 @@ class UsageManager:
         )
 
         for stable_id, state in self._states.items():
-            status = "active"
             now = time.time()
-            if state.cooldowns:
-                for cooldown in state.cooldowns.values():
-                    if cooldown.until > now:
-                        status = "cooldown"
-                        break
-            if status == "active" and state.fair_cycle:
-                for fc_state in state.fair_cycle.values():
-                    if fc_state.exhausted:
-                        status = "exhausted"
-                        break
+
+            # Determine credential status with proper granularity
+            status = "active"
+            has_global_cooldown = False
+            has_group_cooldown = False
+            fc_exhausted_groups = []
+
+            # Check cooldowns (global vs per-group)
+            for key, cooldown in state.cooldowns.items():
+                if cooldown.until > now:
+                    if key == "_global_":
+                        has_global_cooldown = True
+                    else:
+                        has_group_cooldown = True
+
+            # Check fair cycle per group
+            for group_key, fc_state in state.fair_cycle.items():
+                if fc_state.exhausted:
+                    fc_exhausted_groups.append(group_key)
+
+            # Determine final status
+            known_groups = set(state.group_usage.keys()) if state.group_usage else set()
+
+            if has_global_cooldown:
+                status = "cooldown"
+            elif fc_exhausted_groups:
+                # Check if ALL known groups are exhausted
+                if known_groups and set(fc_exhausted_groups) >= known_groups:
+                    status = "exhausted"
+                else:
+                    status = "mixed"  # Some groups available
+            elif has_group_cooldown:
+                status = "cooldown"
 
             cred_stats = {
                 "stable_id": stable_id,
@@ -970,14 +992,80 @@ class UsageManager:
                     },
                 }
 
+                # Add per-group status info for this credential
+                group_data = cred_stats["group_usage"][group_key]
+
+                # Fair cycle status for this group
+                fc_state = state.fair_cycle.get(group_key)
+                group_data["fair_cycle_exhausted"] = (
+                    fc_state.exhausted if fc_state else False
+                )
+                group_data["fair_cycle_reason"] = (
+                    fc_state.exhausted_reason
+                    if fc_state and fc_state.exhausted
+                    else None
+                )
+
+                # Group-specific cooldown
+                group_cooldown = state.cooldowns.get(group_key)
+                if group_cooldown and group_cooldown.is_active:
+                    group_data["cooldown_remaining"] = int(
+                        group_cooldown.remaining_seconds
+                    )
+                    group_data["cooldown_source"] = group_cooldown.source
+                else:
+                    group_data["cooldown_remaining"] = None
+                    group_data["cooldown_source"] = None
+
+                # Custom cap info for this group
+                cap = self._limits.custom_cap_checker.get_cap_for(
+                    state, group_key, group_key
+                )
+                if cap:
+                    # Get usage from primary window
+                    primary_window = group_windows.get(
+                        self._window_manager.get_primary_definition().name
+                        if self._window_manager.get_primary_definition()
+                        else "5h"
+                    )
+                    cap_used = (
+                        primary_window.get("request_count", 0) if primary_window else 0
+                    )
+                    cap_limit = cap.max_requests
+                    # Handle percentage-based caps (negative means percentage)
+                    if cap_limit < 0:
+                        api_limit = (
+                            primary_window.get("limit") if primary_window else None
+                        )
+                        if api_limit:
+                            cap_limit = int(api_limit * (-cap_limit) / 100)
+                        else:
+                            cap_limit = 0
+                    group_data["custom_cap"] = {
+                        "limit": cap_limit,
+                        "used": cap_used,
+                        "remaining": max(0, cap_limit - cap_used),
+                    }
+                else:
+                    group_data["custom_cap"] = None
+
                 # Aggregate quota group stats with per-window breakdown
                 group_agg = stats["quota_groups"].setdefault(
                     group_key,
                     {
                         "tiers": {},  # Credential tier counts (provider-level)
                         "windows": {},  # Per-window aggregated stats
+                        "fair_cycle_summary": {  # FC status across all credentials
+                            "exhausted_count": 0,
+                            "total_count": 0,
+                        },
                     },
                 )
+
+                # Update fair cycle summary for this group
+                group_agg["fair_cycle_summary"]["total_count"] += 1
+                if group_data.get("fair_cycle_exhausted"):
+                    group_agg["fair_cycle_summary"]["exhausted_count"] += 1
 
                 # Add credential to tier count (provider-level, not per-window)
                 tier_key = state.tier or "unknown"
