@@ -132,3 +132,22 @@ COOLDOWN_TRANSIENT_ERROR: int = 30
 
 # Default rate limit cooldown when retry_after not provided (seconds)
 COOLDOWN_RATE_LIMIT_DEFAULT: int = 60
+
+# =============================================================================
+# SMALL COOLDOWN AUTO-RETRY
+# =============================================================================
+# When retry_after is below this threshold, automatically retry with the same
+# credential instead of rotating. This avoids unnecessary rotation for very
+# short rate limits (e.g., 2-3 second capacity bursts).
+# Override: SMALL_COOLDOWN_RETRY_THRESHOLD=<seconds>
+DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD: int = 10  # 10 seconds
+
+# =============================================================================
+# PROVIDER/MODEL 503 COOLDOWN
+# =============================================================================
+# When a 503 error is hit (e.g., MODEL_CAPACITY_EXHAUSTED), apply a cooldown
+# to the entire provider/model combination instead of rotating credentials.
+# This prevents pointless rotation when capacity exhaustion affects all
+# credentials equally. The request will wait and retry with the SAME credential.
+# Override: PROVIDER_MODEL_503_COOLDOWN=<seconds>
+DEFAULT_PROVIDER_MODEL_503_COOLDOWN: int = 5  # 5 seconds

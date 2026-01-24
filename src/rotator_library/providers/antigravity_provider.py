@@ -1546,9 +1546,80 @@ class AntigravityProvider(
         """Clear tool name mapping at start of each request."""
         self._tool_name_mapping.clear()
 
-    def _get_antigravity_headers(self) -> Dict[str, str]:
-        """Return the Antigravity API headers. Used by quota tracker mixin."""
-        return ANTIGRAVITY_HEADERS
+    def _get_credential_email(self, credential_path: str) -> Optional[str]:
+        """
+        Extract email from credential file's _proxy_metadata.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            Email address if found, None otherwise
+        """
+        # Skip env:// paths
+        if self._parse_env_credential_path(credential_path) is not None:
+            return None
+
+        try:
+            # Try to get from cached credentials first
+            if (
+                hasattr(self, "_credentials_cache")
+                and credential_path in self._credentials_cache
+            ):
+                creds = self._credentials_cache[credential_path]
+                return creds.get("_proxy_metadata", {}).get("email")
+
+            # Fall back to reading file
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+            return creds.get("_proxy_metadata", {}).get("email")
+        except Exception:
+            return None
+
+    def _get_antigravity_headers(
+        self, credential_path: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Return the Antigravity API headers, optionally with device profile.
+
+        If credential_path is provided and has a valid email, builds dynamic
+        Client-Metadata header with device profile for hardware ID binding.
+        Otherwise returns static default headers.
+
+        Args:
+            credential_path: Optional credential path for device profile lookup
+
+        Returns:
+            Dict of HTTP headers for Antigravity API
+        """
+        # Start with static headers (User-Agent, X-Goog-Api-Client)
+        headers = {
+            "User-Agent": ANTIGRAVITY_HEADERS["User-Agent"],
+            "X-Goog-Api-Client": ANTIGRAVITY_HEADERS["X-Goog-Api-Client"],
+        }
+
+        # Try to build dynamic Client-Metadata with device profile
+        if credential_path:
+            email = self._get_credential_email(credential_path)
+            if email:
+                try:
+                    from .utilities.device_profile import (
+                        get_or_create_device_profile,
+                        build_client_metadata_header,
+                    )
+
+                    profile = get_or_create_device_profile(email)
+                    if profile:
+                        headers["Client-Metadata"] = build_client_metadata_header(
+                            profile
+                        )
+                        return headers
+                except Exception as e:
+                    lib_logger.debug(f"Failed to build device profile headers: {e}")
+
+        # Fallback to static Client-Metadata
+        headers["Client-Metadata"] = ANTIGRAVITY_HEADERS["Client-Metadata"]
+        return headers
 
     # NOTE: _load_tier_from_file() is inherited from GeminiCredentialManager mixin
     # NOTE: get_credential_tier_name() is inherited from GeminiCredentialManager mixin
@@ -3954,7 +4025,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                **ANTIGRAVITY_HEADERS,
+                **self._get_antigravity_headers(api_key),
             }
             payload = {
                 "project": _generate_project_id(),
@@ -4197,7 +4268,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            **ANTIGRAVITY_HEADERS,
+            **self._get_antigravity_headers(credential_path),
         }
 
         # Keep a mutable reference to gemini_contents for retry injection

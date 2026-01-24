@@ -17,6 +17,87 @@ from .google_oauth_base import GoogleOAuthBase
 
 lib_logger = logging.getLogger("rotator_library")
 
+# =============================================================================
+# FALLBACK PROJECT ID
+# =============================================================================
+# When loadCodeAssist returns no project, uses this fallback unconditionally
+# See: quota.rs:135 - let final_project_id = project_id.unwrap_or("bamboo-precept-lgxtn");
+FALLBACK_PROJECT_ID = "bamboo-precept-lgxtn"
+
+# =============================================================================
+# TIER NAME NORMALIZATION
+# =============================================================================
+
+# Mapping from legacy Python tier names to canonical tier names
+# Canonical uses: ULTRA, PRO, FREE
+# Python used: free-tier, legacy-tier, standard-tier, etc.
+# API also returns: g1-pro-tier, g1-ultra-tier, etc.
+TIER_NAME_TO_CANONICAL = {
+    # Legacy Python names
+    "free-tier": "FREE",
+    "legacy-tier": "FREE",  # Legacy is treated as free
+    "standard-tier": "PRO",
+    "pro-tier": "PRO",
+    "ultra-tier": "ULTRA",
+    "enterprise-tier": "ULTRA",
+    # Google One AI tier names (from paidTier API response)
+    "g1-pro-tier": "PRO",
+    "g1-ultra-tier": "ULTRA",
+    "g1-free-tier": "FREE",
+    # Gemini Code Assist tier names
+    "gemini-code-assist-pro": "PRO",
+    "gemini-code-assist-ultra": "ULTRA",
+    "gemini-code-assist-free": "FREE",
+    # Already canonical
+    "FREE": "FREE",
+    "PRO": "PRO",
+    "ULTRA": "ULTRA",
+}
+
+# Reverse mapping for backwards compatibility
+CANONICAL_TO_LEGACY = {
+    "FREE": "free-tier",
+    "PRO": "standard-tier",
+    "ULTRA": "enterprise-tier",
+}
+
+# Free tier identifiers (both naming conventions)
+FREE_TIER_IDS = {"FREE", "free-tier", "legacy-tier"}
+
+
+def normalize_tier_name(tier_id: Optional[str]) -> Optional[str]:
+    """
+    Normalize tier name to canonical format (ULTRA, PRO, FREE).
+
+    Supports both legacy Python names (free-tier, standard-tier) and
+    Canonical names (FREE, PRO, ULTRA).
+
+    Args:
+        tier_id: Tier identifier from API response
+
+    Returns:
+        Canonical tier name (ULTRA, PRO, FREE) or original if unknown
+    """
+    if not tier_id:
+        return None
+    return TIER_NAME_TO_CANONICAL.get(tier_id, tier_id)
+
+
+def is_free_tier(tier_id: Optional[str]) -> bool:
+    """Check if tier is a free tier (any naming convention)."""
+    if not tier_id:
+        return False
+    return tier_id in FREE_TIER_IDS or normalize_tier_name(tier_id) == "FREE"
+
+
+def is_paid_tier(tier_id: Optional[str]) -> bool:
+    """Check if tier is a paid tier (not free, not unknown)."""
+    if not tier_id or tier_id == "unknown":
+        return False
+    canonical = normalize_tier_name(tier_id)
+    return canonical in ("PRO", "ULTRA")
+
+
 # Headers for Antigravity auth/discovery calls (loadCodeAssist, onboardUser)
 # CRITICAL: User-Agent MUST be google-api-nodejs-client/* for standard-tier detection.
 # Using antigravity/* UA causes server to return free-tier only (tested via matrix test).
@@ -384,10 +465,13 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 )
 
                 # Extract tier information
+                # Canonical prioritizes paidTier over currentTier for accurate subscription detection
                 allowed_tiers = data.get("allowedTiers", [])
                 current_tier = data.get("currentTier")
+                paid_tier = data.get("paidTier")  # Added: Canonical-style tier detection
 
                 lib_logger.debug(f"=== Tier Information ===")
+                lib_logger.debug(f"paidTier: {paid_tier}")
                 lib_logger.debug(f"currentTier: {current_tier}")
                 lib_logger.debug(f"allowedTiers count: {len(allowed_tiers)}")
                 for i, tier in enumerate(allowed_tiers):
@@ -399,83 +483,74 @@ class AntigravityAuthBase(GoogleOAuthBase):
                     )
                 lib_logger.debug(f"========================")
 
-                # Determine the current tier ID
-                current_tier_id = None
-                if current_tier:
-                    current_tier_id = current_tier.get("id")
-                    lib_logger.debug(f"User has currentTier: {current_tier_id}")
+                # Determine tier ID with Canonical-style priority: paidTier > currentTier
+                # This matches quota.rs:88-91 logic for accurate subscription detection
+                effective_tier_id = None
+                if paid_tier and paid_tier.get("id"):
+                    effective_tier_id = paid_tier.get("id")
+                    lib_logger.debug(f"Using paidTier: {effective_tier_id}")
+                elif current_tier and current_tier.get("id"):
+                    effective_tier_id = current_tier.get("id")
+                    lib_logger.debug(
+                        f"Using currentTier (paidTier not available): {effective_tier_id}"
+                    )
 
-                # Check if user is already known to server (has currentTier)
-                if current_tier_id:
-                    # User is already onboarded - check for project from server
-                    # Use helper to handle both string and object formats
+                # Normalize to canonical tier name (ULTRA, PRO, FREE)
+                if effective_tier_id:
+                    canonical_tier = normalize_tier_name(effective_tier_id)
+                    lib_logger.debug(
+                        f"Canonical tier: {canonical_tier} (from {effective_tier_id})"
+                    )
+
+                # Check if user is already known to server (has tier info)
+                if effective_tier_id:
+                    # User has tier info - use Canonical-style project selection
                     server_project = self._extract_project_id_from_response(data)
 
-                    # Check if this tier requires user-defined project (paid tiers)
-                    requires_user_project = any(
-                        t.get("id") == current_tier_id
-                        and t.get("userDefinedCloudaicompanionProject", False)
-                        for t in allowed_tiers
-                    )
-                    is_free_tier = current_tier_id == "free-tier"
-
+                    # Canonical-style project selection (quota.rs:135):
+                    # 1. Server project (if returned)
+                    # 2. Configured project (from env)
+                    # 3. Fallback project (always works)
                     if server_project:
-                        # Server returned a project - use it (server wins)
                         project_id = server_project
                         lib_logger.debug(f"Server returned project: {project_id}")
                     elif configured_project_id:
-                        # No server project but we have configured one - use it
                         project_id = configured_project_id
-                        lib_logger.debug(
-                            f"No server project, using configured: {project_id}"
+                        lib_logger.debug(f"Using configured project: {project_id}")
+                    else:
+                        # Canonical fallback: project_id.unwrap_or("bamboo-precept-lgxtn")
+                        project_id = FALLBACK_PROJECT_ID
+                        lib_logger.info(
+                            f"No server/configured project for tier '{effective_tier_id}' - using Canonical fallback: {project_id}"
                         )
-                    elif is_free_tier:
-                        # Free tier user without server project - try onboarding
-                        lib_logger.debug(
-                            "Free tier user with currentTier but no project - will try onboarding"
-                        )
-                        project_id = None
-                    elif requires_user_project:
-                        # Paid tier requires a project ID to be set
-                        raise ValueError(
-                            f"Paid tier '{current_tier_id}' requires setting ANTIGRAVITY_PROJECT_ID environment variable."
+
+                    # We have a project now (guaranteed by fallback)
+                    # Cache tier info - use canonical tier name for consistency
+                    canonical = (
+                        normalize_tier_name(effective_tier_id) or effective_tier_id
+                    )
+                    self.project_tier_cache[credential_path] = canonical
+                    discovered_tier = canonical
+
+                    # Log appropriately based on tier
+                    if is_paid_tier(effective_tier_id):
+                        lib_logger.info(
+                            f"Using Antigravity paid tier '{canonical}' with project: {project_id}"
                         )
                     else:
-                        # Unknown tier without project - proceed to onboarding
-                        lib_logger.warning(
-                            f"Tier '{current_tier_id}' has no project and none configured - will try onboarding"
-                        )
-                        project_id = None
-
-                    if project_id:
-                        # Cache tier info
-                        self.project_tier_cache[credential_path] = current_tier_id
-                        discovered_tier = current_tier_id
-
-                        # Log appropriately based on tier
-                        is_paid = current_tier_id and current_tier_id not in [
-                            "free-tier",
-                            "legacy-tier",
-                            "unknown",
-                        ]
-                        if is_paid:
-                            lib_logger.info(
-                                f"Using Antigravity paid tier '{current_tier_id}' with project: {project_id}"
-                            )
-                        else:
-                            lib_logger.info(
-                                f"Discovered Antigravity project ID via loadCodeAssist: {project_id}"
-                            )
-
-                        self.project_id_cache[credential_path] = project_id
-                        discovered_project_id = project_id
-
-                        # Persist to credential file
-                        await self._persist_project_metadata(
-                            credential_path, project_id, discovered_tier
+                        lib_logger.info(
+                            f"Discovered Antigravity project ID via loadCodeAssist: {project_id} (tier={canonical})"
                         )
 
-                        return project_id
+                    self.project_id_cache[credential_path] = project_id
+                    discovered_project_id = project_id
+
+                    # Persist to credential file
+                    await self._persist_project_metadata(
+                        credential_path, project_id, discovered_tier
+                    )
+
+                    return project_id
 
                 # 2. User needs onboarding - no currentTier or no project found
                 lib_logger.info(
@@ -513,9 +588,9 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 # Build onboard request based on tier type
                 # FREE tier: cloudaicompanionProject = None (server-managed)
                 # PAID tier: cloudaicompanionProject = configured_project_id
-                is_free_tier = tier_id == "free-tier"
+                tier_is_free = is_free_tier(tier_id)
 
-                if is_free_tier:
+                if tier_is_free:
                     # Free tier uses server-managed project
                     onboard_request = {
                         "tierId": tier_id,
@@ -612,20 +687,20 @@ class AntigravityAuthBase(GoogleOAuthBase):
                     f"Successfully extracted project ID from onboarding response: {project_id}"
                 )
 
-                # Cache tier info
-                self.project_tier_cache[credential_path] = tier_id
-                discovered_tier = tier_id
-                lib_logger.debug(f"Cached tier information: {tier_id}")
+                # Cache tier info - use canonical tier name for consistency
+                canonical_tier = normalize_tier_name(tier_id) or tier_id
+                self.project_tier_cache[credential_path] = canonical_tier
+                discovered_tier = canonical_tier
+                lib_logger.debug(f"Cached tier information: {canonical_tier}")
 
                 # Log concise message based on tier
-                is_paid = tier_id and tier_id not in ["free-tier", "legacy-tier"]
-                if is_paid:
+                if is_paid_tier(tier_id):
                     lib_logger.info(
-                        f"Using Antigravity paid tier '{tier_id}' with project: {project_id}"
+                        f"Using Antigravity paid tier '{canonical_tier}' with project: {project_id}"
                     )
                 else:
                     lib_logger.info(
-                        f"Successfully onboarded user and discovered project ID: {project_id}"
+                        f"Successfully onboarded user and discovered project ID: {project_id} (tier={canonical_tier})"
                     )
 
                 self.project_id_cache[credential_path] = project_id

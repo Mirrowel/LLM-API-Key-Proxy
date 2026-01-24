@@ -80,8 +80,13 @@ class SequentialStrategy:
         if current and current in context.candidates:
             return current
 
-        # Current not available - select new one by priority
-        selected = self._select_by_priority(context.candidates, context.priorities)
+        # Current not available - select new one by tier -> usage -> recency
+        selected = self._select_by_priority(
+            context.candidates,
+            context.priorities,
+            context.usage_counts,
+            states,
+        )
 
         # Make it sticky
         if selected:
@@ -129,14 +134,47 @@ class SequentialStrategy:
         self,
         candidates: List[str],
         priorities: Dict[str, int],
+        usage_counts: Optional[Dict[str, int]] = None,
+        states: Optional[Dict[str, CredentialState]] = None,
     ) -> Optional[str]:
-        """Select the highest priority (lowest number) candidate."""
+        """
+        Select credential by: tier (priority) -> usage (highest) -> recency (most recent).
+
+        Sequential mode prefers most-used credentials within the window to maximize
+        cache hits. When selecting a new sticky credential:
+        1. Highest tier (lowest priority number) first
+        2. Within same tier, prefer highest usage count
+        3. Within same usage, prefer most recently used
+
+        Args:
+            candidates: List of available credential stable_ids
+            priorities: Dict of stable_id -> priority (lower = higher tier)
+            usage_counts: Dict of stable_id -> request count for relevant window
+            states: Dict of stable_id -> CredentialState for recency lookup
+
+        Returns:
+            Selected stable_id, or None if no candidates
+        """
         if not candidates:
             return None
 
-        # Sort by priority (lower = higher priority)
-        sorted_candidates = sorted(candidates, key=lambda c: priorities.get(c, 999))
+        usage_counts = usage_counts or {}
+        states = states or {}
 
+        def sort_key(c: str):
+            # 1. Priority/tier (lower number = higher tier = preferred)
+            priority = priorities.get(c, 999)
+
+            # 2. Usage count (higher = preferred, so negate for ascending sort)
+            usage = -(usage_counts.get(c, 0))
+
+            # 3. Recency (more recent = preferred, so negate for ascending sort)
+            state = states.get(c)
+            last_used = -(state.totals.last_used_at or 0) if state else 0
+
+            return (priority, usage, last_used)
+
+        sorted_candidates = sorted(candidates, key=sort_key)
         return sorted_candidates[0]
 
     def clear_sticky(self, provider: Optional[str] = None) -> None:

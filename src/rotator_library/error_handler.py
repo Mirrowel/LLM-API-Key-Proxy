@@ -902,8 +902,45 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code=status_code,
             )
         if 500 <= status_code:
+            # 503 errors are handled at provider/model level (not credential level)
+            # because capacity exhaustion affects all credentials equally.
+            # Do NOT apply credential-level cooldown for 503 - let executor handle it.
+            if status_code == 503:
+                try:
+                    capacity_exhausted = False
+                    if error_body and "MODEL_CAPACITY_EXHAUSTED" in error_body:
+                        capacity_exhausted = True
+                    else:
+                        # Try to get from response if not in lowercased body
+                        original_body = (
+                            e.response.text if hasattr(e.response, "text") else ""
+                        )
+                        if "MODEL_CAPACITY_EXHAUSTED" in original_body:
+                            capacity_exhausted = True
+
+                    if capacity_exhausted:
+                        lib_logger.info(
+                            "503 MODEL_CAPACITY_EXHAUSTED detected - "
+                            "will be handled with provider/model cooldown"
+                        )
+                except Exception:
+                    pass
+
+                # Return 503 WITHOUT retry_after - executor handles provider/model cooldown
+                return ClassifiedError(
+                    error_type="server_error",
+                    original_exception=e,
+                    status_code=503,
+                    # No retry_after - executor applies provider/model cooldown instead
+                )
+
+            # Apply default 30s cooldown for other server errors (500, 502, 504, etc.)
+            # This prevents rapid retries against overloaded/erroring servers
             return ClassifiedError(
-                error_type="server_error", original_exception=e, status_code=status_code
+                error_type="server_error",
+                original_exception=e,
+                status_code=status_code,
+                retry_after=30,  # Default 30s cooldown for server errors
             )
 
     if isinstance(
@@ -935,6 +972,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
+            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     if isinstance(e, TransientQuotaError):
@@ -944,6 +982,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
+            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     if isinstance(e, RateLimitError):
@@ -1009,6 +1048,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=status_code or 503,
+            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     # Fallback for any other unclassified errors
@@ -1068,16 +1108,35 @@ def should_rotate_on_error(classified_error: ClassifiedError) -> bool:
     return classified_error.error_type not in non_rotatable_errors
 
 
-def should_retry_same_key(classified_error: ClassifiedError) -> bool:
+def should_retry_same_key(
+    classified_error: ClassifiedError,
+    small_cooldown_threshold: int = 10,
+) -> bool:
     """
     Determines if an error should retry with the same key (with backoff).
 
-    Only server errors and connection issues should retry the same key,
-    as these are often transient.
+    Retry same key if:
+    1. Any error with a small retry_after (< threshold) - more efficient to wait
+       than rotate and disrupt cache locality
+    2. Server errors or connection issues (often transient)
+
+    Args:
+        classified_error: The classified error
+        small_cooldown_threshold: If retry_after < this, always retry same key.
+            Default is 10 seconds. Override via SMALL_COOLDOWN_RETRY_THRESHOLD env var.
 
     Returns:
         True if should retry same key, False if should rotate immediately
     """
+    # Small retry_after = faster to just wait than rotate
+    # This preserves cache locality and avoids unnecessary rotation
+    if (
+        classified_error.retry_after is not None
+        and 0 < classified_error.retry_after < small_cooldown_threshold
+    ):
+        return True
+
+    # Standard transient errors that should retry same key
     retryable_errors = {
         "server_error",
         "api_connection",

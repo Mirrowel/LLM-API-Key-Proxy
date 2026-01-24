@@ -15,6 +15,13 @@ import httpx
 from .google_oauth_base import GoogleOAuthBase
 from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
 
+# Import tier normalization functions from antigravity_auth_base
+from .antigravity_auth_base import (
+    normalize_tier_name,
+    is_free_tier,
+    is_paid_tier,
+)
+
 lib_logger = logging.getLogger("rotator_library")
 
 # Headers for Gemini CLI auth/discovery calls (loadCodeAssist, onboardUser, etc.)
@@ -265,10 +272,13 @@ class GeminiAuthBase(GoogleOAuthBase):
                 )
 
                 # Extract and log ALL tier information for debugging
+                # Canonical prioritizes paidTier over currentTier for accurate subscription detection
                 allowed_tiers = data.get("allowedTiers", [])
                 current_tier = data.get("currentTier")
+                paid_tier = data.get("paidTier")  # Added: Canonical-style tier detection
 
                 lib_logger.debug(f"=== Tier Information ===")
+                lib_logger.debug(f"paidTier: {paid_tier}")
                 lib_logger.debug(f"currentTier: {current_tier}")
                 lib_logger.debug(f"allowedTiers count: {len(allowed_tiers)}")
                 for i, tier in enumerate(allowed_tiers):
@@ -280,75 +290,62 @@ class GeminiAuthBase(GoogleOAuthBase):
                     )
                 lib_logger.debug(f"========================")
 
-                # Determine the current tier ID
-                current_tier_id = None
-                if current_tier:
-                    current_tier_id = current_tier.get("id")
-                    lib_logger.debug(f"User has currentTier: {current_tier_id}")
+                # Determine tier ID with Canonical-style priority: paidTier > currentTier
+                # This matches quota.rs:88-91 logic for accurate subscription detection
+                effective_tier_id = None
+                if paid_tier and paid_tier.get("id"):
+                    effective_tier_id = paid_tier.get("id")
+                    lib_logger.debug(f"Using paidTier: {effective_tier_id}")
+                elif current_tier and current_tier.get("id"):
+                    effective_tier_id = current_tier.get("id")
+                    lib_logger.debug(
+                        f"Using currentTier (paidTier not available): {effective_tier_id}"
+                    )
 
-                # Check if user is already known to server (has currentTier)
-                if current_tier_id:
-                    # User is already onboarded - check for project from server
+                # Normalize to canonical tier name (ULTRA, PRO, FREE)
+                if effective_tier_id:
+                    canonical_tier = normalize_tier_name(effective_tier_id)
+                    lib_logger.debug(
+                        f"Canonical tier: {canonical_tier} (from {effective_tier_id})"
+                    )
+
+                # Check if user is already known to server (has tier info)
+                if effective_tier_id:
+                    # User has tier info - check for project from server
                     server_project = data.get("cloudaicompanionProject")
 
-                    # Check if this tier requires user-defined project (paid tiers)
-                    requires_user_project = any(
-                        t.get("id") == current_tier_id
-                        and t.get("userDefinedCloudaicompanionProject", False)
-                        for t in allowed_tiers
-                    )
-                    is_free_tier = current_tier_id == "free-tier"
-
+                    # Project selection: server > configured > onboarding
+                    # (Note: Gemini CLI needs proper onboarding, unlike Antigravity which uses fallback)
                     if server_project:
-                        # Server returned a project - use it (server wins)
-                        # This is the normal case for FREE tier users
                         project_id = server_project
                         lib_logger.debug(f"Server returned project: {project_id}")
                     elif configured_project_id:
-                        # No server project but we have configured one - use it
-                        # This is the PAID TIER case where server doesn't return a project
                         project_id = configured_project_id
-                        lib_logger.debug(
-                            f"No server project, using configured: {project_id}"
-                        )
-                    elif is_free_tier:
-                        # Free tier user without server project - this shouldn't happen normally
-                        # but let's not fail, just proceed to onboarding
-                        lib_logger.debug(
-                            "Free tier user with currentTier but no project - will try onboarding"
-                        )
-                        project_id = None
-                    elif requires_user_project:
-                        # Paid tier requires a project ID to be set
-                        raise ValueError(
-                            f"Paid tier '{current_tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable. "
-                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
-                        )
+                        lib_logger.debug(f"Using configured project: {project_id}")
                     else:
-                        # Unknown tier without project - proceed carefully
-                        lib_logger.warning(
-                            f"Tier '{current_tier_id}' has no project and none configured - will try onboarding"
+                        # No project available - will fall through to onboarding
+                        # This is different from Antigravity which uses a fallback project
+                        lib_logger.debug(
+                            f"Tier '{effective_tier_id}' detected but no project - will try onboarding"
                         )
                         project_id = None
 
                     if project_id:
-                        # Cache tier info
-                        self.project_tier_cache[credential_path] = current_tier_id
-                        discovered_tier = current_tier_id
+                        # Cache tier info - use canonical tier name for consistency
+                        canonical = (
+                            normalize_tier_name(effective_tier_id) or effective_tier_id
+                        )
+                        self.project_tier_cache[credential_path] = canonical
+                        discovered_tier = canonical
 
                         # Log appropriately based on tier
-                        is_paid = current_tier_id and current_tier_id not in [
-                            "free-tier",
-                            "legacy-tier",
-                            "unknown",
-                        ]
-                        if is_paid:
+                        if is_paid_tier(effective_tier_id):
                             lib_logger.info(
-                                f"Using Gemini paid tier '{current_tier_id}' with project: {project_id}"
+                                f"Using Gemini paid tier '{canonical}' with project: {project_id}"
                             )
                         else:
                             lib_logger.info(
-                                f"Discovered Gemini project ID via loadCodeAssist: {project_id}"
+                                f"Discovered Gemini project ID via loadCodeAssist: {project_id} (tier={canonical})"
                             )
 
                         self.project_id_cache[credential_path] = project_id
@@ -399,9 +396,9 @@ class GeminiAuthBase(GoogleOAuthBase):
                 # Build onboard request based on tier type (following official CLI logic)
                 # FREE tier: cloudaicompanionProject = None (server-managed)
                 # PAID tier: cloudaicompanionProject = configured_project_id (user must provide)
-                is_free_tier = tier_id == "free-tier"
+                tier_is_free = is_free_tier(tier_id)
 
-                if is_free_tier:
+                if tier_is_free:
                     # Free tier uses server-managed project
                     onboard_request = {
                         "tierId": tier_id,
@@ -504,20 +501,20 @@ class GeminiAuthBase(GoogleOAuthBase):
                     f"Successfully extracted project ID from onboarding response: {project_id}"
                 )
 
-                # Cache tier info
-                self.project_tier_cache[credential_path] = tier_id
-                discovered_tier = tier_id
-                lib_logger.debug(f"Cached tier information: {tier_id}")
+                # Cache tier info - use canonical tier name for consistency
+                canonical_tier = normalize_tier_name(tier_id) or tier_id
+                self.project_tier_cache[credential_path] = canonical_tier
+                discovered_tier = canonical_tier
+                lib_logger.debug(f"Cached tier information: {canonical_tier}")
 
                 # Log concise message for paid projects
-                is_paid = tier_id and tier_id not in ["free-tier", "legacy-tier"]
-                if is_paid:
+                if is_paid_tier(tier_id):
                     lib_logger.info(
-                        f"Using Gemini paid tier '{tier_id}' with project: {project_id}"
+                        f"Using Gemini paid tier '{canonical_tier}' with project: {project_id}"
                     )
                 else:
                     lib_logger.info(
-                        f"Successfully onboarded user and discovered project ID: {project_id}"
+                        f"Successfully onboarded user and discovered project ID: {project_id} (tier={canonical_tier})"
                     )
 
                 self.project_id_cache[credential_path] = project_id

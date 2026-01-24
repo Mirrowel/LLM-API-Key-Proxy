@@ -60,12 +60,18 @@ class GeminiCredentialManager:
         This is used as a fallback when the tier isn't in the memory cache,
         typically on first access before initialize_credentials() has run.
 
+        Also performs tier name migration: old tier names (e.g., "g1-pro-tier")
+        are normalized to canonical names (e.g., "PRO") and the file is updated.
+
         Args:
             credential_path: Path to the credential file
 
         Returns:
             Tier string if found, None otherwise
         """
+        # Import here to avoid circular imports
+        from ..antigravity_auth_base import normalize_tier_name
+
         # Skip env:// paths (environment-based credentials)
         if self._parse_env_credential_path(credential_path) is not None:
             return None
@@ -79,6 +85,23 @@ class GeminiCredentialManager:
             project_id = metadata.get("project_id")
 
             if tier:
+                # Migrate old tier names to canonical format
+                canonical_tier = normalize_tier_name(tier)
+                if canonical_tier and canonical_tier != tier:
+                    # Tier name changed - update file and log migration
+                    lib_logger.info(
+                        f"Migrating tier '{tier}' -> '{canonical_tier}' for credential: {Path(credential_path).name}"
+                    )
+                    creds["_proxy_metadata"]["tier"] = canonical_tier
+                    try:
+                        with open(credential_path, "w") as f:
+                            json.dump(creds, f, indent=2)
+                    except Exception as write_err:
+                        lib_logger.warning(
+                            f"Could not persist tier migration to {credential_path}: {write_err}"
+                        )
+                    tier = canonical_tier
+
                 self.project_tier_cache[credential_path] = tier
                 lib_logger.debug(
                     f"Lazy-loaded tier '{tier}' for credential: {Path(credential_path).name}"
