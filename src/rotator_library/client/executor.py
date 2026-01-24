@@ -464,6 +464,8 @@ class RequestExecutor:
                                     # Standard LiteLLM call
                                     kwargs["api_key"] = cred
                                     self._apply_litellm_logger(kwargs)
+                                    # Remove internal context before litellm call
+                                    kwargs.pop("transaction_context", None)
                                     response = await litellm.acompletion(**kwargs)
 
                                 # Success! Extract token usage if available
@@ -681,6 +683,8 @@ class RequestExecutor:
                                         kwargs["api_key"] = cred
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
+                                        # Remove internal context before litellm call
+                                        kwargs.pop("transaction_context", None)
                                         stream = await litellm.acompletion(**kwargs)
 
                                     # Hand off to streaming handler with cred_context
