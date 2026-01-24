@@ -125,21 +125,6 @@ class TrackingEngine:
                     output_tokens,
                     window_definitions=state.window_definitions or None,
                 )
-            self._apply_to_totals(
-                model_stats.totals, update, now, total_tokens, output_tokens
-            )
-
-            # 2. Update group stats (if applicable)
-            if group:
-                group_stats = state.get_group_stats(group)
-                self._apply_to_windows(
-                    group_stats.windows,
-                    update,
-                    now,
-                    total_tokens,
-                    output_tokens,
-                    window_definitions=state.window_definitions or None,
-                )
                 self._apply_to_totals(
                     group_stats.totals, update, now, total_tokens, output_tokens
                 )
