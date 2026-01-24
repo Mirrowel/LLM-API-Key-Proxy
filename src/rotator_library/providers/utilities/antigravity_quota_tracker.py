@@ -1018,6 +1018,8 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         # Aggregate cooldown info for consolidated logging
         # Structure: {short_cred_name: {group_or_model: hours_until_reset}}
         cooldowns_by_cred: Dict[str, Dict[str, float]] = {}
+        # Track cleared cooldowns for consolidated logging
+        cleared_cooldowns_by_cred: Dict[str, List[str]] = {}
 
         for cred_path, quota_data in quota_results.items():
             if quota_data.get("status") != "success":
@@ -1077,6 +1079,22 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                 # for subsequent refreshes)
                 apply_exhaustion = is_initial_fetch and (remaining == 0.0)
 
+                # Clear cooldowns if API shows quota is available
+                # This handles both force refresh and baseline refresh (proxy restart)
+                if remaining > 0.0:
+                    cooldown_target = quota_group or prefixed_model
+                    cleared = await usage_manager.clear_cooldown_if_exists(
+                        cred_path,
+                        model_or_group=cooldown_target,
+                    )
+                    if cleared:
+                        if short_cred not in cleared_cooldowns_by_cred:
+                            cleared_cooldowns_by_cred[short_cred] = []
+                        if cooldown_target not in cleared_cooldowns_by_cred[short_cred]:
+                            cleared_cooldowns_by_cred[short_cred].append(
+                                cooldown_target
+                            )
+
                 cooldown_info = await usage_manager.update_quota_baseline(
                     cred_path,
                     prefixed_model,
@@ -1106,6 +1124,15 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             lib_logger.debug("Antigravity quota baseline refresh: cooldowns recorded")
         else:
             lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
+
+        # Log consolidated message for cleared cooldowns
+        if cleared_cooldowns_by_cred:
+            total_cleared = sum(len(v) for v in cleared_cooldowns_by_cred.values())
+            lib_logger.info(
+                f"Antigravity baseline refresh: cleared cooldowns for "
+                f"{total_cleared} model/group(s) across "
+                f"{len(cleared_cooldowns_by_cred)} credential(s)"
+            )
 
         return stored_count
 

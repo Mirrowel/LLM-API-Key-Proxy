@@ -579,12 +579,20 @@ class TrackingEngine:
         existing = state.cooldowns.get(key)
         backoff_count = 0
         if existing and existing.is_active:
+            # Preserve original reason/source/started_at - cooldown reason should
+            # reflect why it was originally set, not subsequent updates
+            # Time (until) is updated to the new value as API is authoritative
             backoff_count = existing.backoff_count + 1
+            reason = existing.reason
+            source = existing.source
+            started_at = existing.started_at
+        else:
+            started_at = now
 
         state.cooldowns[key] = CooldownInfo(
             reason=reason,
             until=cooldown_until,
-            started_at=now,
+            started_at=started_at,
             source=source,
             model_or_group=model_or_group,
             backoff_count=backoff_count,

@@ -1482,6 +1482,43 @@ class UsageManager:
 
         return None
 
+    async def clear_cooldown_if_exists(
+        self,
+        accessor: str,
+        model_or_group: Optional[str] = None,
+    ) -> bool:
+        """
+        Clear a cooldown if one exists for the given scope.
+
+        Used during baseline refresh to clear cooldowns when API
+        reports quota is available.
+
+        Args:
+            accessor: Credential accessor (path or key)
+            model_or_group: Scope of cooldown to clear (None = global)
+
+        Returns:
+            True if a cooldown was cleared, False if none existed
+        """
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state:
+            return False
+
+        key = model_or_group or "_global_"
+        cooldown = state.cooldowns.get(key)
+
+        if cooldown and cooldown.is_active:
+            await self._tracking.clear_cooldown(state, model_or_group)
+            lib_logger.info(
+                f"Cleared cooldown for {key} on "
+                f"{mask_credential(accessor, style='full')} - API shows quota available "
+                f"(was: {cooldown.reason}, source: {cooldown.source})"
+            )
+            return True
+
+        return False
+
     def _apply_quota_update(
         self,
         window: WindowStats,
