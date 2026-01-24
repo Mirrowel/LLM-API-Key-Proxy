@@ -580,19 +580,16 @@ class GeminiAuthBase(GoogleOAuthBase):
                 )
 
                 # Build onboard request based on tier type (following official CLI logic)
-                # FREE tier: cloudaicompanionProject = None (server-managed)
-                # PAID tier: cloudaicompanionProject = configured_project_id (user must provide)
+                # For ALL tiers (free and paid): cloudaicompanionProject can be None
+                # The server will create a project automatically if none is provided
+                # If user has configured a project, use it; otherwise let server decide
                 tier_is_free = is_free_tier(tier_id)
 
-                # For paid tiers that require a project, try GCP scan if no configured project
+                # For paid tiers, first try to find an existing Code Assist project
                 onboard_project_id = configured_project_id
-                if (
-                    not tier_is_free
-                    and not onboard_project_id
-                    and requires_user_project
-                ):
+                if not tier_is_free and not onboard_project_id:
                     lib_logger.debug(
-                        "Paid tier requires project but none configured - trying GCP scan..."
+                        "Paid tier with no configured project - checking for existing Code Assist projects..."
                     )
                     scanned_project, _ = await self._scan_gcp_projects_for_code_assist(
                         access_token, headers
@@ -602,37 +599,30 @@ class GeminiAuthBase(GoogleOAuthBase):
                         lib_logger.info(
                             f"Found existing Code Assist project for onboarding: {scanned_project}"
                         )
+                    else:
+                        lib_logger.debug(
+                            "No existing Code Assist project found - server will create one"
+                        )
 
-                if tier_is_free:
-                    # Free tier uses server-managed project
-                    onboard_request = {
-                        "tierId": tier_id,
-                        "cloudaicompanionProject": None,  # Server will create/manage
-                        "metadata": core_client_metadata,
+                # Build onboard request - server will create project if None
+                onboard_request = {
+                    "tierId": tier_id,
+                    "cloudaicompanionProject": onboard_project_id,  # Can be None - server will create
+                    "metadata": {
+                        **core_client_metadata,
+                        "duetProject": onboard_project_id,
                     }
+                    if onboard_project_id
+                    else core_client_metadata,
+                }
+
+                if onboard_project_id:
                     lib_logger.debug(
-                        "Free tier onboarding: using server-managed project"
+                        f"Onboarding with user-provided project: {onboard_project_id}"
                     )
                 else:
-                    # Paid/legacy tier requires user-provided project
-                    if not onboard_project_id and requires_user_project:
-                        raise ValueError(
-                            f"Tier '{tier_id}' requires setting GEMINI_CLI_PROJECT_ID environment variable "
-                            "or having a GCP project with cloudaicompanion.googleapis.com API enabled. "
-                            "See https://goo.gle/gemini-cli-auth-docs#workspace-gca"
-                        )
-                    onboard_request = {
-                        "tierId": tier_id,
-                        "cloudaicompanionProject": onboard_project_id,
-                        "metadata": {
-                            **core_client_metadata,
-                            "duetProject": onboard_project_id,
-                        }
-                        if onboard_project_id
-                        else core_client_metadata,
-                    }
                     lib_logger.debug(
-                        f"Paid tier onboarding: using project {onboard_project_id}"
+                        "Onboarding with server-managed project (will be created by server)"
                     )
 
                 lib_logger.debug("Initiating onboardUser request...")
