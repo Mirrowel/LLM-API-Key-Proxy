@@ -51,7 +51,8 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    "standard-tier": {
+    # Canonical tier names (Rust-style)
+    "PRO": {
         # Claude/GPT-OSS group (verified: 0.6667% per request = 150 requests)
         "claude-sonnet-4-5": 150,
         "claude-sonnet-4-5-thinking": 150,
@@ -74,7 +75,7 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
         "gemini-2.5-pro": 1,
     },
-    "free-tier": {
+    "FREE": {
         # Claude/GPT-OSS group (verified: 2.0% per request = 50 requests)
         "claude-sonnet-4-5": 50,
         "claude-sonnet-4-5-thinking": 50,
@@ -98,6 +99,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-2.5-pro": 1,
     },
 }
+
+# Legacy tier name aliases (backwards compatibility)
+DEFAULT_MAX_REQUESTS["standard-tier"] = DEFAULT_MAX_REQUESTS["PRO"]
+DEFAULT_MAX_REQUESTS["free-tier"] = DEFAULT_MAX_REQUESTS["FREE"]
 
 # Default max requests for unknown models (1% = 100 requests)
 DEFAULT_MAX_REQUESTS_UNKNOWN = 100

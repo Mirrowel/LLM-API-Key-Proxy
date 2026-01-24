@@ -268,7 +268,7 @@ class BaseQuotaTracker:
 
         # Fall back to defaults
         tier_costs = self.default_quota_costs.get(
-            tier, self.default_quota_costs.get("standard-tier", {})
+            tier, self.default_quota_costs.get("PRO", {})
         )
         return tier_costs.get(clean_model, self.default_quota_cost_unknown)
 
@@ -535,7 +535,7 @@ class BaseQuotaTracker:
                 continue
 
             # Get tier for this credential
-            tier = self.project_tier_cache.get(cred_path, "standard-tier")
+            tier = self.project_tier_cache.get(cred_path, "PRO")
 
             # Extract model quota data using subclass implementation
             model_quotas = self._extract_model_quota_from_response(quota_data, tier)
@@ -827,7 +827,7 @@ class BaseQuotaTracker:
         Returns:
             Remaining fraction (0.0 to 1.0) or None if not found
         """
-        tier = quota_data.get("tier", "standard-tier")
+        tier = quota_data.get("tier", "PRO")
         model_quotas = self._extract_model_quota_from_response(quota_data, tier)
 
         clean_model = model.split("/")[-1] if "/" in model else model

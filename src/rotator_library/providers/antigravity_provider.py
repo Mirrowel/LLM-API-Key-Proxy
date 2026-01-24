@@ -1074,13 +1074,15 @@ class AntigravityProvider(
     # Tier name -> priority mapping (Single Source of Truth)
     # Lower numbers = higher priority
     tier_priorities = {
-        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
-        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
-        # Priority 2: Standard paid tier
+        # Canonical names (Rust-style) - preferred
+        "ULTRA": 1,  # Highest paid tier
+        "PRO": 2,  # Standard paid tier
+        "FREE": 3,  # Free tier
+        # Legacy/API names (backwards compatibility)
+        "g1-ultra-tier": 1,
+        "g1-pro-tier": 2,
         "standard-tier": 2,
-        # Priority 3: Free tier
         "free-tier": 3,
-        # Priority 10: Legacy/Unknown (lowest)
         "legacy-tier": 10,
         "unknown": 10,
     }

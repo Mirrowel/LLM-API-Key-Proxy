@@ -55,7 +55,8 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    "standard-tier": {
+    # Canonical tier names (Rust-style)
+    "PRO": {
         # Pro group (verified: 0.4% per request = 250 requests)
         "gemini-2.5-pro": 250,
         "gemini-3-pro-preview": 250,
@@ -67,7 +68,7 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # 3-Flash group (verified: ~0.0667% per request = 1500 requests)
         "gemini-3-flash-preview": 1500,
     },
-    "free-tier": {
+    "FREE": {
         # Pro group (verified: 1.0% per request = 100 requests)
         "gemini-2.5-pro": 100,
         "gemini-3-pro-preview": 100,
@@ -79,6 +80,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-3-flash-preview": 1000,
     },
 }
+
+# Legacy tier name aliases (backwards compatibility)
+DEFAULT_MAX_REQUESTS["standard-tier"] = DEFAULT_MAX_REQUESTS["PRO"]
+DEFAULT_MAX_REQUESTS["free-tier"] = DEFAULT_MAX_REQUESTS["FREE"]
 
 # Default max requests for unknown models (1% = 100 requests)
 DEFAULT_MAX_REQUESTS_UNKNOWN = 1000
