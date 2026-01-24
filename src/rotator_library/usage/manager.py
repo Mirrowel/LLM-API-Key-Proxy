@@ -306,8 +306,12 @@ class UsageManager:
             # Clean up stale windows from tier changes
             # This handles the case where a credential's tier changed and now has
             # windows from the old tier that should be removed
+            # Also populate window_definitions for each credential based on tier
             total_removed = 0
             for stable_id, state in self._states.items():
+                # Populate window definitions for this credential's tier
+                state.window_definitions = self._get_window_definitions_for_state(state)
+
                 valid_windows = self._get_valid_window_names_for_state(state)
                 removed = self._cleanup_stale_windows_for_state(state, valid_windows)
                 total_removed += removed
@@ -1567,6 +1571,77 @@ class UsageManager:
             window_name = "window"
 
         return {window_name}
+
+    def _get_window_definitions_for_state(
+        self, state: CredentialState
+    ) -> List["WindowDefinition"]:
+        """
+        Get the window definitions for a credential based on its tier.
+
+        Uses the provider's usage_reset_configs to determine which window(s)
+        should be used for this credential's tier/priority.
+
+        Args:
+            state: The credential state
+
+        Returns:
+            List of WindowDefinition objects for this credential's tier
+        """
+        from .config import WindowDefinition
+
+        plugin_class = self._provider_plugins.get(self.provider)
+        if not plugin_class:
+            # No plugin - use current config windows
+            return list(self._config.windows) if self._config.windows else []
+
+        # Check if provider defines usage_reset_configs
+        usage_reset_configs = getattr(plugin_class, "usage_reset_configs", None)
+        if not usage_reset_configs:
+            # No tier-specific configs - use current config windows
+            return list(self._config.windows) if self._config.windows else []
+
+        # Get tier priorities mapping
+        tier_priorities = getattr(plugin_class, "tier_priorities", {})
+        default_priority = getattr(plugin_class, "default_tier_priority", 10)
+
+        # Resolve credential's priority from tier
+        priority = state.priority
+        if priority is None and state.tier:
+            priority = tier_priorities.get(state.tier, default_priority)
+        if priority is None:
+            priority = default_priority
+
+        # Find matching usage config for this priority
+        matching_config = None
+        for key, config in usage_reset_configs.items():
+            if isinstance(key, frozenset) and priority in key:
+                matching_config = config
+                break
+        if matching_config is None:
+            matching_config = usage_reset_configs.get("default")
+
+        if matching_config is None:
+            # No matching config - use current windows
+            return list(self._config.windows) if self._config.windows else []
+
+        # Generate window name from window_seconds
+        window_seconds = matching_config.window_seconds
+        if window_seconds == 86400:
+            window_name = "daily"
+        elif window_seconds % 3600 == 0:
+            window_name = f"{window_seconds // 3600}h"
+        else:
+            window_name = "window"
+
+        # Create WindowDefinition for this tier
+        return [
+            WindowDefinition.rolling(
+                name=window_name,
+                duration_seconds=window_seconds,
+                is_primary=True,
+                applies_to=matching_config.field_name or "model",
+            )
+        ]
 
     def _cleanup_stale_windows_for_state(
         self, state: CredentialState, valid_windows: Set[str]

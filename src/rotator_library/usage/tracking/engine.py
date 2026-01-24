@@ -10,7 +10,10 @@ Central component for recording requests, successes, and failures.
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+
+if TYPE_CHECKING:
+    from ..config import WindowDefinition
 
 from ..types import (
     WindowStats,
@@ -100,7 +103,12 @@ class TrackingEngine:
             # 1. Update model stats
             model_stats = state.get_model_stats(model)
             self._apply_to_windows(
-                model_stats.windows, update, now, total_tokens, output_tokens
+                model_stats.windows,
+                update,
+                now,
+                total_tokens,
+                output_tokens,
+                window_definitions=state.window_definitions or None,
             )
             self._apply_to_totals(
                 model_stats.totals, update, now, total_tokens, output_tokens
@@ -110,7 +118,27 @@ class TrackingEngine:
             if group:
                 group_stats = state.get_group_stats(group)
                 self._apply_to_windows(
-                    group_stats.windows, update, now, total_tokens, output_tokens
+                    group_stats.windows,
+                    update,
+                    now,
+                    total_tokens,
+                    output_tokens,
+                    window_definitions=state.window_definitions or None,
+                )
+            self._apply_to_totals(
+                model_stats.totals, update, now, total_tokens, output_tokens
+            )
+
+            # 2. Update group stats (if applicable)
+            if group:
+                group_stats = state.get_group_stats(group)
+                self._apply_to_windows(
+                    group_stats.windows,
+                    update,
+                    now,
+                    total_tokens,
+                    output_tokens,
+                    window_definitions=state.window_definitions or None,
                 )
                 self._apply_to_totals(
                     group_stats.totals, update, now, total_tokens, output_tokens
@@ -454,11 +482,16 @@ class TrackingEngine:
         now: float,
         total_tokens: int,
         output_tokens: int,
+        window_definitions: Optional[List["WindowDefinition"]] = None,
     ) -> None:
         """Apply update to all configured windows."""
-        for window_def in self._config.windows:
+        # Use credential's window definitions if provided, otherwise fall back to config
+        defs = window_definitions if window_definitions else self._config.windows
+        for window_def in defs:
             window = self._windows.get_or_create_window(windows, window_def.name)
-            self._apply_to_window(window, update, now, total_tokens, output_tokens)
+            self._apply_to_window(
+                window, update, now, total_tokens, output_tokens, window_def
+            )
 
     def _apply_to_window(
         self,
@@ -467,6 +500,7 @@ class TrackingEngine:
         now: float,
         total_tokens: int,
         output_tokens: int,
+        window_def: Optional["WindowDefinition"] = None,
     ) -> None:
         """Apply update to a single window."""
         window.request_count += update.request_count
@@ -492,9 +526,12 @@ class TrackingEngine:
         if window.started_at is None:
             window.started_at = now
             # Calculate reset_at based on window definition
-            window_def = self._windows.definitions.get(window.name)
-            if window_def and window.reset_at is None:
-                window.reset_at = self._windows._calculate_reset_time(window_def, now)
+            # Use passed window_def first, then fall back to shared definitions
+            effective_def = window_def or self._windows.definitions.get(window.name)
+            if effective_def and window.reset_at is None:
+                window.reset_at = self._windows._calculate_reset_time(
+                    effective_def, now
+                )
 
         # Update max recorded requests (historical high-water mark)
         if (

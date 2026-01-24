@@ -11,7 +11,10 @@ usage tracking, limits, and credential selection.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
+
+if TYPE_CHECKING:
+    from .config import WindowDefinition
 
 
 # =============================================================================
@@ -309,6 +312,10 @@ class CredentialState:
     display_name: Optional[str] = None
     tier: Optional[str] = None
     priority: int = 999  # Lower = higher priority
+
+    # Window definitions for this credential's tier
+    # Populated during initialization based on tier/priority
+    window_definitions: List["WindowDefinition"] = field(default_factory=list)
 
     # Stats - source of truth
     model_usage: Dict[str, ModelStats] = field(default_factory=dict)
