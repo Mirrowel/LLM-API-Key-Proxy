@@ -195,6 +195,74 @@ class RequestExecutor:
 
         return "?/?"
 
+    def _log_acquiring_credential(
+        self,
+        model: str,
+        tried_count: int,
+        availability: Dict[str, Any],
+    ) -> None:
+        """
+        Log credential acquisition attempt with availability info.
+
+        Args:
+            model: Model name
+            tried_count: Number of credentials already tried
+            availability: Availability stats dict from usage manager
+        """
+        blocked = availability.get("blocked_by", {})
+        blocked_parts = []
+        if blocked.get("cooldowns"):
+            blocked_parts.append(f"cd:{blocked['cooldowns']}")
+        if blocked.get("fair_cycle"):
+            blocked_parts.append(f"fc:{blocked['fair_cycle']}")
+        if blocked.get("custom_caps"):
+            blocked_parts.append(f"cap:{blocked['custom_caps']}")
+        if blocked.get("window_limits"):
+            blocked_parts.append(f"wl:{blocked['window_limits']}")
+        if blocked.get("concurrent"):
+            blocked_parts.append(f"con:{blocked['concurrent']}")
+        blocked_str = f"({', '.join(blocked_parts)})" if blocked_parts else ""
+        lib_logger.info(
+            f"Acquiring credential for model {model}. Tried: {tried_count}/"
+            f"{availability.get('available', 0)}({availability.get('total', 0)}{blocked_str})"
+        )
+
+    async def _prepare_request_kwargs(
+        self,
+        provider: str,
+        model: str,
+        cred: str,
+        context: "RequestContext",
+    ) -> Dict[str, Any]:
+        """
+        Prepare request kwargs with transforms, sanitization, and provider params.
+
+        Args:
+            provider: Provider name
+            model: Model name
+            cred: Credential string
+            context: Request context
+
+        Returns:
+            Prepared kwargs dict for the LiteLLM call
+        """
+        # Apply transforms
+        kwargs = await self._transforms.apply(
+            provider, model, cred, context.kwargs.copy()
+        )
+
+        # Sanitize request payload
+        kwargs = sanitize_request_payload(kwargs, model)
+
+        # Apply provider-specific LiteLLM params
+        self._apply_litellm_provider_params(provider, kwargs)
+
+        # Add transaction context for provider logging
+        if context.transaction_logger:
+            kwargs["transaction_context"] = context.transaction_logger.get_context()
+
+        return kwargs
+
     async def execute(
         self,
         context: RequestContext,
@@ -288,22 +356,8 @@ class RequestExecutor:
             availability = await usage_manager.get_availability_stats(
                 model, quota_group
             )
-            blocked = availability.get("blocked_by", {})
-            blocked_parts = []
-            if blocked.get("cooldowns"):
-                blocked_parts.append(f"cd:{blocked['cooldowns']}")
-            if blocked.get("fair_cycle"):
-                blocked_parts.append(f"fc:{blocked['fair_cycle']}")
-            if blocked.get("custom_caps"):
-                blocked_parts.append(f"cap:{blocked['custom_caps']}")
-            if blocked.get("window_limits"):
-                blocked_parts.append(f"wl:{blocked['window_limits']}")
-            if blocked.get("concurrent"):
-                blocked_parts.append(f"con:{blocked['concurrent']}")
-            blocked_str = f"({', '.join(blocked_parts)})" if blocked_parts else ""
-            lib_logger.info(
-                f"Acquiring key for model {model}. Tried keys: {len(retry_state.tried_credentials)}/"
-                f"{availability.get('available', 0)}({availability.get('total', 0)}{blocked_str})"
+            self._log_acquiring_credential(
+                model, len(retry_state.tried_credentials), availability
             )
 
             # Wait for provider cooldown
@@ -339,25 +393,13 @@ class RequestExecutor:
                     )
 
                     try:
-                        # Apply transforms
-                        kwargs = await self._transforms.apply(
-                            provider, model, cred, context.kwargs.copy()
+                        # Prepare request kwargs
+                        kwargs = await self._prepare_request_kwargs(
+                            provider, model, cred, context
                         )
-
-                        # Sanitize request payload
-                        kwargs = sanitize_request_payload(kwargs, model)
-
-                        # Apply provider-specific LiteLLM params
-                        self._apply_litellm_provider_params(provider, kwargs)
 
                         # Get provider plugin
                         plugin = self._get_plugin_instance(provider)
-
-                        # Add transaction context for provider logging
-                        if context.transaction_logger:
-                            kwargs["transaction_context"] = (
-                                context.transaction_logger.get_context()
-                            )
 
                         # Execute request with retries
                         for attempt in range(self._max_retries):
@@ -525,22 +567,8 @@ class RequestExecutor:
             availability = await usage_manager.get_availability_stats(
                 model, quota_group
             )
-            blocked = availability.get("blocked_by", {})
-            blocked_parts = []
-            if blocked.get("cooldowns"):
-                blocked_parts.append(f"cd:{blocked['cooldowns']}")
-            if blocked.get("fair_cycle"):
-                blocked_parts.append(f"fc:{blocked['fair_cycle']}")
-            if blocked.get("custom_caps"):
-                blocked_parts.append(f"cap:{blocked['custom_caps']}")
-            if blocked.get("window_limits"):
-                blocked_parts.append(f"wl:{blocked['window_limits']}")
-            if blocked.get("concurrent"):
-                blocked_parts.append(f"con:{blocked['concurrent']}")
-            blocked_str = f"({', '.join(blocked_parts)})" if blocked_parts else ""
-            lib_logger.info(
-                f"Acquiring credential for model {model}. Tried credentials: {len(retry_state.tried_credentials)}/"
-                f"{availability.get('available', 0)}({availability.get('total', 0)}{blocked_str})"
+            self._log_acquiring_credential(
+                model, len(retry_state.tried_credentials), availability
             )
 
             while time.time() < deadline:
@@ -590,16 +618,10 @@ class RequestExecutor:
                         )
 
                         try:
-                            # Apply transforms
-                            kwargs = await self._transforms.apply(
-                                provider, model, cred, context.kwargs.copy()
+                            # Prepare request kwargs
+                            kwargs = await self._prepare_request_kwargs(
+                                provider, model, cred, context
                             )
-
-                            # Sanitize request payload
-                            kwargs = sanitize_request_payload(kwargs, model)
-
-                            # Apply provider-specific LiteLLM params
-                            self._apply_litellm_provider_params(provider, kwargs)
 
                             # Add stream options (but not for iflow - it returns 406)
                             if provider != "iflow":
@@ -614,12 +636,6 @@ class RequestExecutor:
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
                             )
-
-                            # Add transaction context for provider logging
-                            if context.transaction_logger:
-                                kwargs["transaction_context"] = (
-                                    context.transaction_logger.get_context()
-                                )
 
                             # Execute request with retries
                             for attempt in range(self._max_retries):

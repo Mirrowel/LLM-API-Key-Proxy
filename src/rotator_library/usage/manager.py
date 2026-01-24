@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from ..core.types import CredentialInfo, RequestCompleteResult
-from ..error_handler import ClassifiedError, classify_error
+from ..error_handler import ClassifiedError, classify_error, mask_credential
 
 from .types import (
     WindowStats,
@@ -401,7 +401,7 @@ class UsageManager:
                         ):
                             state.active_requests += 1
                             lib_logger.debug(
-                                f"Acquired credential {self._mask_accessor(state.accessor)} "
+                                f"Acquired credential {mask_credential(state.accessor, style='full')} "
                                 f"for {model} (active: {state.active_requests}"
                                 f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
                             )
@@ -474,7 +474,7 @@ class UsageManager:
             condition = self._key_conditions.get(best_wait_id)
             if condition:
                 lib_logger.debug(
-                    f"All credentials busy. Waiting for {self._mask_accessor(self._states[best_wait_id].accessor)}..."
+                    f"All credentials busy. Waiting for {mask_credential(self._states[best_wait_id].accessor, style='full')}..."
                 )
                 try:
                     async with condition:
@@ -861,9 +861,9 @@ class UsageManager:
 
             cred_stats = {
                 "stable_id": stable_id,
-                "accessor_masked": self._mask_accessor(state.accessor),
+                "accessor_masked": mask_credential(state.accessor, style="full"),
                 "full_path": state.accessor,
-                "identifier": self._mask_accessor(state.accessor),
+                "identifier": mask_credential(state.accessor, style="full"),
                 "email": state.display_name,
                 "tier": state.tier,
                 "priority": state.priority,
@@ -1177,19 +1177,6 @@ class UsageManager:
 
         return stats
 
-    def _mask_accessor(self, accessor: str) -> str:
-        """Mask an accessor for safe display."""
-        if accessor.endswith(".json"):
-            # OAuth credential - show filename only
-            from pathlib import Path
-
-            return Path(accessor).name
-        elif len(accessor) > 12:
-            # API key - show first 4 and last 4 chars
-            return f"{accessor[:4]}...{accessor[-4:]}"
-        else:
-            return "***"
-
     def _get_provider_plugin_instance(self) -> Optional[Any]:
         """Get provider plugin instance for the current provider."""
         if not self._provider_plugins:
@@ -1475,7 +1462,7 @@ class UsageManager:
                 # ERROR: Provider says exhausted but no reset timestamp!
                 lib_logger.error(
                     f"Quota exhausted for {cooldown_target} on "
-                    f"{self._mask_accessor(accessor)} but no reset_timestamp "
+                    f"{mask_credential(accessor, style='full')} but no reset_timestamp "
                     f"provided by API - cannot apply cooldown"
                 )
 
@@ -1619,19 +1606,17 @@ class UsageManager:
         if lock:
             async with lock:
                 state.active_requests = max(0, state.active_requests - 1)
-                remaining = state.active_requests
-                lib_logger.info(
-                    f"Released credential {self._mask_accessor(state.accessor)} "
-                    f"from {model} (remaining concurrent: {remaining}"
-                    f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
-                )
         else:
             state.active_requests = max(0, state.active_requests - 1)
-            lib_logger.info(
-                f"Released credential {self._mask_accessor(state.accessor)} "
-                f"from {model} (remaining concurrent: {state.active_requests}"
-                f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
-            )
+
+        # Log release with current state
+        remaining = state.active_requests
+        max_concurrent = state.max_concurrent
+        lib_logger.info(
+            f"Released credential {mask_credential(state.accessor, style='full')} "
+            f"from {model} (remaining concurrent: {remaining}"
+            f"{f'/{max_concurrent}' if max_concurrent else ''})"
+        )
 
         # Notify all tasks waiting on this credential's condition
         condition = self._key_conditions.get(stable_id)
@@ -1643,7 +1628,7 @@ class UsageManager:
         self, accessor: str, group_key: str, quota_reset_ts: float
     ) -> None:
         async with self._quota_exhausted_lock:
-            masked = self._mask_accessor(accessor)
+            masked = mask_credential(accessor, style="full")
             if masked not in self._quota_exhausted_summary:
                 self._quota_exhausted_summary[masked] = {}
             self._quota_exhausted_summary[masked][group_key] = quota_reset_ts
@@ -1790,7 +1775,7 @@ class UsageManager:
                     mark_exhausted = True
 
                     # Log quota exhaustion like legacy system
-                    masked = self._mask_accessor(state.accessor)
+                    masked = mask_credential(state.accessor, style="full")
                     cooldown_target = group_key or normalized_model
 
                     if quota_reset:
@@ -1835,7 +1820,7 @@ class UsageManager:
                 for s in self._states.values()
                 if fc_key in s.fair_cycle and s.fair_cycle[fc_key].exhausted
             )
-            masked = self._mask_accessor(state.accessor)
+            masked = mask_credential(state.accessor, style="full")
             lib_logger.info(
                 f"Fair cycle: marked {masked} exhausted for {fc_key} ({exhausted_count} total)"
             )

@@ -247,15 +247,25 @@ def is_abnormal_error(classified_error: "ClassifiedError") -> bool:
     return classified_error.error_type in ABNORMAL_ERROR_TYPES
 
 
-def mask_credential(credential: str) -> str:
+def mask_credential(credential: str, style: str = "short") -> str:
     """
     Mask a credential for safe display in logs and error messages.
 
-    - For API keys: shows last 6 characters (e.g., "...xyz123")
-    - For OAuth file paths: shows just the filename (e.g., "antigravity_oauth_1.json")
+    Args:
+        credential: The credential string to mask
+        style: Masking style - "short" (last 6 chars) or "full" (first 4 + last 4)
+
+    Returns:
+        Masked credential string:
+        - For OAuth file paths: shows just the filename (e.g., "oauth_1.json")
+        - For API keys with style="short": shows last 6 chars (e.g., "...xyz123")
+        - For API keys with style="full": shows first 4 + last 4 (e.g., "AIza...3456")
     """
     if os.path.isfile(credential) or credential.endswith(".json"):
         return os.path.basename(credential)
+
+    if style == "full" and len(credential) > 12:
+        return f"{credential[:4]}...{credential[-4:]}"
     elif len(credential) > 6:
         return f"...{credential[-6:]}"
     else:
