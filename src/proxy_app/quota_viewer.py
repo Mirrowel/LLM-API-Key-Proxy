@@ -315,28 +315,23 @@ def quota_group_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple:
     """
     Sort key for quota groups.
 
-    Order: by minimum remaining percentage across windows (lowest first).
-    Groups without any windows/limits sort last.
+    Order: by total quota limit (lowest first), then alphabetically.
+    Groups without limits sort last.
     """
     name, group_stats = item
     windows = group_stats.get("windows", {})
 
     if not windows:
-        return (1, 100.0, name)  # No windows = sort last
+        return (float("inf"), name)  # No windows = sort last
 
-    # Find minimum remaining percentage across all windows
-    min_pct = 100.0
-    has_limits = False
+    # Find minimum total_max across windows
+    min_limit = float("inf")
     for window_stats in windows.values():
-        pct = window_stats.get("remaining_pct")
-        if pct is not None:
-            has_limits = True
-            min_pct = min(min_pct, pct)
+        total_max = window_stats.get("total_max", 0)
+        if total_max > 0:
+            min_limit = min(min_limit, total_max)
 
-    if not has_limits:
-        return (1, 100.0, name)  # No limits = sort last
-
-    return (0, min_pct, name)  # Lower percentage first
+    return (min_limit, name)
 
 
 class QuotaViewer:
@@ -1302,11 +1297,12 @@ class QuotaViewer:
                     )
 
         # Display group usage with per-window breakdown
+        # Note: group_usage is pre-sorted by limit (lowest first) from the API
         if group_usage:
             content_lines.append("")
             content_lines.append("[bold]Quota Groups:[/bold]")
 
-            for group_name, group_stats in sorted(group_usage.items()):
+            for group_name, group_stats in group_usage.items():
                 windows = group_stats.get("windows", {})
                 if not windows:
                     continue
@@ -1337,8 +1333,6 @@ class QuotaViewer:
                     reset_time_str = ""
                     if reset_at and request_count > 0:
                         try:
-                            from datetime import datetime
-
                             reset_dt = datetime.fromtimestamp(reset_at)
                             reset_time_str = reset_dt.strftime("%b %d %H:%M")
                         except (ValueError, OSError):

@@ -1043,29 +1043,22 @@ class UsageManager:
                     "cycle_request_count": fc_state.cycle_request_count,
                 }
 
-            # Sort group_usage by minimum remaining % (lowest first)
+            # Sort group_usage by quota limit (lowest first), then alphabetically
             # This ensures detail view matches the global summary sort order
             def group_sort_key(item):
                 group_name, group_data = item
                 windows = group_data.get("windows", {})
                 if not windows:
-                    return (1, 100.0, group_name)  # No windows = sort last
-                min_pct = 100.0
-                has_limits = False
+                    return (float("inf"), group_name)  # No windows = sort last
+
+                # Find minimum limit across windows
+                min_limit = float("inf")
                 for window_data in windows.values():
                     limit = window_data.get("limit")
                     if limit is not None and limit > 0:
-                        has_limits = True
-                        remaining = window_data.get("remaining")
-                        if remaining is None:
-                            remaining = max(
-                                0, limit - window_data.get("request_count", 0)
-                            )
-                        pct = remaining / limit * 100
-                        min_pct = min(min_pct, pct)
-                if not has_limits:
-                    return (1, 100.0, group_name)  # No limits = sort last
-                return (0, min_pct, group_name)  # Lower % first
+                        min_limit = min(min_limit, limit)
+
+                return (min_limit, group_name)
 
             sorted_group_usage = dict(
                 sorted(cred_stats["group_usage"].items(), key=group_sort_key)
