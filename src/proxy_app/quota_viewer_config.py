@@ -298,3 +298,48 @@ class QuotaViewerConfig:
         except IOError:
             pass
         return None
+
+    def get_show_models(self, provider: str) -> bool:
+        """
+        Get whether to show model breakdown for a provider.
+
+        Args:
+            provider: Provider name
+
+        Returns:
+            True if models should be shown, False otherwise
+        """
+        provider_settings = self.config.get("provider_settings", {})
+        return provider_settings.get(provider, {}).get("show_models", False)
+
+    def set_show_models(self, provider: str, show: bool) -> bool:
+        """
+        Set whether to show model breakdown for a provider.
+
+        Args:
+            provider: Provider name
+            show: Whether to show models
+
+        Returns:
+            True on success
+        """
+        if "provider_settings" not in self.config:
+            self.config["provider_settings"] = {}
+        if provider not in self.config["provider_settings"]:
+            self.config["provider_settings"][provider] = {}
+        self.config["provider_settings"][provider]["show_models"] = show
+        return self._save()
+
+    def toggle_show_models(self, provider: str) -> bool:
+        """
+        Toggle the show_models setting for a provider.
+
+        Args:
+            provider: Provider name
+
+        Returns:
+            The new value (True if now showing, False if now hidden)
+        """
+        current = self.get_show_models(provider)
+        self.set_show_models(provider, not current)
+        return not current

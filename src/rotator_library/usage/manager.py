@@ -871,10 +871,9 @@ class UsageManager:
             stats["total_requests"] += state.totals.request_count
             stats["tokens"]["output"] += state.totals.output_tokens
             stats["tokens"]["input_cached"] += state.totals.prompt_tokens_cache_read
-            stats["tokens"]["input_uncached"] += max(
-                0,
-                state.totals.prompt_tokens - state.totals.prompt_tokens_cache_read,
-            )
+            # prompt_tokens in LiteLLM = uncached tokens (not total input)
+            # Total input = prompt_tokens + prompt_tokens_cache_read
+            stats["tokens"]["input_uncached"] += state.totals.prompt_tokens
             if state.totals.approx_cost:
                 stats["approx_cost"] = (
                     stats["approx_cost"] or 0.0
@@ -971,34 +970,60 @@ class UsageManager:
                     },
                 }
 
-                # Aggregate quota group stats
+                # Aggregate quota group stats with per-window breakdown
                 group_agg = stats["quota_groups"].setdefault(
                     group_key,
                     {
-                        "total_requests_used": 0,
-                        "total_requests_remaining": 0,
-                        "total_requests_max": 0,
-                        "total_remaining_pct": None,
-                        "tiers": {},
+                        "tiers": {},  # Credential tier counts (provider-level)
+                        "windows": {},  # Per-window aggregated stats
                     },
                 )
-                for window in group_windows.values():
-                    if window.get("limit") is not None:
-                        limit = window["limit"]
-                        used = window["request_count"]
-                        remaining = max(0, limit - used)
-                        group_agg["total_requests_used"] += used
-                        group_agg["total_requests_remaining"] += remaining
-                        group_agg["total_requests_max"] += limit
 
+                # Add credential to tier count (provider-level, not per-window)
                 tier_key = state.tier or "unknown"
                 tier_stats = group_agg["tiers"].setdefault(
                     tier_key,
-                    {"priority": state.priority or 0, "total": 0, "active": 0},
+                    {"priority": state.priority or 0, "total": 0},
                 )
                 tier_stats["total"] += 1
-                if status == "active":
-                    tier_stats["active"] += 1
+
+                # Aggregate per-window stats
+                for window_name, window in group_windows.items():
+                    window_agg = group_agg[
+                        "windows"
+                    ].setdefault(
+                        window_name,
+                        {
+                            "total_used": 0,
+                            "total_remaining": 0,
+                            "total_max": 0,
+                            "remaining_pct": None,
+                            "tier_availability": {},  # Per-window credential availability
+                        },
+                    )
+
+                    # Track tier availability for this window
+                    tier_avail = window_agg["tier_availability"].setdefault(
+                        tier_key,
+                        {"total": 0, "available": 0},
+                    )
+                    tier_avail["total"] += 1
+
+                    # Check if this credential has quota remaining in this window
+                    limit = window.get("limit")
+                    if limit is not None:
+                        used = window["request_count"]
+                        remaining = max(0, limit - used)
+                        window_agg["total_used"] += used
+                        window_agg["total_remaining"] += remaining
+                        window_agg["total_max"] += limit
+
+                        # Credential has availability if remaining > 0
+                        if remaining > 0:
+                            tier_avail["available"] += 1
+                    else:
+                        # No limit = unlimited = always available
+                        tier_avail["available"] += 1
 
             # Add active cooldowns
             for key, cooldown in state.cooldowns.items():
@@ -1018,16 +1043,47 @@ class UsageManager:
                     "cycle_request_count": fc_state.cycle_request_count,
                 }
 
+            # Sort group_usage by minimum remaining % (lowest first)
+            # This ensures detail view matches the global summary sort order
+            def group_sort_key(item):
+                group_name, group_data = item
+                windows = group_data.get("windows", {})
+                if not windows:
+                    return (1, 100.0, group_name)  # No windows = sort last
+                min_pct = 100.0
+                has_limits = False
+                for window_data in windows.values():
+                    limit = window_data.get("limit")
+                    if limit is not None and limit > 0:
+                        has_limits = True
+                        remaining = window_data.get("remaining")
+                        if remaining is None:
+                            remaining = max(
+                                0, limit - window_data.get("request_count", 0)
+                            )
+                        pct = remaining / limit * 100
+                        min_pct = min(min_pct, pct)
+                if not has_limits:
+                    return (1, 100.0, group_name)  # No limits = sort last
+                return (0, min_pct, group_name)  # Lower % first
+
+            sorted_group_usage = dict(
+                sorted(cred_stats["group_usage"].items(), key=group_sort_key)
+            )
+            cred_stats["group_usage"] = sorted_group_usage
+
             stats["credentials"][stable_id] = cred_stats
 
+        # Calculate remaining percentages for each window in each quota group
         for group_stats in stats["quota_groups"].values():
-            if group_stats["total_requests_max"] > 0:
-                group_stats["total_remaining_pct"] = round(
-                    group_stats["total_requests_remaining"]
-                    / group_stats["total_requests_max"]
-                    * 100,
-                    1,
-                )
+            for window_stats in group_stats.get("windows", {}).values():
+                if window_stats["total_max"] > 0:
+                    window_stats["remaining_pct"] = round(
+                        window_stats["total_remaining"]
+                        / window_stats["total_max"]
+                        * 100,
+                        1,
+                    )
 
         total_input = (
             stats["tokens"]["input_cached"] + stats["tokens"]["input_uncached"]
