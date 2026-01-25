@@ -602,6 +602,13 @@ class QwenAuthBase:
                 await self._refresh_queue.put((path, force))
                 await self._ensure_queue_processor_running()
 
+    async def _ensure_queue_processor_running(self):
+        """Lazily starts the queue processor if not already running."""
+        if self._queue_processor_task is None or self._queue_processor_task.done():
+            self._queue_processor_task = asyncio.create_task(
+                self._process_refresh_queue()
+            )
+
     async def _process_refresh_queue(self):
         """Background worker that processes normal refresh requests sequentially.
 
@@ -1006,20 +1013,27 @@ class QwenAuthBase:
                         lib_logger.warning(
                             f"Automatic token refresh for '{display_name}' failed: {e}."
                         )
-                        # Fall through to mark as expired
+                        # Fall through to handle expired credential
 
-                # [NO AUTO-REAUTH] Mark credential as permanently expired instead of
-                # launching interactive device OAuth. This prevents blocking proxy
-                # operations. User must run credential_tool.py manually and restart proxy.
+                # Distinguish between proxy context (has path) and credential tool context (no path)
+                # - Proxy context: mark as expired and fail (no interactive OAuth during proxy operation)
+                # - Credential tool context: do interactive OAuth for new credential setup
                 if path:
+                    # [NO AUTO-REAUTH] Proxy context - mark as permanently expired
                     self._mark_credential_expired(
                         path,
                         f"{reason}. Manual re-authentication required via credential_tool.py",
                     )
-                raise ValueError(
-                    f"Credential '{display_name}' is expired and requires manual re-authentication. "
-                    f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                    raise ValueError(
+                        f"Credential '{display_name}' is expired and requires manual re-authentication. "
+                        f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                    )
+
+                # Credential tool context - do interactive OAuth for new credential setup
+                lib_logger.warning(
+                    f"Qwen OAuth token for '{display_name}' needs setup: {reason}."
                 )
+                return await self._perform_interactive_oauth(path, creds, display_name)
 
             lib_logger.info(f"Qwen OAuth token at '{display_name}' is valid.")
             return creds

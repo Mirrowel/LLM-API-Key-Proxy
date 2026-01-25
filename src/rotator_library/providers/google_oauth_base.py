@@ -1191,20 +1191,27 @@ class GoogleOAuthBase:
                         lib_logger.warning(
                             f"Automatic token refresh for '{display_name}' failed: {e}."
                         )
-                        # Fall through to mark as expired
+                        # Fall through to handle expired credential
 
-                # [NO AUTO-REAUTH] Mark credential as permanently expired instead of
-                # launching interactive browser OAuth. This prevents blocking proxy
-                # operations. User must run credential_tool.py manually and restart proxy.
+                # Distinguish between proxy context (has path) and credential tool context (no path)
+                # - Proxy context: mark as expired and fail (no interactive OAuth during proxy operation)
+                # - Credential tool context: do interactive OAuth for new credential setup
                 if path:
+                    # [NO AUTO-REAUTH] Proxy context - mark as permanently expired
                     self._mark_credential_expired(
                         path,
                         f"{reason}. Manual re-authentication required via credential_tool.py",
                     )
-                raise ValueError(
-                    f"Credential '{display_name}' is expired and requires manual re-authentication. "
-                    f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                    raise ValueError(
+                        f"Credential '{display_name}' is expired and requires manual re-authentication. "
+                        f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                    )
+
+                # Credential tool context - do interactive OAuth for new credential setup
+                lib_logger.warning(
+                    f"{self.ENV_PREFIX} OAuth token for '{display_name}' needs setup: {reason}."
                 )
+                return await self._perform_interactive_oauth(path, creds, display_name)
 
             lib_logger.info(
                 f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid."
