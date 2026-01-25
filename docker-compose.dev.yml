@@ -1,30 +1,41 @@
+# Docker Compose for b3nw fork - uses pre-built image from GHCR
+# Automatically built on every push to dev branch via GitHub Actions
+#
+# Usage:
+#   1. Create a .env file in the same directory with your credentials
+#   2. Run: docker-compose -f docker-compose.dev.yml up -d
+#
+# The image is built from: https://github.com/b3nw/LLM-API-Key-Proxy
+# Container images: ghcr.io/b3nw/llm-api-key-proxy:dev-latest
+
 services:
   llm-proxy:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: llm-api-proxy-dev
+    container_name: llm-proxy
+    image: ghcr.io/b3nw/llm-api-key-proxy:dev-latest
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
     ports:
-      - "${PORT:-8000}:8000"
+      - "${PROXY_PORT:-9220}:8000"
     volumes:
-      # Mount .env files for configuration
+      # Mount .env file for the application to read
       - ./.env:/app/.env:ro
-      # Mount oauth_creds directory for OAuth credentials persistence
-      - ./oauth_creds:/app/oauth_creds
-      # Mount logs directory for persistent logging
+      # Mount data directories for persistence
+      - ./data:/app/data
       - ./logs:/app/logs
+      - ./cache:/app/cache
       # Mount usage directory for usage statistics persistence
       - ./usage:/app/usage
+      - ./oauth_creds:/app/oauth_creds
       # Optionally mount additional .env files (e.g., combined credential files)
       # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
     environment:
-      # Skip OAuth interactive initialization in container (non-interactive)
+      # Skip interactive OAuth setup in container (non-interactive)
       - SKIP_OAUTH_INIT_CHECK=true
+      # Disable fair cycle for OAuth providers (optional)
+      - FAIR_CYCLE_ANTIGRAVITY=false
+      - FAIR_CYCLE_GEMINI_CLI=false
       # Ensure Python output is not buffered
       - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    env_file:
+      - .env
+    command: ["python", "src/proxy_app/main.py", "--host", "0.0.0.0", "--port", "8000", "--enable-request-logging"]
