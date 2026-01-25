@@ -58,7 +58,7 @@ class CredentialFilter:
                 # Check if it's a class or already an instance
                 if isinstance(plugin_class, type):
                     lib_logger.debug(
-                        f"[CredentialFilter] CREATING NEW INSTANCE for {provider} (cache_id={cache_id})"
+                        f"[CredentialFilter] CREATING NEW INSTANCE for {provider}"
                     )
                     self._plugin_instances[provider] = plugin_class()
                 else:

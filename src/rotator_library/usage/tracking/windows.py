@@ -173,26 +173,6 @@ class WindowManager:
             return None
         return window.remaining
 
-    def check_expired_windows(
-        self,
-        windows: Dict[str, WindowStats],
-    ) -> List[str]:
-        """
-        Check for and remove expired windows.
-
-        Args:
-            windows: Current windows dict for a credential
-
-        Returns:
-            List of removed window names
-        """
-        expired = []
-        for name in list(windows.keys()):
-            if self.get_active_window(windows, name) is None:
-                del windows[name]
-                expired.append(name)
-        return expired
-
     def update_limit(
         self,
         windows: Dict[str, WindowStats],
