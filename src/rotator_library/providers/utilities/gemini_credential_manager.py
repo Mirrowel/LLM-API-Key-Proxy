@@ -70,7 +70,7 @@ class GeminiCredentialManager:
             Tier string if found, None otherwise
         """
         # Import here to avoid circular imports
-        from ..antigravity_auth_base import normalize_tier_name
+        from .gemini_shared_utils import normalize_tier_name
 
         # Skip env:// paths (environment-based credentials)
         if self._parse_env_credential_path(credential_path) is not None:

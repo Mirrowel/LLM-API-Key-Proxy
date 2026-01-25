@@ -24,6 +24,9 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_ENDPOINT_FALLBACKS,
+    # Tier utilities
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
 )
 from ..transaction_logger import ProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -146,24 +149,12 @@ class GeminiCliProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_GEMINI_CLI_*)
     provider_env_name: str = "gemini_cli"
 
-    # Tier name -> priority mapping (Single Source of Truth)
-    # Same tier names as Antigravity (coincidentally), but defined separately
-    tier_priorities = {
-        # Canonical names (Rust-style) - preferred
-        "ULTRA": 1,  # Highest paid tier
-        "PRO": 2,  # Standard paid tier
-        "FREE": 3,  # Free tier
-        # Legacy/API names (backwards compatibility)
-        "g1-ultra-tier": 1,
-        "g1-pro-tier": 2,
-        "standard-tier": 2,
-        "free-tier": 3,
-        "legacy-tier": 10,
-        "unknown": 10,
-    }
+    # Tier name -> priority mapping (from centralized tier utilities)
+    # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
+    tier_priorities = TIER_PRIORITIES
 
     # Default priority for tiers not in the mapping
-    default_tier_priority: int = 10
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # Usage reset configs for Gemini CLI
     # Verified 2026-01-07: 24-hour fixed window from first request for ALL tiers

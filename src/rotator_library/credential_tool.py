@@ -26,6 +26,7 @@ from .litellm_providers import (
     get_provider_api_key_var,
     get_provider_display_name,
 )
+from .providers.utilities.gemini_shared_utils import format_tier_for_display
 
 
 def _get_oauth_base_dir() -> Path:
@@ -80,25 +81,8 @@ def _extract_key_number(key_name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _normalize_tier_name(tier: str) -> str:
-    """Normalize tier names for consistent display.
-
-    Examples:
-        "free-tier" -> "free"
-        "FREE_TIER" -> "free"
-        "PAID" -> "paid"
-        "standard" -> "standard"
-        None -> "unknown"
-    """
-    if not tier:
-        return "unknown"
-
-    # Lowercase and remove common suffixes/prefixes
-    normalized = tier.lower().strip()
-    normalized = normalized.replace("-tier", "").replace("_tier", "")
-    normalized = normalized.replace("-", "").replace("_", "")
-
-    return normalized
+# Note: _normalize_tier_name was replaced with format_tier_for_display
+# from providers.utilities.gemini_shared_utils for centralized tier handling
 
 
 def _count_tiers(credentials: list) -> dict:
@@ -114,7 +98,7 @@ def _count_tiers(credentials: list) -> dict:
     for cred in credentials:
         tier = cred.get("tier")
         if tier:
-            normalized = _normalize_tier_name(tier)
+            normalized = format_tier_for_display(tier)
             tier_counts[normalized] = tier_counts.get(normalized, 0) + 1
     return tier_counts
 
@@ -799,7 +783,9 @@ async def _view_oauth_credentials_detail(provider_name: str):
         email = cred.get("email", "unknown")
 
         if provider_name in ["gemini_cli", "antigravity"]:
-            tier = _normalize_tier_name(cred.get("tier")) if cred.get("tier") else "-"
+            tier = (
+                format_tier_for_display(cred.get("tier")) if cred.get("tier") else "-"
+            )
             project = cred.get("project_id", "-")
             if project and len(project) > 25:
                 project = project[:22] + "..."

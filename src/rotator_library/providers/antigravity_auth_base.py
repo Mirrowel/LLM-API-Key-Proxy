@@ -13,7 +13,26 @@ from typing import Any, Dict, Optional, List
 import httpx
 
 from .google_oauth_base import GoogleOAuthBase
-# Note: Endpoint constants are imported by helper methods from gemini_shared_utils
+
+# Import tier utilities from shared module
+# These are re-exported here for backwards compatibility with existing imports
+from .utilities.gemini_shared_utils import (
+    # Tier constants
+    TIER_ULTRA,
+    TIER_PRO,
+    TIER_FREE,
+    TIER_NAME_TO_CANONICAL,
+    CANONICAL_TO_LEGACY,
+    FREE_TIER_IDS,
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
+    # Tier functions
+    normalize_tier_name,
+    is_free_tier,
+    is_paid_tier,
+    get_tier_priority,
+    format_tier_for_display,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -23,79 +42,6 @@ lib_logger = logging.getLogger("rotator_library")
 # When loadCodeAssist returns no project, uses this fallback unconditionally
 # See: quota.rs:135 - let final_project_id = project_id.unwrap_or("bamboo-precept-lgxtn");
 FALLBACK_PROJECT_ID = "bamboo-precept-lgxtn"
-
-# =============================================================================
-# TIER NAME NORMALIZATION
-# =============================================================================
-
-# Mapping from legacy Python tier names to canonical tier names
-# Canonical uses: ULTRA, PRO, FREE
-# Python used: free-tier, legacy-tier, standard-tier, etc.
-# API also returns: g1-pro-tier, g1-ultra-tier, etc.
-TIER_NAME_TO_CANONICAL = {
-    # Legacy Python names
-    "free-tier": "FREE",
-    "legacy-tier": "FREE",  # Legacy is treated as free
-    "standard-tier": "PRO",
-    "pro-tier": "PRO",
-    "ultra-tier": "ULTRA",
-    "enterprise-tier": "ULTRA",
-    # Google One AI tier names (from paidTier API response)
-    "g1-pro-tier": "PRO",
-    "g1-ultra-tier": "ULTRA",
-    "g1-free-tier": "FREE",
-    # Gemini Code Assist tier names
-    "gemini-code-assist-pro": "PRO",
-    "gemini-code-assist-ultra": "ULTRA",
-    "gemini-code-assist-free": "FREE",
-    # Already canonical
-    "FREE": "FREE",
-    "PRO": "PRO",
-    "ULTRA": "ULTRA",
-}
-
-# Reverse mapping for backwards compatibility
-CANONICAL_TO_LEGACY = {
-    "FREE": "free-tier",
-    "PRO": "standard-tier",
-    "ULTRA": "enterprise-tier",
-}
-
-# Free tier identifiers (both naming conventions)
-FREE_TIER_IDS = {"FREE", "free-tier", "legacy-tier"}
-
-
-def normalize_tier_name(tier_id: Optional[str]) -> Optional[str]:
-    """
-    Normalize tier name to canonical format (ULTRA, PRO, FREE).
-
-    Supports both legacy Python names (free-tier, standard-tier) and
-    Canonical names (FREE, PRO, ULTRA).
-
-    Args:
-        tier_id: Tier identifier from API response
-
-    Returns:
-        Canonical tier name (ULTRA, PRO, FREE) or original if unknown
-    """
-    if not tier_id:
-        return None
-    return TIER_NAME_TO_CANONICAL.get(tier_id, tier_id)
-
-
-def is_free_tier(tier_id: Optional[str]) -> bool:
-    """Check if tier is a free tier (any naming convention)."""
-    if not tier_id:
-        return False
-    return tier_id in FREE_TIER_IDS or normalize_tier_name(tier_id) == "FREE"
-
-
-def is_paid_tier(tier_id: Optional[str]) -> bool:
-    """Check if tier is a paid tier (not free, not unknown)."""
-    if not tier_id or tier_id == "unknown":
-        return False
-    canonical = normalize_tier_name(tier_id)
-    return canonical in ("PRO", "ULTRA")
 
 
 # Headers for Antigravity auth/discovery calls (loadCodeAssist, onboardUser)
@@ -468,7 +414,9 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 # Canonical prioritizes paidTier over currentTier for accurate subscription detection
                 allowed_tiers = data.get("allowedTiers", [])
                 current_tier = data.get("currentTier")
-                paid_tier = data.get("paidTier")  # Added: Canonical-style tier detection
+                paid_tier = data.get(
+                    "paidTier"
+                )  # Added: Canonical-style tier detection
 
                 lib_logger.debug(f"=== Tier Information ===")
                 lib_logger.debug(f"paidTier: {paid_tier}")

@@ -60,6 +60,9 @@ from .utilities.gemini_shared_utils import (
     GEMINI3_TOOL_RENAMES_REVERSE,
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
+    # Tier utilities
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
 )
 from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -1077,24 +1080,12 @@ class AntigravityProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_ANTIGRAVITY_*)
     provider_env_name: str = "antigravity"
 
-    # Tier name -> priority mapping (Single Source of Truth)
-    # Lower numbers = higher priority
-    tier_priorities = {
-        # Canonical names (Rust-style) - preferred
-        "ULTRA": 1,  # Highest paid tier
-        "PRO": 2,  # Standard paid tier
-        "FREE": 3,  # Free tier
-        # Legacy/API names (backwards compatibility)
-        "g1-ultra-tier": 1,
-        "g1-pro-tier": 2,
-        "standard-tier": 2,
-        "free-tier": 3,
-        "legacy-tier": 10,
-        "unknown": 10,
-    }
+    # Tier name -> priority mapping (from centralized tier utilities)
+    # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
+    tier_priorities = TIER_PRIORITIES
 
     # Default priority for tiers not in the mapping
-    default_tier_priority: int = 10
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # Usage reset configs keyed by priority sets
     # Priorities 1-2 (paid tiers) get 5h window, others get 7d window

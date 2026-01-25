@@ -13,10 +13,9 @@ from typing import Any, Dict, Optional, List
 import httpx
 
 from .google_oauth_base import GoogleOAuthBase
-from .utilities.gemini_shared_utils import CODE_ASSIST_ENDPOINT
-
-# Import tier normalization functions from antigravity_auth_base
-from .antigravity_auth_base import (
+from .utilities.gemini_shared_utils import (
+    CODE_ASSIST_ENDPOINT,
+    # Tier utilities
     normalize_tier_name,
     is_free_tier,
     is_paid_tier,

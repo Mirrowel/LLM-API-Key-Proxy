@@ -376,3 +376,168 @@ def recursively_parse_json_strings(
                 except (json.JSONDecodeError, ValueError):
                     pass
     return obj
+
+
+# =============================================================================
+# TIER NAMING AND PRIORITY CONSTANTS
+# =============================================================================
+# Shared tier handling for Google/Gemini-based providers (Gemini CLI, Antigravity)
+#
+# Canonical tier names are uppercase: ULTRA, PRO, FREE
+# API returns various formats: g1-pro-tier, standard-tier, free-tier, etc.
+# This module normalizes all tier names and provides priority ordering.
+
+# Canonical tier names
+TIER_ULTRA = "ULTRA"
+TIER_PRO = "PRO"
+TIER_FREE = "FREE"
+
+# Mapping from API/legacy tier names to canonical names
+# Handles all known tier name formats from various API responses
+TIER_NAME_TO_CANONICAL: Dict[str, str] = {
+    # Legacy Python names
+    "free-tier": TIER_FREE,
+    "legacy-tier": TIER_FREE,  # Legacy is treated as free
+    "standard-tier": TIER_PRO,
+    "pro-tier": TIER_PRO,
+    "ultra-tier": TIER_ULTRA,
+    "enterprise-tier": TIER_ULTRA,
+    # Google One AI tier names (from paidTier API response)
+    "g1-pro-tier": TIER_PRO,
+    "g1-ultra-tier": TIER_ULTRA,
+    "g1-free-tier": TIER_FREE,
+    # Gemini Code Assist tier names
+    "gemini-code-assist-pro": TIER_PRO,
+    "gemini-code-assist-ultra": TIER_ULTRA,
+    "gemini-code-assist-free": TIER_FREE,
+    # Already canonical (uppercase)
+    TIER_FREE: TIER_FREE,
+    TIER_PRO: TIER_PRO,
+    TIER_ULTRA: TIER_ULTRA,
+}
+
+# Reverse mapping for backwards compatibility (canonical -> legacy)
+CANONICAL_TO_LEGACY: Dict[str, str] = {
+    TIER_FREE: "free-tier",
+    TIER_PRO: "standard-tier",
+    TIER_ULTRA: "enterprise-tier",
+}
+
+# Free tier identifiers (all naming conventions)
+FREE_TIER_IDS: set = {TIER_FREE, "free-tier", "legacy-tier", "g1-free-tier"}
+
+# Tier priorities for credential selection (lower number = higher priority)
+# ULTRA (Google One AI Premium) > PRO (Google One AI / Paid) > FREE
+TIER_PRIORITIES: Dict[str, int] = {
+    # Canonical names
+    TIER_ULTRA: 1,  # Highest priority - Google One AI Premium
+    TIER_PRO: 2,  # Standard paid tier - Google One AI
+    TIER_FREE: 3,  # Free tier
+    # API/legacy names mapped to same priorities for backwards compatibility
+    "g1-ultra-tier": 1,
+    "g1-pro-tier": 2,
+    "standard-tier": 2,
+    "free-tier": 3,
+    "legacy-tier": 10,  # Legacy/unknown treated as lowest
+    "unknown": 10,
+}
+
+# Default priority for tiers not in the mapping
+DEFAULT_TIER_PRIORITY: int = 10
+
+
+# =============================================================================
+# TIER HELPER FUNCTIONS
+# =============================================================================
+
+
+def normalize_tier_name(tier_id: Optional[str]) -> Optional[str]:
+    """
+    Normalize tier name to canonical format (ULTRA, PRO, FREE).
+
+    Supports all tier name formats:
+    - Legacy Python names: free-tier, standard-tier, legacy-tier
+    - Google One AI names: g1-pro-tier, g1-ultra-tier
+    - Gemini Code Assist names: gemini-code-assist-pro
+    - Already canonical: FREE, PRO, ULTRA
+
+    Args:
+        tier_id: Tier identifier from API response or config
+
+    Returns:
+        Canonical tier name (ULTRA, PRO, FREE) or original if unknown
+    """
+    if not tier_id:
+        return None
+    return TIER_NAME_TO_CANONICAL.get(tier_id, tier_id)
+
+
+def is_free_tier(tier_id: Optional[str]) -> bool:
+    """
+    Check if tier is a free tier (any naming convention).
+
+    Args:
+        tier_id: Tier identifier to check
+
+    Returns:
+        True if tier is free, False otherwise
+    """
+    if not tier_id:
+        return False
+    return tier_id in FREE_TIER_IDS or normalize_tier_name(tier_id) == TIER_FREE
+
+
+def is_paid_tier(tier_id: Optional[str]) -> bool:
+    """
+    Check if tier is a paid tier (PRO or ULTRA).
+
+    Args:
+        tier_id: Tier identifier to check
+
+    Returns:
+        True if tier is paid (PRO or ULTRA), False otherwise
+    """
+    if not tier_id or tier_id == "unknown":
+        return False
+    canonical = normalize_tier_name(tier_id)
+    return canonical in (TIER_PRO, TIER_ULTRA)
+
+
+def get_tier_priority(tier_id: Optional[str]) -> int:
+    """
+    Get priority for a tier (lower number = higher priority).
+
+    Priority order: ULTRA (1) > PRO (2) > FREE (3) > unknown (10)
+
+    Args:
+        tier_id: Tier identifier
+
+    Returns:
+        Priority number (1-10), lower is better
+    """
+    if not tier_id:
+        return DEFAULT_TIER_PRIORITY
+    # Try direct lookup first (handles both canonical and API names)
+    if tier_id in TIER_PRIORITIES:
+        return TIER_PRIORITIES[tier_id]
+    # Normalize and try again
+    canonical = normalize_tier_name(tier_id)
+    return TIER_PRIORITIES.get(canonical, DEFAULT_TIER_PRIORITY)
+
+
+def format_tier_for_display(tier_id: Optional[str]) -> str:
+    """
+    Format tier name for display (lowercase canonical).
+
+    Args:
+        tier_id: Tier identifier
+
+    Returns:
+        Display-friendly tier name: "ultra", "pro", "free", or "unknown"
+    """
+    if not tier_id:
+        return "unknown"
+    canonical = normalize_tier_name(tier_id)
+    if canonical in (TIER_ULTRA, TIER_PRO, TIER_FREE):
+        return canonical.lower()
+    return "unknown"
