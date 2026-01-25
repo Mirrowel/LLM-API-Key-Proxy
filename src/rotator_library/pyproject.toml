@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rotator_library"
-version = "1.5"
+version = "1.7"
 authors = [
     { name="Mirrowel", email="mirrowel-github.appraiser015@aleeas.com" },
 ]

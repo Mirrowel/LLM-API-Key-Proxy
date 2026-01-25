@@ -49,6 +49,8 @@ def main():
         "--hidden-import=rotator_library",
         "--hidden-import=tiktoken_ext.openai_public",
         "--hidden-import=tiktoken_ext",
+        # Fix for Rich 14.0+ which lazy-loads Unicode data via dynamic imports
+        "--collect-submodules=rich._unicode_data",
         "--collect-data",
         "litellm",
         # Optimization: Exclude unused heavy modules
