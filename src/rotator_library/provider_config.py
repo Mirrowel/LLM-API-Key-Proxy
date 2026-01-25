@@ -677,6 +677,16 @@ class ProviderConfig:
                         f"Detected API base override for {provider}: {value}"
                     )
 
+        # Handle firmware provider: has default api_base but LiteLLM doesn't
+        # recognize it as a native provider. Without this, FIRMWARE_API_KEY_*
+        # users without explicit FIRMWARE_API_BASE would have requests fail.
+        if "firmware" not in self._api_bases and "firmware" not in KNOWN_PROVIDERS:
+            self._api_bases["firmware"] = "https://app.firmware.ai/api/v1"
+            self._custom_providers.add("firmware")
+            lib_logger.info(
+                "Using default api_base for firmware: https://app.firmware.ai/api/v1"
+            )
+
     def is_known_provider(self, provider: str) -> bool:
         """Check if provider is known to LiteLLM."""
         return provider.lower() in KNOWN_PROVIDERS
