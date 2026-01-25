@@ -1004,29 +1004,21 @@ class QwenAuthBase:
                         return await self._refresh_token(path)
                     except Exception as e:
                         lib_logger.warning(
-                            f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login."
+                            f"Automatic token refresh for '{display_name}' failed: {e}."
                         )
+                        # Fall through to mark as expired
 
-                lib_logger.warning(
-                    f"Qwen OAuth token for '{display_name}' needs setup: {reason}."
-                )
-
-                # [GLOBAL REAUTH COORDINATION] Use the global coordinator to ensure
-                # only one interactive OAuth flow runs at a time across all providers
-                coordinator = get_reauth_coordinator()
-
-                # Define the interactive OAuth function to be executed by coordinator
-                async def _do_interactive_oauth():
-                    return await self._perform_interactive_oauth(
-                        path, creds, display_name
+                # [NO AUTO-REAUTH] Mark credential as permanently expired instead of
+                # launching interactive device OAuth. This prevents blocking proxy
+                # operations. User must run credential_tool.py manually and restart proxy.
+                if path:
+                    self._mark_credential_expired(
+                        path,
+                        f"{reason}. Manual re-authentication required via credential_tool.py",
                     )
-
-                # Execute via global coordinator (ensures only one at a time)
-                return await coordinator.execute_reauth(
-                    credential_path=path or display_name,
-                    provider_name="QWEN_CODE",
-                    reauth_func=_do_interactive_oauth,
-                    timeout=300.0,  # 5 minute timeout for user to complete OAuth
+                raise ValueError(
+                    f"Credential '{display_name}' is expired and requires manual re-authentication. "
+                    f"Run 'python credential_tool.py' to fix, then restart the proxy."
                 )
 
             lib_logger.info(f"Qwen OAuth token at '{display_name}' is valid.")

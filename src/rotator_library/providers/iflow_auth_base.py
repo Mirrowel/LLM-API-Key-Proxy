@@ -1326,18 +1326,18 @@ class IFlowAuthBase:
                         )
                         # Fall through to mark as expired
 
-                # [NO AUTO-REAUTH] If force_interactive is True or refresh failed,
-                # mark the credential as permanently expired instead of launching browser OAuth.
-                # User must run credential_tool.py manually and restart proxy.
-                if force_interactive or reason != "token is expired":
+                # [NO AUTO-REAUTH] Mark credential as permanently expired instead of
+                # launching interactive browser OAuth. This prevents blocking proxy
+                # operations. User must run credential_tool.py manually and restart proxy.
+                if path:
                     self._mark_credential_expired(
                         path,
                         f"{reason}. Manual re-authentication required via credential_tool.py",
                     )
-                    raise ValueError(
-                        f"Credential '{display_name}' is expired and requires manual re-authentication. "
-                        f"Run 'python credential_tool.py' to fix, then restart the proxy."
-                    )
+                raise ValueError(
+                    f"Credential '{display_name}' is expired and requires manual re-authentication. "
+                    f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                )
 
             lib_logger.info(f"iFlow OAuth token at '{display_name}' is valid.")
             return creds
