@@ -171,10 +171,27 @@ class GeminiCredentialManager:
                 await self._discover_project_id(
                     credential_path, access_token, litellm_params={}
                 )
-                discovered_tier = self.project_tier_cache.get(
+                # Use full tier name for discovery log (one-time display)
+                tier_full_cache = getattr(self, "tier_full_cache", {})
+                tier_full = tier_full_cache.get(credential_path)
+                discovered_tier = tier_full or self.project_tier_cache.get(
                     credential_path, "unknown"
                 )
-                lib_logger.debug(
+                lib_logger.info(
+                    f"Discovered tier '{discovered_tier}' for {Path(credential_path).name}"
+                )
+            except Exception as e:
+                lib_logger.warning(
+                    f"Failed to discover tier for {Path(credential_path).name}: {e}. "
+                    f"Credential will use default priority."
+                )
+                # Use full tier name for discovery log (one-time display)
+                tier_full_cache = getattr(self, "tier_full_cache", {})
+                tier_full = tier_full_cache.get(credential_path)
+                discovered_tier = tier_full or self.project_tier_cache.get(
+                    credential_path, "unknown"
+                )
+                lib_logger.info(
                     f"Discovered tier '{discovered_tier}' for {Path(credential_path).name}"
                 )
             except Exception as e:
@@ -216,6 +233,13 @@ class GeminiCredentialManager:
                 if tier:
                     self.project_tier_cache[path] = tier
                     loaded[path] = tier
+
+                    # Also load tier_full if available
+                    tier_full = metadata.get("tier_full")
+                    tier_full_cache = getattr(self, "tier_full_cache", None)
+                    if tier_full and tier_full_cache is not None:
+                        tier_full_cache[path] = tier_full
+
                     lib_logger.debug(
                         f"Loaded persisted tier '{tier}' for credential: {Path(path).name}"
                     )

@@ -387,10 +387,34 @@ def recursively_parse_json_strings(
 # API returns various formats: g1-pro-tier, standard-tier, free-tier, etc.
 # This module normalizes all tier names and provides priority ordering.
 
-# Canonical tier names
+# Canonical tier names (short)
 TIER_ULTRA = "ULTRA"
 TIER_PRO = "PRO"
 TIER_FREE = "FREE"
+
+# Full tier names for display (based on tier source/subscription type)
+# Used for one-time displays like credential discovery logging
+TIER_ID_TO_FULL_NAME: Dict[str, str] = {
+    # Google One AI subscription tiers (from paidTier API response)
+    "g1-pro-tier": "Google One AI PRO",
+    "g1-ultra-tier": "Google One AI ULTRA",
+    "g1-free-tier": TIER_FREE,  # Free tiers are just "FREE"
+    # Gemini Code Assist subscription tiers
+    "gemini-code-assist-pro": "Code Assist PRO",
+    "gemini-code-assist-ultra": "Code Assist ULTRA",
+    "gemini-code-assist-free": TIER_FREE,
+    # Legacy/standard tier names (no special prefix)
+    "standard-tier": TIER_PRO,
+    "pro-tier": TIER_PRO,
+    "ultra-tier": TIER_ULTRA,
+    "enterprise-tier": TIER_ULTRA,
+    "free-tier": TIER_FREE,
+    "legacy-tier": TIER_FREE,
+    # Already canonical - return as-is
+    TIER_FREE: TIER_FREE,
+    TIER_PRO: TIER_PRO,
+    TIER_ULTRA: TIER_ULTRA,
+}
 
 # Mapping from API/legacy tier names to canonical names
 # Handles all known tier name formats from various API responses
@@ -543,6 +567,29 @@ def format_tier_for_display(tier_id: Optional[str]) -> str:
     return "unknown"
 
 
+def get_tier_full_name(tier_id: Optional[str]) -> str:
+    """
+    Get the full/descriptive tier name for display.
+
+    Used for one-time displays like credential discovery logging where
+    we want to show the subscription source (e.g., "Google One AI PRO").
+
+    Args:
+        tier_id: Original tier identifier from API response (e.g., "g1-pro-tier")
+
+    Returns:
+        Full tier name (e.g., "Google One AI PRO") or canonical short name as fallback
+    """
+    if not tier_id:
+        return "unknown"
+    # Try direct lookup for full name
+    if tier_id in TIER_ID_TO_FULL_NAME:
+        return TIER_ID_TO_FULL_NAME[tier_id]
+    # Fallback to canonical short name
+    canonical = normalize_tier_name(tier_id)
+    return canonical if canonical else tier_id
+
+
 # =============================================================================
 # PROJECT ID EXTRACTION
 # =============================================================================
@@ -584,6 +631,7 @@ def load_persisted_project_metadata(
     credentials_cache: Dict[str, Any],
     project_id_cache: Dict[str, str],
     project_tier_cache: Dict[str, str],
+    tier_full_cache: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """
     Load persisted project_id and tier from credential file or env cache.
@@ -597,6 +645,7 @@ def load_persisted_project_metadata(
         credentials_cache: Dict of loaded credentials (for env-based)
         project_id_cache: Dict to populate with project_id
         project_tier_cache: Dict to populate with tier
+        tier_full_cache: Optional dict to populate with tier_full (full display name)
 
     Returns:
         Project ID if found and cached, None otherwise (caller should do discovery)
@@ -610,6 +659,7 @@ def load_persisted_project_metadata(
             metadata = creds.get("_proxy_metadata", {})
             persisted_project_id = metadata.get("project_id")
             persisted_tier = metadata.get("tier")
+            persisted_tier_full = metadata.get("tier_full")
 
             if persisted_project_id:
                 lib_logger.debug(
@@ -621,6 +671,13 @@ def load_persisted_project_metadata(
                 if persisted_tier:
                     project_tier_cache[credential_path] = persisted_tier
                     lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+
+                # Load tier_full if available and cache provided
+                if persisted_tier_full and tier_full_cache is not None:
+                    tier_full_cache[credential_path] = persisted_tier_full
+                    lib_logger.debug(
+                        f"Loaded persisted tier_full: {persisted_tier_full}"
+                    )
 
                 return persisted_project_id
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
@@ -634,6 +691,7 @@ def load_persisted_project_metadata(
             metadata = creds.get("_proxy_metadata", {})
             env_project_id = metadata.get("project_id")
             env_tier = metadata.get("tier")
+            env_tier_full = metadata.get("tier_full")
 
             if env_project_id:
                 lib_logger.debug(
@@ -645,6 +703,13 @@ def load_persisted_project_metadata(
                     project_tier_cache[credential_path] = env_tier
                     lib_logger.debug(
                         f"Loaded tier from env credential metadata: {env_tier}"
+                    )
+
+                # Load tier_full if available and cache provided
+                if env_tier_full and tier_full_cache is not None:
+                    tier_full_cache[credential_path] = env_tier_full
+                    lib_logger.debug(
+                        f"Loaded tier_full from env credential metadata: {env_tier_full}"
                     )
 
                 return env_project_id
@@ -680,10 +745,13 @@ def build_project_tier_env_lines(
 
     project_id = metadata.get("project_id", "")
     tier = metadata.get("tier", "")
+    tier_full = metadata.get("tier_full", "")
 
     if project_id:
         lines.append(f"{prefix}_PROJECT_ID={project_id}")
     if tier:
         lines.append(f"{prefix}_TIER={tier}")
+    if tier_full:
+        lines.append(f"{prefix}_TIER_FULL={tier_full}")
 
     return lines

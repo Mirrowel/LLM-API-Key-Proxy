@@ -1344,7 +1344,11 @@ class GoogleOAuthBase:
         pass
 
     async def _persist_project_metadata(
-        self, credential_path: str, project_id: str, tier: Optional[str]
+        self,
+        credential_path: str,
+        project_id: str,
+        tier: Optional[str],
+        tier_full: Optional[str] = None,
     ) -> None:
         """
         Persist project ID and tier to the credential file for faster future startups.
@@ -1356,6 +1360,7 @@ class GoogleOAuthBase:
             credential_path: Path to the credential file
             project_id: The Google Cloud project ID to persist
             tier: Optional tier identifier (e.g., "PRO", "FREE", "ULTRA")
+            tier_full: Optional full tier name for display (e.g., "Google One AI PRO")
         """
         # Skip persistence for env:// paths (environment-based credentials)
         credential_index = self._parse_env_credential_path(credential_path)
@@ -1377,6 +1382,8 @@ class GoogleOAuthBase:
             creds["_proxy_metadata"]["project_id"] = project_id
             if tier:
                 creds["_proxy_metadata"]["tier"] = tier
+            if tier_full:
+                creds["_proxy_metadata"]["tier_full"] = tier_full
 
             # Save back using the existing save method (handles atomic writes and permissions)
             await self._save_credentials(credential_path, creds)

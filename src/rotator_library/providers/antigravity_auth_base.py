@@ -32,6 +32,7 @@ from .utilities.gemini_shared_utils import (
     is_paid_tier,
     get_tier_priority,
     format_tier_for_display,
+    get_tier_full_name,
     # Project ID extraction
     extract_project_id_from_response,
     # Credential loading helpers
@@ -95,6 +96,8 @@ class AntigravityAuthBase(GoogleOAuthBase):
         # Project and tier caches - shared between auth base and provider
         self.project_id_cache: Dict[str, str] = {}
         self.project_tier_cache: Dict[str, str] = {}
+        self.tier_full_cache: Dict[str, str] = {}  # Full tier names for display
+        self.tier_full_cache: Dict[str, str] = {}  # Full tier names for display
 
     # =========================================================================
     # POST-AUTH DISCOVERY HOOK
@@ -134,7 +137,25 @@ class AntigravityAuthBase(GoogleOAuthBase):
             credential_path, access_token, litellm_params={}
         )
 
-        tier = self.project_tier_cache.get(credential_path, "unknown")
+        # Use full tier name for post-auth log (one-time display)
+        tier_full = self.tier_full_cache.get(credential_path)
+        tier = tier_full or self.project_tier_cache.get(credential_path, "unknown")
+        lib_logger.info(
+            f"Post-auth discovery complete for {Path(credential_path).name}: "
+            f"tier={tier}, project={project_id}"
+        )
+
+        # Use full tier name for post-auth log (one-time display)
+        tier_full = self.tier_full_cache.get(credential_path)
+        tier = tier_full or self.project_tier_cache.get(credential_path, "unknown")
+        lib_logger.info(
+            f"Post-auth discovery complete for {Path(credential_path).name}: "
+            f"tier={tier}, project={project_id}"
+        )
+
+        # Use full tier name for post-auth log (one-time display)
+        tier_full = self.tier_full_cache.get(credential_path)
+        tier = tier_full or self.project_tier_cache.get(credential_path, "unknown")
         lib_logger.info(
             f"Post-auth discovery complete for {Path(credential_path).name}: "
             f"tier={tier}, project={project_id}"
@@ -309,6 +330,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
             self._credentials_cache,
             self.project_id_cache,
             self.project_tier_cache,
+            self.tier_full_cache,
         )
         if persisted_project_id:
             return persisted_project_id
@@ -333,6 +355,8 @@ class AntigravityAuthBase(GoogleOAuthBase):
 
         discovered_project_id = None
         discovered_tier = None
+        discovered_tier_full = None
+        discovered_tier_full = None
 
         async with httpx.AsyncClient() as client:
             # 1. Try discovery endpoint with loadCodeAssist using endpoint fallback
@@ -427,22 +451,25 @@ class AntigravityAuthBase(GoogleOAuthBase):
                     self.project_tier_cache[credential_path] = canonical
                     discovered_tier = canonical
 
-                    # Log appropriately based on tier
-                    if is_paid_tier(effective_tier_id):
-                        lib_logger.info(
-                            f"Using Antigravity paid tier '{canonical}' with project: {project_id}"
-                        )
-                    else:
-                        lib_logger.info(
-                            f"Discovered Antigravity project ID via loadCodeAssist: {project_id} (tier={canonical})"
-                        )
+                    # Get and cache full tier name for display
+                    tier_full = get_tier_full_name(effective_tier_id)
+                    self.tier_full_cache[credential_path] = tier_full
+                    discovered_tier_full = tier_full
+
+                    # Log with full tier name for discovery messages
+                    lib_logger.info(
+                        f"Discovered Antigravity tier '{tier_full}' with project: {project_id}"
+                    )
 
                     self.project_id_cache[credential_path] = project_id
                     discovered_project_id = project_id
 
                     # Persist to credential file
                     await self._persist_project_metadata(
-                        credential_path, project_id, discovered_tier
+                        credential_path,
+                        project_id,
+                        discovered_tier,
+                        discovered_tier_full,
                     )
 
                     return project_id
@@ -586,24 +613,26 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 canonical_tier = normalize_tier_name(tier_id) or tier_id
                 self.project_tier_cache[credential_path] = canonical_tier
                 discovered_tier = canonical_tier
-                lib_logger.debug(f"Cached tier information: {canonical_tier}")
 
-                # Log concise message based on tier
-                if is_paid_tier(tier_id):
-                    lib_logger.info(
-                        f"Using Antigravity paid tier '{canonical_tier}' with project: {project_id}"
-                    )
-                else:
-                    lib_logger.info(
-                        f"Successfully onboarded user and discovered project ID: {project_id} (tier={canonical_tier})"
-                    )
+                # Get and cache full tier name for display
+                tier_full = get_tier_full_name(tier_id)
+                self.tier_full_cache[credential_path] = tier_full
+                discovered_tier_full = tier_full
+                lib_logger.debug(
+                    f"Cached tier information: {canonical_tier} (full: {tier_full})"
+                )
+
+                # Log with full tier name for onboarding messages
+                lib_logger.info(
+                    f"Onboarded Antigravity credential with tier '{tier_full}', project: {project_id}"
+                )
 
                 self.project_id_cache[credential_path] = project_id
                 discovered_project_id = project_id
 
                 # Persist to credential file
                 await self._persist_project_metadata(
-                    credential_path, project_id, discovered_tier
+                    credential_path, project_id, discovered_tier, discovered_tier_full
                 )
 
                 return project_id
