@@ -32,6 +32,15 @@ from .utilities.gemini_shared_utils import (
     is_paid_tier,
     get_tier_priority,
     format_tier_for_display,
+    # Project ID extraction
+    extract_project_id_from_response,
+    # Credential loading helpers
+    load_persisted_project_metadata,
+    # Env file helpers
+    build_project_tier_env_lines,
+    # Endpoint constants
+    ANTIGRAVITY_LOAD_ENDPOINT_ORDER,
+    ANTIGRAVITY_ENDPOINT_FALLBACKS,
 )
 
 lib_logger = logging.getLogger("rotator_library")
@@ -134,30 +143,6 @@ class AntigravityAuthBase(GoogleOAuthBase):
     # =========================================================================
     # ENDPOINT FALLBACK HELPERS
     # =========================================================================
-
-    def _extract_project_id_from_response(
-        self, data: Dict[str, Any], key: str = "cloudaicompanionProject"
-    ) -> Optional[str]:
-        """
-        Extract project ID from API response, handling both string and object formats.
-
-        The API may return cloudaicompanionProject as either:
-        - A string: "project-id-123"
-        - An object: {"id": "project-id-123", ...}
-
-        Args:
-            data: API response data
-            key: Key to extract from (default: "cloudaicompanionProject")
-
-        Returns:
-            Project ID string or None if not found
-        """
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            return value
-        if isinstance(value, dict):
-            return value.get("id")
-        return None
 
     async def _call_load_code_assist(
         self,
@@ -318,53 +303,15 @@ class AntigravityAuthBase(GoogleOAuthBase):
 
         # Load credentials to check for persisted/configured project_id and tier
         credential_index = self._parse_env_credential_path(credential_path)
-        if credential_index is None:
-            # File-based credentials: load from file
-            try:
-                with open(credential_path, "r") as f:
-                    creds = json.load(f)
-
-                metadata = creds.get("_proxy_metadata", {})
-                persisted_project_id = metadata.get("project_id")
-                persisted_tier = metadata.get("tier")
-
-                if persisted_project_id:
-                    lib_logger.debug(
-                        f"Loaded persisted project ID from credential file: {persisted_project_id}"
-                    )
-                    self.project_id_cache[credential_path] = persisted_project_id
-
-                    # Also load tier if available
-                    if persisted_tier:
-                        self.project_tier_cache[credential_path] = persisted_tier
-                        lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
-
-                    return persisted_project_id
-            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                lib_logger.debug(f"Could not load persisted project ID from file: {e}")
-        else:
-            # Env-based credentials: load from credentials cache
-            # The credentials were already loaded by _load_from_env() which reads
-            # {PREFIX}_{N}_PROJECT_ID and {PREFIX}_{N}_TIER into _proxy_metadata
-            if credential_path in self._credentials_cache:
-                creds = self._credentials_cache[credential_path]
-                metadata = creds.get("_proxy_metadata", {})
-                env_project_id = metadata.get("project_id")
-                env_tier = metadata.get("tier")
-
-                if env_project_id:
-                    lib_logger.debug(
-                        f"Loaded project ID from env credential metadata: {env_project_id}"
-                    )
-                    self.project_id_cache[credential_path] = env_project_id
-
-                    if env_tier:
-                        self.project_tier_cache[credential_path] = env_tier
-                        lib_logger.debug(
-                            f"Loaded tier from env credential metadata: {env_tier}"
-                        )
-
-                    return env_project_id
+        persisted_project_id = load_persisted_project_metadata(
+            credential_path,
+            credential_index,
+            self._credentials_cache,
+            self.project_id_cache,
+            self.project_tier_cache,
+        )
+        if persisted_project_id:
+            return persisted_project_id
 
         lib_logger.debug(
             "No cached or configured project ID found, initiating discovery..."
@@ -453,7 +400,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 # Check if user is already known to server (has tier info)
                 if effective_tier_id:
                     # User has tier info - use Canonical-style project selection
-                    server_project = self._extract_project_id_from_response(data)
+                    server_project = extract_project_id_from_response(data)
 
                     # Canonical-style project selection (quota.rs:135):
                     # 1. Server project (if returned)
@@ -613,7 +560,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
                 # Extract project ID from LRO response using helper
                 # Note: onboardUser returns response.cloudaicompanionProject as an object with .id
                 lro_response_data = lro_data.get("response", {})
-                project_id = self._extract_project_id_from_response(lro_response_data)
+                project_id = extract_project_id_from_response(lro_response_data)
 
                 # Fallback to configured project if LRO didn't return one
                 if not project_id and configured_project_id:
@@ -759,43 +706,6 @@ class AntigravityAuthBase(GoogleOAuthBase):
             "To manually specify a project, set ANTIGRAVITY_PROJECT_ID in your .env file."
         )
 
-    async def _persist_project_metadata(
-        self, credential_path: str, project_id: str, tier: Optional[str]
-    ):
-        """Persists project ID and tier to the credential file for faster future startups."""
-        # Skip persistence for env:// paths (environment-based credentials)
-        credential_index = self._parse_env_credential_path(credential_path)
-        if credential_index is not None:
-            lib_logger.debug(
-                f"Skipping project metadata persistence for env:// credential path: {credential_path}"
-            )
-            return
-
-        try:
-            # Load current credentials
-            with open(credential_path, "r") as f:
-                creds = json.load(f)
-
-            # Update metadata
-            if "_proxy_metadata" not in creds:
-                creds["_proxy_metadata"] = {}
-
-            creds["_proxy_metadata"]["project_id"] = project_id
-            if tier:
-                creds["_proxy_metadata"]["tier"] = tier
-
-            # Save back using the existing save method (handles atomic writes and permissions)
-            await self._save_credentials(credential_path, creds)
-
-            lib_logger.debug(
-                f"Persisted project_id and tier to credential file: {credential_path}"
-            )
-        except Exception as e:
-            lib_logger.warning(
-                f"Failed to persist project metadata to credential file: {e}"
-            )
-            # Non-fatal - just means slower startup next time
-
     # =========================================================================
     # CREDENTIAL MANAGEMENT OVERRIDES
     # =========================================================================
@@ -813,16 +723,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
         # Get base lines from parent class
         lines = super().build_env_lines(creds, cred_number)
 
-        # Add Antigravity-specific fields (tier and project_id)
-        metadata = creds.get("_proxy_metadata", {})
-        prefix = f"{self.ENV_PREFIX}_{cred_number}"
-
-        project_id = metadata.get("project_id", "")
-        tier = metadata.get("tier", "")
-
-        if project_id:
-            lines.append(f"{prefix}_PROJECT_ID={project_id}")
-        if tier:
-            lines.append(f"{prefix}_TIER={tier}")
+        # Add project_id and tier using shared helper
+        lines.extend(build_project_tier_env_lines(creds, self.ENV_PREFIX, cred_number))
 
         return lines

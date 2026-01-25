@@ -1343,6 +1343,53 @@ class GoogleOAuthBase:
         # Default implementation does nothing - subclasses can override
         pass
 
+    async def _persist_project_metadata(
+        self, credential_path: str, project_id: str, tier: Optional[str]
+    ) -> None:
+        """
+        Persist project ID and tier to the credential file for faster future startups.
+
+        This is a shared implementation for Google Cloud OAuth providers that need
+        to cache project and tier information (e.g., Gemini CLI, Antigravity).
+
+        Args:
+            credential_path: Path to the credential file
+            project_id: The Google Cloud project ID to persist
+            tier: Optional tier identifier (e.g., "PRO", "FREE", "ULTRA")
+        """
+        # Skip persistence for env:// paths (environment-based credentials)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is not None:
+            lib_logger.debug(
+                f"Skipping project metadata persistence for env:// credential path: {credential_path}"
+            )
+            return
+
+        try:
+            # Load current credentials
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+
+            # Update metadata
+            if "_proxy_metadata" not in creds:
+                creds["_proxy_metadata"] = {}
+
+            creds["_proxy_metadata"]["project_id"] = project_id
+            if tier:
+                creds["_proxy_metadata"]["tier"] = tier
+
+            # Save back using the existing save method (handles atomic writes and permissions)
+            await self._save_credentials(credential_path, creds)
+
+            lib_logger.debug(
+                f"Persisted project_id and tier to credential file: {credential_path}"
+            )
+        except Exception as e:
+            lib_logger.warning(
+                f"Failed to persist project metadata to credential file: {e}"
+            )
+            # Non-fatal - just means slower startup next time
+
     async def get_user_info(
         self, creds_or_path: Union[Dict[str, Any], str]
     ) -> Dict[str, Any]:

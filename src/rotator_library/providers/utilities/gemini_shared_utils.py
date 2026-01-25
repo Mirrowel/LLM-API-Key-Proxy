@@ -541,3 +541,149 @@ def format_tier_for_display(tier_id: Optional[str]) -> str:
     if canonical in (TIER_ULTRA, TIER_PRO, TIER_FREE):
         return canonical.lower()
     return "unknown"
+
+
+# =============================================================================
+# PROJECT ID EXTRACTION
+# =============================================================================
+
+
+def extract_project_id_from_response(
+    data: Dict[str, Any], key: str = "cloudaicompanionProject"
+) -> Optional[str]:
+    """
+    Extract project ID from API response, handling both string and object formats.
+
+    The API may return cloudaicompanionProject as either:
+    - A string: "project-id-123"
+    - An object: {"id": "project-id-123", ...}
+
+    Args:
+        data: API response data
+        key: Key to extract from (default: "cloudaicompanionProject")
+
+    Returns:
+        Project ID string or None if not found
+    """
+    value = data.get(key)
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        return value.get("id")
+    return None
+
+
+# =============================================================================
+# CREDENTIAL LOADING HELPERS
+# =============================================================================
+
+
+def load_persisted_project_metadata(
+    credential_path: str,
+    credential_index: Optional[int],
+    credentials_cache: Dict[str, Any],
+    project_id_cache: Dict[str, str],
+    project_tier_cache: Dict[str, str],
+) -> Optional[str]:
+    """
+    Load persisted project_id and tier from credential file or env cache.
+
+    This helper handles the common pattern of checking for already-persisted
+    project metadata in both file-based and env-based credentials.
+
+    Args:
+        credential_path: Path to the credential (file path or env:// path)
+        credential_index: Result of _parse_env_credential_path() - None for file, int for env
+        credentials_cache: Dict of loaded credentials (for env-based)
+        project_id_cache: Dict to populate with project_id
+        project_tier_cache: Dict to populate with tier
+
+    Returns:
+        Project ID if found and cached, None otherwise (caller should do discovery)
+    """
+    if credential_index is None:
+        # File-based credentials: load from file
+        try:
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+
+            metadata = creds.get("_proxy_metadata", {})
+            persisted_project_id = metadata.get("project_id")
+            persisted_tier = metadata.get("tier")
+
+            if persisted_project_id:
+                lib_logger.debug(
+                    f"Loaded persisted project ID from credential file: {persisted_project_id}"
+                )
+                project_id_cache[credential_path] = persisted_project_id
+
+                # Also load tier if available
+                if persisted_tier:
+                    project_tier_cache[credential_path] = persisted_tier
+                    lib_logger.debug(f"Loaded persisted tier: {persisted_tier}")
+
+                return persisted_project_id
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            lib_logger.debug(f"Could not load persisted project ID from file: {e}")
+    else:
+        # Env-based credentials: load from credentials cache
+        # The credentials were already loaded by _load_from_env() which reads
+        # {PREFIX}_{N}_PROJECT_ID and {PREFIX}_{N}_TIER into _proxy_metadata
+        if credential_path in credentials_cache:
+            creds = credentials_cache[credential_path]
+            metadata = creds.get("_proxy_metadata", {})
+            env_project_id = metadata.get("project_id")
+            env_tier = metadata.get("tier")
+
+            if env_project_id:
+                lib_logger.debug(
+                    f"Loaded project ID from env credential metadata: {env_project_id}"
+                )
+                project_id_cache[credential_path] = env_project_id
+
+                if env_tier:
+                    project_tier_cache[credential_path] = env_tier
+                    lib_logger.debug(
+                        f"Loaded tier from env credential metadata: {env_tier}"
+                    )
+
+                return env_project_id
+
+    return None
+
+
+# =============================================================================
+# ENV FILE HELPERS
+# =============================================================================
+
+
+def build_project_tier_env_lines(
+    creds: Dict[str, Any], env_prefix: str, cred_number: int
+) -> List[str]:
+    """
+    Build env lines for project_id and tier from credential metadata.
+
+    Used by Google OAuth providers (Gemini CLI, Antigravity) to generate
+    environment variable lines for project and tier information.
+
+    Args:
+        creds: Credential dict containing _proxy_metadata
+        env_prefix: Environment variable prefix (e.g., "GEMINI_CLI", "ANTIGRAVITY")
+        cred_number: Credential number for env var naming
+
+    Returns:
+        List of env lines like ["PREFIX_N_PROJECT_ID=...", "PREFIX_N_TIER=..."]
+    """
+    lines = []
+    metadata = creds.get("_proxy_metadata", {})
+    prefix = f"{env_prefix}_{cred_number}"
+
+    project_id = metadata.get("project_id", "")
+    tier = metadata.get("tier", "")
+
+    if project_id:
+        lines.append(f"{prefix}_PROJECT_ID={project_id}")
+    if tier:
+        lines.append(f"{prefix}_TIER={tier}")
+
+    return lines
