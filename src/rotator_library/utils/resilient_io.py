@@ -36,6 +36,41 @@ DEFAULT_BUFFERED_WRITE_RETRY_INTERVAL: float = 30.0
 
 
 # =============================================================================
+# SYMLINK-AWARE ATOMIC WRITE HELPER
+# =============================================================================
+
+
+def _resolve_write_target(path: Path, logger: Optional[logging.Logger] = None) -> Path:
+    """
+    Resolve symlinks to get the actual write target.
+
+    When writing atomically with tempfile + shutil.move(), we must write to the
+    resolved path (symlink target) rather than the symlink itself. Otherwise,
+    shutil.move() replaces the symlink with a regular file instead of writing
+    through the symlink to the target.
+
+    This is critical for Docker volume mounts where a symlink points to a
+    persistent volume - writing to the symlink path would write to the
+    container's ephemeral overlay filesystem instead.
+
+    Args:
+        path: Original path (may be a symlink)
+        logger: Optional logger for warning on resolution failure
+
+    Returns:
+        Resolved path (symlink target if path is a symlink, otherwise unchanged)
+    """
+    try:
+        # resolve() follows all symlinks and returns the canonical absolute path
+        return path.resolve()
+    except (OSError, RuntimeError) as e:
+        # Resolution failed (permissions, symlink loops, etc.) - use original path
+        if logger:
+            logger.warning(f"Symlink resolution failed for {path.name}: {e}")
+        return path
+
+
+# =============================================================================
 # BUFFERED WRITE REGISTRY (SINGLETON)
 # =============================================================================
 
@@ -193,9 +228,11 @@ class BufferedWriteRegistry:
             data, serializer, options = self._pending[path_str]
 
         path = Path(path_str)
+        # Resolve symlinks to write to actual target (critical for Docker volume mounts)
+        write_path = _resolve_write_target(path, self._logger)
         try:
             # Ensure directory exists
-            path.parent.mkdir(parents=True, exist_ok=True)
+            write_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Serialize data
             content = serializer(data)
@@ -205,7 +242,7 @@ class BufferedWriteRegistry:
             tmp_path = None
             try:
                 tmp_fd, tmp_path = tempfile.mkstemp(
-                    dir=path.parent, prefix=".tmp_", suffix=".json", text=True
+                    dir=write_path.parent, prefix=".tmp_", suffix=".json", text=True
                 )
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -218,7 +255,7 @@ class BufferedWriteRegistry:
                     except (OSError, AttributeError):
                         pass
 
-                shutil.move(tmp_path, path)
+                shutil.move(tmp_path, write_path)
                 tmp_path = None
 
             finally:
@@ -426,9 +463,12 @@ class ResilientStateWriter:
 
         self._last_attempt = time.time()
 
+        # Resolve symlinks to write to actual target (critical for Docker volume mounts)
+        write_path = _resolve_write_target(self.path, self.logger)
+
         try:
             # Ensure directory exists
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Serialize data
             content = self._serializer(self._current_state)
@@ -438,7 +478,7 @@ class ResilientStateWriter:
             tmp_path = None
             try:
                 tmp_fd, tmp_path = tempfile.mkstemp(
-                    dir=self.path.parent, prefix=".tmp_", suffix=".json", text=True
+                    dir=write_path.parent, prefix=".tmp_", suffix=".json", text=True
                 )
 
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
@@ -446,7 +486,7 @@ class ResilientStateWriter:
                     tmp_fd = None  # fdopen closes the fd
 
                 # Atomic move
-                shutil.move(tmp_path, self.path)
+                shutil.move(tmp_path, write_path)
                 tmp_path = None
 
             finally:
@@ -551,13 +591,15 @@ def safe_write_json(
         True on success, False on failure (never raises)
     """
     path = Path(path)
+    # Resolve symlinks to write to actual target (critical for Docker volume mounts)
+    write_path = _resolve_write_target(path, logger)
 
     # Create serializer function that matches the requested formatting
     def serializer(d: Any) -> str:
         return json.dumps(d, indent=indent, ensure_ascii=ensure_ascii)
 
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        write_path.parent.mkdir(parents=True, exist_ok=True)
         content = serializer(data)
 
         if atomic:
@@ -565,7 +607,7 @@ def safe_write_json(
             tmp_path = None
             try:
                 tmp_fd, tmp_path = tempfile.mkstemp(
-                    dir=path.parent, prefix=".tmp_", suffix=".json", text=True
+                    dir=write_path.parent, prefix=".tmp_", suffix=".json", text=True
                 )
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -579,7 +621,7 @@ def safe_write_json(
                         # Windows may not support chmod, ignore
                         pass
 
-                shutil.move(tmp_path, path)
+                shutil.move(tmp_path, write_path)
                 tmp_path = None
             finally:
                 if tmp_fd is not None:
@@ -593,13 +635,13 @@ def safe_write_json(
                     except OSError:
                         pass
         else:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(write_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
             # Set secure permissions if requested
             if secure_permissions:
                 try:
-                    os.chmod(path, 0o600)
+                    os.chmod(write_path, 0o600)
                 except (OSError, AttributeError):
                     pass
 
