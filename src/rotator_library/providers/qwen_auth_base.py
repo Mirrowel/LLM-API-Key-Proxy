@@ -273,6 +273,14 @@ class QwenAuthBase:
         expiry_timestamp = creds.get("expiry_date", 0) / 1000
         return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
 
+    async def _get_lock(self, path: str) -> asyncio.Lock:
+        # [FIX RACE CONDITION] Protect lock creation with a master lock
+        # This prevents TOCTOU bug where multiple coroutines check and create simultaneously
+        async with self._locks_lock:
+            if path not in self._refresh_locks:
+                self._refresh_locks[path] = asyncio.Lock()
+            return self._refresh_locks[path]
+
     def _is_token_truly_expired(self, creds: Dict[str, Any]) -> bool:
         """Check if token is TRULY expired (past actual expiry, not just threshold).
 
