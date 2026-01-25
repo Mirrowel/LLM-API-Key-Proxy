@@ -214,25 +214,19 @@ class GoogleOAuthBase:
             str, float
         ] = {}  # Track backoff timers (Unix timestamp)
 
-        # [QUEUE SYSTEM] Sequential refresh processing with two separate queues
+        # [QUEUE SYSTEM] Sequential refresh processing
         # Normal refresh queue: for proactive token refresh (old token still valid)
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queue_processor_task: Optional[asyncio.Task] = None
 
-        # Re-auth queue: for invalid refresh tokens (requires user interaction)
-        self._reauth_queue: asyncio.Queue = asyncio.Queue()
-        self._reauth_processor_task: Optional[asyncio.Task] = None
-
         # Tracking sets/dicts
-        self._queued_credentials: set = set()  # Track credentials in either queue
-        # Only credentials in re-auth queue are marked unavailable (not normal refresh)
-        # TTL cleanup is defense-in-depth for edge cases where re-auth processor crashes
-        self._unavailable_credentials: Dict[
-            str, float
-        ] = {}  # Maps credential path -> timestamp when marked unavailable
-        # TTL should exceed reauth timeout (300s) to avoid premature cleanup
-        self._unavailable_ttl_seconds: int = 360  # 6 minutes TTL for stale entries
+        self._queued_credentials: set = set()  # Track credentials in refresh queue
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
+
+        # [PERMANENTLY EXPIRED] Track credentials that have been permanently removed from rotation
+        # These credentials have invalid/revoked refresh tokens and require manual re-authentication
+        # via credential_tool.py. They will NOT be selected for rotation until proxy restart.
+        self._permanently_expired_credentials: set = set()
 
         # Retry tracking for normal refresh queue
         self._queue_retry_count: Dict[
@@ -243,7 +237,6 @@ class GoogleOAuthBase:
         self._refresh_timeout_seconds: int = 15  # Max time for single refresh
         self._refresh_interval_seconds: int = 30  # Delay between queue items
         self._refresh_max_retries: int = 3  # Attempts before kicked out
-        self._reauth_timeout_seconds: int = 300  # Time for user to complete OAuth
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """
@@ -483,39 +476,31 @@ class GoogleOAuthBase:
                         status_code = e.response.status_code
                         error_body = e.response.text
 
-                        # [INVALID GRANT HANDLING] Handle 400/401/403 by queuing for re-auth
-                        # We must NOT call initialize_token from here as we hold a lock (would deadlock)
+                        # [INVALID GRANT HANDLING] Handle 400/401/403 by marking as expired
+                        # These errors indicate the refresh token is invalid/revoked
+                        # Mark as permanently expired - no interactive re-auth during proxy operation
                         if status_code == 400:
                             # Check if this is an invalid_grant error
                             if "invalid_grant" in error_body.lower():
-                                lib_logger.info(
-                                    f"Credential '{Path(path).name}' needs re-auth (HTTP 400: invalid_grant). "
-                                    f"Queued for re-authentication, rotating to next credential."
-                                )
-                                asyncio.create_task(
-                                    self._queue_refresh(
-                                        path, force=True, needs_reauth=True
-                                    )
+                                self._mark_credential_expired(
+                                    path,
+                                    f"Refresh token invalid (HTTP 400: invalid_grant)",
                                 )
                                 raise CredentialNeedsReauthError(
                                     credential_path=path,
-                                    message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                    message=f"Refresh token invalid for '{Path(path).name}'. Credential removed from rotation.",
                                 )
                             else:
                                 # Other 400 error - raise it
                                 raise
 
                         elif status_code in (401, 403):
-                            lib_logger.info(
-                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code}). "
-                                f"Queued for re-authentication, rotating to next credential."
-                            )
-                            asyncio.create_task(
-                                self._queue_refresh(path, force=True, needs_reauth=True)
+                            self._mark_credential_expired(
+                                path, f"Credential unauthorized (HTTP {status_code})"
                             )
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Credential removed from rotation.",
                             )
 
                         elif status_code == 429:
@@ -634,7 +619,7 @@ class GoogleOAuthBase:
         creds = await self._load_credentials(credential_path)
         if self._is_token_expired(creds):
             # lib_logger.info(f"Proactive refresh triggered for '{Path(credential_path).name}'")
-            await self._queue_refresh(credential_path, force=False, needs_reauth=False)
+            await self._queue_refresh(credential_path, force=False)
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
         # [FIX RACE CONDITION] Protect lock creation with a master lock
@@ -657,40 +642,65 @@ class GoogleOAuthBase:
             expiry_timestamp = time.mktime(time.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ"))
         return expiry_timestamp < time.time()
 
+    def _mark_credential_expired(self, path: str, reason: str) -> None:
+        """
+        Permanently mark a credential as expired and remove it from rotation.
+
+        This is called when a credential's refresh token is invalid or revoked,
+        meaning normal token refresh cannot work. The credential is removed from
+        rotation entirely and requires manual re-authentication via credential_tool.py.
+
+        The proxy must be restarted after fixing the credential.
+
+        Args:
+            path: Credential file path or env:// path
+            reason: Human-readable reason for expiration (e.g., "invalid_grant", "HTTP 401")
+        """
+        # Add to permanently expired set
+        self._permanently_expired_credentials.add(path)
+
+        # Clean up other tracking structures
+        self._queued_credentials.discard(path)
+
+        # Get display name
+        if path.startswith("env://"):
+            display_name = path
+        else:
+            display_name = Path(path).name
+
+        # Rich-formatted output for high visibility
+        console.print(
+            Panel(
+                f"[bold red]Credential:[/bold red] {display_name}\n"
+                f"[bold red]Reason:[/bold red] {reason}\n\n"
+                f"[yellow]This credential has been removed from rotation.[/yellow]\n"
+                f"[yellow]To fix: Run 'python credential_tool.py' to re-authenticate,[/yellow]\n"
+                f"[yellow]then restart the proxy.[/yellow]",
+                title="[bold red]⚠ CREDENTIAL EXPIRED - REMOVED FROM ROTATION[/bold red]",
+                border_style="red",
+            )
+        )
+
+        # Also log at ERROR level for log files
+        lib_logger.error(
+            f"CREDENTIAL EXPIRED - REMOVED FROM ROTATION | "
+            f"Credential: {display_name} | Reason: {reason} | "
+            f"Action: Run 'credential_tool.py' to re-authenticate, then restart proxy"
+        )
+
     def is_credential_available(self, path: str) -> bool:
         """Check if a credential is available for rotation.
 
         Credentials are unavailable if:
-        1. In re-auth queue (token is truly broken, requires user interaction)
+        1. Permanently expired (refresh token invalid/revoked, requires manual re-auth)
         2. Token is TRULY expired (past actual expiry, not just threshold)
 
         Note: Credentials in normal refresh queue are still available because
         the old token is valid until actual expiry.
-
-        TTL cleanup (defense-in-depth): If a credential has been in the re-auth
-        queue longer than _unavailable_ttl_seconds without being processed, it's
-        cleaned up. This should only happen if the re-auth processor crashes or
-        is cancelled without proper cleanup.
         """
-        # Check if in re-auth queue (truly unavailable)
-        if path in self._unavailable_credentials:
-            marked_time = self._unavailable_credentials.get(path)
-            if marked_time is not None:
-                now = time.time()
-                if now - marked_time > self._unavailable_ttl_seconds:
-                    # Entry is stale - clean it up and return available
-                    # This is a defense-in-depth for edge cases where re-auth
-                    # processor crashed or was cancelled without cleanup
-                    lib_logger.warning(
-                        f"Credential '{Path(path).name}' stuck in re-auth queue for "
-                        f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
-                        f"Re-auth processor may have crashed. Auto-cleaning stale entry."
-                    )
-                    # Clean up both tracking structures for consistency
-                    self._unavailable_credentials.pop(path, None)
-                    self._queued_credentials.discard(path)
-                else:
-                    return False  # Still in re-auth, not available
+        # Check if permanently expired (requires manual re-authentication)
+        if path in self._permanently_expired_credentials:
+            return False
 
         # Check if token is TRULY expired (not just threshold-expired)
         creds = self._credentials_cache.get(path)
@@ -698,12 +708,7 @@ class GoogleOAuthBase:
             # Token is actually expired - should not be used
             # Queue for refresh if not already queued
             if path not in self._queued_credentials:
-                # lib_logger.debug(
-                #     f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
-                # )
-                asyncio.create_task(
-                    self._queue_refresh(path, force=True, needs_reauth=False)
-                )
+                asyncio.create_task(self._queue_refresh(path, force=True))
             return False
 
         return True
@@ -715,63 +720,26 @@ class GoogleOAuthBase:
                 self._process_refresh_queue()
             )
 
-    async def _ensure_reauth_processor_running(self):
-        """Lazily starts the re-auth queue processor if not already running."""
-        if self._reauth_processor_task is None or self._reauth_processor_task.done():
-            self._reauth_processor_task = asyncio.create_task(
-                self._process_reauth_queue()
-            )
-
-    async def _queue_refresh(
-        self, path: str, force: bool = False, needs_reauth: bool = False
-    ):
-        """Add a credential to the appropriate refresh queue if not already queued.
+    async def _queue_refresh(self, path: str, force: bool = False):
+        """Add a credential to the refresh queue if not already queued.
 
         Args:
             path: Credential file path
             force: Force refresh even if not expired
-            needs_reauth: True if full re-authentication needed (routes to re-auth queue)
-
-        Queue routing:
-        - needs_reauth=True: Goes to re-auth queue, marks as unavailable
-        - needs_reauth=False: Goes to normal refresh queue, does NOT mark unavailable
-          (old token is still valid until actual expiry)
         """
-        # IMPORTANT: Only check backoff for simple automated refreshes
-        # Re-authentication (interactive OAuth) should BYPASS backoff since it needs user input
-        if not needs_reauth:
-            now = time.time()
-            if path in self._next_refresh_after:
-                backoff_until = self._next_refresh_after[path]
-                if now < backoff_until:
-                    # Credential is in backoff for automated refresh, do not queue
-                    # remaining = int(backoff_until - now)
-                    # lib_logger.debug(
-                    #     f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
-                    # )
-                    return
+        # Check backoff for automated refreshes
+        now = time.time()
+        if path in self._next_refresh_after:
+            backoff_until = self._next_refresh_after[path]
+            if now < backoff_until:
+                # Credential is in backoff, do not queue
+                return
 
         async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
                 self._queued_credentials.add(path)
-
-                if needs_reauth:
-                    # Re-auth queue: mark as unavailable (token is truly broken)
-                    self._unavailable_credentials[path] = time.time()
-                    # lib_logger.debug(
-                    #     f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
-                    #     f"Total unavailable: {len(self._unavailable_credentials)}"
-                    # )
-                    await self._reauth_queue.put(path)
-                    await self._ensure_reauth_processor_running()
-                else:
-                    # Normal refresh queue: do NOT mark unavailable (old token still valid)
-                    # lib_logger.debug(
-                    #     f"Queued '{Path(path).name}' for refresh (still available). "
-                    #     f"Queue size: {self._refresh_queue.qsize() + 1}"
-                    # )
-                    await self._refresh_queue.put((path, force))
-                    await self._ensure_queue_processor_running()
+                await self._refresh_queue.put((path, force))
+                await self._ensure_queue_processor_running()
 
     async def _process_refresh_queue(self):
         """Background worker that processes normal refresh requests sequentially.
@@ -780,8 +748,8 @@ class GoogleOAuthBase:
         - 15s timeout per refresh operation
         - 30s delay between processing credentials (prevents thundering herd)
         - On failure: back of queue, max 3 retries before kicked
-        - If 401/403 detected: routes to re-auth queue
-        - Does NOT mark credentials unavailable (old token still valid)
+        - If 401/403 detected: marks credential as permanently expired
+        - Does NOT mark credentials unavailable for normal refresh (old token still valid)
         """
         # lib_logger.info("Refresh queue processor started")
         while True:
@@ -806,9 +774,6 @@ class GoogleOAuthBase:
                     creds = self._credentials_cache.get(path)
                     if creds and not self._is_token_expired(creds):
                         # No longer expired, skip refresh
-                        # lib_logger.debug(
-                        #     f"Credential '{Path(path).name}' no longer expired, skipping refresh"
-                        # )
                         # Clear retry count on skip (not a failure)
                         self._queue_retry_count.pop(path, None)
                         continue
@@ -834,19 +799,29 @@ class GoogleOAuthBase:
                     except httpx.HTTPStatusError as e:
                         status_code = e.response.status_code
                         if status_code in (401, 403):
-                            # Invalid refresh token - route to re-auth queue
-                            lib_logger.warning(
-                                f"Refresh token invalid for '{Path(path).name}' (HTTP {status_code}). "
-                                f"Routing to re-auth queue."
-                            )
+                            # Invalid refresh token - mark as permanently expired
                             self._queue_retry_count.pop(path, None)  # Clear retry count
                             async with self._queue_tracking_lock:
-                                self._queued_credentials.discard(
-                                    path
-                                )  # Remove from queued
-                            await self._queue_refresh(
-                                path, force=True, needs_reauth=True
+                                self._queued_credentials.discard(path)
+                            self._mark_credential_expired(
+                                path,
+                                f"Refresh token invalid (HTTP {status_code})"
                             )
+                        elif status_code == 400:
+                            # Check for invalid_grant
+                            error_body = e.response.text
+                            if "invalid_grant" in error_body.lower():
+                                self._queue_retry_count.pop(path, None)
+                                async with self._queue_tracking_lock:
+                                    self._queued_credentials.discard(path)
+                                self._mark_credential_expired(
+                                    path,
+                                    f"Refresh token invalid (HTTP 400: invalid_grant)"
+                                )
+                            else:
+                                await self._handle_refresh_failure(
+                                    path, force, f"HTTP {status_code}"
+                                )
                         else:
                             await self._handle_refresh_failure(
                                 path, force, f"HTTP {status_code}"
@@ -906,65 +881,6 @@ class GoogleOAuthBase:
         )
         # Keep in queued_credentials set, add back to queue
         await self._refresh_queue.put((path, force))
-
-    async def _process_reauth_queue(self):
-        """Background worker that processes re-auth requests.
-
-        Key behaviors:
-        - Credentials ARE marked unavailable (token is truly broken)
-        - Uses ReauthCoordinator for interactive OAuth
-        - No automatic retry (requires user action)
-        - Cleans up unavailable status when done
-        """
-        # lib_logger.info("Re-auth queue processor started")
-        while True:
-            path = None
-            try:
-                # Wait for an item with timeout to allow graceful shutdown
-                try:
-                    path = await asyncio.wait_for(
-                        self._reauth_queue.get(), timeout=60.0
-                    )
-                except asyncio.TimeoutError:
-                    # Queue is empty and idle for 60s - exit
-                    self._reauth_processor_task = None
-                    # lib_logger.debug("Re-auth queue processor idle, shutting down")
-                    return
-
-                try:
-                    lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
-                    await self.initialize_token(path, force_interactive=True)
-                    lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
-
-                except Exception as e:
-                    lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
-                    # No automatic retry for re-auth (requires user action)
-
-                finally:
-                    # Always clean up
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
-                        # lib_logger.debug(
-                        #     f"Re-auth cleanup for '{Path(path).name}'. "
-                        #     f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        # )
-                    self._reauth_queue.task_done()
-
-            except asyncio.CancelledError:
-                # Clean up current credential before breaking
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
-                # lib_logger.debug("Re-auth queue processor cancelled")
-                break
-            except Exception as e:
-                lib_logger.error(f"Error in re-auth queue processor: {e}")
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
 
     async def _perform_interactive_oauth(
         self, path: str, creds: Dict[str, Any], display_name: str
@@ -1219,15 +1135,18 @@ class GoogleOAuthBase:
         """
         Initialize OAuth token, triggering interactive OAuth flow if needed.
 
-        If interactive OAuth is required (expired refresh token, missing credentials, etc.),
-        the flow is coordinated globally via ReauthCoordinator to ensure only one
-        interactive OAuth flow runs at a time across all providers.
+        For new credential setup (CLI tool), interactive OAuth is used when:
+        - Token is expired and refresh fails
+        - Refresh token is missing
+
+        For proxy operation with force_interactive=True (deprecated):
+        - The credential is marked as permanently expired instead of interactive OAuth
+        - This prevents breaking the proxy flow with browser prompts
 
         Args:
             creds_or_path: Either a credentials dict or path to credentials file.
-            force_interactive: If True, skip expiry checks and force interactive OAuth.
-                               Use this when the refresh token is known to be invalid
-                               (e.g., after HTTP 400 from token endpoint).
+            force_interactive: If True, mark credential as expired (for proxy context).
+                               For CLI tool, use the normal path (force_interactive=False).
         """
         path = creds_or_path if isinstance(creds_or_path, str) else None
 
@@ -1246,12 +1165,22 @@ class GoogleOAuthBase:
             creds = (
                 await self._load_credentials(creds_or_path) if path else creds_or_path
             )
-            reason = ""
+
+            # If force_interactive is True, this was called from proxy context
+            # where re-auth was requested. Instead of interactive OAuth, mark as expired.
             if force_interactive:
-                reason = (
-                    "re-authentication was explicitly requested (refresh token invalid)"
+                if path:
+                    self._mark_credential_expired(
+                        path,
+                        "Refresh token invalid - re-authentication required"
+                    )
+                raise ValueError(
+                    f"Credential '{display_name}' requires re-authentication. "
+                    f"Run 'credential_tool.py' to manually re-authenticate, then restart proxy."
                 )
-            elif not creds.get("refresh_token"):
+
+            reason = ""
+            if not creds.get("refresh_token"):
                 reason = "refresh token is missing"
             elif self._is_token_expired(creds):
                 reason = "token is expired"
