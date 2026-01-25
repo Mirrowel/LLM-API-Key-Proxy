@@ -1,7 +1,7 @@
 #
 name: Create and publish a Docker image
 
-# Configures this workflow to run every time a change is pushed to the branch called `main` or `dev`.
+# Configures this workflow to run every time a change is pushed to the `dev` branch.
 on:
   workflow_dispatch:
     inputs:
@@ -10,13 +10,7 @@ on:
         required: false
         default: ''
   push:
-    branches: ["main"]
-    paths:
-      - "src/proxy_app/**"
-      - "src/rotator_library/**"
-      - ".github/workflows/docker-build.yml"
-      - "Dockerfile"
-      - "requirements.txt"
+    branches: ["dev"]
 
 # Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
 env:
@@ -102,10 +96,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: false
           sbom: false
 
