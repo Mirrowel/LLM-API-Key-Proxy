@@ -1757,7 +1757,15 @@ async def setup_new_credential(provider_name: str):
 
         # Add tier/project info if available (Google OAuth providers)
         if hasattr(result, "tier") and result.tier:
-            success_text.append(f"\nTier: {result.tier}")
+            # Try to get the full tier name for better display (e.g., "Google One AI PRO")
+            tier_display = result.tier
+            if result.credentials and isinstance(result.credentials, dict):
+                tier_full = result.credentials.get("_proxy_metadata", {}).get(
+                    "tier_full"
+                )
+                if tier_full:
+                    tier_display = tier_full
+            success_text.append(f"\nTier: {tier_display}")
         if hasattr(result, "project_id") and result.project_id:
             success_text.append(f"\nProject: {result.project_id}")
 
