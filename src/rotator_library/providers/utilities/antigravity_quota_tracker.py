@@ -51,7 +51,7 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    # Canonical tier names (Rust-style)
+    # Canonical tier names
     "PRO": {
         # Claude/GPT-OSS group (verified: 0.6667% per request = 150 requests)
         "claude-sonnet-4-5": 150,
@@ -398,7 +398,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
+                **self._get_antigravity_headers(credential_path),
             }
 
             payload = {
@@ -484,7 +484,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
+                **self._get_antigravity_headers(credential_path),
             }
             payload = {"project": project_id} if project_id else {}
 

@@ -55,7 +55,7 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    # Canonical tier names (Rust-style)
+    # Canonical tier names
     "PRO": {
         # Pro group (verified: 0.4% per request = 250 requests)
         "gemini-2.5-pro": 250,
