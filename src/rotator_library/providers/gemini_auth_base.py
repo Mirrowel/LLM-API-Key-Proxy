@@ -49,7 +49,7 @@ lib_logger = logging.getLogger("rotator_library")
 #
 # Source: gemini-cli/packages/core/src/code_assist/server.ts:284-290
 GEMINI_CLI_AUTH_HEADERS = {
-    "User-Agent": "GeminiCLI/0.26.0 (win32; x64)",
+    "User-Agent": "GeminiCLI/0.28.0 (win32; x64)",
     # -------------------------------------------------------------------------
     # COMMENTED OUT - Not sent by native gemini-cli for OAuth/Code Assist path
     # -------------------------------------------------------------------------
@@ -57,7 +57,7 @@ GEMINI_CLI_AUTH_HEADERS = {
     # "Client-Metadata": (                                  # Sent in body, not as header
     #     "ideType=IDE_UNSPECIFIED,"
     #     "pluginType=GEMINI,"
-    #     "ideVersion=0.26.0,"
+    #     "ideVersion=0.28.0,"
     #     "platform=WINDOWS_AMD64,"
     #     "updateChannel=stable"
     # ),
@@ -381,11 +381,13 @@ class GeminiAuthBase(GoogleOAuthBase):
                 if configured_project_id:
                     core_client_metadata["duetProject"] = configured_project_id
 
-                # Build load request - pass configured_project_id if available, otherwise None
+                # Build load request - only include cloudaicompanionProject if configured
+                # Native CLI omits this field entirely when no project is configured
                 load_request = {
-                    "cloudaicompanionProject": configured_project_id,  # Can be None
                     "metadata": core_client_metadata,
                 }
+                if configured_project_id:
+                    load_request["cloudaicompanionProject"] = configured_project_id
 
                 lib_logger.debug(
                     f"Sending loadCodeAssist request with cloudaicompanionProject={configured_project_id}"
@@ -575,17 +577,19 @@ class GeminiAuthBase(GoogleOAuthBase):
                             "No existing Code Assist project found - server will create one"
                         )
 
-                # Build onboard request - server will create project if None
+                # Build onboard request - only include cloudaicompanionProject if we have one
+                # CRITICAL: For free-tier, cloudaicompanionProject MUST be omitted entirely.
+                # Setting it to null causes 412 Precondition Failed error.
+                # Native CLI behavior: field is undefined (omitted) for free tier.
                 onboard_request = {
                     "tierId": tier_id,
-                    "cloudaicompanionProject": onboard_project_id,  # Can be None - server will create
-                    "metadata": {
-                        **core_client_metadata,
-                        "duetProject": onboard_project_id,
-                    }
-                    if onboard_project_id
-                    else core_client_metadata,
+                    "metadata": core_client_metadata.copy(),
                 }
+
+                # Only add cloudaicompanionProject and duetProject if we have a project ID
+                if onboard_project_id:
+                    onboard_request["cloudaicompanionProject"] = onboard_project_id
+                    onboard_request["metadata"]["duetProject"] = onboard_project_id
 
                 if onboard_project_id:
                     lib_logger.debug(

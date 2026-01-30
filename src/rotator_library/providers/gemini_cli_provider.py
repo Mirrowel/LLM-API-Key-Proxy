@@ -528,7 +528,7 @@ class GeminiCliProvider(
 
         # Hardcoded to Windows x64 platform (matching common development environment)
         # Native format: GeminiCLI/${version}/${model} (${platform}; ${arch})
-        user_agent = f"GeminiCLI/0.26.0/{model_name} (win32; x64)"
+        user_agent = f"GeminiCLI/0.28.0/{model_name} (win32; x64)"
 
         # =========================================================================
         # COMMENTED OUT HEADERS - Not sent by native gemini-cli for Code Assist path
@@ -546,7 +546,7 @@ class GeminiCliProvider(
         # client_metadata = (
         #     "ideType=IDE_UNSPECIFIED,"
         #     "pluginType=GEMINI,"
-        #     "ideVersion=0.26.0,"
+        #     "ideVersion=0.28.0,"
         #     "platform=WINDOWS_AMD64,"
         #     "updateChannel=stable"
         # )
