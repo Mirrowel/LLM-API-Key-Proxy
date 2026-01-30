@@ -512,7 +512,14 @@ class RotatingClient:
         for provider, manager in self._usage_managers.items():
             if provider_filter and provider != provider_filter:
                 continue
-            providers[provider] = await manager.get_stats_for_endpoint()
+
+            stats = await manager.get_stats_for_endpoint()
+
+            # Skip providers with no activity (filters out invalid/unused providers)
+            if stats.get("total_requests", 0) == 0:
+                continue
+
+            providers[provider] = stats
 
         summary = {
             "total_providers": len(providers),
