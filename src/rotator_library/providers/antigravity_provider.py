@@ -4716,7 +4716,14 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         # Reset internal attempt counter for this request (thread-safe via ContextVar)
         _internal_attempt_count.set(1)
 
-        for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
+        # Use the maximum of all retry limits to ensure the loop runs enough iterations
+        # for whichever error type needs the most retries. Each error type enforces its
+        # own limit via internal checks (EMPTY_RESPONSE_MAX_ATTEMPTS for empty/429,
+        # CAPACITY_EXHAUSTED_MAX_ATTEMPTS for 503).
+        max_loop_attempts = max(
+            EMPTY_RESPONSE_MAX_ATTEMPTS, CAPACITY_EXHAUSTED_MAX_ATTEMPTS
+        )
+        for attempt in range(max_loop_attempts):
             chunk_count = 0
 
             try:
