@@ -35,13 +35,13 @@ HARDCODED_MODELS = [
     "qwen3-coder-plus",
     "kimi-k2",
     "kimi-k2-0905",
-    "kimi-k2-thinking", # Seems to not work, but should
+    "kimi-k2-thinking",  # Seems to not work, but should
     "qwen3-max",
     "qwen3-max-preview",
     "qwen3-235b-a22b-thinking-2507",
     "deepseek-v3.2-reasoner",
     "deepseek-v3.2-chat",
-    "deepseek-v3.2", #seems to not work, but should. Use above variants instead
+    "deepseek-v3.2",  # seems to not work, but should. Use above variants instead
     "deepseek-v3.1",
     "deepseek-v3",
     "deepseek-r1",
@@ -285,14 +285,14 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             effort_lower = str(reasoning_effort).lower().strip()
             # Disabled values
             if effort_lower in ("none", "disabled", "0", "off", "false"):
-                #lib_logger.info(
+                # lib_logger.info(
                 #    f"iFlow: Detected reasoning_effort='{reasoning_effort}' → thinking DISABLED"
-                #)
+                # )
                 return False
             # Any other value enables thinking
-            #lib_logger.info(
+            # lib_logger.info(
             #    f"iFlow: Detected reasoning_effort='{reasoning_effort}' → thinking ENABLED"
-            #)
+            # )
             return True
 
         # Check extra_body for thinking config (Claude-style, for compatibility)
@@ -570,9 +570,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         raw_finish_reason = self._extract_finish_reason_from_chunk(chunk)
         if raw_finish_reason:
             stream_state["last_finish_reason"] = raw_finish_reason
-            #lib_logger.debug(
+            # lib_logger.debug(
             #    f"iFlow: Found finish_reason='{raw_finish_reason}' in raw chunk"
-            #)
+            # )
 
         def normalize_choices(
             choices_list: List[Dict[str, Any]],
@@ -600,10 +600,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 reasoning_content = delta.get("reasoning_content")
                 if reasoning_content and reasoning_content.strip():
                     if not stream_state.get("has_reasoning_logged"):
-                        #lib_logger.debug(
+                        # lib_logger.debug(
                         #    f"iFlow: Chunk contains reasoning_content "
                         #    f"({len(reasoning_content)} chars)"
-                        #)
+                        # )
                         stream_state["has_reasoning_logged"] = True
 
                 # Get current finish_reason
@@ -620,20 +620,21 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                         # Tool calls take highest priority
                         final_reason = "tool_calls"
                         if finish_reason and finish_reason != "tool_calls":
-                            #lib_logger.debug(
+                            pass  # Silently override - tool_calls takes priority
+                            # lib_logger.debug(
                             #    f"iFlow: Overriding finish_reason '{finish_reason}' "
                             #    f"with 'tool_calls' (tool_calls present)"
-                            #)
+                            # )
                     elif finish_reason:
                         # Use explicit finish_reason from this chunk
                         final_reason = finish_reason
                     elif stream_state.get("last_finish_reason"):
                         # Use tracked finish_reason from earlier chunk
                         final_reason = stream_state["last_finish_reason"]
-                        #lib_logger.debug(
+                        # lib_logger.debug(
                         #    f"iFlow: Using tracked finish_reason '{final_reason}' "
                         #    f"for final chunk"
-                        #)
+                        # )
                     else:
                         # No finish_reason found anywhere - default to stop with warning
                         final_reason = "stop"
@@ -642,9 +643,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                         )
 
                     choice_copy = {**choice_copy, "finish_reason": final_reason}
-                    #lib_logger.debug(
+                    # lib_logger.debug(
                     #    f"iFlow: Final chunk finish_reason set to '{final_reason}'"
-                    #)
+                    # )
                 else:
                     # For non-final chunks, normalize tool_calls if needed
                     if (
@@ -685,9 +686,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                     "completion_tokens": 1,
                     "total_tokens": 2,
                 }
-                #lib_logger.debug(
+                # lib_logger.debug(
                 #    "iFlow: Empty usage detected, using placeholder values for final chunk"
-                #)
+                # )
 
             yield {
                 "choices": normalized_choices,
@@ -931,7 +932,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
             # Log request to dedicated file
             file_logger.log_request(payload)
-            #lib_logger.debug(f"iFlow Request URL: {url}")
+            # lib_logger.debug(f"iFlow Request URL: {url}")
 
             return client.stream(
                 "POST",
@@ -1004,7 +1005,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 data_str = line[5:]  # Skip "data:"
 
                             if data_str.strip() == "[DONE]":
-                                #lib_logger.debug("iFlow: Received [DONE] marker")
+                                # lib_logger.debug("iFlow: Received [DONE] marker")
                                 break
                             try:
                                 chunk = json.loads(data_str)
