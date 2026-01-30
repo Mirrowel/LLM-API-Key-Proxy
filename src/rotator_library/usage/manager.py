@@ -390,7 +390,7 @@ class UsageManager:
                 if sid in candidate_ids
             }
         else:
-            states_to_check = self._states
+            states_to_check = self._get_active_states()
 
         # Convert accessor-based priorities to stable_id-based
         priority_overrides = None
@@ -594,7 +594,7 @@ class UsageManager:
         stable_id = self._selection.select(
             provider=self.provider,
             model=normalized_model,
-            states=self._states,
+            states=self._get_active_states(),
             quota_group=quota_group,
             exclude=exclude_ids,
             deadline=deadline,
@@ -815,7 +815,7 @@ class UsageManager:
         return self._selection.get_availability_stats(
             provider=self.provider,
             model=model,
-            states=self._states,
+            states=self._get_active_states(),
             quota_group=quota_group,
         )
 
@@ -1885,6 +1885,23 @@ class UsageManager:
     # =========================================================================
     # PRIVATE METHODS
     # =========================================================================
+
+    def _get_active_states(self) -> Dict[str, CredentialState]:
+        """
+        Get only active credential states.
+
+        Returns states for credentials currently registered with the proxy,
+        excluding stale/historical credentials that exist only in storage.
+        Use this for rotation, selection, and availability checking.
+
+        Returns:
+            Dict of stable_id -> CredentialState for active credentials only
+        """
+        return {
+            sid: state
+            for sid, state in self._states.items()
+            if sid in self._active_stable_ids
+        }
 
     def _resolve_fair_cycle_key(self, group_key: str) -> str:
         """Resolve fair cycle tracking key based on config."""
