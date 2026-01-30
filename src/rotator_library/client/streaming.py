@@ -282,17 +282,39 @@ class StreamingHandler:
             if delta.get("tool_calls"):
                 chunk_has_tool_calls = True
 
-            # Detect final chunk: has usage with completion_tokens > 0
-            has_completion_tokens = (
+            # Get source finish_reason before we potentially modify it
+            source_finish_reason = choice.get("finish_reason")
+
+            # Detect final chunk using multiple signals:
+            # 1. Primary: has usage with any meaningful token count > 0
+            # 2. Secondary: has usage (even empty) + source has finish_reason (Fallback case)
+            has_meaningful_usage = (
                 usage
                 and isinstance(usage, dict)
-                and usage.get("completion_tokens", 0) > 0
+                and any(
+                    usage.get(k, 0) > 0
+                    for k in [
+                        "completion_tokens",
+                        "prompt_tokens",
+                        "total_tokens",
+                        "reasoning_tokens",
+                    ]
+                )
             )
+            has_usage_with_finish = (
+                usage is not None
+                and isinstance(usage, dict)
+                and source_finish_reason is not None
+            )
+            is_final_chunk = has_meaningful_usage or has_usage_with_finish
 
-            if has_completion_tokens:
+            if is_final_chunk:
                 # FINAL CHUNK: Determine correct finish_reason
+                # Priority: tool_calls > source_finish_reason > accumulated > "stop"
                 if has_tool_calls or chunk_has_tool_calls:
                     choice["finish_reason"] = "tool_calls"
+                elif source_finish_reason:
+                    choice["finish_reason"] = source_finish_reason
                 elif accumulated_finish_reason:
                     choice["finish_reason"] = accumulated_finish_reason
                 else:

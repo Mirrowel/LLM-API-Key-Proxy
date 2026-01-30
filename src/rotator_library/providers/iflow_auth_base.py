@@ -505,52 +505,6 @@ class IFlowAuthBase:
             f"Action: Run 'credential_tool.py' to re-authenticate, then restart proxy"
         )
 
-    def _mark_credential_expired(self, path: str, reason: str) -> None:
-        """
-        Permanently mark a credential as expired and remove it from rotation.
-
-        This is called when a credential's refresh token is invalid or revoked,
-        meaning normal token refresh cannot work. The credential is removed from
-        rotation entirely and requires manual re-authentication via credential_tool.py.
-
-        The proxy must be restarted after fixing the credential.
-
-        Args:
-            path: Credential file path or env:// path
-            reason: Human-readable reason for expiration (e.g., "invalid_grant", "HTTP 401")
-        """
-        # Add to permanently expired set
-        self._permanently_expired_credentials.add(path)
-
-        # Clean up other tracking structures
-        self._queued_credentials.discard(path)
-
-        # Get display name
-        if path.startswith("env://"):
-            display_name = path
-        else:
-            display_name = Path(path).name
-
-        # Rich-formatted output for high visibility
-        console.print(
-            Panel(
-                f"[bold red]Credential:[/bold red] {display_name}\n"
-                f"[bold red]Reason:[/bold red] {reason}\n\n"
-                f"[yellow]This credential has been removed from rotation.[/yellow]\n"
-                f"[yellow]To fix: Run 'python credential_tool.py' to re-authenticate,[/yellow]\n"
-                f"[yellow]then restart the proxy.[/yellow]",
-                title="[bold red]⚠ CREDENTIAL EXPIRED - REMOVED FROM ROTATION[/bold red]",
-                border_style="red",
-            )
-        )
-
-        # Also log at ERROR level for log files
-        lib_logger.error(
-            f"CREDENTIAL EXPIRED - REMOVED FROM ROTATION | "
-            f"Credential: {display_name} | Reason: {reason} | "
-            f"Action: Run 'credential_tool.py' to re-authenticate, then restart proxy"
-        )
-
     async def _fetch_user_info(self, access_token: str) -> Dict[str, Any]:
         """
         Fetches user info (including API key) from iFlow API.

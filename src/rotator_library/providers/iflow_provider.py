@@ -4,6 +4,7 @@
 # src/rotator_library/providers/iflow_provider.py
 
 import copy
+import hashlib
 import json
 import time
 import os
@@ -12,6 +13,7 @@ import logging
 from typing import Union, AsyncGenerator, List, Dict, Any, Optional
 from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
+from .provider_cache import ProviderCache
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
@@ -27,15 +29,19 @@ lib_logger = logging.getLogger("rotator_library")
 # Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
     "glm-4.6",
+    "glm-4.7",
     "minimax-m2",
+    "minimax-m2.1",
     "qwen3-coder-plus",
     "kimi-k2",
     "kimi-k2-0905",
-    "kimi-k2-thinking",
+    "kimi-k2-thinking", # Seems to not work, but should
     "qwen3-max",
+    "qwen3-max-preview",
     "qwen3-235b-a22b-thinking-2507",
+    "deepseek-v3.2-reasoner",
     "deepseek-v3.2-chat",
-    "deepseek-v3.2",
+    "deepseek-v3.2", #seems to not work, but should. Use above variants instead
     "deepseek-v3.1",
     "deepseek-v3",
     "deepseek-r1",
@@ -62,6 +68,36 @@ SUPPORTED_PARAMS = {
     "response_format",
 }
 
+# =============================================================================
+# THINKING MODE CONFIGURATION
+# =============================================================================
+# Models using chat_template_kwargs.enable_thinking (boolean toggle)
+# Based on Go implementation: internal/thinking/provider/iflow/apply.go
+ENABLE_THINKING_MODELS = {
+    "glm-4.6",
+    "glm-4.7",
+    "qwen3-max-preview",
+    "deepseek-v3.2",
+    "deepseek-v3.1",
+}
+
+# GLM models need additional clear_thinking=false when thinking is enabled
+GLM_MODELS = {"glm-4.6", "glm-4.7"}
+
+# Models using reasoning_split (boolean) instead of enable_thinking
+REASONING_SPLIT_MODELS = {"minimax-m2", "minimax-m2.1"}
+
+# Models that benefit from reasoning_content preservation in message history
+# (for multi-turn conversations)
+REASONING_PRESERVATION_MODELS_PREFIXES = ("glm-4", "minimax-m2")
+
+# Cache file path for reasoning content preservation
+_REASONING_CACHE_FILE = (
+    Path(__file__).resolve().parent.parent.parent.parent
+    / "cache"
+    / "iflow_reasoning.json"
+)
+
 
 class IFlowProvider(IFlowAuthBase, ProviderInterface):
     """
@@ -74,6 +110,15 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
     def __init__(self):
         super().__init__()
         self.model_definitions = ModelDefinitions()
+
+        # Initialize reasoning cache for multi-turn conversation support
+        # Created in __init__ (not module level) to ensure event loop exists
+        self._reasoning_cache = ProviderCache(
+            cache_file=_REASONING_CACHE_FILE,
+            memory_ttl_seconds=3600,  # 1 hour in memory
+            disk_ttl_seconds=86400,  # 24 hours on disk
+            env_prefix="IFLOW_REASONING_CACHE",
+        )
 
     def has_custom_logic(self) -> bool:
         return True
@@ -218,10 +263,211 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 if "items" in prop_schema and isinstance(prop_schema["items"], dict):
                     self._clean_schema_properties({"item": prop_schema["items"]})
 
-    def _build_request_payload(self, **kwargs) -> Dict[str, Any]:
+    # =========================================================================
+    # THINKING MODE SUPPORT
+    # =========================================================================
+
+    def _should_enable_thinking(self, kwargs: Dict[str, Any]) -> Optional[bool]:
+        """
+        Check if thinking should be enabled based on request parameters.
+
+        Uses OpenAI-compatible format. Checks for reasoning_effort parameter.
+        Thinking is enabled for any value except "none", "disabled", or "0".
+
+        Returns:
+            True: Enable thinking
+            False: Disable thinking explicitly
+            None: No thinking params (passthrough - don't modify payload)
+        """
+        # Check reasoning_effort (OpenAI-style)
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if reasoning_effort is not None:
+            effort_lower = str(reasoning_effort).lower().strip()
+            # Disabled values
+            if effort_lower in ("none", "disabled", "0", "off", "false"):
+                #lib_logger.info(
+                #    f"iFlow: Detected reasoning_effort='{reasoning_effort}' → thinking DISABLED"
+                #)
+                return False
+            # Any other value enables thinking
+            #lib_logger.info(
+            #    f"iFlow: Detected reasoning_effort='{reasoning_effort}' → thinking ENABLED"
+            #)
+            return True
+
+        # Check extra_body for thinking config (Claude-style, for compatibility)
+        extra_body = kwargs.get("extra_body", {})
+        if extra_body and "thinking" in extra_body:
+            thinking = extra_body["thinking"]
+            if isinstance(thinking, dict):
+                budget = thinking.get("budget_tokens", 0)
+                return budget != 0
+            return bool(thinking)
+
+        return None  # No thinking params specified
+
+    def _apply_thinking_config(
+        self, payload: Dict[str, Any], model_name: str, kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Apply thinking configuration for supported iFlow models.
+
+        Logic matches Go implementation (internal/thinking/provider/iflow/apply.go):
+        - GLM models: enable_thinking + clear_thinking=false (when enabled)
+        - Qwen/DeepSeek: enable_thinking only
+        - MiniMax: reasoning_split
+
+        Args:
+            payload: The request payload to modify
+            model_name: Model name (without provider prefix)
+            kwargs: Original request kwargs containing reasoning_effort, etc.
+
+        Returns:
+            Modified payload with thinking config applied
+        """
+        model_lower = model_name.lower()
+        enable_thinking = self._should_enable_thinking(kwargs)
+
+        if enable_thinking is None:
+            return payload  # No thinking params, passthrough
+
+        # Check model type
+        is_glm = model_lower in GLM_MODELS
+        is_enable_thinking = model_lower in ENABLE_THINKING_MODELS or is_glm
+        is_minimax = model_lower in REASONING_SPLIT_MODELS
+
+        if is_enable_thinking:
+            # Models using chat_template_kwargs.enable_thinking
+            if "chat_template_kwargs" not in payload:
+                payload["chat_template_kwargs"] = {}
+            payload["chat_template_kwargs"]["enable_thinking"] = enable_thinking
+
+            # GLM models: strip clear_thinking first (like Go does with DeleteBytes),
+            # then set it to false only when thinking is enabled
+            if is_glm:
+                payload["chat_template_kwargs"].pop("clear_thinking", None)
+                if enable_thinking:
+                    payload["chat_template_kwargs"]["clear_thinking"] = False
+
+            lib_logger.info(
+                f"iFlow: Applied enable_thinking={enable_thinking} for {model_name}"
+            )
+        elif is_minimax:
+            # MiniMax models use reasoning_split
+            payload["reasoning_split"] = enable_thinking
+            lib_logger.info(
+                f"iFlow: Applied reasoning_split={enable_thinking} for {model_name}"
+            )
+
+        return payload
+
+    # =========================================================================
+    # REASONING CONTENT PRESERVATION
+    # =========================================================================
+
+    def _get_conversation_signature(self, messages: List[Dict[str, Any]]) -> str:
+        """
+        Generate a stable conversation signature from the first user message.
+
+        This provides conversation-level uniqueness for cache keys.
+        """
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str) and content:
+                    # Use first 100 chars of first user message as conversation signature
+                    return hashlib.md5(content[:100].encode()).hexdigest()[:8]
+        return "default"
+
+    def _get_message_cache_key(self, message: Dict[str, Any], conv_sig: str) -> str:
+        """
+        Generate a cache key for a message to look up cached reasoning.
+
+        Combines:
+        - Conversation signature (stable per conversation)
+        - Message content hash (identifies specific message)
+        """
+        content = message.get("content", "") or ""
+        role = message.get("role", "")
+        # Use content[:200] + role for message identity
+        msg_hash = hashlib.md5(f"{role}:{content[:200]}".encode()).hexdigest()[:12]
+        return f"{conv_sig}:{msg_hash}"
+
+    def _store_reasoning_content(self, message: Dict[str, Any], conv_sig: str) -> None:
+        """
+        Store reasoning_content from an assistant message for later retrieval.
+
+        Args:
+            message: The assistant message dict containing reasoning_content
+            conv_sig: Conversation signature for the cache key
+        """
+        reasoning = message.get("reasoning_content")
+        if reasoning and message.get("role") == "assistant":
+            key = self._get_message_cache_key(message, conv_sig)
+            self._reasoning_cache.store(key, reasoning)
+            lib_logger.debug(f"iFlow: Cached reasoning_content for message {key}")
+
+    def _inject_reasoning_content(
+        self, messages: List[Dict[str, Any]], model_name: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Inject cached reasoning_content into assistant messages.
+
+        Only for models that benefit from reasoning preservation (GLM-4.x, MiniMax-M2.x).
+        This is helpful for multi-turn conversations where the model may benefit
+        from seeing its previous reasoning to maintain coherent thought chains.
+
+        Args:
+            messages: List of messages in the conversation
+            model_name: Model name (without provider prefix)
+
+        Returns:
+            Messages list with reasoning_content restored where available
+        """
+        model_lower = model_name.lower()
+
+        # Only for models that benefit from reasoning preservation
+        if not any(
+            model_lower.startswith(prefix)
+            for prefix in REASONING_PRESERVATION_MODELS_PREFIXES
+        ):
+            return messages
+
+        # Get conversation signature
+        conv_sig = self._get_conversation_signature(messages)
+
+        result = []
+        restored_count = 0
+        for msg in messages:
+            if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                key = self._get_message_cache_key(msg, conv_sig)
+                cached = self._reasoning_cache.retrieve(key)
+                if cached:
+                    msg = {**msg, "reasoning_content": cached}
+                    restored_count += 1
+            result.append(msg)
+
+        if restored_count > 0:
+            lib_logger.debug(
+                f"iFlow: Restored reasoning_content for {restored_count} messages in {model_name}"
+            )
+
+        return result
+
+    def _build_request_payload(
+        self, model_name: str, full_kwargs: Dict[str, Any], **kwargs
+    ) -> Dict[str, Any]:
         """
         Builds a clean request payload with only supported parameters.
-        This prevents 400 Bad Request errors from litellm-internal parameters.
+        Also applies thinking mode and reasoning content preservation.
+
+        Args:
+            model_name: Model name without provider prefix (for thinking/reasoning logic)
+            full_kwargs: Original kwargs (for extracting reasoning_effort, etc.)
+            **kwargs: Filtered kwargs with stripped model name
+
+        Returns:
+            Complete payload ready for iFlow API
         """
         # Extract only supported OpenAI parameters
         payload = {k: v for k, v in kwargs.items() if k in SUPPORTED_PARAMS}
@@ -254,7 +500,34 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             ]
             lib_logger.debug("Injected placeholder tool for empty tools array")
 
+        # Inject cached reasoning_content into messages for multi-turn conversations
+        if "messages" in payload:
+            payload["messages"] = self._inject_reasoning_content(
+                payload["messages"], model_name
+            )
+
+        # Apply thinking mode configuration based on reasoning_effort
+        payload = self._apply_thinking_config(payload, model_name, full_kwargs)
+
         return payload
+
+    def _extract_finish_reason_from_chunk(self, chunk: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract finish_reason from a raw iFlow chunk by searching all possible locations.
+
+        Args:
+            chunk: Raw chunk from iFlow API
+
+        Returns:
+            The finish_reason if found, None otherwise
+        """
+        choices = chunk.get("choices", [])
+        for choice in choices:
+            if isinstance(choice, dict):
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    return finish_reason
+        return None
 
     def _convert_chunk_to_openai(
         self,
@@ -266,13 +539,16 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         Converts a raw iFlow SSE chunk to an OpenAI-compatible chunk.
         Since iFlow is OpenAI-compatible, minimal conversion is needed.
 
-        CRITICAL FIX: Handle chunks with BOTH usage and choices (final chunk)
-        without early return to ensure finish_reason is properly processed.
+        ROBUST FINISH_REASON HANDLING:
+        - Tracks finish_reason across all chunks in stream_state
+        - tool_calls takes priority over stop
+        - Always sets finish_reason on final chunks (with usage)
+        - Logs warning if no finish_reason found
 
         Args:
             chunk: Raw chunk from iFlow API
             model_id: Model identifier for response
-            stream_state: Mutable dict to track state across chunks (e.g., tool_calls seen)
+            stream_state: Mutable dict to track state across chunks
         """
         if not isinstance(chunk, dict):
             return
@@ -281,15 +557,35 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         if stream_state is None:
             stream_state = {}
 
+        # Get choices and usage data
+        choices = chunk.get("choices", [])
+        usage_data = chunk.get("usage")
+
+        # IMPORTANT: Empty dict {} is falsy in Python, but "usage": {} still indicates final chunk
+        # Use "is not None" check instead of truthiness
+        has_usage = usage_data is not None
+        is_final_chunk = has_usage
+
+        # Extract and track finish_reason from raw chunk
+        raw_finish_reason = self._extract_finish_reason_from_chunk(chunk)
+        if raw_finish_reason:
+            stream_state["last_finish_reason"] = raw_finish_reason
+            #lib_logger.debug(
+            #    f"iFlow: Found finish_reason='{raw_finish_reason}' in raw chunk"
+            #)
+
         def normalize_choices(
             choices_list: List[Dict[str, Any]],
-            is_final_chunk: bool = False,
+            force_final: bool = False,
         ) -> List[Dict[str, Any]]:
             """
-            Normalizes choices array:
-            - Tracks tool_calls presence in stream_state
-            - Overrides finish_reason to 'tool_calls' when tool_calls were seen
-            - For final chunks (with usage): ensures finish_reason is set (defaults to 'stop')
+            Normalizes choices array with robust finish_reason handling.
+
+            Priority for finish_reason:
+            1. tool_calls (if any tool_calls were seen in the stream)
+            2. Explicit finish_reason from this chunk
+            3. Last tracked finish_reason from stream_state
+            4. Default to 'stop' (with warning)
             """
             normalized = []
             for choice in choices_list:
@@ -300,17 +596,57 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 if delta.get("tool_calls"):
                     stream_state["has_tool_calls"] = True
 
+                # Track reasoning_content presence (for logging)
+                reasoning_content = delta.get("reasoning_content")
+                if reasoning_content and reasoning_content.strip():
+                    if not stream_state.get("has_reasoning_logged"):
+                        #lib_logger.debug(
+                        #    f"iFlow: Chunk contains reasoning_content "
+                        #    f"({len(reasoning_content)} chars)"
+                        #)
+                        stream_state["has_reasoning_logged"] = True
+
+                # Get current finish_reason
                 finish_reason = choice_copy.get("finish_reason")
 
-                # For final chunks, ensure finish_reason is always set
-                if is_final_chunk:
+                # Track any finish_reason we see
+                if finish_reason:
+                    stream_state["last_finish_reason"] = finish_reason
+
+                # For final chunks, ensure finish_reason is ALWAYS set
+                if force_final:
+                    # Priority: tool_calls > explicit > tracked > stop (with warning)
                     if stream_state.get("has_tool_calls"):
-                        if finish_reason != "tool_calls":
-                            choice_copy = {**choice_copy, "finish_reason": "tool_calls"}
-                    elif not finish_reason:
-                        choice_copy = {**choice_copy, "finish_reason": "stop"}
+                        # Tool calls take highest priority
+                        final_reason = "tool_calls"
+                        if finish_reason and finish_reason != "tool_calls":
+                            #lib_logger.debug(
+                            #    f"iFlow: Overriding finish_reason '{finish_reason}' "
+                            #    f"with 'tool_calls' (tool_calls present)"
+                            #)
+                    elif finish_reason:
+                        # Use explicit finish_reason from this chunk
+                        final_reason = finish_reason
+                    elif stream_state.get("last_finish_reason"):
+                        # Use tracked finish_reason from earlier chunk
+                        final_reason = stream_state["last_finish_reason"]
+                        #lib_logger.debug(
+                        #    f"iFlow: Using tracked finish_reason '{final_reason}' "
+                        #    f"for final chunk"
+                        #)
+                    else:
+                        # No finish_reason found anywhere - default to stop with warning
+                        final_reason = "stop"
+                        lib_logger.warning(
+                            f"iFlow: No finish_reason found in stream, defaulting to 'stop'"
+                        )
+
+                    choice_copy = {**choice_copy, "finish_reason": final_reason}
+                    #lib_logger.debug(
+                    #    f"iFlow: Final chunk finish_reason set to '{final_reason}'"
+                    #)
                 else:
-                    # For non-final chunks, only normalize if finish_reason already present
+                    # For non-final chunks, normalize tool_calls if needed
                     if (
                         finish_reason
                         and stream_state.get("has_tool_calls")
@@ -321,51 +657,73 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 normalized.append(choice_copy)
             return normalized
 
-        # Get choices and usage data
-        choices = chunk.get("choices", [])
-        usage_data = chunk.get("usage")
+        # Handle chunks with usage (final chunk indicator)
+        # Note: "usage": {} (empty dict) still indicates final chunk
+        if choices and has_usage:
+            # Normalize choices for final chunk - MUST set finish_reason
+            normalized_choices = normalize_choices(choices, force_final=True)
+            # Build usage dict, handling empty usage gracefully
+            usage_dict = {
+                "prompt_tokens": usage_data.get("prompt_tokens", 0)
+                if usage_data
+                else 0,
+                "completion_tokens": usage_data.get("completion_tokens", 0)
+                if usage_data
+                else 0,
+                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
+            }
 
-        # Handle chunks with BOTH choices and usage (typical for final chunk)
-        # CRITICAL: Keep as single chunk - don't split! Client needs usage to detect final chunk.
-        if choices and usage_data:
-            # Normalize choices for tool_calls finish_reason (final chunk)
-            normalized_choices = normalize_choices(choices, is_final_chunk=True)
-            # Yield single chunk with BOTH choices and usage
+            # CRITICAL FIX: If usage is empty/all-zeros (e.g., MiniMax sends "usage": {}),
+            # set placeholder non-zero values to ensure downstream processing
+            # (litellm/client) recognizes this as a final chunk and preserves finish_reason
+            if not any(
+                usage_dict.get(k, 0) > 0
+                for k in ["prompt_tokens", "completion_tokens", "total_tokens"]
+            ):
+                usage_dict = {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                }
+                #lib_logger.debug(
+                #    "iFlow: Empty usage detected, using placeholder values for final chunk"
+                #)
+
             yield {
                 "choices": normalized_choices,
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
+                "usage": usage_dict,
             }
             return
 
-        # Handle usage-only chunks
-        if usage_data:
+        # Handle usage-only chunks (no choices)
+        if has_usage and not choices:
+            usage_dict = {
+                "prompt_tokens": usage_data.get("prompt_tokens", 0)
+                if usage_data
+                else 0,
+                "completion_tokens": usage_data.get("completion_tokens", 0)
+                if usage_data
+                else 0,
+                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
+            }
             yield {
                 "choices": [],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
+                "usage": usage_dict,
             }
             return
 
-        # Handle content-only chunks
+        # Handle content-only chunks (no usage)
         if choices:
-            # Normalize choices for tool_calls finish_reason tracking
-            normalized_choices = normalize_choices(choices)
-            # iFlow returns OpenAI-compatible format, so we can mostly pass through
+            # Normalize choices - not final, so finish_reason not forced
+            normalized_choices = normalize_choices(choices, force_final=False)
             yield {
                 "choices": normalized_choices,
                 "model": model_id,
@@ -505,6 +863,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             if field not in final_message:
                 final_message[field] = None
 
+        # Remove MiniMax-specific reasoning_details - we have the full reasoning_content
+        # The reasoning_details array only contains partial data from the last chunk
+        final_message.pop("reasoning_details", None)
+
         # Determine finish_reason based on accumulated state
         # Priority: tool_calls wins if present, then chunk's finish_reason, then default to "stop"
         if aggregated_tool_calls:
@@ -553,7 +915,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             kwargs_with_stripped_model = {**kwargs, "model": model_name}
 
             # Build clean payload with only supported parameters
-            payload = self._build_request_payload(**kwargs_with_stripped_model)
+            # Pass original kwargs for thinking detection (reasoning_effort, etc.)
+            payload = self._build_request_payload(
+                model_name, kwargs, **kwargs_with_stripped_model
+            )
 
             headers = {
                 "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
@@ -566,7 +931,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
             # Log request to dedicated file
             file_logger.log_request(payload)
-            lib_logger.debug(f"iFlow Request URL: {url}")
+            #lib_logger.debug(f"iFlow Request URL: {url}")
 
             return client.stream(
                 "POST",
@@ -639,9 +1004,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 data_str = line[5:]  # Skip "data:"
 
                             if data_str.strip() == "[DONE]":
+                                #lib_logger.debug("iFlow: Received [DONE] marker")
                                 break
                             try:
                                 chunk = json.loads(data_str)
+
                                 for openai_chunk in self._convert_chunk_to_openai(
                                     chunk, model, stream_state
                                 ):
@@ -661,7 +1028,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 raise
 
         async def logging_stream_wrapper():
-            """Wraps the stream to log the final reassembled response."""
+            """Wraps the stream to log the final reassembled response and cache reasoning."""
             openai_chunks = []
             try:
                 async for chunk in stream_handler(await make_request()):
@@ -671,6 +1038,34 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 if openai_chunks:
                     final_response = self._stream_to_completion_response(openai_chunks)
                     file_logger.log_final_response(final_response.dict())
+
+                    # Store reasoning_content from the response for future multi-turn conversations
+                    # This enables reasoning preservation in subsequent requests
+                    model_name = model.split("/")[-1]
+                    messages = kwargs.get("messages", [])
+                    if messages:
+                        conv_sig = self._get_conversation_signature(messages)
+                        # Get the assistant message from the final response
+                        if final_response.choices and len(final_response.choices) > 0:
+                            choice = final_response.choices[0]
+                            message = getattr(choice, "message", None)
+                            if message:
+                                # Convert to dict if needed
+                                if hasattr(message, "model_dump"):
+                                    msg_dict = message.model_dump()
+                                elif hasattr(message, "__dict__"):
+                                    msg_dict = {
+                                        k: v
+                                        for k, v in message.__dict__.items()
+                                        if not k.startswith("_")
+                                    }
+                                else:
+                                    msg_dict = (
+                                        dict(message)
+                                        if isinstance(message, dict)
+                                        else {}
+                                    )
+                                self._store_reasoning_content(msg_dict, conv_sig)
 
         if kwargs.get("stream"):
             return logging_stream_wrapper()
