@@ -11,6 +11,7 @@ scattered throughout client.py, including:
 - Gemini safety settings and thinking parameter
 - NVIDIA thinking parameter
 - iflow stream_options removal
+- dedaluslabs tool_choice=auto removal
 
 Transforms are applied in a defined order with logging of modifications.
 """
@@ -60,6 +61,7 @@ class ProviderTransforms:
             "gemini": [self._transform_gemini_safety, self._transform_gemini_thinking],
             "nvidia_nim": [self._transform_nvidia_thinking],
             "iflow": [self._transform_iflow_stream_options],
+            "dedaluslabs": [self._transform_dedaluslabs_tool_choice],
         }
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
@@ -348,6 +350,27 @@ class ProviderTransforms:
         if "stream_options" in kwargs:
             del kwargs["stream_options"]
             return "iflow: removed stream_options"
+        return None
+
+    def _transform_dedaluslabs_tool_choice(
+        self,
+        kwargs: Dict[str, Any],
+        model: str,
+        provider: str,
+    ) -> Optional[str]:
+        """
+        Remove tool_choice=auto for dedaluslabs provider.
+
+        Dedaluslabs API returns HTTP 422 if tool_choice is passed as a string
+        ("auto") instead of an object. Since "auto" is the default behavior,
+        removing it fixes the issue without changing functionality.
+        """
+        if provider != "dedaluslabs":
+            return None
+
+        if kwargs.get("tool_choice") == "auto":
+            del kwargs["tool_choice"]
+            return "dedaluslabs: removed tool_choice=auto"
         return None
 
     # =========================================================================
