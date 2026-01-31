@@ -358,7 +358,7 @@ class RotatingClient:
 
         return await self._executor.execute(context)
 
-    def aembedding(
+    async def aembedding(
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
@@ -375,19 +375,39 @@ class RotatingClient:
                 f"Invalid model format or no credentials for provider: {model}"
             )
 
+        # Extract internal logging parameters (not passed to API)
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+
+        # Resolve model ID
+        resolved_model = self._model_resolver.resolve_model_id(model, provider)
+        kwargs["model"] = resolved_model
+
+        # Create transaction logger if enabled
+        transaction_logger = None
+        if self.enable_request_logging:
+            transaction_logger = TransactionLogger(
+                provider=provider,
+                model=resolved_model,
+                enabled=True,
+                parent_dir=parent_log_dir,
+            )
+            transaction_logger.log_request(kwargs)
+
         # Build request context (embeddings are never streaming)
         context = RequestContext(
-            model=model,
+            model=resolved_model,
             provider=provider,
             kwargs=kwargs,
             streaming=False,
+            request_type="embedding",
             credentials=self.all_credentials.get(provider, []),
             deadline=time.time() + self.global_timeout,
             request=request,
             pre_request_callback=pre_request_callback,
+            transaction_logger=transaction_logger,
         )
 
-        return self._executor.execute(context)
+        return await self._executor.execute(context)
 
     def token_count(self, **kwargs) -> int:
         """Calculate token count for text or messages.
