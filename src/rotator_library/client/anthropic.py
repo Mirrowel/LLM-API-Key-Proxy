@@ -103,6 +103,14 @@ class AnthropicHandler:
             openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
         if request.stream:
+            # Pre-calculate input tokens for message_start
+            # Anthropic's native API provides input_tokens in message_start, but OpenAI-format
+            # streams only provide usage data at the end. We calculate upfront to match behavior.
+            precalculated_input_tokens = self._client.token_count(
+                model=request.model,
+                messages=openai_request.get("messages", []),
+            )
+
             # Streaming response
             response_generator = await self._client.acompletion(
                 request=raw_request,
@@ -123,6 +131,7 @@ class AnthropicHandler:
                 request_id=request_id,
                 is_disconnected=is_disconnected,
                 transaction_logger=anthropic_logger,
+                precalculated_input_tokens=precalculated_input_tokens,
             )
         else:
             # Non-streaming response

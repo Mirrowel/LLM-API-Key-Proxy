@@ -265,8 +265,12 @@ class TransactionLogger:
         model = response_data.get("model", self.model)
         finish_reason = "N/A"
 
+        # Handle OpenAI format (choices[0].finish_reason)
         if "choices" in response_data and response_data["choices"]:
             finish_reason = response_data["choices"][0].get("finish_reason", "N/A")
+        # Handle Anthropic format (stop_reason at top level)
+        elif "stop_reason" in response_data:
+            finish_reason = response_data.get("stop_reason", "N/A")
 
         # Check for provider subdirectory
         has_provider_logs = False
@@ -279,6 +283,19 @@ class TransactionLogger:
             except OSError:
                 has_provider_logs = False
 
+        # Extract token counts - support both OpenAI and Anthropic formats
+        # Prefers OpenAI format if available: prompt_tokens, completion_tokens
+        # Falls back to Anthropic format: input_tokens, output_tokens
+        prompt_tokens = usage.get("prompt_tokens")
+        if prompt_tokens is None:
+            prompt_tokens = usage.get("input_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if completion_tokens is None:
+            completion_tokens = usage.get("output_tokens")
+        total_tokens = usage.get("total_tokens")
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+
         metadata = {
             "request_id": self.request_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
@@ -288,9 +305,9 @@ class TransactionLogger:
             "model": model,
             "streaming": self.streaming,
             "usage": {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
             },
             "finish_reason": finish_reason,
             "has_provider_logs": has_provider_logs,
