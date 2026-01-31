@@ -67,6 +67,12 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
             ("OPENROUTER_API_BASE", "API Base URL (optional)", None),
         ],
     },
+    "kilocode": {
+        "category": "popular",
+        "extra_vars": [
+            ("KILOCODE_API_BASE", "API Base URL (optional)", None),
+        ],
+    },
     "groq": {
         "category": "popular",
     },

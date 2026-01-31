@@ -443,9 +443,9 @@ class RotatingClient:
                         custom_caps[provider][tier_key][model_key] = {}
 
                     # Store max_requests value
-                    custom_caps[provider][tier_key][model_key]["max_requests"] = (
-                        env_value
-                    )
+                    custom_caps[provider][tier_key][model_key][
+                        "max_requests"
+                    ] = env_value
 
                 elif env_key.startswith(cooldown_prefix):
                     # Parse cooldown config
@@ -1476,9 +1476,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             # Record in accumulator for client reporting
@@ -1519,9 +1519,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1569,9 +1569,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1654,13 +1654,21 @@ class RotatingClient:
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:
                         litellm_kwargs["messages"] = [
-                            {"role": "user", "content": m["content"]}
-                            if m.get("role") == "system"
-                            else m
+                            (
+                                {"role": "user", "content": m["content"]}
+                                if m.get("role") == "system"
+                                else m
+                            )
                             for m in litellm_kwargs["messages"]
                         ]
 
                     litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+
+                    # If the provider is 'nvidia', set the custom provider to 'nvidia_nim'
+                    # and strip the prefix from the model name for LiteLLM.
+                    if provider == "nvidia":
+                        litellm_kwargs["custom_llm_provider"] = "nvidia_nim"
+                        litellm_kwargs["model"] = model.split("/", 1)[1]
 
                     for attempt in range(self.max_retries):
                         try:
@@ -1716,9 +1724,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
 
@@ -1760,9 +1768,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1815,9 +1823,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             classified_error = classify_error(e, provider=provider)
@@ -1878,9 +1886,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             if request and await request.is_disconnected():
@@ -2257,9 +2265,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
 
                                 # Record in accumulator for client reporting
@@ -2302,9 +2310,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
                                 classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
@@ -2352,9 +2360,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
                                 classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
@@ -2426,9 +2434,11 @@ class RotatingClient:
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:
                         litellm_kwargs["messages"] = [
-                            {"role": "user", "content": m["content"]}
-                            if m.get("role") == "system"
-                            else m
+                            (
+                                {"role": "user", "content": m["content"]}
+                                if m.get("role") == "system"
+                                else m
+                            )
                             for m in litellm_kwargs["messages"]
                         ]
 
@@ -2533,9 +2543,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                                 raw_response_text=cleaned_str,
                             )
 
@@ -2629,9 +2639,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
@@ -2680,9 +2690,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
@@ -3127,7 +3137,9 @@ class RotatingClient:
                         group_stats["total_requests_remaining"] = 0
                         # Fallback to avg_remaining_pct when max_requests unavailable
                         # This handles providers like Firmware that only provide percentage
-                        group_stats["total_remaining_pct"] = group_stats.get("avg_remaining_pct")
+                        group_stats["total_remaining_pct"] = group_stats.get(
+                            "avg_remaining_pct"
+                        )
 
                     prov_stats["quota_groups"][group_name] = group_stats
 
@@ -3334,9 +3346,9 @@ class RotatingClient:
         """
         result = {
             "action": "force_refresh",
-            "scope": "credential"
-            if credential
-            else ("provider" if provider else "all"),
+            "scope": (
+                "credential" if credential else ("provider" if provider else "all")
+            ),
             "provider": provider,
             "credential": credential,
             "credentials_refreshed": 0,
