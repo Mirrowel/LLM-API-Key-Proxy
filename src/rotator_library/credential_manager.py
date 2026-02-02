@@ -124,6 +124,55 @@ class CredentialManager:
         lib_logger.info("Starting automated OAuth credential discovery...")
         final_config = {}
 
+        # Special-case: Kiro CLI supports multiple credential sources
+        # Priority: REFRESH_TOKEN (env) > KIRO_CREDS_FILE (JSON) > KIRO_CLI_DB_FILE (SQLite) > default paths
+        kiro_refresh_token = self.env_vars.get("KIRO_REFRESH_TOKEN") or self.env_vars.get("REFRESH_TOKEN")
+        kiro_creds_file = self.env_vars.get("KIRO_CREDS_FILE")
+        kiro_cli_db_path = self.env_vars.get("KIRO_CLI_DB_FILE")
+
+        if kiro_refresh_token:
+            # Use env:token: prefix to indicate direct refresh token from env
+            final_config["kiro_cli"] = ["env:token:kiro_cli"]
+            lib_logger.info("Using KIRO_REFRESH_TOKEN for kiro_cli")
+        elif kiro_creds_file:
+            path = Path(kiro_creds_file).expanduser()
+            if path.exists():
+                # Use json: prefix to indicate JSON credential type
+                final_config["kiro_cli"] = [f"json:{path.resolve()}"]
+                lib_logger.info(f"Using KIRO_CREDS_FILE for kiro_cli: {path}")
+        elif kiro_cli_db_path:
+            path = Path(kiro_cli_db_path).expanduser()
+            if path.exists():
+                final_config["kiro_cli"] = [str(path.resolve())]
+                lib_logger.info(f"Using KIRO_CLI_DB_FILE for kiro_cli: {path}")
+
+        if "kiro_cli" not in final_config:
+            # Check default paths: JSON first, then SQLite
+            default_json_paths = [
+                Path.home() / ".aws" / "sso" / "cache" / "kiro-auth-token.json",
+            ]
+            default_sqlite_paths = [
+                # macOS
+                Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
+                Path.home() / "Library" / "Application Support" / "amazon-q" / "data.sqlite3",
+                # Linux
+                Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
+                Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
+            ]
+            # Try JSON first
+            for path in default_json_paths:
+                if path.exists():
+                    final_config["kiro_cli"] = [f"json:{path.resolve()}"]
+                    lib_logger.info(f"Using default kiro_cli JSON path: {path}")
+                    break
+            # Then try SQLite
+            if "kiro_cli" not in final_config:
+                for path in default_sqlite_paths:
+                    if path.exists():
+                        final_config["kiro_cli"] = [str(path.resolve())]
+                        lib_logger.info(f"Using default kiro_cli SQLite path: {path}")
+                        break
+
         # PHASE 1: Discover environment variable-based OAuth credentials
         # These take priority for stateless deployments
         env_oauth_creds = self._discover_env_oauth_credentials()

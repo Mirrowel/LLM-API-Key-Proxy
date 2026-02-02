@@ -9,7 +9,7 @@ services:
         max-size: "10m"
         max-file: "3"
     ports:
-      - "${PORT:-8000}:8000"
+      - "${PORT:-7777}:7777"
     volumes:
       # Mount .env files for configuration
       - ./.env:/app/.env:ro

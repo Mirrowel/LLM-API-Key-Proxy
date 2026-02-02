@@ -230,7 +230,7 @@ class QuotaViewer:
     def _get_base_url(self) -> str:
         """Get base URL for the current remote."""
         if not self.current_remote:
-            return "http://127.0.0.1:8000"
+            return "http://127.0.0.1:7777"
         host = self.current_remote.get("host", "127.0.0.1")
         host = normalize_host_for_connection(host)
 
@@ -239,7 +239,7 @@ class QuotaViewer:
             return host.rstrip("/")
 
         # Otherwise construct from host:port
-        port = self.current_remote.get("port", 8000)
+        port = self.current_remote.get("port", 7777)
         scheme = get_scheme_for_host(host, port)
         return f"{scheme}://{host}:{port}"
 
@@ -250,8 +250,8 @@ class QuotaViewer:
         Handles cases where base URL already contains a path (e.g., /v1):
         - Base: "https://api.example.com/v1", Endpoint: "/v1/quota-stats"
           -> "https://api.example.com/v1/quota-stats" (no duplication)
-        - Base: "http://localhost:8000", Endpoint: "/v1/quota-stats"
-          -> "http://localhost:8000/v1/quota-stats"
+        - Base: "http://localhost:7777", Endpoint: "/v1/quota-stats"
+          -> "http://localhost:7777/v1/quota-stats"
 
         Args:
             endpoint: The endpoint path (e.g., "/v1/quota-stats")
@@ -308,7 +308,7 @@ class QuotaViewer:
             # Hit the root domain, not the path (e.g., /v1 would 404)
             url = f"{parsed.scheme}://{parsed.netloc}/"
         else:
-            port = remote.get("port", 8000)
+            port = remote.get("port", 7777)
             scheme = get_scheme_for_host(host, port)
             url = f"{scheme}://{host}:{port}/"
 
@@ -1349,7 +1349,7 @@ class QuotaViewer:
                     str(idx),
                     remote.get("name", ""),
                     remote.get("host", ""),
-                    str(remote.get("port", 8000)),
+                    str(remote.get("port", 7777)),
                     is_default,
                 )
 
@@ -1406,7 +1406,7 @@ class QuotaViewer:
         if is_full_url(host):
             port_default = ""
         else:
-            port_default = "8000"
+            port_default = "7777"
 
         port_str = Prompt.ask(
             "Port (empty for full URLs)", default=port_default
@@ -1417,7 +1417,7 @@ class QuotaViewer:
             try:
                 port = int(port_str)
             except ValueError:
-                port = 8000
+                port = 7777
 
         api_key = Prompt.ask("API Key (optional)", default="").strip() or None
 
@@ -1455,7 +1455,7 @@ class QuotaViewer:
             try:
                 new_port = int(new_port_str)
             except ValueError:
-                new_port = current_port if current_port != "" else 8000
+                new_port = current_port if current_port != "" else 7777
 
         current_key = remote.get("api_key", "") or ""
         display_key = f"{current_key[:8]}..." if len(current_key) > 8 else current_key

@@ -26,7 +26,7 @@ class OpenAICompatibleProvider(ProviderInterface):
         <NAME>_API_KEY  - The API key (optional for some providers)
 
     Example:
-        MYSERVER_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_BASE=http://localhost:7777/v1
         MYSERVER_API_KEY=sk-xxx
 
     Note: This is only used for providers NOT in the known LiteLLM providers list.
