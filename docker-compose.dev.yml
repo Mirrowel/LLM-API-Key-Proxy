@@ -23,6 +23,14 @@ services:
       - ./key_usage.json:/app/key_usage.json
       # Optionally mount additional .env files (e.g., combined credential files)
       # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
+      
+      # --- Kiro CLI Credentials ---
+      # Option 1: Mount AWS SSO cache (JSON credentials from Kiro IDE) - RECOMMENDED
+      - ~/.aws/sso/cache:/root/.aws/sso/cache:ro
+      # Option 2: Mount kiro-cli SQLite database (macOS)
+      - ~/Library/Application Support/kiro-cli:/root/Library/Application Support/kiro-cli:ro
+      # Option 3: Mount kiro-cli SQLite database (Linux - uncomment if on Linux)
+      # - ~/.local/share/kiro-cli:/root/.local/share/kiro-cli:ro
     environment:
       # Skip OAuth interactive initialization in container (non-interactive)
       - SKIP_OAUTH_INIT_CHECK=true

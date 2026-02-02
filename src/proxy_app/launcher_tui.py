@@ -217,6 +217,50 @@ class SettingsDetector:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["oauth"] += oauth_count
 
+        # Detect Kiro CLI credentials (env token, JSON, or SQLite)
+        kiro_refresh_token = env_vars.get("KIRO_REFRESH_TOKEN") or env_vars.get("REFRESH_TOKEN")
+        kiro_creds_file = env_vars.get("KIRO_CREDS_FILE")
+        kiro_cli_db = env_vars.get("KIRO_CLI_DB_FILE")
+        kiro_detected = False
+
+        # Check explicit env vars first (in priority order)
+        if kiro_refresh_token:
+            kiro_detected = True
+        elif kiro_creds_file:
+            path = Path(kiro_creds_file).expanduser()
+            if path.exists():
+                kiro_detected = True
+        elif kiro_cli_db:
+            path = Path(kiro_cli_db).expanduser()
+            if path.exists():
+                kiro_detected = True
+
+        # Check default paths if not found via env vars
+        if not kiro_detected:
+            default_paths = [
+                # JSON (Kiro IDE)
+                Path.home() / ".aws" / "sso" / "cache" / "kiro-auth-token.json",
+                # SQLite (macOS)
+                Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
+                Path.home() / "Library" / "Application Support" / "amazon-q" / "data.sqlite3",
+                # SQLite (Linux)
+                Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
+                Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
+            ]
+            for path in default_paths:
+                if path.exists():
+                    kiro_detected = True
+                    break
+
+        if kiro_detected:
+            if "kiro_cli" not in providers:
+                providers["kiro_cli"] = {
+                    "api_keys": 0,
+                    "oauth": 0,
+                    "custom": False,
+                }
+            providers["kiro_cli"]["oauth"] += 1
+
         # Mark custom providers (have API_BASE set)
         for provider in providers:
             if os.getenv(f"{provider.upper()}_API_BASE"):

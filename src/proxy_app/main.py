@@ -450,6 +450,11 @@ async def lifespan(app: FastAPI):
                     credentials_to_initialize[provider].append(path)
                     continue
 
+                # Skip kiro_cli credentials - they use SQLite DB, not JSON
+                if provider == "kiro_cli":
+                    credentials_to_initialize[provider].append(path)
+                    continue
+
                 try:
                     with open(path, "r") as f:
                         data = json.load(f)

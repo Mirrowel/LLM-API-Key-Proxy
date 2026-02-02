@@ -19,7 +19,7 @@ This project consists of two components:
 - **One Endpoint, Many Providers** — Configure Gemini, OpenAI, Anthropic, and [any LiteLLM-supported provider](https://docs.litellm.ai/docs/providers) once. Access them all through a single API key
 - **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
-- **Exclusive Provider Support** — Includes custom providers not available elsewhere: **Antigravity** (Gemini 3 + Claude Sonnet/Opus 4.5), **Gemini CLI**, **Qwen Code**, and **iFlow**
+- **Exclusive Provider Support** — Includes custom providers not available elsewhere: **Antigravity** (Gemini 3 + Claude Sonnet/Opus 4.5), **Gemini CLI**, **Kiro CLI**, **Qwen Code**, and **iFlow**
 
 ---
 
@@ -104,6 +104,7 @@ openai/gpt-4o                    ← OpenAI API
 anthropic/claude-3-5-sonnet      ← Anthropic API
 openrouter/anthropic/claude-3-opus  ← OpenRouter
 gemini_cli/gemini-2.5-pro        ← Gemini CLI (OAuth)
+kiro_cli/claude-sonnet-4.5       ← Kiro CLI (Amazon Q/Kiro)
 antigravity/gemini-3-pro-preview ← Antigravity (Gemini 3, Claude Opus 4.5)
 ```
 
@@ -593,6 +594,62 @@ TIMEOUT_READ_NON_STREAMING=600  # Full response wait (10 min)
 ---
 
 ## OAuth Providers
+
+<details>
+<summary><b>Kiro CLI / Kiro IDE (Amazon Q / Kiro)</b></summary>
+
+Supports multiple credential sources from Kiro IDE or kiro-cli.
+
+**Setup (choose one):**
+
+**Option 1: Direct Refresh Token** (best for Docker/stateless deployments)
+```env
+KIRO_REFRESH_TOKEN="your_kiro_refresh_token"
+# or
+REFRESH_TOKEN="your_kiro_refresh_token"
+
+# Optional (only for Kiro Desktop auth, not needed for AWS SSO)
+PROFILE_ARN="arn:aws:codewhisperer:us-east-1:..."
+```
+
+**Option 2: Kiro IDE (JSON credentials)** - Recommended for local use
+1. Open Kiro IDE and sign in
+2. The proxy auto-detects `~/.aws/sso/cache/kiro-auth-token.json`
+```env
+# Or specify explicitly:
+KIRO_CREDS_FILE="~/.aws/sso/cache/kiro-auth-token.json"
+```
+
+**Option 3: kiro-cli (SQLite database)**
+1. Install and log in with `kiro-cli`
+2. The proxy auto-detects the SQLite database
+```env
+# Or specify explicitly:
+KIRO_CLI_DB_FILE="~/Library/Application Support/kiro-cli/data.sqlite3"
+```
+
+**Common Options:**
+
+```env
+# Optional region override (default: us-east-1)
+KIRO_REGION="us-east-1"
+```
+
+**Default auto-detection locations (checked in order):**
+
+1. JSON: `~/.aws/sso/cache/kiro-auth-token.json`
+2. SQLite (macOS): `~/Library/Application Support/kiro-cli/data.sqlite3`
+3. SQLite (macOS): `~/Library/Application Support/amazon-q/data.sqlite3`
+4. SQLite (Linux): `~/.local/share/kiro-cli/data.sqlite3`
+5. SQLite (Linux): `~/.local/share/amazon-q/data.sqlite3`
+
+**Authentication Types:**
+
+The proxy automatically detects the auth type based on credentials:
+- **Kiro Desktop Auth**: When `clientId`/`clientSecret` are NOT present (uses Kiro refresh endpoint)
+- **AWS SSO OIDC**: When `clientId`/`clientSecret` ARE present (uses AWS OIDC endpoint)
+
+</details>
 
 <details>
 <summary><b>Gemini CLI</b></summary>
