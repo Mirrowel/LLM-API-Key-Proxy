@@ -62,7 +62,7 @@ class LauncherConfig:
         self.config_path = config_path
         self.defaults = {
             "host": "127.0.0.1",
-            "port": 8000,
+            "port": 7777,
             "enable_request_logging": False,
             "enable_raw_logging": False,
         }
@@ -695,7 +695,7 @@ class LauncherTUI:
                 # Reset to Default Settings
                 # Define defaults
                 default_host = "127.0.0.1"
-                default_port = 8000
+                default_port = 7777
                 default_logging = False
                 default_raw_logging = False
                 default_api_key = "VerysecretKey"

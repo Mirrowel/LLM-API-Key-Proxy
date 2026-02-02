@@ -515,7 +515,7 @@ SCRAPED_PROVIDERS: dict[str, dict] = {
         "route": 'lemonade/',
         "api_key_env_vars": [],
         "api_base_env_vars": ['LEMONADE_API_BASE'],
-        "api_base_url": 'http://localhost:8000/api/v1',
+        "api_base_url": 'http://localhost:7777/api/v1',
         "endpoints": ['/chat/completions'],
         "features": ['streaming', 'function_calling', 'response_format', 'tools'],
         "model_count": 2,

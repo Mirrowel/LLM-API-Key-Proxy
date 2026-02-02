@@ -57,7 +57,7 @@ class QuotaViewerConfig:
                 {
                     "name": "Local",
                     "host": "127.0.0.1",
-                    "port": 8000,
+                    "port": 7777,
                     "api_key": None,
                     "is_default": True,
                 }
@@ -112,7 +112,7 @@ class QuotaViewerConfig:
         self,
         name: str,
         host: str,
-        port: Optional[Union[int, str]] = 8000,
+        port: Optional[Union[int, str]] = 7777,
         api_key: Optional[str] = None,
         is_default: bool = False,
     ) -> bool:
@@ -122,7 +122,7 @@ class QuotaViewerConfig:
         Args:
             name: Display name for the remote
             host: Hostname, IP address, or full URL (e.g., https://api.example.com/v1)
-            port: Port number (default 8000). Can be None or empty string for full URLs.
+            port: Port number (default 7777). Can be None or empty string for full URLs.
             api_key: Optional API key for authentication
             is_default: Whether this should be the default remote
 
@@ -252,7 +252,7 @@ class QuotaViewerConfig:
                     launcher_config = json.load(f)
 
                 host = launcher_config.get("host", "127.0.0.1")
-                port = launcher_config.get("port", 8000)
+                port = launcher_config.get("port", 7777)
 
                 # Update Local remote
                 local_remote = self.get_remote_by_name("Local")

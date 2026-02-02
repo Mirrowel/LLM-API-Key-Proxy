@@ -422,7 +422,7 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "category": "local",
         "note": "Local proxy. API key is optional.",
         "extra_vars": [
-            ("LEMONADE_API_BASE", "Lemonade URL", "http://localhost:8000/api/v1"),
+            ("LEMONADE_API_BASE", "Lemonade URL", "http://localhost:7777/api/v1"),
         ],
     },
     # NOTE: ollama, llamafile, petals, triton are in PROVIDER_BLACKLIST
@@ -643,7 +643,7 @@ class ProviderConfig:
        Request: openai/gpt-4 → LiteLLM gets model="openai/gpt-4", api_base="http://..."
 
     2. Custom OpenAI-compatible provider:
-       Set MYSERVER_API_BASE=http://myserver:8000/v1
+       Set MYSERVER_API_BASE=http://myserver:7777/v1
        Request: myserver/llama-3 → LiteLLM gets model="openai/llama-3",
                 api_base="http://...", custom_llm_provider="openai"
     """

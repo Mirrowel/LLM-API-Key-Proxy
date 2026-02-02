@@ -38,7 +38,7 @@ COPY src/ ./src/
 RUN mkdir -p logs oauth_creds
 
 # Expose the default port
-EXPOSE 8000
+EXPOSE 7777
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
@@ -46,4 +46,4 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 
 # Default command - runs proxy with the correct PYTHONPATH
-CMD ["python", "src/proxy_app/main.py", "--port", "8000"]
+CMD ["python", "src/proxy_app/main.py", "--port", "7777"]

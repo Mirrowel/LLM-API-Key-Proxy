@@ -17,7 +17,7 @@ parser = argparse.ArgumentParser(description="API Key Proxy Server")
 parser.add_argument(
     "--host", type=str, default="0.0.0.0", help="Host to bind the server to."
 )
-parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
+parser.add_argument("--port", type=int, default=7777, help="Port to run the server on.")
 parser.add_argument(
     "--enable-request-logging",
     action="store_true",

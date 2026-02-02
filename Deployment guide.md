@@ -21,11 +21,11 @@ Before deploying, try the proxy locally to ensure your keys work. This uses a pr
 2. Download the latest release ZIP file (e.g., for Windows).
 3. Unzip the file.
 4. Double-click `setup_env.bat`. A window will open—follow the prompts to add your PROXY_API_KEY (a strong secret you create) and provider keys. Use the [LiteLLM Providers Documentation](https://docs.litellm.ai/docs/providers) for guidance on key formats (e.g., `GEMINI_API_KEY_1="your-key"`).
-5. Double-click `proxy_app.exe` to start the proxy. It runs at `http://127.0.0.1:8000`—visit in a browser to confirm "API Key Proxy is running".
+5. Double-click `proxy_app.exe` to start the proxy. It runs at `http://127.0.0.1:7777`—visit in a browser to confirm "API Key Proxy is running".
 6. Test with curl (replace with your PROXY_API_KEY):
 
 ```
-curl -X POST http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer your-proxy-key" -d '{"model": "gemini/gemini-2.5-flash", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
+curl -X POST http://127.0.0.1:7777/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer your-proxy-key" -d '{"model": "gemini/gemini-2.5-flash", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
 ```
 
     - Expected: A JSON response with the answer (e.g., "Paris").
@@ -220,7 +220,7 @@ docker compose ps
 docker compose logs -f
 
 # Test the endpoint
-curl http://localhost:8000/
+curl http://localhost:7777/
 ```
 
 ### Manual Docker Run
@@ -236,7 +236,7 @@ touch key_usage.json
 docker run -d \
   --name llm-api-proxy \
   --restart unless-stopped \
-  -p 8000:8000 \
+  -p 7777:7777 \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
@@ -378,7 +378,7 @@ The image is built for both `linux/amd64` and `linux/arm64` architectures, so it
 | Container exits immediately   | Check logs: `docker compose logs` — likely missing `.env` or invalid config                                      |
 | Permission denied on volumes  | Ensure directories exist and have correct permissions: `mkdir -p oauth_creds logs && chmod 755 oauth_creds logs` |
 | OAuth credentials not loading | Verify `oauth_creds/` is mounted and contains valid JSON files, or check environment variables are set           |
-| Port already in use           | Change the port mapping: `-p 9000:8000` or edit `docker-compose.yml`                                             |
+| Port already in use           | Change the port mapping: `-p 9000:7777` or edit `docker-compose.yml`                                             |
 | Image not updating            | Force pull: `docker compose pull && docker compose up -d`                                                        |
 
 ---
@@ -488,7 +488,7 @@ nano .env
 # Also add your PROXY_API_KEY and other provider keys
 
 # Start the proxy
-uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 7777
 ```
 
 **Method B: Upload Credential Files**
@@ -501,7 +501,7 @@ scp -r oauth_creds/ user@your-vps-ip:/path/to/LLM-API-Key-Proxy/
 ls -la oauth_creds/
 
 # Start the proxy
-uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 7777
 ```
 
 > **Note**: Environment variables are preferred for production deployments (more secure, easier to manage, works with container orchestration).
@@ -572,7 +572,7 @@ Still in the credential tool:
 # Tunnels are no longer needed
 
 # Start the proxy on VPS (in a screen/tmux session or as a service)
-uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 7777
 ```
 
 ---
@@ -650,7 +650,7 @@ OAuth callback ports should **never** be publicly exposed:
 # sudo ufw allow 11451/tcp
 
 # ✅ Only open your proxy API port
-sudo ufw allow 8000/tcp
+sudo ufw allow 7777/tcp
 
 # Check firewall status
 sudo ufw status
@@ -677,7 +677,7 @@ Type=simple
 User=your-username
 WorkingDirectory=/path/to/LLM-API-Key-Proxy
 Environment="PATH=/path/to/python/bin"
-ExecStart=/path/to/python/bin/uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+ExecStart=/path/to/python/bin/uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 7777
 Restart=always
 RestartSec=10
 

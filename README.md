@@ -49,7 +49,7 @@ chmod +x proxy_app
 # Pull and run directly
 docker run -d \
   --name llm-api-proxy \
-  -p 8000:8000 \
+  -p 7777:7777 \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
@@ -81,7 +81,7 @@ pip install -r requirements.txt
 python src/proxy_app/main.py
 ```
 
-> **Tip:** Running with command-line arguments (e.g., `--host 0.0.0.0 --port 8000`) bypasses the TUI and starts the proxy directly.
+> **Tip:** Running with command-line arguments (e.g., `--host 0.0.0.0 --port 7777`) bypasses the TUI and starts the proxy directly.
 
 ---
 
@@ -91,7 +91,7 @@ Once the proxy is running, configure your application with these settings:
 
 | Setting | Value |
 |---------|-------|
-| **Base URL / API Endpoint** | `http://127.0.0.1:8000/v1` |
+| **Base URL / API Endpoint** | `http://127.0.0.1:7777/v1` |
 | **API Key** | Your `PROXY_API_KEY` |
 
 ### Model Format: `provider/model_name`
@@ -116,7 +116,7 @@ antigravity/gemini-3-pro-preview ← Antigravity (Gemini 3, Claude Opus 4.5)
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://127.0.0.1:8000/v1",
+    base_url="http://127.0.0.1:7777/v1",
     api_key="your-proxy-api-key"
 )
 
@@ -133,7 +133,7 @@ print(response.choices[0].message.content)
 <summary><b>curl</b></summary>
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+curl -X POST http://127.0.0.1:7777/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-proxy-api-key" \
   -d '{
@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 1. Go to **API Settings**
 2. Select **"Proxy"** or **"Custom OpenAI"** mode
 3. Configure:
-   - **API URL:** `http://127.0.0.1:8000/v1`
+   - **API URL:** `http://127.0.0.1:7777/v1`
    - **API Key:** Your `PROXY_API_KEY`
    - **Model:** `provider/model_name` (e.g., `gemini/gemini-2.5-flash`)
 4. Save and start chatting
@@ -169,7 +169,7 @@ In your configuration file (e.g., `config.json`):
       "title": "Gemini via Proxy",
       "provider": "openai",
       "model": "gemini/gemini-2.5-flash",
-      "apiBase": "http://127.0.0.1:8000/v1",
+      "apiBase": "http://127.0.0.1:7777/v1",
       "apiKey": "your-proxy-api-key"
     }
   ]
@@ -187,7 +187,7 @@ Claude Code natively supports custom Anthropic API endpoints. The recommended se
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "your-proxy-api-key",
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:7777",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "gemini/gemini-3-pro",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gemini/gemini-3-flash",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "openai/gpt-5-mini"
@@ -206,7 +206,7 @@ Now you can use Claude Code with Gemini, OpenAI, or any other configured provide
 from anthropic import Anthropic
 
 client = Anthropic(
-    base_url="http://127.0.0.1:8000",
+    base_url="http://127.0.0.1:7777",
     api_key="your-proxy-api-key"
 )
 
@@ -799,7 +799,7 @@ python src/proxy_app/main.py [OPTIONS]
 
 Options:
   --host TEXT                Host to bind (default: 0.0.0.0)
-  --port INTEGER             Port to run on (default: 8000)
+  --port INTEGER             Port to run on (default: 7777)
   --enable-request-logging   Enable detailed per-request logging
   --add-credential           Launch interactive credential setup tool
 ```
@@ -871,7 +871,7 @@ touch key_usage.json
 docker run -d \
   --name llm-api-proxy \
   --restart unless-stopped \
-  -p 8000:8000 \
+  -p 7777:7777 \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
@@ -945,7 +945,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/path/to/LLM-API-Key-Proxy
-ExecStart=/path/to/python -m uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 8000
+ExecStart=/path/to/python -m uvicorn src.proxy_app.main:app --host 0.0.0.0 --port 7777
 Restart=always
 
 [Install]

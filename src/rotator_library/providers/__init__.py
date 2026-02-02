@@ -24,7 +24,7 @@ class DynamicOpenAICompatibleProvider:
         <NAME>_API_KEY  - The API key
 
     Example:
-        MYSERVER_API_BASE=http://localhost:8000/v1
+        MYSERVER_API_BASE=http://localhost:7777/v1
         MYSERVER_API_KEY=sk-xxx
 
     Note: For known providers (openai, anthropic, etc.), setting _API_BASE
