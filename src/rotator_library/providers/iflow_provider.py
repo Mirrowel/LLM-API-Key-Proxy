@@ -36,6 +36,7 @@ HARDCODED_MODELS = [
     "kimi-k2",
     "kimi-k2-0905",
     "kimi-k2-thinking",  # Seems to not work, but should
+    "kimi-k2.5",  # Seems to not work, but should
     "qwen3-max",
     "qwen3-max-preview",
     "qwen3-235b-a22b-thinking-2507",
