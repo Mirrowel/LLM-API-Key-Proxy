@@ -622,7 +622,7 @@ class IFlowAuthBase:
         if not result.get("success"):
             raise ValueError("iFlow user info request not successful")
 
-        data = result.get("data", {})
+        data = result.get("data") or {}
         api_key = data.get("apiKey", "").strip()
         if not api_key:
             raise ValueError("Missing API key in user info response")
@@ -676,7 +676,7 @@ class IFlowAuthBase:
             error_msg = result.get("message", "Unknown error")
             raise ValueError(f"Cookie authentication failed: {error_msg}")
 
-        data = result.get("data", {})
+        data = result.get("data") or {}
 
         # Handle case where apiKey is masked - use apiKeyMask if apiKey is empty
         if not data.get("apiKey") and data.get("apiKeyMask"):
@@ -732,7 +732,7 @@ class IFlowAuthBase:
             error_msg = result.get("message", "Unknown error")
             raise ValueError(f"Cookie API key refresh failed: {error_msg}")
 
-        return result.get("data", {})
+        return result.get("data") or {}
 
     async def authenticate_with_cookie(self, cookie: str) -> Dict[str, Any]:
         """
