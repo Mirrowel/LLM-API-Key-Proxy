@@ -1324,25 +1324,6 @@ class RotatingClient:
             current_cred = None
             key_acquired = False
             try:
-                # Check for a provider-wide cooldown first.
-                if await self.cooldown_manager.is_cooling_down(provider):
-                    remaining_cooldown = (
-                        await self.cooldown_manager.get_cooldown_remaining(provider)
-                    )
-                    remaining_budget = deadline - time.time()
-
-                    # If the cooldown is longer than the remaining time budget, fail fast.
-                    if remaining_cooldown > remaining_budget:
-                        lib_logger.warning(
-                            f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early."
-                        )
-                        break
-
-                    lib_logger.warning(
-                        f"Provider {provider} is in cooldown. Waiting for {remaining_cooldown:.2f} seconds."
-                    )
-                    await asyncio.sleep(remaining_cooldown)
-
                 creds_to_try = [
                     c for c in credentials_for_provider if c not in tried_creds
                 ]
@@ -1497,7 +1478,7 @@ class RotatingClient:
                             if classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1599,7 +1580,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1749,7 +1730,7 @@ class RotatingClient:
                             ):
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1851,7 +1832,7 @@ class RotatingClient:
                             if classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             # Check if we should retry same key (server errors with retries left)
@@ -1911,7 +1892,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             # Check if this error should trigger rotation
@@ -2096,21 +2077,6 @@ class RotatingClient:
                 current_cred = None
                 key_acquired = False
                 try:
-                    if await self.cooldown_manager.is_cooling_down(provider):
-                        remaining_cooldown = (
-                            await self.cooldown_manager.get_cooldown_remaining(provider)
-                        )
-                        remaining_budget = deadline - time.time()
-                        if remaining_cooldown > remaining_budget:
-                            lib_logger.warning(
-                                f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early."
-                            )
-                            break
-                        lib_logger.warning(
-                            f"Provider {provider} is in a global cooldown. All requests to this provider will be paused for {remaining_cooldown:.2f} seconds."
-                        )
-                        await asyncio.sleep(remaining_cooldown)
-
                     creds_to_try = [
                         c for c in credentials_for_provider if c not in tried_creds
                     ]
@@ -2288,7 +2254,7 @@ class RotatingClient:
                                         classified_error.retry_after or 60
                                     )
                                     await self.cooldown_manager.start_cooldown(
-                                        provider, cooldown_duration
+                                        current_cred, cooldown_duration
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -2619,7 +2585,7 @@ class RotatingClient:
                                         classified_error.retry_after or 60
                                     )
                                     await self.cooldown_manager.start_cooldown(
-                                        provider, cooldown_duration
+                                        current_cred, cooldown_duration
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -2713,7 +2679,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
                                 lib_logger.warning(
                                     f"Rate limit detected for {provider}. Starting {cooldown_duration}s cooldown."

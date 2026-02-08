@@ -358,9 +358,9 @@ def anthropic_to_openai_messages(
                         for c in openai_content
                         if c.get("type") == "text"
                     ]
-                    msg_dict["content"] = " ".join(text_parts) if text_parts else None
+                    msg_dict["content"] = " ".join(text_parts) if text_parts else ""
                 else:
-                    msg_dict["content"] = None
+                    msg_dict["content"] = ""
                 if reasoning_content:
                     msg_dict["reasoning_content"] = reasoning_content
                 if thinking_signature:
