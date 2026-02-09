@@ -132,3 +132,5 @@ cache/
 
 oauth_creds/
 
+#Agentic tools
+.omc/

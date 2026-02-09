@@ -804,6 +804,79 @@ class RotatingClient:
         ):
             litellm_kwargs["safety_settings"] = default_generic.copy()
 
+    def _apply_provider_headers(
+        self, litellm_kwargs: Dict[str, Any], provider: str, credential: str
+    ):
+        """
+        Apply correct provider headers and remove problematic client headers.
+
+        This ensures that authorization/x-api-key headers from client requests
+        are replaced with the correct values from the provider configuration.
+
+        Args:
+            litellm_kwargs: The kwargs being prepared for LiteLLM
+            provider: The provider name (e.g., 'kilocode', 'openai')
+            credential: The credential/API key being used
+        """
+        # Headers that should be removed from client requests to prevent
+        # them from being forwarded to the actual provider
+        problematic_headers = {
+            "authorization",
+            "x-api-key",
+            "api-key",
+        }
+
+        # Remove problematic headers from litellm_kwargs if present
+        # These might come from extra_body or other client-provided parameters
+        if "extra_body" in litellm_kwargs and isinstance(
+            litellm_kwargs["extra_body"], dict
+        ):
+            extra_body = litellm_kwargs["extra_body"]
+            for header in problematic_headers:
+                extra_body.pop(header, None)
+                # Also check for case-insensitive headers
+                for key in list(extra_body.keys()):
+                    if key.lower() == header:
+                        extra_body.pop(key, None)
+
+        # Check for direct headers parameter in litellm_kwargs
+        if "headers" in litellm_kwargs and isinstance(litellm_kwargs["headers"], dict):
+            headers = litellm_kwargs["headers"]
+            for header in problematic_headers:
+                headers.pop(header, None)
+                # Also check for case-insensitive headers
+                for key in list(headers.keys()):
+                    if key.lower() == header:
+                        headers.pop(key, None)
+
+        # Add provider-specific headers from environment variables if configured
+        # These headers should be used instead of any client-provided ones
+        provider_headers_key = f"{provider.upper()}_API_HEADERS"
+        provider_headers = os.environ.get(provider_headers_key)
+
+        if provider_headers:
+            try:
+                # Parse headers from JSON format
+                import json
+                headers_dict = json.loads(provider_headers)
+                if isinstance(headers_dict, dict):
+                    # Use headers parameter if available, otherwise create it
+                    if "headers" not in litellm_kwargs:
+                        litellm_kwargs["headers"] = {}
+                    if isinstance(litellm_kwargs["headers"], dict):
+                        litellm_kwargs["headers"].update(headers_dict)
+                    elif "extra_body" in litellm_kwargs and isinstance(
+                        litellm_kwargs["extra_body"], dict
+                    ):
+                        litellm_kwargs["extra_body"].update(headers_dict)
+                    lib_logger.debug(
+                        f"Applied provider headers from {provider_headers_key} for provider '{provider}'"
+                    )
+            except (json.JSONDecodeError, TypeError) as e:
+                lib_logger.warning(
+                    f"Failed to parse {provider_headers_key}: {e}. Expected JSON format."
+                )
+
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         return self.oauth_credentials
 
@@ -1600,6 +1673,11 @@ class RotatingClient:
                     else:  # API Key
                         litellm_kwargs["api_key"] = current_cred
 
+                    # [FIX] Remove problematic headers and add correct provider headers
+                    # This ensures that authorization/x-api-key from client requests
+                    # are replaced with the correct values from configuration
+                    self._apply_provider_headers(litellm_kwargs, provider, current_cred)
+
                     provider_instance = self._get_provider_instance(provider)
                     if provider_instance:
                         # Ensure default Gemini safety settings are present (without overriding request)
@@ -2365,6 +2443,11 @@ class RotatingClient:
                             pass
                         else:  # API Key
                             litellm_kwargs["api_key"] = current_cred
+
+                    # [FIX] Remove problematic headers and add correct provider headers
+                    # This ensures that authorization/x-api-key from client requests
+                    # are replaced with the correct values from configuration
+                    self._apply_provider_headers(litellm_kwargs, provider, current_cred)
 
                     provider_instance = self._get_provider_instance(provider)
                     if provider_instance:
