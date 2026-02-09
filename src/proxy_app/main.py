@@ -11,12 +11,14 @@ from pathlib import Path
 import sys
 import argparse
 import logging
+import re
 
 # Fix Windows console encoding issues
 if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -374,10 +376,13 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 api_keys = {}
 for key, value in os.environ.items():
     if "_API_KEY" in key and key != "PROXY_API_KEY":
-        provider = key.split("_API_KEY")[0].lower()
-        if provider not in api_keys:
-            api_keys[provider] = []
-        api_keys[provider].append(value)
+        # Parse provider name from key like KILOCODE_API_KEY or KILOCODE_API_KEY_1
+        match = re.match(r"^([A-Z0-9]+)_API_KEY(?:_\d+)?$", key)
+        if match:
+            provider = match.group(1).lower()
+            if provider not in api_keys:
+                api_keys[provider] = []
+            api_keys[provider].append(value)
 
 # Load model ignore lists from environment variables
 ignore_models = {}
@@ -833,9 +838,9 @@ async def streaming_response_wrapper(
                                     ]
                             if "arguments" in value:
                                 if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
+                                    final_message["function_call"][
+                                        "arguments"
+                                    ] += value["arguments"]
 
                         else:  # Generic key handling for other data like 'reasoning'
                             # FIX: Role should always replace, never concatenate

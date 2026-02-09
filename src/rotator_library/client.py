@@ -1442,6 +1442,15 @@ class RotatingClient:
 
                 litellm_kwargs = kwargs.copy()
 
+                # [FIX] Remove client-provided headers/api_key that could override provider credentials
+                # Clean case-insensitive headers and api_key
+                headers_to_remove = ["authorization", "x-api-key", "api-key", "api_key"]
+                for key in headers_to_remove:
+                    litellm_kwargs.pop(key, None)
+                    litellm_kwargs.pop(key.lower(), None)
+                    litellm_kwargs.pop(key.upper(), None)
+                    litellm_kwargs.pop(key.title(), None)
+
                 # [NEW] Merge provider-specific params
                 if provider in self.litellm_provider_params:
                     litellm_kwargs["litellm_params"] = {
@@ -2204,6 +2213,15 @@ class RotatingClient:
                     tried_creds.add(current_cred)
 
                     litellm_kwargs = kwargs.copy()
+
+                    # [FIX] Remove client-provided headers/api_key that could override provider credentials
+                    headers_to_remove = ["authorization", "x-api-key", "api-key", "api_key"]
+                    for key in headers_to_remove:
+                        litellm_kwargs.pop(key, None)
+                        litellm_kwargs.pop(key.lower(), None)
+                        litellm_kwargs.pop(key.upper(), None)
+                        litellm_kwargs.pop(key.title(), None)
+
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
 
