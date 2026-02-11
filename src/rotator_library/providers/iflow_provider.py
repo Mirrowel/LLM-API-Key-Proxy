@@ -4,6 +4,7 @@
 # src/rotator_library/providers/iflow_provider.py
 
 import copy
+import hmac
 import hashlib
 import json
 import time
@@ -68,6 +69,11 @@ SUPPORTED_PARAMS = {
     "seed",
     "response_format",
 }
+
+IFLOW_USER_AGENT = "iFlow-Cli"
+IFLOW_HEADER_SESSION_ID = "session-id"
+IFLOW_HEADER_TIMESTAMP = "x-iflow-timestamp"
+IFLOW_HEADER_SIGNATURE = "x-iflow-signature"
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -512,6 +518,39 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         return payload
 
+    def _create_iflow_signature(
+        self, user_agent: str, session_id: str, timestamp_ms: int, api_key: str
+    ) -> str:
+        """Generate iFlow HMAC-SHA256 signature: userAgent:sessionId:timestamp."""
+        if not api_key:
+            return ""
+
+        payload = f"{user_agent}:{session_id}:{timestamp_ms}"
+        return hmac.new(
+            api_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    def _build_iflow_headers(self, api_key: str, stream: bool) -> Dict[str, str]:
+        """Build iFlow request headers, including signed auth headers."""
+        session_id = f"session-{uuid.uuid4()}"
+        timestamp_ms = int(time.time() * 1000)
+        signature = self._create_iflow_signature(
+            IFLOW_USER_AGENT, session_id, timestamp_ms, api_key
+        )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": IFLOW_USER_AGENT,
+            IFLOW_HEADER_SESSION_ID: session_id,
+            IFLOW_HEADER_TIMESTAMP: str(timestamp_ms),
+            "Accept": "text/event-stream" if stream else "application/json",
+        }
+        if signature:
+            headers[IFLOW_HEADER_SIGNATURE] = signature
+
+        return headers
+
     def _extract_finish_reason_from_chunk(self, chunk: Dict[str, Any]) -> Optional[str]:
         """
         Extract finish_reason from a raw iFlow chunk by searching all possible locations.
@@ -922,12 +961,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 model_name, kwargs, **kwargs_with_stripped_model
             )
 
-            headers = {
-                "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "User-Agent": "iFlow-Cli",
-            }
+            headers = self._build_iflow_headers(
+                api_key=api_key,
+                stream=bool(payload.get("stream")),
+            )
 
             url = f"{api_base.rstrip('/')}/chat/completions"
 
@@ -983,6 +1020,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
                         # Handle other errors
                         else:
+                            if not error_text:
+                                content_type = response.headers.get("content-type", "")
+                                error_text = (
+                                    f"(empty response body, content-type={content_type})"
+                                )
                             error_msg = (
                                 f"iFlow HTTP {response.status_code} error: {error_text}"
                             )
