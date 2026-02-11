@@ -63,6 +63,7 @@ class RequestContext:
     streaming: bool
     credentials: List[str]
     deadline: float
+    request_type: Literal["completion", "embedding"] = "completion"
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None
