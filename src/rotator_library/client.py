@@ -963,6 +963,19 @@ class RotatingClient:
                 return None
         return self._provider_instances[provider_name]
 
+    def _normalize_model_string(self, model: str) -> str:
+        """Normalize incoming model string for consistent routing and matching."""
+        if not isinstance(model, str):
+            return ""
+        return model.strip()
+
+    def _extract_provider_from_model(self, model: str) -> str:
+        """Extract provider prefix from provider/model format safely."""
+        normalized_model = self._normalize_model_string(model)
+        if not normalized_model or "/" not in normalized_model:
+            return ""
+        return normalized_model.split("/", 1)[0].strip().lower()
+
     def _resolve_model_id(self, model: str, provider: str) -> str:
         """
         Resolves the actual model ID to send to the provider.
@@ -1278,11 +1291,14 @@ class RotatingClient:
         **kwargs,
     ) -> Any:
         """A generic retry mechanism for non-streaming API calls."""
-        model = kwargs.get("model")
+        model = self._normalize_model_string(kwargs.get("model"))
         if not model:
             raise ValueError("'model' is a required parameter.")
+        kwargs["model"] = model
 
-        provider = model.split("/")[0]
+        provider = self._extract_provider_from_model(model)
+        if not provider:
+            raise ValueError("'model' must be in 'provider/model' format.")
         if provider not in self.all_credentials:
             raise ValueError(
                 f"No API keys or OAuth credentials configured for provider: {provider}"
@@ -2075,8 +2091,14 @@ class RotatingClient:
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
-        model = kwargs.get("model")
-        provider = model.split("/")[0]
+        model = self._normalize_model_string(kwargs.get("model"))
+        if not model:
+            raise ValueError("'model' is a required parameter.")
+        kwargs["model"] = model
+
+        provider = self._extract_provider_from_model(model)
+        if not provider:
+            raise ValueError("'model' must be in 'provider/model' format.")
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
@@ -2947,8 +2969,9 @@ class RotatingClient:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
         # Handle iflow provider: remove stream_options to avoid HTTP 406
-        model = kwargs.get("model", "")
-        provider = model.split("/")[0] if "/" in model else ""
+        model = self._normalize_model_string(kwargs.get("model", ""))
+        kwargs["model"] = model
+        provider = self._extract_provider_from_model(model)
 
         if provider == "iflow" and "stream_options" in kwargs:
             lib_logger.debug(
@@ -3026,7 +3049,7 @@ class RotatingClient:
         # Add preprompt tokens for Antigravity provider
         # The Antigravity provider injects system instructions during actual API calls,
         # so we need to account for those tokens in the count
-        provider = model.split("/")[0] if "/" in model else ""
+        provider = self._extract_provider_from_model(model)
         if provider == "antigravity":
             try:
                 from .providers.antigravity_provider import (
@@ -3600,7 +3623,7 @@ class RotatingClient:
         original_model = request.model
 
         # Extract provider from model for logging
-        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+        provider = self._extract_provider_from_model(original_model) or "unknown"
 
         # Create Anthropic transaction logger if request logging is enabled
         anthropic_logger = None

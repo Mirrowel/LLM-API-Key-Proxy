@@ -753,11 +753,39 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     original_exception=e,
                     status_code=status_code,
                 )
-            return ClassifiedError(
-                error_type="invalid_request",
-                original_exception=e,
-                status_code=status_code,
-            )
+
+            # Provider-side transient 400s (from upstream wrappers) should rotate.
+            # Keep strict fail-fast behavior for explicit policy/safety violations.
+            if any(
+                pattern in error_body
+                for pattern in [
+                    "policy",
+                    "safety",
+                    "content blocked",
+                    "prompt blocked",
+                ]
+            ):
+                return ClassifiedError(
+                    error_type="invalid_request",
+                    original_exception=e,
+                    status_code=status_code,
+                )
+
+            if any(
+                pattern in error_body
+                for pattern in [
+                    "provider returned error",
+                    "upstream error",
+                    "upstream temporarily unavailable",
+                    "upstream service unavailable",
+                ]
+            ):
+                return ClassifiedError(
+                    error_type="server_error",
+                    original_exception=e,
+                    status_code=503,
+                )
+
             return ClassifiedError(
                 error_type="invalid_request",
                 original_exception=e,
@@ -841,6 +869,22 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         )
 
     if isinstance(e, (InvalidRequestError, BadRequestError)):
+        error_msg = str(e).lower()
+        if any(
+            pattern in error_msg
+            for pattern in [
+                "provider returned error",
+                "upstream error",
+                "upstream temporarily unavailable",
+                "upstream service unavailable",
+            ]
+        ):
+            return ClassifiedError(
+                error_type="server_error",
+                original_exception=e,
+                status_code=status_code or 503,
+            )
+
         return ClassifiedError(
             error_type="invalid_request",
             original_exception=e,
