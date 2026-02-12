@@ -66,6 +66,7 @@ OAUTH_FRIENDLY_NAMES = {
     "qwen_code": "Qwen Code",
     "iflow": "iFlow",
     "antigravity": "Antigravity",
+    "codex": "OpenAI Codex",
 }
 
 
