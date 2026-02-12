@@ -893,8 +893,12 @@ def is_unrecoverable_error(e: Exception) -> bool:
     """
     Checks if the exception is a non-retriable client-side error.
     These are errors that will not resolve on their own.
+
+    NOTE: We no longer treat BadRequestError/InvalidRequestError as unrecoverable
+    because "invalid_request" can come from provider-side issues (e.g., "Provider returned error")
+    and should trigger rotation rather than immediate failure.
     """
-    return isinstance(e, (InvalidRequestError, AuthenticationError, BadRequestError))
+    return False  # All errors are potentially recoverable via rotation
 
 
 def should_rotate_on_error(classified_error: ClassifiedError) -> bool:

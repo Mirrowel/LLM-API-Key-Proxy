@@ -11,7 +11,7 @@ import os
 import random
 import httpx
 import litellm
-from litellm.exceptions import APIConnectionError
+from litellm.exceptions import APIConnectionError, BadRequestError, InvalidRequestError
 from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from pathlib import Path
@@ -820,34 +820,60 @@ class RotatingClient:
         """
         # Headers that should be removed from client requests to prevent
         # them from being forwarded to the actual provider
+        # These are case-insensitive patterns to match
         problematic_headers = {
             "authorization",
             "x-api-key",
             "api-key",
+            # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+            "anthropic-version",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-beta",
+            "x-anthropic-",
         }
 
-        # Remove problematic headers from litellm_kwargs if present
-        # These might come from extra_body or other client-provided parameters
+        def _remove_problematic_headers(target_dict: Dict[str, Any], location: str) -> None:
+            """Remove problematic headers case-insensitively from a dict."""
+            if not isinstance(target_dict, dict):
+                return
+            keys_to_remove = []
+            for key in target_dict.keys():
+                if not isinstance(key, str):
+                    continue
+                key_lower = key.lower()
+                # Check if key matches any problematic header pattern
+                for header in problematic_headers:
+                    if key_lower == header.lower():
+                        keys_to_remove.append(key)
+                        break
+                    elif header.endswith("-") and key_lower.startswith(header.lower()):
+                        # For patterns like "x-anthropic-" - remove any header starting with this
+                        keys_to_remove.append(key)
+                        break
+            if keys_to_remove:
+                lib_logger.debug(
+                    f"[DEBUG] Removing {len(keys_to_remove)} problematic headers from {location}: {keys_to_remove}"
+                )
+            for key in keys_to_remove:
+                target_dict.pop(key, None)
+
+        # DEBUG: Log all keys in litellm_kwargs
+        lib_logger.debug(
+            f"[DEBUG] _apply_provider_headers called for provider '{provider}' with keys: {list(litellm_kwargs.keys())}"
+        )
+
+        # Remove problematic headers from top-level litellm_kwargs
+        _remove_problematic_headers(litellm_kwargs, "top-level kwargs")
+
+        # Remove problematic headers from extra_body
         if "extra_body" in litellm_kwargs and isinstance(
             litellm_kwargs["extra_body"], dict
         ):
-            extra_body = litellm_kwargs["extra_body"]
-            for header in problematic_headers:
-                extra_body.pop(header, None)
-                # Also check for case-insensitive headers
-                for key in list(extra_body.keys()):
-                    if key.lower() == header:
-                        extra_body.pop(key, None)
+            _remove_problematic_headers(litellm_kwargs["extra_body"], "extra_body")
 
-        # Check for direct headers parameter in litellm_kwargs
+        # Remove problematic headers from headers parameter
         if "headers" in litellm_kwargs and isinstance(litellm_kwargs["headers"], dict):
-            headers = litellm_kwargs["headers"]
-            for header in problematic_headers:
-                headers.pop(header, None)
-                # Also check for case-insensitive headers
-                for key in list(headers.keys()):
-                    if key.lower() == header:
-                        headers.pop(key, None)
+            _remove_problematic_headers(litellm_kwargs["headers"], "headers")
 
         # Add provider-specific headers from environment variables if configured
         # These headers should be used instead of any client-provided ones
@@ -1443,13 +1469,35 @@ class RotatingClient:
                 litellm_kwargs = kwargs.copy()
 
                 # [FIX] Remove client-provided headers/api_key that could override provider credentials
-                # Clean case-insensitive headers and api_key
-                headers_to_remove = ["authorization", "x-api-key", "api-key", "api_key"]
-                for key in headers_to_remove:
-                    litellm_kwargs.pop(key, None)
-                    litellm_kwargs.pop(key.lower(), None)
-                    litellm_kwargs.pop(key.upper(), None)
-                    litellm_kwargs.pop(key.title(), None)
+                # Clean case-insensitive headers and api_key from top-level kwargs
+                headers_to_remove = [
+                    "authorization",
+                    "x-api-key",
+                    "api-key",
+                    "api_key",
+                    # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+                    "anthropic-version",
+                    "anthropic-dangerous-direct-browser-access",
+                    "anthropic-beta",
+                    "x-anthropic-",
+                ]
+                for key in list(litellm_kwargs.keys()):
+                    if not isinstance(key, str):
+                        continue
+                    key_lower = key.lower()
+                    should_remove = False
+                    for header in headers_to_remove:
+                        if header.endswith("-") and key_lower.startswith(header):
+                            should_remove = True
+                            break
+                        elif key_lower == header.lower():
+                            should_remove = True
+                            break
+                    if should_remove:
+                        litellm_kwargs.pop(key, None)
+
+                # Also clean nested headers in extra_body and headers params
+                self._apply_provider_headers(litellm_kwargs, provider, current_cred)
 
                 # [NEW] Merge provider-specific params
                 if provider in self.litellm_provider_params:
@@ -2215,12 +2263,31 @@ class RotatingClient:
                     litellm_kwargs = kwargs.copy()
 
                     # [FIX] Remove client-provided headers/api_key that could override provider credentials
-                    headers_to_remove = ["authorization", "x-api-key", "api-key", "api_key"]
-                    for key in headers_to_remove:
-                        litellm_kwargs.pop(key, None)
-                        litellm_kwargs.pop(key.lower(), None)
-                        litellm_kwargs.pop(key.upper(), None)
-                        litellm_kwargs.pop(key.title(), None)
+                    headers_to_remove = [
+                        "authorization",
+                        "x-api-key",
+                        "api-key",
+                        "api_key",
+                        # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+                        "anthropic-version",
+                        "anthropic-dangerous-direct-browser-access",
+                        "anthropic-beta",
+                        "x-anthropic-",
+                    ]
+                    for key in list(litellm_kwargs.keys()):
+                        if not isinstance(key, str):
+                            continue
+                        key_lower = key.lower()
+                        should_remove = False
+                        for header in headers_to_remove:
+                            if header.endswith("-") and key_lower.startswith(header):
+                                should_remove = True
+                                break
+                            elif key_lower == header.lower():
+                                should_remove = True
+                                break
+                        if should_remove:
+                            litellm_kwargs.pop(key, None)
 
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
@@ -2313,6 +2380,8 @@ class RotatingClient:
                                 StreamedAPIError,
                                 litellm.RateLimitError,
                                 httpx.HTTPStatusError,
+                                BadRequestError,
+                                InvalidRequestError,
                             ) as e:
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
@@ -2573,6 +2642,8 @@ class RotatingClient:
                             StreamedAPIError,
                             litellm.RateLimitError,
                             httpx.HTTPStatusError,
+                            BadRequestError,
+                            InvalidRequestError,
                         ) as e:
                             last_exception = e
 
@@ -3553,10 +3624,16 @@ class RotatingClient:
         if anthropic_logger and anthropic_logger.log_dir:
             openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
+        # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+        # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
+        # We only use raw_request for disconnect checking, not for passing to LiteLLM
+        litellm_request = None  # Don't pass request object to LiteLLM
+
         if request.stream:
             # Streaming response
+            # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+            # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
             response_generator = self.acompletion(
-                request=raw_request,
                 pre_request_callback=pre_request_callback,
                 **openai_request,
             )
@@ -3577,8 +3654,9 @@ class RotatingClient:
             )
         else:
             # Non-streaming response
+            # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+            # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
             response = await self.acompletion(
-                request=raw_request,
                 pre_request_callback=pre_request_callback,
                 **openai_request,
             )
