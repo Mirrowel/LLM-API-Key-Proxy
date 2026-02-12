@@ -267,9 +267,10 @@ class BackgroundRefresher:
 
     async def _run(self):
         """The main loop for OAuth token refresh."""
-        await self._client.initialize_usage_managers()
-        # Initialize credentials (load persisted tiers) before starting
+        # Initialize credentials first to populate tier/project caches
         await self._initialize_credentials()
+        # Then initialize usage managers which reads from those caches
+        await self._client.initialize_usage_managers()
 
         # Start provider-specific background jobs with their own timers
         self._start_provider_background_jobs()
