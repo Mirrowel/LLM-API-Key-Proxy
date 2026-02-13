@@ -39,6 +39,7 @@ from .provider_config import ProviderConfig
 from .providers import PROVIDER_PLUGINS
 from .providers.openai_compatible_provider import OpenAICompatibleProvider
 from .request_sanitizer import sanitize_request_payload
+from .model_info_service import get_model_info_service
 from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
@@ -518,6 +519,9 @@ class RotatingClient:
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
         self.model_definitions = ModelDefinitions()
+
+        # Initialize ModelRegistry for context window lookups (used by token calculator)
+        self._model_registry = get_model_info_service()
 
         # Store and validate max concurrent requests per key
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
@@ -1132,11 +1136,15 @@ class RotatingClient:
                     litellm.ServiceUnavailableError,
                     litellm.InternalServerError,
                     APIConnectionError,
+                    BadRequestError,
+                    InvalidRequestError,
                     httpx.HTTPStatusError,
                 ) as e:
                     # This is a critical, typed error from litellm or httpx that signals a key failure.
                     # We do not try to parse it here. We wrap it and raise it immediately
                     # for the outer retry loop to handle.
+                    # NOTE: BadRequestError/InvalidRequestError with "provider returned error" are
+                    # transient upstream issues and should be classified as server_error for rotation.
                     lib_logger.warning(
                         f"Caught a critical API error mid-stream: {type(e).__name__}. Signaling for credential rotation."
                     )
@@ -1794,7 +1802,9 @@ class RotatingClient:
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs, model, registry=self._model_registry
+                    )
 
                     # If the provider is 'nvidia', set the custom provider to 'nvidia_nim'
                     # and strip the prefix from the model name for LiteLLM.
@@ -2600,7 +2610,9 @@ class RotatingClient:
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs, model, registry=self._model_registry
+                    )
 
                     # If the provider is 'qwen_code', set the custom provider to 'qwen'
                     # and strip the prefix from the model name for LiteLLM.
@@ -2968,20 +2980,24 @@ class RotatingClient:
         Returns:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
-        # Handle iflow provider: remove stream_options to avoid HTTP 406
+        # Providers that don't support stream_options parameter
+        # These providers return 400/406 errors when stream_options is sent
+        STREAM_OPTIONS_UNSUPPORTED_PROVIDERS = {"iflow", "kilocode"}
+
         model = self._normalize_model_string(kwargs.get("model", ""))
         kwargs["model"] = model
         provider = self._extract_provider_from_model(model)
 
-        if provider == "iflow" and "stream_options" in kwargs:
+        # Remove stream_options for providers that don't support it
+        if provider in STREAM_OPTIONS_UNSUPPORTED_PROVIDERS and "stream_options" in kwargs:
             lib_logger.debug(
-                "Removing stream_options for iflow provider to avoid HTTP 406"
+                f"Removing stream_options for {provider} provider (not supported)"
             )
             kwargs.pop("stream_options", None)
 
         if kwargs.get("stream"):
-            # Only add stream_options for providers that support it (excluding iflow)
-            if provider != "iflow":
+            # Only add stream_options for providers that support it
+            if provider not in STREAM_OPTIONS_UNSUPPORTED_PROVIDERS:
                 if "stream_options" not in kwargs:
                     kwargs["stream_options"] = {}
                 if "include_usage" not in kwargs["stream_options"]:
