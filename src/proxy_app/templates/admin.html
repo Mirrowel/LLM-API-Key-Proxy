@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Admin{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>Admin Console</h1>
+  <p class="muted">Manage users and inspect usage.</p>
+</section>
+
+{% if error %}
+<section class="panel">
+  <p class="error">{{ error }}</p>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Create User</h2>
+  <form action="/ui/admin/users" method="post" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" required>
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required>
+
+    <label for="role">Role</label>
+    <select id="role" name="role">
+      <option value="user" selected>User</option>
+      <option value="admin">Admin</option>
+    </select>
+
+    <label class="checkbox-row" for="is_active">
+      <input id="is_active" name="is_active" type="checkbox" checked>
+      Active
+    </label>
+
+    <button type="submit">Create User</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Users</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Username</th>
+        <th>Role</th>
+        <th>Status</th>
+        <th>Created</th>
+        <th>Last Login</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for user in users %}
+      <tr>
+        <td>{{ user.id }}</td>
+        <td><a href="/ui/admin/users/{{ user.id }}">{{ user.username }}</a></td>
+        <td>{{ user.role }}</td>
+        <td>{% if user.is_active %}Active{% else %}Disabled{% endif %}</td>
+        <td>{{ user.created_at }}</td>
+        <td>{{ user.last_login_at if user.last_login_at else "-" }}</td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="6" class="muted">No users found.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

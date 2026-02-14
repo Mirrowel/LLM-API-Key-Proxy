@@ -38,6 +38,7 @@ from rotator_library.utils.resilient_io import (
     safe_mkdir,
 )
 from rotator_library.utils.paths import get_logs_dir
+from proxy_app.request_logger import redact_sensitive_data, redact_sensitive_headers
 
 
 def _get_raw_io_logs_dir() -> Path:
@@ -96,8 +97,8 @@ class RawIOLogger:
         request_data = {
             "request_id": self.request_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
-            "headers": dict(headers),
-            "body": body,
+            "headers": redact_sensitive_headers(dict(headers)),
+            "body": redact_sensitive_data(body),
         }
         self._write_json("request.json", request_data)
 
@@ -106,7 +107,10 @@ class RawIOLogger:
         if not self._dir_available:
             return
 
-        log_entry = {"timestamp_utc": datetime.utcnow().isoformat(), "chunk": chunk}
+        log_entry = {
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "chunk": redact_sensitive_data(chunk),
+        }
         content = json.dumps(log_entry, ensure_ascii=False) + "\n"
         safe_log_write(self.log_dir / "streaming_chunks.jsonl", content, logging)
 
@@ -122,8 +126,8 @@ class RawIOLogger:
             "timestamp_utc": datetime.utcnow().isoformat(),
             "status_code": status_code,
             "duration_ms": round(duration_ms),
-            "headers": dict(headers) if headers else None,
-            "body": body,
+            "headers": redact_sensitive_headers(dict(headers)) if headers else None,
+            "body": redact_sensitive_data(body),
         }
         self._write_json("final_response.json", response_data)
         self._log_metadata(response_data)

@@ -111,7 +111,7 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse, JSONResponse
-    from fastapi.security import APIKeyHeader
+    from fastapi.staticfiles import StaticFiles
 
 print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
@@ -135,9 +135,17 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
-    from proxy_app.request_logger import log_request_to_console
+    from proxy_app.request_logger import log_request_to_console, redact_sensitive_data
     from proxy_app.batch_manager import EmbeddingBatcher
+    from proxy_app.api_token_auth import ApiActor, get_api_actor, require_admin_api_actor
     from proxy_app.detailed_logger import RawIOLogger
+    from proxy_app.db import init_db
+    from proxy_app.routers import admin_router, auth_router, ui_router, user_router
+    from proxy_app.usage_recorder import (
+        record_usage_event as record_usage_event_async,
+        start_usage_recorder,
+        stop_usage_recorder,
+    )
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -425,6 +433,9 @@ for key, value in os.environ.items():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    app.state.db_session_maker = await init_db(_root_dir)
+    app.state.usage_recorder = await start_usage_recorder(app.state.db_session_maker)
+
     # [MODIFIED] Perform skippable OAuth initialization at startup
     skip_oauth_init = os.getenv("SKIP_OAUTH_INIT_CHECK", "false").lower() == "true"
 
@@ -577,7 +588,11 @@ async def lifespan(app: FastAPI):
                             json.dump(data, f, indent=2)
                             f.truncate()
                     except Exception as e:
-                        logging.error(f"Failed to update metadata for '{path}': {e}")
+                        logging.error(
+                            "Failed to update metadata for '%s': %s",
+                            path,
+                            redact_sensitive_data(str(e), key_hint="error"),
+                        )
 
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
@@ -644,6 +659,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await stop_usage_recorder()
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
@@ -661,6 +677,15 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
+app.include_router(auth_router)
+app.include_router(user_router)
+app.include_router(admin_router)
+app.include_router(ui_router)
+app.mount(
+    "/static",
+    StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),
+    name="static",
+)
 
 # Add CORS middleware to allow all origins, methods, and headers
 app.add_middleware(
@@ -670,9 +695,6 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
-api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-
-
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
     return request.app.state.rotating_client
@@ -683,41 +705,89 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     return request.app.state.embedding_batcher
 
 
-async def verify_api_key(auth: str = Depends(api_key_header)):
-    """Dependency to verify the proxy API key."""
-    # If PROXY_API_KEY is not set or empty, skip verification (open access)
-    if not PROXY_API_KEY:
-        return auth
-    if not auth or auth != f"Bearer {PROXY_API_KEY}":
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return auth
+def get_usage_recorder(request: Request):
+    """Dependency to get the usage recorder instance from the app state."""
+    return getattr(request.app.state, "usage_recorder", None)
 
 
-# --- Anthropic API Key Header ---
-anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+def _resolve_request_id(request: Request, fallback_id: str | None = None) -> str:
+    request_id = request.headers.get("x-request-id") or request.headers.get("request-id")
+    if request_id:
+        return request_id
+    if fallback_id:
+        return fallback_id
+    return str(uuid.uuid4())
 
 
-async def verify_anthropic_api_key(
-    x_api_key: str = Depends(anthropic_api_key_header),
-    auth: str = Depends(api_key_header),
-):
-    """
-    Dependency to verify API key for Anthropic endpoints.
-    Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
-    """
-    # Check x-api-key first (Anthropic style)
-    if x_api_key and x_api_key == PROXY_API_KEY:
-        return x_api_key
-    # Fall back to Bearer token (OpenAI style)
-    if auth and auth == f"Bearer {PROXY_API_KEY}":
-        return auth
-    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+def _extract_usage_payload(payload: Any) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+    usage = None
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+    elif hasattr(payload, "usage"):
+        usage = getattr(payload, "usage")
+
+    if usage is None and hasattr(payload, "model_dump"):
+        dumped = payload.model_dump(exclude_none=True)
+        if isinstance(dumped, dict):
+            usage = dumped.get("usage")
+
+    if usage is None:
+        return None
+
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump(exclude_none=True)
+
+    if isinstance(usage, dict):
+        return usage
+    return None
+
+
+_ERROR_MESSAGE_MAX_CHARS = max(64, int(os.getenv("ERROR_MESSAGE_MAX_CHARS", "500")))
+
+
+def _safe_error_message(error: Exception | str | None, *, default: str) -> str:
+    raw = str(error).strip() if error is not None else ""
+    if not raw:
+        raw = default
+    redacted = redact_sensitive_data(raw, key_hint="error")
+    if not isinstance(redacted, str):
+        redacted = default
+    if len(redacted) > _ERROR_MESSAGE_MAX_CHARS:
+        return f"{redacted[:_ERROR_MESSAGE_MAX_CHARS]}...[truncated]"
+    return redacted
+
+
+async def _record_usage(
+    *,
+    actor: ApiActor,
+    endpoint: str,
+    model: str | None,
+    request_id: str,
+    status_code: int,
+    usage: dict[str, Any] | None,
+    error: Exception | None = None,
+) -> None:
+    await record_usage_event_async(
+        actor=actor,
+        endpoint=endpoint,
+        model=model,
+        status_code=status_code,
+        usage=usage,
+        request_id=request_id,
+        error_type=type(error).__name__ if error else None,
+        error_message=_safe_error_message(error, default="Internal server error") if error else None,
+    )
 
 
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
     response_stream: AsyncGenerator[str, None],
+    actor: ApiActor,
+    endpoint: str,
+    request_id: str,
     logger: Optional[RawIOLogger] = None,
 ) -> AsyncGenerator[str, None]:
     """
@@ -726,6 +796,10 @@ async def streaming_response_wrapper(
     """
     response_chunks = []
     full_response = {}
+    usage_data = None
+    status_code = 200
+    stream_error: Exception | None = None
+    model = request_data.get("model")
 
     try:
         async for chunk_str in response_stream:
@@ -744,11 +818,14 @@ async def streaming_response_wrapper(
                     except json.JSONDecodeError:
                         pass
     except Exception as e:
-        logging.error(f"An error occurred during the response stream: {e}")
+        status_code = 500
+        stream_error = e
+        safe_message = _safe_error_message(e, default="Unexpected streaming error")
+        logging.error("An error occurred during the response stream: %s", safe_message)
         # Yield a final error message to the client to ensure they are not left hanging.
         error_payload = {
             "error": {
-                "message": f"An unexpected error occurred during the stream: {str(e)}",
+                "message": f"An unexpected error occurred during the stream: {safe_message}",
                 "type": "proxy_internal_error",
                 "code": 500,
             }
@@ -758,7 +835,7 @@ async def streaming_response_wrapper(
         # Also log this as a failed request
         if logger:
             logger.log_final_response(
-                status_code=500, headers=None, body={"error": str(e)}
+                status_code=500, headers=None, body={"error": safe_message}
             )
         return  # Stop further processing
     finally:
@@ -877,20 +954,32 @@ async def streaming_response_wrapper(
                 "choices": [final_choice],
                 "usage": usage_data,
             }
+            model = full_response.get("model") or model
+            request_id = _resolve_request_id(request, full_response.get("id") or request_id)
 
         if logger:
             logger.log_final_response(
-                status_code=200,
+                status_code=status_code,
                 headers=None,  # Headers are not available at this stage
                 body=full_response,
             )
+
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=status_code,
+            usage=usage_data,
+            error=stream_error,
+        )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
+    actor: ApiActor = Depends(get_api_actor),
 ):
     """
     OpenAI-compatible endpoint powered by the RotatingClient.
@@ -898,11 +987,24 @@ async def chat_completions(
     """
     # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
     raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    endpoint = "/v1/chat/completions"
+    request_id = _resolve_request_id(request)
+    model = None
     try:
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
         except json.JSONDecodeError:
+            error = ValueError("Invalid JSON in request body.")
+            await _record_usage(
+                actor=actor,
+                endpoint=endpoint,
+                model=model,
+                request_id=request_id,
+                status_code=400,
+                usage=None,
+                error=error,
+            )
             raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
 
         # Global temperature=0 override (controlled by .env variable, default: OFF)
@@ -963,12 +1065,26 @@ async def chat_completions(
             )
             return StreamingResponse(
                 streaming_response_wrapper(
-                    request, request_data, response_generator, raw_logger
+                    request,
+                    request_data,
+                    response_generator,
+                    actor,
+                    endpoint,
+                    request_id,
+                    raw_logger,
                 ),
                 media_type="text/event-stream",
             )
         else:
             response = await client.acompletion(request=request, **request_data)
+            response_dump = (
+                response.model_dump(exclude_none=True)
+                if hasattr(response, "model_dump")
+                else response
+            )
+            if isinstance(response_dump, dict):
+                request_id = _resolve_request_id(request, response_dump.get("id") or request_id)
+                model = response_dump.get("model") or model
             if raw_logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object
@@ -981,8 +1097,17 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
-                    body=response.model_dump(),
+                    body=response_dump,
                 )
+
+            await _record_usage(
+                actor=actor,
+                endpoint=endpoint,
+                model=model,
+                request_id=request_id,
+                status_code=200,
+                usage=_extract_usage_payload(response_dump),
+            )
             return response
 
     except (
@@ -990,19 +1115,83 @@ async def chat_completions(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=400,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {_safe_error_message(e, default='Invalid request')}")
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=401,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {_safe_error_message(e, default='Authentication failed')}")
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=429,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {_safe_error_message(e, default='Rate limit exceeded')}")
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=503,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=503, detail=f"Service Unavailable: {_safe_error_message(e, default='Service unavailable')}")
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=504,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {_safe_error_message(e, default='Gateway timeout')}")
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=502,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=502, detail=f"Bad Gateway: {_safe_error_message(e, default='Upstream error')}")
     except Exception as e:
-        logging.error(f"Request failed after all retries: {e}")
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Request failed after all retries: %s", safe_message)
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=500,
+            usage=None,
+            error=e,
+        )
         # Optionally log the failed request
         if ENABLE_REQUEST_LOGGING:
             try:
@@ -1011,9 +1200,9 @@ async def chat_completions(
                 request_data = {"error": "Could not parse request body"}
             if raw_logger:
                 raw_logger.log_final_response(
-                    status_code=500, headers=None, body={"error": str(e)}
+                    status_code=500, headers=None, body={"error": safe_message}
                 )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 # --- Anthropic Messages API Endpoint ---
@@ -1022,7 +1211,7 @@ async def anthropic_messages(
     request: Request,
     body: AnthropicMessagesRequest,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_anthropic_api_key),
+    actor: ApiActor = Depends(get_api_actor),
 ):
     """
     Anthropic-compatible Messages API endpoint.
@@ -1034,6 +1223,9 @@ async def anthropic_messages(
     """
     # Initialize raw I/O logger if enabled (for debugging proxy boundary)
     logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    endpoint = "/v1/messages"
+    model = body.model
+    request_id = _resolve_request_id(request)
 
     # Log raw Anthropic request if raw logging is enabled
     if logger:
@@ -1058,6 +1250,14 @@ async def anthropic_messages(
         result = await client.anthropic_messages(body, raw_request=request)
 
         if body.stream:
+            await _record_usage(
+                actor=actor,
+                endpoint=endpoint,
+                model=model,
+                request_id=request_id,
+                status_code=200,
+                usage=None,
+            )
             # Streaming response
             return StreamingResponse(
                 result,
@@ -1069,6 +1269,8 @@ async def anthropic_messages(
                 },
             )
         else:
+            request_id = _resolve_request_id(request, result.get("id") if isinstance(result, dict) else request_id)
+            model = result.get("model") if isinstance(result, dict) else model
             # Non-streaming response
             if logger:
                 logger.log_final_response(
@@ -1076,6 +1278,14 @@ async def anthropic_messages(
                     headers=None,
                     body=result,
                 )
+            await _record_usage(
+                actor=actor,
+                endpoint=endpoint,
+                model=model,
+                request_id=request_id,
+                status_code=200,
+                usage=_extract_usage_payload(result),
+            )
             return JSONResponse(content=result)
 
     except (
@@ -1083,46 +1293,116 @@ async def anthropic_messages(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=400,
+            usage=None,
+            error=e,
+        )
         error_response = {
             "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
+            "error": {
+                "type": "invalid_request_error",
+                "message": _safe_error_message(e, default="Invalid request"),
+            },
         }
         raise HTTPException(status_code=400, detail=error_response)
     except litellm.AuthenticationError as e:
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=401,
+            usage=None,
+            error=e,
+        )
         error_response = {
             "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
+            "error": {
+                "type": "authentication_error",
+                "message": _safe_error_message(e, default="Authentication failed"),
+            },
         }
         raise HTTPException(status_code=401, detail=error_response)
     except litellm.RateLimitError as e:
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=429,
+            usage=None,
+            error=e,
+        )
         error_response = {
             "type": "error",
-            "error": {"type": "rate_limit_error", "message": str(e)},
+            "error": {
+                "type": "rate_limit_error",
+                "message": _safe_error_message(e, default="Rate limit exceeded"),
+            },
         }
         raise HTTPException(status_code=429, detail=error_response)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=503,
+            usage=None,
+            error=e,
+        )
         error_response = {
             "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
+            "error": {
+                "type": "api_error",
+                "message": _safe_error_message(e, default="Service unavailable"),
+            },
         }
         raise HTTPException(status_code=503, detail=error_response)
     except litellm.Timeout as e:
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=504,
+            usage=None,
+            error=e,
+        )
         error_response = {
             "type": "error",
-            "error": {"type": "api_error", "message": f"Request timed out: {str(e)}"},
+            "error": {
+                "type": "api_error",
+                "message": f"Request timed out: {_safe_error_message(e, default='Gateway timeout')}",
+            },
         }
         raise HTTPException(status_code=504, detail=error_response)
     except Exception as e:
-        logging.error(f"Anthropic messages endpoint error: {e}")
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Anthropic messages endpoint error: %s", safe_message)
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=500,
+            usage=None,
+            error=e,
+        )
         if logger:
             logger.log_final_response(
                 status_code=500,
                 headers=None,
-                body={"error": str(e)},
+                body={"error": safe_message},
             )
         error_response = {
             "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
+            "error": {"type": "api_error", "message": safe_message},
         }
         raise HTTPException(status_code=500, detail=error_response)
 
@@ -1133,7 +1413,7 @@ async def anthropic_count_tokens(
     request: Request,
     body: AnthropicCountTokensRequest,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_anthropic_api_key),
+    _=Depends(get_api_actor),
 ):
     """
     Anthropic-compatible count_tokens endpoint.
@@ -1155,20 +1435,27 @@ async def anthropic_count_tokens(
     ) as e:
         error_response = {
             "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
+            "error": {
+                "type": "invalid_request_error",
+                "message": _safe_error_message(e, default="Invalid request"),
+            },
         }
         raise HTTPException(status_code=400, detail=error_response)
     except litellm.AuthenticationError as e:
         error_response = {
             "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
+            "error": {
+                "type": "authentication_error",
+                "message": _safe_error_message(e, default="Authentication failed"),
+            },
         }
         raise HTTPException(status_code=401, detail=error_response)
     except Exception as e:
-        logging.error(f"Anthropic count_tokens endpoint error: {e}")
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Anthropic count_tokens endpoint error: %s", safe_message)
         error_response = {
             "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
+            "error": {"type": "api_error", "message": safe_message},
         }
         raise HTTPException(status_code=500, detail=error_response)
 
@@ -1179,7 +1466,7 @@ async def embeddings(
     body: EmbeddingRequest,
     client: RotatingClient = Depends(get_rotating_client),
     batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
-    _=Depends(verify_api_key),
+    actor: ApiActor = Depends(get_api_actor),
 ):
     """
     OpenAI-compatible endpoint for creating embeddings.
@@ -1187,6 +1474,9 @@ async def embeddings(
     - True: Uses a server-side batcher for high throughput.
     - False: Passes requests directly to the provider.
     """
+    endpoint = "/v1/embeddings"
+    model = body.model
+    request_id = _resolve_request_id(request)
     try:
         request_data = body.model_dump(exclude_none=True)
         log_request_to_console(
@@ -1238,6 +1528,22 @@ async def embeddings(
 
             response = await client.aembedding(request=request, **request_data)
 
+        response_dump = (
+            response.model_dump(exclude_none=True)
+            if hasattr(response, "model_dump")
+            else response
+        )
+        if isinstance(response_dump, dict):
+            request_id = _resolve_request_id(request, response_dump.get("id") or request_id)
+            model = response_dump.get("model") or model
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=200,
+            usage=_extract_usage_payload(response_dump),
+        )
         return response
 
     except HTTPException as e:
@@ -1248,20 +1554,84 @@ async def embeddings(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=400,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=400, detail=f"Invalid Request: {_safe_error_message(e, default='Invalid request')}")
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=401,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=401, detail=f"Authentication Error: {_safe_error_message(e, default='Authentication failed')}")
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=429,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {_safe_error_message(e, default='Rate limit exceeded')}")
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=503,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=503, detail=f"Service Unavailable: {_safe_error_message(e, default='Service unavailable')}")
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=504,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {_safe_error_message(e, default='Gateway timeout')}")
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=502,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=502, detail=f"Bad Gateway: {_safe_error_message(e, default='Upstream error')}")
     except Exception as e:
-        logging.error(f"Embedding request failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Embedding request failed: %s", safe_message)
+        await _record_usage(
+            actor=actor,
+            endpoint=endpoint,
+            model=model,
+            request_id=request_id,
+            status_code=500,
+            usage=None,
+            error=e,
+        )
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 @app.get("/")
@@ -1273,7 +1643,7 @@ def read_root():
 async def list_models(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
+    _=Depends(get_api_actor),
     enriched: bool = True,
 ):
     """
@@ -1309,7 +1679,7 @@ async def list_models(
 async def get_model(
     model_id: str,
     request: Request,
-    _=Depends(verify_api_key),
+    _=Depends(get_api_actor),
 ):
     """
     Returns detailed information about a specific model.
@@ -1336,7 +1706,7 @@ async def get_model(
 @app.get("/v1/model-info/stats")
 async def model_info_stats(
     request: Request,
-    _=Depends(verify_api_key),
+    _=Depends(get_api_actor),
 ):
     """
     Returns statistics about the model info service (for monitoring/debugging).
@@ -1347,7 +1717,7 @@ async def model_info_stats(
 
 
 @app.get("/v1/providers")
-async def list_providers(_=Depends(verify_api_key)):
+async def list_providers(_=Depends(get_api_actor)):
     """
     Returns a list of all available providers.
     """
@@ -1358,7 +1728,7 @@ async def list_providers(_=Depends(verify_api_key)):
 async def get_quota_stats(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
+    _=Depends(require_admin_api_actor),
     provider: str = None,
 ):
     """
@@ -1394,15 +1764,16 @@ async def get_quota_stats(
         stats = await client.get_quota_stats(provider_filter=provider)
         return stats
     except Exception as e:
-        logging.error(f"Failed to get quota stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Failed to get quota stats: %s", safe_message)
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 @app.post("/v1/quota-stats")
 async def refresh_quota_stats(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
+    _=Depends(require_admin_api_actor),
 ):
     """
     Refresh quota and usage statistics.
@@ -1489,15 +1860,16 @@ async def refresh_quota_stats(
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Failed to refresh quota stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Failed to refresh quota stats: %s", safe_message)
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 @app.post("/v1/token-count")
 async def token_count(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    _=Depends(verify_api_key),
+    _=Depends(get_api_actor),
 ):
     """
     Calculates the token count for a given list of messages and a model.
@@ -1516,12 +1888,13 @@ async def token_count(
         return {"token_count": count}
 
     except Exception as e:
-        logging.error(f"Token count failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Token count failed: %s", safe_message)
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 @app.post("/v1/cost-estimate")
-async def cost_estimate(request: Request, _=Depends(verify_api_key)):
+async def cost_estimate(request: Request, _=Depends(get_api_actor)):
     """
     Estimates the cost for a request based on token counts and model pricing.
 
@@ -1611,8 +1984,9 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Cost estimate failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_message = _safe_error_message(e, default="Internal server error")
+        logging.error("Cost estimate failed: %s", safe_message)
+        raise HTTPException(status_code=500, detail=safe_message)
 
 
 if __name__ == "__main__":
