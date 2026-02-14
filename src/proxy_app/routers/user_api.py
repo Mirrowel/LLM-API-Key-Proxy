@@ -10,6 +10,7 @@ from proxy_app.auth import SessionUser, get_db_session, require_user
 from proxy_app.api_token_auth import hash_api_token
 from proxy_app.db_models import ApiKey, User
 from proxy_app.usage_queries import (
+    fetch_api_key_last_used_map,
     fetch_usage_by_day,
     fetch_usage_by_model,
     fetch_usage_summary,
@@ -105,11 +106,19 @@ async def list_my_api_keys(
     current_user: SessionUser = Depends(require_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> ApiKeyListResponse:
-    rows = await session.scalars(
+    rows = list(
+        await session.scalars(
         select(ApiKey)
         .where(ApiKey.user_id == current_user.id)
         .order_by(ApiKey.created_at.desc())
+        )
     )
+    derived_last_used = await fetch_api_key_last_used_map(
+        session,
+        user_id=current_user.id,
+        api_key_ids=[row.id for row in rows],
+    )
+
     return ApiKeyListResponse(
         api_keys=[
             ApiKeyItem(
@@ -117,7 +126,7 @@ async def list_my_api_keys(
                 name=row.name,
                 token_prefix=row.token_prefix,
                 created_at=row.created_at,
-                last_used_at=row.last_used_at,
+                last_used_at=derived_last_used.get(row.id, row.last_used_at),
                 revoked_at=row.revoked_at,
                 expires_at=row.expires_at,
             )

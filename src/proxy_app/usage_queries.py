@@ -118,3 +118,26 @@ async def fetch_usage_by_model(
         }
         for row in rows
     ]
+
+
+async def fetch_api_key_last_used_map(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    api_key_ids: list[int],
+) -> dict[int, datetime]:
+    if not api_key_ids:
+        return {}
+
+    rows = await session.execute(
+        select(UsageEvent.api_key_id, func.max(UsageEvent.timestamp))
+        .where(UsageEvent.user_id == user_id)
+        .where(UsageEvent.api_key_id.in_(api_key_ids))
+        .group_by(UsageEvent.api_key_id)
+    )
+
+    result: dict[int, datetime] = {}
+    for api_key_id, last_used in rows:
+        if api_key_id is not None and last_used is not None:
+            result[int(api_key_id)] = last_used
+    return result

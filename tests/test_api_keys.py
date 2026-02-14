@@ -3,7 +3,7 @@ from sqlalchemy import select
 
 from proxy_app.api_token_auth import hash_api_token
 from proxy_app.auth import SessionUser
-from proxy_app.db_models import ApiKey
+from proxy_app.db_models import ApiKey, UsageEvent
 from proxy_app.routers.user_api import (
     CreateApiKeyRequest,
     create_my_api_key,
@@ -65,3 +65,47 @@ async def test_create_list_revoke_api_key_hides_plaintext_at_rest(
     assert revoked == {"ok": True}
     assert reloaded is not None
     assert reloaded.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_list_api_keys_uses_derived_last_used_timestamp(
+    session_maker,
+    seeded_user,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("API_TOKEN_PEPPER", "pepper-for-tests")
+    monkeypatch.setattr(
+        "proxy_app.routers.user_api.generate_api_token",
+        lambda: "pk_plaintext_for_last_used_case",
+    )
+
+    session_user = SessionUser(id=seeded_user.id, username=seeded_user.username, role="user")
+
+    async with session_maker() as session:
+        created = await create_my_api_key(
+            payload=CreateApiKeyRequest(name="usage key"),
+            current_user=session_user,
+            session=session,
+        )
+
+    async with session_maker() as session:
+        session.add(
+            UsageEvent(
+                user_id=seeded_user.id,
+                api_key_id=created.id,
+                endpoint="/v1/chat/completions",
+                provider="openai",
+                model="openai/gpt-4o-mini",
+                request_id="req-derived-last-used",
+                status_code=200,
+                total_tokens=12,
+            )
+        )
+        await session.commit()
+
+    async with session_maker() as session:
+        listed = await list_my_api_keys(current_user=session_user, session=session)
+
+    assert listed.api_keys
+    listed_item = listed.api_keys[0]
+    assert listed_item.last_used_at is not None
