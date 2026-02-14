@@ -23,6 +23,9 @@ from litellm.exceptions import (
 
 lib_logger = logging.getLogger("rotator_library")
 
+# Default cooldown for rate limits without retry_after (reduced from 60s)
+RATE_LIMIT_DEFAULT_COOLDOWN = 10  # seconds
+
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
     """
@@ -619,6 +622,38 @@ def get_retry_after(error: Exception) -> Optional[int]:
     return None
 
 
+def get_retry_backoff(classified_error: "ClassifiedError", attempt: int) -> float:
+    """
+    Calculate retry backoff time based on error type and attempt number.
+
+    Different strategies for different error types:
+    - api_connection: More aggressive retry (network issues are transient)
+    - server_error: Standard exponential backoff
+    - rate_limit: Use retry_after if available, otherwise shorter default
+    """
+    import random
+
+    # If provider specified retry_after, use it
+    if classified_error.retry_after:
+        return classified_error.retry_after
+
+    error_type = classified_error.error_type
+
+    if error_type == "api_connection":
+        # More aggressive retry for network errors - they're usually transient
+        # 0.5s, 0.75s, 1.1s, 1.7s, 2.5s...
+        return 0.5 * (1.5 ** attempt) + random.uniform(0, 0.5)
+    elif error_type == "server_error":
+        # Standard exponential backoff: 1s, 2s, 4s, 8s...
+        return (2 ** attempt) + random.uniform(0, 1)
+    elif error_type == "rate_limit":
+        # Short default for transient rate limits without retry_after
+        return 5 + random.uniform(0, 2)
+    else:
+        # Default backoff
+        return (2 ** attempt) + random.uniform(0, 1)
+
+
 def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
@@ -929,7 +964,7 @@ def is_server_error(e: Exception) -> bool:
     """Checks if the exception is a temporary server-side error."""
     return isinstance(
         e,
-        (ServiceUnavailableError, APIConnectionError, InternalServerError, OpenAIError),
+        (ServiceUnavailableError, APIConnectionError, InternalServerError),
     )
 
 

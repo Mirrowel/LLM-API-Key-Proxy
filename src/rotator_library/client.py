@@ -511,7 +511,7 @@ class RotatingClient:
             custom_caps=custom_caps,
         )
         self._model_list_cache = {}
-        self.http_client = httpx.AsyncClient()
+        self._http_client: Optional[httpx.AsyncClient] = None
         self.provider_config = ProviderConfig()
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
@@ -532,6 +532,21 @@ class RotatingClient:
                     f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
                 )
                 self.max_concurrent_requests_per_key[provider] = 1
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Get or create a healthy HTTP client."""
+        if not hasattr(self, "_http_client") or self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.global_timeout, connect=30.0),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            )
+            lib_logger.debug("Created new HTTP client")
+        return self._http_client
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Property that ensures client is always usable."""
+        return self._get_http_client()
 
     def _parse_custom_cap_env_key(
         self, remainder: str
@@ -745,8 +760,9 @@ class RotatingClient:
 
     async def close(self):
         """Close the HTTP client to prevent resource leaks."""
-        if hasattr(self, "http_client") and self.http_client:
-            await self.http_client.aclose()
+        if hasattr(self, "_http_client") and self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     def _apply_default_safety_settings(
         self, litellm_kwargs: Dict[str, Any], provider: str
@@ -1041,6 +1057,7 @@ class RotatingClient:
         json_buffer = ""
         accumulated_finish_reason = None  # Track strongest finish_reason across chunks
         has_tool_calls = False  # Track if ANY tool calls were seen in stream
+        chunk_index = 0  # Track chunk count for better error logging
 
         try:
             while True:
@@ -1052,6 +1069,7 @@ class RotatingClient:
 
                 try:
                     chunk = await stream_iterator.__anext__()
+                    chunk_index += 1
                     if json_buffer:
                         lib_logger.warning(
                             f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}"
@@ -1169,6 +1187,19 @@ class RotatingClient:
                             ):  # Ensure the split actually did something
                                 raw_chunk = chunk_from_split
 
+                        # Early detection of error responses in stream
+                        if raw_chunk and '"error"' in raw_chunk:
+                            # Try to parse error immediately instead of buffering
+                            try:
+                                potential_error = json.loads(raw_chunk)
+                                if "error" in potential_error:
+                                    error_obj = potential_error.get("error", {})
+                                    error_message = error_obj.get("message", "Provider error in stream")
+                                    lib_logger.warning(f"Early stream error detected at chunk {chunk_index}: {error_message}")
+                                    raise StreamedAPIError(error_message, data=potential_error)
+                            except json.JSONDecodeError:
+                                pass  # Not a complete JSON, continue normal buffering
+
                         if not raw_chunk:
                             # If we could not extract a valid chunk, we cannot proceed with reassembly.
                             # This indicates a different, unexpected error type. Re-raise it.
@@ -1200,7 +1231,7 @@ class RotatingClient:
                     except Exception as buffer_exc:
                         # If the error was not a JSONDecodeError, it's an unexpected internal error.
                         lib_logger.error(
-                            f"Error during stream buffering logic: {buffer_exc}. Discarding buffer."
+                            f"Error during stream buffering logic at chunk {chunk_index}: {buffer_exc}. Discarding buffer."
                         )
                         json_buffer = (
                             ""  # Clear the corrupted buffer to prevent further issues.
@@ -1214,7 +1245,7 @@ class RotatingClient:
 
         except Exception as e:
             # Catch any other unexpected errors during streaming.
-            lib_logger.error(f"Caught unexpected exception of type: {type(e).__name__}")
+            lib_logger.error(f"Stream error at chunk {chunk_index}: {type(e).__name__}: {e}")
             lib_logger.error(
                 f"An unexpected error occurred during the stream for credential {mask_credential(key)}: {e}"
             )
