@@ -270,7 +270,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         3. Makes direct API call to Copilot
         4. Parses response into LiteLLM format
         """
-        credential_path = kwargs.get("api_key", "")
+        credential_path = kwargs.pop("credential_identifier", kwargs.get("api_key", ""))
         model = kwargs.get("model", "gpt-4o")
         messages = kwargs.get("messages", [])
         stream = kwargs.get("stream", False)
