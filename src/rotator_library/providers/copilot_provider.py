@@ -158,7 +158,8 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         The api_key here is actually the credential path for OAuth providers.
         For Copilot, models are configured via environment or defaults.
         """
-        return self._available_models
+        # Always return provider-prefixed models so /v1/models entries are directly usable.
+        return [m if "/" in m else f"copilot/{m}" for m in self._available_models]
 
     def get_credential_priority(self, credential: str) -> Optional[int]:
         """
