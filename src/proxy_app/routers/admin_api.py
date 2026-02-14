@@ -2,7 +2,7 @@ import secrets
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from proxy_app.auth import SessionUser, get_db_session, require_admin
 from proxy_app.db import hash_password
 from proxy_app.db_models import User
+from proxy_app.usage_recorder import get_usage_retention_days, prune_usage_events
 from proxy_app.usage_queries import (
     fetch_usage_by_day,
     fetch_usage_by_model,
@@ -73,6 +74,12 @@ class UsageByModelItem(UsageTotals):
 class UsageByModelResponse(BaseModel):
     days: int
     rows: list[UsageByModelItem]
+
+
+class UsagePruneResponse(BaseModel):
+    ok: bool
+    deleted: int
+    retention_days: int
 
 
 def _serialize_user(user: User) -> AdminUserItem:
@@ -243,3 +250,17 @@ async def admin_user_usage_by_model(
         days=days,
         rows=[UsageByModelItem(**row) for row in rows],
     )
+
+
+@router.post("/usage/prune", response_model=UsagePruneResponse)
+async def admin_prune_usage(
+    request: Request,
+    _: SessionUser = Depends(require_admin),
+) -> UsagePruneResponse:
+    retention_days = get_usage_retention_days()
+    session_maker = request.app.state.db_session_maker
+    deleted = await prune_usage_events(
+        session_maker,
+        retention_days=retention_days,
+    )
+    return UsagePruneResponse(ok=True, deleted=deleted, retention_days=retention_days)

@@ -243,8 +243,10 @@ print(response.content[0].text)
 | `GET /v1/models` | List all available models with pricing & capabilities |
 | `GET /v1/models/{model_id}` | Get details for a specific model |
 | `GET /v1/providers` | List configured providers |
+| `GET/POST /v1/quota-stats` | Provider quota stats (admin-only actor) |
 | `POST /v1/token-count` | Calculate token count for a payload |
 | `POST /v1/cost-estimate` | Estimate cost based on token counts |
+| `POST /api/admin/usage/prune` | Prune usage events older than `USAGE_RETENTION_DAYS` |
 
 > **Tip:** The `/v1/models` endpoint is useful for discovering available models in your client. Many apps can fetch this list automatically. Add `?enriched=false` for a minimal response without pricing data.
 
@@ -508,6 +510,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `CORS_ALLOW_ORIGINS` | Comma-separated browser origins | empty |
 | `CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS requests | false (unless origins configured) |
 | `SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout in milliseconds | `5000` |
+| `USAGE_RETENTION_DAYS` | Usage event retention window in days | `30` |
 | `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds) | `600` |
 | `SKIP_OAUTH_INIT_CHECK` | Skip interactive OAuth setup on startup | `false` |
 

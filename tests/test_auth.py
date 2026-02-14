@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 import pytest
+from fastapi import HTTPException
 
 from proxy_app.api_token_auth import (
     AUTH_MODE_BOTH,
@@ -8,9 +9,11 @@ from proxy_app.api_token_auth import (
     AUTH_MODE_USERS,
     AUTH_SOURCE_LEGACY_MASTER,
     AUTH_SOURCE_USER_API_KEY,
+    ApiActor,
     extract_api_token_from_headers,
     hash_api_token,
     hash_api_token_legacy,
+    require_admin_api_actor,
     resolve_api_actor_from_token,
 )
 from proxy_app.auth import create_session_token, decode_session_token, verify_password
@@ -110,6 +113,21 @@ def test_x_api_key_header_precedence_over_authorization() -> None:
         authorization="Bearer bearer-token",
     )
     assert fallback == "bearer-token"
+
+
+@pytest.mark.asyncio
+async def test_require_admin_api_actor_blocks_non_admin() -> None:
+    with pytest.raises(HTTPException) as exc:
+        await require_admin_api_actor(
+            actor=ApiActor(
+                user_id=1,
+                api_key_id=2,
+                role="user",
+                auth_source="user_api_key",
+            )
+        )
+
+    assert exc.value.status_code == 403
 
 
 @pytest.mark.asyncio
