@@ -44,14 +44,26 @@ COPILOT_API_BASE = "https://api.githubcopilot.com"
 
 # Available Copilot models (these may vary based on subscription)
 DEFAULT_COPILOT_MODELS = [
-    "gpt-4o",
     "gpt-4.1",
-    "gpt-4.1-mini",
-    "claude-3.5-sonnet",
+    "gpt-4o",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
     "claude-sonnet-4",
-    "o3-mini",
-    "o1",
-    "gemini-2.0-flash-001",
+    "claude-sonnet-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-41",
+    "claude-haiku-4.5",
+    "gemini-2.5-pro",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "grok-code-fast-1",
 ]
 
 # Responses API alternate input types for agent detection
