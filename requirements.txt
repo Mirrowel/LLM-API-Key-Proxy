@@ -1,5 +1,7 @@
 # FastAPI framework for building the proxy server
 fastapi
+jinja2
+python-multipart
 # ASGI server for running the FastAPI application
 uvicorn
 # For loading environment variables from a .env file
@@ -20,8 +22,15 @@ colorlog
 
 rich
 
+sqlalchemy
+aiosqlite
+
 # GUI for model filter configuration
 customtkinter
 
 # For building the executable
 pyinstaller
+
+# Test dependencies
+pytest
+pytest-asyncio

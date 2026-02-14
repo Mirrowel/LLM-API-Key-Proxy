@@ -54,6 +54,7 @@ docker run -d \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/usage:/app/usage \
+  -v $(pwd)/data:/app/data \
   -e SKIP_OAUTH_INIT_CHECK=true \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
 ```
@@ -61,13 +62,13 @@ docker run -d \
 **Using Docker Compose:**
 
 ```bash
-# Create your .env file and usage directory first, then:
+# Create your .env file and runtime data directories first, then:
 cp .env.example .env
-mkdir usage
+mkdir -p usage data
 docker compose up -d
 ```
 
-> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
+> **Important:** Create `usage/` and `data/` before running Docker Compose so usage stats and SQLite DB data persist on the host.
 
 > **Note:** For OAuth providers, complete authentication locally first using the credential tool, then mount the `oauth_creds/` directory or export credentials to environment variables.
 
@@ -93,7 +94,15 @@ Once the proxy is running, configure your application with these settings:
 | Setting | Value |
 |---------|-------|
 | **Base URL / API Endpoint** | `http://127.0.0.1:8000/v1` |
-| **API Key** | Your `PROXY_API_KEY` |
+| **API Key** | Depends on `AUTH_MODE` (`PROXY_API_KEY`, user API key, or both) |
+
+### Auth Transition Modes
+
+- `AUTH_MODE=users`: only per-user API keys are accepted for `/v1/*`
+- `AUTH_MODE=legacy`: only `PROXY_API_KEY` is accepted
+- `AUTH_MODE=both`: accepts either user API keys or `PROXY_API_KEY` (recommended migration mode)
+
+Recommended rollout: start with `AUTH_MODE=both`, move clients to user keys, then switch to `AUTH_MODE=users`.
 
 ### Model Format: `provider/model_name`
 
@@ -234,10 +243,33 @@ print(response.content[0].text)
 | `GET /v1/models` | List all available models with pricing & capabilities |
 | `GET /v1/models/{model_id}` | Get details for a specific model |
 | `GET /v1/providers` | List configured providers |
+| `GET/POST /v1/quota-stats` | Provider quota stats (admin-only actor) |
 | `POST /v1/token-count` | Calculate token count for a payload |
 | `POST /v1/cost-estimate` | Estimate cost based on token counts |
+| `POST /api/admin/usage/prune` | Prune usage events older than `USAGE_RETENTION_DAYS` |
 
 > **Tip:** The `/v1/models` endpoint is useful for discovering available models in your client. Many apps can fetch this list automatically. Add `?enriched=false` for a minimal response without pricing data.
+
+---
+
+## AUTH_MODE Migration (MVP)
+
+`AUTH_MODE` controls which tokens are accepted on `/v1/*` endpoints.
+
+| `AUTH_MODE` | Accepted token(s) | Intended phase |
+|-------------|-------------------|----------------|
+| `users` | User API keys created in the dashboard/API | Final state after migration |
+| `legacy` | `PROXY_API_KEY` only | Backward-compatible legacy-only mode |
+| `both` (default) | User API keys and `PROXY_API_KEY` | Transition window for gradual rollout |
+
+Recommended transition path:
+
+1. Start on `AUTH_MODE=both`
+2. Bootstrap admin with `INITIAL_ADMIN_USERNAME` + `INITIAL_ADMIN_PASSWORD`
+3. Create user API keys and rotate clients over to those keys
+4. Switch to `AUTH_MODE=users` once all clients are migrated
+
+Legacy compatibility statement: `PROXY_API_KEY` remains fully supported when `AUTH_MODE` is set to `legacy` or `both`.
 
 ---
 
@@ -469,9 +501,26 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PROXY_API_KEY` | Authentication key for your proxy | Required |
+| `PROXY_API_KEY` | Legacy `/v1/*` key used in `legacy` or `both` mode | Optional |
+| `AUTH_MODE` | `/v1/*` auth mode: `users`, `legacy`, `both` | `both` |
+| `APP_ENV` | Runtime environment (`dev` or `prod`) | `dev` |
+| `ALLOW_INSECURE_DEFAULTS` | Allow startup with default secrets | `true` in dev, `false` in prod |
+| `SESSION_SECRET` | Dashboard session signing secret | Required in prod |
+| `API_TOKEN_PEPPER` | HMAC key for API token hashes | Required in prod |
+| `CORS_ALLOW_ORIGINS` | Comma-separated browser origins | empty |
+| `CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS requests | false (unless origins configured) |
+| `SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout in milliseconds | `5000` |
+| `USAGE_RETENTION_DAYS` | Usage event retention window in days | `30` |
 | `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds) | `600` |
 | `SKIP_OAUTH_INIT_CHECK` | Skip interactive OAuth setup on startup | `false` |
+
+### Production Checklist
+
+- Set `APP_ENV=prod`
+- Set strong `SESSION_SECRET` and `API_TOKEN_PEPPER`
+- Keep `ALLOW_INSECURE_DEFAULTS=false`
+- Set explicit `CORS_ALLOW_ORIGINS` (do not use `*` with credentials)
+- Keep persistent mounts for `/app/data`, `/app/logs`, `/app/oauth_creds`, and `/app/usage`
 
 ### Per-Provider Settings
 
@@ -859,8 +908,8 @@ The proxy is available as a multi-architecture Docker image (amd64/arm64) from G
 cp .env.example .env
 nano .env
 
-# 2. Create usage directory (usage_*.json files are created automatically)
-mkdir usage
+# 2. Create runtime data directories
+mkdir -p usage data
 
 # 3. Start the proxy
 docker compose up -d
@@ -869,13 +918,13 @@ docker compose up -d
 docker compose logs -f
 ```
 
-> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
+> **Important:** Create `usage/` and `data/` before running Docker Compose so usage stats and SQLite data persist on the host.
 
 **Manual Docker Run:**
 
 ```bash
-# Create usage directory if it doesn't exist
-mkdir usage
+# Create runtime data directories if they don't exist
+mkdir -p usage data
 
 docker run -d \
   --name llm-api-proxy \
@@ -885,6 +934,7 @@ docker run -d \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/usage:/app/usage \
+  -v $(pwd)/data:/app/data \
   -e SKIP_OAUTH_INIT_CHECK=true \
   -e PYTHONUNBUFFERED=1 \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
@@ -905,6 +955,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 | `oauth_creds/`   | OAuth credential files (persistent)    |
 | `logs/`          | Request logs and detailed logging      |
 | `usage/`       | Usage statistics persistence (`usage_*.json`) |
+| `data/`          | SQLite database persistence (`data/proxy.db`) |
 
 **Image Tags:**
 
