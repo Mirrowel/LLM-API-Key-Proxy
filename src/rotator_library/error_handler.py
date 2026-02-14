@@ -23,6 +23,9 @@ from litellm.exceptions import (
 
 lib_logger = logging.getLogger("rotator_library")
 
+# Default cooldown for rate limits without retry_after (reduced from 60s)
+RATE_LIMIT_DEFAULT_COOLDOWN = 10  # seconds
+
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
     """
@@ -619,6 +622,38 @@ def get_retry_after(error: Exception) -> Optional[int]:
     return None
 
 
+def get_retry_backoff(classified_error: "ClassifiedError", attempt: int) -> float:
+    """
+    Calculate retry backoff time based on error type and attempt number.
+
+    Different strategies for different error types:
+    - api_connection: More aggressive retry (network issues are transient)
+    - server_error: Standard exponential backoff
+    - rate_limit: Use retry_after if available, otherwise shorter default
+    """
+    import random
+
+    # If provider specified retry_after, use it
+    if classified_error.retry_after:
+        return classified_error.retry_after
+
+    error_type = classified_error.error_type
+
+    if error_type == "api_connection":
+        # More aggressive retry for network errors - they're usually transient
+        # 0.5s, 0.75s, 1.1s, 1.7s, 2.5s...
+        return 0.5 * (1.5 ** attempt) + random.uniform(0, 0.5)
+    elif error_type == "server_error":
+        # Standard exponential backoff: 1s, 2s, 4s, 8s...
+        return (2 ** attempt) + random.uniform(0, 1)
+    elif error_type == "rate_limit":
+        # Short default for transient rate limits without retry_after
+        return 5 + random.uniform(0, 2)
+    else:
+        # Default backoff
+        return (2 ** attempt) + random.uniform(0, 1)
+
+
 def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedError:
     """
     Classifies an exception into a structured ClassifiedError object.
@@ -753,11 +788,39 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     original_exception=e,
                     status_code=status_code,
                 )
-            return ClassifiedError(
-                error_type="invalid_request",
-                original_exception=e,
-                status_code=status_code,
-            )
+
+            # Provider-side transient 400s (from upstream wrappers) should rotate.
+            # Keep strict fail-fast behavior for explicit policy/safety violations.
+            if any(
+                pattern in error_body
+                for pattern in [
+                    "policy",
+                    "safety",
+                    "content blocked",
+                    "prompt blocked",
+                ]
+            ):
+                return ClassifiedError(
+                    error_type="invalid_request",
+                    original_exception=e,
+                    status_code=status_code,
+                )
+
+            if any(
+                pattern in error_body
+                for pattern in [
+                    "provider returned error",
+                    "upstream error",
+                    "upstream temporarily unavailable",
+                    "upstream service unavailable",
+                ]
+            ):
+                return ClassifiedError(
+                    error_type="server_error",
+                    original_exception=e,
+                    status_code=503,
+                )
+
             return ClassifiedError(
                 error_type="invalid_request",
                 original_exception=e,
@@ -841,6 +904,22 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         )
 
     if isinstance(e, (InvalidRequestError, BadRequestError)):
+        error_msg = str(e).lower()
+        if any(
+            pattern in error_msg
+            for pattern in [
+                "provider returned error",
+                "upstream error",
+                "upstream temporarily unavailable",
+                "upstream service unavailable",
+            ]
+        ):
+            return ClassifiedError(
+                error_type="server_error",
+                original_exception=e,
+                status_code=status_code or 503,
+            )
+
         return ClassifiedError(
             error_type="invalid_request",
             original_exception=e,
@@ -885,7 +964,7 @@ def is_server_error(e: Exception) -> bool:
     """Checks if the exception is a temporary server-side error."""
     return isinstance(
         e,
-        (ServiceUnavailableError, APIConnectionError, InternalServerError, OpenAIError),
+        (ServiceUnavailableError, APIConnectionError, InternalServerError),
     )
 
 
@@ -893,8 +972,12 @@ def is_unrecoverable_error(e: Exception) -> bool:
     """
     Checks if the exception is a non-retriable client-side error.
     These are errors that will not resolve on their own.
+
+    NOTE: We no longer treat BadRequestError/InvalidRequestError as unrecoverable
+    because "invalid_request" can come from provider-side issues (e.g., "Provider returned error")
+    and should trigger rotation rather than immediate failure.
     """
-    return isinstance(e, (InvalidRequestError, AuthenticationError, BadRequestError))
+    return False  # All errors are potentially recoverable via rotation
 
 
 def should_rotate_on_error(classified_error: ClassifiedError) -> bool:

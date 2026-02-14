@@ -11,7 +11,7 @@ import os
 import random
 import httpx
 import litellm
-from litellm.exceptions import APIConnectionError
+from litellm.exceptions import APIConnectionError, BadRequestError, InvalidRequestError
 from litellm.litellm_core_utils.token_counter import token_counter
 import logging
 from pathlib import Path
@@ -39,6 +39,7 @@ from .provider_config import ProviderConfig
 from .providers import PROVIDER_PLUGINS
 from .providers.openai_compatible_provider import OpenAICompatibleProvider
 from .request_sanitizer import sanitize_request_payload
+from .model_info_service import get_model_info_service
 from .cooldown_manager import CooldownManager
 from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
@@ -443,9 +444,9 @@ class RotatingClient:
                         custom_caps[provider][tier_key][model_key] = {}
 
                     # Store max_requests value
-                    custom_caps[provider][tier_key][model_key]["max_requests"] = (
-                        env_value
-                    )
+                    custom_caps[provider][tier_key][model_key][
+                        "max_requests"
+                    ] = env_value
 
                 elif env_key.startswith(cooldown_prefix):
                     # Parse cooldown config
@@ -510,7 +511,7 @@ class RotatingClient:
             custom_caps=custom_caps,
         )
         self._model_list_cache = {}
-        self.http_client = httpx.AsyncClient()
+        self._http_client: Optional[httpx.AsyncClient] = None
         self.provider_config = ProviderConfig()
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
@@ -518,6 +519,9 @@ class RotatingClient:
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
         self.model_definitions = ModelDefinitions()
+
+        # Initialize ModelRegistry for context window lookups (used by token calculator)
+        self._model_registry = get_model_info_service()
 
         # Store and validate max concurrent requests per key
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
@@ -528,6 +532,21 @@ class RotatingClient:
                     f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
                 )
                 self.max_concurrent_requests_per_key[provider] = 1
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Get or create a healthy HTTP client."""
+        if not hasattr(self, "_http_client") or self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.global_timeout, connect=30.0),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            )
+            lib_logger.debug("Created new HTTP client")
+        return self._http_client
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Property that ensures client is always usable."""
+        return self._get_http_client()
 
     def _parse_custom_cap_env_key(
         self, remainder: str
@@ -741,8 +760,9 @@ class RotatingClient:
 
     async def close(self):
         """Close the HTTP client to prevent resource leaks."""
-        if hasattr(self, "http_client") and self.http_client:
-            await self.http_client.aclose()
+        if hasattr(self, "_http_client") and self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     def _apply_default_safety_settings(
         self, litellm_kwargs: Dict[str, Any], provider: str
@@ -804,6 +824,105 @@ class RotatingClient:
         ):
             litellm_kwargs["safety_settings"] = default_generic.copy()
 
+    def _apply_provider_headers(
+        self, litellm_kwargs: Dict[str, Any], provider: str, credential: str
+    ):
+        """
+        Apply correct provider headers and remove problematic client headers.
+
+        This ensures that authorization/x-api-key headers from client requests
+        are replaced with the correct values from the provider configuration.
+
+        Args:
+            litellm_kwargs: The kwargs being prepared for LiteLLM
+            provider: The provider name (e.g., 'kilocode', 'openai')
+            credential: The credential/API key being used
+        """
+        # Headers that should be removed from client requests to prevent
+        # them from being forwarded to the actual provider
+        # These are case-insensitive patterns to match
+        problematic_headers = {
+            "authorization",
+            "x-api-key",
+            "api-key",
+            # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+            "anthropic-version",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-beta",
+            "x-anthropic-",
+        }
+
+        def _remove_problematic_headers(target_dict: Dict[str, Any], location: str) -> None:
+            """Remove problematic headers case-insensitively from a dict."""
+            if not isinstance(target_dict, dict):
+                return
+            keys_to_remove = []
+            for key in target_dict.keys():
+                if not isinstance(key, str):
+                    continue
+                key_lower = key.lower()
+                # Check if key matches any problematic header pattern
+                for header in problematic_headers:
+                    if key_lower == header.lower():
+                        keys_to_remove.append(key)
+                        break
+                    elif header.endswith("-") and key_lower.startswith(header.lower()):
+                        # For patterns like "x-anthropic-" - remove any header starting with this
+                        keys_to_remove.append(key)
+                        break
+            if keys_to_remove:
+                lib_logger.debug(
+                    f"[DEBUG] Removing {len(keys_to_remove)} problematic headers from {location}: {keys_to_remove}"
+                )
+            for key in keys_to_remove:
+                target_dict.pop(key, None)
+
+        # DEBUG: Log all keys in litellm_kwargs
+        lib_logger.debug(
+            f"[DEBUG] _apply_provider_headers called for provider '{provider}' with keys: {list(litellm_kwargs.keys())}"
+        )
+
+        # Remove problematic headers from top-level litellm_kwargs
+        _remove_problematic_headers(litellm_kwargs, "top-level kwargs")
+
+        # Remove problematic headers from extra_body
+        if "extra_body" in litellm_kwargs and isinstance(
+            litellm_kwargs["extra_body"], dict
+        ):
+            _remove_problematic_headers(litellm_kwargs["extra_body"], "extra_body")
+
+        # Remove problematic headers from headers parameter
+        if "headers" in litellm_kwargs and isinstance(litellm_kwargs["headers"], dict):
+            _remove_problematic_headers(litellm_kwargs["headers"], "headers")
+
+        # Add provider-specific headers from environment variables if configured
+        # These headers should be used instead of any client-provided ones
+        provider_headers_key = f"{provider.upper()}_API_HEADERS"
+        provider_headers = os.environ.get(provider_headers_key)
+
+        if provider_headers:
+            try:
+                # Parse headers from JSON format
+                import json
+                headers_dict = json.loads(provider_headers)
+                if isinstance(headers_dict, dict):
+                    # Use headers parameter if available, otherwise create it
+                    if "headers" not in litellm_kwargs:
+                        litellm_kwargs["headers"] = {}
+                    if isinstance(litellm_kwargs["headers"], dict):
+                        litellm_kwargs["headers"].update(headers_dict)
+                    elif "extra_body" in litellm_kwargs and isinstance(
+                        litellm_kwargs["extra_body"], dict
+                    ):
+                        litellm_kwargs["extra_body"].update(headers_dict)
+                    lib_logger.debug(
+                        f"Applied provider headers from {provider_headers_key} for provider '{provider}'"
+                    )
+            except (json.JSONDecodeError, TypeError) as e:
+                lib_logger.warning(
+                    f"Failed to parse {provider_headers_key}: {e}. Expected JSON format."
+                )
+
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         return self.oauth_credentials
 
@@ -863,6 +982,19 @@ class RotatingClient:
             else:
                 return None
         return self._provider_instances[provider_name]
+
+    def _normalize_model_string(self, model: str) -> str:
+        """Normalize incoming model string for consistent routing and matching."""
+        if not isinstance(model, str):
+            return ""
+        return model.strip()
+
+    def _extract_provider_from_model(self, model: str) -> str:
+        """Extract provider prefix from provider/model format safely."""
+        normalized_model = self._normalize_model_string(model)
+        if not normalized_model or "/" not in normalized_model:
+            return ""
+        return normalized_model.split("/", 1)[0].strip().lower()
 
     def _resolve_model_id(self, model: str, provider: str) -> str:
         """
@@ -925,6 +1057,7 @@ class RotatingClient:
         json_buffer = ""
         accumulated_finish_reason = None  # Track strongest finish_reason across chunks
         has_tool_calls = False  # Track if ANY tool calls were seen in stream
+        chunk_index = 0  # Track chunk count for better error logging
 
         try:
             while True:
@@ -936,6 +1069,7 @@ class RotatingClient:
 
                 try:
                     chunk = await stream_iterator.__anext__()
+                    chunk_index += 1
                     if json_buffer:
                         lib_logger.warning(
                             f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}"
@@ -1020,11 +1154,15 @@ class RotatingClient:
                     litellm.ServiceUnavailableError,
                     litellm.InternalServerError,
                     APIConnectionError,
+                    BadRequestError,
+                    InvalidRequestError,
                     httpx.HTTPStatusError,
                 ) as e:
                     # This is a critical, typed error from litellm or httpx that signals a key failure.
                     # We do not try to parse it here. We wrap it and raise it immediately
                     # for the outer retry loop to handle.
+                    # NOTE: BadRequestError/InvalidRequestError with "provider returned error" are
+                    # transient upstream issues and should be classified as server_error for rotation.
                     lib_logger.warning(
                         f"Caught a critical API error mid-stream: {type(e).__name__}. Signaling for credential rotation."
                     )
@@ -1048,6 +1186,19 @@ class RotatingClient:
                                 e
                             ):  # Ensure the split actually did something
                                 raw_chunk = chunk_from_split
+
+                        # Early detection of error responses in stream
+                        if raw_chunk and '"error"' in raw_chunk:
+                            # Try to parse error immediately instead of buffering
+                            try:
+                                potential_error = json.loads(raw_chunk)
+                                if "error" in potential_error:
+                                    error_obj = potential_error.get("error", {})
+                                    error_message = error_obj.get("message", "Provider error in stream")
+                                    lib_logger.warning(f"Early stream error detected at chunk {chunk_index}: {error_message}")
+                                    raise StreamedAPIError(error_message, data=potential_error)
+                            except json.JSONDecodeError:
+                                pass  # Not a complete JSON, continue normal buffering
 
                         if not raw_chunk:
                             # If we could not extract a valid chunk, we cannot proceed with reassembly.
@@ -1080,7 +1231,7 @@ class RotatingClient:
                     except Exception as buffer_exc:
                         # If the error was not a JSONDecodeError, it's an unexpected internal error.
                         lib_logger.error(
-                            f"Error during stream buffering logic: {buffer_exc}. Discarding buffer."
+                            f"Error during stream buffering logic at chunk {chunk_index}: {buffer_exc}. Discarding buffer."
                         )
                         json_buffer = (
                             ""  # Clear the corrupted buffer to prevent further issues.
@@ -1094,7 +1245,7 @@ class RotatingClient:
 
         except Exception as e:
             # Catch any other unexpected errors during streaming.
-            lib_logger.error(f"Caught unexpected exception of type: {type(e).__name__}")
+            lib_logger.error(f"Stream error at chunk {chunk_index}: {type(e).__name__}: {e}")
             lib_logger.error(
                 f"An unexpected error occurred during the stream for credential {mask_credential(key)}: {e}"
             )
@@ -1179,11 +1330,14 @@ class RotatingClient:
         **kwargs,
     ) -> Any:
         """A generic retry mechanism for non-streaming API calls."""
-        model = kwargs.get("model")
+        model = self._normalize_model_string(kwargs.get("model"))
         if not model:
             raise ValueError("'model' is a required parameter.")
+        kwargs["model"] = model
 
-        provider = model.split("/")[0]
+        provider = self._extract_provider_from_model(model)
+        if not provider:
+            raise ValueError("'model' must be in 'provider/model' format.")
         if provider not in self.all_credentials:
             raise ValueError(
                 f"No API keys or OAuth credentials configured for provider: {provider}"
@@ -1324,25 +1478,6 @@ class RotatingClient:
             current_cred = None
             key_acquired = False
             try:
-                # Check for a provider-wide cooldown first.
-                if await self.cooldown_manager.is_cooling_down(provider):
-                    remaining_cooldown = (
-                        await self.cooldown_manager.get_cooldown_remaining(provider)
-                    )
-                    remaining_budget = deadline - time.time()
-
-                    # If the cooldown is longer than the remaining time budget, fail fast.
-                    if remaining_cooldown > remaining_budget:
-                        lib_logger.warning(
-                            f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early."
-                        )
-                        break
-
-                    lib_logger.warning(
-                        f"Provider {provider} is in cooldown. Waiting for {remaining_cooldown:.2f} seconds."
-                    )
-                    await asyncio.sleep(remaining_cooldown)
-
                 creds_to_try = [
                     c for c in credentials_for_provider if c not in tried_creds
                 ]
@@ -1387,6 +1522,37 @@ class RotatingClient:
                 tried_creds.add(current_cred)
 
                 litellm_kwargs = kwargs.copy()
+
+                # [FIX] Remove client-provided headers/api_key that could override provider credentials
+                # Clean case-insensitive headers and api_key from top-level kwargs
+                headers_to_remove = [
+                    "authorization",
+                    "x-api-key",
+                    "api-key",
+                    "api_key",
+                    # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+                    "anthropic-version",
+                    "anthropic-dangerous-direct-browser-access",
+                    "anthropic-beta",
+                    "x-anthropic-",
+                ]
+                for key in list(litellm_kwargs.keys()):
+                    if not isinstance(key, str):
+                        continue
+                    key_lower = key.lower()
+                    should_remove = False
+                    for header in headers_to_remove:
+                        if header.endswith("-") and key_lower.startswith(header):
+                            should_remove = True
+                            break
+                        elif key_lower == header.lower():
+                            should_remove = True
+                            break
+                    if should_remove:
+                        litellm_kwargs.pop(key, None)
+
+                # Also clean nested headers in extra_body and headers params
+                self._apply_provider_headers(litellm_kwargs, provider, current_cred)
 
                 # [NEW] Merge provider-specific params
                 if provider in self.litellm_provider_params:
@@ -1476,9 +1642,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             # Record in accumulator for client reporting
@@ -1497,7 +1663,7 @@ class RotatingClient:
                             if classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1519,9 +1685,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1569,9 +1735,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1599,7 +1765,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1618,6 +1784,11 @@ class RotatingClient:
                         pass
                     else:  # API Key
                         litellm_kwargs["api_key"] = current_cred
+
+                    # [FIX] Remove problematic headers and add correct provider headers
+                    # This ensures that authorization/x-api-key from client requests
+                    # are replaced with the correct values from configuration
+                    self._apply_provider_headers(litellm_kwargs, provider, current_cred)
 
                     provider_instance = self._get_provider_instance(provider)
                     if provider_instance:
@@ -1654,13 +1825,23 @@ class RotatingClient:
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:
                         litellm_kwargs["messages"] = [
-                            {"role": "user", "content": m["content"]}
-                            if m.get("role") == "system"
-                            else m
+                            (
+                                {"role": "user", "content": m["content"]}
+                                if m.get("role") == "system"
+                                else m
+                            )
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs, model, registry=self._model_registry
+                    )
+
+                    # If the provider is 'nvidia', set the custom provider to 'nvidia_nim'
+                    # and strip the prefix from the model name for LiteLLM.
+                    if provider == "nvidia":
+                        litellm_kwargs["custom_llm_provider"] = "nvidia_nim"
+                        litellm_kwargs["model"] = model.split("/", 1)[1]
 
                     for attempt in range(self.max_retries):
                         try:
@@ -1716,9 +1897,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
 
@@ -1741,7 +1922,7 @@ class RotatingClient:
                             ):
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             await self.usage_manager.record_failure(
@@ -1760,9 +1941,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message = str(e).split("\n")[0]
@@ -1815,9 +1996,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             classified_error = classify_error(e, provider=provider)
@@ -1843,7 +2024,7 @@ class RotatingClient:
                             if classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             # Check if we should retry same key (server errors with retries left)
@@ -1878,9 +2059,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
 
                             if request and await request.is_disconnected():
@@ -1903,7 +2084,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
 
                             # Check if this error should trigger rotation
@@ -1951,8 +2132,14 @@ class RotatingClient:
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         """A dedicated generator for retrying streaming completions with full request preparation and per-key retries."""
-        model = kwargs.get("model")
-        provider = model.split("/")[0]
+        model = self._normalize_model_string(kwargs.get("model"))
+        if not model:
+            raise ValueError("'model' is a required parameter.")
+        kwargs["model"] = model
+
+        provider = self._extract_provider_from_model(model)
+        if not provider:
+            raise ValueError("'model' must be in 'provider/model' format.")
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
@@ -2088,21 +2275,6 @@ class RotatingClient:
                 current_cred = None
                 key_acquired = False
                 try:
-                    if await self.cooldown_manager.is_cooling_down(provider):
-                        remaining_cooldown = (
-                            await self.cooldown_manager.get_cooldown_remaining(provider)
-                        )
-                        remaining_budget = deadline - time.time()
-                        if remaining_cooldown > remaining_budget:
-                            lib_logger.warning(
-                                f"Provider {provider} cooldown ({remaining_cooldown:.2f}s) exceeds remaining request budget ({remaining_budget:.2f}s). Failing early."
-                            )
-                            break
-                        lib_logger.warning(
-                            f"Provider {provider} is in a global cooldown. All requests to this provider will be paused for {remaining_cooldown:.2f} seconds."
-                        )
-                        await asyncio.sleep(remaining_cooldown)
-
                     creds_to_try = [
                         c for c in credentials_for_provider if c not in tried_creds
                     ]
@@ -2152,6 +2324,34 @@ class RotatingClient:
                     tried_creds.add(current_cred)
 
                     litellm_kwargs = kwargs.copy()
+
+                    # [FIX] Remove client-provided headers/api_key that could override provider credentials
+                    headers_to_remove = [
+                        "authorization",
+                        "x-api-key",
+                        "api-key",
+                        "api_key",
+                        # Anthropic-specific headers that should not be sent to OpenAI-compatible providers
+                        "anthropic-version",
+                        "anthropic-dangerous-direct-browser-access",
+                        "anthropic-beta",
+                        "x-anthropic-",
+                    ]
+                    for key in list(litellm_kwargs.keys()):
+                        if not isinstance(key, str):
+                            continue
+                        key_lower = key.lower()
+                        should_remove = False
+                        for header in headers_to_remove:
+                            if header.endswith("-") and key_lower.startswith(header):
+                                should_remove = True
+                                break
+                            elif key_lower == header.lower():
+                                should_remove = True
+                                break
+                        if should_remove:
+                            litellm_kwargs.pop(key, None)
+
                     if "reasoning_effort" in kwargs:
                         litellm_kwargs["reasoning_effort"] = kwargs["reasoning_effort"]
 
@@ -2243,6 +2443,8 @@ class RotatingClient:
                                 StreamedAPIError,
                                 litellm.RateLimitError,
                                 httpx.HTTPStatusError,
+                                BadRequestError,
+                                InvalidRequestError,
                             ) as e:
                                 last_exception = e
                                 # If the exception is our custom wrapper, unwrap the original error
@@ -2257,9 +2459,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
 
                                 # Record in accumulator for client reporting
@@ -2280,7 +2482,7 @@ class RotatingClient:
                                         classified_error.retry_after or 60
                                     )
                                     await self.cooldown_manager.start_cooldown(
-                                        provider, cooldown_duration
+                                        current_cred, cooldown_duration
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -2302,9 +2504,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
                                 classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
@@ -2352,9 +2554,9 @@ class RotatingClient:
                                     model=model,
                                     attempt=attempt + 1,
                                     error=e,
-                                    request_headers=dict(request.headers)
-                                    if request
-                                    else {},
+                                    request_headers=(
+                                        dict(request.headers) if request else {}
+                                    ),
                                 )
                                 classified_error = classify_error(e, provider=provider)
                                 error_message = str(e).split("\n")[0]
@@ -2392,6 +2594,11 @@ class RotatingClient:
                         else:  # API Key
                             litellm_kwargs["api_key"] = current_cred
 
+                    # [FIX] Remove problematic headers and add correct provider headers
+                    # This ensures that authorization/x-api-key from client requests
+                    # are replaced with the correct values from configuration
+                    self._apply_provider_headers(litellm_kwargs, provider, current_cred)
+
                     provider_instance = self._get_provider_instance(provider)
                     if provider_instance:
                         # Ensure default Gemini safety settings are present (without overriding request)
@@ -2426,13 +2633,17 @@ class RotatingClient:
 
                     if "gemma-3" in model and "messages" in litellm_kwargs:
                         litellm_kwargs["messages"] = [
-                            {"role": "user", "content": m["content"]}
-                            if m.get("role") == "system"
-                            else m
+                            (
+                                {"role": "user", "content": m["content"]}
+                                if m.get("role") == "system"
+                                else m
+                            )
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs, model, registry=self._model_registry
+                    )
 
                     # If the provider is 'qwen_code', set the custom provider to 'qwen'
                     # and strip the prefix from the model name for LiteLLM.
@@ -2496,6 +2707,8 @@ class RotatingClient:
                             StreamedAPIError,
                             litellm.RateLimitError,
                             httpx.HTTPStatusError,
+                            BadRequestError,
+                            InvalidRequestError,
                         ) as e:
                             last_exception = e
 
@@ -2533,9 +2746,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                                 raw_response_text=cleaned_str,
                             )
 
@@ -2609,7 +2822,7 @@ class RotatingClient:
                                         classified_error.retry_after or 60
                                     )
                                     await self.cooldown_manager.start_cooldown(
-                                        provider, cooldown_duration
+                                        current_cred, cooldown_duration
                                     )
 
                                 await self.usage_manager.record_failure(
@@ -2629,9 +2842,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
@@ -2680,9 +2893,9 @@ class RotatingClient:
                                 model=model,
                                 attempt=attempt + 1,
                                 error=e,
-                                request_headers=dict(request.headers)
-                                if request
-                                else {},
+                                request_headers=(
+                                    dict(request.headers) if request else {}
+                                ),
                             )
                             classified_error = classify_error(e, provider=provider)
                             error_message_text = str(e).split("\n")[0]
@@ -2703,7 +2916,7 @@ class RotatingClient:
                             ) or classified_error.error_type == "rate_limit":
                                 cooldown_duration = classified_error.retry_after or 60
                                 await self.cooldown_manager.start_cooldown(
-                                    provider, cooldown_duration
+                                    current_cred, cooldown_duration
                                 )
                                 lib_logger.warning(
                                     f"Rate limit detected for {provider}. Starting {cooldown_duration}s cooldown."
@@ -2798,19 +3011,24 @@ class RotatingClient:
         Returns:
             The completion response object, or an async generator for streaming responses, or None if all retries fail.
         """
-        # Handle iflow provider: remove stream_options to avoid HTTP 406
-        model = kwargs.get("model", "")
-        provider = model.split("/")[0] if "/" in model else ""
+        # Providers that don't support stream_options parameter
+        # These providers return 400/406 errors when stream_options is sent
+        STREAM_OPTIONS_UNSUPPORTED_PROVIDERS = {"iflow", "kilocode"}
 
-        if provider == "iflow" and "stream_options" in kwargs:
+        model = self._normalize_model_string(kwargs.get("model", ""))
+        kwargs["model"] = model
+        provider = self._extract_provider_from_model(model)
+
+        # Remove stream_options for providers that don't support it
+        if provider in STREAM_OPTIONS_UNSUPPORTED_PROVIDERS and "stream_options" in kwargs:
             lib_logger.debug(
-                "Removing stream_options for iflow provider to avoid HTTP 406"
+                f"Removing stream_options for {provider} provider (not supported)"
             )
             kwargs.pop("stream_options", None)
 
         if kwargs.get("stream"):
-            # Only add stream_options for providers that support it (excluding iflow)
-            if provider != "iflow":
+            # Only add stream_options for providers that support it
+            if provider not in STREAM_OPTIONS_UNSUPPORTED_PROVIDERS:
                 if "stream_options" not in kwargs:
                     kwargs["stream_options"] = {}
                 if "include_usage" not in kwargs["stream_options"]:
@@ -2878,7 +3096,7 @@ class RotatingClient:
         # Add preprompt tokens for Antigravity provider
         # The Antigravity provider injects system instructions during actual API calls,
         # so we need to account for those tokens in the count
-        provider = model.split("/")[0] if "/" in model else ""
+        provider = self._extract_provider_from_model(model)
         if provider == "antigravity":
             try:
                 from .providers.antigravity_provider import (
@@ -3127,7 +3345,9 @@ class RotatingClient:
                         group_stats["total_requests_remaining"] = 0
                         # Fallback to avg_remaining_pct when max_requests unavailable
                         # This handles providers like Firmware that only provide percentage
-                        group_stats["total_remaining_pct"] = group_stats.get("avg_remaining_pct")
+                        group_stats["total_remaining_pct"] = group_stats.get(
+                            "avg_remaining_pct"
+                        )
 
                     prov_stats["quota_groups"][group_name] = group_stats
 
@@ -3334,9 +3554,9 @@ class RotatingClient:
         """
         result = {
             "action": "force_refresh",
-            "scope": "credential"
-            if credential
-            else ("provider" if provider else "all"),
+            "scope": (
+                "credential" if credential else ("provider" if provider else "all")
+            ),
             "provider": provider,
             "credential": credential,
             "credentials_refreshed": 0,
@@ -3450,7 +3670,7 @@ class RotatingClient:
         original_model = request.model
 
         # Extract provider from model for logging
-        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+        provider = self._extract_provider_from_model(original_model) or "unknown"
 
         # Create Anthropic transaction logger if request logging is enabled
         anthropic_logger = None
@@ -3474,10 +3694,16 @@ class RotatingClient:
         if anthropic_logger and anthropic_logger.log_dir:
             openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
+        # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+        # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
+        # We only use raw_request for disconnect checking, not for passing to LiteLLM
+        litellm_request = None  # Don't pass request object to LiteLLM
+
         if request.stream:
             # Streaming response
+            # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+            # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
             response_generator = self.acompletion(
-                request=raw_request,
                 pre_request_callback=pre_request_callback,
                 **openai_request,
             )
@@ -3498,8 +3724,9 @@ class RotatingClient:
             )
         else:
             # Non-streaming response
+            # [FIX] Don't pass raw_request to LiteLLM - it may contain client headers
+            # (x-api-key, anthropic-version, etc.) that shouldn't be forwarded to providers
             response = await self.acompletion(
-                request=raw_request,
                 pre_request_callback=pre_request_callback,
                 **openai_request,
             )

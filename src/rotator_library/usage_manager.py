@@ -1076,6 +1076,17 @@ class UsageManager:
 
         return model
 
+    def _extract_provider_from_model(self, model: str) -> str:
+        """Extract provider name from provider/model string safely."""
+        if not isinstance(model, str):
+            return ""
+
+        normalized_model = model.strip()
+        if not normalized_model or "/" not in normalized_model:
+            return ""
+
+        return normalized_model.split("/", 1)[0].strip().lower()
+
     # Providers where request_count should be used for credential selection
     # instead of success_count (because failed requests also consume quota)
     _REQUEST_COUNT_PROVIDERS = {"antigravity", "gemini_cli", "chutes", "nanogpt"}
@@ -2239,7 +2250,7 @@ class UsageManager:
                     keys_in_priority = priority_groups[priority_level]
 
                     # Determine selection method based on provider's rotation mode
-                    provider = model.split("/")[0] if "/" in model else ""
+                    provider = self._extract_provider_from_model(model)
                     rotation_mode = self._get_rotation_mode(provider)
 
                     # Fair cycle filtering
@@ -2383,17 +2394,32 @@ class UsageManager:
                     all_potential_keys.extend(keys_list)
 
                 if not all_potential_keys:
-                    # All credentials are on cooldown - check if waiting makes sense
+                    # All credentials are on cooldown or locked - check if waiting makes sense
                     soonest_end = await self.get_soonest_cooldown_end(
                         available_keys, model
                     )
 
                     if soonest_end is None:
-                        # No cooldowns active but no keys available (shouldn't happen)
-                        lib_logger.warning(
-                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        # No cooldowns active but no keys available - all are locked by concurrent requests
+                        # Wait on any key's condition variable to be notified when a key is released
+                        lib_logger.debug(
+                            "All keys are busy. Waiting for a key to be released..."
                         )
-                        await asyncio.sleep(1)
+                        # Pick any available key to wait on (they're all locked)
+                        if available_keys:
+                            wait_condition = self.key_states[available_keys[0]]["condition"]
+                            try:
+                                async with wait_condition:
+                                    remaining_budget = deadline - time.time()
+                                    if remaining_budget <= 0:
+                                        break
+                                    await asyncio.wait_for(
+                                        wait_condition.wait(), timeout=min(0.5, remaining_budget)
+                                    )
+                            except asyncio.TimeoutError:
+                                pass  # Continue loop and re-evaluate
+                        else:
+                            await asyncio.sleep(0.1)
                         continue
 
                     remaining_budget = deadline - time.time()
@@ -2428,7 +2454,7 @@ class UsageManager:
                 # Original logic when no priorities specified
 
                 # Determine selection method based on provider's rotation mode
-                provider = model.split("/")[0] if "/" in model else ""
+                provider = self._extract_provider_from_model(model)
                 rotation_mode = self._get_rotation_mode(provider)
 
                 # Calculate effective concurrency for default priority (999)
@@ -2589,22 +2615,37 @@ class UsageManager:
 
                 # If all eligible keys are locked, wait for a key to be released.
                 lib_logger.info(
-                    "All eligible keys are currently locked for this model. Waiting..."
+                    "All keys are busy with concurrent requests. Waiting for one to become available..."
                 )
 
                 all_potential_keys = tier1_keys + tier2_keys
                 if not all_potential_keys:
-                    # All credentials are on cooldown - check if waiting makes sense
+                    # All credentials are on cooldown or locked - check if waiting makes sense
                     soonest_end = await self.get_soonest_cooldown_end(
                         available_keys, model
                     )
 
                     if soonest_end is None:
-                        # No cooldowns active but no keys available (shouldn't happen)
-                        lib_logger.warning(
-                            "No keys eligible and no cooldowns active. Re-evaluating..."
+                        # No cooldowns active but no keys available - all are locked by concurrent requests
+                        # Wait on any key's condition variable to be notified when a key is released
+                        lib_logger.debug(
+                            "All keys are busy. Waiting for a key to be released..."
                         )
-                        await asyncio.sleep(1)
+                        # Pick any available key to wait on (they're all locked)
+                        if available_keys:
+                            wait_condition = self.key_states[available_keys[0]]["condition"]
+                            try:
+                                async with wait_condition:
+                                    remaining_budget = deadline - time.time()
+                                    if remaining_budget <= 0:
+                                        break
+                                    await asyncio.wait_for(
+                                        wait_condition.wait(), timeout=min(0.5, remaining_budget)
+                                    )
+                            except asyncio.TimeoutError:
+                                pass  # Continue loop and re-evaluate
+                        else:
+                            await asyncio.sleep(0.1)
                         continue
 
                     remaining_budget = deadline - time.time()
@@ -2638,10 +2679,10 @@ class UsageManager:
                     await asyncio.wait_for(
                         wait_condition.wait(), timeout=min(1, remaining_budget)
                     )
-                lib_logger.info("Notified that a key was released. Re-evaluating...")
+                lib_logger.debug("Notified that a key was released. Re-evaluating...")
             except asyncio.TimeoutError:
                 # This is not an error, just a timeout for the wait. The main loop will re-evaluate.
-                lib_logger.info("Wait timed out. Re-evaluating for any available key.")
+                lib_logger.debug("Wait timed out. Re-evaluating for any available key.")
 
         # If the loop exits, it means the deadline was exceeded.
         raise NoAvailableKeysError(
@@ -2875,7 +2916,7 @@ class UsageManager:
                     f"Recorded usage from response object for key {mask_credential(key)}"
                 )
                 try:
-                    provider_name = model.split("/")[0]
+                    provider_name = self._extract_provider_from_model(model)
                     provider_instance = self._get_provider_instance(provider_name)
 
                     if provider_instance and getattr(

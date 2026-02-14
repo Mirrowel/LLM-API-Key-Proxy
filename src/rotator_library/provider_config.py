@@ -67,6 +67,12 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
             ("OPENROUTER_API_BASE", "API Base URL (optional)", None),
         ],
     },
+    "kilocode": {
+        "category": "popular",
+        "extra_vars": [
+            ("KILOCODE_API_BASE", "API Base URL", "https://kilocode.ai/api/openrouter"),
+        ],
+    },
     "groq": {
         "category": "popular",
     },
@@ -676,6 +682,24 @@ class ProviderConfig:
                     lib_logger.info(
                         f"Detected API base override for {provider}: {value}"
                     )
+
+        # Then, apply defaults for providers with extra_vars default API_BASE
+        # This handles providers like kilocode that are not known to LiteLLM
+        for provider, config in LITELLM_PROVIDERS.items():
+            if provider in self._api_bases:
+                continue  # Already configured via env var
+
+            extra_vars = config.get("extra_vars", [])
+            for var_name, var_label, var_default in extra_vars:
+                if var_name.endswith("_API_BASE") and var_default:
+                    # Provider has a default API_BASE and is not known to LiteLLM
+                    if provider not in KNOWN_PROVIDERS:
+                        self._api_bases[provider] = var_default.rstrip("/")
+                        self._custom_providers.add(provider)
+                        lib_logger.info(
+                            f"Applied default API_BASE for custom provider '{provider}': {var_default}"
+                        )
+                    break
 
     def is_known_provider(self, provider: str) -> bool:
         """Check if provider is known to LiteLLM."""

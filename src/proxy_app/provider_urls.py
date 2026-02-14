@@ -30,6 +30,7 @@ PROVIDER_URL_MAP = {
     "cohere": "https://api.cohere.ai/v1",
     "bedrock": "https://bedrock-runtime.us-east-1.amazonaws.com",
     "openrouter": "https://openrouter.ai/api/v1",
+    "kilocode": "https://kilocode.ai/api/openrouter",
 }
 
 def get_provider_endpoint(provider: str, model_name: str, incoming_path: str) -> Optional[str]:
