@@ -335,7 +335,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         )
 
         if stream:
-            return self._handle_streaming_response(
+            return await self._handle_streaming_response(
                 client, base_url, headers, body, model
             )
         else:
