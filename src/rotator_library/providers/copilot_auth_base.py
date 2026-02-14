@@ -565,10 +565,13 @@ class CopilotAuthBase:
                                 )
                                 if user_response.is_success:
                                     user_info = user_response.json()
+                                    resolved_identity = (
+                                        user_info.get("email")
+                                        or user_info.get("login")
+                                        or "unknown"
+                                    )
                                     new_creds["_proxy_metadata"]["email"] = (
-                                        user_info.get(
-                                            "email", user_info.get("login", "unknown")
-                                        )
+                                        resolved_identity
                                     )
                             except Exception as e:
                                 lib_logger.warning(f"Failed to fetch user info: {e}")
@@ -640,8 +643,10 @@ class CopilotAuthBase:
                     )
                     if response.is_success:
                         user_info = response.json()
-                        email = user_info.get(
-                            "email", user_info.get("login", "unknown")
+                        email = (
+                            user_info.get("email")
+                            or user_info.get("login")
+                            or "unknown"
                         )
                         creds["_proxy_metadata"] = {
                             "email": email,
