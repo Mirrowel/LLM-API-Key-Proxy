@@ -465,20 +465,20 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         choices = []
         for choice in chunk_data.get("choices", []):
             delta = choice.get("delta", {})
-            litellm_choice = litellm.Choices(
-                index=choice.get("index", 0),
-                delta=litellm.Delta(
-                    role=delta.get("role"),
-                    content=delta.get("content"),
-                ),
-                finish_reason=choice.get("finish_reason"),
-            )
-
-            # Handle tool call deltas
+            delta_payload = {
+                "role": delta.get("role"),
+                "content": delta.get("content"),
+            }
             if delta.get("tool_calls"):
-                litellm_choice.delta.tool_calls = delta["tool_calls"]
+                delta_payload["tool_calls"] = delta["tool_calls"]
 
-            choices.append(litellm_choice)
+            choices.append(
+                {
+                    "index": choice.get("index", 0),
+                    "delta": delta_payload,
+                    "finish_reason": choice.get("finish_reason"),
+                }
+            )
 
         return litellm.ModelResponse(
             id=chunk_data.get("id", f"copilot-{uuid.uuid4()}"),
