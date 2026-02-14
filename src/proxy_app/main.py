@@ -140,7 +140,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.api_token_auth import ApiActor, get_api_actor, require_admin_api_actor
     from proxy_app.detailed_logger import RawIOLogger
-    from proxy_app.db import init_db
+    from proxy_app.db import init_db_runtime
     from proxy_app.routers import admin_router, auth_router, ui_router, user_router
     from proxy_app.usage_recorder import (
         record_usage_event as record_usage_event_async,
@@ -436,7 +436,9 @@ for key, value in os.environ.items():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
-    app.state.db_session_maker = await init_db(_root_dir)
+    db_engine, db_session_maker = await init_db_runtime(_root_dir)
+    app.state.db_engine = db_engine
+    app.state.db_session_maker = db_session_maker
     app.state.usage_recorder = await start_usage_recorder(app.state.db_session_maker)
 
     # [MODIFIED] Perform skippable OAuth initialization at startup
@@ -676,6 +678,9 @@ async def lifespan(app: FastAPI):
         logging.info("RotatingClient and EmbeddingBatcher closed.")
     else:
         logging.info("RotatingClient closed.")
+
+    if hasattr(app.state, "db_engine") and app.state.db_engine:
+        await app.state.db_engine.dispose()
 
 
 # --- FastAPI App Setup ---

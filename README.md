@@ -507,6 +507,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `API_TOKEN_PEPPER` | HMAC key for API token hashes | Required in prod |
 | `CORS_ALLOW_ORIGINS` | Comma-separated browser origins | empty |
 | `CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS requests | false (unless origins configured) |
+| `SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout in milliseconds | `5000` |
 | `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds) | `600` |
 | `SKIP_OAUTH_INIT_CHECK` | Skip interactive OAuth setup on startup | `false` |
 
