@@ -96,6 +96,14 @@ Once the proxy is running, configure your application with these settings:
 | **Base URL / API Endpoint** | `http://127.0.0.1:8000/v1` |
 | **API Key** | Depends on `AUTH_MODE` (`PROXY_API_KEY`, user API key, or both) |
 
+### Auth Transition Modes
+
+- `AUTH_MODE=users`: only per-user API keys are accepted for `/v1/*`
+- `AUTH_MODE=legacy`: only `PROXY_API_KEY` is accepted
+- `AUTH_MODE=both`: accepts either user API keys or `PROXY_API_KEY` (recommended migration mode)
+
+Recommended rollout: start with `AUTH_MODE=both`, move clients to user keys, then switch to `AUTH_MODE=users`.
+
 ### Model Format: `provider/model_name`
 
 **Important:** Models must be specified in the format `provider/model_name`. The `provider/` prefix tells the proxy which backend to route the request to.
@@ -491,9 +499,24 @@ The proxy includes a powerful text-based UI for configuration and management.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PROXY_API_KEY` | Authentication key for your proxy | Required |
+| `PROXY_API_KEY` | Legacy `/v1/*` key used in `legacy` or `both` mode | Optional |
+| `AUTH_MODE` | `/v1/*` auth mode: `users`, `legacy`, `both` | `both` |
+| `APP_ENV` | Runtime environment (`dev` or `prod`) | `dev` |
+| `ALLOW_INSECURE_DEFAULTS` | Allow startup with default secrets | `true` in dev, `false` in prod |
+| `SESSION_SECRET` | Dashboard session signing secret | Required in prod |
+| `API_TOKEN_PEPPER` | HMAC key for API token hashes | Required in prod |
+| `CORS_ALLOW_ORIGINS` | Comma-separated browser origins | empty |
+| `CORS_ALLOW_CREDENTIALS` | Allow credentialed CORS requests | false (unless origins configured) |
 | `OAUTH_REFRESH_INTERVAL` | Token refresh check interval (seconds) | `600` |
 | `SKIP_OAUTH_INIT_CHECK` | Skip interactive OAuth setup on startup | `false` |
+
+### Production Checklist
+
+- Set `APP_ENV=prod`
+- Set strong `SESSION_SECRET` and `API_TOKEN_PEPPER`
+- Keep `ALLOW_INSECURE_DEFAULTS=false`
+- Set explicit `CORS_ALLOW_ORIGINS` (do not use `*` with credentials)
+- Keep persistent mounts for `/app/data`, `/app/logs`, `/app/oauth_creds`, and `/app/usage`
 
 ### Per-Provider Settings
 
