@@ -40,6 +40,7 @@
         <th>Name</th>
         <th>Prefix</th>
         <th>Created</th>
+        <th>Last used</th>
         <th>Status</th>
         <th>Action</th>
       </tr>
@@ -51,6 +52,7 @@
         <td>{{ key.name }}</td>
         <td><code>{{ key.token_prefix }}</code></td>
         <td>{{ key.created_at }}</td>
+        <td>{{ key.last_used_at if key.last_used_at else "-" }}</td>
         <td>{% if key.revoked_at %}Revoked{% else %}Active{% endif %}</td>
         <td>
           {% if not key.revoked_at %}
@@ -65,7 +67,7 @@
       </tr>
       {% else %}
       <tr>
-        <td colspan="6" class="muted">No API keys yet.</td>
+        <td colspan="7" class="muted">No API keys yet.</td>
       </tr>
       {% endfor %}
     </tbody>

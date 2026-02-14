@@ -29,6 +29,7 @@ from proxy_app.auth import (
 from proxy_app.db import hash_password
 from proxy_app.db_models import ApiKey, User
 from proxy_app.usage_queries import (
+    fetch_api_key_last_used_map,
     fetch_usage_by_day,
     fetch_usage_by_model,
     fetch_usage_summary,
@@ -96,6 +97,14 @@ async def _load_me_context(
         select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.created_at.desc())
     )
     api_keys = list(rows)
+    derived_last_used = await fetch_api_key_last_used_map(
+        session,
+        user_id=user_id,
+        api_key_ids=[key.id for key in api_keys],
+    )
+    for key in api_keys:
+        key.last_used_at = derived_last_used.get(key.id, key.last_used_at)
+
     usage_summary = await fetch_usage_summary(session, user_id=user_id)
     usage_by_day = await fetch_usage_by_day(session, user_id=user_id, days=days)
     return {
