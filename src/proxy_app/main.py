@@ -138,12 +138,15 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.request_logger import log_request_to_console, redact_sensitive_data
     from proxy_app.security_config import get_cors_settings, validate_secret_settings
     from proxy_app.stream_usage import StreamUsageTracker
+    from proxy_app.anthropic_errors import anthropic_error_response
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.api_token_auth import ApiActor, get_api_actor, require_admin_api_actor
     from proxy_app.detailed_logger import RawIOLogger
     from proxy_app.db import init_db_runtime
     from proxy_app.routers import admin_router, auth_router, ui_router, user_router
     from proxy_app.usage_recorder import (
+        get_usage_retention_days,
+        prune_usage_events,
         record_usage_event as record_usage_event_async,
         start_usage_recorder,
         stop_usage_recorder,
@@ -440,6 +443,11 @@ async def lifespan(app: FastAPI):
     db_engine, db_session_maker = await init_db_runtime(_root_dir)
     app.state.db_engine = db_engine
     app.state.db_session_maker = db_session_maker
+    retention_days = get_usage_retention_days()
+    await prune_usage_events(
+        app.state.db_session_maker,
+        retention_days=retention_days,
+    )
     app.state.usage_recorder = await start_usage_recorder(app.state.db_session_maker)
 
     # [MODIFIED] Perform skippable OAuth initialization at startup
@@ -1199,14 +1207,11 @@ async def anthropic_messages(
             usage=None,
             error=e,
         )
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "invalid_request_error",
-                "message": _safe_error_message(e, default="Invalid request"),
-            },
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+        return anthropic_error_response(
+            status_code=400,
+            error_type="invalid_request_error",
+            message=_safe_error_message(e, default="Invalid request"),
+        )
     except litellm.AuthenticationError as e:
         await _record_usage(
             actor=actor,
@@ -1217,14 +1222,11 @@ async def anthropic_messages(
             usage=None,
             error=e,
         )
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "authentication_error",
-                "message": _safe_error_message(e, default="Authentication failed"),
-            },
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        return anthropic_error_response(
+            status_code=401,
+            error_type="authentication_error",
+            message=_safe_error_message(e, default="Authentication failed"),
+        )
     except litellm.RateLimitError as e:
         await _record_usage(
             actor=actor,
@@ -1235,14 +1237,11 @@ async def anthropic_messages(
             usage=None,
             error=e,
         )
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "rate_limit_error",
-                "message": _safe_error_message(e, default="Rate limit exceeded"),
-            },
-        }
-        raise HTTPException(status_code=429, detail=error_response)
+        return anthropic_error_response(
+            status_code=429,
+            error_type="rate_limit_error",
+            message=_safe_error_message(e, default="Rate limit exceeded"),
+        )
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
         await _record_usage(
             actor=actor,
@@ -1253,14 +1252,11 @@ async def anthropic_messages(
             usage=None,
             error=e,
         )
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": _safe_error_message(e, default="Service unavailable"),
-            },
-        }
-        raise HTTPException(status_code=503, detail=error_response)
+        return anthropic_error_response(
+            status_code=503,
+            error_type="api_error",
+            message=_safe_error_message(e, default="Service unavailable"),
+        )
     except litellm.Timeout as e:
         await _record_usage(
             actor=actor,
@@ -1271,14 +1267,11 @@ async def anthropic_messages(
             usage=None,
             error=e,
         )
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": f"Request timed out: {_safe_error_message(e, default='Gateway timeout')}",
-            },
-        }
-        raise HTTPException(status_code=504, detail=error_response)
+        return anthropic_error_response(
+            status_code=504,
+            error_type="api_error",
+            message=f"Request timed out: {_safe_error_message(e, default='Gateway timeout')}",
+        )
     except Exception as e:
         safe_message = _safe_error_message(e, default="Internal server error")
         logging.error("Anthropic messages endpoint error: %s", safe_message)
@@ -1297,11 +1290,11 @@ async def anthropic_messages(
                 headers=None,
                 body={"error": safe_message},
             )
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": safe_message},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        return anthropic_error_response(
+            status_code=500,
+            error_type="api_error",
+            message=safe_message,
+        )
 
 
 # --- Anthropic Count Tokens Endpoint ---
@@ -1330,31 +1323,25 @@ async def anthropic_count_tokens(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "invalid_request_error",
-                "message": _safe_error_message(e, default="Invalid request"),
-            },
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+        return anthropic_error_response(
+            status_code=400,
+            error_type="invalid_request_error",
+            message=_safe_error_message(e, default="Invalid request"),
+        )
     except litellm.AuthenticationError as e:
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "authentication_error",
-                "message": _safe_error_message(e, default="Authentication failed"),
-            },
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        return anthropic_error_response(
+            status_code=401,
+            error_type="authentication_error",
+            message=_safe_error_message(e, default="Authentication failed"),
+        )
     except Exception as e:
         safe_message = _safe_error_message(e, default="Internal server error")
         logging.error("Anthropic count_tokens endpoint error: %s", safe_message)
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": safe_message},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        return anthropic_error_response(
+            status_code=500,
+            error_type="api_error",
+            message=safe_message,
+        )
 
 
 @app.post("/v1/embeddings")

@@ -1,13 +1,48 @@
 import asyncio
 import logging
+import os
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxy_app.db_models import UsageEvent
 
 logger = logging.getLogger(__name__)
+
+
+def get_usage_retention_days() -> int:
+    raw = os.getenv("USAGE_RETENTION_DAYS", "30")
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 30
+    return max(1, days)
+
+
+async def prune_usage_events(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    retention_days: int | None = None,
+) -> int:
+    active_retention_days = retention_days or get_usage_retention_days()
+    cutoff = datetime.utcnow() - timedelta(days=active_retention_days)
+    async with session_maker() as session:
+        result = await session.execute(
+            delete(UsageEvent).where(UsageEvent.timestamp < cutoff)
+        )
+        await session.commit()
+        deleted = result.rowcount if result.rowcount is not None else 0
+
+    if deleted > 0:
+        logger.info(
+            "Pruned %d usage events older than %d days",
+            deleted,
+            active_retention_days,
+        )
+    return deleted
 
 
 @dataclass(slots=True)
