@@ -413,8 +413,17 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
                             continue
 
             except httpx.HTTPStatusError as e:
+                response_text = "<unavailable>"
+                try:
+                    # In streaming mode, response body is not automatically read.
+                    # Read it explicitly so logging does not raise ResponseNotRead.
+                    response_text = (await e.response.aread()).decode(
+                        "utf-8", errors="replace"
+                    )
+                except Exception:
+                    pass
                 lib_logger.error(
-                    f"Copilot streaming error (HTTP {e.response.status_code}): {e.response.text}"
+                    f"Copilot streaming error (HTTP {e.response.status_code}): {response_text}"
                 )
                 raise
             except Exception as e:
