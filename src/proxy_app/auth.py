@@ -12,6 +12,7 @@ from fastapi import Depends, Form, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from proxy_app.db_models import User
+from proxy_app.security_config import get_session_secret
 
 SESSION_COOKIE_NAME = "proxy_session"
 SESSION_COOKIE_PATH = "/"
@@ -30,15 +31,6 @@ def _b64url_encode(data: bytes) -> str:
 def _b64url_decode(data: str) -> bytes:
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
-
-
-def _get_session_secret() -> str:
-    return (
-        os.getenv("SESSION_SECRET")
-        or os.getenv("PROXY_API_KEY")
-        or "change-me-session-secret"
-    )
-
 
 def _get_session_ttl_seconds() -> int:
     raw = os.getenv("SESSION_TTL_SECONDS", str(DEFAULT_SESSION_TTL_SECONDS))
@@ -122,7 +114,7 @@ def create_session_token(*, user_id: int, username: str, role: str) -> str:
     )
     payload_b64 = _b64url_encode(payload_json)
     signature = hmac.new(
-        _get_session_secret().encode("utf-8"),
+        get_session_secret().encode("utf-8"),
         payload_b64.encode("ascii"),
         hashlib.sha256,
     ).digest()
@@ -133,7 +125,7 @@ def decode_session_token(token: str) -> dict | None:
     try:
         payload_b64, sig_b64 = token.split(".", 1)
         expected_sig = hmac.new(
-            _get_session_secret().encode("utf-8"),
+            get_session_secret().encode("utf-8"),
             payload_b64.encode("ascii"),
             hashlib.sha256,
         ).digest()
@@ -175,21 +167,21 @@ def clear_session_cookie(response: Response) -> None:
 
 
 def attach_csrf_cookie(request: Request, response: Response, *, token: str | None = None) -> str:
-    token = token if _is_valid_csrf_token(token) else get_csrf_token_for_request(request)
+    token_value = token if _is_valid_csrf_token(token) else get_csrf_token_for_request(request)
 
     same_site = _get_cookie_samesite()
     current_cookie = request.cookies.get(CSRF_COOKIE_NAME)
-    if current_cookie != token:
+    if current_cookie != token_value:
         response.set_cookie(
             key=CSRF_COOKIE_NAME,
-            value=token,
+            value=token_value,
             httponly=True,
             secure=_resolve_cookie_secure(same_site),
             samesite=same_site,
             max_age=_get_session_ttl_seconds(),
             path=CSRF_COOKIE_PATH,
         )
-    return token
+    return token_value
 
 
 def clear_csrf_cookie(response: Response) -> None:

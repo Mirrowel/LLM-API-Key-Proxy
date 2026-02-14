@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from proxy_app.auth import get_db_session
 from proxy_app.db_models import ApiKey, User
+from proxy_app.security_config import get_api_token_pepper
 
 AUTH_MODE_USERS = "users"
 AUTH_MODE_LEGACY = "legacy"
@@ -18,6 +20,9 @@ DEFAULT_AUTH_MODE = AUTH_MODE_BOTH
 
 AUTH_SOURCE_USER_API_KEY = "user_api_key"
 AUTH_SOURCE_LEGACY_MASTER = "legacy_master"
+
+HASH_SCHEME_HMAC_SHA256 = "hmac_sha256_v1"
+HASH_SCHEME_LEGACY_SHA256_PREFIX = "sha256_prefix_v1"
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
@@ -40,10 +45,6 @@ def normalize_auth_mode(mode: str) -> str:
     if mode in {AUTH_MODE_USERS, AUTH_MODE_LEGACY, AUTH_MODE_BOTH}:
         return mode
     return DEFAULT_AUTH_MODE
-
-
-def get_api_token_pepper() -> str:
-    return os.getenv("API_TOKEN_PEPPER") or "change-me-token-pepper"
 
 
 def get_legacy_master_key() -> str:
@@ -76,19 +77,67 @@ def extract_api_token_from_headers(
 
 def hash_api_token(token: str, *, pepper: str | None = None) -> str:
     active_pepper = pepper if pepper is not None else get_api_token_pepper()
+    digest = hmac.new(
+        active_pepper.encode("utf-8"),
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest
+
+
+def hash_api_token_legacy(token: str, *, pepper: str | None = None) -> str:
+    active_pepper = pepper if pepper is not None else get_api_token_pepper()
     payload = f"{active_pepper}{token}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
-def _active_user_api_key_query(token_hash: str):
+def _active_user_api_key_query(token_hashes: list[str]):
     now = datetime.utcnow()
     return (
         select(ApiKey, User)
         .join(User, ApiKey.user_id == User.id)
-        .where(ApiKey.token_hash == token_hash)
+        .where(ApiKey.token_hash.in_(token_hashes))
         .where(ApiKey.revoked_at.is_(None))
         .where((ApiKey.expires_at.is_(None)) | (ApiKey.expires_at > now))
         .where(User.is_active.is_(True))
+    )
+
+
+async def _lookup_user_actor(
+    *,
+    session: AsyncSession,
+    token: str,
+    token_pepper: str | None,
+) -> ApiActor | None:
+    new_hash = hash_api_token(token, pepper=token_pepper)
+    legacy_hash = hash_api_token_legacy(token, pepper=token_pepper)
+    lookup_hashes = [new_hash] if legacy_hash == new_hash else [new_hash, legacy_hash]
+
+    rows = (await session.execute(_active_user_api_key_query(lookup_hashes))).all()
+    if not rows:
+        return None
+
+    api_key: ApiKey
+    user: User
+    api_key, user = rows[0]
+    for row in rows:
+        candidate_key, candidate_user = row
+        if candidate_key.token_hash == new_hash:
+            api_key, user = candidate_key, candidate_user
+            break
+
+    if api_key.token_hash == legacy_hash and api_key.token_hash != new_hash:
+        try:
+            api_key.token_hash = new_hash
+            await session.commit()
+        except Exception:
+            await session.rollback()
+
+    return ApiActor(
+        user_id=user.id,
+        api_key_id=api_key.id,
+        role=user.role,
+        auth_source=AUTH_SOURCE_USER_API_KEY,
     )
 
 
@@ -103,16 +152,13 @@ async def resolve_api_actor_from_token(
     mode = normalize_auth_mode(auth_mode) if auth_mode else get_auth_mode()
 
     if mode in {AUTH_MODE_USERS, AUTH_MODE_BOTH}:
-        token_hash = hash_api_token(token, pepper=token_pepper)
-        row = (await session.execute(_active_user_api_key_query(token_hash))).first()
-        if row:
-            api_key, user = row
-            return ApiActor(
-                user_id=user.id,
-                api_key_id=api_key.id,
-                role=user.role,
-                auth_source=AUTH_SOURCE_USER_API_KEY,
-            )
+        actor = await _lookup_user_actor(
+            session=session,
+            token=token,
+            token_pepper=token_pepper,
+        )
+        if actor:
+            return actor
 
     if mode in {AUTH_MODE_LEGACY, AUTH_MODE_BOTH}:
         legacy_key = (

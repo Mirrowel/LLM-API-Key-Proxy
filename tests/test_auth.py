@@ -10,6 +10,7 @@ from proxy_app.api_token_auth import (
     AUTH_SOURCE_USER_API_KEY,
     extract_api_token_from_headers,
     hash_api_token,
+    hash_api_token_legacy,
     resolve_api_actor_from_token,
 )
 from proxy_app.auth import create_session_token, decode_session_token, verify_password
@@ -109,3 +110,38 @@ def test_x_api_key_header_precedence_over_authorization() -> None:
         authorization="Bearer bearer-token",
     )
     assert fallback == "bearer-token"
+
+
+@pytest.mark.asyncio
+async def test_legacy_token_hash_opportunistic_migration(
+    session_maker,
+    seeded_user,
+) -> None:
+    async with session_maker() as session:
+        key = ApiKey(
+            user_id=seeded_user.id,
+            name="legacy-key",
+            token_prefix="pk_legacy",
+            token_hash=hash_api_token_legacy("legacy-user-token", pepper="pepper-1"),
+            expires_at=datetime.utcnow() + timedelta(days=1),
+        )
+        session.add(key)
+        await session.commit()
+        await session.refresh(key)
+        key_id = key.id
+
+    async with session_maker() as session:
+        actor = await resolve_api_actor_from_token(
+            session=session,
+            token="legacy-user-token",
+            auth_mode=AUTH_MODE_USERS,
+            token_pepper="pepper-1",
+        )
+        assert actor is not None
+        assert actor.api_key_id == key_id
+
+    async with session_maker() as session:
+        migrated_key = await session.get(ApiKey, key_id)
+
+    assert migrated_key is not None
+    assert migrated_key.token_hash == hash_api_token("legacy-user-token", pepper="pepper-1")

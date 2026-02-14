@@ -136,6 +136,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console, redact_sensitive_data
+    from proxy_app.security_config import get_cors_settings, validate_secret_settings
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.api_token_auth import ApiActor, get_api_actor, require_admin_api_actor
     from proxy_app.detailed_logger import RawIOLogger
@@ -358,6 +359,8 @@ logging.debug(f"Modules loaded in {_elapsed:.2f}s")
 
 # Load environment variables from .env file
 load_dotenv(_root_dir / ".env")
+
+validate_secret_settings()
 
 # --- Configuration ---
 USE_EMBEDDING_BATCHER = False
@@ -687,13 +690,14 @@ app.mount(
     name="static",
 )
 
-# Add CORS middleware to allow all origins, methods, and headers
+# Add CORS middleware with secure defaults.
+_cors_settings = get_cors_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_origins=_cors_settings.allow_origins,
+    allow_credentials=_cors_settings.allow_credentials,
+    allow_methods=_cors_settings.allow_methods,
+    allow_headers=_cors_settings.allow_headers,
 )
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
