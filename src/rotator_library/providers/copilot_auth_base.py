@@ -18,6 +18,7 @@ import asyncio
 import logging
 import re
 from pathlib import Path
+from ..utils.paths import get_oauth_dir
 from typing import Dict, Any, Optional, Union
 import tempfile
 import shutil
@@ -662,7 +663,7 @@ class CopilotAuthBase:
 
     def _get_oauth_base_dir(self) -> Path:
         """Return the OAuth credentials base directory."""
-        return Path.cwd() / "oauth_creds"
+        return get_oauth_dir()
 
     def _get_provider_file_prefix(self) -> str:
         """Return file prefix for Copilot credential files."""
