@@ -4,6 +4,7 @@
 # src/rotator_library/providers/anthropic_provider.py
 
 import copy
+import hashlib
 import json
 import os
 import time
@@ -18,6 +19,7 @@ from litellm.exceptions import RateLimitError
 
 from .provider_interface import ProviderInterface
 from .anthropic_auth_base import AnthropicAuthBase
+from .provider_cache import create_provider_cache
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
 
@@ -61,6 +63,22 @@ STOP_REASON_MAP = {
     "stop_sequence": "stop",
     "pause_turn": "stop",
 }
+
+# Lazy-initialised server-side cache for thinking block signatures.
+# Allows us to re-attach signatures when OpenAI-format clients send back
+# reasoning_content without the signature (which they can't preserve).
+_thinking_sig_cache = None
+
+
+def _get_thinking_cache():
+    global _thinking_sig_cache
+    if _thinking_sig_cache is None:
+        _thinking_sig_cache = create_provider_cache(
+            "anthropic_thinking_signatures",
+            memory_ttl_seconds=7200,    # 2 hours in memory
+            disk_ttl_seconds=172800,    # 48 hours on disk
+        )
+    return _thinking_sig_cache
 
 
 class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
@@ -155,15 +173,23 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 blocks = []
 
                 reasoning = msg.get("reasoning_content")
-                thinking_sig = msg.get("thinking_signature")
                 if reasoning:
-                    thinking_block = {
-                        "type": "thinking",
-                        "thinking": reasoning,
-                    }
-                    if thinking_sig and len(thinking_sig) >= 100:
-                        thinking_block["signature"] = thinking_sig
-                    blocks.append(thinking_block)
+                    # Try server-side cache first (signature preserved from
+                    # the original Anthropic response)
+                    cached = self._retrieve_thinking_blocks(reasoning)
+                    if cached:
+                        blocks.extend(cached)
+                    else:
+                        # Fallback: inline signature from client (custom clients)
+                        thinking_sig = msg.get("thinking_signature")
+                        if thinking_sig and len(thinking_sig) >= 100:
+                            blocks.append({
+                                "type": "thinking",
+                                "thinking": reasoning,
+                                "signature": thinking_sig,
+                            })
+                        # else: no signature → drop thinking block,
+                        # model generates fresh thinking (cache miss on prefix)
 
                 if isinstance(content, str) and content.strip():
                     blocks.append({"type": "text", "text": content})
@@ -250,6 +276,29 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                     anthropic_messages.append({"role": "user", "content": blocks})
 
         return system_blocks, anthropic_messages
+
+    def _retrieve_thinking_blocks(
+        self, reasoning_content: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Look up cached thinking blocks with signatures for given thinking content."""
+        cache_key = hashlib.sha256(reasoning_content.encode()).hexdigest()
+        cached = _get_thinking_cache().retrieve(cache_key)
+        if not cached:
+            return None
+        try:
+            blocks_data = json.loads(cached)
+            result = [
+                {
+                    "type": "thinking",
+                    "thinking": b["thinking"],
+                    "signature": b["signature"],
+                }
+                for b in blocks_data
+                if b.get("signature")
+            ]
+            return result if result else None
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
 
     def _openai_tools_to_anthropic(
         self, tools: Optional[List[Dict[str, Any]]]
@@ -348,6 +397,10 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             stream_state["current_block_type"] = block_type
             stream_state["current_block_index"] = index
 
+            if block_type == "thinking":
+                stream_state["_block_thinking"] = ""
+                stream_state["_block_signature"] = ""
+
             if block_type == "tool_use":
                 tool_id = block.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
                 raw_name = block.get("name", "")
@@ -423,6 +476,9 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                     stream_state["accumulated_thinking"] = (
                         stream_state.get("accumulated_thinking", "") + thinking
                     )
+                    stream_state["_block_thinking"] = (
+                        stream_state.get("_block_thinking", "") + thinking
+                    )
                     yield {
                         "choices": [
                             {
@@ -473,10 +529,21 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 stream_state["thinking_signature"] = (
                     stream_state.get("thinking_signature", "") + sig
                 )
+                stream_state["_block_signature"] = (
+                    stream_state.get("_block_signature", "") + sig
+                )
 
             return
 
         if event_type == "content_block_stop":
+            if stream_state.get("current_block_type") == "thinking":
+                block_thinking = stream_state.pop("_block_thinking", "")
+                block_sig = stream_state.pop("_block_signature", "")
+                if block_thinking and block_sig:
+                    stream_state.setdefault("_thinking_blocks", []).append({
+                        "thinking": block_thinking,
+                        "signature": block_sig,
+                    })
             return
 
         if event_type == "message_delta":
@@ -509,6 +576,14 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                     "total_tokens": input_tokens + output_tokens,
                 },
             }
+
+            # Cache thinking blocks with signatures for multi-turn preservation
+            thinking_blocks = stream_state.get("_thinking_blocks")
+            if thinking_blocks:
+                full_thinking = "".join(b["thinking"] for b in thinking_blocks)
+                cache_key = hashlib.sha256(full_thinking.encode()).hexdigest()
+                _get_thinking_cache().store(cache_key, json.dumps(thinking_blocks))
+
             return
 
     # =========================================================================
