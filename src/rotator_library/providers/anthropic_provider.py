@@ -367,6 +367,50 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
         return result
 
     # =========================================================================
+    # PROMPT CACHING
+    # =========================================================================
+
+    def _inject_cache_control(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inject cache_control breakpoints into the Anthropic payload to enable
+        prompt caching. Marks the last system block, last tool, and the last
+        content block of the final message for caching.
+
+        Anthropic caches the full prefix up to each breakpoint. This saves
+        ~90% on cached input token costs and reduces latency.
+        """
+        cache_marker = {"type": "ephemeral"}
+
+        # 1. Cache the last system block (system prompt rarely changes)
+        system = payload.get("system")
+        if system and isinstance(system, list) and len(system) > 0:
+            system[-1]["cache_control"] = cache_marker
+
+        # 2. Cache the last tool definition (tools rarely change)
+        tools = payload.get("tools")
+        if tools and isinstance(tools, list) and len(tools) > 0:
+            tools[-1]["cache_control"] = cache_marker
+
+        # 3. Cache the end of conversation history for multi-turn caching.
+        #    Mark the last content block of the second-to-last message
+        #    (the turn before the new user message) so the growing
+        #    conversation prefix gets cached across turns.
+        messages = payload.get("messages")
+        if messages and len(messages) >= 2:
+            # The last message is the new user turn; cache up to the one before it
+            prev_msg = messages[-2]
+            content = prev_msg.get("content")
+            if isinstance(content, list) and len(content) > 0:
+                content[-1]["cache_control"] = cache_marker
+            elif isinstance(content, str) and content:
+                # Convert string content to block format so we can attach cache_control
+                prev_msg["content"] = [
+                    {"type": "text", "text": content, "cache_control": cache_marker}
+                ]
+
+        return payload
+
+    # =========================================================================
     # ANTHROPIC SSE -> OPENAI CHUNK CONVERSION
     # =========================================================================
 
@@ -660,6 +704,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             }
 
         payload = self._prefix_tool_names(payload)
+        payload = self._inject_cache_control(payload)
         return payload
 
     def _reasoning_effort_to_budget(self, effort: Any, max_tokens: int) -> int:
