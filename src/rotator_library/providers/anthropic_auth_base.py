@@ -67,8 +67,8 @@ def _build_authorize_url(verifier: str, challenge: str) -> str:
         "code_challenge_method": "S256",
         "state": verifier,
     }
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"https://claude.ai/oauth/authorize?{qs}"
+    from urllib.parse import urlencode
+    return f"https://claude.ai/oauth/authorize?{urlencode(params)}"
 
 
 class AnthropicAuthBase:
