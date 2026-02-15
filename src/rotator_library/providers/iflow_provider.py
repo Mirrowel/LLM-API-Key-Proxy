@@ -31,25 +31,30 @@ lib_logger = logging.getLogger("rotator_library")
 HARDCODED_MODELS = [
     "glm-4.6",
     "glm-4.7",
-    "minimax-m2",
-    "minimax-m2.1",
-    "qwen3-coder-plus",
+    "glm-5",
+    "iflow-rome-30ba3b",
     "kimi-k2",
     "kimi-k2-0905",
     "kimi-k2-thinking",  # Seems to not work, but should
     "kimi-k2.5",  # Seems to not work, but should
+    "minimax-m2",
+    "minimax-m2.1",
+    "minimax-m2.5",
+    "qwen3-32b",
+    "qwen3-235b",
+    "qwen3-235b-a22b-instruct",
+    "qwen3-235b-a22b-thinking-2507",
+    "qwen3-coder-plus",
     "qwen3-max",
     "qwen3-max-preview",
-    "qwen3-235b-a22b-thinking-2507",
+    "qwen3-vl-plus",
     "deepseek-v3.2-reasoner",
     "deepseek-v3.2-chat",
     "deepseek-v3.2",  # seems to not work, but should. Use above variants instead
     "deepseek-v3.1",
     "deepseek-v3",
     "deepseek-r1",
-    "qwen3-vl-plus",
-    "qwen3-235b-a22b-instruct",
-    "qwen3-235b",
+    "tstars2.0",
 ]
 
 # OpenAI-compatible parameters supported by iFlow API
@@ -83,20 +88,22 @@ IFLOW_HEADER_SIGNATURE = "x-iflow-signature"
 ENABLE_THINKING_MODELS = {
     "glm-4.6",
     "glm-4.7",
+    "glm-5",
     "qwen3-max-preview",
+    "qwen3-32b",
     "deepseek-v3.2",
     "deepseek-v3.1",
 }
 
 # GLM models need additional clear_thinking=false when thinking is enabled
-GLM_MODELS = {"glm-4.6", "glm-4.7"}
+GLM_MODELS = {"glm-4.6", "glm-4.7", "glm-5"}
 
 # Models using reasoning_split (boolean) instead of enable_thinking
-REASONING_SPLIT_MODELS = {"minimax-m2", "minimax-m2.1"}
+REASONING_SPLIT_MODELS = {"minimax-m2", "minimax-m2.1", "minimax-m2.5"}
 
 # Models that benefit from reasoning_content preservation in message history
 # (for multi-turn conversations)
-REASONING_PRESERVATION_MODELS_PREFIXES = ("glm-4", "minimax-m2")
+REASONING_PRESERVATION_MODELS_PREFIXES = ("glm-4", "glm-5", "minimax-m2", "tstars")
 
 # Cache file path for reasoning content preservation
 _REASONING_CACHE_FILE = (
@@ -1022,9 +1029,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                         else:
                             if not error_text:
                                 content_type = response.headers.get("content-type", "")
-                                error_text = (
-                                    f"(empty response body, content-type={content_type})"
-                                )
+                                error_text = f"(empty response body, content-type={content_type})"
                             error_msg = (
                                 f"iFlow HTTP {response.status_code} error: {error_text}"
                             )
