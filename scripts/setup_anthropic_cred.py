@@ -23,6 +23,9 @@ STATE_FILE = Path(__file__).parent / ".anthropic_pkce_state.json"
 OAUTH_DIR = Path(__file__).parent / ".." / "oauth_creds"
 
 async def exchange_code(auth_code: str):
+    if not STATE_FILE.exists():
+        print("Error: PKCE state file not found. Please run Step 1 first.")
+        sys.exit(1)
     state = json.loads(STATE_FILE.read_text())
     verifier = state["verifier"]
 

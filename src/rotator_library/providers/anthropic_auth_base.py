@@ -274,10 +274,10 @@ class AnthropicAuthBase:
         refresh_token = data.get("refresh_token", "")
         expires_in = data.get("expires_in", 3600)
 
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
         expiry_date = (
-            datetime.utcnow() + timedelta(seconds=expires_in)
+            datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         ).isoformat() + "Z"
 
         return {
@@ -378,10 +378,10 @@ class AnthropicAuthBase:
             )
 
             expires_in = new_token_data.get("expires_in", 3600)
-            from datetime import datetime, timedelta
+            from datetime import datetime, timedelta, timezone
 
             creds["expiry_date"] = (
-                datetime.utcnow() + timedelta(seconds=expires_in)
+                datetime.now(timezone.utc) + timedelta(seconds=expires_in)
             ).isoformat() + "Z"
 
             if "_proxy_metadata" not in creds:

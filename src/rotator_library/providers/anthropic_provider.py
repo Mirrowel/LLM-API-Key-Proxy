@@ -132,7 +132,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 tool_result = {
                     "type": "tool_result",
                     "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": content if isinstance(content, str) else str(content),
+                    "content": content if isinstance(content, str) else json.dumps(content),
                 }
                 if anthropic_messages and anthropic_messages[-1]["role"] == "user":
                     if isinstance(anthropic_messages[-1]["content"], list):
