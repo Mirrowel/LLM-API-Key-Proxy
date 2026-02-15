@@ -39,7 +39,8 @@ from litellm.exceptions import (
     InternalServerError,
 )
 
-from ..core.types import RequestContext, ErrorAction
+from ..core.types import RequestContext, ErrorAction, FilterResult
+
 from ..core.errors import (
     NoAvailableKeysError,
     PreRequestCallbackError,
@@ -1259,8 +1260,11 @@ class RequestExecutor:
             if isinstance(response, litellm.EmbeddingResponse):
                 model_info = litellm.get_model_info(model)
                 input_cost = model_info.get("input_cost_per_token")
-                if input_cost:
-                    return (response.usage.prompt_tokens or 0) * input_cost
+                usage = getattr(response, "usage", None)
+                # Handle None cost (unknown pricing) and 0.0 cost (free tier)
+                if usage is not None and input_cost is not None:
+                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                    return prompt_tokens * input_cost
                 return 0.0
 
             cost = litellm.completion_cost(
