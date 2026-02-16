@@ -187,18 +187,60 @@ def is_full_url(host: str) -> bool:
     return host.startswith("http://") or host.startswith("https://")
 
 
-def format_cooldown(seconds: int) -> str:
-    """Format cooldown seconds as human-readable string."""
+def format_duration(seconds: int, *, show_seconds: bool = False) -> str:
+    """Format a duration in seconds as a human-readable string.
+
+    Args:
+        seconds: Duration in seconds (must be non-negative).
+        show_seconds: If True, include seconds precision for short
+            durations (e.g. '5m 30s').  If False, the smallest unit
+            shown is minutes.
+
+    Returns:
+        Strings like '2d 5h', '12h 30m', '45m', '30s', etc.
+    """
+    if seconds < 0:
+        seconds = 0
     if seconds < 60:
-        return f"{seconds}s"
-    elif seconds < 3600:
-        mins = seconds // 60
+        return f"{seconds}s" if show_seconds else "< 1m"
+
+    total_minutes = seconds // 60
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+
+    if hours >= 24:
+        days = hours // 24
+        remaining_hours = hours % 24
+        if remaining_hours > 0:
+            return f"{days}d {remaining_hours}h"
+        return f"{days}d"
+    if hours > 0:
+        return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+    if show_seconds:
         secs = seconds % 60
         return f"{mins}m {secs}s" if secs > 0 else f"{mins}m"
-    else:
-        hours = seconds // 3600
-        mins = (seconds % 3600) // 60
-        return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+    return f"{mins}m"
+
+
+def format_cooldown(seconds: int) -> str:
+    """Format cooldown seconds as human-readable string (includes seconds)."""
+    return format_duration(seconds, show_seconds=True)
+
+
+def format_time_remaining(reset_at: float) -> str:
+    """Format a reset timestamp as a human-readable countdown string.
+
+    Args:
+        reset_at: Absolute UTC timestamp (seconds since epoch) of the
+            upcoming reset.
+
+    Returns:
+        Strings like '12h 30m', '45m', '< 1m', '2d 5h', or 'now'.
+    """
+    diff = reset_at - time.time()
+    if diff <= 0:
+        return "now"
+    return format_duration(int(diff))
 
 
 def natural_sort_key(item: Any) -> List:
@@ -1342,10 +1384,12 @@ class QuotaViewer:
 
                     # Format reset time (only show if there's actual usage or cooldown)
                     reset_time_str = ""
+                    reset_countdown_str = ""
                     if reset_at and (request_count > 0 or group_cooldown_remaining):
                         try:
                             reset_dt = datetime.fromtimestamp(reset_at)
                             reset_time_str = reset_dt.strftime("%b %d %H:%M")
+                            reset_countdown_str = format_time_remaining(reset_at)
                         except (ValueError, OSError):
                             reset_time_str = ""
 
@@ -1401,9 +1445,14 @@ class QuotaViewer:
 
                     line = f"  [{color}]{display_name:<{DETAIL_GROUP_NAME_WIDTH}} {usage_str:<{DETAIL_USAGE_WIDTH}} {pct_str:>{DETAIL_PCT_WIDTH}} {bar}[/{color}]"
 
-                    # Add reset time if applicable
+                    # Add reset time with countdown if applicable
                     if reset_time_str:
-                        line += f"  Resets: {reset_time_str}"
+                        if reset_countdown_str and reset_countdown_str != "now":
+                            line += f"  Resets in {reset_countdown_str} ({reset_time_str})"
+                        elif reset_countdown_str == "now":
+                            line += f"  Resets now"
+                        else:
+                            line += f"  Resets: {reset_time_str}"
 
                     # Add indicators
                     indicators = []
