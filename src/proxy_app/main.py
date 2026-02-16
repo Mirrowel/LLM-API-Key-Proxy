@@ -627,6 +627,7 @@ async def lifespan(app: FastAPI):
 
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
+    litellm.suppress_debug_info = True
     litellm.drop_params = True
     if USE_EMBEDDING_BATCHER:
         batcher = EmbeddingBatcher(client=client)

@@ -1530,12 +1530,36 @@ class GeminiCliProvider(
                             if response.status_code >= 400:
                                 try:
                                     error_body = await response.aread()
-                                    lib_logger.error(
-                                        f"Gemini CLI API error {response.status_code}: {error_body.decode()}"
-                                    )
+                                    error_text = error_body.decode()
+                                    # Always log full body to transaction file for debugging
                                     file_logger.log_error(
-                                        f"API error {response.status_code}: {error_body.decode()}"
+                                        f"API error {response.status_code}: {error_text}"
                                     )
+                                    # Console logging: condensed for 429s, full for other errors
+                                    if response.status_code == 429:
+                                        # Extract key fields for a single-line summary
+                                        try:
+                                            err_json = json.loads(error_text)
+                                            err_msg = err_json.get("error", {}).get("message", "")
+                                            # Extract quotaResetDelay from details
+                                            reset_delay = ""
+                                            for detail in err_json.get("error", {}).get("details", []):
+                                                metadata = detail.get("metadata", {})
+                                                if "quotaResetDelay" in metadata:
+                                                    reset_delay = metadata["quotaResetDelay"]
+                                                    break
+                                            summary = f"Gemini CLI 429: {err_msg}"
+                                            if reset_delay:
+                                                summary += f" (resetDelay: {reset_delay})"
+                                            lib_logger.warning(summary)
+                                        except (json.JSONDecodeError, KeyError):
+                                            lib_logger.warning(
+                                                f"Gemini CLI 429: {error_text[:200]}"
+                                            )
+                                    else:
+                                        lib_logger.error(
+                                            f"Gemini CLI API error {response.status_code}: {error_text}"
+                                        )
                                 except Exception:
                                     pass
 
