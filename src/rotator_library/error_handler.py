@@ -159,6 +159,34 @@ class CredentialNeedsReauthError(Exception):
         super().__init__(self.message)
 
 
+class IFlowNoAPIKeyError(Exception):
+    """
+    Raised when an iFlow account has not set up an API key yet.
+
+    This occurs when using cookie-based authentication with a new iFlow account
+    that hasn't created an API key through the web interface.
+
+    Unlike ValueError, this exception can be caught programmatically to:
+    - Trigger OAuth authentication (which auto-creates an API key)
+    - Provide clear guidance to the user
+    - Distinguish from other authentication failures
+
+    Attributes:
+        message: Human-readable message with guidance on how to fix
+        account_identifier: Optional identifier for the account (e.g., email or name)
+    """
+
+    def __init__(self, message: str = "", account_identifier: str = ""):
+        self.account_identifier = account_identifier
+        self.message = message or (
+            "This iFlow account has not set up an API key yet. "
+            "Please either:\n"
+            "1. Use OAuth authentication (run with --oauth flag) which will automatically create an API key, OR\n"
+            "2. Manually create an API key at https://platform.iflow.cn/ and try again"
+        )
+        super().__init__(self.message)
+
+
 class EmptyResponseError(Exception):
     """
     Raised when a provider returns an empty response after multiple retry attempts.

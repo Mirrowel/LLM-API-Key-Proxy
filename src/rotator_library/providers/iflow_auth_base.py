@@ -29,7 +29,7 @@ from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
-from ..error_handler import CredentialNeedsReauthError
+from ..error_handler import CredentialNeedsReauthError, IFlowNoAPIKeyError
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -675,6 +675,13 @@ class IFlowAuthBase:
         if not result.get("success"):
             error_msg = result.get("message", "Unknown error")
             raise ValueError(f"Cookie authentication failed: {error_msg}")
+
+        # Check if data is explicitly None (null) - indicates no API key exists yet
+        if result.get("data") is None:
+            lib_logger.warning(
+                "iFlow API returned null data - account has no API key configured"
+            )
+            raise IFlowNoAPIKeyError()
 
         data = result.get("data") or {}
 
