@@ -20,7 +20,10 @@ from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
 import litellm
-from litellm.exceptions import RateLimitError, AuthenticationError
+from litellm.exceptions import (
+    RateLimitError,
+    AuthenticationError,
+)
 from pathlib import Path
 import uuid
 from datetime import datetime
@@ -961,6 +964,114 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         return litellm.ModelResponse(**final_response_data)
 
+    def _get_usage_token_count(self, usage: Any, token_key: str) -> int:
+        """Extract usage token count from dict/object usage payloads."""
+        if usage is None:
+            return 0
+
+        if isinstance(usage, dict):
+            value = usage.get(token_key, 0)
+        else:
+            value = getattr(usage, token_key, 0)
+
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _message_to_dict(self, message: Any) -> Dict[str, Any]:
+        """Normalize response message object to dict."""
+        if message is None:
+            return {}
+        if isinstance(message, dict):
+            return message
+        if hasattr(message, "model_dump"):
+            return message.model_dump(exclude_none=False)
+        if hasattr(message, "dict"):
+            return message.dict()
+        if hasattr(message, "__dict__"):
+            return {k: v for k, v in message.__dict__.items() if not k.startswith("_")}
+        return {}
+
+    def _raise_silent_context_failure(
+        self,
+        *,
+        model: str,
+        reason: str,
+        file_logger: ProviderLogger,
+    ) -> None:
+        """Raise a non-retryable context-window style error for silent 200 failures."""
+        error_msg = f"iFlow silent context failure detected for {model}: {reason}"
+        file_logger.log_error(error_msg)
+        lib_logger.warning(error_msg)
+        request = httpx.Request("POST", "https://iflow.invalid/chat/completions")
+        response = httpx.Response(
+            status_code=400,
+            request=request,
+            text=f"context window exceeded: {error_msg}",
+        )
+        raise httpx.HTTPStatusError(
+            f"Context window exceeded: {error_msg}",
+            request=request,
+            response=response,
+        )
+
+    def _validate_final_response(
+        self,
+        *,
+        final_response: litellm.ModelResponse,
+        model: str,
+        file_logger: ProviderLogger,
+    ) -> None:
+        """Detect empty/invalid 200 responses that indicate silent context failures."""
+        choices = getattr(final_response, "choices", None) or []
+        if not choices:
+            self._raise_silent_context_failure(
+                model=model,
+                reason="HTTP 200 response had no choices",
+                file_logger=file_logger,
+            )
+
+        usage = getattr(final_response, "usage", None)
+        prompt_tokens = self._get_usage_token_count(usage, "prompt_tokens")
+        completion_tokens = self._get_usage_token_count(usage, "completion_tokens")
+        if prompt_tokens > 0 and completion_tokens == 0:
+            self._raise_silent_context_failure(
+                model=model,
+                reason=(
+                    "completion_tokens=0 with non-zero prompt_tokens "
+                    f"(prompt_tokens={prompt_tokens})"
+                ),
+                file_logger=file_logger,
+            )
+
+        first_choice = choices[0]
+        message_obj = (
+            first_choice.get("message")
+            if isinstance(first_choice, dict)
+            else getattr(first_choice, "message", None)
+        )
+        message = self._message_to_dict(message_obj)
+
+        content = message.get("content")
+        reasoning_content = message.get("reasoning_content")
+        tool_calls = message.get("tool_calls")
+        function_call = message.get("function_call")
+
+        has_content = isinstance(content, str) and bool(content.strip())
+        has_reasoning = isinstance(reasoning_content, str) and bool(
+            reasoning_content.strip()
+        )
+        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+        has_function_call = function_call not in (None, {}, [])
+
+        if not (has_content or has_reasoning or has_tool_calls or has_function_call):
+            self._raise_silent_context_failure(
+                model=model,
+                reason="HTTP 200 response completed with empty assistant message",
+                file_logger=file_logger,
+            )
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
@@ -1162,13 +1273,27 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         async def logging_stream_wrapper():
             """Wraps the stream to log the final reassembled response and cache reasoning."""
             openai_chunks = []
+            stream_completed = False
             try:
                 async for chunk in stream_handler(await make_request()):
                     openai_chunks.append(chunk)
                     yield chunk
+                stream_completed = True
             finally:
-                if openai_chunks:
+                if stream_completed:
+                    if not openai_chunks:
+                        self._raise_silent_context_failure(
+                            model=model,
+                            reason="HTTP 200 stream ended without any data chunks",
+                            file_logger=file_logger,
+                        )
+
                     final_response = self._stream_to_completion_response(openai_chunks)
+                    self._validate_final_response(
+                        final_response=final_response,
+                        model=model,
+                        file_logger=file_logger,
+                    )
                     file_logger.log_final_response(final_response.dict())
 
                     # Store reasoning_content from the response for future multi-turn conversations
