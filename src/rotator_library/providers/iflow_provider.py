@@ -29,6 +29,12 @@ lib_logger = logging.getLogger("rotator_library")
 
 # Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
+    "deepseek-r1",
+    "deepseek-v3",
+    "deepseek-v3.1",
+    "deepseek-v3.2",  # seems to not work, but should. Use -chat/-reasoner variants instead
+    "deepseek-v3.2-chat",
+    "deepseek-v3.2-reasoner",
     "glm-4.6",
     "glm-4.7",
     "glm-5",
@@ -48,12 +54,6 @@ HARDCODED_MODELS = [
     "qwen3-max",
     "qwen3-max-preview",
     "qwen3-vl-plus",
-    "deepseek-v3.2-reasoner",
-    "deepseek-v3.2-chat",
-    "deepseek-v3.2",  # seems to not work, but should. Use above variants instead
-    "deepseek-v3.1",
-    "deepseek-v3",
-    "deepseek-r1",
     "tstars2.0",
 ]
 
@@ -103,7 +103,13 @@ REASONING_SPLIT_MODELS = {"minimax-m2", "minimax-m2.1", "minimax-m2.5"}
 
 # Models that benefit from reasoning_content preservation in message history
 # (for multi-turn conversations)
-REASONING_PRESERVATION_MODELS_PREFIXES = ("glm-4", "glm-5", "minimax-m2", "tstars")
+REASONING_PRESERVATION_MODELS_PREFIXES = (
+    "deepseek",
+    "glm-",
+    "minimax-",
+    "qwen",
+    "tstars",
+)
 
 # Cache file path for reasoning content preservation
 _REASONING_CACHE_FILE = (
@@ -427,7 +433,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         """
         Inject cached reasoning_content into assistant messages.
 
-        Only for models that benefit from reasoning preservation (GLM-4.x, MiniMax-M2.x).
+        Only for models that benefit from reasoning preservation.
         This is helpful for multi-turn conversations where the model may benefit
         from seeing its previous reasoning to maintain coherent thought chains.
 
