@@ -11,6 +11,7 @@ import time
 import os
 import re
 import threading
+import asyncio
 import httpx
 import logging
 from typing import Union, AsyncGenerator, List, Dict, Any, Optional, Tuple
@@ -98,6 +99,29 @@ DEFAULT_IFLOW_STICKY_MAX_ENTRIES = 10000
 
 def _is_truthy_env(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Connection error types that should trigger retries.
+CONNECTION_ERROR_TYPES = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
+
+# Context window error patterns to detect in provider error bodies.
+CONTEXT_WINDOW_ERROR_PATTERNS = (
+    "context_length",
+    "token limit",
+    "context window",
+    "too many tokens",
+    "too long",
+    "max_tokens",
+)
+
+MAX_CONNECTION_RETRIES = 3
+RETRY_BACKOFF_BASE = 1.0
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -1413,6 +1437,115 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         return litellm.ModelResponse(**final_response_data)
 
+    def _get_usage_token_count(self, usage: Any, token_key: str) -> int:
+        """Extract usage token count from dict/object usage payloads."""
+        if usage is None:
+            return 0
+
+        if isinstance(usage, dict):
+            value = usage.get(token_key, 0)
+        else:
+            value = getattr(usage, token_key, 0)
+
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _message_to_dict(self, message: Any) -> Dict[str, Any]:
+        """Normalize response message object to dict."""
+        if message is None:
+            return {}
+        if isinstance(message, dict):
+            return message
+        if hasattr(message, "model_dump"):
+            return message.model_dump(exclude_none=False)
+        if hasattr(message, "dict"):
+            return message.dict()
+        if hasattr(message, "__dict__"):
+            return {k: v for k, v in message.__dict__.items() if not k.startswith("_")}
+        return {}
+
+    def _raise_silent_context_failure(
+        self,
+        *,
+        model: str,
+        reason: str,
+        file_logger: ProviderLogger,
+    ) -> None:
+        """Raise non-retryable context-window style error for silent 200 failures."""
+        error_msg = f"iFlow silent context failure detected for {model}: {reason}"
+        file_logger.log_error(error_msg)
+        lib_logger.warning(error_msg)
+
+        request = httpx.Request("POST", "https://iflow.invalid/chat/completions")
+        response = httpx.Response(
+            status_code=400,
+            request=request,
+            text=f"context window exceeded: {error_msg}",
+        )
+        raise httpx.HTTPStatusError(
+            f"Context window exceeded: {error_msg}",
+            request=request,
+            response=response,
+        )
+
+    def _validate_final_response(
+        self,
+        *,
+        final_response: litellm.ModelResponse,
+        model: str,
+        file_logger: ProviderLogger,
+    ) -> None:
+        """Detect empty/invalid 200 responses that indicate silent context failures."""
+        choices = getattr(final_response, "choices", None) or []
+        if not choices:
+            self._raise_silent_context_failure(
+                model=model,
+                reason="HTTP 200 response had no choices",
+                file_logger=file_logger,
+            )
+
+        usage = getattr(final_response, "usage", None)
+        prompt_tokens = self._get_usage_token_count(usage, "prompt_tokens")
+        completion_tokens = self._get_usage_token_count(usage, "completion_tokens")
+        if prompt_tokens > 0 and completion_tokens == 0:
+            self._raise_silent_context_failure(
+                model=model,
+                reason=(
+                    "completion_tokens=0 with non-zero prompt_tokens "
+                    f"(prompt_tokens={prompt_tokens})"
+                ),
+                file_logger=file_logger,
+            )
+
+        first_choice = choices[0]
+        message_obj = (
+            first_choice.get("message")
+            if isinstance(first_choice, dict)
+            else getattr(first_choice, "message", None)
+        )
+        message = self._message_to_dict(message_obj)
+
+        content = message.get("content")
+        reasoning_content = message.get("reasoning_content")
+        tool_calls = message.get("tool_calls")
+        function_call = message.get("function_call")
+
+        has_content = isinstance(content, str) and bool(content.strip())
+        has_reasoning = isinstance(reasoning_content, str) and bool(
+            reasoning_content.strip()
+        )
+        has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+        has_function_call = function_call not in (None, {}, [])
+
+        if not (has_content or has_reasoning or has_tool_calls or has_function_call):
+            self._raise_silent_context_failure(
+                model=model,
+                reason="HTTP 200 response completed with empty assistant message",
+                file_logger=file_logger,
+            )
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
@@ -1473,85 +1606,100 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             include_signature: bool = True,
             allow_unsigned_retry: bool = True,
         ):
-            """Handles the streaming response and converts chunks."""
-            # Track state across chunks for finish_reason normalization
+            """Handles streaming response with retries and context-failure detection."""
             stream_state: Dict[str, Any] = {}
-            try:
-                async with response_stream as response:
-                    # Check for HTTP errors before processing stream
-                    if response.status_code >= 400:
-                        error_text = await response.aread()
-                        error_text = (
-                            error_text.decode("utf-8")
-                            if isinstance(error_text, bytes)
-                            else error_text
-                        )
+            saw_data_chunk = False
 
-                        # Handle 401: Force token refresh and retry once
-                        if response.status_code == 401 and attempt == 1:
-                            lib_logger.warning(
-                                "iFlow returned 401. Forcing token refresh and retrying once."
+            connection_retry_count = 0
+            current_stream = response_stream
+
+            while connection_retry_count <= MAX_CONNECTION_RETRIES:
+                try:
+                    async with current_stream as response:
+                        if response.status_code >= 400:
+                            error_text = await response.aread()
+                            error_text = (
+                                error_text.decode("utf-8")
+                                if isinstance(error_text, bytes)
+                                else error_text
                             )
-                            await self._refresh_token(credential_path, force=True)
-                            retry_stream = await make_request(
-                                api_base, include_signature=include_signature
-                            )
-                            async for chunk in stream_handler(
-                                retry_stream,
-                                api_base=api_base,
-                                attempt=2,
-                                include_signature=include_signature,
-                                allow_unsigned_retry=allow_unsigned_retry,
+                            error_text_lower = error_text.lower()
+
+                            if response.status_code == 401 and attempt == 1:
+                                lib_logger.warning(
+                                    "iFlow returned 401. Forcing token refresh and retrying once."
+                                )
+                                await self._refresh_token(credential_path, force=True)
+                                retry_stream = await make_request(
+                                    api_base, include_signature=include_signature
+                                )
+                                async for chunk in stream_handler(
+                                    retry_stream,
+                                    api_base=api_base,
+                                    attempt=2,
+                                    include_signature=include_signature,
+                                    allow_unsigned_retry=allow_unsigned_retry,
+                                ):
+                                    yield chunk
+                                return
+
+                            if (
+                                response.status_code == 406
+                                and include_signature
+                                and allow_unsigned_retry
                             ):
-                                yield chunk
-                            return
+                                lib_logger.warning(
+                                    f"iFlow returned 406 on {api_base}, retrying once without signature headers"
+                                )
+                                retry_stream = await make_request(
+                                    api_base, include_signature=False
+                                )
+                                async for chunk in stream_handler(
+                                    retry_stream,
+                                    api_base=api_base,
+                                    attempt=attempt,
+                                    include_signature=False,
+                                    allow_unsigned_retry=False,
+                                ):
+                                    yield chunk
+                                return
 
-                        # Handle 406: retry once without signature headers
-                        elif (
-                            response.status_code == 406
-                            and include_signature
-                            and allow_unsigned_retry
-                        ):
-                            lib_logger.warning(
-                                f"iFlow returned 406 on {api_base}, retrying once without signature headers"
-                            )
-                            retry_stream = await make_request(
-                                api_base, include_signature=False
-                            )
-                            async for chunk in stream_handler(
-                                retry_stream,
-                                api_base=api_base,
-                                attempt=attempt,
-                                include_signature=False,
-                                allow_unsigned_retry=False,
+                            if (
+                                response.status_code == 429
+                                or "slow_down" in error_text_lower
                             ):
-                                yield chunk
-                            return
+                                raise RateLimitError(
+                                    f"iFlow rate limit exceeded: {error_text}",
+                                    llm_provider="iflow",
+                                    model=model,
+                                    response=response,
+                                )
 
-                        # Handle 429: Rate limit
-                        elif (
-                            response.status_code == 429
-                            or "slow_down" in error_text.lower()
-                        ):
-                            raise RateLimitError(
-                                f"iFlow rate limit exceeded: {error_text}",
-                                llm_provider="iflow",
-                                model=model,
-                                response=response,
-                            )
-
-                        elif self._should_fallback_base(response.status_code):
-                            raise _NextBaseError(
-                                f"iFlow HTTP {response.status_code} on {api_base}",
-                                cause=httpx.HTTPStatusError(
-                                    f"HTTP {response.status_code}: {error_text}",
+                            if any(
+                                pattern in error_text_lower
+                                for pattern in CONTEXT_WINDOW_ERROR_PATTERNS
+                            ):
+                                error_msg = f"iFlow context window exceeded: {error_text}"
+                                file_logger.log_error(error_msg)
+                                lib_logger.warning(
+                                    f"iFlow context window error detected: {error_text}"
+                                )
+                                raise httpx.HTTPStatusError(
+                                    f"Context window exceeded: {error_text}",
                                     request=response.request,
                                     response=response,
-                                ),
-                            )
+                                )
 
-                        # Handle other errors
-                        else:
+                            if self._should_fallback_base(response.status_code):
+                                raise _NextBaseError(
+                                    f"iFlow HTTP {response.status_code} on {api_base}",
+                                    cause=httpx.HTTPStatusError(
+                                        f"HTTP {response.status_code}: {error_text}",
+                                        request=response.request,
+                                        response=response,
+                                    ),
+                                )
+
                             if not error_text:
                                 content_type = response.headers.get("content-type", "")
                                 error_text = (
@@ -1567,47 +1715,66 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 response=response,
                             )
 
-                    # Process successful streaming response
-                    async for line in response.aiter_lines():
-                        file_logger.log_response_chunk(line)
+                        async for line in response.aiter_lines():
+                            file_logger.log_response_chunk(line)
 
-                        # CRITICAL FIX: Handle both "data:" (no space) and "data: " (with space)
-                        if line.startswith("data:"):
-                            # Extract data after "data:" prefix, handling both formats
-                            if line.startswith("data: "):
-                                data_str = line[6:]  # Skip "data: "
-                            else:
-                                data_str = line[5:]  # Skip "data:"
+                            if line.startswith("data:"):
+                                data_str = line[6:] if line.startswith("data: ") else line[5:]
 
-                            if data_str.strip() == "[DONE]":
-                                # lib_logger.debug("iFlow: Received [DONE] marker")
-                                break
-                            try:
-                                chunk = json.loads(data_str)
+                                if data_str.strip() == "[DONE]":
+                                    break
 
-                                for openai_chunk in self._convert_chunk_to_openai(
-                                    chunk, model, stream_state
-                                ):
-                                    yield litellm.ModelResponse(**openai_chunk)
-                            except json.JSONDecodeError:
-                                lib_logger.warning(
-                                    f"Could not decode JSON from iFlow: {line}"
-                                )
+                                saw_data_chunk = True
+                                try:
+                                    chunk = json.loads(data_str)
+                                    for openai_chunk in self._convert_chunk_to_openai(
+                                        chunk, model, stream_state
+                                    ):
+                                        yield litellm.ModelResponse(**openai_chunk)
+                                except json.JSONDecodeError:
+                                    lib_logger.warning(
+                                        f"Could not decode JSON from iFlow: {line}"
+                                    )
 
-            except httpx.HTTPStatusError:
-                raise  # Re-raise HTTP errors we already handled
-            except (httpx.RequestError, httpx.TimeoutException) as e:
-                raise _NextBaseError(
-                    f"Network error on iFlow base {api_base}: {e}", cause=e
-                )
-            except _NextBaseError:
-                raise
-            except Exception as e:
-                file_logger.log_error(f"Error during iFlow stream processing: {e}")
-                lib_logger.error(
-                    f"Error during iFlow stream processing: {e}", exc_info=True
-                )
-                raise
+                    if not saw_data_chunk:
+                        self._raise_silent_context_failure(
+                            model=model,
+                            reason="stream completed without any data chunks",
+                            file_logger=file_logger,
+                        )
+                    return
+
+                except httpx.HTTPStatusError:
+                    raise
+                except _NextBaseError:
+                    raise
+                except CONNECTION_ERROR_TYPES as e:
+                    connection_retry_count += 1
+                    error_type_name = type(e).__name__
+
+                    if connection_retry_count > MAX_CONNECTION_RETRIES:
+                        raise _NextBaseError(
+                            f"Network error on iFlow base {api_base}: {error_type_name}: {e}",
+                            cause=e,
+                        )
+
+                    backoff = RETRY_BACKOFF_BASE * (2 ** (connection_retry_count - 1))
+                    lib_logger.warning(
+                        f"iFlow connection error ({error_type_name}) on attempt "
+                        f"{connection_retry_count}/{MAX_CONNECTION_RETRIES}: {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    current_stream = await make_request(
+                        api_base,
+                        include_signature=include_signature,
+                    )
+                except Exception as e:
+                    file_logger.log_error(f"Error during iFlow stream processing: {e}")
+                    lib_logger.error(
+                        f"Error during iFlow stream processing: {e}", exc_info=True
+                    )
+                    raise
 
         async def logging_stream_wrapper():
             """Wraps the stream to log the final reassembled response and cache reasoning."""
@@ -1642,6 +1809,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             finally:
                 if openai_chunks:
                     final_response = self._stream_to_completion_response(openai_chunks)
+                    self._validate_final_response(
+                        final_response=final_response,
+                        model=model,
+                        file_logger=file_logger,
+                    )
                     file_logger.log_final_response(final_response.dict())
 
                     # Store reasoning_content from the response for future multi-turn conversations
