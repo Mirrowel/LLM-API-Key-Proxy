@@ -104,11 +104,13 @@ REASONING_SPLIT_MODELS = {"minimax-m2", "minimax-m2.1", "minimax-m2.5"}
 # Models that benefit from reasoning_content preservation in message history
 # (for multi-turn conversations)
 REASONING_PRESERVATION_MODELS_PREFIXES = (
-    "deepseek",
-    "glm-",
-    "minimax-",
-    "qwen",
+    "glm-4",
+    "glm-5",
+    "minimax-m2",
     "tstars",
+    "qwen3-32b",
+    "deepseek-v3.1",
+    "deepseek-v3.2",
 )
 
 # Cache file path for reasoning content preservation
