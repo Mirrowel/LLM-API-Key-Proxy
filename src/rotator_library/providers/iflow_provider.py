@@ -22,7 +22,10 @@ from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
 import litellm
-from litellm.exceptions import RateLimitError, AuthenticationError
+from litellm.exceptions import (
+    RateLimitError,
+    AuthenticationError,
+)
 from pathlib import Path
 import uuid
 from datetime import datetime
@@ -1473,11 +1476,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         reason: str,
         file_logger: ProviderLogger,
     ) -> None:
-        """Raise non-retryable context-window style error for silent 200 failures."""
+        """Raise a non-retryable context-window style error for silent 200 failures."""
         error_msg = f"iFlow silent context failure detected for {model}: {reason}"
         file_logger.log_error(error_msg)
         lib_logger.warning(error_msg)
-
         request = httpx.Request("POST", "https://iflow.invalid/chat/completions")
         response = httpx.Response(
             status_code=400,
@@ -1780,6 +1782,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             """Wraps the stream to log the final reassembled response and cache reasoning."""
             openai_chunks = []
             last_fallback_error: Optional[Exception] = None
+            stream_completed = False
             try:
                 for idx, api_base in enumerate(api_bases):
                     try:
@@ -1791,6 +1794,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                         ):
                             openai_chunks.append(chunk)
                             yield chunk
+                        stream_completed = True
                         return
                     except _NextBaseError as e:
                         if openai_chunks:
@@ -1807,7 +1811,14 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 if last_fallback_error:
                     raise last_fallback_error
             finally:
-                if openai_chunks:
+                if stream_completed:
+                    if not openai_chunks:
+                        self._raise_silent_context_failure(
+                            model=model,
+                            reason="HTTP 200 stream ended without any data chunks",
+                            file_logger=file_logger,
+                        )
+
                     final_response = self._stream_to_completion_response(openai_chunks)
                     self._validate_final_response(
                         final_response=final_response,
