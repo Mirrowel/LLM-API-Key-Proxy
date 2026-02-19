@@ -11,6 +11,7 @@ import time
 import os
 import httpx
 import logging
+import asyncio
 from typing import Union, AsyncGenerator, List, Dict, Any, Optional
 from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
@@ -23,6 +24,30 @@ from litellm.exceptions import RateLimitError, AuthenticationError
 from pathlib import Path
 import uuid
 from datetime import datetime
+
+# Connection error types that should trigger retries
+# These indicate transient network issues that may resolve on retry
+CONNECTION_ERROR_TYPES = (
+    httpx.RemoteProtocolError,  # peer closed connection without complete message
+    httpx.ConnectError,  # connection failed
+    httpx.ReadTimeout,  # read timeout during streaming
+    httpx.TimeoutException,  # base timeout (covers all timeout types)
+    httpx.NetworkError,  # base network error (covers all network issues)
+)
+
+# Context window error patterns to detect in error responses
+CONTEXT_WINDOW_ERROR_PATTERNS = (
+    "context_length",
+    "token limit",
+    "context window",
+    "too many tokens",
+    "too long",
+    "max_tokens",
+)
+
+# Retry configuration
+MAX_CONNECTION_RETRIES = 3
+RETRY_BACKOFF_BASE = 1.0  # Start with 1 second, then 2, 4
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -981,95 +1006,158 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             )
 
         async def stream_handler(response_stream, attempt=1):
-            """Handles the streaming response and converts chunks."""
+            """Handles the streaming response and converts chunks.
+
+            Includes retry logic for transient connection errors with exponential backoff.
+            Connection errors (RemoteProtocolError, ConnectError, ReadTimeout, etc.) are
+            retried up to MAX_CONNECTION_RETRIES times before raising for higher-level handling.
+            """
             # Track state across chunks for finish_reason normalization
             stream_state: Dict[str, Any] = {}
-            try:
-                async with response_stream as response:
-                    # Check for HTTP errors before processing stream
-                    if response.status_code >= 400:
-                        error_text = await response.aread()
-                        error_text = (
-                            error_text.decode("utf-8")
-                            if isinstance(error_text, bytes)
-                            else error_text
-                        )
 
-                        # Handle 401: Force token refresh and retry once
-                        if response.status_code == 401 and attempt == 1:
-                            lib_logger.warning(
-                                "iFlow returned 401. Forcing token refresh and retrying once."
+            # Connection error retry state
+            connection_retry_count = 0
+            current_stream = response_stream
+
+            while connection_retry_count <= MAX_CONNECTION_RETRIES:
+                try:
+                    async with current_stream as response:
+                        # Check for HTTP errors before processing stream
+                        if response.status_code >= 400:
+                            error_text = await response.aread()
+                            error_text = (
+                                error_text.decode("utf-8")
+                                if isinstance(error_text, bytes)
+                                else error_text
                             )
-                            await self._refresh_token(credential_path, force=True)
-                            retry_stream = await make_request()
-                            async for chunk in stream_handler(retry_stream, attempt=2):
-                                yield chunk
-                            return
+                            error_text_lower = error_text.lower()
 
-                        # Handle 429: Rate limit
-                        elif (
-                            response.status_code == 429
-                            or "slow_down" in error_text.lower()
-                        ):
-                            raise RateLimitError(
-                                f"iFlow rate limit exceeded: {error_text}",
-                                llm_provider="iflow",
-                                model=model,
-                                response=response,
-                            )
-
-                        # Handle other errors
-                        else:
-                            if not error_text:
-                                content_type = response.headers.get("content-type", "")
-                                error_text = (
-                                    f"(empty response body, content-type={content_type})"
-                                )
-                            error_msg = (
-                                f"iFlow HTTP {response.status_code} error: {error_text}"
-                            )
-                            file_logger.log_error(error_msg)
-                            raise httpx.HTTPStatusError(
-                                f"HTTP {response.status_code}: {error_text}",
-                                request=response.request,
-                                response=response,
-                            )
-
-                    # Process successful streaming response
-                    async for line in response.aiter_lines():
-                        file_logger.log_response_chunk(line)
-
-                        # CRITICAL FIX: Handle both "data:" (no space) and "data: " (with space)
-                        if line.startswith("data:"):
-                            # Extract data after "data:" prefix, handling both formats
-                            if line.startswith("data: "):
-                                data_str = line[6:]  # Skip "data: "
-                            else:
-                                data_str = line[5:]  # Skip "data:"
-
-                            if data_str.strip() == "[DONE]":
-                                # lib_logger.debug("iFlow: Received [DONE] marker")
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-
-                                for openai_chunk in self._convert_chunk_to_openai(
-                                    chunk, model, stream_state
-                                ):
-                                    yield litellm.ModelResponse(**openai_chunk)
-                            except json.JSONDecodeError:
+                            # Handle 401: Force token refresh and retry once
+                            if response.status_code == 401 and attempt == 1:
                                 lib_logger.warning(
-                                    f"Could not decode JSON from iFlow: {line}"
+                                    "iFlow returned 401. Forcing token refresh and retrying once."
+                                )
+                                await self._refresh_token(credential_path, force=True)
+                                retry_stream = await make_request()
+                                async for chunk in stream_handler(
+                                    retry_stream, attempt=2
+                                ):
+                                    yield chunk
+                                return
+
+                            # Handle 429: Rate limit
+                            elif (
+                                response.status_code == 429
+                                or "slow_down" in error_text_lower
+                            ):
+                                raise RateLimitError(
+                                    f"iFlow rate limit exceeded: {error_text}",
+                                    llm_provider="iflow",
+                                    model=model,
+                                    response=response,
                                 )
 
-            except httpx.HTTPStatusError:
-                raise  # Re-raise HTTP errors we already handled
-            except Exception as e:
-                file_logger.log_error(f"Error during iFlow stream processing: {e}")
-                lib_logger.error(
-                    f"Error during iFlow stream processing: {e}", exc_info=True
-                )
-                raise
+                            # Handle other errors
+                            else:
+                                if not error_text:
+                                    content_type = response.headers.get(
+                                        "content-type", ""
+                                    )
+                                    error_text = f"(empty response body, content-type={content_type})"
+                                    error_text_lower = error_text.lower()
+
+                                # Detect context window errors from response body
+                                if any(
+                                    pattern in error_text_lower
+                                    for pattern in CONTEXT_WINDOW_ERROR_PATTERNS
+                                ):
+                                    error_msg = (
+                                        f"iFlow context window exceeded: {error_text}"
+                                    )
+                                    file_logger.log_error(error_msg)
+                                    lib_logger.warning(
+                                        f"iFlow context window error detected: {error_text}"
+                                    )
+                                    raise httpx.HTTPStatusError(
+                                        f"Context window exceeded: {error_text}",
+                                        request=response.request,
+                                        response=response,
+                                    )
+
+                                error_msg = f"iFlow HTTP {response.status_code} error: {error_text}"
+                                file_logger.log_error(error_msg)
+                                raise httpx.HTTPStatusError(
+                                    f"HTTP {response.status_code}: {error_text}",
+                                    request=response.request,
+                                    response=response,
+                                )
+
+                        # Process successful streaming response
+                        async for line in response.aiter_lines():
+                            file_logger.log_response_chunk(line)
+
+                            # CRITICAL FIX: Handle both "data:" (no space) and "data: " (with space)
+                            if line.startswith("data:"):
+                                # Extract data after "data:" prefix, handling both formats
+                                if line.startswith("data: "):
+                                    data_str = line[6:]  # Skip "data: "
+                                else:
+                                    data_str = line[5:]  # Skip "data:"
+
+                                if data_str.strip() == "[DONE]":
+                                    # lib_logger.debug("iFlow: Received [DONE] marker")
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+
+                                    for openai_chunk in self._convert_chunk_to_openai(
+                                        chunk, model, stream_state
+                                    ):
+                                        yield litellm.ModelResponse(**openai_chunk)
+                                except json.JSONDecodeError:
+                                    lib_logger.warning(
+                                        f"Could not decode JSON from iFlow: {line}"
+                                    )
+
+                    # Successfully completed without errors, exit retry loop
+                    return
+
+                except httpx.HTTPStatusError:
+                    raise  # Re-raise HTTP errors we already handled
+
+                except CONNECTION_ERROR_TYPES as e:
+                    connection_retry_count += 1
+                    error_type_name = type(e).__name__
+
+                    if connection_retry_count > MAX_CONNECTION_RETRIES:
+                        # Max retries exhausted, log and re-raise for higher-level handling
+                        error_msg = (
+                            f"iFlow connection error after {MAX_CONNECTION_RETRIES} retries: "
+                            f"{error_type_name}: {e}"
+                        )
+                        file_logger.log_error(error_msg)
+                        lib_logger.error(error_msg)
+                        raise
+
+                    # Exponential backoff: 1s, 2s, 4s
+                    backoff = RETRY_BACKOFF_BASE * (2 ** (connection_retry_count - 1))
+                    lib_logger.warning(
+                        f"iFlow connection error ({error_type_name}) on attempt "
+                        f"{connection_retry_count}/{MAX_CONNECTION_RETRIES}: {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+
+                    # Re-create the stream for retry
+                    current_stream = await make_request()
+                    # Continue the while loop to retry
+
+                except Exception as e:
+                    file_logger.log_error(f"Error during iFlow stream processing: {e}")
+                    lib_logger.error(
+                        f"Error during iFlow stream processing: {e}", exc_info=True
+                    )
+                    raise
 
         async def logging_stream_wrapper():
             """Wraps the stream to log the final reassembled response and cache reasoning."""
