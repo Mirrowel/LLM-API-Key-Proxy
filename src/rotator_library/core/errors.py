@@ -18,6 +18,7 @@ from ..error_handler import (
     NoAvailableKeysError,
     PreRequestCallbackError,
     CredentialNeedsReauthError,
+    IFlowNoAPIKeyError,
     EmptyResponseError,
     TransientQuotaError,
     # Error classification
@@ -67,6 +68,7 @@ __all__ = [
     "NoAvailableKeysError",
     "PreRequestCallbackError",
     "CredentialNeedsReauthError",
+    "IFlowNoAPIKeyError",
     "EmptyResponseError",
     "TransientQuotaError",
     "StreamedAPIError",

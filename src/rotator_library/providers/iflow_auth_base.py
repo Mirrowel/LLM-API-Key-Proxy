@@ -29,7 +29,11 @@ from rich.markup import escape as rich_escape
 from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
-from ..error_handler import CredentialNeedsReauthError, IFlowNoAPIKeyError
+from ..error_handler import (
+    CredentialNeedsReauthError,
+    IFlowNoAPIKeyError,
+    mask_credential,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -681,7 +685,9 @@ class IFlowAuthBase:
             lib_logger.warning(
                 "iFlow API returned null data - account has no API key configured"
             )
-            raise IFlowNoAPIKeyError()
+            bx_auth_value = extract_bx_auth(cookie) or ""
+            masked_identifier = f"BXAuth={mask_credential(bx_auth_value)};"
+            raise IFlowNoAPIKeyError(account_identifier=masked_identifier)
 
         data = result.get("data") or {}
 
