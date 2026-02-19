@@ -935,7 +935,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             )
 
     if isinstance(
-        e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)
+        e,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,  # peer closed connection without complete message
+        ),
     ):  # [NEW]
         return ClassifiedError(
             error_type="api_connection", original_exception=e, status_code=status_code
