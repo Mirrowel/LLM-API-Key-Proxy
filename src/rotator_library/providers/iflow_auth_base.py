@@ -42,6 +42,7 @@ IFLOW_ERROR_REDIRECT_URL = "https://iflow.cn/oauth/error"
 
 # Cookie-based authentication endpoint
 IFLOW_API_KEY_ENDPOINT = "https://platform.iflow.cn/api/openapi/apikey"
+IFLOW_DEFAULT_API_BASE = "https://apis.iflow.cn/v1"
 
 # Client credentials provided by iFlow
 IFLOW_CLIENT_ID = "10009311001"
@@ -330,6 +331,32 @@ class IFlowAuthBase:
         self._refresh_timeout_seconds: int = 15  # Max time for single refresh
         self._refresh_interval_seconds: int = 30  # Delay between queue items
         self._refresh_max_retries: int = 3  # Attempts before kicked out
+
+    def get_api_base_candidates(self) -> List[str]:
+        """Return ordered iFlow API base candidates from environment variables."""
+        candidates: List[str] = []
+
+        single_base = os.getenv("IFLOW_API_BASE", "").strip()
+        if single_base:
+            normalized = single_base.rstrip("/")
+            if normalized:
+                candidates.append(normalized)
+
+        base_list = os.getenv("IFLOW_API_BASES", "").strip()
+        if base_list:
+            for item in base_list.split(","):
+                normalized = item.strip().rstrip("/")
+                if normalized and normalized not in candidates:
+                    candidates.append(normalized)
+
+        if IFLOW_DEFAULT_API_BASE not in candidates:
+            candidates.append(IFLOW_DEFAULT_API_BASE)
+
+        return candidates
+
+    def get_api_base(self) -> str:
+        """Return the primary iFlow API base URL."""
+        return self.get_api_base_candidates()[0]
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """
@@ -965,12 +992,32 @@ class IFlowAuthBase:
             if not force and cached_creds and not self._is_token_expired(cached_creds):
                 return cached_creds
 
-            # [ROTATING TOKEN FIX] Always read fresh from disk before refresh.
-            # iFlow may use rotating refresh tokens - each refresh could invalidate the previous token.
-            # If we use a stale cached token, refresh will fail.
-            # Reading fresh from disk ensures we have the latest token.
-            await self._read_creds_from_file(path)
-            creds_from_file = self._credentials_cache[path]
+            # For file-based credentials, read fresh from disk before refresh.
+            # For env-loaded credentials, refresh using cached/env values (no file IO).
+            creds_from_file: Optional[Dict[str, Any]] = None
+            if cached_creds and cached_creds.get("_proxy_metadata", {}).get(
+                "loaded_from_env"
+            ):
+                creds_from_file = cached_creds
+            elif self._parse_env_credential_path(path) is not None:
+                credential_index = self._parse_env_credential_path(path)
+                env_creds = self._load_from_env(credential_index)
+                if env_creds:
+                    self._credentials_cache[path] = env_creds
+                    creds_from_file = env_creds
+                else:
+                    raise ValueError(
+                        f"No environment credentials found for iFlow path: {path}"
+                    )
+            else:
+                # [ROTATING TOKEN FIX] Always read fresh from disk before refresh.
+                # iFlow may use rotating refresh tokens - each refresh could invalidate
+                # the previous token. Fresh disk read keeps us in sync.
+                await self._read_creds_from_file(path)
+                creds_from_file = self._credentials_cache[path]
+
+            if creds_from_file is None:
+                raise ValueError(f"No credentials available for iFlow refresh: {path}")
 
             lib_logger.debug(f"Refreshing iFlow OAuth token for '{Path(path).name}'...")
             refresh_token = creds_from_file.get("refresh_token")
@@ -1215,7 +1262,8 @@ class IFlowAuthBase:
         - API Key: credential_identifier is the API key string itself
         """
         # Detect credential type
-        if os.path.isfile(credential_identifier):
+        credential_index = self._parse_env_credential_path(credential_identifier)
+        if credential_index is not None or os.path.isfile(credential_identifier):
             creds = await self._load_credentials(credential_identifier)
 
             # Check if this is a cookie-based credential
@@ -1249,7 +1297,7 @@ class IFlowAuthBase:
             lib_logger.debug("Using direct API key for iFlow")
             api_key = credential_identifier
 
-        base_url = "https://apis.iflow.cn/v1"
+        base_url = self.get_api_base()
         return base_url, api_key
 
     async def proactively_refresh(self, credential_identifier: str):

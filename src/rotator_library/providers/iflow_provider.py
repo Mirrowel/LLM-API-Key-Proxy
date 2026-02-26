@@ -29,6 +29,7 @@ lib_logger = logging.getLogger("rotator_library")
 
 # Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
+    "glm-5",
     "glm-4.6",
     "glm-4.7",
     "minimax-m2",
@@ -72,8 +73,10 @@ SUPPORTED_PARAMS = {
 
 IFLOW_USER_AGENT = "iFlow-Cli"
 IFLOW_HEADER_SESSION_ID = "session-id"
+IFLOW_HEADER_CONVERSATION_ID = "conversation-id"
 IFLOW_HEADER_TIMESTAMP = "x-iflow-timestamp"
 IFLOW_HEADER_SIGNATURE = "x-iflow-signature"
+IFLOW_HEADER_API_KEY = "x-api-key"
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -187,34 +190,87 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             if os.path.isfile(credential):
                 await self.initialize_token(credential)
 
-            api_base, api_key = await self.get_api_details(credential)
-            models_url = f"{api_base.rstrip('/')}/models"
+            _, api_key = await self.get_api_details(credential)
+            api_bases = self.get_api_base_candidates()
+            request_ids = self._extract_iflow_ids({})
 
-            response = await client.get(
-                models_url, headers={"Authorization": f"Bearer {api_key}"}
-            )
-            response.raise_for_status()
+            last_error: Optional[Exception] = None
+            fetched = False
 
-            dynamic_data = response.json()
-            # Handle both {data: [...]} and direct [...] formats
-            model_list = (
-                dynamic_data.get("data", dynamic_data)
-                if isinstance(dynamic_data, dict)
-                else dynamic_data
-            )
+            for idx, api_base in enumerate(api_bases):
+                models_url = f"{api_base.rstrip('/')}/models"
+                try:
+                    headers = self._build_iflow_headers(
+                        api_key=api_key,
+                        stream=False,
+                        request_ids=request_ids,
+                        include_signature=True,
+                    )
+                    response = await client.get(
+                        models_url,
+                        headers=headers,
+                        timeout=TimeoutConfig.non_streaming(),
+                    )
 
-            dynamic_count = 0
-            for model in model_list:
-                model_id = extract_model_id(model)
-                if model_id and model_id not in env_var_ids:
-                    models.append(f"iflow/{model_id}")
-                    env_var_ids.add(model_id)
-                    dynamic_count += 1
+                    if response.status_code == 406:
+                        unsigned_headers = self._build_iflow_headers(
+                            api_key=api_key,
+                            stream=False,
+                            request_ids=request_ids,
+                            include_signature=False,
+                        )
+                        response = await client.get(
+                            models_url,
+                            headers=unsigned_headers,
+                            timeout=TimeoutConfig.non_streaming(),
+                        )
 
-            if dynamic_count > 0:
-                lib_logger.debug(
-                    f"Discovered {dynamic_count} additional models for iflow from API"
-                )
+                    response.raise_for_status()
+
+                    dynamic_data = response.json()
+                    # Handle both {data: [...]} and direct [...] formats
+                    model_list = (
+                        dynamic_data.get("data", dynamic_data)
+                        if isinstance(dynamic_data, dict)
+                        else dynamic_data
+                    )
+
+                    dynamic_count = 0
+                    for model in model_list:
+                        model_id = extract_model_id(model)
+                        if model_id and model_id not in env_var_ids:
+                            models.append(f"iflow/{model_id}")
+                            env_var_ids.add(model_id)
+                            dynamic_count += 1
+
+                    if dynamic_count > 0:
+                        lib_logger.debug(
+                            f"Discovered {dynamic_count} additional models for iflow from API"
+                        )
+
+                    fetched = True
+                    break
+
+                except (httpx.RequestError, httpx.TimeoutException) as e:
+                    last_error = e
+                    if idx + 1 < len(api_bases):
+                        lib_logger.warning(
+                            f"iFlow models fetch network error on {api_base}, trying fallback base"
+                        )
+                        continue
+                    raise
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    status_code = e.response.status_code
+                    if self._should_fallback_base(status_code) and idx + 1 < len(api_bases):
+                        lib_logger.warning(
+                            f"iFlow models fetch got HTTP {status_code} on {api_base}, trying fallback base"
+                        )
+                        continue
+                    raise
+
+            if not fetched and last_error:
+                raise last_error
 
         except Exception as e:
             # Silently ignore dynamic discovery errors
@@ -530,26 +586,60 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             api_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    def _build_iflow_headers(self, api_key: str, stream: bool) -> Dict[str, str]:
-        """Build iFlow request headers, including signed auth headers."""
-        session_id = f"session-{uuid.uuid4()}"
+    def _extract_iflow_ids(
+        self, request_args: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
+        """Extract session/conversation IDs from request args."""
+        request_args = request_args or {}
+
+        def _pick(*keys: str) -> str:
+            for key in keys:
+                value = request_args.get(key)
+                if value:
+                    return str(value)
+            return ""
+
+        generated_session_id = f"session-{uuid.uuid4()}"
+        session_id = _pick("session_id", "sessionId") or generated_session_id
+        conversation_id = _pick("conversation_id", "conversationId") or session_id
+        return {"session_id": session_id, "conversation_id": conversation_id}
+
+    def _build_iflow_headers(
+        self,
+        api_key: str,
+        stream: bool,
+        request_ids: Optional[Dict[str, str]] = None,
+        include_signature: bool = True,
+    ) -> Dict[str, str]:
+        """Build iFlow request headers, with optional anti-block signature headers."""
+        request_ids = request_ids or self._extract_iflow_ids()
+        session_id = request_ids["session_id"]
+        conversation_id = request_ids["conversation_id"]
         timestamp_ms = int(time.time() * 1000)
-        signature = self._create_iflow_signature(
-            IFLOW_USER_AGENT, session_id, timestamp_ms, api_key
-        )
 
         headers = {
             "Authorization": f"Bearer {api_key}",
+            IFLOW_HEADER_API_KEY: api_key,
             "Content-Type": "application/json",
             "User-Agent": IFLOW_USER_AGENT,
             IFLOW_HEADER_SESSION_ID: session_id,
-            IFLOW_HEADER_TIMESTAMP: str(timestamp_ms),
+            IFLOW_HEADER_CONVERSATION_ID: conversation_id,
             "Accept": "text/event-stream" if stream else "application/json",
         }
-        if signature:
+        if include_signature:
+            signature = self._create_iflow_signature(
+                IFLOW_USER_AGENT, session_id, timestamp_ms, api_key
+            )
+            headers[IFLOW_HEADER_TIMESTAMP] = str(timestamp_ms)
             headers[IFLOW_HEADER_SIGNATURE] = signature
 
         return headers
+
+    def _should_fallback_base(self, status_code: int) -> bool:
+        """Return True for block-like status codes worth base fallback."""
+        if status_code in {403, 406, 408, 423, 451, 502, 503, 504}:
+            return True
+        return 520 <= status_code <= 530
 
     def _extract_finish_reason_from_chunk(self, chunk: Dict[str, Any]) -> Optional[str]:
         """
@@ -945,11 +1035,18 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         # Create provider logger from transaction context
         file_logger = ProviderLogger(transaction_context)
+        request_ids = self._extract_iflow_ids(kwargs)
+        api_bases = self.get_api_base_candidates()
 
-        async def make_request():
+        class _NextBaseError(Exception):
+            def __init__(self, message: str, cause: Optional[Exception] = None):
+                super().__init__(message)
+                self.cause = cause
+
+        async def make_request(api_base: str, include_signature: bool = True):
             """Prepares and makes the actual API call."""
             # CRITICAL: get_api_details returns api_key, NOT access_token
-            api_base, api_key = await self.get_api_details(credential_path)
+            _, api_key = await self.get_api_details(credential_path)
 
             # Strip provider prefix from model name (e.g., "iflow/Qwen3-Coder-Plus" -> "Qwen3-Coder-Plus")
             model_name = model.split("/")[-1]
@@ -964,6 +1061,8 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             headers = self._build_iflow_headers(
                 api_key=api_key,
                 stream=bool(payload.get("stream")),
+                request_ids=request_ids,
+                include_signature=include_signature,
             )
 
             url = f"{api_base.rstrip('/')}/chat/completions"
@@ -980,7 +1079,13 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 timeout=TimeoutConfig.streaming(),
             )
 
-        async def stream_handler(response_stream, attempt=1):
+        async def stream_handler(
+            response_stream,
+            api_base: str,
+            attempt: int = 1,
+            include_signature: bool = True,
+            allow_unsigned_retry: bool = True,
+        ):
             """Handles the streaming response and converts chunks."""
             # Track state across chunks for finish_reason normalization
             stream_state: Dict[str, Any] = {}
@@ -1001,8 +1106,38 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 "iFlow returned 401. Forcing token refresh and retrying once."
                             )
                             await self._refresh_token(credential_path, force=True)
-                            retry_stream = await make_request()
-                            async for chunk in stream_handler(retry_stream, attempt=2):
+                            retry_stream = await make_request(
+                                api_base, include_signature=include_signature
+                            )
+                            async for chunk in stream_handler(
+                                retry_stream,
+                                api_base=api_base,
+                                attempt=2,
+                                include_signature=include_signature,
+                                allow_unsigned_retry=allow_unsigned_retry,
+                            ):
+                                yield chunk
+                            return
+
+                        # Handle 406: retry once without signature headers
+                        elif (
+                            response.status_code == 406
+                            and include_signature
+                            and allow_unsigned_retry
+                        ):
+                            lib_logger.warning(
+                                f"iFlow returned 406 on {api_base}, retrying once without signature headers"
+                            )
+                            retry_stream = await make_request(
+                                api_base, include_signature=False
+                            )
+                            async for chunk in stream_handler(
+                                retry_stream,
+                                api_base=api_base,
+                                attempt=attempt,
+                                include_signature=False,
+                                allow_unsigned_retry=False,
+                            ):
                                 yield chunk
                             return
 
@@ -1016,6 +1151,16 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 llm_provider="iflow",
                                 model=model,
                                 response=response,
+                            )
+
+                        elif self._should_fallback_base(response.status_code):
+                            raise _NextBaseError(
+                                f"iFlow HTTP {response.status_code} on {api_base}",
+                                cause=httpx.HTTPStatusError(
+                                    f"HTTP {response.status_code}: {error_text}",
+                                    request=response.request,
+                                    response=response,
+                                ),
                             )
 
                         # Handle other errors
@@ -1064,6 +1209,12 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
             except httpx.HTTPStatusError:
                 raise  # Re-raise HTTP errors we already handled
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                raise _NextBaseError(
+                    f"Network error on iFlow base {api_base}: {e}", cause=e
+                )
+            except _NextBaseError:
+                raise
             except Exception as e:
                 file_logger.log_error(f"Error during iFlow stream processing: {e}")
                 lib_logger.error(
@@ -1074,10 +1225,33 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         async def logging_stream_wrapper():
             """Wraps the stream to log the final reassembled response and cache reasoning."""
             openai_chunks = []
+            last_fallback_error: Optional[Exception] = None
             try:
-                async for chunk in stream_handler(await make_request()):
-                    openai_chunks.append(chunk)
-                    yield chunk
+                for idx, api_base in enumerate(api_bases):
+                    try:
+                        async for chunk in stream_handler(
+                            await make_request(api_base, include_signature=True),
+                            api_base=api_base,
+                            include_signature=True,
+                            allow_unsigned_retry=True,
+                        ):
+                            openai_chunks.append(chunk)
+                            yield chunk
+                        return
+                    except _NextBaseError as e:
+                        if openai_chunks:
+                            raise e.cause or e
+
+                        last_fallback_error = e.cause or e
+                        if idx + 1 < len(api_bases):
+                            lib_logger.warning(
+                                f"iFlow base {api_base} failed ({e}); trying fallback base"
+                            )
+                            continue
+                        raise last_fallback_error
+
+                if last_fallback_error:
+                    raise last_fallback_error
             finally:
                 if openai_chunks:
                     final_response = self._stream_to_completion_response(openai_chunks)
