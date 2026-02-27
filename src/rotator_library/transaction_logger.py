@@ -31,7 +31,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, TextIO, Union
 
 from .utils.paths import get_logs_dir
 
@@ -104,6 +104,7 @@ class TransactionLogger:
         "api_format",
         "_dir_available",
         "_context",
+        "_append_handles",
     )
 
     def __init__(
@@ -141,6 +142,7 @@ class TransactionLogger:
         self.log_dir: Optional[Path] = None
         self._dir_available = False
         self._context: Optional[TransactionContext] = None
+        self._append_handles: Dict[str, TextIO] = {}
 
         if not enabled:
             return
@@ -256,6 +258,7 @@ class TransactionLogger:
 
         # Also write metadata
         self._log_metadata(response_data, status_code, duration_ms)
+        self.close_append_files()
 
     def _log_metadata(
         self, response_data: Dict[str, Any], status_code: int, duration_ms: float
@@ -327,6 +330,7 @@ class TransactionLogger:
         """Write JSON data to a file in the log directory."""
         if not self.log_dir:
             return
+        self._close_append_handle(filename)
         try:
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -338,10 +342,50 @@ class TransactionLogger:
         if not self.log_dir:
             return
         try:
-            with open(self.log_dir / filename, "a", encoding="utf-8") as f:
-                f.write(text)
+            handle = self._get_append_handle(filename)
+            if handle:
+                handle.write(text)
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to append to {filename}: {e}")
+
+    def _get_append_handle(self, filename: str) -> Optional[TextIO]:
+        """Get (or lazily open) an append handle for a transaction log file."""
+        if not self.log_dir:
+            return None
+        handle = self._append_handles.get(filename)
+        if handle and not handle.closed:
+            return handle
+        handle = open(self.log_dir / filename, "a", encoding="utf-8")
+        self._append_handles[filename] = handle
+        return handle
+
+    def _close_append_handle(self, filename: str) -> None:
+        """Close and forget a single cached append handle by filename."""
+        handle = self._append_handles.pop(filename, None)
+        if not handle:
+            return
+        try:
+            handle.flush()
+            handle.close()
+        except Exception:
+            pass
+
+    def flush_append_files(self) -> None:
+        """Flush cached append handles to reduce data loss risk."""
+        for handle in list(self._append_handles.values()):
+            try:
+                if not handle.closed:
+                    handle.flush()
+            except Exception:
+                pass
+
+    def close_append_files(self) -> None:
+        """Flush and close all cached append handles."""
+        for filename in list(self._append_handles.keys()):
+            self._close_append_handle(filename)
+
+    def __del__(self) -> None:
+        self.close_append_files()
 
     @staticmethod
     def assemble_streaming_response(
@@ -485,7 +529,7 @@ class ProviderLogger:
     or add custom methods for provider-specific logging needs.
     """
 
-    __slots__ = ("enabled", "log_dir")
+    __slots__ = ("enabled", "log_dir", "_append_handles")
 
     def __init__(self, context: Optional[TransactionContext]):
         """
@@ -496,6 +540,7 @@ class ProviderLogger:
         """
         self.enabled = False
         self.log_dir: Optional[Path] = None
+        self._append_handles: Dict[str, TextIO] = {}
 
         if context is None or not context.enabled:
             return
@@ -535,6 +580,7 @@ class ProviderLogger:
             response_data: The complete response data
         """
         self._write_json("final_response.json", response_data)
+        self.close_append_files()
 
     def log_error(self, error_message: str) -> None:
         """
@@ -545,6 +591,7 @@ class ProviderLogger:
         """
         timestamp = datetime.utcnow().isoformat()
         self._append_text("error.log", f"[{timestamp}] {error_message}\n")
+        self.close_append_files()
 
     def log_extra(self, filename: str, data: Union[Dict[str, Any], str]) -> None:
         """
@@ -565,6 +612,7 @@ class ProviderLogger:
         """Write JSON data to a file in the log directory."""
         if not self.enabled or not self.log_dir:
             return
+        self._close_append_handle(filename)
         try:
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -576,10 +624,50 @@ class ProviderLogger:
         if not self.enabled or not self.log_dir:
             return
         try:
-            with open(self.log_dir / filename, "a", encoding="utf-8") as f:
-                f.write(text)
+            handle = self._get_append_handle(filename)
+            if handle:
+                handle.write(text)
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to append to {filename}: {e}")
+
+    def _get_append_handle(self, filename: str) -> Optional[TextIO]:
+        """Get (or lazily open) an append handle for a provider log file."""
+        if not self.log_dir:
+            return None
+        handle = self._append_handles.get(filename)
+        if handle and not handle.closed:
+            return handle
+        handle = open(self.log_dir / filename, "a", encoding="utf-8")
+        self._append_handles[filename] = handle
+        return handle
+
+    def _close_append_handle(self, filename: str) -> None:
+        """Close and forget a single cached append handle by filename."""
+        handle = self._append_handles.pop(filename, None)
+        if not handle:
+            return
+        try:
+            handle.flush()
+            handle.close()
+        except Exception:
+            pass
+
+    def flush_append_files(self) -> None:
+        """Flush cached append handles to reduce data loss risk."""
+        for handle in list(self._append_handles.values()):
+            try:
+                if not handle.closed:
+                    handle.flush()
+            except Exception:
+                pass
+
+    def close_append_files(self) -> None:
+        """Flush and close all cached append handles."""
+        for filename in list(self._append_handles.keys()):
+            self._close_append_handle(filename)
+
+    def __del__(self) -> None:
+        self.close_append_files()
 
 
 class AntigravityProviderLogger(ProviderLogger):
