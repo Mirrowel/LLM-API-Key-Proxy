@@ -9,9 +9,11 @@ import hashlib
 import json
 import time
 import os
+import re
+import threading
 import httpx
 import logging
-from typing import Union, AsyncGenerator, List, Dict, Any, Optional
+from typing import Union, AsyncGenerator, List, Dict, Any, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
 from .provider_cache import ProviderCache
@@ -60,6 +62,8 @@ SUPPORTED_PARAMS = {
     "temperature",
     "top_p",
     "max_tokens",
+    "max_new_tokens",
+    "max_completion_tokens",
     "stream",
     "tools",
     "tool_choice",
@@ -69,6 +73,10 @@ SUPPORTED_PARAMS = {
     "stop",
     "seed",
     "response_format",
+    "thinking",
+    "enable_thinking",
+    "chat_template_kwargs",
+    "reasoning_split",
 }
 
 IFLOW_USER_AGENT = "iFlow-Cli"
@@ -77,6 +85,19 @@ IFLOW_HEADER_CONVERSATION_ID = "conversation-id"
 IFLOW_HEADER_TIMESTAMP = "x-iflow-timestamp"
 IFLOW_HEADER_SIGNATURE = "x-iflow-signature"
 IFLOW_HEADER_API_KEY = "x-api-key"
+IFLOW_HEADER_TRACEPARENT = "traceparent"
+IFLOW_HEADER_X_BIZ_INFO = "x-biz-info"
+IFLOW_HEADER_EAGLEEYE_USERDATA = "EagleEye-UserData"
+IFLOW_HEADER_PRIORITY = "priority"
+
+TRACEPARENT_PATTERN = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+DEFAULT_IFLOW_STICKY_MODE = "auto"
+DEFAULT_IFLOW_STICKY_TTL_SECONDS = 86400
+DEFAULT_IFLOW_STICKY_MAX_ENTRIES = 10000
+
+
+def _is_truthy_env(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -129,6 +150,31 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             disk_ttl_seconds=86400,  # 24 hours on disk
             env_prefix="IFLOW_REASONING_CACHE",
         )
+
+        self._sticky_mode = os.getenv(
+            "IFLOW_STICKY_SESSION_MODE", DEFAULT_IFLOW_STICKY_MODE
+        ).strip().lower()
+        self._sticky_ttl_seconds = max(
+            60,
+            int(
+                os.getenv(
+                    "IFLOW_STICKY_SESSION_TTL_SECONDS",
+                    str(DEFAULT_IFLOW_STICKY_TTL_SECONDS),
+                )
+            ),
+        )
+        self._sticky_max_entries = max(
+            100,
+            int(
+                os.getenv(
+                    "IFLOW_STICKY_SESSION_MAX_ENTRIES",
+                    str(DEFAULT_IFLOW_STICKY_MAX_ENTRIES),
+                )
+            ),
+        )
+        self._sticky_lock = threading.Lock()
+        self._sticky_session_cache: Dict[str, Tuple[str, float]] = {}
+        self._sticky_conversation_cache: Dict[str, Tuple[str, float]] = {}
 
     def has_custom_logic(self) -> bool:
         return True
@@ -342,6 +388,45 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             False: Disable thinking explicitly
             None: No thinking params (passthrough - don't modify payload)
         """
+        # Check explicit iFlow thinking fields first
+        direct_thinking = kwargs.get("thinking")
+        if direct_thinking is not None:
+            if isinstance(direct_thinking, dict):
+                thinking_type = str(direct_thinking.get("type", "")).lower().strip()
+                if thinking_type == "disabled":
+                    return False
+                if thinking_type == "enabled":
+                    budget = direct_thinking.get("budget_tokens")
+                    if budget is None:
+                        return True
+                    try:
+                        return int(budget) != 0
+                    except Exception:
+                        return True
+            return bool(direct_thinking)
+
+        enable_thinking = kwargs.get("enable_thinking")
+        if enable_thinking is not None:
+            if isinstance(enable_thinking, str):
+                lowered = enable_thinking.lower().strip()
+                return lowered not in ("0", "false", "off", "none", "disabled")
+            return bool(enable_thinking)
+
+        chat_template_kwargs = kwargs.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict):
+            ctk_enable = chat_template_kwargs.get("enable_thinking")
+            if ctk_enable is not None:
+                if isinstance(ctk_enable, str):
+                    lowered = ctk_enable.lower().strip()
+                    return lowered not in (
+                        "0",
+                        "false",
+                        "off",
+                        "none",
+                        "disabled",
+                    )
+                return bool(ctk_enable)
+
         # Check reasoning_effort (OpenAI-style)
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort is not None:
@@ -571,6 +656,63 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         # Apply thinking mode configuration based on reasoning_effort
         payload = self._apply_thinking_config(payload, model_name, full_kwargs)
+        explicit_thinking = self._should_enable_thinking(full_kwargs)
+
+        # CLI-like defaults when absent
+        payload.setdefault("temperature", 1)
+        payload.setdefault("top_p", 0.95)
+
+        # Align token field naming with native iFlow CLI payload shape
+        if "max_new_tokens" not in payload:
+            if "max_completion_tokens" in payload:
+                payload["max_new_tokens"] = payload["max_completion_tokens"]
+            elif "max_tokens" in payload:
+                payload["max_new_tokens"] = payload["max_tokens"]
+            else:
+                payload["max_new_tokens"] = 32000
+
+        # Enable thinking by default unless caller explicitly disables it.
+        if "enable_thinking" not in payload:
+            if explicit_thinking is not None:
+                payload["enable_thinking"] = bool(explicit_thinking)
+            else:
+                payload["enable_thinking"] = _is_truthy_env(
+                    os.getenv("IFLOW_ENABLE_THINKING_BY_DEFAULT", "true")
+                )
+
+        if "thinking" not in payload:
+            payload["thinking"] = {
+                "type": "enabled" if bool(payload["enable_thinking"]) else "disabled"
+            }
+
+        model_lower = model_name.lower()
+        has_enable_thinking = "enable_thinking" in payload
+        enable_thinking_value = bool(payload.get("enable_thinking"))
+        if (
+            model_lower.startswith("glm-")
+            or model_lower in ENABLE_THINKING_MODELS
+            or model_lower in GLM_MODELS
+            or isinstance(payload.get("chat_template_kwargs"), dict)
+        ):
+            chat_template = payload.get("chat_template_kwargs")
+            if not isinstance(chat_template, dict):
+                chat_template = {}
+            if has_enable_thinking:
+                chat_template.setdefault("enable_thinking", enable_thinking_value)
+            if model_lower in GLM_MODELS:
+                if has_enable_thinking and chat_template.get("enable_thinking"):
+                    chat_template["clear_thinking"] = False
+                else:
+                    chat_template.pop("clear_thinking", None)
+            if chat_template:
+                payload["chat_template_kwargs"] = chat_template
+
+        if (
+            model_lower in REASONING_SPLIT_MODELS
+            and "reasoning_split" not in payload
+            and has_enable_thinking
+        ):
+            payload["reasoning_split"] = enable_thinking_value
 
         return payload
 
@@ -586,23 +728,261 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             api_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
+    def _sticky_enabled(self) -> bool:
+        return self._sticky_mode not in {"off", "false", "0", "none", "disabled"}
+
+    def _sticky_mode_value(self) -> str:
+        mode = self._sticky_mode
+        if mode in {"conversation", "conv"}:
+            return "conversation"
+        if mode in {"client", "user"}:
+            return "client"
+        return "auto"
+
+    def _prune_sticky_cache(self, cache: Dict[str, Tuple[str, float]], now: float) -> None:
+        expired = [
+            key for key, (_, ts) in cache.items() if now - ts > self._sticky_ttl_seconds
+        ]
+        for key in expired:
+            cache.pop(key, None)
+
+        overflow = len(cache) - self._sticky_max_entries
+        if overflow > 0:
+            oldest = sorted(cache.items(), key=lambda item: item[1][1])[:overflow]
+            for key, _ in oldest:
+                cache.pop(key, None)
+
+    def _get_sticky_value(
+        self,
+        cache: Dict[str, Tuple[str, float]],
+        keys: List[str],
+        now: float,
+    ) -> Optional[str]:
+        self._prune_sticky_cache(cache, now)
+        for key in keys:
+            cached = cache.get(key)
+            if cached is None:
+                continue
+            value, _ = cached
+            cache[key] = (value, now)
+            return value
+        return None
+
+    def _set_sticky_value(
+        self,
+        cache: Dict[str, Tuple[str, float]],
+        keys: List[str],
+        value: str,
+        now: float,
+    ) -> None:
+        self._prune_sticky_cache(cache, now)
+        for key in keys:
+            cache[key] = (value, now)
+
+    def _build_sticky_keys(
+        self,
+        sources: List[Dict[str, Any]],
+        messages: Any,
+        conversation_id: str,
+    ) -> List[str]:
+        mode = self._sticky_mode_value()
+
+        def _pick_case_insensitive(*keys: str) -> str:
+            for source in sources:
+                for key in keys:
+                    for source_key, value in source.items():
+                        if (
+                            isinstance(source_key, str)
+                            and source_key.lower() == key.lower()
+                            and value not in (None, "")
+                        ):
+                            return str(value)
+            return ""
+
+        keys: List[str] = []
+        if conversation_id:
+            conv_hash = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:32]
+            keys.append(f"conv:{conv_hash}")
+
+        client_identifier = _pick_case_insensitive(
+            "client_id",
+            "clientId",
+            "session_key",
+            "thread_id",
+            "threadId",
+            "user",
+            "user_id",
+            "userId",
+            "x-user-id",
+            "x-client-id",
+        )
+        if client_identifier:
+            client_hash = hashlib.sha256(client_identifier.encode("utf-8")).hexdigest()[:32]
+            keys.append(f"client:{client_hash}")
+
+        if _is_truthy_env(os.getenv("IFLOW_STICKY_HISTORY_FALLBACK", "false")) and isinstance(
+            messages, list
+        ):
+            conv_sig = self._get_conversation_signature(messages)
+            if conv_sig and conv_sig != "default":
+                keys.append(f"history:{conv_sig}")
+
+        if mode == "conversation":
+            keys = [k for k in keys if k.startswith("conv:") or k.startswith("history:")]
+        elif mode == "client":
+            keys = [k for k in keys if k.startswith("client:") or k.startswith("history:")]
+
+        return list(dict.fromkeys(keys))
+
     def _extract_iflow_ids(
         self, request_args: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
-        """Extract session/conversation IDs from request args."""
+        """Extract iFlow routing + tracing metadata from request args."""
         request_args = request_args or {}
 
+        metadata = request_args.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        extra_headers = request_args.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            extra_headers = {}
+
+        sources: List[Dict[str, Any]] = [request_args, metadata, extra_headers]
+
         def _pick(*keys: str) -> str:
-            for key in keys:
-                value = request_args.get(key)
-                if value:
-                    return str(value)
+            for source in sources:
+                for key in keys:
+                    for source_key, value in source.items():
+                        if (
+                            isinstance(source_key, str)
+                            and source_key.lower() == key.lower()
+                            and value not in (None, "")
+                        ):
+                            return str(value)
             return ""
 
-        generated_session_id = f"session-{uuid.uuid4()}"
-        session_id = _pick("session_id", "sessionId") or generated_session_id
-        conversation_id = _pick("conversation_id", "conversationId") or session_id
-        return {"session_id": session_id, "conversation_id": conversation_id}
+        def _generate_traceparent() -> str:
+            trace_id = uuid.uuid4().hex
+            span_id = uuid.uuid4().hex[:16]
+            return f"00-{trace_id}-{span_id}-01"
+
+        def _normalize_traceparent(raw_value: str) -> str:
+            lowered = raw_value.strip().lower()
+            if lowered and TRACEPARENT_PATTERN.match(lowered):
+                return lowered
+            return _generate_traceparent()
+
+        explicit_session_id = _pick(
+            "session_id",
+            "sessionId",
+            "litellm_session_id",
+            "session-id",
+            "x-litellm-session-id",
+        )
+        explicit_conversation_id = _pick(
+            "conversation_id",
+            "conversationId",
+            "litellm_conversation_id",
+            "conversation-id",
+            "x-litellm-conversation-id",
+        )
+
+        messages = request_args.get("messages")
+
+        conversation_id = explicit_conversation_id
+        conversation_keys = self._build_sticky_keys(
+            sources=sources,
+            messages=messages,
+            conversation_id=conversation_id,
+        )
+        if not conversation_id:
+            if self._sticky_enabled() and conversation_keys:
+                now = time.time()
+                with self._sticky_lock:
+                    cached_conversation = self._get_sticky_value(
+                        cache=self._sticky_conversation_cache,
+                        keys=conversation_keys,
+                        now=now,
+                    )
+                    if cached_conversation:
+                        conversation_id = cached_conversation
+                    else:
+                        conversation_id = str(uuid.uuid4())
+                        self._set_sticky_value(
+                            cache=self._sticky_conversation_cache,
+                            keys=conversation_keys,
+                            value=conversation_id,
+                            now=now,
+                        )
+            else:
+                conversation_id = str(uuid.uuid4())
+
+        session_keys = self._build_sticky_keys(
+            sources=sources,
+            messages=messages,
+            conversation_id=conversation_id,
+        )
+        session_id = explicit_session_id
+        if not session_id:
+            if self._sticky_enabled() and session_keys:
+                now = time.time()
+                with self._sticky_lock:
+                    cached_session = self._get_sticky_value(
+                        cache=self._sticky_session_cache,
+                        keys=session_keys,
+                        now=now,
+                    )
+                    if cached_session:
+                        session_id = cached_session
+                    else:
+                        session_id = f"session-{uuid.uuid4()}"
+                        self._set_sticky_value(
+                            cache=self._sticky_session_cache,
+                            keys=session_keys,
+                            value=session_id,
+                            now=now,
+                        )
+            else:
+                session_id = f"session-{uuid.uuid4()}"
+        elif self._sticky_enabled() and session_keys:
+            now = time.time()
+            with self._sticky_lock:
+                self._set_sticky_value(
+                    cache=self._sticky_session_cache,
+                    keys=session_keys,
+                    value=str(session_id),
+                    now=now,
+                )
+
+        if self._sticky_enabled() and conversation_keys and conversation_id:
+            now = time.time()
+            with self._sticky_lock:
+                self._set_sticky_value(
+                    cache=self._sticky_conversation_cache,
+                    keys=conversation_keys,
+                    value=str(conversation_id),
+                    now=now,
+                )
+
+        traceparent = _normalize_traceparent(
+            _pick("traceparent", IFLOW_HEADER_TRACEPARENT)
+        )
+
+        return {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "traceparent": traceparent,
+            "x_biz_info": _pick(
+                "iflow_x_biz_info", "x_biz_info", IFLOW_HEADER_X_BIZ_INFO
+            ),
+            "eagleeye_userdata": _pick(
+                "iflow_eagleeye_userdata",
+                "eagleeye_userdata",
+                IFLOW_HEADER_EAGLEEYE_USERDATA,
+            ),
+            "priority": _pick("iflow_priority", IFLOW_HEADER_PRIORITY),
+        }
 
     def _build_iflow_headers(
         self,
@@ -615,17 +995,34 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         request_ids = request_ids or self._extract_iflow_ids()
         session_id = request_ids["session_id"]
         conversation_id = request_ids["conversation_id"]
+        traceparent = request_ids.get("traceparent", "")
         timestamp_ms = int(time.time() * 1000)
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            IFLOW_HEADER_API_KEY: api_key,
             "Content-Type": "application/json",
             "User-Agent": IFLOW_USER_AGENT,
             IFLOW_HEADER_SESSION_ID: session_id,
             IFLOW_HEADER_CONVERSATION_ID: conversation_id,
-            "Accept": "text/event-stream" if stream else "application/json",
+            IFLOW_HEADER_TRACEPARENT: traceparent,
+            "Accept": "*/*",
+            "Accept-Language": "*",
+            "Sec-Fetch-Mode": "cors",
+            "Accept-Encoding": "br, gzip, deflate",
         }
+
+        if _is_truthy_env(os.getenv("IFLOW_SEND_X_API_KEY", "false")):
+            headers[IFLOW_HEADER_API_KEY] = api_key
+
+        if request_ids.get("x_biz_info"):
+            headers[IFLOW_HEADER_X_BIZ_INFO] = request_ids["x_biz_info"]
+        if request_ids.get("eagleeye_userdata"):
+            headers[IFLOW_HEADER_EAGLEEYE_USERDATA] = request_ids[
+                "eagleeye_userdata"
+            ]
+        if request_ids.get("priority"):
+            headers[IFLOW_HEADER_PRIORITY] = request_ids["priority"]
+
         if include_signature:
             signature = self._create_iflow_signature(
                 IFLOW_USER_AGENT, session_id, timestamp_ms, api_key
@@ -794,15 +1191,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             # Normalize choices for final chunk - MUST set finish_reason
             normalized_choices = normalize_choices(choices, force_final=True)
             # Build usage dict, handling empty usage gracefully
-            usage_dict = {
-                "prompt_tokens": usage_data.get("prompt_tokens", 0)
-                if usage_data
-                else 0,
-                "completion_tokens": usage_data.get("completion_tokens", 0)
-                if usage_data
-                else 0,
-                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
-            }
+            usage_dict = dict(usage_data) if isinstance(usage_data, dict) else {}
+            usage_dict.setdefault("prompt_tokens", 0)
+            usage_dict.setdefault("completion_tokens", 0)
+            usage_dict.setdefault("total_tokens", 0)
 
             # CRITICAL FIX: If usage is empty/all-zeros (e.g., MiniMax sends "usage": {}),
             # set placeholder non-zero values to ensure downstream processing
@@ -832,15 +1224,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         # Handle usage-only chunks (no choices)
         if has_usage and not choices:
-            usage_dict = {
-                "prompt_tokens": usage_data.get("prompt_tokens", 0)
-                if usage_data
-                else 0,
-                "completion_tokens": usage_data.get("completion_tokens", 0)
-                if usage_data
-                else 0,
-                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
-            }
+            usage_dict = dict(usage_data) if isinstance(usage_data, dict) else {}
+            usage_dict.setdefault("prompt_tokens", 0)
+            usage_dict.setdefault("completion_tokens", 0)
+            usage_dict.setdefault("total_tokens", 0)
             yield {
                 "choices": [],
                 "model": model_id,

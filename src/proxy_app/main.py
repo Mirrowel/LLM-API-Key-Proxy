@@ -886,6 +886,47 @@ async def streaming_response_wrapper(
             )
 
 
+def _inject_iflow_metadata_from_incoming_headers(
+    request_data: dict[str, Any],
+    request_headers: dict[str, str],
+) -> None:
+    """Propagate iFlow-specific routing headers into request metadata."""
+    model_name = str(request_data.get("model", ""))
+    provider_name = model_name.split("/", 1)[0].lower() if "/" in model_name else ""
+    if provider_name != "iflow":
+        return
+
+    metadata = request_data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    def _pick(*header_names: str) -> str:
+        for key in header_names:
+            value = request_headers.get(key)
+            if value:
+                return value
+        return ""
+
+    mappings = [
+        ("session_id", ("session-id", "x-litellm-session-id")),
+        ("conversation_id", ("conversation-id", "x-litellm-conversation-id")),
+        ("traceparent", ("traceparent",)),
+        ("iflow_x_biz_info", ("x-biz-info",)),
+        ("iflow_eagleeye_userdata", ("eagleeye-userdata",)),
+        ("iflow_priority", ("priority",)),
+    ]
+
+    for metadata_key, header_keys in mappings:
+        if metadata.get(metadata_key):
+            continue
+        picked = _pick(*header_keys)
+        if picked:
+            metadata[metadata_key] = picked
+
+    if metadata:
+        request_data["metadata"] = metadata
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -932,6 +973,11 @@ async def chat_completions(
         # If raw logging is enabled, capture the unmodified request data.
         if raw_logger:
             raw_logger.log_request(headers=request.headers, body=request_data)
+
+        _inject_iflow_metadata_from_incoming_headers(
+            request_data=request_data,
+            request_headers=dict(request.headers),
+        )
 
         # Extract and log specific reasoning parameters for monitoring.
         model = request_data.get("model")

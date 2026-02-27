@@ -43,6 +43,7 @@ IFLOW_ERROR_REDIRECT_URL = "https://iflow.cn/oauth/error"
 # Cookie-based authentication endpoint
 IFLOW_API_KEY_ENDPOINT = "https://platform.iflow.cn/api/openapi/apikey"
 IFLOW_DEFAULT_API_BASE = "https://apis.iflow.cn/v1"
+IFLOW_CLI_USER_AGENT = "iFlow-Cli"
 
 # Client credentials provided by iFlow
 IFLOW_CLIENT_ID = "10009311001"
@@ -638,11 +639,21 @@ class IFlowAuthBase:
         if not access_token or not access_token.strip():
             raise ValueError("Access token is empty")
 
-        url = f"{IFLOW_USER_INFO_ENDPOINT}?accessToken={access_token}"
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "*/*",
+            "accessToken": access_token,
+            "User-Agent": "node",
+            "Accept-Language": "*",
+            "Sec-Fetch-Mode": "cors",
+            "Accept-Encoding": "br, gzip, deflate",
+        }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(
+                IFLOW_USER_INFO_ENDPOINT,
+                headers=headers,
+                params={"accessToken": access_token},
+            )
             response.raise_for_status()
             result = response.json()
 
@@ -1291,7 +1302,24 @@ class IFlowAuthBase:
 
                 api_key = creds.get("api_key")
                 if not api_key:
-                    raise ValueError("Missing api_key in iFlow OAuth credentials")
+                    access_token = creds.get("access_token", "")
+                    if access_token:
+                        try:
+                            user_info = await self._fetch_user_info(access_token)
+                            api_key = user_info.get("api_key", "")
+                            if api_key:
+                                creds["api_key"] = api_key
+                                if credential_index is None:
+                                    await self._save_credentials(
+                                        credential_identifier,
+                                        creds,
+                                    )
+                        except Exception as e:
+                            lib_logger.warning(
+                                f"Failed to recover iFlow api_key from OAuth user info: {e}"
+                            )
+                    if not api_key:
+                        raise ValueError("Missing api_key in iFlow OAuth credentials")
         else:
             # Direct API key: use as-is
             lib_logger.debug("Using direct API key for iFlow")
