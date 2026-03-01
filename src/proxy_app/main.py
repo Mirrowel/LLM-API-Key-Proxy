@@ -132,6 +132,7 @@ with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
+    from rotator_library.core.errors import StreamBootstrapError
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
@@ -714,6 +715,29 @@ async def verify_anthropic_api_key(
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
+async def _prepend_first_stream_chunk(
+    first_chunk: str,
+    stream: AsyncGenerator[str, None],
+) -> AsyncGenerator[str, None]:
+    """Yield a primed first chunk, then continue streaming remaining chunks."""
+    yield first_chunk
+    async for chunk in stream:
+        yield chunk
+
+
+async def _prepare_streaming_response(
+    response_stream: AsyncGenerator[str, None],
+) -> tuple[Optional[str], AsyncGenerator[str, None]]:
+    """
+    Prime streaming generator to avoid committing HTTP 200 before bootstrap errors.
+
+    Returns:
+        (first_chunk, stream_with_first_chunk_replayed)
+    """
+    first_chunk = await response_stream.__anext__()
+    return first_chunk, _prepend_first_stream_chunk(first_chunk, response_stream)
+
+
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
@@ -961,29 +985,64 @@ async def chat_completions(
             response_generator = await client.acompletion(
                 request=request, **request_data
             )
+
+            try:
+                _, primed_stream = await _prepare_streaming_response(response_generator)
+            except StreamBootstrapError as e:
+                status_code = e.status_code if e.status_code else 500
+                headers = {}
+                if e.retry_after is not None and e.retry_after > 0:
+                    headers["Retry-After"] = str(int(e.retry_after))
+                logging.warning(
+                    "Streaming bootstrap failed before first chunk "
+                    f"(status={status_code}, retry_after={e.retry_after})"
+                )
+                if raw_logger:
+                    raw_logger.log_final_response(
+                        status_code=status_code,
+                        headers=headers or None,
+                        body=e.error_payload,
+                    )
+                return JSONResponse(
+                    content=e.error_payload,
+                    status_code=status_code,
+                    headers=headers or None,
+                )
+            except StopAsyncIteration:
+                empty_error = {
+                    "error": {
+                        "message": "Upstream stream ended before first chunk",
+                        "type": "proxy_internal_error",
+                    }
+                }
+                logging.error("Streaming bootstrap produced no chunks.")
+                if raw_logger:
+                    raw_logger.log_final_response(
+                        status_code=502,
+                        headers=None,
+                        body=empty_error,
+                    )
+                return JSONResponse(content=empty_error, status_code=502)
+
             return StreamingResponse(
                 streaming_response_wrapper(
-                    request, request_data, response_generator, raw_logger
+                    request, request_data, primed_stream, raw_logger
                 ),
                 media_type="text/event-stream",
             )
-        else:
-            response = await client.acompletion(request=request, **request_data)
-            if raw_logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
-                response_headers = (
-                    response.headers if hasattr(response, "headers") else None
-                )
-                status_code = (
-                    response.status_code if hasattr(response, "status_code") else 200
-                )
-                raw_logger.log_final_response(
-                    status_code=status_code,
-                    headers=response_headers,
-                    body=response.model_dump(),
-                )
-            return response
+
+        response = await client.acompletion(request=request, **request_data)
+        if raw_logger:
+            # Assuming response has status_code and headers attributes
+            # This might need adjustment based on the actual response object
+            response_headers = response.headers if hasattr(response, "headers") else None
+            status_code = response.status_code if hasattr(response, "status_code") else 200
+            raw_logger.log_final_response(
+                status_code=status_code,
+                headers=response_headers,
+                body=response.model_dump(),
+            )
+        return response
 
     except (
         litellm.InvalidRequestError,
