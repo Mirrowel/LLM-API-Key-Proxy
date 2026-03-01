@@ -12,6 +12,8 @@ Note: The actual implementations remain in error_handler.py for backward
 compatibility. This module provides a cleaner import path.
 """
 
+from typing import Any, Dict, Optional
+
 # Re-export everything from error_handler
 from ..error_handler import (
     # Exception classes
@@ -62,6 +64,32 @@ class StreamedAPIError(Exception):
         self.data = data
 
 
+class StreamBootstrapError(Exception):
+    """
+    Raised when a streaming request fails before the first chunk is emitted.
+
+    This lets the HTTP layer return a proper non-200 response (e.g. HTTP 429)
+    instead of committing an SSE stream and sending an in-band error payload.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 500,
+        error_payload: Optional[Dict[str, Any]] = None,
+        retry_after: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_payload = error_payload or {
+            "error": {
+                "message": message,
+                "type": "proxy_error",
+            }
+        }
+        self.retry_after = retry_after
+
+
 __all__ = [
     # Exception classes
     "NoAvailableKeysError",
@@ -70,6 +98,7 @@ __all__ = [
     "EmptyResponseError",
     "TransientQuotaError",
     "StreamedAPIError",
+    "StreamBootstrapError",
     # Error classification
     "ClassifiedError",
     "RequestErrorAccumulator",

@@ -44,6 +44,7 @@ from ..core.errors import (
     NoAvailableKeysError,
     PreRequestCallbackError,
     StreamedAPIError,
+    StreamBootstrapError,
     ClassifiedError,
     RequestErrorAccumulator,
     classify_error,
@@ -668,17 +669,17 @@ class RequestExecutor:
         """
         Execute streaming request with retry/rotation.
 
-        This is an async generator that yields SSE-formatted strings.
-
-        Args:
-            context: RequestContext with all request details
-
-        Yields:
-            SSE-formatted strings
+        Retries/rotation are only allowed before the first chunk is emitted.
+        After first-byte commit, failures are terminated in-band as SSE error + [DONE]
+        to avoid duplicated/corrupted client output.
         """
         provider = context.provider
         model = context.model
         deadline = context.deadline
+
+        stream_committed = False
+        prestream_status_codes: List[int] = []
+        prestream_retry_after_values: List[int] = []
 
         try:
             (
@@ -695,9 +696,11 @@ class RequestExecutor:
                     "type": "proxy_error",
                 }
             }
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+            raise StreamBootstrapError(
+                message=str(exc),
+                status_code=503,
+                error_payload=error_data,
+            ) from exc
 
         error_accumulator = RequestErrorAccumulator()
         error_accumulator.model = model
@@ -708,7 +711,6 @@ class RequestExecutor:
 
         try:
             while time.time() < deadline:
-                # Check for untried credentials
                 untried = [
                     c for c in credentials if c not in retry_state.tried_credentials
                 ]
@@ -718,13 +720,11 @@ class RequestExecutor:
                     )
                     break
 
-                # Wait for provider cooldown
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 await self._wait_for_cooldown(provider, deadline)
 
-                # Acquire credential using context manager
                 try:
                     availability = await usage_manager.get_availability_stats(
                         model, quota_group
@@ -750,38 +750,32 @@ class RequestExecutor:
                         )
 
                         try:
-                            # Prepare request kwargs
                             kwargs = await self._prepare_request_kwargs(
                                 provider, model, cred, context
                             )
 
-                            # Add stream options (but not for iflow - it returns 406)
                             if provider != "iflow":
                                 if "stream_options" not in kwargs:
                                     kwargs["stream_options"] = {}
                                 if "include_usage" not in kwargs["stream_options"]:
                                     kwargs["stream_options"]["include_usage"] = True
 
-                            # Get provider plugin
                             plugin = self._get_plugin_instance(provider)
                             skip_cost_calculation = bool(
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
                             )
 
-                            # Execute request with retries
                             for attempt in range(self._max_retries):
                                 try:
                                     lib_logger.info(
                                         f"Attempting stream with credential {mask_credential(cred)} "
                                         f"(Attempt {attempt + 1}/{self._max_retries})"
                                     )
-                                    # Pre-request callback
                                     await self._run_pre_request_callback(
                                         context, kwargs
                                     )
 
-                                    # Make the API call
                                     if plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = cred
                                         stream = await plugin.acompletion(
@@ -791,12 +785,9 @@ class RequestExecutor:
                                         kwargs["api_key"] = cred
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
-                                        # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
                                         stream = await litellm.acompletion(**kwargs)
 
-                                    # Hand off to streaming handler with cred_context
-                                    # The handler will call mark_success on completion
                                     base_stream = self._streaming_handler.wrap_stream(
                                         stream,
                                         cred,
@@ -811,7 +802,6 @@ class RequestExecutor:
                                         "Processing response."
                                     )
 
-                                    # Wrap with transaction logging if enabled
                                     if context.transaction_logger:
                                         async for (
                                             chunk
@@ -820,9 +810,21 @@ class RequestExecutor:
                                             context.transaction_logger,
                                             context.kwargs,
                                         ):
+                                            if not stream_committed:
+                                                stream_committed = True
+                                                lib_logger.info(
+                                                    "Stream committed after first chunk; "
+                                                    "disabling further retry/rotation for this request"
+                                                )
                                             yield chunk
                                     else:
                                         async for chunk in base_stream:
+                                            if not stream_committed:
+                                                stream_committed = True
+                                                lib_logger.info(
+                                                    "Stream committed after first chunk; "
+                                                    "disabling further retry/rotation for this request"
+                                                )
                                             yield chunk
                                     return
 
@@ -840,8 +842,23 @@ class RequestExecutor:
                                     error_accumulator.record_error(
                                         cred, classified, str(original)[:150]
                                     )
+                                    self._record_prestream_failure(
+                                        stream_committed,
+                                        classified,
+                                        prestream_status_codes,
+                                        prestream_retry_after_values,
+                                    )
 
-                                    # Track consecutive quota failures
+                                    if stream_committed:
+                                        lib_logger.warning(
+                                            "Streaming error after first chunk; ending stream without retry/rotation"
+                                        )
+                                        yield self._build_stream_error_chunk(
+                                            classified, str(original)
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                        return
+
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
                                         if retry_state.consecutive_quota_failures >= 3:
@@ -856,9 +873,12 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
+                                            raise self._build_stream_bootstrap_error(
+                                                error_data,
+                                                prestream_status_codes,
+                                                prestream_retry_after_values,
+                                                original,
+                                            )
                                     else:
                                         retry_state.reset_quota_failures()
 
@@ -867,7 +887,7 @@ class RequestExecutor:
                                         raise
 
                                     cred_context.mark_failure(classified)
-                                    break  # Rotate
+                                    break
 
                                 except (RateLimitError, httpx.HTTPStatusError) as e:
                                     last_exception = e
@@ -882,8 +902,23 @@ class RequestExecutor:
                                     error_accumulator.record_error(
                                         cred, classified, str(e)[:150]
                                     )
+                                    self._record_prestream_failure(
+                                        stream_committed,
+                                        classified,
+                                        prestream_status_codes,
+                                        prestream_retry_after_values,
+                                    )
 
-                                    # Track consecutive quota failures
+                                    if stream_committed:
+                                        lib_logger.warning(
+                                            "Rate-limit/server status error after first chunk; ending stream without retry/rotation"
+                                        )
+                                        yield self._build_stream_error_chunk(
+                                            classified, str(e)
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                        return
+
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
                                         if retry_state.consecutive_quota_failures >= 3:
@@ -898,9 +933,12 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
+                                            raise self._build_stream_bootstrap_error(
+                                                error_data,
+                                                prestream_status_codes,
+                                                prestream_retry_after_values,
+                                                e,
+                                            )
                                     else:
                                         retry_state.reset_quota_failures()
 
@@ -908,7 +946,6 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
-                                    # Check for small cooldown - retry same key instead of rotating
                                     small_cooldown_threshold = int(
                                         os.environ.get(
                                             "SMALL_COOLDOWN_RETRY_THRESHOLD",
@@ -917,9 +954,7 @@ class RequestExecutor:
                                     )
                                     if (
                                         classified.retry_after is not None
-                                        and 0
-                                        < classified.retry_after
-                                        < small_cooldown_threshold
+                                        and 0 < classified.retry_after < small_cooldown_threshold
                                         and attempt < self._max_retries - 1
                                     ):
                                         remaining = deadline - time.time()
@@ -929,10 +964,10 @@ class RequestExecutor:
                                                 f"(small cooldown {classified.retry_after}s < {small_cooldown_threshold}s threshold)"
                                             )
                                             await asyncio.sleep(classified.retry_after)
-                                            continue  # Retry same key
+                                            continue
 
                                     cred_context.mark_failure(classified)
-                                    break  # Rotate
+                                    break
 
                                 except (
                                     APIConnectionError,
@@ -948,24 +983,39 @@ class RequestExecutor:
                                         error=e,
                                         request_headers=request_headers,
                                     )
+                                    self._record_prestream_failure(
+                                        stream_committed,
+                                        classified,
+                                        prestream_status_codes,
+                                        prestream_retry_after_values,
+                                    )
+
+                                    if stream_committed:
+                                        lib_logger.warning(
+                                            "Upstream connection/server error after first chunk; ending stream without retry/rotation"
+                                        )
+                                        yield self._build_stream_error_chunk(
+                                            classified, str(e)
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                        return
 
                                     if attempt >= self._max_retries - 1:
                                         error_accumulator.record_error(
                                             cred, classified, str(e)[:150]
                                         )
                                         cred_context.mark_failure(classified)
-                                        break  # Rotate
+                                        break
 
-                                    # Calculate wait time
                                     wait_time = classified.retry_after or (
                                         2**attempt
                                     ) + random.uniform(0, 1)
                                     remaining = deadline - time.time()
                                     if wait_time > remaining:
-                                        break  # No time to wait
+                                        break
 
                                     await asyncio.sleep(wait_time)
-                                    continue  # Retry
+                                    continue
 
                                 except Exception as e:
                                     last_exception = e
@@ -980,40 +1030,167 @@ class RequestExecutor:
                                     error_accumulator.record_error(
                                         cred, classified, str(e)[:150]
                                     )
+                                    self._record_prestream_failure(
+                                        stream_committed,
+                                        classified,
+                                        prestream_status_codes,
+                                        prestream_retry_after_values,
+                                    )
+
+                                    if stream_committed:
+                                        lib_logger.warning(
+                                            "Unhandled stream exception after first chunk; ending stream without retry/rotation"
+                                        )
+                                        yield self._build_stream_error_chunk(
+                                            classified, str(e)
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                        return
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
 
                                     cred_context.mark_failure(classified)
-                                    break  # Rotate
+                                    break
 
                         except PreRequestCallbackError:
                             raise
                         except Exception:
-                            # Let context manager handle cleanup
                             pass
 
                 except NoAvailableKeysError:
                     break
 
-            # All credentials exhausted or timeout
             error_accumulator.timeout_occurred = time.time() >= deadline
+
+            if stream_committed:
+                error_data = error_accumulator.build_client_error_response()
+                yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            if last_exception and not error_accumulator.has_errors():
+                raise last_exception
+
             error_data = error_accumulator.build_client_error_response()
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            raise self._build_stream_bootstrap_error(
+                error_data,
+                prestream_status_codes,
+                prestream_retry_after_values,
+                last_exception,
+            )
 
         except NoAvailableKeysError as e:
             lib_logger.error(f"No keys available: {e}")
             error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            if stream_committed:
+                yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            raise StreamBootstrapError(
+                message=str(e),
+                status_code=503,
+                error_payload=error_data,
+            ) from e
+
+        except StreamBootstrapError:
+            raise
 
         except Exception as e:
             lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
-            error_data = {"error": {"message": str(e), "type": "proxy_internal_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            error_data = {
+                "error": {
+                    "message": str(e),
+                    "type": "proxy_internal_error",
+                }
+            }
+            if stream_committed:
+                yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            raise StreamBootstrapError(
+                message=str(e),
+                status_code=500,
+                error_payload=error_data,
+            ) from e
+
+    def _record_prestream_failure(
+        self,
+        stream_committed: bool,
+        classified: ClassifiedError,
+        prestream_status_codes: List[int],
+        prestream_retry_after_values: List[int],
+    ) -> None:
+        """Track pre-stream failure metadata for final HTTP status selection."""
+        if stream_committed:
+            return
+
+        if classified.status_code is not None:
+            prestream_status_codes.append(classified.status_code)
+        if classified.retry_after is not None and classified.retry_after > 0:
+            prestream_retry_after_values.append(classified.retry_after)
+
+    def _build_stream_error_chunk(
+        self,
+        classified: ClassifiedError,
+        fallback_message: str,
+    ) -> str:
+        """Build a terminal SSE error chunk for post-commit stream failures."""
+        error_payload: Dict[str, Any] = {
+            "error": {
+                "message": fallback_message,
+                "type": "stream_error",
+                "error_type": classified.error_type,
+                "code": classified.status_code,
+            }
+        }
+        if classified.retry_after is not None and classified.retry_after > 0:
+            error_payload["error"]["retry_after"] = classified.retry_after
+        return f"data: {json.dumps(error_payload)}\n\n"
+
+    def _build_stream_bootstrap_error(
+        self,
+        error_payload: Dict[str, Any],
+        prestream_status_codes: List[int],
+        prestream_retry_after_values: List[int],
+        last_exception: Optional[Exception],
+    ) -> StreamBootstrapError:
+        """Build a structured bootstrap error for HTTP-layer mapping."""
+        status_code = 500
+
+        if prestream_status_codes:
+            if all(code == 429 for code in prestream_status_codes):
+                status_code = 429
+            else:
+                status_code = prestream_status_codes[-1]
+        elif last_exception is not None:
+            classified_last = classify_error(last_exception)
+            if classified_last.status_code is not None:
+                status_code = classified_last.status_code
+
+        retry_after = (
+            min(prestream_retry_after_values)
+            if prestream_retry_after_values
+            else None
+        )
+
+        message = (
+            error_payload.get("error", {}).get("message")
+            or "Streaming request failed before first chunk"
+        )
+
+        if status_code == 429:
+            lib_logger.warning(
+                "Terminal pre-stream 429 encountered; returning HTTP 429 instead of SSE error stream"
+            )
+
+        return StreamBootstrapError(
+            message=message,
+            status_code=status_code,
+            error_payload=error_payload,
+            retry_after=retry_after,
+        )
 
     def _apply_litellm_provider_params(
         self, provider: str, kwargs: Dict[str, Any]
