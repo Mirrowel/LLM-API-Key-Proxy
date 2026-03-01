@@ -711,6 +711,7 @@ class RequestExecutor:
 
         try:
             while time.time() < deadline:
+                # Check for untried credentials
                 untried = [
                     c for c in credentials if c not in retry_state.tried_credentials
                 ]
@@ -720,11 +721,13 @@ class RequestExecutor:
                     )
                     break
 
+                # Wait for provider cooldown
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
                 await self._wait_for_cooldown(provider, deadline)
 
+                # Acquire credential using context manager
                 try:
                     availability = await usage_manager.get_availability_stats(
                         model, quota_group
@@ -750,32 +753,38 @@ class RequestExecutor:
                         )
 
                         try:
+                            # Prepare request kwargs
                             kwargs = await self._prepare_request_kwargs(
                                 provider, model, cred, context
                             )
 
+                            # Add stream options (but not for iflow - it returns 406)
                             if provider != "iflow":
                                 if "stream_options" not in kwargs:
                                     kwargs["stream_options"] = {}
                                 if "include_usage" not in kwargs["stream_options"]:
                                     kwargs["stream_options"]["include_usage"] = True
 
+                            # Get provider plugin
                             plugin = self._get_plugin_instance(provider)
                             skip_cost_calculation = bool(
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
                             )
 
+                            # Execute request with retries
                             for attempt in range(self._max_retries):
                                 try:
                                     lib_logger.info(
                                         f"Attempting stream with credential {mask_credential(cred)} "
                                         f"(Attempt {attempt + 1}/{self._max_retries})"
                                     )
+                                    # Pre-request callback
                                     await self._run_pre_request_callback(
                                         context, kwargs
                                     )
 
+                                    # Make the API call
                                     if plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = cred
                                         stream = await plugin.acompletion(
@@ -785,9 +794,12 @@ class RequestExecutor:
                                         kwargs["api_key"] = cred
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
+                                        # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
                                         stream = await litellm.acompletion(**kwargs)
 
+                                    # Hand off to streaming handler with cred_context
+                                    # The handler will call mark_success on completion
                                     base_stream = self._streaming_handler.wrap_stream(
                                         stream,
                                         cred,
@@ -802,6 +814,7 @@ class RequestExecutor:
                                         "Processing response."
                                     )
 
+                                    # Wrap with transaction logging if enabled
                                     if context.transaction_logger:
                                         async for (
                                             chunk
@@ -859,6 +872,7 @@ class RequestExecutor:
                                         yield "data: [DONE]\n\n"
                                         return
 
+                                    # Track consecutive quota failures
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
                                         if retry_state.consecutive_quota_failures >= 3:
@@ -919,6 +933,7 @@ class RequestExecutor:
                                         yield "data: [DONE]\n\n"
                                         return
 
+                                    # Track consecutive quota failures
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
                                         if retry_state.consecutive_quota_failures >= 3:
@@ -946,6 +961,7 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
+                                    # Check for small cooldown - retry same key instead of rotating
                                     small_cooldown_threshold = int(
                                         os.environ.get(
                                             "SMALL_COOLDOWN_RETRY_THRESHOLD",
@@ -1007,6 +1023,7 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         break
 
+                                    # Calculate wait time
                                     wait_time = classified.retry_after or (
                                         2**attempt
                                     ) + random.uniform(0, 1)
@@ -1054,6 +1071,7 @@ class RequestExecutor:
                                     cred_context.mark_failure(classified)
                                     break
 
+                        # Let context manager handle cleanup
                         except PreRequestCallbackError:
                             raise
                         except Exception:
@@ -1062,6 +1080,7 @@ class RequestExecutor:
                 except NoAvailableKeysError:
                     break
 
+            # All credentials exhausted or timeout
             error_accumulator.timeout_occurred = time.time() >= deadline
 
             if stream_committed:
