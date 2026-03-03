@@ -24,6 +24,11 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_ENDPOINT_FALLBACKS,
+    GEMINI_CLI_UA_VERSION,
+    GEMINI_CLI_NODE_CLIENT_VERSION,
+    GEMINI_CLI_GL_NODE_VERSION,
+    GEMINI_CLI_PLATFORM_ARCH,
+    GEMINI_CLI_ACCEPT_ENCODING,
     # Tier utilities
     TIER_PRIORITIES,
     DEFAULT_TIER_PRIORITY,
@@ -512,51 +517,52 @@ class GeminiCliProvider(
         """
         Build request headers matching native gemini-cli client.
 
-        For the OAuth/Code Assist path, native gemini-cli only sends:
-        - Content-Type: application/json (handled by httpx)
-        - Authorization: Bearer <token> (handled by auth_header)
-        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch})
+        Header behavior changed across CLI versions:
 
-        Headers NOT sent by native CLI (confirmed via explore agent analysis):
-        - X-Goog-Api-Client: Not used in Code Assist path (only in SDK/API key path)
-        - Client-Metadata: Not sent as HTTP header (only in request body for management endpoints)
-        - X-Goog-User-Project: Only used in MCP path, causes 403 errors in Code Assist
+        - Older observations (v0.28.x OAuth/Code Assist path) showed a minimal
+          set where only User-Agent was explicitly present.
+          References:
+          - gemini-cli/packages/core/src/code_assist/server.ts
+          - gemini-cli/packages/core/src/core/contentGenerator.ts
 
-        Source: gemini-cli/packages/core/src/code_assist/server.ts:332
-        Source: gemini-cli/packages/core/src/core/contentGenerator.ts:129
+        - Newer captures (v0.31.x) include additional fingerprint headers for
+          content generation calls. We intentionally mirror that profile here
+          to match current request wire format.
+
+        For streamGenerateContent/countTokens requests we send:
+        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch}) google-api-nodejs-client/${version}
+        - X-Goog-Api-Client: gl-node/${version}
+        - Accept: */*
+        - Accept-Encoding: gzip, deflate, br
+        - Connection: close
+
+        Note: Client-Metadata is still sent in request bodies for management
+        endpoints (loadCodeAssist/onboardUser/etc.), not as a header for
+        generateContent/countTokens.
         """
         model_name = model.split("/")[-1].replace(":thinking", "")
 
-        # Hardcoded to Windows x64 platform (matching common development environment)
-        # Native format: GeminiCLI/${version}/${model} (${platform}; ${arch})
-        user_agent = f"GeminiCLI/0.28.0/{model_name} (win32; x64)"
+        user_agent = (
+            f"GeminiCLI/{GEMINI_CLI_UA_VERSION}/{model_name} "
+            f"({GEMINI_CLI_PLATFORM_ARCH}) "
+            f"google-api-nodejs-client/{GEMINI_CLI_NODE_CLIENT_VERSION}"
+        )
 
-        # =========================================================================
-        # COMMENTED OUT HEADERS - Not sent by native gemini-cli for Code Assist path
-        # Keeping these for reference as they worked well for SDK mimicry.
-        # Uncomment if rate limiting issues arise and you want to try SDK fingerprinting.
-        # =========================================================================
-
-        # X-Goog-Api-Client: Mimics @google/genai SDK but native CLI doesn't send this
-        # for OAuth/Code Assist path (only set when using API key authentication)
-        # x_goog_api_client = "gl-node/22.17.0 gdcl/1.30.0"
-
-        # Client-Metadata: Native CLI sends this in REQUEST BODY for management endpoints
-        # (loadCodeAssist, onboardUser, listExperiments, recordCodeAssistMetrics)
-        # but NOT as an HTTP header for generateContent requests.
-        # client_metadata = (
-        #     "ideType=IDE_UNSPECIFIED,"
-        #     "pluginType=GEMINI,"
-        #     "ideVersion=0.28.0,"
-        #     "platform=WINDOWS_AMD64,"
-        #     "updateChannel=stable"
-        # )
+        # Historical/debug reference values that were previously used when
+        # mimicking older/minimal request fingerprints:
+        # - X-Goog-Api-Client: "gl-node/22.17.0 gdcl/1.30.0"
+        # - Client-Metadata header (not used here for content generation):
+        #   "ideType=IDE_UNSPECIFIED,pluginType=GEMINI,ideVersion=0.28.0,"
+        #   "platform=WINDOWS_AMD64,updateChannel=stable"
+        # These notes are intentionally preserved for future regression
+        # analysis when upstream Gemini CLI behavior changes.
 
         return {
             "User-Agent": user_agent,
-            # "X-Goog-Api-Client": x_goog_api_client,  # Not sent by native CLI
-            # "Client-Metadata": client_metadata,      # Not sent as header by native CLI
-            # "Accept": "application/json",            # Not explicitly sent by native CLI
+            "X-Goog-Api-Client": f"gl-node/{GEMINI_CLI_GL_NODE_VERSION}",
+            "Accept": "*/*",
+            "Accept-Encoding": GEMINI_CLI_ACCEPT_ENCODING,
+            "Connection": "close",
         }
 
     def _get_available_models(self) -> List[str]:

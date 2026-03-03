@@ -15,6 +15,11 @@ import httpx
 from .google_oauth_base import GoogleOAuthBase
 from .utilities.gemini_shared_utils import (
     CODE_ASSIST_ENDPOINT,
+    GEMINI_CLI_UA_VERSION,
+    GEMINI_CLI_NODE_CLIENT_VERSION,
+    GEMINI_CLI_GL_NODE_VERSION,
+    GEMINI_CLI_PLATFORM_ARCH,
+    GEMINI_CLI_ACCEPT_ENCODING,
     # Tier utilities
     normalize_tier_name,
     is_free_tier,
@@ -35,32 +40,30 @@ lib_logger = logging.getLogger("rotator_library")
 
 # Headers for Gemini CLI auth/discovery calls (loadCodeAssist, onboardUser, etc.)
 #
-# For OAuth/Code Assist path, native gemini-cli only sends:
-# - Content-Type: application/json
-# - Authorization: Bearer <token>
-# - User-Agent: GeminiCLI/${version} (${platform}; ${arch})
+# Historical note:
+# - Early v0.28.x observations showed a minimal OAuth/Code Assist header set
+#   (primarily Authorization + User-Agent).
+# - Recent v0.31.x captures include richer fingerprint headers on content calls
+#   (X-Goog-Api-Client, Accept-Encoding with br, etc.).
 #
-# Headers NOT sent by native CLI (confirmed via explore agent analysis of server.ts):
-# - X-Goog-Api-Client: Not used in Code Assist path
-# - Client-Metadata: Sent in REQUEST BODY for these endpoints, not as HTTP header
+# We keep auth/discovery headers aligned with the same version constants used by
+# generateContent/countTokens to avoid drift between call paths.
 #
-# Note: The commented headers below previously worked well for SDK fingerprinting.
-# Uncomment if you want to try SDK mimicry for potential rate limit benefits.
+# Client-Metadata remains payload metadata for management endpoints rather than a
+# standard HTTP header in this provider's flow.
 #
-# Source: gemini-cli/packages/core/src/code_assist/server.ts:284-290
+# Upstream reference locations used during prior analysis:
+# - gemini-cli/packages/core/src/code_assist/server.ts
+# - gemini-cli/packages/core/src/core/contentGenerator.ts
 GEMINI_CLI_AUTH_HEADERS = {
-    "User-Agent": "GeminiCLI/0.28.0 (win32; x64)",
-    # -------------------------------------------------------------------------
-    # COMMENTED OUT - Not sent by native gemini-cli for OAuth/Code Assist path
-    # -------------------------------------------------------------------------
-    # "X-Goog-Api-Client": "gl-node/22.17.0 gdcl/1.30.0",  # SDK mimicry - not used by native CLI
-    # "Client-Metadata": (                                  # Sent in body, not as header
-    #     "ideType=IDE_UNSPECIFIED,"
-    #     "pluginType=GEMINI,"
-    #     "ideVersion=0.28.0,"
-    #     "platform=WINDOWS_AMD64,"
-    #     "updateChannel=stable"
-    # ),
+    "User-Agent": (
+        f"GeminiCLI/{GEMINI_CLI_UA_VERSION} ({GEMINI_CLI_PLATFORM_ARCH}) "
+        f"google-api-nodejs-client/{GEMINI_CLI_NODE_CLIENT_VERSION}"
+    ),
+    "X-Goog-Api-Client": f"gl-node/{GEMINI_CLI_GL_NODE_VERSION}",
+    "Accept": "*/*",
+    "Accept-Encoding": GEMINI_CLI_ACCEPT_ENCODING,
+    "Connection": "close",
 }
 
 

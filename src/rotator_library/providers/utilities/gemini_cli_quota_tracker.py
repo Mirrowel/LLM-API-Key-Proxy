@@ -36,7 +36,14 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import httpx
 
 from .base_quota_tracker import BaseQuotaTracker
-from .gemini_shared_utils import CODE_ASSIST_ENDPOINT
+from .gemini_shared_utils import (
+    CODE_ASSIST_ENDPOINT,
+    GEMINI_CLI_UA_VERSION,
+    GEMINI_CLI_NODE_CLIENT_VERSION,
+    GEMINI_CLI_GL_NODE_VERSION,
+    GEMINI_CLI_PLATFORM_ARCH,
+    GEMINI_CLI_ACCEPT_ENCODING,
+)
 
 if TYPE_CHECKING:
     from ...usage import UsageManager
@@ -135,10 +142,15 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
     def _get_gemini_cli_headers(self) -> Dict[str, str]:
         """Get standard headers for Gemini CLI API requests."""
         return {
-            "User-Agent": "google-api-nodejs-client/9.15.1",
-            "X-Goog-Api-Client": "gl-node/22.17.0",
+            "User-Agent": (
+                f"GeminiCLI/{GEMINI_CLI_UA_VERSION} ({GEMINI_CLI_PLATFORM_ARCH}) "
+                f"google-api-nodejs-client/{GEMINI_CLI_NODE_CLIENT_VERSION}"
+            ),
+            "X-Goog-Api-Client": f"gl-node/{GEMINI_CLI_GL_NODE_VERSION}",
             "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-            "Accept": "application/json",
+            "Accept": "*/*",
+            "Accept-Encoding": GEMINI_CLI_ACCEPT_ENCODING,
+            "Connection": "close",
             "Content-Type": "application/json",
         }
 

@@ -39,6 +39,22 @@ def env_int(key: str, default: int) -> int:
 # API ENDPOINTS
 # =============================================================================
 
+# Gemini CLI fingerprint defaults (can be overridden via environment variables)
+#
+# These defaults track the observed Gemini CLI request profile used by the
+# provider (currently aligned to v0.31.x captures).
+# Keeping them centralized avoids version drift across:
+# - generateContent/countTokens requests
+# - auth/discovery requests
+# - quota API helper requests
+GEMINI_CLI_UA_VERSION = os.getenv("GEMINI_CLI_UA_VERSION", "0.31.0")
+GEMINI_CLI_NODE_CLIENT_VERSION = os.getenv("GEMINI_CLI_NODE_CLIENT_VERSION", "10.6.1")
+GEMINI_CLI_GL_NODE_VERSION = os.getenv("GEMINI_CLI_GL_NODE_VERSION", "22.17.1")
+GEMINI_CLI_PLATFORM_ARCH = os.getenv("GEMINI_CLI_PLATFORM_ARCH", "win32; x64")
+GEMINI_CLI_ACCEPT_ENCODING = os.getenv(
+    "GEMINI_CLI_ACCEPT_ENCODING", "gzip, deflate, br"
+)
+
 # Google Code Assist API endpoint (used by Gemini CLI and Antigravity providers)
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
