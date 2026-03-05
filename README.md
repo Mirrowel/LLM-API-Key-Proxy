@@ -775,6 +775,76 @@ For platforms without file persistence (Railway, Render, Vercel):
 </details>
 
 <details>
+<summary><b>Remote Host Deployment (SSH Port Forwarding)</b></summary>
+
+When the proxy is running on a remote host (VPS, cloud server, etc.), OAuth token authentication requires SSH port forwarding. This is because the OAuth callback URL is sent to `localhost`, which on the remote server points to the server itself, not your local machine.
+
+**The Problem:**
+
+- You run the proxy on a remote VPS
+- You try to add OAuth credentials using the credential tool
+- The OAuth provider redirects to `http://localhost:PORT/callback`
+- On the VPS, `localhost` refers to the VPS, not your local machine
+- The callback fails because your browser can't reach the VPS's localhost
+
+**The Solution: SSH Port Forwarding**
+
+Use SSH to tunnel the OAuth callback ports from the VPS back to your local machine. You only need to do this when adding OAuth credentials.
+
+**Single Provider Examples:**
+
+```bash
+# Gemini CLI (port 8085)
+ssh -L 8085:localhost:8085 user@your-vps-ip
+
+# Antigravity (port 51121)
+ssh -L 51121:localhost:51121 user@your-vps-ip
+
+# iFlow (port 11451)
+ssh -L 11451:localhost:11451 user@your-vps-ip
+```
+
+**Multiple Providers at Once:**
+
+```bash
+# Forward all three OAuth ports simultaneously
+ssh -L 8085:localhost:8085 -L 51121:localhost:51121 -L 11451:localhost:11451 user@your-vps-ip
+```
+
+**Complete Workflow:**
+
+1. **Establish SSH tunnel** (keep this connection open):
+   ```bash
+   ssh -L 8085:localhost:8085 -L 51121:localhost:51121 user@your-vps-ip
+   ```
+
+2. **Run the credential tool on the VPS** (in a separate terminal or SSH session):
+   ```bash
+   ssh user@your-vps-ip
+   cd /path/to/LLM-API-Key-Proxy
+   python -m rotator_library.credential_tool
+   ```
+
+3. **Complete OAuth authentication**:
+   - The credential tool will open a browser window
+   - Because of the SSH tunnel, the callback will be forwarded to your local machine
+   - Complete the authentication flow as normal
+
+4. **Close SSH tunnel** after authentication is complete
+
+**Alternative: Local Authentication + Deploy Credentials**
+
+If you prefer not to use SSH port forwarding:
+
+1. Complete OAuth flows locally on your machine
+2. Export credentials to environment variables using the credential tool
+3. Deploy the `.env` file to your remote server
+
+See the "Stateless Deployment" section above for details on exporting credentials.
+
+</details>
+
+<details>
 <summary><b>OAuth Callback Port Configuration</b></summary>
 
 Customize OAuth callback ports if defaults conflict:
@@ -930,10 +1000,12 @@ For OAuth providers (Antigravity, Gemini CLI, etc.), you must authenticate local
 
 ```bash
 # Forward callback ports through SSH
-ssh -L 51121:localhost:51121 -L 8085:localhost:8085 user@your-vps
+ssh -L 8085:localhost:8085 -L 51121:localhost:51121 -L 11451:localhost:11451 user@your-vps-ip
 
-# Then run credential tool on the VPS
+# Then run credential tool on the VPS in a separate terminal
 ```
+
+This creates a tunnel that forwards OAuth callback ports from the VPS to your local machine, allowing the browser-based authentication to complete successfully.
 
 **Systemd Service:**
 
@@ -953,6 +1025,7 @@ WantedBy=multi-user.target
 ```
 
 See [VPS Deployment](Deployment%20guide.md#appendix-deploying-to-a-custom-vps) for complete guide.
+See the [Remote Host Deployment (SSH Port Forwarding)](#remote-host-deployment-ssh-port-forwarding) section above for detailed OAuth setup instructions.
 
 </details>
 
@@ -967,6 +1040,7 @@ See [VPS Deployment](Deployment%20guide.md#appendix-deploying-to-a-custom-vps) f
 | All keys on cooldown | All keys failed recently; check `logs/detailed_logs/` for upstream errors |
 | Model not found | Verify format is `provider/model_name` (e.g., `gemini/gemini-2.5-flash`) |
 | OAuth callback failed | Ensure callback port (8085, 51121, 11451) isn't blocked by firewall |
+| OAuth callback failed on remote VPS | Use SSH port forwarding: `ssh -L 8085:localhost:8085 -L 51121:localhost:51121 user@your-vps-ip` |
 | Streaming hangs | Increase `TIMEOUT_READ_STREAMING`; check provider status |
 
 **Detailed Logs:**

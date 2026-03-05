@@ -703,6 +703,9 @@ async def verify_anthropic_api_key(
     Dependency to verify API key for Anthropic endpoints.
     Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
     """
+    # If PROXY_API_KEY is not set or empty, skip verification (open access)
+    if not PROXY_API_KEY:
+        return x_api_key or auth
     # Check x-api-key first (Anthropic style)
     if x_api_key and x_api_key == PROXY_API_KEY:
         return x_api_key
