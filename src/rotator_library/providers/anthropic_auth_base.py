@@ -68,6 +68,7 @@ def _build_authorize_url(verifier: str, challenge: str) -> str:
         "state": verifier,
     }
     from urllib.parse import urlencode
+
     return f"https://claude.ai/oauth/authorize?{urlencode(params)}"
 
 
@@ -278,7 +279,7 @@ class AnthropicAuthBase:
 
         expiry_date = (
             datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-        ).isoformat() + "Z"
+        ).isoformat()
 
         return {
             "access_token": access_token,
@@ -382,7 +383,7 @@ class AnthropicAuthBase:
 
             creds["expiry_date"] = (
                 datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-            ).isoformat() + "Z"
+            ).isoformat()
 
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}

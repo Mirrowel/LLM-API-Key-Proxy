@@ -75,8 +75,8 @@ def _get_thinking_cache():
     if _thinking_sig_cache is None:
         _thinking_sig_cache = create_provider_cache(
             "anthropic_thinking_signatures",
-            memory_ttl_seconds=7200,    # 2 hours in memory
-            disk_ttl_seconds=172800,    # 48 hours on disk
+            memory_ttl_seconds=7200,  # 2 hours in memory
+            disk_ttl_seconds=172800,  # 48 hours on disk
         )
     return _thinking_sig_cache
 
@@ -108,9 +108,7 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             if resp.status_code == 200:
                 data = resp.json()
                 models = [
-                    f"anthropic/{m['id']}"
-                    for m in data.get("data", [])
-                    if m.get("id")
+                    f"anthropic/{m['id']}" for m in data.get("data", []) if m.get("id")
                 ]
                 if models:
                     return models
@@ -150,7 +148,9 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 tool_result = {
                     "type": "tool_result",
                     "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": content if isinstance(content, str) else json.dumps(content),
+                    "content": content
+                    if isinstance(content, str)
+                    else json.dumps(content),
                 }
                 if anthropic_messages and anthropic_messages[-1]["role"] == "user":
                     if isinstance(anthropic_messages[-1]["content"], list):
@@ -183,11 +183,13 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                         # Fallback: inline signature from client (custom clients)
                         thinking_sig = msg.get("thinking_signature")
                         if thinking_sig and len(thinking_sig) >= 100:
-                            blocks.append({
-                                "type": "thinking",
-                                "thinking": reasoning,
-                                "signature": thinking_sig,
-                            })
+                            blocks.append(
+                                {
+                                    "type": "thinking",
+                                    "thinking": reasoning,
+                                    "signature": thinking_sig,
+                                }
+                            )
                         # else: no signature → drop thinking block,
                         # model generates fresh thinking (cache miss on prefix)
 
@@ -584,10 +586,12 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
                 block_thinking = stream_state.pop("_block_thinking", "")
                 block_sig = stream_state.pop("_block_signature", "")
                 if block_thinking and block_sig:
-                    stream_state.setdefault("_thinking_blocks", []).append({
-                        "thinking": block_thinking,
-                        "signature": block_sig,
-                    })
+                    stream_state.setdefault("_thinking_blocks", []).append(
+                        {
+                            "thinking": block_thinking,
+                            "signature": block_sig,
+                        }
+                    )
             return
 
         if event_type == "message_delta":
@@ -708,6 +712,10 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
         return payload
 
     def _reasoning_effort_to_budget(self, effort: Any, max_tokens: int) -> int:
+        """Convert reasoning_effort to Anthropic budget_tokens.
+
+        Anthropic requires budget_tokens < max_tokens, so we always clamp.
+        """
         effort_str = str(effort).lower().strip()
         budget_map = {
             "low": 4096,
@@ -715,12 +723,13 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             "high": 16384,
         }
         budget = budget_map.get(effort_str)
-        if budget is not None:
-            return min(budget, max(max_tokens - 1000, 4096))
-        try:
-            return int(effort_str)
-        except (ValueError, TypeError):
-            return min(8192, max(max_tokens - 1000, 4096))
+        if budget is None:
+            try:
+                budget = int(effort_str)
+            except (ValueError, TypeError):
+                budget = 8192
+        # Anthropic requires budget_tokens < max_tokens
+        return min(budget, max_tokens - 1) if max_tokens > 1 else 1
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
