@@ -44,14 +44,26 @@ COPILOT_API_BASE = "https://api.githubcopilot.com"
 
 # Available Copilot models (these may vary based on subscription)
 DEFAULT_COPILOT_MODELS = [
-    "gpt-4o",
     "gpt-4.1",
-    "gpt-4.1-mini",
-    "claude-3.5-sonnet",
+    "gpt-4o",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
     "claude-sonnet-4",
-    "o3-mini",
-    "o1",
-    "gemini-2.0-flash-001",
+    "claude-sonnet-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-41",
+    "claude-haiku-4.5",
+    "gemini-2.5-pro",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "grok-code-fast-1",
 ]
 
 # Responses API alternate input types for agent detection
@@ -158,7 +170,8 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         The api_key here is actually the credential path for OAuth providers.
         For Copilot, models are configured via environment or defaults.
         """
-        return self._available_models
+        # Always return provider-prefixed models so /v1/models entries are directly usable.
+        return [m if "/" in m else f"copilot/{m}" for m in self._available_models]
 
     def get_credential_priority(self, credential: str) -> Optional[int]:
         """
@@ -257,7 +270,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         3. Makes direct API call to Copilot
         4. Parses response into LiteLLM format
         """
-        credential_path = kwargs.get("api_key", "")
+        credential_path = kwargs.pop("credential_identifier", kwargs.get("api_key", ""))
         model = kwargs.get("model", "gpt-4o")
         messages = kwargs.get("messages", [])
         stream = kwargs.get("stream", False)
@@ -322,7 +335,7 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         )
 
         if stream:
-            return self._handle_streaming_response(
+            return await self._handle_streaming_response(
                 client, base_url, headers, body, model
             )
         else:
@@ -400,8 +413,17 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
                             continue
 
             except httpx.HTTPStatusError as e:
+                response_text = "<unavailable>"
+                try:
+                    # In streaming mode, response body is not automatically read.
+                    # Read it explicitly so logging does not raise ResponseNotRead.
+                    response_text = (await e.response.aread()).decode(
+                        "utf-8", errors="replace"
+                    )
+                except Exception:
+                    pass
                 lib_logger.error(
-                    f"Copilot streaming error (HTTP {e.response.status_code}): {e.response.text}"
+                    f"Copilot streaming error (HTTP {e.response.status_code}): {response_text}"
                 )
                 raise
             except Exception as e:
@@ -452,20 +474,20 @@ class CopilotProvider(CopilotAuthBase, ProviderInterface):
         choices = []
         for choice in chunk_data.get("choices", []):
             delta = choice.get("delta", {})
-            litellm_choice = litellm.Choices(
-                index=choice.get("index", 0),
-                delta=litellm.Delta(
-                    role=delta.get("role"),
-                    content=delta.get("content"),
-                ),
-                finish_reason=choice.get("finish_reason"),
-            )
-
-            # Handle tool call deltas
+            delta_payload = {
+                "role": delta.get("role"),
+                "content": delta.get("content"),
+            }
             if delta.get("tool_calls"):
-                litellm_choice.delta.tool_calls = delta["tool_calls"]
+                delta_payload["tool_calls"] = delta["tool_calls"]
 
-            choices.append(litellm_choice)
+            choices.append(
+                {
+                    "index": choice.get("index", 0),
+                    "delta": delta_payload,
+                    "finish_reason": choice.get("finish_reason"),
+                }
+            )
 
         return litellm.ModelResponse(
             id=chunk_data.get("id", f"copilot-{uuid.uuid4()}"),
