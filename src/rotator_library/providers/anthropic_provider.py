@@ -687,7 +687,10 @@ class AnthropicProvider(AnthropicAuthBase, ProviderInterface):
             elif isinstance(tool_choice, dict):
                 func_name = tool_choice.get("function", {}).get("name", "")
                 if func_name:
-                    payload["tool_choice"] = {"type": "tool", "name": func_name}
+                    payload["tool_choice"] = {
+                        "type": "tool",
+                        "name": f"{TOOL_PREFIX}{func_name}",
+                    }
 
         if kwargs.get("temperature") is not None:
             payload["temperature"] = kwargs["temperature"]
