@@ -727,7 +727,7 @@ class CopilotAuthBase:
 
             user_info = await self.get_user_info(new_creds)
             email = user_info.get("email")
-            if not email:
+            if not email or email == "unknown":
                 return CopilotCredentialSetupResult(
                     success=False, error="Could not retrieve email from OAuth response"
                 )
