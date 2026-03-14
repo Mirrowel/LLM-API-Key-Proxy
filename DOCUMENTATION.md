@@ -80,6 +80,30 @@ The logic applies in the following order:
 2.  **Blacklist Check**: For any model *not* on the whitelist, the client checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model matches a blacklist pattern (supports wildcards like `*-preview`), it is excluded.
 3.  **Default**: If a model is on neither list, it is included.
 
+#### Per-Model Routing Overrides (v1)
+
+`MODEL_ROUTING_OVERRIDES` lets operators rewrite `weighted-router/<model>` aliases into a concrete provider-prefixed model before provider lock-in. v1 supports only strict `single` routes so retry, cooldown, and credential rotation continue to run inside one provider lane.
+
+In v1, `allowed_providers` must contain only the primary provider and `fallback_providers` must remain empty.
+
+Example:
+
+```bash
+MODEL_ROUTING_OVERRIDES='{
+  "nemotron-3-super": {
+    "strategy": "single",
+    "primary": "ollama",
+    "allowed_providers": ["ollama"],
+    "fallback_providers": [],
+    "strict": true,
+    "allow_global_fallback": false,
+    "reason": "Only available on Ollama Cloud"
+  }
+}'
+```
+
+This rewrites `weighted-router/nemotron-3-super` to `ollama/nemotron-3-super`. Invalid override config fails at startup, and unmatched `weighted-router/*` models fail closed instead of silently falling back to another provider.
+
 #### Request Lifecycle: A Deadline-Driven Approach
 
 The request lifecycle has been designed around a single, authoritative time budget to ensure predictable performance:
@@ -1925,4 +1949,3 @@ The GUI modifies the same environment variables that the `RotatingClient` reads:
 3. **Proxy applies rules** → `get_available_models()` filters based on rules
 
 **Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
-

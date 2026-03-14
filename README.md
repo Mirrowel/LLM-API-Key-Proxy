@@ -477,6 +477,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `ROTATION_MODE_<PROVIDER>` | `balanced` or `sequential` | `ROTATION_MODE_GEMINI=sequential` |
 | `IGNORE_MODELS_<PROVIDER>` | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*` |
 | `WHITELIST_MODELS_<PROVIDER>` | Whitelist (overrides blacklist) | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro` |
+| `MODEL_ROUTING_OVERRIDES` | JSON per-model routing overrides for `weighted-router/*` aliases | `{"nemotron-3-super":{"strategy":"single","primary":"ollama","allowed_providers":["ollama"],"fallback_providers":[],"strict":true,"allow_global_fallback":false}}` |
 
 ### Advanced Features
 
@@ -488,6 +489,31 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 | `ANTIGRAVITY_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
+
+</details>
+
+<details>
+<summary><b>Weighted Router Per-Model Overrides (v1)</b></summary>
+
+Use `MODEL_ROUTING_OVERRIDES` to pin a `weighted-router/<model>` alias to a single provider before credential selection begins. v1 supports only the `single` strategy and fails closed if a matching override is missing or invalid.
+
+In v1, `allowed_providers` must contain only the primary provider and `fallback_providers` must stay empty.
+
+```bash
+export MODEL_ROUTING_OVERRIDES='{
+  "nemotron-3-super": {
+    "strategy": "single",
+    "primary": "ollama",
+    "allowed_providers": ["ollama"],
+    "fallback_providers": [],
+    "strict": true,
+    "allow_global_fallback": false,
+    "reason": "Only available on Ollama Cloud"
+  }
+}'
+```
+
+With that configuration, a request for `weighted-router/nemotron-3-super` is rewritten to `ollama/nemotron-3-super` before the normal retry and credential rotation flow runs.
 
 </details>
 
