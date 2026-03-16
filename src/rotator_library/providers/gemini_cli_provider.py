@@ -624,6 +624,58 @@ class GeminiCliProvider(
         # Return fallback chain if available, otherwise just return the original model
         return fallback_chains.get(model_name, [model_name])
 
+    def _parse_content_parts(
+        self, content: Any, model: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse content into Gemini parts format.
+
+        Handles both string content and multipart list content (text, images, etc.).
+        This ensures compatibility with OpenAI API format where content can be:
+        - A plain string: "Hello"
+        - A list of parts: [{"type": "text", "text": "Hello"}, {"type": "image_url", ...}]
+
+        Args:
+            content: The message content (string or list)
+            model: The model name (for context if needed)
+
+        Returns:
+            List of Gemini parts dictionaries
+        """
+        parts = []
+
+        if isinstance(content, str):
+            if content:
+                parts.append({"text": content})
+        elif isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append({"text": text})
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:"):
+                        try:
+                            header, data = image_url.split(",", 1)
+                            mime_type = header.split(":")[1].split(";")[0]
+                            parts.append(
+                                {
+                                    "inlineData": {
+                                        "mimeType": mime_type,
+                                        "data": data,
+                                    }
+                                }
+                            )
+                        except Exception as e:
+                            lib_logger.warning(f"Failed to parse image data URL: {e}")
+                    else:
+                        lib_logger.warning(
+                            f"Non-data-URL images not supported: {image_url[:50]}..."
+                        )
+
+        return parts
+
     def _transform_messages(
         self, messages: List[Dict[str, Any]], model: str = ""
     ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -645,10 +697,12 @@ class GeminiCliProvider(
         if messages and messages[0].get("role") == "system":
             system_prompt_content = messages.pop(0).get("content", "")
             if system_prompt_content:
-                system_instruction = {
-                    "role": "user",
-                    "parts": [{"text": system_prompt_content}],
-                }
+                system_parts = self._parse_content_parts(system_prompt_content, model)
+                if system_parts:
+                    system_instruction = {
+                        "role": "user",
+                        "parts": system_parts,
+                    }
 
         tool_call_id_to_name = {}
         for msg in messages:
@@ -678,45 +732,12 @@ class GeminiCliProvider(
                 pending_tool_parts = []
 
             if role == "user":
-                if isinstance(content, str):
-                    # Simple text content
-                    if content:
-                        parts.append({"text": content})
-                elif isinstance(content, list):
-                    # Multi-part content (text, images, etc.)
-                    for item in content:
-                        if item.get("type") == "text":
-                            text = item.get("text", "")
-                            if text:
-                                parts.append({"text": text})
-                        elif item.get("type") == "image_url":
-                            # Handle image data URLs
-                            image_url = item.get("image_url", {}).get("url", "")
-                            if image_url.startswith("data:"):
-                                try:
-                                    # Parse: data:image/png;base64,iVBORw0KG...
-                                    header, data = image_url.split(",", 1)
-                                    mime_type = header.split(":")[1].split(";")[0]
-                                    parts.append(
-                                        {
-                                            "inlineData": {
-                                                "mimeType": mime_type,
-                                                "data": data,
-                                            }
-                                        }
-                                    )
-                                except Exception as e:
-                                    lib_logger.warning(
-                                        f"Failed to parse image data URL: {e}"
-                                    )
-                            else:
-                                lib_logger.warning(
-                                    f"Non-data-URL images not supported: {image_url[:50]}..."
-                                )
+                parts = self._parse_content_parts(content, model)
 
             elif role == "assistant":
-                if isinstance(content, str):
-                    parts.append({"text": content})
+                if content:
+                    content_parts = self._parse_content_parts(content, model)
+                    parts.extend(content_parts)
                 if msg.get("tool_calls"):
                     # Track if we've seen the first function call in this message
                     # Per Gemini docs: Only the FIRST parallel function call gets a signature
