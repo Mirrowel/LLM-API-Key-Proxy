@@ -649,6 +649,11 @@ class GeminiCliProvider(
                 parts.append({"text": content})
         elif isinstance(content, list):
             for item in content:
+                if not isinstance(item, dict):
+                    lib_logger.warning(
+                        f"Skipping non-dict item in content list: {type(item).__name__}"
+                    )
+                    continue
                 if item.get("type") == "text":
                     text = item.get("text", "")
                     if text:
