@@ -31,6 +31,15 @@ from .utilities.gemini_shared_utils import (
 # Service Usage API for checking enabled APIs
 SERVICE_USAGE_API = "https://serviceusage.googleapis.com/v1"
 
+# Known Gemini CLI tiers for manual selection
+KNOWN_GEMINI_TIERS = [
+    "free-tier",
+    "legacy-tier",
+    "standard",
+    "premium",
+    "enterprise",
+]
+
 lib_logger = logging.getLogger("rotator_library")
 
 # Headers for Gemini CLI auth/discovery calls (loadCodeAssist, onboardUser, etc.)
@@ -785,13 +794,172 @@ class GeminiAuthBase(GoogleOAuthBase):
         except httpx.RequestError as e:
             lib_logger.error(f"Network error while listing GCP projects: {e}")
 
+        # Auto-discovery failed - prompt for manual input (interactive mode only)
+        lib_logger.info(
+            "Auto-discovery failed. Checking if manual input is available..."
+        )
+
+        # Try to get project_id and tier from user input
+        try:
+            manual_result = await self._prompt_for_manual_setup()
+            if manual_result and manual_result.get("project_id"):
+                project_id = manual_result["project_id"]
+                tier = manual_result.get("tier")
+
+                lib_logger.info(
+                    f"Using manually provided project ID: {project_id}, tier: {tier}"
+                )
+
+                # Cache the values
+                self.project_id_cache[credential_path] = project_id
+                if tier:
+                    self.project_tier_cache[credential_path] = tier
+
+                # Persist to credential file
+                await self._persist_project_metadata(credential_path, project_id, tier)
+
+                return project_id
+        except Exception as e:
+            lib_logger.debug(f"Manual input not available or failed: {e}")
+
+        # If we get here, manual input was not available or failed
         raise ValueError(
             "Could not auto-discover Gemini project ID. Possible causes:\n"
             "  1. The cloudaicompanion.googleapis.com API is not enabled (enable it in Google Cloud Console)\n"
             "  2. No active GCP projects exist for this account (create one in Google Cloud Console)\n"
             "  3. Account lacks necessary permissions\n"
-            "To manually specify a project, set GEMINI_CLI_PROJECT_ID in your .env file."
+            "To manually specify a project, set GEMINI_CLI_PROJECT_ID in your .env file or provide it during interactive setup."
         )
+
+    async def _prompt_for_manual_setup(self) -> Optional[Dict[str, str]]:
+        """
+        Prompt user for manual project_id and tier selection.
+
+        This is called when auto-discovery fails during interactive credential setup.
+        Only works in interactive mode (stdin available).
+
+        Returns:
+            Dict with 'project_id' and optionally 'tier', or None if not available
+        """
+        import sys
+
+        # Check if we're in interactive mode
+        if not sys.stdin.isatty():
+            lib_logger.debug("Not in interactive mode, skipping manual prompt")
+            return None
+
+        # Import Rich for console output (deferred import to avoid circular dependency)
+        try:
+            from rich.console import Console
+            from rich.prompt import Prompt, Confirm
+            from rich.panel import Panel
+            from rich.text import Text
+        except ImportError:
+            lib_logger.debug("Rich not available for manual prompt")
+            return None
+
+        console = Console()
+
+        # Display instructions
+        console.print(
+            Panel(
+                Text.from_markup(
+                    "[bold yellow]Automatic project discovery failed.[/bold yellow]\n\n"
+                    "This usually means:\n"
+                    "1. The Cloud AI Companion API is not enabled in your Google Cloud project\n"
+                    "2. You need to manually create a project\n\n"
+                    "[bold]Please follow the manual setup instructions:[/bold]\n"
+                    "[cyan]docs/gemini-cli-manual-code-assist-setup.md[/cyan]\n\n"
+                    "After following the instructions, enter your Project ID below."
+                ),
+                title="Manual Project Setup Required",
+                style="yellow",
+            )
+        )
+
+        # Prompt for project_id
+        project_id = Prompt.ask(
+            "[bold]Enter your Google Cloud Project ID[/bold] [dim](or press Enter to skip)[/dim]",
+            default="",
+        )
+
+        if not project_id.strip():
+            console.print(
+                "[dim]Skipping manual setup. You can set GEMINI_CLI_PROJECT_ID environment variable later.[/dim]"
+            )
+            return None
+
+        project_id = project_id.strip()
+
+        # Prompt for tier selection
+        console.print("\n[bold]Select your tier:[/bold]")
+        console.print("[dim]If unsure, select 'free-tier' or 'legacy-tier'[/dim]\n")
+
+        for i, tier in enumerate(KNOWN_GEMINI_TIERS, 1):
+            console.print(f"  {i}. {tier}")
+        console.print(f"  {len(KNOWN_GEMINI_TIERS) + 1}. Other (unknown)")
+
+        tier_choice = Prompt.ask(
+            "\n[bold]Enter tier number[/bold]",
+            default="1",
+        )
+
+        try:
+            choice_idx = int(tier_choice) - 1
+            if 0 <= choice_idx < len(KNOWN_GEMINI_TIERS):
+                selected_tier = KNOWN_GEMINI_TIERS[choice_idx]
+            else:
+                selected_tier = "unknown"
+        except ValueError:
+            selected_tier = "unknown"
+
+        console.print(
+            Panel(
+                f"Project ID: [cyan]{project_id}[/cyan]\n"
+                f"Tier: [green]{selected_tier}[/green]",
+                style="green",
+                title="Manual Setup Complete",
+            )
+        )
+
+        return {"project_id": project_id, "tier": selected_tier}
+
+    async def _persist_project_metadata(
+        self, credential_path: str, project_id: str, tier: Optional[str]
+    ):
+        """Persists project ID and tier to the credential file for faster future startups."""
+        # Skip persistence for env:// paths (environment-based credentials)
+        credential_index = self._parse_env_credential_path(credential_path)
+        if credential_index is not None:
+            lib_logger.debug(
+                f"Skipping project metadata persistence for env:// credential path: {credential_path}"
+            )
+            return
+
+        try:
+            # Load current credentials
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+
+            # Update metadata
+            if "_proxy_metadata" not in creds:
+                creds["_proxy_metadata"] = {}
+
+            creds["_proxy_metadata"]["project_id"] = project_id
+            if tier:
+                creds["_proxy_metadata"]["tier"] = tier
+
+            # Save back using the existing save method (handles atomic writes and permissions)
+            await self._save_credentials(credential_path, creds)
+
+            lib_logger.debug(
+                f"Persisted project_id and tier to credential file: {credential_path}"
+            )
+        except Exception as e:
+            lib_logger.warning(
+                f"Failed to persist project metadata to credential file: {e}"
+            )
+            # Non-fatal - just means slower startup next time
 
     # =========================================================================
     # CREDENTIAL MANAGEMENT OVERRIDES
