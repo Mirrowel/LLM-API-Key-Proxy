@@ -37,6 +37,9 @@ COPY src/ ./src/
 # Create directories for logs and oauth credentials
 RUN mkdir -p logs oauth_creds
 
+# Configure interactive shell: auto-launch TUI + alias
+RUN printf '\n# TUI shortcut\nalias tui="python src/proxy_app/main.py"\n\n# Auto-launch TUI on interactive terminal (skip with SKIP_TUI=1)\nif [ -z "$SKIP_TUI" ] && [[ $- == *i* ]] && [ -t 0 ]; then\n    exec python src/proxy_app/main.py\nfi\n' >> /root/.bashrc
+
 # Expose the default port
 EXPOSE 8000
 

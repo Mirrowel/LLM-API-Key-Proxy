@@ -498,9 +498,10 @@ class LauncherTUI:
         self.console.print(
             "   5. :chart_with_upwards_trend: View Quota & Usage Stats (Alpha)"
         )
-        self.console.print("   6. :arrows_counterclockwise: Reload Configuration")
-        self.console.print("   7. :information_source:  About")
-        self.console.print("   8. :door: Exit")
+        self.console.print("   6. :clipboard: View Logs")
+        self.console.print("   7. :arrows_counterclockwise: Reload Configuration")
+        self.console.print("   8. :information_source:  About")
+        self.console.print("   9. :door: Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -508,7 +509,7 @@ class LauncherTUI:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
             show_choices=False,
         )
 
@@ -523,14 +524,16 @@ class LauncherTUI:
         elif choice == "5":
             self.launch_quota_viewer()
         elif choice == "6":
+            self.launch_log_viewer()
+        elif choice == "7":
             load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
             self.console.print(
                 "\n[green]:white_check_mark: Configuration reloaded![/green]"
             )
-        elif choice == "7":
-            self.show_about()
         elif choice == "8":
+            self.show_about()
+        elif choice == "9":
             self.running = False
             sys.exit(0)
 
@@ -1022,6 +1025,13 @@ class LauncherTUI:
 
         run_quota_viewer()
 
+    def launch_log_viewer(self):
+        """Launch the Log Viewer interface"""
+        from proxy_app.log_viewer import LogViewer
+
+        viewer = LogViewer(self.console)
+        viewer.show_menu()
+
     def show_about(self):
         """Display About page with project information"""
         clear_screen()
@@ -1152,3 +1162,7 @@ def run_launcher_tui():
     """Entry point for launcher TUI"""
     tui = LauncherTUI()
     tui.run()
+
+
+if __name__ == "__main__":
+    run_launcher_tui()

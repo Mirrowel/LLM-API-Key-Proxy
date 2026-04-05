@@ -111,7 +111,7 @@ def _fmt_dollars(cents: Optional[int]) -> str:
     return f"${cents / 100:.2f}"
 
 
-def _fmt_compact(value: Optional[int]) -> str:
+def _fmt_compact(value: Optional[Union[int, float]]) -> str:
     """Format a large number compactly for quota display.
 
     Examples: 59796630 → '59.8M', 60000000 → '60M', 5000 → '5000'
@@ -127,7 +127,9 @@ def _fmt_compact(value: Optional[int]) -> str:
         return s.replace(".0M", "M")
     if value >= 100_000:
         return f"{value / 1_000:.0f}k"
-    return str(value)
+    
+    # For small values, round to nearest integer to handle 0.0001 hack gracefully
+    return str(int(round(value)))
 
 
 def _shorten_model_name(model: str) -> str:
@@ -370,7 +372,7 @@ def get_credential_stats(
     cache_pct = round(input_cached / input_total * 100, 1) if input_total > 0 else 0
 
     return {
-        "requests": stats_source.get("request_count", 0),
+        "requests": int(round(stats_source.get("request_count", 0))),
         "last_used_ts": stats_source.get("last_used_at"),
         "approx_cost": stats_source.get("approx_cost"),
         "tokens": {
@@ -893,12 +895,18 @@ class QuotaViewer:
 
                 # Use current_period stats in current mode, provider-level totals in global mode
                 if self.view_mode == "global":
-                    total_requests = prov_stats.get("total_requests", 0)
+                    total_requests = int(round(prov_stats.get("total_requests", 0)))
                     tokens = prov_stats.get("tokens", {})
                     cost_value = prov_stats.get("approx_cost")
                 else:
                     cp = prov_stats.get("current_period", {})
-                    total_requests = cp.get("total_requests", prov_stats.get("total_requests", 0))
+                    total_requests = int(
+                        round(
+                            cp.get(
+                                "total_requests", prov_stats.get("total_requests", 0)
+                            )
+                        )
+                    )
                     tokens = cp.get("tokens", prov_stats.get("tokens", {}))
                     cost_value = cp.get("approx_cost", prov_stats.get("approx_cost"))
 
@@ -1134,7 +1142,7 @@ class QuotaViewer:
                 summary = self.cached_stats.get("summary", {})
 
             total_creds = summary.get("total_credentials", 0)
-            total_requests = summary.get("total_requests", 0)
+            total_requests = int(round(summary.get("total_requests", 0)))
             total_tokens = summary.get("tokens", {})
             total_input = total_tokens.get("input_cached", 0) + total_tokens.get(
                 "input_uncached", 0
