@@ -103,6 +103,14 @@ class AnthropicHandler:
             openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
         if request.stream:
+            # Pre-calculate input tokens for message_start
+            # Anthropic's native API provides input_tokens in message_start, but OpenAI-format
+            # streams only provide usage data at the end. We calculate upfront to match behavior.
+            precalculated_input_tokens = self._client.token_count(
+                model=request.model,
+                messages=openai_request.get("messages", []),
+            )
+
             # Streaming response
             response_generator = await self._client.acompletion(
                 request=raw_request,
@@ -123,6 +131,7 @@ class AnthropicHandler:
                 request_id=request_id,
                 is_disconnected=is_disconnected,
                 transaction_logger=anthropic_logger,
+                precalculated_input_tokens=precalculated_input_tokens,
             )
         else:
             # Non-streaming response
@@ -133,11 +142,23 @@ class AnthropicHandler:
             )
 
             # Convert OpenAI response to Anthropic format
+            # Handle null/empty responses by defaulting to empty dict
             openai_response = (
                 response.model_dump()
-                if hasattr(response, "model_dump")
-                else dict(response)
+                if response and hasattr(response, "model_dump")
+                else dict(response or {})
             )
+
+            # Validate response has choices - LiteLLM may return None or empty
+            # responses on malformed upstream replies
+            if not openai_response.get("choices"):
+                from ..error_handler import EmptyResponseError
+
+                raise EmptyResponseError(
+                    provider=provider,
+                    model=original_model,
+                    message=f"Provider returned empty or invalid response for non-streaming request to {original_model}",
+                )
             anthropic_response = openai_to_anthropic_response(
                 openai_response, original_model
             )

@@ -25,6 +25,7 @@ async def anthropic_streaming_wrapper(
     request_id: Optional[str] = None,
     is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
     transaction_logger: Optional["TransactionLogger"] = None,
+    precalculated_input_tokens: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Convert OpenAI streaming format to Anthropic streaming format.
@@ -47,6 +48,10 @@ async def anthropic_streaming_wrapper(
         request_id: Optional request ID (auto-generated if not provided)
         is_disconnected: Optional async callback that returns True if client disconnected
         transaction_logger: Optional TransactionLogger for logging the final Anthropic response
+        precalculated_input_tokens: Optional pre-calculated input token count for message_start.
+            When provided, this value is used in message_start to match Anthropic's native
+            behavior (which provides input_tokens upfront). Without this, message_start will
+            have input_tokens=0 since OpenAI-format streams provide usage data at the end.
 
     Yields:
         SSE format strings in Anthropic's streaming format
@@ -60,7 +65,9 @@ async def anthropic_streaming_wrapper(
     current_block_index = 0
     tool_calls_by_index = {}  # Track tool calls by their index
     tool_block_indices = {}  # Track which block index each tool call uses
-    input_tokens = 0
+    # Use precalculated input tokens if provided, otherwise start at 0
+    # This allows message_start to have accurate input_tokens like Anthropic's native API
+    input_tokens = precalculated_input_tokens if precalculated_input_tokens is not None else 0
     output_tokens = 0
     cached_tokens = 0  # Track cached tokens for proper Anthropic format
     accumulated_text = ""  # Track accumulated text for logging
@@ -128,7 +135,10 @@ async def anthropic_streaming_wrapper(
                 stop_reason_final = stop_reason
 
                 # Build final usage dict with cached tokens
-                final_usage = {"output_tokens": output_tokens}
+                final_usage = {
+                    "input_tokens": input_tokens - cached_tokens,
+                    "output_tokens": output_tokens,
+                }
                 if cached_tokens > 0:
                     final_usage["cache_read_input_tokens"] = cached_tokens
                     final_usage["cache_creation_input_tokens"] = 0
@@ -416,7 +426,10 @@ async def anthropic_streaming_wrapper(
         yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
 
         # Build final usage with cached tokens
-        final_usage = {"output_tokens": 0}
+        final_usage = {
+            "input_tokens": input_tokens - cached_tokens,
+            "output_tokens": 0,
+        }
         if cached_tokens > 0:
             final_usage["cache_read_input_tokens"] = cached_tokens
             final_usage["cache_creation_input_tokens"] = 0

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-import os
 import re
 import shutil
 import logging
@@ -15,13 +14,16 @@ lib_logger = logging.getLogger("rotator_library")
 # Standard directories where tools like `gemini login` store credentials.
 DEFAULT_OAUTH_DIRS = {
     "gemini_cli": Path.home() / ".gemini",
-    # Add other providers like 'claude' here if they have a standard CLI path
+    "codex": Path.home() / ".codex",
+    "anthropic": Path.home() / ".claude",
 }
 
 # OAuth providers that support environment variable-based credentials
 # Maps provider name to the ENV_PREFIX used by the provider
 ENV_OAUTH_PROVIDERS = {
     "gemini_cli": "GEMINI_CLI",
+    "codex": "CODEX",
+    "anthropic": "ANTHROPIC_OAUTH",
 }
 
 
