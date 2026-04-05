@@ -65,7 +65,7 @@ NATIVE_PROVIDER_PRIORITY = [
     "fireworks-ai",
     "groq",
     "sap-ai-core",
-    "zenmux",
+    "opencode_zen",
 ]
 
 # ============================================================================
