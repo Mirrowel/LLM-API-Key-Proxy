@@ -11,7 +11,7 @@ import httpx
 import logging
 from typing import Union, AsyncGenerator, List, Dict, Any, Optional
 from .provider_interface import ProviderInterface
-from .qwen_auth_base import QwenAuthBase
+from .qwen_auth_base import QwenAuthBase, DEFAULT_DASHSCOPE_BASE_URL, QWEN_USER_AGENT
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..transaction_logger import ProviderLogger
@@ -46,7 +46,12 @@ SUPPORTED_PARAMS = {
     "stop",
     "seed",
     "response_format",
+    "metadata",
 }
+
+# Default DashScope base URL — re-exported from qwen_auth_base (source of truth).
+# Kept here so existing callers importing from this module do not break.
+# Do NOT define the string here; update it in qwen_auth_base.py only.
 
 
 class QwenCodeProvider(QwenAuthBase, ProviderInterface):
@@ -118,7 +123,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                 await self.initialize_token(credential)
 
             api_base, access_token = await self.get_api_details(credential)
-            models_url = f"{api_base.rstrip('/')}/v1/models"
+            models_url = f"{api_base.rstrip('/')}/models"
 
             response = await client.get(
                 models_url, headers={"Authorization": f"Bearer {access_token}"}
@@ -602,16 +607,23 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             # Build clean payload with only supported parameters
             payload = self._build_request_payload(**kwargs_with_stripped_model)
 
+            try:
+                is_oauth = credential_path.startswith("env://") or os.path.isfile(credential_path)
+            except (OSError, ValueError):
+                is_oauth = False
+
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-                "User-Agent": "google-api-nodejs-client/9.15.1",
-                "X-Goog-Api-Client": "gl-node/22.17.0",
-                "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+                "User-Agent": QWEN_USER_AGENT,
+                "X-DashScope-CacheControl": "enable",
+                "X-DashScope-UserAgent": QWEN_USER_AGENT,
             }
+            if is_oauth:
+                headers["X-DashScope-AuthType"] = "qwen-oauth"
 
-            url = f"{api_base.rstrip('/')}/v1/chat/completions"
+            url = f"{api_base.rstrip('/')}/chat/completions"
 
             # Log request to dedicated file
             file_logger.log_request(payload)
