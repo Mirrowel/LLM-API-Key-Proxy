@@ -294,6 +294,14 @@ class RotatingClient:
                 lib_logger.info(
                     f"Usage managers initialized: {', '.join(sorted(summaries))}"
                 )
+
+            # Inject usage manager references into providers that support it
+            # (e.g., CodexProvider via CodexQuotaTracker for header-based quota updates)
+            for provider, manager in self._usage_managers.items():
+                instance = self._get_provider_instance(provider)
+                if instance and hasattr(instance, "set_usage_manager"):
+                    instance.set_usage_manager(manager)
+
             self._usage_initialized = True
 
     async def close(self):
