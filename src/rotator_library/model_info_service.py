@@ -84,6 +84,7 @@ PROVIDER_ALIASES = {
     "nvidia_nim": ["nvidia"],
     "gemini_cli": ["google"],
     "gemini": ["google"],
+    "opencode_go": ["opencode"],
 }
 
 
