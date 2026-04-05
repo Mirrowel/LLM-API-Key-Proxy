@@ -2,6 +2,7 @@
 fastapi
 # ASGI server for running the FastAPI application
 uvicorn
+websockets>=14.0,<15.0
 # For loading environment variables from a .env file
 python-dotenv
 
@@ -13,6 +14,8 @@ litellm
 
 filelock
 httpx
+# SOCKS5 proxy support for httpx (enables socks5:// proxy URLs)
+socksio
 aiofiles
 aiohttp
 
@@ -25,3 +28,5 @@ customtkinter
 
 # For building the executable
 pyinstaller
+pytest-mock
+pytest-asyncio

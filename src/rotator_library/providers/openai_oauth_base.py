@@ -1,16 +1,16 @@
-# src/rotator_library/providers/anthropic_oauth_base.py
+# src/rotator_library/providers/openai_oauth_base.py
 """
-Anthropic OAuth Base Class
+OpenAI OAuth Base Class
 
-Base class for Anthropic OAuth2 authentication (Claude Pro/Max subscriptions).
-Handles PKCE flow, token refresh, and credential management.
+Base class for OpenAI OAuth2 authentication providers (Codex).
+Handles PKCE flow, token refresh, and API key exchange.
 
 OAuth Configuration:
-- Client ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
-- Auth URL: https://claude.ai/oauth/authorize
-- Token URL: https://console.anthropic.com/v1/oauth/token
-- Redirect URI: https://console.anthropic.com/oauth/code/callback
-- Scopes: org:create_api_key user:profile user:inference
+- Client ID: app_EMoamEEZ73f0CkXaXp7hrann
+- Authorization URL: https://auth.openai.com/oauth/authorize
+- Token URL: https://auth.openai.com/oauth/token
+- Redirect URI: http://localhost:1455/auth/callback
+- Scopes: openid profile email offline_access
 """
 
 from __future__ import annotations
@@ -24,18 +24,15 @@ import os
 import re
 import secrets
 import time
+import webbrowser
 from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import webbrowser
-from urllib.parse import urlencode, urlparse, parse_qs
-
 import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt as RichPrompt
 from rich.text import Text
 from rich.markup import escape as rich_escape
 
@@ -47,10 +44,29 @@ from ..error_handler import CredentialNeedsReauthError
 lib_logger = logging.getLogger("rotator_library")
 console = Console()
 
+# =============================================================================
+# OAUTH CONFIGURATION
+# =============================================================================
+
+# OpenAI OAuth endpoints
+OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
+OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
+
+# Default OAuth callback port for local redirect server
+DEFAULT_OAUTH_CALLBACK_PORT: int = 1455
+
+# Default OAuth callback path
+DEFAULT_OAUTH_CALLBACK_PATH: str = "/auth/callback"
+
+# Token refresh buffer in seconds (refresh tokens this far before expiry)
+DEFAULT_REFRESH_EXPIRY_BUFFER: int = 5 * 60  # 5 minutes before expiry
+
 
 @dataclass
 class CredentialSetupResult:
-    """Standardized result structure for credential setup operations."""
+    """
+    Standardized result structure for credential setup operations.
+    """
     success: bool
     file_path: Optional[str] = None
     email: Optional[str] = None
@@ -60,49 +76,94 @@ class CredentialSetupResult:
     error: Optional[str] = None
     credentials: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
-# =============================================================================
-# OAUTH CONFIGURATION
-# =============================================================================
-
-ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-ANTHROPIC_AUTH_URL = "https://claude.ai/oauth/authorize"
-ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
-ANTHROPIC_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
-ANTHROPIC_OAUTH_SCOPES = ["org:create_api_key", "user:profile", "user:inference"]
-
-# Token refresh buffer in seconds (refresh tokens this far before expiry)
-DEFAULT_REFRESH_EXPIRY_BUFFER: int = 5 * 60  # 5 minutes before expiry
-
 
 def _generate_pkce() -> Tuple[str, str]:
-    """Generate PKCE code verifier and challenge (S256)."""
+    """
+    Generate PKCE code verifier and challenge.
+
+    Returns:
+        Tuple of (code_verifier, code_challenge)
+    """
+    # Generate random code verifier (43-128 characters)
     code_verifier = secrets.token_urlsafe(32)
+
+    # Create code challenge using S256 method
     code_challenge = base64.urlsafe_b64encode(
         hashlib.sha256(code_verifier.encode()).digest()
     ).decode().rstrip("=")
+
     return code_verifier, code_challenge
 
 
-class AnthropicOAuthBase:
+def _parse_jwt_claims(token: str) -> Optional[Dict[str, Any]]:
     """
-    Base class for Anthropic OAuth2 authentication.
+    Parse JWT token and extract claims from payload.
 
-    Handles:
-    - Loading credentials from copied ~/.claude/.credentials.json files
-      (nested claudeAiOauth format)
-    - Loading credentials from env vars (ANTHROPIC_OAUTH_N_ACCESS_TOKEN)
-    - Token refresh via JSON POST to Anthropic token endpoint
-    - Interactive PKCE OAuth flow (manual code paste)
-    - Queue-based refresh coordination
+    Args:
+        token: JWT token string
+
+    Returns:
+        Decoded payload as dict, or None if invalid
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+
+        payload = parts[1]
+        # Add padding if needed
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += "=" * padding
+
+        decoded = base64.urlsafe_b64decode(payload).decode("utf-8")
+        return json.loads(decoded)
+    except Exception:
+        return None
+
+
+class OpenAIOAuthBase:
+    """
+    Base class for OpenAI OAuth2 authentication providers.
+
+    Subclasses must override:
+        - CLIENT_ID: OAuth client ID
+        - OAUTH_SCOPES: List of OAuth scopes
+        - ENV_PREFIX: Prefix for environment variables (e.g., "CODEX")
+
+    Subclasses may optionally override:
+        - CALLBACK_PORT: Local OAuth callback server port (default: 1455)
+        - CALLBACK_PATH: OAuth callback path (default: "/auth/callback")
+        - REFRESH_EXPIRY_BUFFER_SECONDS: Time buffer before token expiry
     """
 
-    CLIENT_ID: str = ANTHROPIC_CLIENT_ID
-    AUTH_URL: str = ANTHROPIC_AUTH_URL
-    TOKEN_URL: str = ANTHROPIC_TOKEN_URL
-    REDIRECT_URI: str = ANTHROPIC_REDIRECT_URI
-    OAUTH_SCOPES: List[str] = ANTHROPIC_OAUTH_SCOPES
-    ENV_PREFIX: str = "ANTHROPIC_OAUTH"
+    # Subclasses MUST override these
+    CLIENT_ID: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    OAUTH_SCOPES: List[str] = ["openid", "profile", "email", "offline_access"]
+    ENV_PREFIX: str = "CODEX"
+
+    # Subclasses MAY override these
+    AUTH_URL: str = OPENAI_AUTH_URL
+    TOKEN_URL: str = OPENAI_TOKEN_URL
+    CALLBACK_PORT: int = DEFAULT_OAUTH_CALLBACK_PORT
+    CALLBACK_PATH: str = DEFAULT_OAUTH_CALLBACK_PATH
     REFRESH_EXPIRY_BUFFER_SECONDS: int = DEFAULT_REFRESH_EXPIRY_BUFFER
+
+    @property
+    def callback_port(self) -> int:
+        """
+        Get the OAuth callback port, checking environment variable first.
+        """
+        env_var = f"{self.ENV_PREFIX}_OAUTH_PORT"
+        env_value = os.getenv(env_var)
+        if env_value:
+            try:
+                return int(env_value)
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid {env_var} value: {env_value}, using default {self.CALLBACK_PORT}"
+                )
+        return self.CALLBACK_PORT
 
     def __init__(self):
         self._credentials_cache: Dict[str, Dict[str, Any]] = {}
@@ -132,13 +193,6 @@ class AnthropicOAuthBase:
         self._refresh_max_retries: int = 3
         self._reauth_timeout_seconds: int = 300
 
-        # Tier cache: credential_path -> tier info
-        self._tier_cache: Dict[str, Dict[str, Any]] = {}
-
-    # =========================================================================
-    # CREDENTIAL LOADING
-    # =========================================================================
-
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """Parse a virtual env:// path and return the credential index."""
         if not path.startswith("env://"):
@@ -150,11 +204,16 @@ class AnthropicOAuthBase:
 
     def _load_from_env(self, credential_index: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Load Anthropic OAuth credentials from environment variables.
+        Load OAuth credentials from environment variables.
 
         Expected variables for numbered format (index N):
-        - ANTHROPIC_OAUTH_N_ACCESS_TOKEN
-        - ANTHROPIC_OAUTH_N_REFRESH_TOKEN
+        - {ENV_PREFIX}_{N}_API_KEY (the exchanged API key)
+        - {ENV_PREFIX}_{N}_ACCESS_TOKEN
+        - {ENV_PREFIX}_{N}_REFRESH_TOKEN
+        - {ENV_PREFIX}_{N}_ID_TOKEN
+        - {ENV_PREFIX}_{N}_ACCOUNT_ID
+        - {ENV_PREFIX}_{N}_EXPIRY_DATE
+        - {ENV_PREFIX}_{N}_EMAIL
         """
         if credential_index and credential_index != "0":
             prefix = f"{self.ENV_PREFIX}_{credential_index}"
@@ -163,10 +222,12 @@ class AnthropicOAuthBase:
             prefix = self.ENV_PREFIX
             default_email = "env-user"
 
+        # Check for API key or access token
+        api_key = os.getenv(f"{prefix}_API_KEY")
         access_token = os.getenv(f"{prefix}_ACCESS_TOKEN")
         refresh_token = os.getenv(f"{prefix}_REFRESH_TOKEN")
 
-        if not access_token:
+        if not (api_key or access_token):
             return None
 
         lib_logger.debug(f"Loading {prefix} credentials from environment variables")
@@ -178,59 +239,17 @@ class AnthropicOAuthBase:
             expiry_date = 0
 
         creds = {
+            "api_key": api_key,
             "access_token": access_token,
             "refresh_token": refresh_token,
+            "id_token": os.getenv(f"{prefix}_ID_TOKEN"),
+            "account_id": os.getenv(f"{prefix}_ACCOUNT_ID"),
             "expiry_date": expiry_date,
             "_proxy_metadata": {
                 "email": os.getenv(f"{prefix}_EMAIL", default_email),
                 "last_check_timestamp": time.time(),
                 "loaded_from_env": True,
                 "env_credential_index": credential_index or "0",
-            },
-        }
-
-        return creds
-
-    def _parse_claude_credentials_file(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Parse a Claude CLI .credentials.json file.
-
-        The file has a nested structure:
-        {
-            "claudeAiOauth": {
-                "accessToken": "sk-ant-oat01-...",
-                "refreshToken": "sk-ant-ort01-...",
-                "expiresAt": 1700000000000,  // milliseconds
-                "scopes": [...],
-                ...
-            }
-        }
-
-        Normalizes to our internal flat format.
-        """
-        oauth_data = raw_data.get("claudeAiOauth", {})
-        if not oauth_data:
-            # Maybe it's already in flat format (from our own save)
-            if raw_data.get("access_token"):
-                return raw_data
-            raise ValueError("No 'claudeAiOauth' key found in credentials file")
-
-        access_token = oauth_data.get("accessToken", "")
-        refresh_token = oauth_data.get("refreshToken", "")
-        expires_at = oauth_data.get("expiresAt", 0)
-
-        # expiresAt may be in milliseconds — normalise to seconds
-        expiry_date = self._normalize_expiry(expires_at)
-
-        creds = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expiry_date": expiry_date,
-            "_proxy_metadata": {
-                "last_check_timestamp": time.time(),
-                "subscription_type": oauth_data.get("subscriptionType"),
-                "rate_limit_tier": oauth_data.get("rateLimitTier"),
-                "email": oauth_data.get("email", ""),
             },
         }
 
@@ -259,35 +278,25 @@ class AnthropicOAuthBase:
 
             # Try file-based loading
             try:
-                lib_logger.debug(f"Loading Anthropic OAuth credentials from file: {path}")
+                lib_logger.debug(f"Loading {self.ENV_PREFIX} credentials from file: {path}")
                 with open(path, "r") as f:
-                    raw_data = json.load(f)
-                creds = self._parse_claude_credentials_file(raw_data)
+                    creds = json.load(f)
                 self._credentials_cache[path] = creds
-
-                # Cache tier info
-                metadata = creds.get("_proxy_metadata", {})
-                if metadata.get("subscription_type") or metadata.get("rate_limit_tier"):
-                    self._tier_cache[path] = {
-                        "subscription_type": metadata.get("subscription_type"),
-                        "rate_limit_tier": metadata.get("rate_limit_tier"),
-                    }
-
                 return creds
             except FileNotFoundError:
                 env_creds = self._load_from_env()
                 if env_creds:
                     lib_logger.info(
-                        f"File '{path}' not found, using Anthropic OAuth credentials from environment variables"
+                        f"File '{path}' not found, using {self.ENV_PREFIX} credentials from environment variables"
                     )
                     self._credentials_cache[path] = env_creds
                     return env_creds
                 raise IOError(
-                    f"Anthropic OAuth credential file not found at '{path}'"
+                    f"{self.ENV_PREFIX} OAuth credential file not found at '{path}'"
                 )
             except Exception as e:
                 raise IOError(
-                    f"Failed to load Anthropic OAuth credentials from '{path}': {e}"
+                    f"Failed to load {self.ENV_PREFIX} OAuth credentials from '{path}': {e}"
                 )
 
     async def _save_credentials(self, path: str, creds: Dict[str, Any]):
@@ -301,53 +310,45 @@ class AnthropicOAuthBase:
         if safe_write_json(
             path, creds, lib_logger, secure_permissions=True, buffer_on_failure=True
         ):
-            lib_logger.debug(f"Saved updated Anthropic OAuth credentials to '{path}'.")
+            lib_logger.debug(f"Saved updated {self.ENV_PREFIX} OAuth credentials to '{path}'.")
         else:
             lib_logger.warning(
-                f"Anthropic OAuth credentials cached in memory only (buffered for retry)."
+                f"Credentials for {self.ENV_PREFIX} cached in memory only (buffered for retry)."
             )
-
-    # =========================================================================
-    # TOKEN EXPIRY CHECKS
-    # =========================================================================
-
-    def _normalize_expiry(self, raw: Any) -> float:
-        """Normalize an expiry value to a Unix timestamp in seconds.
-
-        Handles string coercion and millisecond timestamps (values > 1e12).
-        Returns 0.0 on invalid input so callers treat the token as expired.
-        """
-        if isinstance(raw, str):
-            try:
-                raw = float(raw)
-            except ValueError:
-                return 0.0
-        try:
-            ts = float(raw)
-        except (TypeError, ValueError):
-            return 0.0
-        if ts > 1e12:
-            ts /= 1000
-        return ts
 
     def _is_token_expired(self, creds: Dict[str, Any]) -> bool:
         """Check if access token is expired or near expiry."""
-        expiry_timestamp = self._normalize_expiry(creds.get("expiry_date", 0))
+        expiry_timestamp = creds.get("expiry_date", 0)
+        if isinstance(expiry_timestamp, str):
+            try:
+                expiry_timestamp = float(expiry_timestamp)
+            except ValueError:
+                expiry_timestamp = 0
+
+        # Handle milliseconds vs seconds
+        if expiry_timestamp > 1e12:
+            expiry_timestamp = expiry_timestamp / 1000
+
         return expiry_timestamp < time.time() + self.REFRESH_EXPIRY_BUFFER_SECONDS
 
     def _is_token_truly_expired(self, creds: Dict[str, Any]) -> bool:
         """Check if token is TRULY expired (past actual expiry)."""
-        expiry_timestamp = self._normalize_expiry(creds.get("expiry_date", 0))
-        return expiry_timestamp < time.time()
+        expiry_timestamp = creds.get("expiry_date", 0)
+        if isinstance(expiry_timestamp, str):
+            try:
+                expiry_timestamp = float(expiry_timestamp)
+            except ValueError:
+                expiry_timestamp = 0
 
-    # =========================================================================
-    # TOKEN REFRESH
-    # =========================================================================
+        if expiry_timestamp > 1e12:
+            expiry_timestamp = expiry_timestamp / 1000
+
+        return expiry_timestamp < time.time()
 
     async def _refresh_token(
         self, path: str, creds: Dict[str, Any], force: bool = False
     ) -> Dict[str, Any]:
-        """Refresh access token using refresh token via JSON POST."""
+        """Refresh access token using refresh token."""
         async with await self._get_lock(path):
             if not force and not self._is_token_expired(
                 self._credentials_cache.get(path, creds)
@@ -355,30 +356,29 @@ class AnthropicOAuthBase:
                 return self._credentials_cache.get(path, creds)
 
             lib_logger.debug(
-                f"Refreshing Anthropic OAuth token for '{Path(path).name}' (forced: {force})..."
+                f"Refreshing {self.ENV_PREFIX} OAuth token for '{Path(path).name}' (forced: {force})..."
             )
 
             refresh_token = creds.get("refresh_token")
             if not refresh_token:
-                raise ValueError("No refresh_token found in Anthropic credentials.")
+                raise ValueError("No refresh_token found in credentials file.")
 
-            max_retries = self._refresh_max_retries
+            max_retries = 3
             new_token_data = None
             last_error = None
 
             async with httpx.AsyncClient() as client:
                 for attempt in range(max_retries):
                     try:
-                        # Anthropic uses JSON body for token refresh (not form-encoded)
                         response = await client.post(
                             self.TOKEN_URL,
-                            json={
+                            data={
                                 "grant_type": "refresh_token",
                                 "refresh_token": refresh_token,
                                 "client_id": self.CLIENT_ID,
                             },
-                            headers={"Content-Type": "application/json"},
-                            timeout=self._refresh_timeout_seconds,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            timeout=30.0,
                         )
                         response.raise_for_status()
                         new_token_data = response.json()
@@ -389,33 +389,28 @@ class AnthropicOAuthBase:
                         status_code = e.response.status_code
                         error_body = e.response.text
 
-                        _err_type = ""
-                        try:
-                            _err_type = json.loads(error_body).get("error", "")
-                        except Exception:
-                            _err_type = error_body.lower()
-                        if status_code == 400 and _err_type == "invalid_grant":
+                        if status_code == 400 and "invalid_grant" in error_body.lower():
                             lib_logger.info(
-                                f"Anthropic credential '{Path(path).name}' needs re-auth (HTTP 400: invalid_grant)."
+                                f"Credential '{Path(path).name}' needs re-auth (HTTP 400: invalid_grant)."
                             )
                             asyncio.create_task(
                                 self._queue_refresh(path, force=True, needs_reauth=True)
                             )
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Anthropic refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
                             )
 
                         elif status_code in (401, 403):
                             lib_logger.info(
-                                f"Anthropic credential '{Path(path).name}' needs re-auth (HTTP {status_code})."
+                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code})."
                             )
                             asyncio.create_task(
                                 self._queue_refresh(path, force=True, needs_reauth=True)
                             )
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Anthropic token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
                             )
 
                         elif status_code == 429:
@@ -452,6 +447,9 @@ class AnthropicOAuthBase:
             if "refresh_token" in new_token_data:
                 creds["refresh_token"] = new_token_data["refresh_token"]
 
+            if "id_token" in new_token_data:
+                creds["id_token"] = new_token_data["id_token"]
+
             # Update metadata
             if "_proxy_metadata" not in creds:
                 creds["_proxy_metadata"] = {}
@@ -459,13 +457,9 @@ class AnthropicOAuthBase:
 
             await self._save_credentials(path, creds)
             lib_logger.debug(
-                f"Successfully refreshed Anthropic OAuth token for '{Path(path).name}'."
+                f"Successfully refreshed {self.ENV_PREFIX} OAuth token for '{Path(path).name}'."
             )
             return creds
-
-    # =========================================================================
-    # LOCK & AVAILABILITY
-    # =========================================================================
 
     async def _get_lock(self, path: str) -> asyncio.Lock:
         """Get or create a lock for a credential path."""
@@ -496,10 +490,6 @@ class AnthropicOAuthBase:
 
         return True
 
-    # =========================================================================
-    # QUEUE MANAGEMENT
-    # =========================================================================
-
     async def _queue_refresh(
         self, path: str, force: bool = False, needs_reauth: bool = False
     ):
@@ -523,12 +513,14 @@ class AnthropicOAuthBase:
                     await self._ensure_queue_processor_running()
 
     async def _ensure_queue_processor_running(self):
+        """Lazily starts the queue processor if not already running."""
         if self._queue_processor_task is None or self._queue_processor_task.done():
             self._queue_processor_task = asyncio.create_task(
                 self._process_refresh_queue()
             )
 
     async def _ensure_reauth_processor_running(self):
+        """Lazily starts the re-auth queue processor if not already running."""
         if self._reauth_processor_task is None or self._reauth_processor_task.done():
             self._reauth_processor_task = asyncio.create_task(
                 self._process_reauth_queue()
@@ -564,7 +556,9 @@ class AnthropicOAuthBase:
                         self._queue_retry_count.pop(path, None)
 
                     except asyncio.TimeoutError:
-                        lib_logger.warning(f"Refresh timeout for '{Path(path).name}'")
+                        lib_logger.warning(
+                            f"Refresh timeout for '{Path(path).name}'"
+                        )
                         await self._handle_refresh_failure(path, force, "timeout")
 
                     except httpx.HTTPStatusError as e:
@@ -595,7 +589,7 @@ class AnthropicOAuthBase:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                lib_logger.error(f"Error in Anthropic refresh queue processor: {e}")
+                lib_logger.error(f"Error in refresh queue processor: {e}")
                 if path:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
@@ -607,7 +601,7 @@ class AnthropicOAuthBase:
 
         if retry_count >= self._refresh_max_retries:
             lib_logger.error(
-                f"Max retries reached for Anthropic '{Path(path).name}' (last error: {error})."
+                f"Max retries reached for '{Path(path).name}' (last error: {error})."
             )
             self._queue_retry_count.pop(path, None)
             async with self._queue_tracking_lock:
@@ -615,7 +609,7 @@ class AnthropicOAuthBase:
             return
 
         lib_logger.warning(
-            f"Anthropic refresh failed for '{Path(path).name}' ({error}). "
+            f"Refresh failed for '{Path(path).name}' ({error}). "
             f"Retry {retry_count}/{self._refresh_max_retries}."
         )
         await self._refresh_queue.put((path, force))
@@ -634,11 +628,11 @@ class AnthropicOAuthBase:
                     return
 
                 try:
-                    lib_logger.info(f"Starting Anthropic re-auth for '{Path(path).name}'...")
+                    lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
                     await self.initialize_token(path, force_interactive=True)
-                    lib_logger.info(f"Anthropic re-auth SUCCESS for '{Path(path).name}'")
+                    lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
                 except Exception as e:
-                    lib_logger.error(f"Anthropic re-auth FAILED for '{Path(path).name}': {e}")
+                    lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
                 finally:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
@@ -652,186 +646,254 @@ class AnthropicOAuthBase:
                         self._unavailable_credentials.pop(path, None)
                 break
             except Exception as e:
-                lib_logger.error(f"Error in Anthropic re-auth queue processor: {e}")
+                lib_logger.error(f"Error in re-auth queue processor: {e}")
                 if path:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
                         self._unavailable_credentials.pop(path, None)
 
-    # =========================================================================
-    # INTERACTIVE OAUTH FLOW
-    # =========================================================================
-
     async def _perform_interactive_oauth(
         self, path: str, creds: Dict[str, Any], display_name: str
     ) -> Dict[str, Any]:
         """
-        Perform interactive OAuth flow for Anthropic.
-
-        Since Anthropic uses a fixed redirect URI (not localhost), the user must:
-        1. Open the auth URL in a browser
-        2. Complete login
-        3. Copy the authorization code from the redirect page
-        4. Paste it back into the terminal
+        Perform interactive OAuth flow (browser-based authentication).
+        Uses PKCE flow for OpenAI.
         """
-        code_verifier, code_challenge = _generate_pkce()
-        # Anthropic uses the PKCE verifier as the state value (per opencode-anthropic-auth plugin)
-        state = code_verifier
-
-        auth_params = {
-            "code": "true",  # Required by Anthropic OAuth
-            "client_id": self.CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": self.REDIRECT_URI,
-            "scope": " ".join(self.OAUTH_SCOPES),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        }
-
-        auth_url = f"{self.AUTH_URL}?" + urlencode(auth_params)
-
         is_headless = is_headless_environment()
 
-        if is_headless:
-            auth_panel_text = Text.from_markup(
-                "Running in headless environment (no GUI detected).\n"
-                "Please open the URL below in a browser on another machine to authorize:\n"
-            )
-        else:
-            auth_panel_text = Text.from_markup(
-                "1. Open the URL below in your browser to log in and authorize.\n"
-                "2. After authorizing, you'll be redirected. Copy the authorization code.\n"
-                "3. Paste the code back here."
-            )
+        # Generate PKCE codes
+        code_verifier, code_challenge = _generate_pkce()
+        state = secrets.token_hex(32)
 
-        console.print(
-            Panel(
-                auth_panel_text,
-                title=f"Anthropic OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
-                style="bold blue",
-            )
-        )
+        auth_code_future = asyncio.get_event_loop().create_future()
+        server = None
 
-        escaped_url = rich_escape(auth_url)
-        console.print(f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n")
-
-        if not is_headless:
+        async def handle_callback(reader, writer):
             try:
-                webbrowser.open(auth_url)
-                lib_logger.info("Browser opened successfully for Anthropic OAuth flow")
+                request_line_bytes = await reader.readline()
+                if not request_line_bytes:
+                    return
+                path_str = request_line_bytes.decode("utf-8").strip().split(" ")[1]
+                while await reader.readline() != b"\r\n":
+                    pass
+
+                from urllib.parse import urlparse, parse_qs
+                query_params = parse_qs(urlparse(path_str).query)
+
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
+
+                if "code" in query_params:
+                    received_state = query_params.get("state", [None])[0]
+                    if received_state != state:
+                        if not auth_code_future.done():
+                            auth_code_future.set_exception(
+                                Exception("OAuth state mismatch")
+                            )
+                        writer.write(
+                            b"<html><body><h1>State Mismatch</h1><p>Security error. Please try again.</p></body></html>"
+                        )
+                    elif not auth_code_future.done():
+                        auth_code_future.set_result(query_params["code"][0])
+                        writer.write(
+                            b"<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>"
+                        )
+                else:
+                    error = query_params.get("error", ["Unknown error"])[0]
+                    if not auth_code_future.done():
+                        auth_code_future.set_exception(Exception(f"OAuth failed: {error}"))
+                    writer.write(
+                        f"<html><body><h1>Authentication Failed</h1><p>Error: {error}</p></body></html>".encode()
+                    )
+
+                await writer.drain()
             except Exception as e:
-                lib_logger.warning(
-                    f"Failed to open browser automatically: {e}. Please open the URL manually."
+                lib_logger.error(f"Error in OAuth callback handler: {e}")
+            finally:
+                writer.close()
+
+        try:
+            server = await asyncio.start_server(
+                handle_callback, "127.0.0.1", self.callback_port
+            )
+
+            from urllib.parse import urlencode
+
+            redirect_uri = f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}"
+
+            auth_params = {
+                "response_type": "code",
+                "client_id": self.CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "scope": " ".join(self.OAUTH_SCOPES),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+                "id_token_add_organizations": "true",
+                "codex_cli_simplified_flow": "true",
+            }
+
+            auth_url = f"{self.AUTH_URL}?" + urlencode(auth_params)
+
+            if is_headless:
+                auth_panel_text = Text.from_markup(
+                    "Running in headless environment (no GUI detected).\n"
+                    "Please open the URL below in a browser on another machine to authorize:\n"
+                )
+            else:
+                auth_panel_text = Text.from_markup(
+                    "1. Your browser will now open to log in and authorize the application.\n"
+                    "2. If it doesn't open automatically, please open the URL below manually."
                 )
 
-        # Wait for user to paste the redirect URL or authorization code
-        console.print(
-            "[bold green]After authorizing, paste the full redirect URL "
-            "(or just the code) here:[/bold green]\n"
-            "[dim]The redirect URL looks like: "
-            "https://console.anthropic.com/oauth/code/callback?code=BGDi...&state=...[/dim]"
-        )
+            console.print(
+                Panel(
+                    auth_panel_text,
+                    title=f"{self.ENV_PREFIX} OAuth Setup for [bold yellow]{display_name}[/bold yellow]",
+                    style="bold blue",
+                )
+            )
 
-        # Use asyncio-compatible input
-        loop = asyncio.get_running_loop()
-        pasted_input = await loop.run_in_executor(None, input, "> ")
-        pasted_input = pasted_input.strip()
+            escaped_url = rich_escape(auth_url)
+            console.print(f"[bold]URL:[/bold] [link={auth_url}]{escaped_url}[/link]\n")
 
-        if not pasted_input:
-            raise Exception("No authorization code provided.")
+            if not is_headless:
+                try:
+                    webbrowser.open(auth_url)
+                    lib_logger.info("Browser opened successfully for OAuth flow")
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Failed to open browser automatically: {e}. Please open the URL manually."
+                    )
 
-        # Parse the code from whatever the user pasted:
-        # 1. Full redirect URL: extract ?code= query param
-        # 2. code#state fragment format (as shown on Anthropic callback page)
-        # 3. Bare code
-        auth_code = pasted_input
-        if "?" in pasted_input or pasted_input.startswith("http"):
-            parsed = urlparse(pasted_input)
-            qs = parse_qs(parsed.query)
-            if "code" in qs:
-                auth_code = qs["code"][0]
-            else:
-                # Fallback: treat everything before # as the code
-                auth_code = pasted_input.split("#")[0].split("?")[-1]
-        elif "#" in pasted_input:
-            # code#state format — take only the part before #
-            auth_code = pasted_input.split("#")[0]
+            with console.status(
+                "[bold green]Waiting for you to complete authentication in the browser...[/bold green]",
+                spinner="dots",
+            ):
+                auth_code = await asyncio.wait_for(auth_code_future, timeout=310)
 
-        auth_code = auth_code.strip()
-        if not auth_code:
-            raise Exception("Could not extract authorization code from input.")
-
-        # Extract state from the user's input to echo back in the token exchange.
-        # - Full URL: state is in the query string (?state=...)
-        # - code#state format: state follows the '#'
-        # - Bare code: use the locally-generated state (code_verifier)
-        if "?" in pasted_input or pasted_input.startswith("http"):
-            _qs = parse_qs(urlparse(pasted_input).query)
-            raw_state = _qs.get("state", [state])[0] or state
-        elif "#" in pasted_input:
-            _parts = pasted_input.split("#", 1)
-            raw_state = _parts[1].strip() if len(_parts) > 1 and _parts[1].strip() else state
-        else:
-            raw_state = state
+        except asyncio.TimeoutError:
+            raise Exception("OAuth flow timed out. Please try again.")
+        finally:
+            if server:
+                server.close()
+                await server.wait_closed()
 
         lib_logger.info("Exchanging authorization code for tokens...")
 
         async with httpx.AsyncClient() as client:
+            redirect_uri = f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}"
+
             response = await client.post(
                 self.TOKEN_URL,
-                json={
+                data={
                     "grant_type": "authorization_code",
-                    "code": auth_code,
-                    "state": raw_state,
+                    "code": auth_code.strip(),
                     "client_id": self.CLIENT_ID,
                     "code_verifier": code_verifier,
-                    "redirect_uri": self.REDIRECT_URI,
+                    "redirect_uri": redirect_uri,
                 },
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             response.raise_for_status()
             token_data = response.json()
 
+            # Build credentials
             new_creds = {
                 "access_token": token_data.get("access_token"),
                 "refresh_token": token_data.get("refresh_token"),
+                "id_token": token_data.get("id_token"),
                 "expiry_date": time.time() + token_data.get("expires_in", 3600),
-                "_proxy_metadata": {
-                    "last_check_timestamp": time.time(),
-                },
             }
 
-            # Prompt for an identifier — Anthropic's token response contains no email
-            try:
-                identifier = RichPrompt.ask(
-                    "\n[bold]Enter an identifier for this credential "
-                    "(e.g. your email or a label like 'pro-account')[/bold]"
-                )
-                identifier = identifier.strip()
-            except (EOFError, KeyboardInterrupt):
-                identifier = ""
+            # Parse ID token for claims
+            id_token_claims = _parse_jwt_claims(token_data.get("id_token", "")) or {}
+            access_token_claims = _parse_jwt_claims(token_data.get("access_token", "")) or {}
 
-            if not identifier:
-                console.print(
-                    "[bold yellow]No identifier provided. "
-                    "Deduplication will not be possible.[/bold yellow]"
-                )
+            # Extract account ID and email
+            auth_claims = id_token_claims.get("https://api.openai.com/auth", {})
+            account_id = auth_claims.get("chatgpt_account_id", "")
+            org_id = id_token_claims.get("organization_id")
+            project_id = id_token_claims.get("project_id")
 
-            new_creds["_proxy_metadata"]["email"] = identifier or None
+            email = id_token_claims.get("email", "")
+            plan_type = (
+                auth_claims.get("chatgpt_plan_type")
+                or access_token_claims.get("chatgpt_plan_type", "")
+            )
+
+            # Extract workspace/organization title from the JWT organizations list
+            organizations = auth_claims.get("organizations", [])
+            workspace_title = ""
+            if organizations and isinstance(organizations, list):
+                # Use the default org, or the first one
+                for org in organizations:
+                    if isinstance(org, dict):
+                        if org.get("is_default"):
+                            workspace_title = org.get("title", "")
+                            break
+                if not workspace_title and isinstance(organizations[0], dict):
+                    workspace_title = organizations[0].get("title", "")
+
+            new_creds["account_id"] = account_id
+
+            # Try to exchange for API key if we have org and project
+            api_key = None
+            if org_id and project_id:
+                try:
+                    api_key = await self._exchange_for_api_key(
+                        client, token_data.get("id_token", "")
+                    )
+                    new_creds["api_key"] = api_key
+                except Exception as e:
+                    lib_logger.warning(f"API key exchange failed: {e}")
+
+            new_creds["_proxy_metadata"] = {
+                "email": email,
+                "account_id": account_id,
+                "org_id": org_id,
+                "project_id": project_id,
+                "plan_type": plan_type,
+                "workspace_title": workspace_title,
+                "last_check_timestamp": time.time(),
+            }
 
             if path:
                 await self._save_credentials(path, new_creds)
 
             lib_logger.info(
-                f"Anthropic OAuth initialized successfully for '{display_name}'."
+                f"{self.ENV_PREFIX} OAuth initialized successfully for '{display_name}'."
             )
 
             return new_creds
 
-    # =========================================================================
-    # TOKEN INITIALIZATION
-    # =========================================================================
+    async def _exchange_for_api_key(
+        self, client: httpx.AsyncClient, id_token: str
+    ) -> Optional[str]:
+        """
+        Exchange ID token for an OpenAI API key.
+
+        Uses the token exchange grant type to get a persistent API key.
+        """
+        import datetime
+
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+        response = await client.post(
+            self.TOKEN_URL,
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "client_id": self.CLIENT_ID,
+                "requested_token": "openai-api-key",
+                "subject_token": id_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "name": f"LLM-API-Key-Proxy [auto-generated] ({today})",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response.raise_for_status()
+        exchange_data = response.json()
+
+        return exchange_data.get("access_token")
 
     async def initialize_token(
         self,
@@ -848,7 +910,7 @@ class AnthropicOAuthBase:
         else:
             display_name = Path(path).name if path else "in-memory object"
 
-        lib_logger.debug(f"Initializing Anthropic token for '{display_name}'...")
+        lib_logger.debug(f"Initializing {self.ENV_PREFIX} token for '{display_name}'...")
 
         try:
             creds = (
@@ -858,9 +920,9 @@ class AnthropicOAuthBase:
 
             if force_interactive:
                 reason = "re-authentication was explicitly requested"
-            elif not creds.get("refresh_token"):
-                reason = "refresh token is missing"
-            elif self._is_token_expired(creds):
+            elif not creds.get("refresh_token") and not creds.get("api_key"):
+                reason = "refresh token and API key are missing"
+            elif self._is_token_expired(creds) and not creds.get("api_key"):
                 reason = "token is expired"
 
             if reason:
@@ -873,7 +935,7 @@ class AnthropicOAuthBase:
                         )
 
                 lib_logger.warning(
-                    f"Anthropic OAuth token for '{display_name}' needs setup: {reason}."
+                    f"{self.ENV_PREFIX} OAuth token for '{display_name}' needs setup: {reason}."
                 )
 
                 coordinator = get_reauth_coordinator()
@@ -883,38 +945,35 @@ class AnthropicOAuthBase:
 
                 return await coordinator.execute_reauth(
                     credential_path=path or display_name,
-                    provider_name="ANTHROPIC_OAUTH",
+                    provider_name=self.ENV_PREFIX,
                     reauth_func=_do_interactive_oauth,
                     timeout=300.0,
                 )
 
-            lib_logger.info(f"Anthropic OAuth token at '{display_name}' is valid.")
+            lib_logger.info(f"{self.ENV_PREFIX} OAuth token at '{display_name}' is valid.")
             return creds
 
         except Exception as e:
             raise ValueError(
-                f"Failed to initialize Anthropic OAuth for '{path}': {e}"
+                f"Failed to initialize {self.ENV_PREFIX} OAuth for '{path}': {e}"
             )
 
-    # =========================================================================
-    # AUTH HEADER
-    # =========================================================================
-
-    async def get_anthropic_auth_header(self, credential_path: str) -> Dict[str, str]:
-        """
-        Get auth header for Anthropic OAuth requests.
-
-        Returns Bearer token header for use with Anthropic Messages API.
-        """
+    async def get_auth_header(self, credential_path: str) -> Dict[str, str]:
+        """Get auth header with graceful degradation if refresh fails."""
         try:
             creds = await self._load_credentials(credential_path)
 
+            # Prefer API key if available
+            if creds.get("api_key"):
+                return {"Authorization": f"Bearer {creds['api_key']}"}
+
+            # Fall back to access token
             if self._is_token_expired(creds):
                 try:
                     creds = await self._refresh_token(credential_path, creds)
                 except Exception as e:
                     cached = self._credentials_cache.get(credential_path)
-                    if cached and cached.get("access_token"):
+                    if cached and (cached.get("access_token") or cached.get("api_key")):
                         lib_logger.warning(
                             f"Token refresh failed for {Path(credential_path).name}: {e}. "
                             "Using cached token."
@@ -923,42 +982,58 @@ class AnthropicOAuthBase:
                     else:
                         raise
 
-            token = creds.get("access_token")
+            token = creds.get("api_key") or creds.get("access_token")
             return {"Authorization": f"Bearer {token}"}
 
         except Exception as e:
             cached = self._credentials_cache.get(credential_path)
-            if cached and cached.get("access_token"):
+            if cached and (cached.get("access_token") or cached.get("api_key")):
                 lib_logger.error(
                     f"Credential load failed for {credential_path}: {e}. Using stale cached token."
                 )
-                token = cached.get("access_token")
+                token = cached.get("api_key") or cached.get("access_token")
                 return {"Authorization": f"Bearer {token}"}
             raise
+
+    async def get_account_id(self, credential_path: str) -> Optional[str]:
+        """Get the ChatGPT account ID for a credential."""
+        creds = await self._load_credentials(credential_path)
+        return creds.get("account_id") or creds.get("_proxy_metadata", {}).get("account_id")
 
     async def proactively_refresh(self, credential_path: str):
         """Proactively refresh a credential by queueing it for refresh."""
         creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
+        if self._is_token_expired(creds) and not creds.get("api_key"):
             await self._queue_refresh(credential_path, force=False, needs_reauth=False)
-
-    def get_credential_tier_info(self, credential_path: str) -> Optional[Dict[str, Any]]:
-        """Get cached tier info for a credential."""
-        return self._tier_cache.get(credential_path)
 
     # =========================================================================
     # CREDENTIAL MANAGEMENT METHODS
     # =========================================================================
 
     def _get_provider_file_prefix(self) -> str:
-        return "anthropic"
+        """Get the file name prefix for this provider's credential files."""
+        return self.ENV_PREFIX.lower()
 
     def _get_oauth_base_dir(self) -> Path:
+        """Get the base directory for OAuth credential files."""
         return Path.cwd() / "oauth_creds"
 
     def _find_existing_credential_by_email(
-        self, email: str, base_dir: Optional[Path] = None
+        self,
+        email: str,
+        base_dir: Optional[Path] = None,
+        account_id: Optional[str] = None,
     ) -> Optional[Path]:
+        """Find an existing credential file for the given email and account.
+
+        When ``account_id`` is provided the match requires **both** the email
+        and the account_id to be equal.  This prevents credentials for the same
+        email on different OpenAI workspaces / organisations from colliding.
+
+        Backward compatibility: if the on-disk credential has no account_id
+        (legacy file created before workspace tracking), it is treated as a
+        match on email alone to avoid creating duplicates.
+        """
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
@@ -969,15 +1044,30 @@ class AnthropicOAuthBase:
             try:
                 with open(cred_file, "r") as f:
                     creds = json.load(f)
-                existing_email = creds.get("_proxy_metadata", {}).get("email")
-                if existing_email == email:
-                    return Path(cred_file)
+                metadata = creds.get("_proxy_metadata", {})
+                existing_email = metadata.get("email")
+                if existing_email != email:
+                    continue
+
+                # If an account_id was supplied, require it to match as well.
+                # Legacy credentials without an account_id are treated as a
+                # match on email alone (backward compatible).
+                if account_id is not None:
+                    existing_account_id = (
+                        creds.get("account_id")
+                        or metadata.get("account_id")
+                    )
+                    if existing_account_id is not None and existing_account_id != account_id:
+                        continue
+
+                return Path(cred_file)
             except Exception:
                 continue
 
         return None
 
     def _get_next_credential_number(self, base_dir: Optional[Path] = None) -> int:
+        """Get the next available credential number."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
@@ -997,6 +1087,7 @@ class AnthropicOAuthBase:
     def _build_credential_path(
         self, base_dir: Optional[Path] = None, number: Optional[int] = None
     ) -> Path:
+        """Build a path for a new credential file."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
@@ -1010,44 +1101,68 @@ class AnthropicOAuthBase:
     async def setup_credential(
         self, base_dir: Optional[Path] = None
     ) -> CredentialSetupResult:
-        """Complete credential setup flow: interactive OAuth → save → return result."""
+        """Complete credential setup flow: OAuth -> save -> discovery."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
-        base_dir.mkdir(parents=True, exist_ok=True)
+        base_dir.mkdir(exist_ok=True)
 
         try:
-            temp_creds: Dict[str, Any] = {
-                "_proxy_metadata": {"display_name": "new Anthropic OAuth credential"}
+            temp_creds = {
+                "_proxy_metadata": {"display_name": f"new {self.ENV_PREFIX} credential"}
             }
-            new_creds = await self._perform_interactive_oauth(
-                path=None, creds=temp_creds, display_name="Anthropic / Claude Code"
+            new_creds = await self.initialize_token(temp_creds)
+
+            email = new_creds.get("_proxy_metadata", {}).get("email")
+
+            if not email:
+                return CredentialSetupResult(
+                    success=False, error="Could not retrieve email from OAuth response"
+                )
+
+            # Extract account_id so we can scope the duplicate check to the
+            # specific workspace / organisation.  Without this, the same email
+            # authenticating to two different workspaces would overwrite the
+            # first credential file.
+            account_id = new_creds.get("account_id") or new_creds.get(
+                "_proxy_metadata", {}
+            ).get("account_id")
+
+            existing_path = self._find_existing_credential_by_email(
+                email, base_dir, account_id=account_id
             )
-
-            email = new_creds.get("_proxy_metadata", {}).get("email", "")
-            subscription_type = new_creds.get("_proxy_metadata", {}).get("subscription_type")
-
-            existing_path = self._find_existing_credential_by_email(email, base_dir) if email else None
             is_update = existing_path is not None
 
-            file_path = existing_path if is_update else self._build_credential_path(base_dir)
+            if is_update:
+                file_path = existing_path
+                lib_logger.info(
+                    f"Updating existing credential at '{Path(file_path).name}' "
+                    f"for {email} (account {account_id})"
+                )
+            else:
+                file_path = self._build_credential_path(base_dir)
+                lib_logger.info(
+                    f"Creating new credential at '{Path(file_path).name}' "
+                    f"for {email} (account {account_id})"
+                )
 
             await self._save_credentials(str(file_path), new_creds)
 
             return CredentialSetupResult(
                 success=True,
                 file_path=str(file_path),
-                email=email or None,
-                tier=subscription_type,
+                email=email,
+                account_id=account_id,
                 is_update=is_update,
                 credentials=new_creds,
             )
 
         except Exception as e:
-            lib_logger.error(f"Anthropic credential setup failed: {e}")
+            lib_logger.error(f"Credential setup failed: {e}")
             return CredentialSetupResult(success=False, error=str(e))
 
     def list_credentials(self, base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """List all credential files for this provider."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
@@ -1060,18 +1175,17 @@ class AnthropicOAuthBase:
                 with open(cred_file, "r") as f:
                     creds = json.load(f)
 
-                # Parse Claude-format credentials if needed
-                parsed = self._parse_claude_credentials_file(creds)
-                metadata = parsed.get("_proxy_metadata", {})
+                metadata = creds.get("_proxy_metadata", {})
 
                 match = re.search(r"_oauth_(\d+)\.json$", cred_file)
                 number = int(match.group(1)) if match else 0
 
                 credentials.append({
                     "file_path": cred_file,
-                    "email": metadata.get("email") or "unknown",
-                    "subscription_type": metadata.get("subscription_type"),
-                    "rate_limit_tier": metadata.get("rate_limit_tier"),
+                    "email": metadata.get("email", "unknown"),
+                    "account_id": creds.get("account_id") or metadata.get("account_id"),
+                    "plan_type": metadata.get("plan_type"),
+                    "workspace_title": metadata.get("workspace_title"),
                     "number": number,
                 })
             except Exception:
@@ -1081,10 +1195,7 @@ class AnthropicOAuthBase:
 
     def build_env_lines(self, creds: Dict[str, Any], cred_number: int) -> List[str]:
         """
-        Generate .env file lines for an Anthropic OAuth credential.
-
-        Handles both the raw Claude CLI format (claudeAiOauth nested)
-        and the already-parsed flat format.
+        Generate .env file lines for an OpenAI OAuth credential.
 
         Args:
             creds: Credential dictionary loaded from JSON
@@ -1093,13 +1204,8 @@ class AnthropicOAuthBase:
         Returns:
             List of .env file lines
         """
-        # Normalize to flat format if needed
-        try:
-            parsed = self._parse_claude_credentials_file(creds)
-        except Exception:
-            parsed = creds
-
-        email = parsed.get("_proxy_metadata", {}).get("email", "unknown")
+        email = creds.get("_proxy_metadata", {}).get("email", "unknown")
+        metadata = creds.get("_proxy_metadata", {})
         prefix = f"{self.ENV_PREFIX}_{cred_number}"
 
         lines = [
@@ -1110,11 +1216,24 @@ class AnthropicOAuthBase:
             "# To combine multiple credentials into one .env file, copy these lines",
             "# and ensure each credential has a unique number (1, 2, 3, etc.)",
             "",
-            f"{prefix}_ACCESS_TOKEN={parsed.get('access_token', '')}",
-            f"{prefix}_REFRESH_TOKEN={parsed.get('refresh_token', '')}",
-            f"{prefix}_EXPIRY_DATE={parsed.get('expiry_date', 0)}",
+            f"{prefix}_ACCESS_TOKEN={creds.get('access_token', '')}",
+            f"{prefix}_REFRESH_TOKEN={creds.get('refresh_token', '')}",
+            f"{prefix}_EXPIRY_DATE={creds.get('expiry_date', 0)}",
             f"{prefix}_EMAIL={email}",
         ]
+
+        # Include API key if present (from token exchange)
+        if creds.get("api_key"):
+            lines.append(f"{prefix}_API_KEY={creds['api_key']}")
+
+        # Include ID token if present
+        if creds.get("id_token"):
+            lines.append(f"{prefix}_ID_TOKEN={creds['id_token']}")
+
+        # Include account ID if present
+        account_id = creds.get("account_id") or metadata.get("account_id", "")
+        if account_id:
+            lines.append(f"{prefix}_ACCOUNT_ID={account_id}")
 
         return lines
 
@@ -1138,13 +1257,8 @@ class AnthropicOAuthBase:
             with open(cred_path, "r") as f:
                 creds = json.load(f)
 
-            # Parse to flat format for email extraction
-            try:
-                parsed = self._parse_claude_credentials_file(creds)
-            except Exception:
-                parsed = creds
-
-            email = parsed.get("_proxy_metadata", {}).get("email", "unknown")
+            # Extract metadata
+            email = creds.get("_proxy_metadata", {}).get("email", "unknown")
 
             # Get credential number from filename
             match = re.search(r"_oauth_(\d+)\.json$", cred_path.name)
@@ -1164,22 +1278,31 @@ class AnthropicOAuthBase:
             with open(env_path, "w") as f:
                 f.write("\n".join(env_lines))
 
-            lib_logger.info(f"Exported Anthropic credential to {env_path}")
+            lib_logger.info(f"Exported credential to {env_path}")
             return str(env_path)
 
         except Exception as e:
-            lib_logger.error(f"Failed to export Anthropic credential: {e}")
+            lib_logger.error(f"Failed to export credential: {e}")
             return None
 
     def delete_credential(self, credential_path: str) -> bool:
-        """Delete a credential file and remove it from cache."""
+        """
+        Delete a credential file.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
         try:
             cred_path = Path(credential_path)
 
+            # Validate that it's one of our credential files
             prefix = self._get_provider_file_prefix()
             if not cred_path.name.startswith(f"{prefix}_oauth_"):
                 lib_logger.error(
-                    f"File {cred_path.name} does not appear to be an Anthropic credential"
+                    f"File {cred_path.name} does not appear to be a {self.ENV_PREFIX} credential"
                 )
                 return False
 
@@ -1187,11 +1310,14 @@ class AnthropicOAuthBase:
                 lib_logger.warning(f"Credential file does not exist: {credential_path}")
                 return False
 
+            # Remove from cache if present
             self._credentials_cache.pop(credential_path, None)
+
+            # Delete the file
             cred_path.unlink()
-            lib_logger.info(f"Deleted Anthropic credential: {credential_path}")
+            lib_logger.info(f"Deleted credential file: {credential_path}")
             return True
 
         except Exception as e:
-            lib_logger.error(f"Failed to delete Anthropic credential: {e}")
+            lib_logger.error(f"Failed to delete credential: {e}")
             return False

@@ -345,6 +345,11 @@ class RotatingClient:
     async def initialize_usage_managers(self) -> None:
         await self._usage_registry.initialize_usage_managers()
 
+        for provider, manager in self._usage_managers.items():
+            instance = self._get_provider_instance(provider)
+            if instance and hasattr(instance, "set_usage_manager"):
+                instance.set_usage_manager(manager)
+
     async def close(self):
         """Close the HTTP client and save usage data."""
         # Save and shutdown new usage managers
