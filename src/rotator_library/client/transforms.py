@@ -10,6 +10,7 @@ scattered throughout client.py, including:
 - Gemini safety settings and thinking parameter
 - NVIDIA thinking parameter
 - dedaluslabs tool_choice=auto removal
+- chutes allowed_openai_params injection for tool calling support
 
 Transforms are applied in a defined order with logging of modifications.
 """
@@ -59,6 +60,7 @@ class ProviderTransforms:
             "nvidia_nim": [self._transform_nvidia_thinking],
             "dedaluslabs": [self._transform_dedaluslabs_tool_choice],
             "mistral": [self._transform_mistral_thinking],
+            "chutes": [self._transform_chutes_allowed_params],
         }
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
@@ -303,6 +305,44 @@ class ProviderTransforms:
             del kwargs["tool_choice"]
             return "dedaluslabs: removed tool_choice=auto"
         return None
+
+    # OpenAI-compatible params that LiteLLM's Chutes provider config
+    # doesn't declare support for.  Without this list, drop_params=True
+    # causes LiteLLM to silently strip tools / tool_choice / etc.
+    _CHUTES_ALLOWED_OPENAI_PARAMS = [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+    ]
+
+    def _transform_chutes_allowed_params(
+        self,
+        kwargs: Dict[str, Any],
+        model: str,
+        provider: str,
+    ) -> Optional[str]:
+        """
+        Inject allowed_openai_params for Chutes provider.
+
+        LiteLLM's built-in Chutes provider config doesn't advertise support
+        for tool calling parameters (tools, tool_choice, etc.), so with
+        litellm.drop_params=True they get silently removed.  This transform
+        tells LiteLLM these standard OpenAI params are safe to pass through
+        to the Chutes API, which is fully OpenAI-compatible.
+        """
+        if provider != "chutes":
+            return None
+
+        # Only inject if the request actually uses any of these params
+        has_tool_params = any(k in kwargs for k in self._CHUTES_ALLOWED_OPENAI_PARAMS)
+        if not has_tool_params:
+            return None
+
+        existing = kwargs.get("allowed_openai_params", [])
+        merged = list(set(existing) | set(self._CHUTES_ALLOWED_OPENAI_PARAMS))
+        kwargs["allowed_openai_params"] = merged
+        return "chutes: injected allowed_openai_params for tool calling"
 
     # =========================================================================
     # SAFETY SETTINGS CONVERSION (REMOVED)
