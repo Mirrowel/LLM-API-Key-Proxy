@@ -46,7 +46,7 @@ from .gemini_shared_utils import (
 )
 
 if TYPE_CHECKING:
-    from ...usage import UsageManager
+    from ...usage import UsageManager  # noqa: F401
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -75,6 +75,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-2.5-flash-lite": 1500,
         # 3-Flash group (verified: ~0.0667% per request = 1500 requests)
         "gemini-3-flash-preview": 1500,
+        "gemini-3-flash": 1500,
+        # 3.1 Flash Lite group (assumed same as 3-flash until verified)
+        "gemini-3.1-flash-lite": 1500,
+        "gemini-3.1-flash-lite-preview": 1500,
     },
     "FREE": {
         # Pro group (verified: 1.0% per request = 100 requests)
@@ -87,6 +91,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-2.5-flash-lite": 1000,
         # 3-Flash group (verified: 0.1% per request = 1000 requests)
         "gemini-3-flash-preview": 1000,
+        "gemini-3-flash": 1000,
+        # 3.1 Flash Lite group (assumed same as 3-flash until verified)
+        "gemini-3.1-flash-lite": 1000,
+        "gemini-3.1-flash-lite-preview": 1000,
     },
 }
 

@@ -60,6 +60,9 @@ QUOTA_FETCH_CONCURRENCY: int = 5
 # Checks for {PREFIX}_1_ACCESS_TOKEN through {PREFIX}_N_ACCESS_TOKEN
 ENV_CREDENTIAL_DISCOVERY_LIMIT: int = 100
 
+# Track permanent unavailability warnings to avoid log spam on each refresh cycle
+_PERMANENT_UNAVAIL_WARNED: set = set()
+
 
 class BaseQuotaTracker:
     """
@@ -554,15 +557,75 @@ class BaseQuotaTracker:
                     quota_used = int((1.0 - remaining) * max_requests)
                 quota_group = self.get_model_quota_group(user_model)
 
-                # Only use reset_timestamp when quota is actually used
+                # Only use reset_timestamp when quota is actually used AND is valid
                 # (remaining == 1.0 means 100% left, timer is bogus)
+                # (reset_timestamp <= 0 means epoch zero / invalid — e.g., Google returns
+                #  "1970-01-01T00:00:00Z" for permanently blocked models)
                 bucket = self._find_bucket_for_model(quota_data, user_model)
                 reset_timestamp = bucket.get("reset_timestamp") if bucket else None
+                if reset_timestamp is not None and reset_timestamp <= 0:
+                    reset_timestamp = None  # Epoch zero is not a valid reset time
                 valid_reset_ts = reset_timestamp if remaining < 1.0 else None
 
-                # DEFAULT: Always apply exhaustion if remaining == 0.0 exactly
-                # (API is authoritative for most providers)
-                apply_exhaustion = remaining == 0.0
+                # Determine if quota is exhausted and whether to apply cooldown
+                if remaining == 0.0 and not valid_reset_ts:
+                    # Permanently unavailable: remaining=0 with no valid reset time
+                    # means the account has no access to this model/group at all
+                    # (e.g., free-tier accounts that lost pro model access).
+                    # Don't use apply_exhaustion (requires reset_timestamp), instead
+                    # apply a direct cooldown to block credential selection.
+                    apply_exhaustion = False
+                    quota_used = max_requests
+                    quota_group_display = quota_group or user_model
+                    cred_display = Path(cred_path).name if not cred_path.startswith('env://') else cred_path
+                    warn_key = f"{cred_display}:{quota_group_display}"
+                    if warn_key not in _PERMANENT_UNAVAIL_WARNED:
+                        _PERMANENT_UNAVAIL_WARNED.add(warn_key)
+                        lib_logger.warning(
+                            f"Model/group '{quota_group_display}' permanently unavailable "
+                            f"for {cred_display} (tier={tier}) - remaining=0 with no reset time, "
+                            f"applying 24h cooldown"
+                        )
+                    else:
+                        lib_logger.debug(
+                            f"Model/group '{quota_group_display}' still unavailable "
+                            f"for {cred_display} (tier={tier}), refreshing cooldown"
+                        )
+
+                    # Apply a 24h cooldown on this credential for the quota group.
+                    # This gets refreshed each background cycle (every 5 min), so it
+                    # stays active as long as the API reports the model is unavailable.
+                    # If access is restored, the API will return remaining > 0 and
+                    # this branch won't execute, allowing the cooldown to expire.
+                    cooldown_target = quota_group or prefixed_model
+                    await usage_manager.apply_cooldown(
+                        accessor=cred_path,
+                        duration=86400,  # 24 hours
+                        reason="permanently_unavailable",
+                        model_or_group=cooldown_target,
+                    )
+                else:
+                    # DEFAULT: Apply exhaustion if remaining == 0.0 exactly
+                    # and we have a reset timestamp (temporary exhaustion)
+                    apply_exhaustion = remaining == 0.0
+
+                    # If this credential+group was previously permanently blocked,
+                    # clear the cooldown now that access has been restored
+                    cred_display = Path(cred_path).name if not cred_path.startswith('env://') else cred_path
+                    quota_group_display = quota_group or user_model
+                    warn_key = f"{cred_display}:{quota_group_display}"
+                    if warn_key in _PERMANENT_UNAVAIL_WARNED:
+                        _PERMANENT_UNAVAIL_WARNED.discard(warn_key)
+                        cooldown_target = quota_group or prefixed_model
+                        cleared = await usage_manager.clear_cooldown_if_exists(
+                            cred_path,
+                            model_or_group=cooldown_target,
+                        )
+                        if cleared:
+                            lib_logger.info(
+                                f"Model/group '{quota_group_display}' access restored "
+                                f"for {cred_display} (tier={tier}) - cooldown cleared"
+                            )
 
                 await usage_manager.update_quota_baseline(
                     cred_path,

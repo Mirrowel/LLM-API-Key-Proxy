@@ -62,6 +62,26 @@ class StreamedAPIError(Exception):
         self.data = data
 
 
+class TerminalRequestError(Exception):
+    """
+    Sentinel exception that wraps a non-rotatable error (e.g. 404 NOT_FOUND).
+
+    When the executor classifies an error as non-rotatable (invalid_request,
+    context_window_exceeded, etc.) and raises the original exception, that raise
+    happens inside an `async with acquire_credential()` block whose cleanup is
+    wrapped by a broad `except Exception: pass`. That bare except swallows the
+    re-raise, causing the rotator to silently move on to the next credential
+    even though the error is model-level (not credential-level).
+
+    Wrapping in TerminalRequestError lets executor.py catch it *before* the
+    swallowing clause and propagate it correctly.
+    """
+
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+
+
 __all__ = [
     # Exception classes
     "NoAvailableKeysError",
@@ -70,6 +90,7 @@ __all__ = [
     "EmptyResponseError",
     "TransientQuotaError",
     "StreamedAPIError",
+    "TerminalRequestError",
     # Error classification
     "ClassifiedError",
     "RequestErrorAccumulator",

@@ -8,7 +8,7 @@ import json
 import httpx
 import logging
 import time
-import asyncio
+
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .gemini_auth_base import GeminiAuthBase
@@ -20,9 +20,9 @@ from .utilities.gemini_shared_utils import (
     inline_schema_refs,
     recursively_parse_json_strings,
     GEMINI3_TOOL_RENAMES,
-    GEMINI3_TOOL_RENAMES_REVERSE,
-    FINISH_REASON_MAP,
-    CODE_ASSIST_ENDPOINT,
+    GEMINI3_TOOL_RENAMES_REVERSE,  # noqa: F401 — re-exported
+    FINISH_REASON_MAP,  # noqa: F401 — re-exported
+    CODE_ASSIST_ENDPOINT,  # noqa: F401 — re-exported
     GEMINI_CLI_ENDPOINT_FALLBACKS,
     GEMINI_CLI_UA_VERSION,
     GEMINI_CLI_NODE_CLIENT_VERSION,
@@ -48,7 +48,7 @@ from pathlib import Path
 import uuid
 import secrets
 import hashlib
-from datetime import datetime
+from datetime import datetime  # noqa: F401 — used in submodules
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -74,7 +74,19 @@ AVAILABLE_MODELS = [
     "gemini-3-pro-preview",
     "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
 ]
+
+# Code Assist API model name remapping.
+# The CCPA backend does not recognize certain user-facing names and expects
+# older/internal identifiers instead.  Matches the official gemini-cli
+# CCPA_AI_MODEL_MAPPINGS in packages/core/src/config/models.ts.
+CCPA_AI_MODEL_MAPPINGS: dict[str, str] = {
+    "gemini-3.5-flash": "gemini-3-flash",
+}
+
 
 # Gemini 3 tool fix system instruction (prevents hallucination)
 DEFAULT_GEMINI3_SYSTEM_INSTRUCTION = """<CRITICAL_TOOL_USAGE_INSTRUCTIONS>
@@ -180,12 +192,14 @@ class GeminiCliProvider(
     # Can be overridden via env: QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"
     model_quota_groups: QuotaGroupMap = {
         # Pro models share a quota pool (verified: gemini-2.5-pro and gemini-3-pro-preview)
-        "pro": ["gemini-2.5-pro", "gemini-3-pro-preview"],
+        "pro": ["gemini-2.5-pro", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
         # All 2.x Flash models share a quota pool (verified: 2.0 shares with 2.5)
         # Note: contrary to PR #62 which claimed 2.0-flash was standalone
         "25-flash": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        # Gemini 3 Flash is standalone (verified)
-        "3-flash": ["gemini-3-flash-preview"],
+        # Gemini 3 Flash models (gemini-3-flash is the GA name for gemini-3-flash-preview)
+        "3-flash": ["gemini-3-flash-preview", "gemini-3-flash"],
+        # Gemini 3.1 Flash Lite models
+        "31-flash-lite": ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"],
     }
 
     # Priority-based concurrency multipliers
@@ -1558,6 +1572,9 @@ class GeminiCliProvider(
             # Handle :thinking suffix
             model_name = attempt_model.split("/")[-1].replace(":thinking", "")
 
+            # Apply Code Assist API model name remapping (e.g. gemini-3.5-flash → gemini-3-flash)
+            api_model_name = CCPA_AI_MODEL_MAPPINGS.get(model_name, model_name)
+
             # Create provider logger from transaction context
             file_logger = ProviderLogger(transaction_context)
 
@@ -1592,7 +1609,7 @@ class GeminiCliProvider(
             # Build payload matching native gemini-cli structure
             # Source: gemini-cli/packages/core/src/code_assist/converter.ts lines 31-48
             request_payload = {
-                "model": model_name,
+                "model": api_model_name,
                 "project": project_id,
                 "user_prompt_id": user_prompt_id,
                 "request": {
@@ -1653,7 +1670,7 @@ class GeminiCliProvider(
 
                 # Build headers matching native gemini-cli client fingerprint
                 final_headers = auth_header.copy()
-                final_headers.update(self._get_gemini_cli_request_headers(model_name))
+                final_headers.update(self._get_gemini_cli_request_headers(api_model_name))
 
                 # Endpoint fallback loop: try sandbox first, then production
                 # Preserve the captured CLI request profile.
@@ -2056,47 +2073,34 @@ class GeminiCliProvider(
                 models.append(f"gemini_cli/{model_id}")
                 env_var_ids.add(model_id)
 
-        # Source 3: Try dynamic discovery from Gemini API (only if ID not already in env vars)
+        # Source 3: Dynamic discovery via Code Assist retrieveUserQuota API.
+        # The Generative Language ListModels endpoint returns 403 for OAuth
+        # credentials (wrong scope), so we extract model IDs from the quota
+        # buckets which already work for this auth path.
         try:
-            # Get access token for API calls
-            auth_header = await self.get_auth_header(credential)
-            access_token = auth_header["Authorization"].split(" ")[1]
+            quota_data = await self.retrieve_user_quota(credential)
+            if quota_data.get("status") == "success":
+                dynamic_count = 0
+                for bucket in quota_data.get("buckets", []):
+                    model_id = bucket.get("model_id")
+                    if not model_id:
+                        continue
+                    # Strip _vertex suffix (quota returns separate request/token buckets)
+                    clean_id = model_id.replace("_vertex", "")
+                    if (
+                        clean_id
+                        and clean_id not in env_var_ids
+                        and clean_id.startswith("gemini")
+                    ):
+                        models.append(f"gemini_cli/{clean_id}")
+                        env_var_ids.add(clean_id)
+                        dynamic_count += 1
 
-            # Try Vertex AI models endpoint
-            # Note: Gemini may not support a simple /models endpoint like OpenAI
-            # This is a best-effort attempt that will gracefully fail if unsupported
-            models_url = f"https://generativelanguage.googleapis.com/v1beta/models"
-
-            response = await client.get(
-                models_url, headers={"Authorization": f"Bearer {access_token}"}
-            )
-            response.raise_for_status()
-
-            dynamic_data = response.json()
-            # Handle various response formats
-            model_list = dynamic_data.get("models", dynamic_data.get("data", []))
-
-            dynamic_count = 0
-            for model in model_list:
-                model_id = extract_model_id(model)
-                # Only include Gemini models that aren't already in env vars
-                if (
-                    model_id
-                    and model_id not in env_var_ids
-                    and model_id.startswith("gemini")
-                ):
-                    models.append(f"gemini_cli/{model_id}")
-                    env_var_ids.add(model_id)
-                    dynamic_count += 1
-
-            if dynamic_count > 0:
-                lib_logger.debug(
-                    f"Discovered {dynamic_count} additional models for gemini_cli from API"
-                )
-
+                if dynamic_count > 0:
+                    lib_logger.info(
+                        f"Discovered {dynamic_count} additional model(s) for gemini_cli from quota API"
+                    )
         except Exception as e:
-            # Silently ignore dynamic discovery errors
-            lib_logger.debug(f"Dynamic model discovery failed for gemini_cli: {e}")
-            pass
+            lib_logger.warning(f"Dynamic model discovery failed for gemini_cli: {e}")
 
         return models
