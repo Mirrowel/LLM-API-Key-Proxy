@@ -624,19 +624,22 @@ class RequestExecutor:
                                 # Pre-request callback
                                 await self._run_pre_request_callback(context, kwargs)
 
-                                # Make the API call
+                                # Make the API call - determine function based on request type
+                                is_embedding = context.request_type == "embedding"
+                                
                                 if plugin and plugin.has_custom_logic():
                                     kwargs["credential_identifier"] = credential_secret
-                                    response = await plugin.acompletion(
-                                        self._http_client, **kwargs
-                                    )
+                                    call_fn = plugin.aembedding if is_embedding else plugin.acompletion
+                                    response = await call_fn(self._http_client, **kwargs)
                                 else:
                                     # Standard LiteLLM call
                                     kwargs["api_key"] = credential_secret
                                     self._apply_litellm_logger(kwargs)
                                     # Remove internal context before litellm call
                                     kwargs.pop("transaction_context", None)
-                                    response = await litellm.acompletion(**kwargs)
+                                    kwargs.pop("_anthropic_payload", None)
+                                    call_fn = litellm.aembedding if is_embedding else litellm.acompletion
+                                    response = await call_fn(**kwargs)
 
                                 # Success! Extract token usage if available
                                 (
@@ -866,6 +869,7 @@ class RequestExecutor:
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
+                                        kwargs.pop("_anthropic_payload", None)
                                         stream = await litellm.acompletion(**kwargs)
 
                                     # Hand off to streaming handler with cred_context

@@ -50,6 +50,7 @@ class StreamingHandler:
         cred_context: Optional["CredentialContext"] = None,
         skip_cost_calculation: bool = False,
         response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cost_calculator: Optional[Callable[[str, int, int], float]] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a LiteLLM stream with error handling and usage tracking.
@@ -97,8 +98,32 @@ class StreamingHandler:
                     )
                 )
             raise StreamedAPIError("Provider returned empty stream", data=None)
-        
-        stream_iterator = stream.__aiter__()
+
+        if not hasattr(stream, "__aiter__"):
+            lib_logger.warning(
+                f"Provider returned a non-streaming response for {model} when stream was requested. Converting to stream."
+            )
+            async def _fake_stream():
+                if hasattr(stream, "model_dump"):
+                    data = stream.model_dump()
+                elif hasattr(stream, "dict"):
+                    data = stream.dict()
+                else:
+                    data = dict(stream)
+                
+                if "choices" in data and isinstance(data["choices"], list):
+                    for choice in data["choices"]:
+                        if "message" in choice:
+                            choice["delta"] = choice.pop("message")
+                
+                if data.get("object") == "chat.completion":
+                    data["object"] = "chat.completion.chunk"
+                
+                yield data
+
+            stream_iterator = _fake_stream().__aiter__()
+        else:
+            stream_iterator = stream.__aiter__()
 
         try:
             while True:
@@ -248,11 +273,23 @@ class StreamingHandler:
                 if cred_context:
                     approx_cost = 0.0
                     if not skip_cost_calculation:
-                        approx_cost = self._calculate_stream_cost(
-                            model,
-                            prompt_tokens_uncached + prompt_tokens_cached,
-                            completion_tokens + thinking_tokens,
-                        )
+                        total_prompt = prompt_tokens_uncached + prompt_tokens_cached
+                        total_completion = completion_tokens + thinking_tokens
+                        if cost_calculator:
+                            try:
+                                approx_cost = cost_calculator(
+                                    model, total_prompt, total_completion
+                                )
+                            except Exception:
+                                approx_cost = 0.0
+                        if approx_cost == 0.0:
+                            approx_cost = self._calculate_stream_cost(
+                                model,
+                                prompt_tokens_uncached,
+                                total_completion,
+                                cache_read_tokens=prompt_tokens_cached,
+                                cache_write_tokens=prompt_tokens_cache_write,
+                            )
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens_uncached,
                         completion_tokens=completion_tokens,
@@ -355,6 +392,12 @@ class StreamingHandler:
         if "choices" in chunk_dict and chunk_dict["choices"]:
             choice = chunk_dict["choices"][0]
             delta = choice.get("delta", {})
+
+            # Normalize non-standard thinking/reasoning field names to
+            # the OpenAI-standard "reasoning_content".
+            # NanoGPT uses "reasoning" instead of "reasoning_content".
+            if "reasoning" in delta and "reasoning_content" not in delta:
+                delta["reasoning_content"] = delta.pop("reasoning")
 
             # Check for tool_calls
             if delta.get("tool_calls"):
@@ -466,16 +509,46 @@ class StreamingHandler:
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> float:
+        """Calculate cost for a streaming response.
+
+        Properly accounts for cached token pricing when available.
+        Cached tokens are typically significantly cheaper than regular input
+        tokens (e.g., 10x cheaper for Anthropic, ~4x for OpenAI).
+
+        Args:
+            model: Model identifier
+            prompt_tokens: Uncached prompt tokens
+            completion_tokens: Completion + thinking tokens
+            cache_read_tokens: Tokens read from cache (charged at reduced rate)
+            cache_write_tokens: Tokens written to cache (charged at write rate)
+        """
         try:
             model_info = litellm.get_model_info(model)
             input_cost = model_info.get("input_cost_per_token")
             output_cost = model_info.get("output_cost_per_token")
+            cache_read_cost = model_info.get("cache_read_input_token_cost")
+            cache_write_cost = model_info.get("cache_creation_input_token_cost")
+
             total_cost = 0.0
             if input_cost:
                 total_cost += prompt_tokens * input_cost
             if output_cost:
                 total_cost += completion_tokens * output_cost
+
+            # Apply cached token pricing: use discounted rate if available,
+            # otherwise fall back to full input rate
+            if cache_read_tokens > 0:
+                rate = cache_read_cost if cache_read_cost else input_cost
+                if rate:
+                    total_cost += cache_read_tokens * rate
+            if cache_write_tokens > 0:
+                rate = cache_write_cost if cache_write_cost else input_cost
+                if rate:
+                    total_cost += cache_write_tokens * rate
+
             return total_cost
         except Exception as exc:
             lib_logger.debug(f"Stream cost calculation failed for {model}: {exc}")

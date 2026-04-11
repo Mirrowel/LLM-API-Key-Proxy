@@ -75,8 +75,10 @@ class NanoGptQuotaTracker:
                 "status": "success" | "error",
                 "error": str | None,
                 "active": bool,
+                "allow_overage": bool,
                 "state": str,  # "active" | "grace" | "inactive"
-                "limits": {"daily": int, "monthly": int},
+                "enforce_daily_limit": bool,
+                "limits": {"daily": int, "monthly": int, "weekly_input_tokens": int},
                 "daily": {
                     "used": int,
                     "remaining": int,
@@ -89,6 +91,12 @@ class NanoGptQuotaTracker:
                     "percent_used": float,
                     "reset_at": float,
                 },
+                "weekly_input_tokens": {
+                    "used": int,
+                    "remaining": int,
+                    "percent_used": float,
+                    "reset_at": float,  # Unix timestamp (seconds)
+                } | None,
                 "fetched_at": float,
             }
         """
@@ -114,16 +122,30 @@ class NanoGptQuotaTracker:
             daily = data.get("daily", {})
             monthly = data.get("monthly", {})
             limits = data.get("limits", {})
+            weekly_tokens_raw = data.get("weeklyInputTokens")
+
+            # Parse weekly token quota if present
+            weekly_input_tokens = None
+            if weekly_tokens_raw is not None:
+                weekly_input_tokens = {
+                    "used": weekly_tokens_raw.get("used", 0),
+                    "remaining": weekly_tokens_raw.get("remaining", 0),
+                    "percent_used": weekly_tokens_raw.get("percentUsed", 0.0),
+                    # Convert epoch ms to seconds
+                    "reset_at": weekly_tokens_raw.get("resetAt", 0) / 1000.0,
+                }
 
             return {
                 "status": "success",
                 "error": None,
                 "active": data.get("active", False),
+                "allow_overage": data.get("allowOverage", False),
                 "state": data.get("state", "inactive"),
                 "enforce_daily_limit": data.get("enforceDailyLimit", False),
                 "limits": {
                     "daily": limits.get("daily", 0),
                     "monthly": limits.get("monthly", 0),
+                    "weekly_input_tokens": limits.get("weeklyInputTokens", 0),
                 },
                 "daily": {
                     "used": daily.get("used", 0),
@@ -138,6 +160,7 @@ class NanoGptQuotaTracker:
                     "percent_used": monthly.get("percentUsed", 0.0),
                     "reset_at": monthly.get("resetAt", 0) / 1000.0,
                 },
+                "weekly_input_tokens": weekly_input_tokens,
                 "fetched_at": time.time(),
             }
 
@@ -154,10 +177,13 @@ class NanoGptQuotaTracker:
                 "status": "error",
                 "error": error_msg,
                 "active": False,
+                "allow_overage": False,
                 "state": "unknown",
-                "limits": {"daily": 0, "monthly": 0},
+                "enforce_daily_limit": False,
+                "limits": {"daily": 0, "monthly": 0, "weekly_input_tokens": 0},
                 "daily": {"used": 0, "remaining": 0, "percent_used": 0.0, "reset_at": 0},
                 "monthly": {"used": 0, "remaining": 0, "percent_used": 0.0, "reset_at": 0},
+                "weekly_input_tokens": None,
                 "fetched_at": time.time(),
             }
         except Exception as e:
@@ -166,10 +192,13 @@ class NanoGptQuotaTracker:
                 "status": "error",
                 "error": str(e),
                 "active": False,
+                "allow_overage": False,
                 "state": "unknown",
-                "limits": {"daily": 0, "monthly": 0},
+                "enforce_daily_limit": False,
+                "limits": {"daily": 0, "monthly": 0, "weekly_input_tokens": 0},
                 "daily": {"used": 0, "remaining": 0, "percent_used": 0.0, "reset_at": 0},
                 "monthly": {"used": 0, "remaining": 0, "percent_used": 0.0, "reset_at": 0},
+                "weekly_input_tokens": None,
                 "fetched_at": time.time(),
             }
 
@@ -194,29 +223,43 @@ class NanoGptQuotaTracker:
         """
         Calculate remaining quota fraction from usage data.
 
-        Uses daily limit by default, unless enforceDailyLimit is False
-        (in which case only monthly matters).
+        Uses monthly limit as the primary enforcement axis.
+        Daily is only used if enforceDailyLimit is True.
 
         Args:
             usage_data: Response from fetch_subscription_usage()
 
         Returns:
-            Remaining fraction (0.0 to 1.0)
+            Remaining fraction (0.0 to 1.0), minimum across enforced limits
         """
         limits = usage_data.get("limits", {})
+        monthly = usage_data.get("monthly", {})
         daily = usage_data.get("daily", {})
+        enforce_daily = usage_data.get("enforce_daily_limit", False)
 
-        daily_limit = limits.get("daily", 0)
-        daily_remaining = daily.get("remaining", 0)
+        fractions = []
 
-        if daily_limit <= 0:
-            return 1.0  # No limit configured
+        # Monthly is always the primary hard limit
+        monthly_limit = limits.get("monthly", 0)
+        if monthly_limit > 0:
+            monthly_remaining = monthly.get("remaining", 0)
+            fractions.append(monthly_remaining / monthly_limit)
 
-        return min(1.0, max(0.0, daily_remaining / daily_limit))
+        # Daily only enforced when enforceDailyLimit is True
+        if enforce_daily:
+            daily_limit = limits.get("daily", 0)
+            if daily_limit > 0:
+                daily_remaining = daily.get("remaining", 0)
+                fractions.append(daily_remaining / daily_limit)
+
+        if not fractions:
+            return 1.0  # No limits configured
+
+        return min(1.0, max(0.0, min(fractions)))
 
     def get_reset_timestamp(self, usage_data: Dict[str, Any]) -> Optional[float]:
         """
-        Get the next reset timestamp from usage data.
+        Get the next reset timestamp from usage data (monthly window).
 
         Args:
             usage_data: Response from fetch_subscription_usage()
@@ -224,8 +267,24 @@ class NanoGptQuotaTracker:
         Returns:
             Unix timestamp when quota resets, or None
         """
-        daily = usage_data.get("daily", {})
-        reset_at = daily.get("reset_at", 0)
+        monthly = usage_data.get("monthly", {})
+        reset_at = monthly.get("reset_at", 0)
+        return reset_at if reset_at > 0 else None
+
+    def get_weekly_token_reset_timestamp(self, usage_data: Dict[str, Any]) -> Optional[float]:
+        """
+        Get the weekly token quota reset timestamp from usage data.
+
+        Args:
+            usage_data: Response from fetch_subscription_usage()
+
+        Returns:
+            Unix timestamp when weekly token quota resets, or None
+        """
+        weekly = usage_data.get("weekly_input_tokens")
+        if not weekly:
+            return None
+        reset_at = weekly.get("reset_at", 0)
         return reset_at if reset_at > 0 else None
 
     # =========================================================================

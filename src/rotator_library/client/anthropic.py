@@ -102,6 +102,9 @@ class AnthropicHandler:
         if anthropic_logger and anthropic_logger.log_dir:
             openai_request["_parent_log_dir"] = anthropic_logger.log_dir
 
+        # Pass original Anthropic request for providers that support native routing
+        openai_request["_anthropic_payload"] = request
+
         if request.stream:
             # Pre-calculate input tokens for message_start
             # Anthropic's native API provides input_tokens in message_start, but OpenAI-format
