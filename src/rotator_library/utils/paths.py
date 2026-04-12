@@ -31,7 +31,11 @@ def get_default_root() -> Path:
         # Running as PyInstaller bundle - use executable's directory
         return Path(sys.executable).parent
     # Running as script or library - use current working directory
-    return Path.cwd()
+    try:
+        return Path.cwd()
+    except OSError:
+        # Fallback to root directory or user home if cwd is inaccessible
+        return Path.home() if Path.home().exists() else Path("/")
 
 
 def get_logs_dir(root: Optional[Union[Path, str]] = None) -> Path:
