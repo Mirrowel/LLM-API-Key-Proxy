@@ -396,9 +396,16 @@ class TransactionLogger:
             return
         try:
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(data, f, indent=2, ensure_ascii=False, default=self._json_default)
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to write {filename}: {e}")
+
+    @staticmethod
+    def _json_default(obj: Any) -> Any:
+        """JSON serializer fallback for non-serializable objects (e.g. Pydantic models)."""
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(exclude_none=True)
+        return str(obj)
 
     def _append_text(self, filename: str, text: str) -> None:
         """Append text to a file in the log directory."""

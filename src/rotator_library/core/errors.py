@@ -82,6 +82,54 @@ class TerminalRequestError(Exception):
         self.original = original
 
 
+class ProxyExhaustionError(Exception):
+    """
+    Raised by the executor when all credentials for a provider are exhausted
+    (or a TerminalRequestError occurs that maps to a specific HTTP status).
+
+    Carries the structured error response dict (ready for JSON serialization)
+    and the dominant upstream error type so that main.py can pick the correct
+    HTTP status code without duck-typing on the return value.
+
+    HTTP status mapping (used in main.py):
+      context_window_exceeded / invalid_request  -> 400
+      authentication                             -> 401
+      forbidden                                  -> 403
+      rate_limit / quota_exceeded                -> 429
+      timeout                                    -> 504
+      server_error / api_connection / other      -> 502
+    """
+
+    # Maps dominant upstream error type to the HTTP status code the proxy should return.
+    _CODE_TO_HTTP_STATUS: dict = {
+        "context_window_exceeded": 400,
+        "invalid_request": 400,
+        "authentication": 401,
+        "forbidden": 403,
+        "rate_limit": 429,
+        "quota_exceeded": 429,
+        # server_error / api_connection / unknown -> 502 (default)
+    }
+
+    def __init__(self, error_response: dict, dominant_code: str | None = None):
+        message = (
+            error_response.get("error", {}).get("message", "Proxy exhaustion error")
+        )
+        super().__init__(message)
+        self.error_response = error_response
+        self.dominant_code = dominant_code
+
+    @property
+    def http_status(self) -> int:
+        """Return the appropriate HTTP status code for this exhaustion error."""
+        if self.dominant_code in self._CODE_TO_HTTP_STATUS:
+            return self._CODE_TO_HTTP_STATUS[self.dominant_code]
+        # Timeout: check the details flag when there is no dominant error code
+        if self.error_response.get("error", {}).get("details", {}).get("timeout"):
+            return 504
+        return 502
+
+
 __all__ = [
     # Exception classes
     "NoAvailableKeysError",
@@ -91,6 +139,7 @@ __all__ = [
     "TransientQuotaError",
     "StreamedAPIError",
     "TerminalRequestError",
+    "ProxyExhaustionError",
     # Error classification
     "ClassifiedError",
     "RequestErrorAccumulator",

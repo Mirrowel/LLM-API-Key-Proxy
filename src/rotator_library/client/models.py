@@ -119,6 +119,7 @@ class ModelResolver:
 
         # Then check blacklist
         if self._is_blacklisted(model, provider):
+            lib_logger.debug(f"Model '{model}' (provider: {provider}) is BLACKLISTED")
             return False
 
         return True
@@ -142,10 +143,20 @@ class ModelResolver:
         """
         model_provider = model.split("/")[0] if "/" in model else provider
 
-        if model_provider not in self._ignore:
+        # Priority 1: Exact match on model's provider prefix
+        if model_provider in self._ignore:
+            ignore_list = self._ignore[model_provider]
+        # Priority 2: Match on the caller's provider name (e.g. "gemini" when model is "google/...")
+        elif provider in self._ignore:
+            ignore_list = self._ignore[provider]
+        # Priority 3: Common aliases
+        elif model_provider == "google" and "gemini" in self._ignore:
+            ignore_list = self._ignore["gemini"]
+        elif model_provider == "gemini" and "google" in self._ignore:
+            ignore_list = self._ignore["google"]
+        else:
             return False
 
-        ignore_list = self._ignore[model_provider]
         if ignore_list == ["*"]:
             return True
 
@@ -176,10 +187,20 @@ class ModelResolver:
         """
         model_provider = model.split("/")[0] if "/" in model else provider
 
-        if model_provider not in self._whitelist:
+        # Priority 1: Exact match on model's provider prefix
+        if model_provider in self._whitelist:
+            whitelist = self._whitelist[model_provider]
+        # Priority 2: Match on the caller's provider name
+        elif provider in self._whitelist:
+            whitelist = self._whitelist[provider]
+        # Priority 3: Common aliases
+        elif model_provider == "google" and "gemini" in self._whitelist:
+            whitelist = self._whitelist["gemini"]
+        elif model_provider == "gemini" and "google" in self._whitelist:
+            whitelist = self._whitelist["google"]
+        else:
             return False
 
-        whitelist = self._whitelist[model_provider]
         model_name = model.split("/", 1)[1] if "/" in model else model
 
         for pattern in whitelist:

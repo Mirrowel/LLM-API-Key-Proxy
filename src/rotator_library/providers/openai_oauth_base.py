@@ -40,6 +40,7 @@ from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
 from ..error_handler import CredentialNeedsReauthError
+from ..proxy_config import ProxyConfig
 
 lib_logger = logging.getLogger("rotator_library")
 console = Console()
@@ -193,6 +194,9 @@ class OpenAIOAuthBase:
         self._refresh_max_retries: int = 3
         self._reauth_timeout_seconds: int = 300
 
+        # Proxy configuration (injected by RotatingClient after construction)
+        self._proxy_config: Optional[ProxyConfig] = None
+
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """Parse a virtual env:// path and return the credential index."""
         if not path.startswith("env://"):
@@ -345,6 +349,41 @@ class OpenAIOAuthBase:
 
         return expiry_timestamp < time.time()
 
+    def _get_credential_stable_id(self, path: str) -> str:
+        """Derive the stable_id for a credential path from cached metadata."""
+        creds = self._credentials_cache.get(path)
+        if creds:
+            metadata = creds.get("_proxy_metadata", {})
+            login = metadata.get("login")
+            email = metadata.get("email")
+            stable = login or email
+            if stable:
+                account_id = creds.get("account_id") or metadata.get("account_id")
+                if account_id:
+                    return f"{stable}::{account_id}"
+                return stable
+        return ""
+
+    def _build_proxy_client_kwargs(self, path: str, provider: str = "") -> Dict[str, Any]:
+        """Build httpx.AsyncClient kwargs with proxy routing for a credential.
+
+        Uses the same proxy resolution as API requests so that token refresh
+        traffic egresses from the same IP as normal requests.
+        """
+        kwargs: Dict[str, Any] = {}
+        if not self._proxy_config or not self._proxy_config.has_any_proxy:
+            return kwargs
+
+        stable_id = self._get_credential_stable_id(path)
+        provider = provider or self.ENV_PREFIX.lower()
+        spec = self._proxy_config.resolve(provider, path, stable_id)
+        if spec:
+            kwargs["proxy"] = spec.url
+            lib_logger.debug(
+                f"Token refresh for '{Path(path).name}' will use proxy {spec.url}"
+            )
+        return kwargs
+
     async def _refresh_token(
         self, path: str, creds: Dict[str, Any], force: bool = False
     ) -> Dict[str, Any]:
@@ -367,7 +406,8 @@ class OpenAIOAuthBase:
             new_token_data = None
             last_error = None
 
-            async with httpx.AsyncClient() as client:
+            proxy_kwargs = self._build_proxy_client_kwargs(path)
+            async with httpx.AsyncClient(**proxy_kwargs) as client:
                 for attempt in range(max_retries):
                     try:
                         response = await client.post(
@@ -396,9 +436,11 @@ class OpenAIOAuthBase:
                             asyncio.create_task(
                                 self._queue_refresh(path, force=True, needs_reauth=True)
                             )
+                            msg = f"Refresh token invalid for '{Path(path).name}'. Re-auth queued."
+                            self._record_refresh_error(path, "CredentialNeedsReauth", msg, 400)
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                message=msg,
                             )
 
                         elif status_code in (401, 403):
@@ -408,9 +450,11 @@ class OpenAIOAuthBase:
                             asyncio.create_task(
                                 self._queue_refresh(path, force=True, needs_reauth=True)
                             )
+                            msg = f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued."
+                            self._record_refresh_error(path, "CredentialNeedsReauth", msg, status_code)
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                                message=msg,
                             )
 
                         elif status_code == 429:
@@ -594,10 +638,33 @@ class OpenAIOAuthBase:
                     async with self._queue_tracking_lock:
                         self._queued_credentials.discard(path)
 
+    def _record_refresh_error(self, path: str, error_type: str, message: str, status_code: int | None = None):
+        """Record a token refresh error to the global error tracker."""
+        try:
+            from ..error_tracker import get_error_tracker
+            from ..error_handler import mask_credential
+            tracker = get_error_tracker()
+            provider = self.ENV_PREFIX.lower()
+            tracker.record_error(
+                provider=provider,
+                model=f"{provider}/token-refresh",
+                error_type=error_type,
+                error_message=message,
+                credential_masked=mask_credential(path, style="full"),
+                attempt=1,
+                status_code=status_code,
+            )
+        except Exception:
+            pass
+
     async def _handle_refresh_failure(self, path: str, force: bool, error: str):
         """Handle a refresh failure with back-of-line retry logic."""
         retry_count = self._queue_retry_count.get(path, 0) + 1
         self._queue_retry_count[path] = retry_count
+
+        self._record_refresh_error(
+            path, "TokenRefreshFailed", f"Refresh failed for '{Path(path).name}': {error}"
+        )
 
         if retry_count >= self._refresh_max_retries:
             lib_logger.error(
@@ -780,7 +847,8 @@ class OpenAIOAuthBase:
 
         lib_logger.info("Exchanging authorization code for tokens...")
 
-        async with httpx.AsyncClient() as client:
+        proxy_kwargs = self._build_proxy_client_kwargs(path) if path else {}
+        async with httpx.AsyncClient(**proxy_kwargs) as client:
             redirect_uri = f"http://localhost:{self.callback_port}{self.CALLBACK_PATH}"
 
             response = await client.post(
@@ -977,6 +1045,11 @@ class OpenAIOAuthBase:
                         lib_logger.warning(
                             f"Token refresh failed for {Path(credential_path).name}: {e}. "
                             "Using cached token."
+                        )
+                        self._record_refresh_error(
+                            credential_path, "TokenRefreshFailed",
+                            f"Token refresh failed for {Path(credential_path).name}: {e}",
+                            status_code=getattr(e, "status_code", None),
                         )
                         creds = cached
                     else:

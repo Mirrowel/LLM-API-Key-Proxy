@@ -20,6 +20,11 @@ import re
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import litellm
+from litellm.exceptions import (
+    APIConnectionError,
+    InternalServerError,
+    ServiceUnavailableError,
+)
 
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
@@ -29,6 +34,51 @@ if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
 
 lib_logger = logging.getLogger("rotator_library")
+
+# Gemma-4 and similar models emit reasoning inside <thought>...</thought>
+# tags within the regular content field.  We strip these blocks so that
+# clients (e.g. Desktop All Goose) do not render raw reasoning in the
+# normal response area.
+_THOUGHT_OPEN = "<thought>"
+_THOUGHT_CLOSE = "</thought>"
+
+
+def _split_thought_tags(
+    text: str, in_thought: bool
+) -> tuple[str, str, bool]:
+    """
+    Split *text* into ``(content, reasoning_content, new_in_thought)``.
+
+    Handles <thought>...</thought> blocks that may span multiple chunks.
+    Text inside the tags becomes ``reasoning_content``; text outside stays
+    in ``content``.  This maps Gemma-4's inline reasoning to the
+    OpenAI-standard ``reasoning_content`` field.
+    """
+    if not text:
+        return text, "", in_thought
+
+    if in_thought:
+        close_idx = text.find(_THOUGHT_CLOSE)
+        if close_idx != -1:
+            reasoning = text[:close_idx]
+            content = text[close_idx + len(_THOUGHT_CLOSE) :]
+            return content, reasoning, False
+        return "", text, True
+
+    open_idx = text.find(_THOUGHT_OPEN)
+    if open_idx == -1:
+        return text, "", False
+
+    before = text[:open_idx]
+    after_open = text[open_idx + len(_THOUGHT_OPEN) :]
+
+    close_idx = after_open.find(_THOUGHT_CLOSE)
+    if close_idx != -1:
+        reasoning = after_open[:close_idx]
+        after = after_open[close_idx + len(_THOUGHT_CLOSE) :]
+        return before + after, reasoning, False
+
+    return before, after_open, True
 
 
 class StreamingHandler:
@@ -74,6 +124,7 @@ class StreamingHandler:
         error_buffer = StreamBuffer()  # Use StreamBuffer for JSON reassembly
         accumulated_finish_reason: Optional[str] = None
         has_tool_calls = False
+        in_thought_block = False
         prompt_tokens = 0
         prompt_tokens_cached = 0
         prompt_tokens_cache_write = 0
@@ -145,6 +196,7 @@ class StreamingHandler:
                         chunk,
                         accumulated_finish_reason,
                         has_tool_calls,
+                        in_thought_block,
                         model,
                     )
                     self._collect_session_response_anchors(
@@ -152,6 +204,7 @@ class StreamingHandler:
                         assistant_parts,
                         tool_call_ids,
                     )
+                    in_thought_block = processed.in_thought_block
 
                     # Update tracking state
                     if processed.has_tool_calls:
@@ -233,6 +286,15 @@ class StreamingHandler:
                         )
                     # Continue waiting for more chunks
                     continue
+
+                except (APIConnectionError, InternalServerError, ServiceUnavailableError):
+                    # Server/connection errors are transient and should be
+                    # retried on the same key with backoff (handled by the
+                    # executor's dedicated except block).  Re-raise raw so
+                    # the executor can classify them correctly — wrapping
+                    # them as StreamedAPIError would lose the error type and
+                    # cause the executor to rotate instead of retrying.
+                    raise
 
                 except Exception as e:
                     # Try to extract JSON from fragmented response
@@ -359,6 +421,7 @@ class StreamingHandler:
         chunk: Any,
         accumulated_finish_reason: Optional[str],
         has_tool_calls: bool,
+        in_thought_block: bool = False,
         model: str = "",
     ) -> ProcessedChunk:
         """
@@ -367,11 +430,14 @@ class StreamingHandler:
         Handles finish_reason logic:
         - Strip from intermediate chunks
         - Apply correct finish_reason on final chunk
+        - Strip <thought>...</thought> blocks from delta.content
 
         Args:
             chunk: Raw chunk from LiteLLM
             accumulated_finish_reason: Current accumulated finish reason
             has_tool_calls: Whether any chunk has had tool_calls
+            in_thought_block: Whether we are inside a <thought> block
+            model: Model name for usage normalization
 
         Returns:
             ProcessedChunk with SSE string and metadata
@@ -398,6 +464,21 @@ class StreamingHandler:
             # NanoGPT uses "reasoning" instead of "reasoning_content".
             if "reasoning" in delta and "reasoning_content" not in delta:
                 delta["reasoning_content"] = delta.pop("reasoning")
+
+            # Extract <thought>...</thought> blocks from content into
+            # reasoning_content so reasoning-aware clients can display them
+            # separately (OpenAI o1-style).
+            if "content" in delta and isinstance(delta["content"], str):
+                content, reasoning_content, in_thought_block = _split_thought_tags(
+                    delta["content"], in_thought_block
+                )
+                if reasoning_content:
+                    existing = delta.get("reasoning_content", "")
+                    delta["reasoning_content"] = existing + reasoning_content
+                if content:
+                    delta["content"] = content
+                else:
+                    delta.pop("content", None)
 
             # Check for tool_calls
             if delta.get("tool_calls"):
@@ -454,6 +535,7 @@ class StreamingHandler:
             usage=usage,
             finish_reason=finish_reason,
             has_tool_calls=chunk_has_tool_calls,
+            in_thought_block=in_thought_block,
         )
 
     def _try_extract_error(
@@ -517,15 +599,23 @@ class StreamingHandler:
         Properly accounts for cached token pricing when available.
         Cached tokens are typically significantly cheaper than regular input
         tokens (e.g., 10x cheaper for Anthropic, ~4x for OpenAI).
-
-        Args:
-            model: Model identifier
-            prompt_tokens: Uncached prompt tokens
-            completion_tokens: Completion + thinking tokens
-            cache_read_tokens: Tokens read from cache (charged at reduced rate)
-            cache_write_tokens: Tokens written to cache (charged at write rate)
         """
         try:
+            # Prefer ModelInfoService if ready (supports provider aliases and unified pricing)
+            from ..model_info_service import get_model_info_service
+            registry = get_model_info_service()
+            if registry and registry.is_ready:
+                cost = registry.calculate_cost(
+                    model, 
+                    prompt_tokens, 
+                    completion_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_write_tokens
+                )
+                if cost is not None:
+                    return float(cost)
+
+            # Fallback to LiteLLM's internal database
             model_info = litellm.get_model_info(model)
             input_cost = model_info.get("input_cost_per_token")
             output_cost = model_info.get("output_cost_per_token")

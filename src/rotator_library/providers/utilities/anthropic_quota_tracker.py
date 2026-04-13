@@ -22,11 +22,10 @@ Required from provider:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -206,7 +205,10 @@ class AnthropicQuotaTracker:
             # Get auth header from the OAuth base class
             auth_headers = await self.get_anthropic_auth_header(credential_path)
 
-            async with httpx.AsyncClient() as client:
+            proxy_kwargs = {}
+            if hasattr(self, "_build_proxy_client_kwargs"):
+                proxy_kwargs = self._build_proxy_client_kwargs(credential_path)
+            async with httpx.AsyncClient(**proxy_kwargs) as client:
                 response = await client.get(
                     ANTHROPIC_USAGE_URL,
                     headers={

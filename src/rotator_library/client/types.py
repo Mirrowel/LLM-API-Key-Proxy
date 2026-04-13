@@ -9,7 +9,9 @@ Shared types are in core/types.py.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Optional, Set
+
+from ..core.constants import DEFAULT_QUOTA_FAILURE_THRESHOLD
 
 
 @dataclass
@@ -50,6 +52,7 @@ class RetryState:
     tried_credentials: Set[str] = field(default_factory=set)
     last_exception: Optional[Exception] = None
     consecutive_quota_failures: int = 0
+    quota_failure_threshold: int = DEFAULT_QUOTA_FAILURE_THRESHOLD
 
     def record_attempt(self, credential: str) -> None:
         """Record that a credential was tried."""

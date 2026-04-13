@@ -68,9 +68,9 @@ def get_provider_endpoint(provider: str, model_name: str, incoming_path: str) ->
             return f"{base_url}/embed"
 
     # Default for OpenAI-compatible providers
-    # Most of these have /v1 in the base URL already, so we just append the action.
-    if base_url.endswith(("/v1", "/v1/openai")):
-        return f"{base_url}/{action}"
+    # If the base URL already contains /v1, we just append the action.
+    if "/v1" in base_url or base_url.endswith("/v1/openai"):
+        return f"{base_url.rstrip('/')}/{action}"
     
-    # Fallback for other cases
-    return f"{base_url}/v1/{action}"
+    # Fallback for other cases (append /v1)
+    return f"{base_url.rstrip('/')}/v1/{action}"

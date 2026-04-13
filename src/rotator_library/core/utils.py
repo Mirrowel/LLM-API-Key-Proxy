@@ -6,7 +6,7 @@ Shared utility functions for the rotator library.
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -71,7 +71,7 @@ def normalize_usage_for_response(usage: Any, model: str = "") -> None:
         usage.completion_tokens = new_completion
         usage.total_tokens = prompt + new_completion
 
-    lib_logger.warning(
+    lib_logger.debug(
         f"Provider usage does not follow inclusive reasoning convention "
         f"(completion_tokens={completion} < reasoning_tokens={reasoning}). "
         f"Auto-normalizing for response. model={model}"

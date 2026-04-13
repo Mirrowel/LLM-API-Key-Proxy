@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from typing import (
     Any,
@@ -24,7 +25,6 @@ from typing import (
     Dict,
     List,
     Optional,
-    Set,
     TYPE_CHECKING,
     Tuple,
     Union,
@@ -39,14 +39,13 @@ from litellm.exceptions import (
     InternalServerError,
 )
 
-from ..core.types import RequestContext, ErrorAction
-from ..core.utils import normalize_usage_for_response
+from ..core.types import RequestContext, ErrorAction, FilterResult
 from ..core.errors import (
     NoAvailableKeysError,
     PreRequestCallbackError,
     StreamedAPIError,
     TerminalRequestError,
-    ClassifiedError,
+    ProxyExhaustionError,
     RequestErrorAccumulator,
     classify_error,
     should_rotate_on_error,
@@ -59,18 +58,22 @@ from ..core.constants import (
     DEFAULT_TRANSIENT_RETRY_DELAY,
     DEFAULT_TRANSIENT_RETRY_JITTER,
     DEFAULT_STREAM_RETRY_ON_REASONING_ONLY,
+    DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER,
+    ENV_PREFIX_MAX_RETRIES,
 )
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
+from ..core.utils import normalize_usage_for_response
 
-from .types import RetryState, AvailabilityStats
+from .types import RetryState
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
 from .stream_retry_policy import can_retry_stream_after_error
 
 if TYPE_CHECKING:
+    from ..error_handler import ClassifiedError
     from ..usage import UsageManager
 
 lib_logger = logging.getLogger("rotator_library")
@@ -101,6 +104,7 @@ class RequestExecutor:
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         litellm_logger_fn: Optional[Any] = None,
         provider_instances: Optional[Dict[str, Any]] = None,
+        client_pool: Optional[Any] = None,
     ):
         """
         Initialize RequestExecutor.
@@ -120,6 +124,7 @@ class RequestExecutor:
             litellm_logger_fn: Optional callback function for LiteLLM logging
             provider_instances: Shared dict for caching provider instances.
                 If None, creates a new dict (not recommended - leads to duplicate instances).
+            client_pool: Optional ProxiedClientPool instance
         """
         self._usage_managers = usage_managers
         self._cooldown = cooldown_manager
@@ -135,6 +140,10 @@ class RequestExecutor:
         self._abort_on_callback_error = abort_on_callback_error
         self._litellm_provider_params = litellm_provider_params or {}
         self._litellm_logger_fn = litellm_logger_fn
+        self._client_pool = client_pool
+        # Per-provider retry overrides (cached on first lookup)
+        self._provider_max_retries: Dict[str, int] = {}
+        self._provider_retries_loaded = False
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
 
@@ -154,7 +163,7 @@ class RequestExecutor:
             jitter = DEFAULT_TRANSIENT_RETRY_JITTER
         return max(0.0, base) + random.uniform(0.0, max(0.0, jitter))
 
-    def _is_transient_error(self, classified: ClassifiedError) -> bool:
+    def _is_transient_error(self, classified: "ClassifiedError") -> bool:
         return classified.error_type in {"server_error", "api_connection", "rate_limit"}
 
     def _stream_retry_on_reasoning_only_enabled(self) -> bool:
@@ -181,6 +190,123 @@ class RequestExecutor:
         lib_logger.info(f"Waiting {delay:.1f}s before {reason}")
         await asyncio.sleep(delay)
         return True
+
+    async def _resolve_http_client(
+        self, provider: str, credential: str, stable_id: str
+    ) -> httpx.AsyncClient:
+        """Resolve the httpx client for a request, using proxy pool if available."""
+        if self._client_pool:
+            return await self._client_pool.get_client(provider, credential, stable_id)
+        return self._http_client
+
+    async def _resolve_litellm_client(
+        self, provider: str, credential: str, stable_id: str,
+        base_url: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[Any]:
+        """Build a litellm-compatible client backed by the proxy pool.
+
+        Many providers are routed through an OpenAI-compatible endpoint via
+        ``ProviderConfig.convert_for_litellm``, so litellm's OpenAI code
+        path expects an ``openai.AsyncOpenAI`` instance.  We create one
+        whose underlying ``httpx.AsyncClient`` routes through our SOCKS5 /
+        HTTP proxy.
+
+        Args:
+            base_url: The API base URL.  Required for the injected
+                ``openai.AsyncOpenAI`` client — without it the SDK would
+                default to ``api.openai.com``.  For native litellm providers
+                (e.g. gemini/) where no ``API_BASE_*`` is configured, this
+                will be ``None`` and the method returns ``None``; litellm
+                then uses its own handler (without SOCKS proxy).
+            extra_headers: Additional default headers to set on the OpenAI
+                client (e.g. User-Agent, X-Title).  When we inject our own
+                ``openai.AsyncOpenAI`` client, litellm's ``extra_headers``
+                kwarg is bypassed, so these must be baked in here.
+
+        Returns None when no proxy applies or base_url is missing.
+        """
+        if not self._client_pool:
+            return None
+        spec = self._client_pool.config.resolve(provider, credential, stable_id)
+        if spec is None:
+            return None
+        if not base_url:
+            lib_logger.debug(
+                f"Proxy configured for {provider}/{stable_id} but no api_base "
+                f"available — skipping custom client (litellm will use its "
+                f"native handler without SOCKS proxy)"
+            )
+            return None
+        import openai
+
+        proxy_url = spec.url
+        proxied_transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
+        proxied_httpx = httpx.AsyncClient(
+            transport=proxied_transport,
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            follow_redirects=True,
+        )
+        return openai.AsyncOpenAI(
+            api_key=credential,
+            base_url=base_url,
+            http_client=proxied_httpx,
+            default_headers=extra_headers or {},
+        )
+    def _get_max_retries(self, provider: str) -> int:
+        """Get max retries for a provider.
+
+        Resolution order:
+        1. MAX_RETRIES_{PROVIDER} env var (e.g. MAX_RETRIES_CHUTES=5)
+        2. Global self._max_retries (from constructor / DEFAULT_MAX_RETRIES)
+
+        Results are cached after first lookup.
+
+        Args:
+            provider: Provider name
+
+        Returns:
+            Max retry count for this provider
+        """
+        if provider in self._provider_max_retries:
+            return self._provider_max_retries[provider]
+
+        provider_upper = provider.upper()
+        env_keys = [f"{ENV_PREFIX_MAX_RETRIES}{provider_upper}"]
+
+        if provider == "gemini":
+            env_keys.append(f"{ENV_PREFIX_MAX_RETRIES}GOOGLE")
+        elif provider == "google":
+            env_keys.append(f"{ENV_PREFIX_MAX_RETRIES}GEMINI")
+
+        env_val = None
+        for env_key in env_keys:
+            env_val = os.environ.get(env_key)
+            if env_val is not None:
+                break
+
+        if env_val is not None:
+            try:
+                retries = int(env_val)
+                if retries < 1:
+                    lib_logger.warning(
+                        f"Invalid {env_key}='{env_val}'. Must be >= 1. Using default ({self._max_retries})."
+                    )
+                    retries = self._max_retries
+                else:
+                    lib_logger.info(
+                        f"Per-provider max retries: {provider} = {retries} (from {env_key})"
+                    )
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid {env_key}='{env_val}'. Must be integer. Using default ({self._max_retries})."
+                )
+                retries = self._max_retries
+        else:
+            retries = self._max_retries
+
+        self._provider_max_retries[provider] = retries
+        return retries
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
         """Get or create a plugin instance for a provider."""
@@ -379,6 +505,7 @@ class RequestExecutor:
             cred,
             context.kwargs.copy(),
             provider_config_override=context.provider_config,
+            request_type=getattr(context, "request_type", "chat"),
         )
 
         # Sanitize request payload
@@ -558,6 +685,7 @@ class RequestExecutor:
         error_accumulator.provider = provider
 
         retry_state = RetryState()
+        max_retries = self._get_max_retries(provider)
         last_exception: Optional[Exception] = None
 
         while time.time() < deadline:
@@ -616,18 +744,23 @@ class RequestExecutor:
                         plugin = self._get_plugin_instance(provider)
 
                         # Execute request with retries
-                        for attempt in range(self._max_retries):
+                        for attempt in range(max_retries):
                             try:
                                 lib_logger.info(
                                     f"Attempting call with credential {mask_credential(cred)} "
-                                    f"(Attempt {attempt + 1}/{self._max_retries})"
+                                    f"(Attempt {attempt + 1}/{max_retries})"
                                 )
                                 # Pre-request callback
                                 await self._run_pre_request_callback(context, kwargs)
 
-                                # Make the API call - determine function based on request type
-                                is_embedding = context.request_type == "embedding"
-                                
+                                # Resolve proxy-aware HTTP client
+                                request_client = await self._resolve_http_client(
+                                    provider, cred, cred_context.stable_id
+                                )
+
+                                is_embedding = getattr(context, "request_type", "chat") == "embedding"
+
+                                # Make the API call
                                 if plugin and plugin.has_custom_logic():
                                     kwargs["credential_identifier"] = credential_secret
                                     call_fn = plugin.aembedding if is_embedding else plugin.acompletion
@@ -635,12 +768,21 @@ class RequestExecutor:
                                 else:
                                     # Standard LiteLLM call
                                     kwargs["api_key"] = credential_secret
+                                    kwargs["max_retries"] = 0
                                     self._apply_litellm_logger(kwargs)
                                     # Remove internal context before litellm call
                                     kwargs.pop("transaction_context", None)
-                                    kwargs.pop("_anthropic_payload", None)
-                                    call_fn = litellm.aembedding if is_embedding else litellm.acompletion
-                                    response = await call_fn(**kwargs)
+                                    litellm_client = await self._resolve_litellm_client(
+                                        provider, cred, cred_context.stable_id,
+                                        base_url=kwargs.get("api_base"),
+                                        extra_headers=kwargs.get("extra_headers"),
+                                    )
+                                    if litellm_client:
+                                        kwargs["client"] = litellm_client
+                                    if is_embedding:
+                                        response = await litellm.aembedding(**kwargs)
+                                    else:
+                                        response = await litellm.acompletion(**kwargs)
 
                                 # Success! Extract token usage if available
                                 (
@@ -689,7 +831,9 @@ class RequestExecutor:
                                             f"Failed to log response: {log_err}"
                                         )
 
-                                return self._normalize_response_usage(response, model)
+                                if hasattr(response, "usage") and response.usage:
+                                    normalize_usage_for_response(response.usage, model)
+                                return self._extract_thought_tags_from_response(response)
 
                             except Exception as e:
                                 last_exception = e
@@ -699,9 +843,11 @@ class RequestExecutor:
                                     model,
                                     provider,
                                     attempt,
+                                    max_retries,
                                     error_accumulator,
                                     retry_state,
                                     request_headers,
+                                    deadline=deadline,
                                 )
 
                                 if action == ErrorAction.RETRY_SAME:
@@ -734,21 +880,29 @@ class RequestExecutor:
                     f"Non-rotatable error for {model} ({classified.error_type}, "
                     f"HTTP {classified.status_code}): {str(original)[:200]} — skipping rotation"
                 )
-                # Build an immediate error response
+                # Build an immediate error response and raise with proper HTTP mapping
                 from ..error_handler import RequestErrorAccumulator as _RqErrAcc
                 acc = _RqErrAcc()
                 acc.model = model
                 acc.provider = provider
                 acc.record_error("(terminal)", classified, str(original)[:200])
-                return acc.build_client_error_response()
+                error_response = acc.build_client_error_response()
+                raise ProxyExhaustionError(
+                    error_response,
+                    dominant_code=classified.error_type,
+                )
 
         # All credentials exhausted
         error_accumulator.timeout_occurred = time.time() >= deadline
         if last_exception and not error_accumulator.has_errors():
             raise last_exception
 
-        # Return error response
-        return error_accumulator.build_client_error_response()
+        # Raise ProxyExhaustionError so main.py can map to the correct HTTP status
+        error_response = error_accumulator.build_client_error_response()
+        raise ProxyExhaustionError(
+            error_response,
+            dominant_code=error_accumulator.get_dominant_error_type(),
+        )
 
     async def _execute_streaming(
         self,
@@ -793,6 +947,7 @@ class RequestExecutor:
         error_accumulator.provider = provider
 
         retry_state = RetryState()
+        max_retries = self._get_max_retries(provider)
         last_exception: Optional[Exception] = None
 
         try:
@@ -865,15 +1020,18 @@ class RequestExecutor:
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
                             )
+                            # Use plugin's cost calculator if available
+                            cost_calculator = None
+                            if plugin and hasattr(plugin, "calculate_cost"):
+                                cost_calculator = plugin.calculate_cost
 
                             # Execute request with retries
-                            for attempt in range(self._max_retries):
+                            for attempt in range(max_retries):
                                 last_streamed_chunk: Optional[str] = None
-
                                 try:
                                     lib_logger.info(
                                         f"Attempting stream with credential {mask_credential(cred)} "
-                                        f"(Attempt {attempt + 1}/{self._max_retries})"
+                                        f"(Attempt {attempt + 1}/{max_retries})"
                                     )
                                     # Pre-request callback
                                     await self._run_pre_request_callback(
@@ -889,10 +1047,10 @@ class RequestExecutor:
                                     else:
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
+                                        kwargs["max_retries"] = 0  # Disable litellm internal retries; we handle them
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
-                                        kwargs.pop("_anthropic_payload", None)
                                         stream = await litellm.acompletion(**kwargs)
 
                                     # Hand off to streaming handler with cred_context
@@ -907,6 +1065,7 @@ class RequestExecutor:
                                         response_callback=lambda response: self._record_session_response(
                                             context, response
                                         ),
+                                        cost_calculator=cost_calculator,
                                     )
 
                                     lib_logger.info(
@@ -949,9 +1108,9 @@ class RequestExecutor:
                                     # Track consecutive quota failures
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
-                                        if retry_state.consecutive_quota_failures >= 3:
+                                        if retry_state.consecutive_quota_failures >= retry_state.quota_failure_threshold:
                                             lib_logger.error(
-                                                "3 consecutive quota errors in streaming - "
+                                                f"{retry_state.quota_failure_threshold} consecutive quota errors in streaming - "
                                                 "request may be too large"
                                             )
                                             cred_context.mark_failure(classified)
@@ -959,6 +1118,7 @@ class RequestExecutor:
                                                 "error": {
                                                     "message": "Request exceeds quota for all credentials",
                                                     "type": "quota_exhausted",
+                                                    "code": "quota_exceeded",
                                                 }
                                             }
                                             yield f"data: {json.dumps(error_data)}\n\n"
@@ -992,11 +1152,20 @@ class RequestExecutor:
                                             DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
                                         )
                                     )
-                                    if (
-                                        should_retry_same_key(
-                                            classified, small_cooldown_threshold
+                                    rate_limit_max_retry_after = int(
+                                        os.environ.get(
+                                            "RATE_LIMIT_MAX_RETRY_AFTER",
+                                            DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER,
                                         )
-                                        and attempt < self._max_retries - 1
+                                    )
+                                    is_rate_limit_retry = (
+                                        classified.error_type == "rate_limit"
+                                        and classified.retry_after is not None
+                                        and 0 < classified.retry_after <= rate_limit_max_retry_after
+                                    )
+                                    if (
+                                        (should_retry_same_key(classified, small_cooldown_threshold) or is_rate_limit_retry)
+                                        and attempt < max_retries - 1
                                     ):
                                         wait_time = (
                                             classified.retry_after
@@ -1034,9 +1203,9 @@ class RequestExecutor:
                                     # Track consecutive quota failures
                                     if classified.error_type == "quota_exceeded":
                                         retry_state.increment_quota_failures()
-                                        if retry_state.consecutive_quota_failures >= 3:
+                                        if retry_state.consecutive_quota_failures >= retry_state.quota_failure_threshold:
                                             lib_logger.error(
-                                                "3 consecutive quota errors in streaming - "
+                                                f"{retry_state.quota_failure_threshold} consecutive quota errors in streaming - "
                                                 "request may be too large"
                                             )
                                             cred_context.mark_failure(classified)
@@ -1044,6 +1213,7 @@ class RequestExecutor:
                                                 "error": {
                                                     "message": "Request exceeds quota for all credentials",
                                                     "type": "quota_exhausted",
+                                                    "code": "quota_exceeded",
                                                 }
                                             }
                                             yield f"data: {json.dumps(error_data)}\n\n"
@@ -1063,12 +1233,18 @@ class RequestExecutor:
                                             DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
                                         )
                                     )
+                                    rate_limit_max_retry_after = int(
+                                        os.environ.get(
+                                            "RATE_LIMIT_MAX_RETRY_AFTER",
+                                            DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER,
+                                        )
+                                    )
                                     if (
                                         classified.retry_after is not None
                                         and 0
                                         < classified.retry_after
                                         < small_cooldown_threshold
-                                        and attempt < self._max_retries - 1
+                                        and attempt < max_retries - 1
                                     ):
                                         remaining = deadline - time.time()
                                         if classified.retry_after <= remaining:
@@ -1077,6 +1253,45 @@ class RequestExecutor:
                                                 f"(small cooldown {classified.retry_after}s < {small_cooldown_threshold}s threshold)"
                                             )
                                             await asyncio.sleep(classified.retry_after)
+                                            continue  # Retry same key
+
+                                    _retryable_429 = classified.error_type in ("rate_limit", "quota_exceeded")
+
+                                    # For rate_limit/quota_exceeded with retry_after, wait
+                                    # and retry same key if within our max threshold.
+                                    if (
+                                        _retryable_429
+                                        and classified.retry_after is not None
+                                        and 0 < classified.retry_after <= rate_limit_max_retry_after
+                                        and attempt < max_retries - 1
+                                    ):
+                                        remaining = deadline - time.time()
+                                        if classified.retry_after <= remaining:
+                                            lib_logger.info(
+                                                f"Retrying {mask_credential(cred)} in {classified.retry_after:.1f}s "
+                                                f"({classified.error_type} retry_after={classified.retry_after}s <= {rate_limit_max_retry_after}s max)"
+                                            )
+                                            await asyncio.sleep(classified.retry_after)
+                                            continue  # Retry same key
+
+                                    # For rate_limit/quota_exceeded (429) without
+                                    # retry_after, retry with exponential backoff —
+                                    # transient capacity errors (including Google
+                                    # RESOURCE_EXHAUSTED) are better handled by backoff,
+                                    # especially with few credentials.
+                                    if (
+                                        _retryable_429
+                                        and attempt < max_retries - 1
+                                        and not classified.retry_after
+                                    ):
+                                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                                        remaining = deadline - time.time()
+                                        if wait_time <= remaining:
+                                            lib_logger.info(
+                                                f"Retrying {mask_credential(cred)} in {wait_time:.1f}s "
+                                                f"({classified.error_type} backoff, attempt {attempt + 1}/{max_retries})"
+                                            )
+                                            await asyncio.sleep(wait_time)
                                             continue  # Retry same key
 
                                     cred_context.mark_failure(classified)
@@ -1103,7 +1318,7 @@ class RequestExecutor:
                                         request_headers=request_headers,
                                     )
 
-                                    if attempt >= self._max_retries - 1:
+                                    if attempt >= max_retries - 1:
                                         error_accumulator.record_error(
                                             cred, classified, str(e)[:150]
                                         )
@@ -1154,11 +1369,20 @@ class RequestExecutor:
                                             DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
                                         )
                                     )
-                                    if (
-                                        should_retry_same_key(
-                                            classified, small_cooldown_threshold
+                                    rate_limit_max_retry_after = int(
+                                        os.environ.get(
+                                            "RATE_LIMIT_MAX_RETRY_AFTER",
+                                            DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER,
                                         )
-                                        and attempt < self._max_retries - 1
+                                    )
+                                    is_rate_limit_retry = (
+                                        classified.error_type == "rate_limit"
+                                        and classified.retry_after is not None
+                                        and 0 < classified.retry_after <= rate_limit_max_retry_after
+                                    )
+                                    if (
+                                        (should_retry_same_key(classified, small_cooldown_threshold) or is_rate_limit_retry)
+                                        and attempt < max_retries - 1
                                     ):
                                         wait_time = (
                                             classified.retry_after
@@ -1259,6 +1483,68 @@ class RequestExecutor:
             return dict(headers)
         return None
 
+    # Gemma-4 and similar models emit reasoning inside <thought>...</thought>
+    # tags within the regular content field.  For non-streaming responses we
+    # can strip them with a simple regex.
+    _THOUGHT_PATTERN = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
+
+    def _extract_thought_tags_from_response(self, response: Any) -> Any:
+        """
+        Extract <thought>...</thought> blocks from a non-streaming response.
+
+        Thought content is moved to ``message.reasoning_content`` (OpenAI
+        o1-style) and removed from ``message.content``.  Mutates the
+        response in-place when possible; falls back to returning a plain
+        dict for immutable Pydantic models.
+        """
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return response
+
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        if message is None:
+            return response
+
+        content = getattr(message, "content", None)
+        if not content or not isinstance(content, str):
+            return response
+
+        # Extract all reasoning segments and build stripped content.
+        reasoning_parts: list[str] = []
+        stripped = content
+        for match in self._THOUGHT_PATTERN.finditer(content):
+            reasoning_parts.append(match.group(1))
+            stripped = stripped.replace(match.group(0), "", 1)
+
+        if not reasoning_parts and stripped == content:
+            return response
+
+        reasoning_content = "".join(reasoning_parts)
+
+        # Try in-place mutation first (some LiteLLM objects are mutable).
+        try:
+            message.content = stripped
+            message.reasoning_content = reasoning_content
+            return response
+        except Exception:
+            pass
+
+        # Fallback: convert to dict, modify, and return the dict.
+        if hasattr(response, "model_dump"):
+            response_dict = response.model_dump()
+        elif hasattr(response, "dict"):
+            response_dict = response.dict()
+        else:
+            response_dict = dict(response)
+
+        msg = response_dict.get("choices", [{}])[0].get("message")
+        if msg is not None:
+            msg["content"] = stripped
+            msg["reasoning_content"] = reasoning_content
+
+        return response_dict
+
     async def _wait_for_cooldown(
         self,
         provider: str,
@@ -1292,9 +1578,11 @@ class RequestExecutor:
         model: str,
         provider: str,
         attempt: int,
+        max_retries: int,
         error_accumulator: RequestErrorAccumulator,
         retry_state: RetryState,
         request_headers: Dict[str, Any],
+        deadline: float,
     ) -> str:
         """
         Handle an error and determine next action.
@@ -1307,6 +1595,7 @@ class RequestExecutor:
             attempt: Current attempt number
             error_accumulator: Error tracking
             retry_state: Retry state tracking
+            deadline: Request deadline
 
         Returns:
             ErrorAction indicating what to do next
@@ -1326,10 +1615,9 @@ class RequestExecutor:
         # Check for quota errors
         if classified.error_type == "quota_exceeded":
             retry_state.increment_quota_failures()
-            if retry_state.consecutive_quota_failures >= 3:
-                # Likely request is too large
+            if retry_state.consecutive_quota_failures >= retry_state.quota_failure_threshold:
                 lib_logger.error(
-                    f"3 consecutive quota errors - request may be too large"
+                    f"{retry_state.quota_failure_threshold} consecutive quota errors - request may be too large"
                 )
                 error_accumulator.record_error(credential, classified, error_message)
                 cred_context.mark_failure(classified)
@@ -1354,25 +1642,49 @@ class RequestExecutor:
             and 0 < classified.retry_after < small_cooldown_threshold
         )
 
+        # Check for rate_limit with retry_after within our max threshold
+        rate_limit_max_retry_after = int(
+            os.environ.get(
+                "RATE_LIMIT_MAX_RETRY_AFTER", DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER
+            )
+        )
+        is_rate_limit_retry = (
+            classified.error_type == "rate_limit"
+            and classified.retry_after is not None
+            and 0 < classified.retry_after <= rate_limit_max_retry_after
+        )
+
         if (
-            should_retry_same_key(classified, small_cooldown_threshold)
-            and attempt < self._max_retries - 1
+            (should_retry_same_key(classified, small_cooldown_threshold) or is_rate_limit_retry)
+            and attempt < max_retries - 1
         ):
             wait_time = (
                 classified.retry_after
                 if classified.retry_after is not None
                 else self._get_transient_retry_delay()
             )
-            retry_reason = (
-                f" (small cooldown {classified.retry_after}s < {small_cooldown_threshold}s threshold)"
-                if is_small_cooldown
-                else ""
-            )
-            lib_logger.info(
-                f"Retrying {mask_credential(credential)} in {wait_time:.1f}s{retry_reason}"
-            )
-            await asyncio.sleep(wait_time)
-            return ErrorAction.RETRY_SAME
+            
+            # Check remaining deadline budget
+            remaining = deadline - time.time()
+            if wait_time <= remaining:
+                retry_reason = (
+                    f" (small cooldown {classified.retry_after}s < {small_cooldown_threshold}s threshold)"
+                    if is_small_cooldown
+                    else (
+                        f" (rate_limit retry_after={classified.retry_after}s <= {rate_limit_max_retry_after}s max)"
+                        if is_rate_limit_retry
+                        else ""
+                    )
+                )
+                lib_logger.info(
+                    f"Retrying {mask_credential(credential)} in {wait_time:.1f}s{retry_reason}"
+                )
+                await asyncio.sleep(wait_time)
+                return ErrorAction.RETRY_SAME
+            else:
+                lib_logger.info(
+                    f"Skipping retry same key for {mask_credential(credential)} (wait {wait_time:.1f}s > {remaining:.1f}s remaining)"
+                )
 
         # Record error and rotate
         error_accumulator.record_error(credential, classified, error_message)
@@ -1500,23 +1812,46 @@ class RequestExecutor:
             thinking_tokens,
         )
 
-    @staticmethod
-    def _normalize_response_usage(response: Any, model: str) -> Any:
-        """
-        Normalize usage fields on the non-streaming response object.
-
-        Delegates to normalize_usage_for_response which handles both
-        dicts (streaming) and pydantic objects (non-streaming).
-        Internal tracking values from _extract_usage_tokens are unaffected.
-        """
-        if hasattr(response, "usage") and response.usage:
-            normalize_usage_for_response(response.usage, model)
-        return response
-
     def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
         plugin = self._get_plugin_instance(provider)
         if plugin and getattr(plugin, "skip_cost_calculation", False):
             return 0.0
+
+        # If the plugin provides its own cost calculation (e.g. from provider
+        # API pricing data), use it instead of LiteLLM's internal database.
+        if plugin and hasattr(plugin, "calculate_cost"):
+            try:
+                usage = getattr(response, "usage", None)
+                if usage:
+                    (
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read,
+                        cache_write,
+                        thinking_tokens,
+                    ) = self._extract_usage_tokens(response)
+                    
+                    # Try to pass cache info if plugin supports it
+                    import inspect
+                    sig = inspect.signature(plugin.calculate_cost)
+                    if "cache_read_tokens" in sig.parameters:
+                        cost = plugin.calculate_cost(
+                            model, 
+                            prompt_tokens, 
+                            completion_tokens + thinking_tokens,
+                            cache_read_tokens=cache_read,
+                            cache_creation_tokens=cache_write
+                        )
+                    else:
+                        # Fallback for plugins with simple signatures
+                        cost = plugin.calculate_cost(model, prompt_tokens, completion_tokens + thinking_tokens)
+                        
+                    if cost > 0:
+                        return cost
+            except Exception as exc:
+                lib_logger.debug(
+                    f"Plugin cost calculation failed for {model}: {exc}"
+                )
 
         try:
             if isinstance(response, litellm.EmbeddingResponse):

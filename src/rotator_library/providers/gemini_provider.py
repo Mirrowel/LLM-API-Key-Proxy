@@ -3,19 +3,56 @@
 
 import httpx
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from .provider_interface import ProviderInterface
+from .utilities.gemini_quota_utils import parse_google_quota_error
+from ..core.types import RequestCompleteResult
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False  # Ensure this logger doesn't propagate to root
 if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
 
+RATE_LIMIT_COOLDOWN = 15.0
+
 
 class GeminiProvider(ProviderInterface):
     """
     Provider implementation for the Google Gemini API.
     """
+
+    @staticmethod
+    def parse_quota_error(error: Exception, error_body: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return parse_google_quota_error(error, error_body)
+
+    def on_request_complete(
+        self,
+        credential: str,
+        model: str,
+        success: bool,
+        response: Optional[Any],
+        error: Optional[Any],
+    ) -> Optional[RequestCompleteResult]:
+        """
+        Apply per-key cooldown after rate-limit / quota errors.
+
+        Google's free-tier API keys share per-project RPM limits (typically
+        15 RPM).  A short cooldown (15s) keeps the key out of rotation
+        briefly, but short enough that the 30s request deadline can wait
+        for it to expire and retry — avoiding both wasteful retry storms
+        and premature "all credentials exhausted" failures.
+        """
+        if success or error is None:
+            return None
+
+        error_type = getattr(error, "error_type", "")
+        if error_type not in ("rate_limit", "quota_exceeded"):
+            return None
+
+        retry_after = getattr(error, "retry_after", None)
+        cooldown = float(retry_after) if retry_after and retry_after > 0 else RATE_LIMIT_COOLDOWN
+
+        return RequestCompleteResult(cooldown_override=cooldown)
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -28,7 +65,7 @@ class GeminiProvider(ProviderInterface):
             )
             response.raise_for_status()
             return [
-                f"gemini/{model['name'].replace('models/', '')}"
+                f"google/{model['name'].replace('models/', '')}"
                 for model in response.json().get("models", [])
             ]
         except httpx.RequestError as e:

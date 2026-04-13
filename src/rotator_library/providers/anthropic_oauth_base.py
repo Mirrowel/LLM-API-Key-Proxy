@@ -43,6 +43,7 @@ from ..utils.headless_detection import is_headless_environment
 from ..utils.reauth_coordinator import get_reauth_coordinator
 from ..utils.resilient_io import safe_write_json
 from ..error_handler import CredentialNeedsReauthError
+from ..proxy_config import ProxyConfig
 
 lib_logger = logging.getLogger("rotator_library")
 console = Console()
@@ -134,6 +135,9 @@ class AnthropicOAuthBase:
 
         # Tier cache: credential_path -> tier info
         self._tier_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Proxy configuration (injected by RotatingClient after construction)
+        self._proxy_config: Optional[ProxyConfig] = None
 
     # =========================================================================
     # CREDENTIAL LOADING
@@ -344,6 +348,38 @@ class AnthropicOAuthBase:
     # TOKEN REFRESH
     # =========================================================================
 
+    def _get_credential_stable_id(self, path: str) -> str:
+        """Derive the stable_id for a credential path from cached metadata."""
+        creds = self._credentials_cache.get(path)
+        if creds:
+            metadata = creds.get("_proxy_metadata", {})
+            login = metadata.get("login")
+            email = metadata.get("email")
+            stable = login or email
+            if stable:
+                return stable
+        return ""
+
+    def _build_proxy_client_kwargs(self, path: str, provider: str = "") -> Dict[str, Any]:
+        """Build httpx.AsyncClient kwargs with proxy routing for a credential.
+
+        Uses the same proxy resolution as API requests so that token refresh
+        traffic egresses from the same IP as normal requests.
+        """
+        kwargs: Dict[str, Any] = {}
+        if not self._proxy_config or not self._proxy_config.has_any_proxy:
+            return kwargs
+
+        stable_id = self._get_credential_stable_id(path)
+        provider = provider or self.ENV_PREFIX.lower()
+        spec = self._proxy_config.resolve(provider, path, stable_id)
+        if spec:
+            kwargs["proxy"] = spec.url
+            lib_logger.debug(
+                f"Token refresh for '{Path(path).name}' will use proxy {spec.url}"
+            )
+        return kwargs
+
     async def _refresh_token(
         self, path: str, creds: Dict[str, Any], force: bool = False
     ) -> Dict[str, Any]:
@@ -366,7 +402,8 @@ class AnthropicOAuthBase:
             new_token_data = None
             last_error = None
 
-            async with httpx.AsyncClient() as client:
+            proxy_kwargs = self._build_proxy_client_kwargs(path)
+            async with httpx.AsyncClient(**proxy_kwargs) as client:
                 for attempt in range(max_retries):
                     try:
                         # Anthropic uses JSON body for token refresh (not form-encoded)
@@ -777,7 +814,8 @@ class AnthropicOAuthBase:
 
         lib_logger.info("Exchanging authorization code for tokens...")
 
-        async with httpx.AsyncClient() as client:
+        proxy_kwargs = self._build_proxy_client_kwargs(path) if path else {}
+        async with httpx.AsyncClient(**proxy_kwargs) as client:
             response = await client.post(
                 self.TOKEN_URL,
                 json={

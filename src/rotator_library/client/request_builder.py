@@ -193,6 +193,7 @@ class RequestContextBuilder:
             provider=provider,
             kwargs=kwargs,
             streaming=False,
+            request_type="embedding",
             credentials=scope["credentials"],
             deadline=time.time() + self._get_global_timeout(),
             session_id=session.session_id,

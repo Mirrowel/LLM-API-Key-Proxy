@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -607,6 +608,50 @@ class ModelsDevAdapter(DataSourceAdapter):
 
 
 # ============================================================================
+# Infrastructure Suffix Stripping
+# ============================================================================
+
+# Infrastructure suffixes that hosting providers append to model names.
+# These are stripped during fuzzy matching so e.g. "GLM-5-FP8" can match
+# catalog entries for "GLM-5".  Ordered longest-first via regex alternation.
+_INFRA_SUFFIX_RE = re.compile(
+    r"(?i)"
+    r"(-FP\d+-\d+"    # -FP8-2, -FP4-1  (numbered quant variants)
+    r"|-FP\d+"        # -FP8, -FP4      (quantization)
+    r"|-GPTQ"         # GPTQ quant
+    r"|-AWQ"          # AWQ quant
+    r"|-GGUF"         # GGUF format
+    r"|-TEE"          # trusted execution
+    r"|-cheaper"      # cheaper pricing variant (e.g. deepseek-v4-pro-cheaper)
+    r"|-original"     # original variant
+    r"|:thinking"     # thinking/reasoning variant suffix
+    r")$"
+)
+
+
+def _strip_infra_suffix(name: str) -> str:
+    """
+    Strip infrastructure / variant suffixes from a model name.
+
+    Applies stripping repeatedly so multiple suffixes are removed in
+    sequence (e.g. 'deepseek-v4-pro-cheaper:thinking' -> 'deepseek-v4-pro').
+
+    Examples:
+        'GLM-5-FP8'            -> 'GLM-5'
+        'GLM-5-FP8-2'          -> 'GLM-5'
+        'GLM-5.1-FP8'          -> 'GLM-5.1'
+        'GLM-5-TEE'            -> 'GLM-5'
+        'v4-pro-cheaper:thinking' -> 'v4-pro'
+        'claude-opus-4'         -> 'claude-opus-4'  (no change)
+    """
+    while True:
+        stripped = _INFRA_SUFFIX_RE.sub("", name)
+        if stripped == name:
+            return name
+        name = stripped
+
+
+# ============================================================================
 # Lookup Index
 # ============================================================================
 
@@ -623,8 +668,6 @@ def _normalize_version_pattern(name: str) -> str:
 
     Only applies to patterns that look like versions (digit-digit at end).
     """
-    import re
-
     # Pattern matches: -X-Y at end of string or before another dash/segment
     # where X and Y are digits (like -4-5, -2-0, -2-5)
     # This converts 4-5 to 4.5, 2-0 to 2.0, etc.
@@ -1104,6 +1147,29 @@ class ModelRegistry:
             if records:
                 quality = "fuzzy"
 
+        # Step 4: Strip infrastructure suffixes and retry fuzzy match
+        # Handles providers like Modal that append -FP8, -FP8-2, -TEE, etc.
+        if not records:
+            stripped_id = self._strip_infra_from_model_id(model_id)
+            if stripped_id != model_id:
+                candidates = self._index.resolve(stripped_id)
+                for cid in candidates:
+                    if cid in self._openrouter_store:
+                        records.append(
+                            (self._openrouter_store[cid], f"openrouter:infra-strip:{cid}")
+                        )
+                    elif cid in self._modelsdev_store:
+                        records.append(
+                            (self._modelsdev_store[cid], f"modelsdev:infra-strip:{cid}")
+                        )
+
+                if records:
+                    quality = "fuzzy"
+                    logger.debug(
+                        "Infra-strip match: %s -> %s (%d sources)",
+                        model_id, stripped_id, len(records),
+                    )
+
         if not records:
             return None
 
@@ -1133,6 +1199,25 @@ class ModelRegistry:
                 candidates.append(f"{alias}/{rest}")
 
         return candidates
+
+    @staticmethod
+    def _strip_infra_from_model_id(model_id: str) -> str:
+        """
+        Strip infrastructure suffixes from all segments of a model ID.
+
+        Applies _strip_infra_suffix to each path segment (preserving
+        provider and org prefixes), so:
+            modal/zai-org/GLM-5-FP8   -> modal/zai-org/GLM-5
+            modal/zai-org/GLM-5-FP8-2 -> modal/zai-org/GLM-5
+            modal/zai-org/GLM-5.1-FP8 -> modal/zai-org/GLM-5.1
+        """
+        parts = model_id.split("/")
+        # Only strip from the final segment (the actual model name)
+        if len(parts) >= 2:
+            parts[-1] = _strip_infra_suffix(parts[-1])
+        else:
+            parts[0] = _strip_infra_suffix(parts[0])
+        return "/".join(parts)
 
     def get_pricing(self, model_id: str) -> Optional[Dict[str, float]]:
         """Extract just pricing info for cost calculations."""

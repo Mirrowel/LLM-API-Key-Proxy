@@ -14,21 +14,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
-from ..core.types import CredentialInfo, RequestCompleteResult
+from ..core.types import RequestCompleteResult
 from ..error_handler import ClassifiedError, classify_error, mask_credential
 
 from .types import (
     WindowStats,
-    TotalStats,
-    ModelStats,
-    GroupStats,
     CredentialState,
-    LimitCheckResult,
-    RotationMode,
     LimitResult,
+    RotationMode,
     FAIR_CYCLE_GLOBAL_KEY,
     TrackingMode,
-    ResetMode,
 )
 from .config import (
     ProviderUsageConfig,
@@ -278,6 +273,11 @@ class UsageManager:
                         fair_cycle_global
                     )
 
+                # Reconcile: prune stale credentials whose accessors no longer
+                # exist on disk or in the current credential set.
+                if self._states:
+                    self._reconcile_stale_credentials(credentials)
+
             # Register credentials and track active ones
             self._active_stable_ids.clear()
             for accessor in credentials:
@@ -361,6 +361,41 @@ class UsageManager:
             lib_logger.debug(
                 f"UsageManager initialized for {self.provider} with {len(credentials)} credentials"
             )
+
+    async def remove_credential(self, accessor: str) -> bool:
+        """
+        Remove a credential from active tracking and persisted state.
+
+        Called when a credential is deleted at runtime to prevent stale
+        in-memory state from being written back on shutdown.
+
+        Args:
+            accessor: The credential accessor (path or key) to remove
+
+        Returns:
+            True if the credential was found and removed
+        """
+        async with self._lock:
+            stable_id = self._registry.get_stable_id(accessor, self.provider)
+            removed = False
+
+            if stable_id in self._active_stable_ids:
+                self._active_stable_ids.discard(stable_id)
+                removed = True
+
+            if stable_id in self._states:
+                del self._states[stable_id]
+                removed = True
+
+            if removed and self._storage:
+                self._storage.mark_dirty()
+                await self._save_if_needed()
+                lib_logger.info(
+                    f"[{self.provider}] Removed credential {mask_credential(stable_id, style='full')} "
+                    f"from usage state"
+                )
+
+            return removed
 
     async def acquire_credential(
         self,
@@ -923,6 +958,10 @@ class UsageManager:
         Returns:
             Dict with comprehensive statistics
         """
+        # Determine primary window name for current_period calculations
+        primary_def = self._window_manager.get_primary_definition()
+        primary_window_name = primary_def.name if primary_def else None
+
         stats = {
             "provider": self.provider,
             "credential_count": len(self._active_stable_ids),
@@ -930,21 +969,42 @@ class UsageManager:
             "credentials": {},
         }
 
+        _empty_token_block = lambda: {
+            "input_cached": 0,
+            "input_uncached": 0,
+            "input_cache_pct": 0,
+            "output": 0,
+        }
+
         stats.update(
             {
                 "active_count": 0,
                 "exhausted_count": 0,
                 "total_requests": 0,
-                "tokens": {
-                    "input_cached": 0,
-                    "input_uncached": 0,
-                    "input_cache_pct": 0,
-                    "output": 0,
-                },
+                "tokens": _empty_token_block(),
                 "approx_cost": None,
                 "quota_groups": {},
+                # Current period stats (from primary window)
+                "current_period": {
+                    "total_requests": 0,
+                    "tokens": _empty_token_block(),
+                    "approx_cost": None,
+                    "window_name": primary_window_name,
+                },
             }
         )
+
+        # Compute hidden groups and defined groups once for the entire response
+        hidden_groups: frozenset = frozenset()
+        defined_groups: frozenset = frozenset()
+        plugin_class = self._provider_plugins.get(self.provider)
+        if plugin_class:
+            plugin_instance = self._get_provider_plugin_instance()
+            if plugin_instance:
+                if hasattr(plugin_instance, "hidden_quota_groups"):
+                    hidden_groups = plugin_instance.hidden_quota_groups
+                if hasattr(plugin_instance, "model_quota_groups"):
+                    defined_groups = frozenset(plugin_instance.model_quota_groups.keys())
 
         for stable_id, state in self._states.items():
             # Skip credentials not currently active in the proxy
@@ -957,7 +1017,7 @@ class UsageManager:
             status = "active"
             has_global_cooldown = False
             has_group_cooldown = False
-            fc_exhausted_groups = []
+            cooldown_groups = []
 
             # Check cooldowns (global vs per-group)
             for key, cooldown in state.cooldowns.items():
@@ -966,25 +1026,48 @@ class UsageManager:
                         has_global_cooldown = True
                     else:
                         has_group_cooldown = True
+                        cooldown_groups.append(key)
 
-            # Check fair cycle per group
-            for group_key, fc_state in state.fair_cycle.items():
-                if fc_state.exhausted:
-                    fc_exhausted_groups.append(group_key)
+            # Determine final status based on real cooldowns only.
+            # Fair cycle exhaustion is an internal rotation concern and
+            # does not mean the credential's quota is actually exhausted.
+            all_group_keys = set(state.group_usage.keys()) if state.group_usage else set()
 
-            # Determine final status
-            known_groups = set(state.group_usage.keys()) if state.group_usage else set()
+            # Scope known_groups to provider-defined groups if available.
+            # Stale group_usage entries (e.g., from older versions) should not
+            # prevent "exhausted" status when all current groups are on cooldown.
+            if defined_groups:
+                known_groups = all_group_keys & defined_groups
+            else:
+                known_groups = all_group_keys
+
+            # Hidden groups (e.g., "opencode_go-global", "codex-global") are
+            # provider-wide routing keys that all real models resolve to.
+            # A cooldown on a hidden group means ALL models are blocked.
+            has_hidden_group_cooldown = bool(
+                hidden_groups and any(g in hidden_groups for g in cooldown_groups)
+            )
+
+            # For the "all groups exhausted?" check, exclude hidden routing
+            # keys — they're internal and shouldn't prevent "exhausted" status
+            # when all visible windows are on cooldown.
+            visible_known_groups = known_groups - hidden_groups if hidden_groups else known_groups
 
             if has_global_cooldown:
                 status = "cooldown"
-            elif fc_exhausted_groups:
-                # Check if ALL known groups are exhausted
-                if known_groups and set(fc_exhausted_groups) >= known_groups:
+            elif has_hidden_group_cooldown:
+                status = "exhausted"
+            elif has_group_cooldown:
+                if visible_known_groups and set(cooldown_groups) >= visible_known_groups:
                     status = "exhausted"
                 else:
-                    status = "mixed"  # Some groups available
-            elif has_group_cooldown:
-                status = "cooldown"
+                    status = "mixed"
+            # Fair cycle rotation — credential is still usable, mark as
+            # "rotating" only in balanced mode so UIs can optionally show it
+            elif state.fair_cycle and any(
+                fc.exhausted for fc in state.fair_cycle.values()
+            ):
+                status = "active"
 
             is_private = str(state.accessor).startswith("private:")
             cred_stats = {
@@ -1019,6 +1102,69 @@ class UsageManager:
                 "fair_cycle": {},
             }
 
+            # --- Compute current_period from primary window across all groups ---
+            cp_requests = 0
+            cp_prompt_tokens = 0
+            cp_cache_read = 0
+            cp_output_tokens = 0
+            cp_cost = 0.0
+            cp_last_used_at = None
+            cp_first_used_at = None
+
+            if primary_window_name:
+                # Aggregate primary window data from group_usage (preferred)
+                # or model_usage as fallback
+                seen_groups = set()
+                for group_key, group_stats in state.group_usage.items():
+                    window = self._window_manager.get_active_window(
+                        group_stats.windows, primary_window_name
+                    )
+                    if window:
+                        seen_groups.add(group_key)
+                        cp_requests += window.request_count
+                        cp_prompt_tokens += window.prompt_tokens
+                        cp_cache_read += window.prompt_tokens_cache_read
+                        cp_output_tokens += window.output_tokens
+                        cp_cost += window.approx_cost
+                        if window.last_used_at:
+                            if cp_last_used_at is None or window.last_used_at > cp_last_used_at:
+                                cp_last_used_at = window.last_used_at
+                        if window.first_used_at:
+                            if cp_first_used_at is None or window.first_used_at < cp_first_used_at:
+                                cp_first_used_at = window.first_used_at
+
+                # Also include ungrouped models
+                for model_key, model_stats in state.model_usage.items():
+                    model_group = self._get_model_quota_group(model_key)
+                    if model_group and model_group in seen_groups:
+                        continue  # Already counted via group
+                    window = self._window_manager.get_active_window(
+                        model_stats.windows, primary_window_name
+                    )
+                    if window:
+                        cp_requests += window.request_count
+                        cp_prompt_tokens += window.prompt_tokens
+                        cp_cache_read += window.prompt_tokens_cache_read
+                        cp_output_tokens += window.output_tokens
+                        cp_cost += window.approx_cost
+                        if window.last_used_at:
+                            if cp_last_used_at is None or window.last_used_at > cp_last_used_at:
+                                cp_last_used_at = window.last_used_at
+                        if window.first_used_at:
+                            if cp_first_used_at is None or window.first_used_at < cp_first_used_at:
+                                cp_first_used_at = window.first_used_at
+
+            cred_stats["current_period"] = {
+                "request_count": cp_requests,
+                "prompt_tokens": cp_prompt_tokens,
+                "prompt_tokens_cache_read": cp_cache_read,
+                "output_tokens": cp_output_tokens,
+                "approx_cost": cp_cost,
+                "first_used_at": cp_first_used_at,
+                "last_used_at": cp_last_used_at,
+            }
+
+            # --- Accumulate provider-level totals (global/lifetime) ---
             stats["total_requests"] += state.totals.request_count
             stats["tokens"]["output"] += state.totals.output_tokens
             stats["tokens"]["input_cached"] += state.totals.prompt_tokens_cache_read
@@ -1029,6 +1175,15 @@ class UsageManager:
                 stats["approx_cost"] = (
                     stats["approx_cost"] or 0.0
                 ) + state.totals.approx_cost
+
+            # --- Accumulate provider-level current_period ---
+            cp_block = stats["current_period"]
+            cp_block["total_requests"] += cp_requests
+            cp_block["tokens"]["output"] += cp_output_tokens
+            cp_block["tokens"]["input_cached"] += cp_cache_read
+            cp_block["tokens"]["input_uncached"] += cp_prompt_tokens
+            if cp_cost:
+                cp_block["approx_cost"] = (cp_block["approx_cost"] or 0.0) + cp_cost
 
             if status == "active":
                 stats["active_count"] += 1
@@ -1079,7 +1234,11 @@ class UsageManager:
                 }
 
             # Add group usage stats
+            # Filter out hidden groups (internal routing keys like codex-global)
+
             for group_key, group_stats in state.group_usage.items():
+                if group_key in hidden_groups:
+                    continue
                 group_windows = {}
                 for window_name, window in group_stats.windows.items():
                     group_windows[window_name] = {
@@ -1209,7 +1368,13 @@ class UsageManager:
                 )
                 tier_stats["total"] += 1
 
-                # Aggregate per-window stats
+                # Aggregate per-window stats.
+                # Exhausted credentials should not contribute remaining
+                # capacity to global totals — their quota windows may show
+                # headroom (e.g. 5hr/weekly) that is unreachable because a
+                # higher-tier window (e.g. monthly) is fully consumed.
+                cred_is_blocked = status in ("exhausted", "cooldown")
+
                 for window_name, window in group_windows.items():
                     window_agg = group_agg[
                         "windows"
@@ -1231,25 +1396,28 @@ class UsageManager:
                     )
                     tier_avail["total"] += 1
 
-                    # Check if this credential has quota remaining in this window
                     limit = window.get("limit")
                     if limit is not None:
                         used = window["request_count"]
                         remaining = max(0, limit - used)
-                        window_agg["total_used"] += used
-                        window_agg["total_remaining"] += remaining
+
+                        if cred_is_blocked:
+                            window_agg["total_used"] += limit
+                            window_agg["total_remaining"] += 0
+                        else:
+                            window_agg["total_used"] += used
+                            window_agg["total_remaining"] += remaining
                         window_agg["total_max"] += limit
 
-                        # Credential has availability if remaining > 0
-                        if remaining > 0:
+                        if remaining > 0 and not cred_is_blocked:
                             tier_avail["available"] += 1
                     else:
-                        # No limit = unlimited = always available
-                        tier_avail["available"] += 1
+                        if not cred_is_blocked:
+                            tier_avail["available"] += 1
 
-            # Add active cooldowns
+            # Add active cooldowns (filter hidden groups)
             for key, cooldown in state.cooldowns.items():
-                if cooldown.is_active:
+                if cooldown.is_active and key not in hidden_groups:
                     cred_stats["cooldowns"][key] = {
                         "reason": cooldown.reason,
                         "remaining_seconds": cooldown.remaining_seconds,
@@ -1306,6 +1474,15 @@ class UsageManager:
         stats["tokens"]["input_cache_pct"] = (
             round(stats["tokens"]["input_cached"] / total_input * 100, 1)
             if total_input > 0
+            else 0
+        )
+
+        # Compute current_period cache_pct
+        cp_tokens = stats["current_period"]["tokens"]
+        cp_total_input = cp_tokens["input_cached"] + cp_tokens["input_uncached"]
+        cp_tokens["input_cache_pct"] = (
+            round(cp_tokens["input_cached"] / cp_total_input * 100, 1)
+            if cp_total_input > 0
             else 0
         )
 
@@ -1408,6 +1585,30 @@ class UsageManager:
             return [f"{self.provider}/{m}" for m in models]
 
         return []
+
+    def _get_group_models_from_data(
+        self, state: "CredentialState", group: str
+    ) -> List[str]:
+        """
+        Get models from actual usage data that belong to a quota group.
+
+        Unlike _get_grouped_models which returns a static list from the provider,
+        this method finds models dynamically from actual usage data. This is
+        necessary for providers where all models share a quota pool but the
+        provider can't enumerate all possible models upfront.
+
+        Args:
+            state: Credential state containing model usage data
+            group: Group name (e.g., "my_provider_global")
+
+        Returns:
+            List of model names from model_usage that belong to the group
+        """
+        return [
+            model
+            for model in state.model_usage
+            if self._get_model_quota_group(model) == group
+        ]
 
     async def save(self, force: bool = False) -> bool:
         """
@@ -1542,6 +1743,7 @@ class UsageManager:
         # Update windows based on quota scope
         # If group_key exists, quota is at group level - only update group stats
         # We can't know which model the requests went to from API-level quota
+        updated_window = None
         if group_key:
             group_stats = state.get_group_stats(group_key)
             if primary_def:
@@ -1551,6 +1753,7 @@ class UsageManager:
                 self._apply_quota_update(
                     group_window, quota_max_requests, quota_reset_ts, quota_used, force
                 )
+                updated_window = group_window
 
                 # Sync timing to all model windows in this group
                 # All models share the same started_at/reset_at/limit as the group
@@ -1567,6 +1770,21 @@ class UsageManager:
                 self._apply_quota_update(
                     model_window, quota_max_requests, quota_reset_ts, quota_used, force
                 )
+                updated_window = model_window
+
+        # Clear stale fair cycle exhaustion if the window shows fresh quota
+        if updated_window and updated_window.request_count == 0:
+            fc_target = group_key or normalized_model
+            if fc_target:
+                fc_key = self._resolve_fair_cycle_key(fc_target)
+                fc_state = state.fair_cycle.get(fc_key)
+                if fc_state and fc_state.exhausted:
+                    await self._tracking.reset_fair_cycle(state, fc_key)
+                    lib_logger.info(
+                        f"Cleared stale fair cycle exhaustion for {fc_key} on "
+                        f"{mask_credential(state.accessor, style='full')} - "
+                        f"quota baseline shows fresh window"
+                    )
 
         # Mark state as updated
         state.last_updated = time.time()
@@ -1609,6 +1827,47 @@ class UsageManager:
         await self._save_if_needed()
 
         return None
+
+    def get_window_request_count(
+        self,
+        accessor: str,
+        model: str,
+        quota_group: Optional[str] = None,
+    ) -> Optional[int]:
+        """Get the current request count from the primary usage window.
+
+        Used by quota trackers to support dynamic limit learning from
+        observed fraction changes. Returns the raw request_count from
+        the usage window without modifying any state.
+
+        Args:
+            accessor: Credential path/accessor string
+            model: Model name (with provider prefix, e.g., "antigravity/claude-sonnet-4-5")
+            quota_group: Optional quota group name (if quota is tracked at group level)
+
+        Returns:
+            Current request_count from the primary window, or None if not found.
+        """
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        if not state:
+            return None
+
+        normalized_model = self._normalize_model(model)
+        group_key = quota_group or self._get_model_quota_group(normalized_model)
+
+        primary_def = self._window_manager.get_primary_definition()
+        if not primary_def:
+            return None
+
+        if group_key:
+            group_stats = state.get_group_stats(group_key)
+            window = group_stats.windows.get(primary_def.name)
+        else:
+            model_stats = state.get_model_stats(normalized_model)
+            window = model_stats.windows.get(primary_def.name)
+
+        return window.request_count if window else None
 
     # =========================================================================
     # WINDOW CLEANUP
@@ -1897,13 +2156,19 @@ class UsageManager:
         consistent started_at, reset_at, and limit values. All models
         in a quota group share the same timing since they share API quota.
 
+        Uses dynamic model discovery from actual usage data, which is necessary
+        for providers where all models share a quota pool but the provider can't
+        enumerate all possible models upfront.
+
         Args:
             state: Credential state containing model stats
             group_key: Quota group name
             group_window: The authoritative group window
             window_name: Name of the window to sync (e.g., "5h")
         """
-        models_in_group = self._get_grouped_models(group_key)
+        # Use dynamic model discovery from actual usage data
+        # This handles providers where models can't be enumerated upfront
+        models_in_group = self._get_group_models_from_data(state, group_key)
         for model_name in models_in_group:
             model_stats = state.get_model_stats(model_name, create=False)
             if model_stats:
@@ -1993,6 +2258,72 @@ class UsageManager:
             for sid, state in self._states.items()
             if sid in self._active_stable_ids
         }
+
+    def _reconcile_stale_credentials(self, current_accessors: List[str]) -> None:
+        """
+        Prune persisted usage entries whose accessor no longer exists.
+
+        Handles three cases:
+        1. File-based accessors (OAuth .json) whose file was deleted from disk.
+        2. Env-based virtual accessors (env://) that are not in the current set.
+        3. Duplicate stable IDs pointing at the same accessor after metadata changes.
+
+        Called once during initialize() after loading from storage but before
+        registering the current credential set.
+        """
+        from pathlib import Path
+
+        current_accessor_set = set(current_accessors)
+        stale_ids: list = []
+        accessor_to_stable: Dict[str, str] = {}
+
+        for stable_id, state in list(self._states.items()):
+            accessor = state.accessor
+
+            # Check if this accessor is still valid
+            is_current = accessor in current_accessor_set
+            is_file = (
+                accessor.endswith(".json")
+                or "/" in accessor
+                or "\\" in accessor
+            ) and not accessor.startswith("env://") and not accessor.startswith("private:")
+
+            if is_file and not is_current:
+                # File-based credential not in current set — check disk
+                if not Path(accessor).exists():
+                    stale_ids.append(stable_id)
+                    continue
+            elif not is_file and not accessor.startswith("env://") and not accessor.startswith("private:"):
+                # API key accessor — only stale if not in current set
+                if not is_current:
+                    stale_ids.append(stable_id)
+                    continue
+
+            # Deduplicate: if multiple stable IDs map to the same accessor,
+            # keep the one that matches what we'd compute now
+            if accessor in accessor_to_stable:
+                existing_id = accessor_to_stable[accessor]
+                # Compute what the stable ID should be for this accessor
+                expected_id = self._registry.get_stable_id(accessor, self.provider)
+                # Keep the one that matches expected; mark the other stale
+                if stable_id != expected_id and existing_id == expected_id:
+                    stale_ids.append(stable_id)
+                    continue
+                elif existing_id != expected_id and stable_id == expected_id:
+                    stale_ids.append(existing_id)
+                    accessor_to_stable[accessor] = stable_id
+                    continue
+            accessor_to_stable[accessor] = stable_id
+
+        if stale_ids:
+            for sid in stale_ids:
+                del self._states[sid]
+            lib_logger.info(
+                f"[{self.provider}] Reconciled usage state: pruned {len(stale_ids)} "
+                f"stale credential(s) from persisted data"
+            )
+            if self._storage:
+                self._storage.mark_dirty()
 
     def _resolve_fair_cycle_key(self, group_key: str) -> str:
         """Resolve fair cycle tracking key based on config."""

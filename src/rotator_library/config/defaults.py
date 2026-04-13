@@ -180,3 +180,21 @@ DEFAULT_TRANSIENT_RETRY_JITTER: float = 0.5
 # duplicate or diverge for consumers that already received content.
 # Override: STREAM_RETRY_ON_REASONING_ONLY=true
 DEFAULT_STREAM_RETRY_ON_REASONING_ONLY: bool = False
+
+# =============================================================================
+# RATE LIMIT MAX RETRY AFTER
+# =============================================================================
+# Maximum retry_after value (in seconds) for rate_limit errors that we will
+# honour by waiting and retrying the same credential. If retry_after exceeds
+# this, we rotate to the next credential instead.
+# Override: RATE_LIMIT_MAX_RETRY_AFTER=<seconds>
+DEFAULT_RATE_LIMIT_MAX_RETRY_AFTER: int = 120  # 2 minutes
+
+# =============================================================================
+# QUOTA FAILURE THRESHOLD
+# =============================================================================
+# Number of consecutive quota_exceeded errors before giving up on a request.
+# A higher value is more tolerant of transient per-minute rate limits that
+# are misclassified as quota errors (e.g. Google RESOURCE_EXHAUSTED).
+# Override: QUOTA_FAILURE_THRESHOLD=<int>
+DEFAULT_QUOTA_FAILURE_THRESHOLD: int = 5

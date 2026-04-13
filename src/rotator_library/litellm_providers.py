@@ -1057,7 +1057,9 @@ def get_provider_route(provider_key: str) -> Optional[str]:
     """Get the LiteLLM route prefix for a provider (without trailing slash)."""
     info = SCRAPED_PROVIDERS.get(provider_key)
     if info and info.get("route"):
-        return info["route"].rstrip("/")
+        route = info["route"]
+        if isinstance(route, str):
+            return route.rstrip("/")
     return None
 
 

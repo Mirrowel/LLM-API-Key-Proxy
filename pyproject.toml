@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 b3nw
+
+[project]
+name = "llm-api-key-proxy"
+version = "2.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "python-dotenv",
+    "litellm",
+    "filelock",
+    "httpx",
+    "socksio",
+    "aiofiles",
+    "aiohttp",
+    "colorlog",
+    "rich",
+    "websockets>=14.0,<15.0",
+    "rotator-library",
+]
+
+[tool.uv.sources]
+rotator-library = { path = "src/rotator_library", editable = true }
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "unit: Pure logic tests, no I/O, no network (<1s each)",
+    "integration: Component interaction with mocked HTTP",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:litellm",
+    "ignore::UserWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Critical rules enforced in pre-commit hook and CI:
+#   F401 — unused imports (often signals a missing import elsewhere)
+#   F811 — redefinition of unused name
+#   F821 — undefined name (would have caught `time` not imported)
+#   E9xx — runtime errors (syntax, IO errors detectable statically)
+select = ["F401", "F811", "F821", "E9"]
+ignore = []

@@ -58,11 +58,11 @@
 **`src/rotator_library/providers/`:**
 - Purpose: Provider-specific implementations and plugin discovery
 - Contains: One file per provider implementing `ProviderInterface`, shared utilities, retired providers
-- Key files: `provider_interface.py`, `__init__.py` (auto-discovery), `gemini_cli_provider.py`, `gemini_provider.py`, `gemini_auth_base.py`, `google_oauth_base.py`, `openai_provider.py`, `openai_compatible_provider.py`, `openrouter_provider.py`, `deepseek_provider.py`, `nvidia_provider.py`, `mistral_provider.py`, `cohere_provider.py`, `groq_provider.py`, `chutes_provider.py`, `firmware_provider.py`, `nanogpt_provider.py`, `provider_cache.py`, `example_provider.py`
+- Key files: `provider_interface.py`, `__init__.py` (auto-discovery), `gemini_cli_provider.py`, `gemini_provider.py`, `gemini_auth_base.py`, `google_oauth_base.py`, `openai_provider.py`, `openai_compatible_provider.py`, `openrouter_provider.py`, `deepseek_provider.py`, `nvidia_provider.py`, `mistral_provider.py`, `cohere_provider.py`, `groq_provider.py`, `chutes_provider.py`, `nanogpt_provider.py`, `provider_cache.py`, `example_provider.py`
 
 **`src/rotator_library/providers/utilities/`:**
 - Purpose: Shared provider utility modules for quota tracking and credential management
-- Key files: `gemini_credential_manager.py`, `gemini_cli_quota_tracker.py`, `gemini_tool_handler.py`, `gemini_shared_utils.py`, `base_quota_tracker.py`, `nanogpt_quota_tracker.py`, `firmware_quota_tracker.py`, `chutes_quota_tracker.py`
+- Key files: `gemini_credential_manager.py`, `gemini_cli_quota_tracker.py`, `gemini_tool_handler.py`, `gemini_shared_utils.py`, `base_quota_tracker.py`, `nanogpt_quota_tracker.py`, `chutes_quota_tracker.py`
 
 **`src/rotator_library/usage/`:**
 - Purpose: Usage tracking, limit enforcement, and credential selection

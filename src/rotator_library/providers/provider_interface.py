@@ -92,6 +92,7 @@ TierPriorityMap = Dict[str, int]  # tier_name -> priority
 UsageConfigKey = Union[FrozenSet[int], str]  # frozenset of priorities OR "default"
 UsageConfigMap = Dict[UsageConfigKey, UsageResetConfigDef]  # priority_set -> config
 QuotaGroupMap = Dict[str, List[str]]  # group_name -> [models]
+HiddenGroupSet = FrozenSet[str]  # groups hidden from display
 
 
 class ProviderInterface(ABC, metaclass=SingletonABCMeta):
@@ -165,6 +166,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # Models that share quota/cooldown timing
     # Can be overridden via env: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
     model_quota_groups: QuotaGroupMap = {}
+
+    # Groups that exist for internal routing (e.g., cooldown key matching)
+    # but should not appear in the quota stats API or viewer display.
+    # Example: codex-global mirrors 5h-limit data for CooldownChecker routing.
+    hidden_quota_groups: HiddenGroupSet = frozenset()
 
     # Model usage weights for grouped usage calculation
     # When calculating combined usage for quota groups, each model's usage

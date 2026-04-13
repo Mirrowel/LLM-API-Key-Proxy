@@ -5,7 +5,7 @@ import re
 import json
 import os
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Tuple
 import httpx
 
 from litellm.exceptions import (
@@ -19,6 +19,7 @@ from litellm.exceptions import (
     InternalServerError,
     Timeout,
     ContextWindowExceededError,
+    MidStreamFallbackError,
 )
 
 lib_logger = logging.getLogger("rotator_library")
@@ -61,6 +62,12 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
         seconds = ms_value / 1000.0
         # Round up to at least 1 second to avoid immediate retry floods
         return max(1, int(seconds)) if seconds > 0 else 0
+
+    # Parse days component
+    day_match = re.match(r"(\d+)d", remaining)
+    if day_match:
+        total_seconds += int(day_match.group(1)) * 86400
+        remaining = remaining[day_match.end() :]
 
     # Parse hours component
     hour_match = re.match(r"(\d+)h", remaining)
@@ -105,16 +112,19 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
 
     # Pattern to match various "reset after" formats - capture the full duration string
     patterns = [
-        r"quota will reset after\s*([\dhmso.]+)",  # Matches compound: 156h14m36s or 120s
-        r"reset after\s*([\dhmso.]+)",
-        r"retry after\s*([\dhmso.]+)",
-        r"try again in\s*(\d+)\s*seconds?",
+        (r"quota will reset after\s*([\ddhmso.]+)", False),
+        (r"reset after\s*([\ddhmso.]+)", False),
+        (r"retry after\s*([\ddhmso.]+)", False),
+        (r"try again in\s*(\d+)\s*seconds?", False),
+        (r"resets? in\s*(\d+)\s*days?", True),
     ]
 
-    for pattern in patterns:
+    for pattern, is_days in patterns:
         match = re.search(pattern, error_body, re.IGNORECASE)
         if match:
             duration_str = match.group(1)
+            if is_days:
+                duration_str = duration_str + "d"
             result = _parse_duration_string(duration_str)
             if result is not None:
                 return result
@@ -262,6 +272,24 @@ def mask_credential(credential: str, style: str = "short") -> str:
         - For API keys with style="short": shows last 6 chars (e.g., "...xyz123")
         - For API keys with style="full": shows first 4 + last 4 (e.g., "AIza...3456")
     """
+    # Handle combined credentials (e.g., api_key:wrk_id:auth=cookie)
+    if ":" in credential:
+        parts = credential.split(":")
+        masked_parts = []
+        for part in parts:
+            if part.startswith("auth="):
+                continue # Skip cookie
+            masked_parts.append(mask_credential(part, style))
+        return ":".join(masked_parts)
+
+    # Special handling for auth cookies and keys
+    if credential.startswith("wrk_"):
+        return credential # Show full workspace ID
+    if credential.startswith("auth="):
+        return "auth=..." # Omit full cookie
+    if credential.startswith("sk-"):
+        return f"sk-...{credential[-4:]}"
+
     # File paths: show just filename
     if os.path.isfile(credential) or credential.endswith(".json"):
         return os.path.basename(credential)
@@ -368,6 +396,60 @@ class RequestErrorAccumulator:
         parts = [f"{count} {err_type}" for err_type, count in counts.items()]
         return ", ".join(parts)
 
+    def get_dominant_error_type(self) -> Optional[str]:
+        """
+        Return the machine-readable dominant upstream error type.
+
+        Priority order (highest first):
+          context_window_exceeded, invalid_request -> client errors (400)
+          authentication                           -> auth error (401)
+          forbidden                                -> access error (403)
+          rate_limit, quota_exceeded               -> rate errors (429)
+          server_error, api_connection             -> upstream errors (502)
+          unknown                                  -> fallback (502)
+
+        Abnormal errors always take precedence over normal errors.
+        Within a tier, the most frequent type wins; ties broken by priority.
+        """
+        _PRIORITY = [
+            "context_window_exceeded",
+            "invalid_request",
+            "authentication",
+            "forbidden",
+            "rate_limit",
+            "quota_exceeded",
+            "server_error",
+            "api_connection",
+            "unknown",
+        ]
+
+        # Abnormal errors take precedence
+        if self.abnormal_errors:
+            counts: Dict[str, int] = {}
+            for err in self.abnormal_errors:
+                t = err["error_type"]
+                counts[t] = counts.get(t, 0) + 1
+            max_count = max(counts.values())
+            candidates = [t for t, c in counts.items() if c == max_count]
+            for p in _PRIORITY:
+                if p in candidates:
+                    return p
+            return candidates[0]
+
+        if self.normal_errors:
+            counts = {}
+            for err in self.normal_errors:
+                t = err["error_type"]
+                counts[t] = counts.get(t, 0) + 1
+            max_count = max(counts.values())
+            candidates = [t for t, c in counts.items() if c == max_count]
+            for p in _PRIORITY:
+                if p in candidates:
+                    return p
+            return candidates[0]
+
+        return None
+
     def build_client_error_response(self) -> dict:
         """
         Build a structured error response for the client.
@@ -409,10 +491,14 @@ class RequestErrorAccumulator:
                     "\nThis is normal during high load - retry later or add more credentials."
                 )
 
+        # Determine machine-readable dominant upstream error code
+        dominant_code = self.get_dominant_error_type()
+
         response = {
             "error": {
                 "message": "".join(message_parts),
                 "type": error_type,
+                "code": dominant_code,
                 "details": {
                     "model": self.model,
                     "provider": self.provider,
@@ -630,6 +716,30 @@ def _extract_quota_details(json_text: str) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
+def _is_short_term_quota_error(error_body: str, quota_id: Optional[str]) -> bool:
+    """
+    Check if the error looks like a short-term rate limit (per minute/second) rather than long-term quota.
+    """
+    if quota_id:
+        qid = quota_id.lower()
+        if "perminute" in qid or "persecond" in qid:
+            return True
+
+    if error_body:
+        bod = str(error_body).lower()
+        if "per minute" in bod or "per_minute" in bod or "per second" in bod or "per_second" in bod:
+            return True
+        if "rate_limit_exceeded" in bod:
+            return True
+
+    if quota_id:
+        qid_upper = quota_id
+        if "PerMinute" in qid_upper or "PerDay" in qid_upper:
+            return True
+
+    return False
+
+
 def get_retry_after(error: Exception) -> Optional[int]:
     """
     Extracts the 'retry-after' duration in seconds from an exception message.
@@ -696,16 +806,21 @@ def get_retry_after(error: Exception) -> Optional[int]:
         r"wait for\s*(\d+)\s*seconds?",
         r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON (lowercased)
         r"x-ratelimit-reset:?\s*(\d+)",
+        # "Resets in N days" patterns (e.g., OpenCode "Resets in 3 days")
+        r"resets? in\s*(\d+)\s*days?",
         # Compound duration patterns.
-        r"quota will reset after\s*([\dhms.]+)",  # e.g., "156h14m36s" or "120s"
-        r"reset after\s*([\dhms.]+)",
-        r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON (lowercased)
+        r"quota will reset after\s*([\ddhms.]+)",  # e.g., "3d", "156h14m36s" or "120s"
+        r"reset after\s*([\ddhms.]+)",
+        r'"quotaresetdelay":\s*"([\ddhms.]+)"',  # quotaResetDelay in JSON (lowercased)
     ]
 
     for pattern in patterns:
         match = re.search(pattern, error_str_lower)
         if match:
             duration_str = match.group(1)
+            # Normalize "resets in N days" → "Nd" for _parse_duration_string
+            if "days" in pattern:
+                duration_str = duration_str + "d"
             # Try parsing as compound duration first
             result = _parse_duration_string(duration_str)
             if result is not None:
@@ -812,29 +927,42 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
                 quota_info = provider_class.parse_quota_error(e, error_body)
 
-                if quota_info and quota_info.get("retry_after"):
-                    retry_after = quota_info["retry_after"]
+                if quota_info:
+                    retry_after = quota_info.get("retry_after")
                     reason = quota_info.get("reason", "QUOTA_EXHAUSTED")
                     reset_ts = quota_info.get("reset_timestamp")
                     quota_reset_timestamp = quota_info.get("quota_reset_timestamp")
 
-                    # Extract quota details from error body
                     quota_value, quota_id = None, None
                     if error_body:
                         quota_value, quota_id = _extract_quota_details(error_body)
 
-                    # Log the parsed result with human-readable duration
-                    hours = retry_after / 3600
-                    lib_logger.info(
-                        f"Provider '{provider}' parsed quota error: "
-                        f"retry_after={retry_after}s ({hours:.1f}h), reason={reason}"
-                        + (f", resets at {reset_ts}" if reset_ts else "")
-                        + (f", quota={quota_value}" if quota_value else "")
-                        + (f", quotaId={quota_id}" if quota_id else "")
+                    transient_reasons = {
+                        "per_minute_rate_limit",
+                        "rate_limit_exceeded",
+                        "infrastructure_capacity",
+                    }
+                    is_transient = (
+                        reason.lower() in transient_reasons
+                        or (retry_after is not None and retry_after <= 120)
+                        or _is_short_term_quota_error(error_body, quota_id)
                     )
 
+                    error_type = "rate_limit" if is_transient else "quota_exceeded"
+
+                    if retry_after:
+                        hours = retry_after / 3600
+                        lib_logger.info(
+                            f"Provider '{provider}' parsed quota error: "
+                            f"classified as {error_type}, "
+                            f"retry_after={retry_after}s ({hours:.1f}h), reason={reason}"
+                            + (f", resets at {reset_ts}" if reset_ts else "")
+                            + (f", quota={quota_value}" if quota_value else "")
+                            + (f", quotaId={quota_id}" if quota_id else "")
+                        )
+
                     return ClassifiedError(
-                        error_type="quota_exceeded",
+                        error_type=error_type,
                         original_exception=e,
                         status_code=429,
                         retry_after=retry_after,
@@ -877,7 +1005,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         if status_code == 429:
             retry_after = get_retry_after(e)
             # Check if this is a quota error vs rate limit
-            if "quota" in error_body or "resource_exhausted" in error_body or "usage_limit" in error_body:
+            if "quota" in error_body or "resource_exhausted" in error_body or "usage_limit" in error_body or "usage limit" in error_body or "limit reached" in error_body:
                 # Extract quota details from the original (non-lowercased) response
                 quota_value, quota_id = None, None
                 try:
@@ -888,8 +1016,12 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 except Exception:
                     pass
 
+                error_type = "quota_exceeded"
+                if _is_short_term_quota_error(error_body, quota_id):
+                    error_type = "rate_limit"
+
                 return ClassifiedError(
-                    error_type="quota_exceeded",
+                    error_type=error_type,
                     original_exception=e,
                     status_code=status_code,
                     retry_after=retry_after,
@@ -961,16 +1093,19 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 except Exception:
                     pass
 
+            # Do NOT set retry_after=30 here: that value exceeds the
+            # small_cooldown_threshold (10s), causing should_retry_same_key()
+            # to return False and the executor to rotate immediately instead
+            # of backing off and retrying the same credential.
             # Let the executor apply request-scoped retry pacing for transient 5xx.
             return ClassifiedError(
                 error_type="server_error",
                 original_exception=e,
                 status_code=status_code,
+                retry_after=None,
             )
 
-    if isinstance(
-        e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)
-    ):  # [NEW]
+    if isinstance(e, httpx.RequestError):  # [NEW] Captures NetworkError, Timeout, ProtocolError, etc
         return ClassifiedError(
             error_type="api_connection", original_exception=e, status_code=status_code
         )
@@ -1012,7 +1147,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         retry_after = get_retry_after(e)
         # Check if this is a quota error vs rate limit
         error_msg = str(e).lower()
-        if "quota" in error_msg or "resource_exhausted" in error_msg:
+        if "quota" in error_msg or "resource_exhausted" in error_msg or "usage_limit" in error_msg or "usage limit" in error_msg or "limit reached" in error_msg:
             # Try to extract quota details from exception body
             quota_value, quota_id = None, None
             try:
@@ -1021,8 +1156,12 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             except Exception:
                 pass
 
+            error_type = "quota_exceeded"
+            if _is_short_term_quota_error(str(error_body) if 'error_body' in locals() else error_msg, quota_id):
+                error_type = "rate_limit"
+
             return ClassifiedError(
-                error_type="quota_exceeded",
+                error_type=error_type,
                 original_exception=e,
                 status_code=status_code or 429,
                 retry_after=retry_after,
@@ -1064,13 +1203,50 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 503,  # Treat like a server error
         )
 
+    if isinstance(e, MidStreamFallbackError):
+        # Mid-stream streaming failures are transient; don't impose a long
+        # cooldown because by the time they occur there may not be enough
+        # budget left in the request timeout to wait 30 s.
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=status_code or 503,
+            retry_after=None,
+        )
+
     if isinstance(e, (ServiceUnavailableError, InternalServerError)):
-        # These are often temporary server-side issues
+        # These are often temporary server-side issues — retry same key
+        # with exponential backoff (handled by should_retry_same_key).
+        # Do NOT set retry_after=30 here: that value exceeds the
+        # small_cooldown_threshold (10s), causing should_retry_same_key()
+        # to return False and the executor to rotate immediately instead
+        # of backing off and retrying the same credential.
         # Note: OpenAIError removed - it's too broad and can catch client errors
         return ClassifiedError(
             error_type="server_error",
             original_exception=e,
             status_code=status_code or 503,
+            retry_after=None,
+        )
+
+    # StreamedAPIError: errors received inside SSE streams (e.g. Codex response.failed)
+    from .core.errors import StreamedAPIError
+
+    if isinstance(e, StreamedAPIError):
+        error_msg = str(e).lower()
+        if any(
+            p in error_msg
+            for p in ["context window", "context_length", "too many tokens", "too long"]
+        ):
+            return ClassifiedError(
+                error_type="context_window_exceeded",
+                original_exception=e,
+                status_code=400,
+            )
+        return ClassifiedError(
+            error_type="invalid_request",
+            original_exception=e,
+            status_code=400,
         )
 
     # Fallback for any other unclassified errors
@@ -1150,17 +1326,23 @@ def should_retry_same_key(
     Returns:
         True if should retry same key, False if should rotate immediately
     """
-    # Small retry_after = faster to just wait than rotate
-    # This preserves cache locality and avoids unnecessary rotation
-    if (
-        classified_error.retry_after is not None
-        and 0 < classified_error.retry_after < small_cooldown_threshold
-    ):
-        return True
+    # If the provider told us to wait, use that to decide
+    if classified_error.retry_after is not None:
+        if 0 < classified_error.retry_after < small_cooldown_threshold:
+            return True
+        else:
+            # Server told us to wait too long - better to rotate now
+            return False
 
-    # Standard transient errors that should retry same key
+    # Standard transient errors that should retry same key (when no retry_after is provided)
+    # rate_limit and quota_exceeded (429) are included because transient
+    # capacity errors (including Google RESOURCE_EXHAUSTED) are better
+    # handled by backing off and retrying the same credential, especially
+    # when there are few credentials available.
     retryable_errors = {
         "server_error",
         "api_connection",
+        "rate_limit",
+        "quota_exceeded",
     }
     return classified_error.error_type in retryable_errors

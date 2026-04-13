@@ -740,8 +740,9 @@ class SettingsTool:
         self.console.print("   4. :arrows_counterclockwise: Rotation Modes")
         self.console.print("   5. 🔬 Provider-Specific Settings")
         self.console.print("   6. :dart: Model Filters (Ignore/Whitelist)")
-        self.console.print("   7. :floppy_disk: Save & Exit")
-        self.console.print("   8. 🚫 Exit Without Saving")
+        self.console.print("   7. 🔄 Model Latest Aliases")
+        self.console.print("   8. :floppy_disk: Save & Exit")
+        self.console.print("   9. 🚫 Exit Without Saving")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -752,7 +753,7 @@ class SettingsTool:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
             show_choices=False,
         )
 
@@ -769,8 +770,10 @@ class SettingsTool:
         elif choice == "6":
             self.launch_model_filter_gui()
         elif choice == "7":
-            self.save_and_exit()
+            self.manage_latest_aliases()
         elif choice == "8":
+            self.save_and_exit()
+        elif choice == "9":
             self.exit_without_saving()
 
     def manage_custom_providers(self):
@@ -1405,6 +1408,297 @@ class SettingsTool:
             self.console.print("  [cyan]pip install customtkinter[/cyan]")
             self.console.print()
             input("Press Enter to continue...")
+
+    def manage_latest_aliases(self):
+        """Manage smart 'latest' model aliases."""
+        while True:
+            clear_screen()
+
+            # Get current latest alias config from env
+            aliases = {}
+            strip_suffixes = os.getenv("MODEL_LATEST_STRIP_SUFFIXES", "")
+            for key, value in os.environ.items():
+                if key.startswith("MODEL_LATEST_") and key != "MODEL_LATEST_STRIP_SUFFIXES":
+                    alias_name = key[len("MODEL_LATEST_"):].lower().replace("_", "-")
+                    aliases[alias_name] = {"env_key": key, "value": value}
+
+            # Also check for pending changes
+            for key in list(self.settings.pending_changes.keys()):
+                if key.startswith("MODEL_LATEST_") and key != "MODEL_LATEST_STRIP_SUFFIXES":
+                    alias_name = key[len("MODEL_LATEST_"):].lower().replace("_", "-")
+                    pending_val = self.settings.pending_changes[key]
+                    if pending_val is None:
+                        # Pending removal
+                        if alias_name in aliases:
+                            aliases[alias_name]["pending_remove"] = True
+                    else:
+                        aliases[alias_name] = {
+                            "env_key": key,
+                            "value": pending_val,
+                            "pending_add": alias_name not in aliases,
+                        }
+
+            self.console.print(
+                Panel.fit(
+                    "[bold cyan]🔄 Model Latest Aliases[/bold cyan]",
+                    border_style="cyan",
+                )
+            )
+
+            # Show global strip suffixes
+            pending_strip = self.settings.get_pending_value("MODEL_LATEST_STRIP_SUFFIXES")
+            effective_strip = (
+                pending_strip if pending_strip is not _NOT_FOUND else strip_suffixes
+            )
+            if effective_strip:
+                self.console.print(
+                    f"\n   [dim]Global strip suffixes:[/dim] {effective_strip}"
+                )
+            else:
+                self.console.print(
+                    "\n   [dim]Global strip suffixes:[/dim] [dim italic](none)[/dim italic]"
+                )
+
+            self.console.print()
+
+            if aliases:
+                for alias_name, info in sorted(aliases.items()):
+                    if info.get("pending_remove"):
+                        self.console.print(
+                            f"   [red]- {alias_name:25} {info['value']}[/red]"
+                        )
+                    elif info.get("pending_add"):
+                        self.console.print(
+                            f"   [green]+ {alias_name:25} {info['value']}[/green]"
+                        )
+                    else:
+                        change_type = self.settings.get_change_type(info["env_key"])
+                        if change_type == "edit":
+                            old_val = os.getenv(info["env_key"], "")
+                            self.console.print(
+                                f"   [yellow]~ {alias_name:25} {old_val} → {info['value']}[/yellow]"
+                            )
+                        else:
+                            self.console.print(
+                                f"   • {alias_name:25} {info['value']}"
+                            )
+            else:
+                self.console.print(
+                    "   [dim]No latest aliases configured[/dim]"
+                )
+
+            self.console.print()
+            self.console.print(
+                "   [bold]a[/bold] Add alias   "
+                "[bold]e[/bold] Edit alias   "
+                "[bold]r[/bold] Remove alias   "
+                "[bold]s[/bold] Strip suffixes   "
+                "[bold]b[/bold] Back"
+            )
+
+            choice = Prompt.ask(
+                "\nAction",
+                choices=["a", "e", "r", "s", "b"],
+                show_choices=False,
+            )
+
+            if choice == "b":
+                return
+            elif choice == "a":
+                self._add_latest_alias()
+            elif choice == "e":
+                self._edit_latest_alias(aliases)
+            elif choice == "r":
+                self._remove_latest_alias(aliases)
+            elif choice == "s":
+                self._edit_strip_suffixes()
+
+    def _add_latest_alias(self):
+        """Interactively add a new latest alias."""
+        self.console.print("\n[bold cyan]Add Latest Alias[/bold cyan]\n")
+
+        self.console.print(
+            "[dim]Latest aliases auto-resolve to the newest matching model.\n"
+            "Format: provider:glob_pattern[:options]\n"
+            "Example: nanogpt:glm-[0-9]*:exclude=*:thinking,*v*[/dim]\n"
+        )
+
+        # Alias name
+        alias_name = Prompt.ask(
+            "Alias name (e.g., glm-latest)"
+        ).strip().lower()
+        if not alias_name:
+            self.console.print("[red]Alias name cannot be empty[/red]")
+            input("Press Enter to continue...")
+            return
+
+        # Provider
+        available = self.get_available_providers()
+        if available:
+            self.console.print(
+                f"\n[dim]Available providers: {', '.join(available)}[/dim]"
+            )
+        provider = Prompt.ask("Provider").strip().lower()
+        if not provider:
+            self.console.print("[red]Provider cannot be empty[/red]")
+            input("Press Enter to continue...")
+            return
+
+        # Glob pattern
+        glob_pattern = Prompt.ask(
+            "Glob pattern (e.g., glm-[0-9]*, DeepSeek-V*)"
+        ).strip()
+        if not glob_pattern:
+            self.console.print("[red]Pattern cannot be empty[/red]")
+            input("Press Enter to continue...")
+            return
+
+        # Optional: exclude patterns
+        exclude = Prompt.ask(
+            "Exclude patterns (comma-separated, or empty)",
+            default="",
+        ).strip()
+
+        # Optional: prefer suffix
+        prefer = Prompt.ask(
+            "Prefer suffix (e.g., -TEE, -Turbo, or empty)",
+            default="",
+        ).strip()
+
+        # Optional: tiebreak mode
+        if not prefer:
+            self.console.print(
+                "\n[dim]Tiebreak modes: cheapest (default), expensive, stripped[/dim]"
+            )
+            tiebreak = Prompt.ask(
+                "Tiebreak mode",
+                default="cheapest",
+            ).strip().lower()
+        else:
+            tiebreak = ""
+
+        # Build the value string
+        value = f"{provider}:{glob_pattern}"
+        if exclude:
+            value += f":exclude={exclude}"
+        if prefer:
+            value += f":prefer={prefer}"
+        elif tiebreak and tiebreak != "cheapest":
+            value += f":tiebreak={tiebreak}"
+
+        # Convert alias name to env key
+        env_key = f"MODEL_LATEST_{alias_name.upper().replace('-', '_')}"
+
+        self.console.print(
+            f"\n[bold]Will set:[/bold] {env_key}={value}"
+        )
+        self.console.print(
+            f"[dim]Virtual model: {provider}/{alias_name}[/dim]"
+        )
+
+        if Confirm.ask("\nConfirm?"):
+            self.settings.set(env_key, value)
+            self.console.print("[green]\n✓ Alias added (pending save)[/green]")
+        input("\nPress Enter to continue...")
+
+    def _edit_latest_alias(self, aliases: Dict):
+        """Edit an existing latest alias."""
+        if not aliases:
+            self.console.print("\n[yellow]No aliases to edit[/yellow]")
+            input("Press Enter to continue...")
+            return
+
+        self.console.print("\n[bold cyan]Edit Latest Alias[/bold cyan]")
+        for i, (name, info) in enumerate(sorted(aliases.items()), 1):
+            self.console.print(f"   {i}. {name} = {info['value']}")
+
+        idx = IntPrompt.ask(
+            "\nSelect alias number",
+            default=1,
+        )
+        sorted_aliases = sorted(aliases.items())
+        if idx < 1 or idx > len(sorted_aliases):
+            self.console.print("[red]Invalid selection[/red]")
+            input("Press Enter to continue...")
+            return
+
+        alias_name, info = sorted_aliases[idx - 1]
+        self.console.print(
+            f"\nCurrent value: [cyan]{info['value']}[/cyan]"
+        )
+        new_value = Prompt.ask(
+            "New value (provider:pattern[:options])"
+        ).strip()
+        if not new_value:
+            self.console.print("[yellow]No changes made[/yellow]")
+            input("Press Enter to continue...")
+            return
+
+        env_key = info["env_key"]
+        self.settings.set(env_key, new_value)
+        self.console.print("[green]\n✓ Alias updated (pending save)[/green]")
+        input("Press Enter to continue...")
+
+    def _remove_latest_alias(self, aliases: Dict):
+        """Remove an existing latest alias."""
+        if not aliases:
+            self.console.print("\n[yellow]No aliases to remove[/yellow]")
+            input("Press Enter to continue...")
+            return
+
+        self.console.print("\n[bold cyan]Remove Latest Alias[/bold cyan]")
+        for i, (name, info) in enumerate(sorted(aliases.items()), 1):
+            self.console.print(f"   {i}. {name} = {info['value']}")
+
+        idx = IntPrompt.ask(
+            "\nSelect alias number to remove",
+            default=1,
+        )
+        sorted_aliases = sorted(aliases.items())
+        if idx < 1 or idx > len(sorted_aliases):
+            self.console.print("[red]Invalid selection[/red]")
+            input("Press Enter to continue...")
+            return
+
+        alias_name, info = sorted_aliases[idx - 1]
+        if Confirm.ask(f"\nRemove '{alias_name}'?"):
+            self.settings.remove(info["env_key"])
+            self.console.print("[green]\n✓ Alias removed (pending save)[/green]")
+        input("Press Enter to continue...")
+
+    def _edit_strip_suffixes(self):
+        """Edit global strip suffixes."""
+        current = os.getenv("MODEL_LATEST_STRIP_SUFFIXES", "")
+        pending = self.settings.get_pending_value("MODEL_LATEST_STRIP_SUFFIXES")
+        effective = pending if pending is not _NOT_FOUND else current
+
+        self.console.print(
+            f"\n[bold cyan]Global Strip Suffixes[/bold cyan]"
+        )
+        self.console.print(
+            f"\nCurrent: [cyan]{effective or '(none)'}[/cyan]"
+        )
+        self.console.print(
+            "[dim]These suffixes are stripped before version comparison.\n"
+            "Example: -TEE,-FP8,-original[/dim]"
+        )
+
+        new_val = Prompt.ask(
+            "\nNew suffixes (comma-separated, or 'clear')",
+            default=effective or "",
+        ).strip()
+
+        if new_val.lower() == "clear":
+            self.settings.remove("MODEL_LATEST_STRIP_SUFFIXES")
+            self.console.print(
+                "[green]\n✓ Strip suffixes cleared (pending save)[/green]"
+            )
+        elif new_val:
+            self.settings.set("MODEL_LATEST_STRIP_SUFFIXES", new_val)
+            self.console.print(
+                "[green]\n✓ Strip suffixes updated (pending save)[/green]"
+            )
+        input("Press Enter to continue...")
 
     def manage_provider_settings(self):
         """Manage provider-specific settings (Gemini CLI)"""
