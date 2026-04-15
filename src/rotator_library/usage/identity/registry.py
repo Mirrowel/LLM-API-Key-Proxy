@@ -176,11 +176,12 @@ class CredentialRegistry:
         """
         Get stable ID for an OAuth credential.
 
-        Reads the email from _proxy_metadata.email in the credential file.
+        Reads login or email from _proxy_metadata in the credential file.
+        Login is preferred (for providers like Copilot), falling back to email.
         When account_id is also present (e.g. for Codex credentials that can
         span multiple OpenAI workspaces), the stable ID combines both to
-        prevent collisions between same-email, different-workspace credentials.
-        Falls back to file hash if email not found.
+        prevent collisions between same-user, different-workspace credentials.
+        Falls back to file hash if neither login nor email is found.
         """
         try:
             path = Path(accessor)
@@ -188,22 +189,26 @@ class CredentialRegistry:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-                # Try to get email from _proxy_metadata
+                # Try to get stable identifier from _proxy_metadata
+                # Prefer login (for providers like Copilot that use username),
+                # fall back to email (for other OAuth providers)
                 metadata = data.get("_proxy_metadata", {})
+                login = metadata.get("login")
                 email = metadata.get("email")
-                if email:
+                stable = login or email
+                if stable:
                     # Include account_id in stable ID to differentiate
-                    # credentials for the same email on different workspaces
+                    # credentials for the same user on different workspaces
                     account_id = (
                         data.get("account_id")
                         or metadata.get("account_id")
                     )
                     if account_id:
-                        return f"{email}::{account_id}"
-                    return email
+                        return f"{stable}::{account_id}"
+                    return stable
 
                 # Fallback: try common OAuth fields
-                for field in ["email", "client_email", "account"]:
+                for field in ["login", "email", "client_email", "account"]:
                     if field in data:
                         return data[field]
 

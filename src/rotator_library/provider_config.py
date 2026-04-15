@@ -13,13 +13,11 @@ This module handl- Known LiteLLM provider definitions (from scraped data)
 
 import os
 import logging
+import litellm
 from typing import Dict, Any, Set, Optional
 
 from .litellm_providers import (
     SCRAPED_PROVIDERS,
-    get_provider_route,
-    get_provider_api_key_var,
-    get_provider_display_name,
 )
 
 lib_logger = logging.getLogger("rotator_library")
@@ -518,7 +516,7 @@ PROVIDER_BLACKLIST: Set[str] = {
     "my-custom-llm",  # Template, not a real provider
     "text-completion-openai",  # Legacy text completion API
     # Require special auth (token files, OAuth, etc.)
-    "github_copilot",  # Requires token file configuration
+    # "github_copilot" was blacklisted; now implemented as "copilot" OAuth provider
     "vercel_ai_gateway",  # Requires OIDC token
     # No API key authentication (use custom provider instead)
     "ollama",  # Local, no API key
@@ -693,6 +691,10 @@ class ProviderConfig:
         """Get the set of detected custom provider names."""
         return self._custom_providers.copy()
 
+    _LITELLM_PROVIDER_REMAP = {
+        "google": "gemini",
+    }
+
     def convert_for_litellm(
         self,
         provider_override: Optional[Dict[str, Any]] = None,
@@ -702,6 +704,7 @@ class ProviderConfig:
         Convert model params for LiteLLM call.
 
         Handles:
+        - Provider prefix remapping (e.g. google/ → gemini/ for litellm)
         - Known provider with _API_BASE: pass api_base as override
         - Unknown provider with _API_BASE: convert to openai/, set custom_llm_provider
         - No _API_BASE configured: pass through unchanged
@@ -718,6 +721,17 @@ class ProviderConfig:
 
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
         provider = model.split("/")[0].lower()
+        litellm_provider = self._LITELLM_PROVIDER_REMAP.get(provider)
+        if litellm_provider and "/" in model:
+            model_name = model.split("/", 1)[1]
+            kwargs = kwargs.copy()
+            kwargs["model"] = f"{litellm_provider}/{model_name}"
+            lib_logger.debug(
+                f"Remapped provider prefix: {provider}/ → {litellm_provider}/ "
+                f"(model={kwargs['model']})"
+            )
+            provider = litellm_provider
+
         provider_override = provider_override or {}
         api_base = (
             provider_override.get("base_url")
@@ -734,20 +748,21 @@ class ProviderConfig:
         # Create a copy to avoid modifying the original
         kwargs = kwargs.copy()
 
-        if provider in KNOWN_PROVIDERS:
-            # Known provider - just add api_base override
+        if provider in KNOWN_PROVIDERS and provider in getattr(litellm, "provider_list", []):
+            # Known provider supported natively - just add api_base override
             kwargs["api_base"] = api_base
             lib_logger.debug(
                 f"Applying api_base override for known provider {provider}: {api_base}"
             )
         else:
-            # Custom provider - route through OpenAI-compatible endpoint
+            # Custom provider or newer litellm provider not supported by our version
+            # route through OpenAI-compatible endpoint
             model_name = model.split("/", 1)[1] if "/" in model else model
             kwargs["model"] = f"openai/{model_name}"
             kwargs["api_base"] = api_base
             kwargs["custom_llm_provider"] = "openai"
             lib_logger.debug(
-                f"Routing custom provider {provider} through openai: "
+                f"Routing {provider} through openai: "
                 f"model={kwargs['model']}, api_base={api_base}"
             )
 

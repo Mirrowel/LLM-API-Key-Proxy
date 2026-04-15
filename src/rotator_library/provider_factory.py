@@ -6,11 +6,13 @@
 from .providers.gemini_auth_base import GeminiAuthBase
 from .providers.openai_oauth_base import OpenAIOAuthBase
 from .providers.anthropic_oauth_base import AnthropicOAuthBase
+from .providers.copilot_auth_base import CopilotAuthBase
 
 PROVIDER_MAP = {
     "gemini_cli": GeminiAuthBase,
     "codex": OpenAIOAuthBase,
     "anthropic": AnthropicOAuthBase,
+    "copilot": CopilotAuthBase,
 }
 
 def get_provider_auth_class(provider_name: str):
