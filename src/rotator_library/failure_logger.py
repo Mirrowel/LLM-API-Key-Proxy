@@ -10,6 +10,7 @@ from typing import Optional, Union
 
 from .error_handler import mask_credential
 from .utils.paths import get_logs_dir
+from .error_tracker import get_error_tracker
 
 # =============================================================================
 # CONFIGURATION DEFAULTS
@@ -250,3 +251,19 @@ def log_failure(
 
     # Console log always succeeds
     main_lib_logger.error(summary_message)
+
+    # Record to in-memory error tracker for /v1/health and /v1/health/errors
+    try:
+        provider = model.split("/")[0] if "/" in model else "unknown"
+        status_code = getattr(error, "status_code", None)
+        get_error_tracker().record_error(
+            provider=provider,
+            model=model,
+            error_type=type(error).__name__,
+            error_message=str(error),
+            credential_masked=mask_credential(api_key),
+            attempt=attempt,
+            status_code=int(status_code) if status_code is not None else None,
+        )
+    except Exception:
+        pass  # Never let tracker errors disrupt the failure logging path
