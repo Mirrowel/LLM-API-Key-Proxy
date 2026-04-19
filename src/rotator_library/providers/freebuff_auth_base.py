@@ -19,7 +19,7 @@ import random
 import re
 import string
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -36,9 +36,8 @@ FREE_AGENTS_SOURCE_URL = (
 )
 MODEL_REFRESH_INTERVAL = 6 * 3600
 SESSION_POLL_INTERVAL = 5.0
-SESSION_RETRY_DELAY = 10.0
 RUN_ROTATION_INTERVAL = 6 * 3600
-REQUEST_TIMEOUT = 900.0
+SESSION_MAX_RETRIES = 20
 
 HARDCODED_AGENT_MODELS: Dict[str, List[str]] = {
     "base2-free": ["minimax/minimax-m2.7", "z-ai/glm-5.1"],
@@ -115,7 +114,7 @@ class TokenPoolState:
         if self.session.status == "active" and self.session.instance_id:
             if self.session.expires_at is None or datetime.now(timezone.utc) < self.session.expires_at.replace(
                 tzinfo=timezone.utc
-            ) - __import__("datetime").timedelta(seconds=5):
+            ) - timedelta(seconds=5):
                 return self.session.instance_id
         return None
 
@@ -307,6 +306,7 @@ class FreebuffAuthBase:
         self, client: httpx.AsyncClient, pool: TokenPoolState
     ) -> Tuple[Optional[CachedSession], Optional[str]]:
         state = await self._create_or_refresh_session(client, pool.token)
+        retries = 0
         while True:
             status = state.get("status", "").strip()
             if status == "disabled":
@@ -329,6 +329,13 @@ class FreebuffAuthBase:
                 await asyncio.sleep(delay)
                 state = await self._get_session(client, pool.token, instance_id)
             else:
+                retries += 1
+                if retries >= SESSION_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"Freebuff: session refresh exceeded max retries "
+                        f"({SESSION_MAX_RETRIES}) with unexpected status: {status!r}"
+                    )
+                await asyncio.sleep(SESSION_POLL_INTERVAL)
                 state = await self._create_or_refresh_session(client, pool.token)
 
     async def _create_or_refresh_session(
@@ -508,9 +515,9 @@ class FreebuffAuthBase:
         if run.inflight > 0:
             run.inflight -= 1
         if run.inflight == 0 and pool.runs.get(run.agent_id) is not run:
-            asyncio.ensure_future(self._finish_draining_run_run(pool, run))
+            asyncio.ensure_future(self._finish_draining_run_background(pool, run))
 
-    async def _finish_draining_run_run(self, pool: TokenPoolState, run: ManagedRun) -> None:
+    async def _finish_draining_run_background(self, pool: TokenPoolState, run: ManagedRun) -> None:
         async with httpx.AsyncClient(timeout=15.0) as client:
             await self._finish_draining_run(client, pool, run)
 

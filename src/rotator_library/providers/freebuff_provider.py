@@ -20,12 +20,9 @@ Environment Variables:
 - FREEBUFF_MODELS: Custom model list (JSON array or dict)
 """
 
-import asyncio
 import copy
 import json
 import logging
-import os
-import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -110,12 +107,6 @@ class FreebuffProvider(FreebuffAuthBase, ProviderInterface):
                 models.append(f"freebuff/{model_id}")
                 seen_ids.add(model_id)
 
-        if not models:
-            for model_id in self.get_available_models():
-                if model_id not in seen_ids:
-                    models.append(f"freebuff/{model_id}")
-                    seen_ids.add(model_id)
-
         return models
 
     def _clean_tool_schemas(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -131,7 +122,7 @@ class FreebuffProvider(FreebuffAuthBase, ProviderInterface):
                     if "properties" in params:
                         self._clean_schema_properties(params["properties"])
                     self._resolve_refs(params)
-            cleaned_tools.append(cleaned_tool)
+            cleaned.append(cleaned_tool)
         return cleaned
 
     def _clean_schema_properties(self, properties: Dict[str, Any]) -> None:
@@ -426,7 +417,6 @@ class FreebuffProvider(FreebuffAuthBase, ProviderInterface):
                                 return
 
                         if response.status_code == 401:
-                            from datetime import timedelta
                             pool.cooldown_until = time.monotonic() + 1800
                             self.invalidate_session(pool, "auth rejected")
                             self.release_run(pool, run)
