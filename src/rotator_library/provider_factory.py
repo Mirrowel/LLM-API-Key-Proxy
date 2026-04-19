@@ -7,12 +7,14 @@ from .providers.gemini_auth_base import GeminiAuthBase
 from .providers.qwen_auth_base import QwenAuthBase
 from .providers.iflow_auth_base import IFlowAuthBase
 from .providers.antigravity_auth_base import AntigravityAuthBase
+from .providers.freebuff_auth_base import FreebuffAuthBase
 
 PROVIDER_MAP = {
     "gemini_cli": GeminiAuthBase,
     "qwen_code": QwenAuthBase,
     "iflow": IFlowAuthBase,
     "antigravity": AntigravityAuthBase,
+    "freebuff": FreebuffAuthBase,
 }
 
 def get_provider_auth_class(provider_name: str):
