@@ -106,6 +106,13 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "synthetic": {
         "category": "popular",
     },
+    "freebuff": {
+        "category": "popular",
+        "note": "Free AI model hosting. Auth token from Freebuff CLI (~/.config/manicode/credentials.json).",
+        "extra_vars": [
+            ("FREEBUFF_API_BASE", "API Base URL (optional)", "https://codebuff.com"),
+        ],
+    },
     # =========================================================================
     # CLOUD PLATFORMS - Aggregators & cloud inference platforms
     # =========================================================================
