@@ -841,7 +841,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         if status_code == 429:
             retry_after = get_retry_after(e)
             # Check if this is a quota error vs rate limit
-            if "quota" in error_body or "resource_exhausted" in error_body:
+            if "quota" in error_body or "resource_exhausted" in error_body or "usage_limit" in error_body:
                 # Extract quota details from the original (non-lowercased) response
                 quota_value, quota_id = None, None
                 try:

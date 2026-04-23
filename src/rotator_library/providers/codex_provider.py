@@ -1552,12 +1552,19 @@ class CodexProvider(OpenAIOAuthBase, CodexQuotaTracker, ProviderInterface):
                     "quota_reset_timestamp": None,
                 }
 
-            if error_info.get("code") == "quota_exceeded":
+            if error_info.get("code") in ("quota_exceeded", "usage_limit_reached"):
+                # usage_limit_reached: Codex returns this when the credential's
+                # usage window quota is exhausted (e.g. 5h rate limit hit).
+                # Must be classified as quota exhaustion so cooldowns are applied
+                # and the credential is skipped during rotation.
+                from ..error_handler import get_retry_after as _get_retry_after
+
+                retry_after = _get_retry_after(error) or 3600  # 1 hour default
                 return {
-                    "retry_after": 3600,  # 1 hour default
+                    "retry_after": retry_after,
                     "reason": "QUOTA_EXHAUSTED",
                     "reset_timestamp": None,
-                    "quota_reset_timestamp": None,
+                    "quota_reset_timestamp": time.time() + retry_after,
                 }
 
         except Exception:
