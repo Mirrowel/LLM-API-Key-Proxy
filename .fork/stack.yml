@@ -1,0 +1,192 @@
+# Fork stack manifest
+#
+# Canonical shared metadata for the b3nw LLM-API-Key-Proxy fork.
+# `dev` is a rewritten linear stack on top of upstream/dev. This manifest records
+# the intended stack order and maps stack commits to durable feature IDs.
+#
+# Keep this file in the repo so every contributor/workspace sees the same feature
+# ownership and ordering rules.
+
+base: upstream/dev
+branch: dev
+
+rules:
+  linear_history: true
+  no_merge_commits: true
+  local_state_is_non_canonical: true
+  canonical_feature_history: .fork/features
+  allow_multiple_commits_per_feature: false
+  allowed_duplicate_features:
+    # Historical split predating the shared .fork metadata. Do not add new
+    # duplicates here without documenting the exception in the feature ledger.
+    gemini-cli:
+      - "fix(gemini-cli): fast-fail on non-rotatable errors and pro quota handling"
+      - "feat(gemini-cli): expose gemini-3.5-flash, unify quota groups, fix token counts"
+    xai:
+      - "feat(xai): add xAI Grok OAuth provider with PKCE and Device Code flows"
+      - "feat(xai): enable xAI Grok device-code OAuth in admin WebUI"
+
+features:
+  - id: anthropic
+    prefix: "feat(anthropic)"
+    subject: "feat(anthropic): add OAuth support and handle streaming nulls"
+    files:
+      - "src/rotator_library/providers/anthropic*"
+      - "src/rotator_library/providers/utilities/anthropic*"
+
+  - id: chutes
+    prefix: "feat(chutes)"
+    subject: "feat(chutes): dollar quota tracking with sliding window"
+    files:
+      - "src/rotator_library/providers/chutes*"
+      - "src/rotator_library/providers/utilities/chutes*"
+
+  - id: codex
+    prefix: "feat(codex)"
+    subject: "feat(codex): Responses API rewrite, dynamic model discovery, and OAuth exports"
+    files:
+      - "src/rotator_library/providers/codex*"
+      - "src/rotator_library/providers/utilities/codex*"
+
+  - id: opencode-zen
+    prefix: "feat(opencode_zen)"
+    subject: "feat(opencode_zen): add opencode_zen provider with routing"
+    files:
+      - "src/rotator_library/providers/opencode_zen*"
+      - "src/rotator_library/providers/utilities/opencode_zen*"
+
+  - id: nanogpt
+    prefix: "feat(nanogpt)"
+    subject: "feat(nanogpt): native Anthropic routing, streaming fallback, and quota cleanup"
+    files:
+      - "src/rotator_library/providers/nanogpt*"
+      - "src/rotator_library/providers/utilities/nanogpt*"
+
+  - id: gemini-cli
+    prefix: "feat(gemini-cli)"
+    subject: "feat(gemini-cli): expose gemini-3.5-flash, unify quota groups, fix token counts"
+    files:
+      - "src/proxy_app/api/config.py"
+      - "src/rotator_library/providers/gemini*"
+      - "src/rotator_library/providers/utilities/gemini*"
+      - "src/rotator_library/usage/manager.py"
+
+  - id: vertex
+    prefix: "feat(vertex)"
+    subject: "feat(vertex): Vertex AI Express Mode provider with x-goog-api-key auth"
+    files:
+      - "src/rotator_library/providers/vertex*"
+      - "src/rotator_library/providers/utilities/vertex*"
+
+  - id: opencode-go
+    prefix: "feat(opencode_go)"
+    subject: "feat(opencode_go): add Opencode Go provider with 3-window quota tracking and scraped balance"
+    files:
+      - "src/rotator_library/providers/opencode_go*"
+      - "src/rotator_library/providers/utilities/opencode_go*"
+
+  - id: command-code
+    prefix: "feat(command_code)"
+    subject: "feat(command_code): add Command Code provider with plan bypass routing and credit monitoring"
+    files:
+      - "src/rotator_library/providers/command_code*"
+      - "src/rotator_library/providers/utilities/command_code*"
+
+  - id: kilocode
+    prefix: "feat(kilocode)"
+    subject: "feat(kilocode): add credit balance tracking via web session cookie"
+    files:
+      - "src/rotator_library/providers/kilocode*"
+      - "src/rotator_library/providers/utilities/kilocode*"
+
+  - id: copilot
+    prefix: "feat(copilot)"
+    subject: "feat(copilot): GitHub Copilot provider with OAuth device flow, plan-based model filtering, and enhanced X-Initiator heuristic"
+    files:
+      - "src/rotator_library/providers/copilot*"
+      - "src/rotator_library/providers/utilities/copilot*"
+
+  - id: core
+    prefix: "feat(core)"
+    subject: "feat(core): infrastructure improvements - latest aliases, error standardization, and utilities"
+    files:
+      - "src/rotator_library/client/**"
+      - "src/rotator_library/error*"
+      - "src/rotator_library/credential*"
+      - "src/proxy_app/main.py"
+
+  - id: health
+    prefix: "feat(health)"
+    subject: "feat(health): add health & diagnostics endpoints (/v1/health, /v1/health/errors)"
+    files:
+      - "src/proxy_app/**health*"
+      - "src/proxy_app/**diagnostic*"
+
+  - id: proxy
+    prefix: "feat(proxy)"
+    subject: "feat(proxy): outbound HTTP/SOCKS5 proxy support with per-provider/credential routing"
+    files:
+      - "src/**/proxy*"
+
+  - id: usage
+    prefix: "feat(usage)"
+    subject: "feat(usage): add monthly budget and RPD quota guards"
+    files:
+      - "src/rotator_library/usage/**"
+
+  - id: fallback
+    prefix: "fix(fallback)"
+    subject: "fix(fallback): enable MODEL_FALLBACK for streaming requests"
+    files:
+      - "src/**/fallback*"
+      - "src/**/stream*"
+
+  - id: model-routing
+    prefix: "feat(model-routing)"
+    subject: "feat(model-routing): MODEL_ALIASES and cross-provider rotation"
+    files:
+      - "src/**/model_alias*"
+      - "src/**/cross_provider*"
+
+  - id: tui
+    prefix: "feat(tui)"
+    subject: "feat(tui): transaction viewer, compact displays, and detail views"
+    files:
+      - "src/proxy_app/*viewer.py"
+      - "src/proxy_app/quota_viewer.py"
+      - "src/proxy_app/log_viewer.py"
+
+  - id: tests
+    prefix: "feat(tests)"
+    subject: "feat(tests): add local test suite (153 tests, zero-cost, no network)"
+    files:
+      - "tests/**"
+
+  - id: tooling
+    prefix: "feat(tooling)"
+    subject: "feat(tooling): add AGENTS.md and .agent/ config for linear stack workflow"
+    files:
+      - "AGENTS.md"
+      - ".agent/**"
+      - ".fork/**"
+
+  - id: webui
+    prefix: "feat(webui)"
+    subject: "feat(webui): add React web UI with admin dashboard, quota viewer, log explorer, and settings"
+    files:
+      - "webui/**"
+
+  - id: ci
+    prefix: "feat(ci)"
+    subject: "feat(ci): fork-aware release notes with incremental topic diff"
+    files:
+      - ".github/workflows/**"
+      - "scripts/create_release.sh"
+
+  - id: xai
+    prefix: "feat(xai)"
+    subject: "feat(xai): add xAI Grok OAuth provider with PKCE and Device Code flows"
+    files:
+      - "src/rotator_library/providers/xai*"
+      - "src/rotator_library/providers/utilities/xai*"
+      - "webui/**/xai*"
