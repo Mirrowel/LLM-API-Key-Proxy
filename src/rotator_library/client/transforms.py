@@ -237,60 +237,9 @@ class ProviderTransforms:
         model: str,
         provider: str,
     ) -> Optional[str]:
-        """
-        Apply default Gemini safety settings.
-
-        Ensures safety settings are present without overriding explicit settings.
-        """
-        if provider != "gemini":
-            return None
-
-        # Default safety settings (generic form)
-        default_generic = {
-            "harassment": "OFF",
-            "hate_speech": "OFF",
-            "sexually_explicit": "OFF",
-            "dangerous_content": "OFF",
-            "civic_integrity": "BLOCK_NONE",
-        }
-
-        # Default Gemini-native settings
-        default_gemini = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
-        ]
-
-        # If generic form present, fill in missing keys
-        if "safety_settings" in kwargs and isinstance(kwargs["safety_settings"], dict):
-            for k, v in default_generic.items():
-                if k not in kwargs["safety_settings"]:
-                    kwargs["safety_settings"][k] = v
-            return "gemini: filled missing safety settings"
-
-        # If Gemini form present, fill in missing categories
-        if "safetySettings" in kwargs and isinstance(kwargs["safetySettings"], list):
-            present = {
-                item.get("category")
-                for item in kwargs["safetySettings"]
-                if isinstance(item, dict)
-            }
-            added = 0
-            for d in default_gemini:
-                if d["category"] not in present:
-                    kwargs["safetySettings"].append(d)
-                    added += 1
-            if added > 0:
-                return f"gemini: added {added} missing safety categories"
-            return None
-
-        # Neither present: set generic defaults
-        if "safety_settings" not in kwargs and "safetySettings" not in kwargs:
-            kwargs["safety_settings"] = default_generic.copy()
-            return "gemini: applied default safety settings"
-
+        # Safety settings are passed through unchanged. No defaults are injected
+        # because some Gemini-family models (e.g. Gemma) reject unknown safety
+        # categories with a 400 error.
         return None
 
     def _transform_gemini_thinking(
@@ -374,25 +323,10 @@ class ProviderTransforms:
         return None
 
     # =========================================================================
-    # SAFETY SETTINGS CONVERSION
+    # SAFETY SETTINGS CONVERSION (REMOVED)
     # =========================================================================
-
-    def convert_safety_settings(
-        self,
-        provider: str,
-        settings: Dict[str, str],
-    ) -> Optional[Any]:
-        """
-        Convert generic safety settings to provider-specific format.
-
-        Args:
-            provider: Provider name
-            settings: Generic safety settings dict
-
-        Returns:
-            Provider-specific settings or None
-        """
-        plugin = self._get_plugin_instance(provider)
-        if plugin and hasattr(plugin, "convert_safety_settings"):
-            return plugin.convert_safety_settings(settings)
-        return None
+    # Previously had convert_safety_settings() wrapper that delegated to
+    # provider plugins. Removed because auto-injecting/merging safety defaults
+    # caused 400 errors on models that don't support those categories (e.g. Gemma).
+    # See gemini_provider.py for the full removal comment with previous defaults.
+    # =========================================================================

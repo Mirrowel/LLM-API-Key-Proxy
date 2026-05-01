@@ -6,15 +6,17 @@ import logging
 from typing import List, Dict, Any
 from .provider_interface import ProviderInterface
 
-lib_logger = logging.getLogger('rotator_library')
-lib_logger.propagate = False # Ensure this logger doesn't propagate to root
+lib_logger = logging.getLogger("rotator_library")
+lib_logger.propagate = False  # Ensure this logger doesn't propagate to root
 if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
+
 
 class GeminiProvider(ProviderInterface):
     """
     Provider implementation for the Google Gemini API.
     """
+
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
         Fetches the list of available models from the Google Gemini API.
@@ -22,71 +24,54 @@ class GeminiProvider(ProviderInterface):
         try:
             response = await client.get(
                 "https://generativelanguage.googleapis.com/v1beta/models",
-                headers={"x-goog-api-key": api_key}
+                headers={"x-goog-api-key": api_key},
             )
             response.raise_for_status()
-            return [f"gemini/{model['name'].replace('models/', '')}" for model in response.json().get("models", [])]
+            return [
+                f"gemini/{model['name'].replace('models/', '')}"
+                for model in response.json().get("models", [])
+            ]
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to fetch Gemini models: {e}")
             return []
 
-    def convert_safety_settings(self, settings: Dict[str, str]) -> List[Dict[str, Any]]:
-        """
-        Converts generic safety settings to the Gemini-specific format.
-        """
-        if not settings:
-            # Return full defaults if nothing provided
-            return [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-                {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
-            ]
-
-        # Default gemini-format settings for merging
-        default_gemini = {
-            "HARM_CATEGORY_HARASSMENT": "OFF",
-            "HARM_CATEGORY_HATE_SPEECH": "OFF",
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "OFF",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "OFF",
-            "HARM_CATEGORY_CIVIC_INTEGRITY": "BLOCK_NONE",
-        }
-
-        # If the caller already provided Gemini-style list, merge defaults without overwriting
-        if isinstance(settings, list):
-            existing = {item.get("category"): item for item in settings if isinstance(item, dict) and item.get("category")}
-            merged = list(settings)
-            for cat, thr in default_gemini.items():
-                if cat not in existing:
-                    merged.append({"category": cat, "threshold": thr})
-            return merged
-
-        # Otherwise assume a generic mapping (dict) and convert
-        gemini_settings = []
-        category_map = {
-            "harassment": "HARM_CATEGORY_HARASSMENT",
-            "hate_speech": "HARM_CATEGORY_HATE_SPEECH",
-            "sexually_explicit": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-            "dangerous_content": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "civic_integrity": "HARM_CATEGORY_CIVIC_INTEGRITY",
-        }
-
-        for generic_category, threshold in settings.items():
-            if generic_category in category_map:
-                thr = (threshold or "").upper()
-                gemini_settings.append({
-                    "category": category_map[generic_category],
-                    "threshold": thr if thr else default_gemini[category_map[generic_category]]
-                })
-
-        # Add any missing defaults
-        present = {s["category"] for s in gemini_settings}
-        for cat, thr in default_gemini.items():
-            if cat not in present:
-                gemini_settings.append({"category": cat, "threshold": thr})
-
-        return gemini_settings
+    # =========================================================================
+    # SAFETY SETTINGS (REMOVED)
+    # =========================================================================
+    #
+    # Previously, the proxy auto-injected default Gemini safety settings for every
+    # request. This caused 400 errors on models that don't support those categories
+    # (e.g. Gemma models reject harassment, hate_speech, sexually_explicit,
+    # dangerous_content, civic_integrity). The safety settings system has been
+    # removed from the transform pipeline. Safety settings are now passed through
+    # unchanged if the caller provides them.
+    #
+    # Previous defaults that were injected:
+    #
+    #   Generic form (dict):
+    #     {
+    #         "harassment": "OFF",
+    #         "hate_speech": "OFF",
+    #         "sexually_explicit": "OFF",
+    #         "dangerous_content": "OFF",
+    #         "civic_integrity": "BLOCK_NONE",
+    #     }
+    #
+    #   Gemini-native form (list):
+    #     [
+    #         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+    #         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+    #         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+    #         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+    #         {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+    #     ]
+    #
+    # Removed from:
+    #   - ProviderTransforms._transform_gemini_safety  (transforms.py)
+    #   - ProviderTransforms.convert_safety_settings   (transforms.py)
+    #   - ProviderInterface.convert_safety_settings    (provider_interface.py)
+    #   - GeminiProvider.convert_safety_settings       (this file)
+    # =========================================================================
 
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
@@ -116,15 +101,15 @@ class GeminiProvider(ProviderInterface):
                     budgets = {"low": 8192, "medium": 16384, "high": 32768}
                 elif "gemini-2.5-flash" in model:
                     budgets = {"low": 6144, "medium": 12288, "high": 24576}
-                else: # Fallback for other models if the custom flag is still used
+                else:  # Fallback for other models if the custom flag is still used
                     budgets = {"low": 1024, "medium": 2048, "high": 4096}
-                
+
                 budget = budgets.get(reasoning_effort)
                 if budget is not None:
                     payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 elif reasoning_effort == "disable":
                     payload["thinking"] = {"type": "enabled", "budget_tokens": 0}
-                
+
                 # Clean up the handled 'reasoning_effort' parameter.
                 payload.pop("reasoning_effort", None)
 

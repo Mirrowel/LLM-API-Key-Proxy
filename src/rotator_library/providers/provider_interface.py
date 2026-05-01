@@ -280,19 +280,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             f"{self.__class__.__name__} does not implement custom aembedding."
         )
 
-    def convert_safety_settings(
-        self, settings: Dict[str, str]
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Converts a generic safety settings dictionary to the provider-specific format.
-
-        Args:
-            settings: A dictionary with generic harm categories and thresholds.
-
-        Returns:
-            A list of provider-specific safety setting objects or None.
-        """
-        return None
+    # convert_safety_settings() removed — see gemini_provider.py for details.
 
     # [NEW] Add new methods for OAuth providers
     async def get_auth_header(self, credential_identifier: str) -> Dict[str, str]:
