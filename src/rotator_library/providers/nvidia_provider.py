@@ -91,12 +91,6 @@ class NvidiaProvider(ProviderInterface):
 
         reasoning_effort = payload.get("reasoning_effort")
 
-        if "extra_body" not in payload:
-            payload["extra_body"] = {}
-        if "chat_template_kwargs" not in payload["extra_body"]:
-            payload["extra_body"]["chat_template_kwargs"] = {}
-
-        kwargs = payload["extra_body"]["chat_template_kwargs"]
         is_disabled = (
             isinstance(reasoning_effort, str)
             and reasoning_effort.lower() in self.DISABLE_VALUES
@@ -109,11 +103,18 @@ class NvidiaProvider(ProviderInterface):
                     f"(reasoning_effort='{reasoning_effort}')"
                 )
                 return
-            kwargs["reasoning_effort"] = "high"
+            payload["reasoning_effort"] = "high"
             lib_logger.info(
                 f"NVIDIA: Mistral '{model_name}' — reasoning_effort='high'"
             )
             return
+
+        if "extra_body" not in payload:
+            payload["extra_body"] = {}
+        if "chat_template_kwargs" not in payload["extra_body"]:
+            payload["extra_body"]["chat_template_kwargs"] = {}
+
+        kwargs = payload["extra_body"]["chat_template_kwargs"]
 
         if is_disabled:
             kwargs["thinking"] = False
