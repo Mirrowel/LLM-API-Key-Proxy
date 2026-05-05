@@ -21,6 +21,8 @@ services:
       - ./logs:/app/logs
       # Mount usage directory for usage statistics persistence
       - ./usage:/app/usage
+      # Mount data directory for sqlite persistence (data/proxy.db)
+      - ./data:/app/data
       # Optionally mount additional .env files (e.g., combined credential files)
       # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
     environment:

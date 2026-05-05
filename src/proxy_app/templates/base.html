@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Proxy UI{% endblock %}</title>
+  <link rel="stylesheet" href="/static/ui.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="/ui/me">LLM API Key Proxy</a>
+      <nav class="nav">
+        <a href="/ui/me">Me</a>
+        {% if current_user and current_user.role == "admin" %}
+        <a href="/ui/admin">Admin</a>
+        {% elif current_admin %}
+        <a href="/ui/admin">Admin</a>
+        {% endif %}
+        {% if current_user or current_admin %}
+        <form action="/ui/logout" method="post" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Logout</button>
+        </form>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+  <main class="wrap main-content">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

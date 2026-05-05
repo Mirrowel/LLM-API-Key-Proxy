@@ -919,6 +919,18 @@ The proxy accepts both Anthropic and OpenAI authentication styles:
 - `x-api-key` header (Anthropic style)
 - `Authorization: Bearer` header (OpenAI style)
 
+For `/v1/*` token validation, behavior is controlled by `AUTH_MODE`:
+
+| AUTH_MODE | Accepted tokens | Migration intent |
+|-----------|-----------------|------------------|
+| `users` | Database-backed user API keys | Target steady-state |
+| `legacy` | `PROXY_API_KEY` only | Legacy compatibility mode |
+| `both` | User API keys + `PROXY_API_KEY` | Default migration mode |
+
+Legacy compatibility statement: existing clients that still send `PROXY_API_KEY` remain supported when `AUTH_MODE=legacy` or `AUTH_MODE=both`.
+
+Recommended rollout: bootstrap admin via `INITIAL_ADMIN_USERNAME`/`INITIAL_ADMIN_PASSWORD`, run with `AUTH_MODE=both` during client migration, then move to `AUTH_MODE=users`.
+
 ### 3.5. Antigravity (`antigravity_provider.py`)
 
 The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
@@ -1925,4 +1937,3 @@ The GUI modifies the same environment variables that the `RotatingClient` reads:
 3. **Proxy applies rules** → `get_available_models()` filters based on rules
 
 **Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
-

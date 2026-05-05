@@ -34,8 +34,8 @@ ENV PATH=/root/.local/bin:$PATH
 # Copy application code
 COPY src/ ./src/
 
-# Create directories for logs and oauth credentials
-RUN mkdir -p logs oauth_creds
+# Create runtime directories for persisted state
+RUN mkdir -p logs oauth_creds usage data
 
 # Expose the default port
 EXPOSE 8000

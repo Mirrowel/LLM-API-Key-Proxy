@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{% block title %}Admin User Detail{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>User: {{ target_user.username }}</h1>
+  <p class="muted">ID {{ target_user.id }} | Role: {{ target_user.role }} | Status: {% if target_user.is_active %}Active{% else %}Disabled{% endif %}</p>
+  <p><a href="/ui/admin">Back to admin list</a></p>
+</section>
+
+{% if error %}
+<section class="panel">
+  <p class="error">{{ error }}</p>
+</section>
+{% endif %}
+
+{% if new_password %}
+<section class="panel">
+  <h2>New Password</h2>
+  <p class="warn">Copy this now and deliver it securely.</p>
+  <code class="token">{{ new_password }}</code>
+</section>
+{% endif %}
+
+<section class="panel action-row">
+  {% if target_user.is_active %}
+  <form action="/ui/admin/users/{{ target_user.id }}/disable" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Disable User</button>
+  </form>
+  {% else %}
+  <form action="/ui/admin/users/{{ target_user.id }}/enable" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Enable User</button>
+  </form>
+  {% endif %}
+
+  <form action="/ui/admin/users/{{ target_user.id }}/reset-password" method="post" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input name="password" type="text" placeholder="Leave blank for generated password">
+    <button type="submit">Reset Password</button>
+  </form>
+</section>
+
+<section class="panel grid-two">
+  <div>
+    <h2>Usage Summary</h2>
+    <ul class="stats">
+      <li>Requests: <strong>{{ usage_summary.request_count }}</strong></li>
+      <li>Prompt tokens: <strong>{{ usage_summary.prompt_tokens }}</strong></li>
+      <li>Completion tokens: <strong>{{ usage_summary.completion_tokens }}</strong></li>
+      <li>Total tokens: <strong>{{ usage_summary.total_tokens }}</strong></li>
+      <li>Cost USD: <strong>{{ usage_summary.cost_usd if usage_summary.cost_usd is not none else "-" }}</strong></li>
+    </ul>
+  </div>
+  <div>
+    <h2>Usage By Day ({{ days }}d)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Day</th>
+          <th>Requests</th>
+          <th>Total Tokens</th>
+          <th>Cost USD</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in usage_by_day %}
+        <tr>
+          <td>{{ row.day }}</td>
+          <td>{{ row.request_count }}</td>
+          <td>{{ row.total_tokens }}</td>
+          <td>{{ row.cost_usd if row.cost_usd is not none else "-" }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" class="muted">No usage yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Usage By Model ({{ days }}d)</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Model</th>
+        <th>Requests</th>
+        <th>Total tokens</th>
+        <th>Cost USD</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in usage_by_model %}
+      <tr>
+        <td>{{ row.model if row.model else "(unknown)" }}</td>
+        <td>{{ row.request_count }}</td>
+        <td>{{ row.total_tokens }}</td>
+        <td>{{ row.cost_usd if row.cost_usd is not none else "-" }}</td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="4" class="muted">No usage yet.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

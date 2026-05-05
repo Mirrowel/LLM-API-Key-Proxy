@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+
+{% block title %}My Account{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>My Account</h1>
+  <p class="muted">Signed in as <strong>{{ current_user.username }}</strong> ({{ current_user.role }})</p>
+</section>
+
+{% if error %}
+<section class="panel">
+  <p class="error">{{ error }}</p>
+</section>
+{% endif %}
+
+{% if new_api_key_token %}
+<section class="panel">
+  <h2>New API Key</h2>
+  <p class="warn">Copy this now. You will not be able to view it again.</p>
+  <code class="token">{{ new_api_key_token }}</code>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Create API Key</h2>
+  <form action="/ui/me/api-keys" method="post" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input name="name" type="text" placeholder="Key name" required>
+    <button type="submit">Create</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>API Keys</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Prefix</th>
+        <th>Created</th>
+        <th>Last used</th>
+        <th>Status</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for key in api_keys %}
+      <tr>
+        <td>{{ key.id }}</td>
+        <td>{{ key.name }}</td>
+        <td><code>{{ key.token_prefix }}</code></td>
+        <td>{{ key.created_at }}</td>
+        <td>{{ key.last_used_at if key.last_used_at else "-" }}</td>
+        <td>{% if key.revoked_at %}Revoked{% else %}Active{% endif %}</td>
+        <td>
+          {% if not key.revoked_at %}
+          <form action="/ui/me/api-keys/{{ key.id }}/revoke" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Revoke</button>
+          </form>
+          {% else %}
+          <span class="muted">-</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="7" class="muted">No API keys yet.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel grid-two">
+  <div>
+    <h2>Usage Summary</h2>
+    <ul class="stats">
+      <li>Requests: <strong>{{ usage_summary.request_count }}</strong></li>
+      <li>Prompt tokens: <strong>{{ usage_summary.prompt_tokens }}</strong></li>
+      <li>Completion tokens: <strong>{{ usage_summary.completion_tokens }}</strong></li>
+      <li>Total tokens: <strong>{{ usage_summary.total_tokens }}</strong></li>
+      <li>Cost USD: <strong>{{ usage_summary.cost_usd if usage_summary.cost_usd is not none else "-" }}</strong></li>
+    </ul>
+  </div>
+  <div>
+    <h2>Usage By Day ({{ days }}d)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Day</th>
+          <th>Requests</th>
+          <th>Total tokens</th>
+          <th>Cost USD</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in usage_by_day %}
+        <tr>
+          <td>{{ row.day }}</td>
+          <td>{{ row.request_count }}</td>
+          <td>{{ row.total_tokens }}</td>
+          <td>{{ row.cost_usd if row.cost_usd is not none else "-" }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" class="muted">No usage yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
