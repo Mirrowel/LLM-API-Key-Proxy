@@ -23,6 +23,7 @@ import litellm
 
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
+from ..core.utils import normalize_usage_for_response
 
 if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
@@ -101,6 +102,7 @@ class StreamingHandler:
                         chunk,
                         accumulated_finish_reason,
                         has_tool_calls,
+                        model,
                     )
 
                     # Update tracking state
@@ -245,6 +247,7 @@ class StreamingHandler:
         chunk: Any,
         accumulated_finish_reason: Optional[str],
         has_tool_calls: bool,
+        model: str = "",
     ) -> ProcessedChunk:
         """
         Process a single streaming chunk.
@@ -323,6 +326,10 @@ class StreamingHandler:
             else:
                 # INTERMEDIATE CHUNK: Never emit finish_reason
                 choice["finish_reason"] = None
+
+        usage = chunk_dict.get("usage")
+        if isinstance(usage, dict):
+            normalize_usage_for_response(usage, model)
 
         return ProcessedChunk(
             sse_string=f"data: {json.dumps(chunk_dict)}\n\n",

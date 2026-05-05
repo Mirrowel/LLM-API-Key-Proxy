@@ -40,6 +40,7 @@ from litellm.exceptions import (
 )
 
 from ..core.types import RequestContext, ErrorAction
+from ..core.utils import normalize_usage_for_response
 from ..core.errors import (
     NoAvailableKeysError,
     PreRequestCallbackError,
@@ -628,7 +629,7 @@ class RequestExecutor:
                                             f"Failed to log response: {log_err}"
                                         )
 
-                                return response
+                                return self._normalize_response_usage(response, model)
 
                             except Exception as e:
                                 last_exception = e
@@ -1261,6 +1262,19 @@ class RequestExecutor:
             cache_write_tokens,
             thinking_tokens,
         )
+
+    @staticmethod
+    def _normalize_response_usage(response: Any, model: str) -> Any:
+        """
+        Normalize usage fields on the non-streaming response object.
+
+        Delegates to normalize_usage_for_response which handles both
+        dicts (streaming) and pydantic objects (non-streaming).
+        Internal tracking values from _extract_usage_tokens are unaffected.
+        """
+        if hasattr(response, "usage") and response.usage:
+            normalize_usage_for_response(response.usage, model)
+        return response
 
     def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
         plugin = self._get_plugin_instance(provider)
