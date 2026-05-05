@@ -549,6 +549,12 @@ class RequestExecutor:
                             provider, model, cred, context
                         )
 
+                        # Log transformed request if it differs from original
+                        if context.transaction_logger:
+                            context.transaction_logger.log_transformed_request(
+                                kwargs, context.kwargs
+                            )
+
                         # Get provider plugin
                         plugin = self._get_plugin_instance(provider)
 
@@ -754,6 +760,12 @@ class RequestExecutor:
                             kwargs = await self._prepare_request_kwargs(
                                 provider, model, cred, context
                             )
+
+                            # Log transformed request if it differs from original
+                            if context.transaction_logger:
+                                context.transaction_logger.log_transformed_request(
+                                    kwargs, context.kwargs
+                                )
 
                             # Add stream options (but not for iflow - it returns 406)
                             if provider != "iflow":

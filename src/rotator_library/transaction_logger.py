@@ -37,6 +37,18 @@ from .utils.paths import get_logs_dir
 
 lib_logger = logging.getLogger("rotator_library")
 
+FRAMEWORK_KEYS = frozenset({
+    "api_key",
+    "api_base",
+    "custom_llm_provider",
+    "transaction_context",
+    "credential_identifier",
+})
+
+
+def _strip_framework_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in data.items() if k not in FRAMEWORK_KEYS}
+
 
 def _get_transactions_dir() -> Path:
     """Get the transactions log directory, creating it if needed."""
@@ -204,6 +216,44 @@ class TransactionLogger:
             "data": request_data,
         }
         self._write_json(filename, data)
+
+    def log_transformed_request(
+        self,
+        transformed_data: Dict[str, Any],
+        original_data: Dict[str, Any],
+    ) -> None:
+        """
+        Log the transformed request if it differs from the original.
+
+        Compares the two payloads after stripping framework infrastructure
+        keys (api_key, api_base, custom_llm_provider, etc.).  If the
+        remaining content is identical, nothing is written.
+
+        Args:
+            transformed_data: The kwargs after all transforms/sanitization.
+            original_data: The original kwargs as received by the client.
+        """
+        if not self.enabled or not self._dir_available:
+            return
+
+        stripped_transformed = _strip_framework_keys(transformed_data)
+        stripped_original = _strip_framework_keys(original_data)
+
+        try:
+            if json.dumps(stripped_transformed, sort_keys=True, default=str) == json.dumps(
+                stripped_original, sort_keys=True, default=str
+            ):
+                return
+        except (TypeError, ValueError):
+            pass
+
+        logged = _strip_framework_keys(transformed_data)
+        data = {
+            "request_id": self.request_id,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "data": logged,
+        }
+        self._write_json("request_transformed.json", data)
 
     def log_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         """
