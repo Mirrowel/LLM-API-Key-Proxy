@@ -20,7 +20,6 @@ class MistralProvider(ProviderInterface):
     MISTRAL_MODEL_PATTERNS = [
         "mistral-medium",
         "mistral-small",
-        "magistral-medium",
     ]
 
     DISABLE_VALUES = {"none", "disable", "off"}
@@ -50,7 +49,7 @@ class MistralProvider(ProviderInterface):
         """
         Configures reasoning_effort for Mistral reasoning models.
 
-        Mistral's reasoning models (medium, small, magistral) support a
+        Mistral's reasoning models (medium, small) support a
         ``reasoning_effort`` parameter, but LiteLLM does not recognise it as a
         top-level kwarg and silently drops it before forwarding the request.
         To work around this we remove the top-level key (if present) and inject
