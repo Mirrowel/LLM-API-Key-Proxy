@@ -62,6 +62,7 @@ class ProviderTransforms:
             "nvidia_nim": [self._transform_nvidia_thinking],
             "iflow": [self._transform_iflow_stream_options],
             "dedaluslabs": [self._transform_dedaluslabs_tool_choice],
+            "mistral": [self._transform_mistral_thinking],
         }
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
@@ -280,6 +281,26 @@ class ProviderTransforms:
         if plugin and hasattr(plugin, "handle_thinking_parameter"):
             plugin.handle_thinking_parameter(kwargs, model)
             return "nvidia_nim: handled thinking parameter"
+        return None
+
+    def _transform_mistral_thinking(
+        self,
+        kwargs: Dict[str, Any],
+        model: str,
+        provider: str,
+    ) -> Optional[str]:
+        """
+        Handle thinking parameter for Mistral.
+
+        Delegates to provider plugin's handle_thinking_parameter method.
+        """
+        if provider != "mistral":
+            return None
+
+        plugin = self._get_plugin_instance(provider)
+        if plugin and hasattr(plugin, "handle_thinking_parameter"):
+            plugin.handle_thinking_parameter(kwargs, model)
+            return "mistral: handled thinking parameter"
         return None
 
     def _transform_iflow_stream_options(
