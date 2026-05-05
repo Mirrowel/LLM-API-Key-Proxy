@@ -47,6 +47,10 @@ class NvidiaProvider(ProviderInterface):
         "deepseek-ai/deepseek-v4-pro",
         "deepseek-ai/deepseek-v4-flash",
     ]
+    MISTRAL_MODEL_PATTERNS = [
+        "mistral-medium-3.5",
+        "mistral-small-4",
+    ]
 
     V4_EFFORT_MAP = {
         "low": "high",
@@ -64,20 +68,25 @@ class NvidiaProvider(ProviderInterface):
     def _is_v4_deepseek(self, model_name: str) -> bool:
         return model_name in self.V4_MODEL_EXACT
 
+    def _is_mistral_reasoning(self, model_name: str) -> bool:
+        return any(p in model_name for p in self.MISTRAL_MODEL_PATTERNS)
+
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
-        Configures thinking and reasoning_effort for DeepSeek models on NVIDIA.
+        Configures thinking and reasoning_effort for DeepSeek and Mistral models on NVIDIA.
 
-        V3.x models: only thinking=True/False in chat_template_kwargs.
-        V4 models: thinking + mapped reasoning_effort (high/max).
-        Incoming reasoning_effort of none/disable/off disables thinking.
+        DeepSeek V3.x: only thinking=True/False in chat_template_kwargs.
+        DeepSeek V4: thinking + mapped reasoning_effort (high/max).
+        Mistral: reasoning_effort="high" in chat_template_kwargs (no thinking param).
+        Incoming reasoning_effort of none/disable/off disables thinking/effort.
         """
         model_name = model.split("/", 1)[1] if "/" in model else model
 
         is_v3 = self._is_v3_deepseek(model_name)
         is_v4 = self._is_v4_deepseek(model_name)
+        is_mistral = self._is_mistral_reasoning(model_name)
 
-        if not is_v3 and not is_v4:
+        if not is_v3 and not is_v4 and not is_mistral:
             return
 
         reasoning_effort = payload.get("reasoning_effort")
@@ -92,6 +101,19 @@ class NvidiaProvider(ProviderInterface):
             isinstance(reasoning_effort, str)
             and reasoning_effort.lower() in self.DISABLE_VALUES
         )
+
+        if is_mistral:
+            if is_disabled:
+                lib_logger.info(
+                    f"NVIDIA: Mistral '{model_name}' — reasoning effort DISABLED "
+                    f"(reasoning_effort='{reasoning_effort}')"
+                )
+                return
+            kwargs["reasoning_effort"] = "high"
+            lib_logger.info(
+                f"NVIDIA: Mistral '{model_name}' — reasoning_effort='high'"
+            )
+            return
 
         if is_disabled:
             kwargs["thinking"] = False
