@@ -77,7 +77,7 @@ class NvidiaProvider(ProviderInterface):
 
         DeepSeek V3.x: only thinking=True/False in chat_template_kwargs.
         DeepSeek V4: thinking + mapped reasoning_effort (high/max).
-        Mistral: reasoning_effort="high" in chat_template_kwargs (no thinking param).
+        Mistral: reasoning_effort="high" via extra_body (LiteLLM drops unsupported top-level params).
         Incoming reasoning_effort of none/disable/off disables thinking/effort.
         """
         model_name = model.split("/", 1)[1] if "/" in model else model
@@ -97,15 +97,18 @@ class NvidiaProvider(ProviderInterface):
         )
 
         if is_mistral:
+            payload.pop("reasoning_effort", None)
             if is_disabled:
                 lib_logger.info(
                     f"NVIDIA: Mistral '{model_name}' — reasoning effort DISABLED "
                     f"(reasoning_effort='{reasoning_effort}')"
                 )
                 return
-            payload["reasoning_effort"] = "high"
+            if "extra_body" not in payload:
+                payload["extra_body"] = {}
+            payload["extra_body"]["reasoning_effort"] = "high"
             lib_logger.info(
-                f"NVIDIA: Mistral '{model_name}' — reasoning_effort='high'"
+                f"NVIDIA: Mistral '{model_name}' — reasoning_effort='high' (via extra_body)"
             )
             return
 
