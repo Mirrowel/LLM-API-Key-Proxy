@@ -971,9 +971,16 @@ async def chat_completions(
             )
         else:
             response = await client.acompletion(request=request, **request_data)
+
+            if isinstance(response, dict):
+                if raw_logger:
+                    raw_logger.log_final_response(
+                        status_code=429, headers=None, body=response
+                    )
+                error_detail = response.get("error", {}).get("message", str(response))
+                raise HTTPException(status_code=429, detail=error_detail)
+
             if raw_logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
                 response_headers = (
                     response.headers if hasattr(response, "headers") else None
                 )
