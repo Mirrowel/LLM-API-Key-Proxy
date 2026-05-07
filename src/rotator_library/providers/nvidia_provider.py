@@ -51,6 +51,9 @@ class NvidiaProvider(ProviderInterface):
         "mistral-medium-3.5",
         "mistral-small-4",
     ]
+    KIMI_K2_MODEL_PATTERNS = [
+        "kimi-k2.",
+    ]
 
     V4_EFFORT_MAP = {
         "low": "high",
@@ -71,6 +74,9 @@ class NvidiaProvider(ProviderInterface):
     def _is_mistral_reasoning(self, model_name: str) -> bool:
         return any(p in model_name for p in self.MISTRAL_MODEL_PATTERNS)
 
+    def _is_kimi_k2(self, model_name: str) -> bool:
+        return any(p in model_name for p in self.KIMI_K2_MODEL_PATTERNS)
+
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
         Configures thinking and reasoning_effort for DeepSeek and Mistral models on NVIDIA.
@@ -85,8 +91,9 @@ class NvidiaProvider(ProviderInterface):
         is_v3 = self._is_v3_deepseek(model_name)
         is_v4 = self._is_v4_deepseek(model_name)
         is_mistral = self._is_mistral_reasoning(model_name)
+        is_kimi = self._is_kimi_k2(model_name)
 
-        if not is_v3 and not is_v4 and not is_mistral:
+        if not is_v3 and not is_v4 and not is_mistral and not is_kimi:
             return
 
         reasoning_effort = payload.get("reasoning_effort")
@@ -95,6 +102,14 @@ class NvidiaProvider(ProviderInterface):
             isinstance(reasoning_effort, str)
             and reasoning_effort.lower() in self.DISABLE_VALUES
         )
+
+        if is_kimi:
+            payload.pop("reasoning_effort", None)
+            thinking = not is_disabled
+            payload["chat_template_kwargs"] = {"thinking": thinking}
+            state = "True" if thinking else f"DISABLED (reasoning_effort='{reasoning_effort}')"
+            lib_logger.info(f"NVIDIA: Kimi K2 '{model_name}' — thinking={state}")
+            return
 
         if is_mistral:
             payload.pop("reasoning_effort", None)
