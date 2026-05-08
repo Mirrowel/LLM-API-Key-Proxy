@@ -56,6 +56,7 @@ from ..model_definitions import ModelDefinitions
 from ..provider_config import ProviderConfig as LiteLLMProviderConfig
 from ..utils.paths import get_default_root, get_logs_dir, get_oauth_dir
 from ..utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
+from ..proxy_config import ProxyConfig, ProxiedClientPool, load_proxy_config
 
 from ..model_latest_registry import ModelLatestRegistry
 from ..failure_logger import configure_failure_logger
@@ -107,6 +108,7 @@ class RotatingClient:
         session_stickiness_ttl_seconds: int = 3600,
         session_persistence_enabled: bool = False,
         session_persistence_flush_interval_seconds: float = 5.0,
+        proxy_config: Optional[ProxyConfig] = None,
     ):
         """
         Initialize the RotatingClient.
@@ -212,6 +214,8 @@ class RotatingClient:
         self.background_refresher = BackgroundRefresher(self)
         self.model_definitions = ModelDefinitions()
         self.provider_config = LiteLLMProviderConfig()
+        self._proxy_config = proxy_config or load_proxy_config()
+        self._client_pool = ProxiedClientPool(self._proxy_config)
         self.http_client = httpx.AsyncClient()
         self._session_tracker = SessionTracker(
             ttl_seconds=session_stickiness_ttl_seconds,
@@ -219,6 +223,25 @@ class RotatingClient:
             persistence_path=self.data_dir / "session_stickiness.json",
             persistence_flush_interval_seconds=session_persistence_flush_interval_seconds,
         )
+
+        if self._proxy_config.has_any_proxy:
+            proxy_summary = []
+            if self._proxy_config.default:
+                proxy_summary.append(f"default={self._proxy_config.default.url}")
+            if self._proxy_config.provider_proxies:
+                proxy_summary.append(
+                    f"providers={list(self._proxy_config.provider_proxies.keys())}"
+                )
+            if self._proxy_config.credential_proxies:
+                proxy_summary.append(
+                    f"credentials={len(self._proxy_config.credential_proxies)}"
+                )
+            if self._proxy_config.rotation_pool:
+                proxy_summary.append(
+                    f"rotation_pool={len(self._proxy_config.rotation_pool)} "
+                    f"({self._proxy_config.rotation_strategy}/{self._proxy_config.rotation_scope})"
+                )
+            lib_logger.info(f"Outbound proxy config: {', '.join(proxy_summary)}")
 
         # Initialize extracted components
         self._credential_filter = CredentialFilter(
@@ -282,6 +305,7 @@ class RotatingClient:
             litellm_provider_params=self.litellm_provider_params,
             litellm_logger_fn=self._litellm_logger_fn,
             provider_instances=self._provider_instances,
+            client_pool=self._client_pool,
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
@@ -366,12 +390,15 @@ class RotatingClient:
                 instance.set_usage_manager(manager)
 
     async def close(self):
-        """Close the HTTP client and save usage data."""
+        """Close HTTP clients and save usage data."""
         # Save and shutdown new usage managers
         for manager in self._usage_managers.values():
             await manager.shutdown()
 
         self._session_tracker.flush()
+
+        if hasattr(self, "_client_pool"):
+            await self._client_pool.close_all()
 
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()

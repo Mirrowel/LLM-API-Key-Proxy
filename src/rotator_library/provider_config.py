@@ -648,8 +648,10 @@ class ProviderConfig:
 
     def __init__(self):
         self._api_bases: Dict[str, str] = {}
+        self._extra_headers: Dict[str, Dict[str, str]] = {}
         self._custom_providers: Set[str] = set()
         self._load_api_bases()
+        self._load_extra_headers()
 
     def _load_api_bases(self) -> None:
         """
@@ -674,6 +676,30 @@ class ProviderConfig:
                     lib_logger.info(
                         f"Detected API base override for {provider}: {value}"
                     )
+
+    def _load_extra_headers(self) -> None:
+        """Load EXTRA_HEADERS_<PROVIDER> env vars.
+
+        Format: ``EXTRA_HEADERS_OPENCODE_ZEN="User-Agent:opencode/1.0,X-Title:opencode"``
+        Each value is a comma-separated list of ``Name:Value`` pairs.
+        """
+        for key, value in os.environ.items():
+            if not key.startswith("EXTRA_HEADERS_") or not value:
+                continue
+            provider = key[len("EXTRA_HEADERS_"):].lower()
+            headers: Dict[str, str] = {}
+            for pair in value.split(","):
+                pair = pair.strip()
+                if ":" not in pair:
+                    continue
+                name, val = pair.split(":", 1)
+                headers[name.strip()] = val.strip()
+            if headers:
+                self._extra_headers[provider] = headers
+                lib_logger.info(
+                    f"Extra headers for {provider}: "
+                    f"{', '.join(f'{k}={v}' for k, v in headers.items())}"
+                )
 
     def is_known_provider(self, provider: str) -> bool:
         """Check if provider is known to LiteLLM."""
@@ -741,14 +767,21 @@ class ProviderConfig:
             or provider_override.get("api_base")
             or self._api_bases.get(provider)
         )
+        if not api_base:
+            original_provider = next(
+                (k for k, v in self._LITELLM_PROVIDER_REMAP.items() if v == provider),
+                None
+            )
+            if original_provider:
+                api_base = self._api_bases.get(original_provider)
         if isinstance(api_base, str):
             api_base = api_base.rstrip("/")
 
-        # If this is a Gemini embedding request and the api_base points to the OpenAI compatibility layer,
-        # we must ignore the api_base override so LiteLLM falls back to standard Gemini native embedding.
-        if api_base and request_type == "embedding" and provider in ("gemini", "google") and "/openai" in api_base.lower():
+        # If this is a Gemini/Google request and the api_base points to the OpenAI compatibility layer,
+        # we must ignore the api_base override so LiteLLM falls back to standard Gemini native endpoints.
+        if api_base and provider in ("gemini", "google") and "/openai" in api_base.lower():
             lib_logger.info(
-                f"Ignoring Gemini api_base override '{api_base}' for embedding request to avoid 404 errors."
+                f"Ignoring Gemini api_base override '{api_base}' for {request_type} request to avoid 404 errors."
             )
             api_base = None
 
@@ -776,5 +809,10 @@ class ProviderConfig:
                 f"Routing {provider} through openai: "
                 f"model={kwargs['model']}, api_base={api_base}"
             )
+
+        extra = self._extra_headers.get(provider)
+        if extra:
+            existing = kwargs.get("extra_headers") or {}
+            kwargs["extra_headers"] = {**existing, **extra}
 
         return kwargs

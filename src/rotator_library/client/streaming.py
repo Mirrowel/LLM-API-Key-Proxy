@@ -23,6 +23,7 @@ import litellm
 from litellm.exceptions import (
     APIConnectionError,
     InternalServerError,
+    MidStreamFallbackError,
     ServiceUnavailableError,
 )
 
@@ -287,7 +288,7 @@ class StreamingHandler:
                     # Continue waiting for more chunks
                     continue
 
-                except (APIConnectionError, InternalServerError, ServiceUnavailableError):
+                except (APIConnectionError, InternalServerError, MidStreamFallbackError, ServiceUnavailableError):
                     # Server/connection errors are transient and should be
                     # retried on the same key with backoff (handled by the
                     # executor's dedicated except block).  Re-raise raw so

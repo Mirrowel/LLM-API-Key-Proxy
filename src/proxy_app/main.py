@@ -107,7 +107,7 @@ _console = Console()
 print("  → Loading FastAPI framework...")
 with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request, HTTPException, Depends
+    from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
@@ -427,6 +427,38 @@ for key, value in os.environ.items():
             f"Loaded whitelist for provider '{provider}': {models_to_whitelist}"
         )
 
+# Load model aliases from environment variable
+# Format: MODEL_ALIASES="from_model:to_model,from_model2:to_model2"
+# Example: MODEL_ALIASES="nanogpt/glm-5.1:nanogpt/glm-5,nanogpt/glm-5.1-thinking:nanogpt/glm-5-thinking"
+# This rewrites the model name in incoming requests before any routing occurs,
+# allowing transparent redirection when a model is temporarily unavailable.
+model_aliases: dict[str, str] = {}
+_aliases_raw = os.getenv("MODEL_ALIASES", "")
+if _aliases_raw:
+    for pair in _aliases_raw.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            from_model, to_model = pair.split(":", 1)
+            from_model = from_model.strip()
+            to_model = to_model.strip()
+            if from_model and to_model:
+                model_aliases[from_model] = to_model
+    if model_aliases:
+        logging.info(
+            f"Loaded {len(model_aliases)} model alias(es): "
+            + ", ".join(f"{k} → {v}" for k, v in model_aliases.items())
+        )
+
+
+def apply_model_alias(model_name: str) -> str:
+    """Rewrite model name if it matches a configured alias."""
+    if not model_aliases:
+        return model_name
+    rewritten = model_aliases.get(model_name)
+    if rewritten:
+        logging.info(f"Model alias: {model_name} → {rewritten}")
+        return rewritten
+    return model_name
 
 # --- Lifespan Management ---
 @asynccontextmanager
@@ -461,20 +493,22 @@ async def lifespan(app: FastAPI):
                     with open(path, "r") as f:
                         data = json.load(f)
                     metadata = data.get("_proxy_metadata", {})
-                    email = metadata.get("email")
+                    # Use email for identity (most providers), fall back to login
+                    # (Copilot stores login as the primary identifier)
+                    identity = metadata.get("email") or metadata.get("login")
 
-                    if email:
-                        if email not in processed_emails:
-                            processed_emails[email] = {}
+                    if identity:
+                        if identity not in processed_emails:
+                            processed_emails[identity] = {}
 
-                        if provider in processed_emails[email]:
-                            original_path = processed_emails[email][provider]
+                        if provider in processed_emails[identity]:
+                            original_path = processed_emails[identity][provider]
                             logging.warning(
-                                f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
+                                f"Duplicate for '{identity}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
                             )
                             continue
                         else:
-                            processed_emails[email][provider] = path
+                            processed_emails[identity][provider] = path
 
                     credentials_to_initialize[provider].append(path)
 
@@ -495,8 +529,10 @@ async def lifespan(app: FastAPI):
                     return (provider, path, None, None)
 
                 user_info = await provider_instance.get_user_info(path)
-                email = user_info.get("email")
-                return (provider, path, email, None)
+                # Use email for identity (most providers), fall back to login
+                # (Copilot returns {"login": "username"} instead of email)
+                identity = user_info.get("email") or user_info.get("login")
+                return (provider, path, identity, None)
 
             except Exception as e:
                 logging.error(
@@ -529,23 +565,23 @@ async def lifespan(app: FastAPI):
                 logging.error(f"Credential processing raised exception: {result}")
                 continue
 
-            provider, path, email, error = result
+            provider, path, identity, error = result
 
             # Skip if there was an error
             if error:
                 continue
 
             # If provider doesn't support get_user_info, add directly
-            if email is None:
+            if identity is None:
                 if provider not in final_oauth_credentials:
                     final_oauth_credentials[provider] = []
                 final_oauth_credentials[provider].append(path)
                 continue
 
-            # Handle empty email
-            if not email:
+            # Handle empty identity
+            if not identity:
                 logging.warning(
-                    f"Could not retrieve email for '{path}'. Treating as unique."
+                    f"Could not retrieve identity for '{path}'. Treating as unique."
                 )
                 if provider not in final_oauth_credentials:
                     final_oauth_credentials[provider] = []
@@ -553,20 +589,20 @@ async def lifespan(app: FastAPI):
                 continue
 
             # Deduplication check
-            if email not in processed_emails:
-                processed_emails[email] = {}
+            if identity not in processed_emails:
+                processed_emails[identity] = {}
 
             if (
-                provider in processed_emails[email]
-                and processed_emails[email][provider] != path
+                provider in processed_emails[identity]
+                and processed_emails[identity][provider] != path
             ):
-                original_path = processed_emails[email][provider]
+                original_path = processed_emails[identity][provider]
                 logging.warning(
-                    f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
+                    f"Duplicate for '{identity}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
                 )
                 continue
             else:
-                processed_emails[email][provider] = path
+                processed_emails[identity][provider] = path
                 if provider not in final_oauth_credentials:
                     final_oauth_credentials[provider] = []
                 final_oauth_credentials[provider].append(path)
@@ -577,7 +613,7 @@ async def lifespan(app: FastAPI):
                         with open(path, "r+") as f:
                             data = json.load(f)
                             metadata = data.get("_proxy_metadata", {})
-                            metadata["email"] = email
+                            metadata["email"] = identity
                             metadata["last_check_timestamp"] = time.time()
                             data["_proxy_metadata"] = metadata
                             f.seek(0)
@@ -597,6 +633,10 @@ async def lifespan(app: FastAPI):
     # Load global timeout from environment (default 30 seconds)
     global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
 
+    # Load outbound proxy configuration (HTTP/SOCKS5 forward proxies)
+    from rotator_library.proxy_config import load_proxy_config
+    proxy_config = load_proxy_config()
+
     # The client now uses the root logger configuration
     client = RotatingClient(
         api_keys=api_keys,
@@ -607,6 +647,7 @@ async def lifespan(app: FastAPI):
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,
         enable_request_logging=ENABLE_REQUEST_LOGGING,
+        proxy_config=proxy_config,
     )
 
     await client.initialize_usage_managers()
@@ -679,6 +720,13 @@ app.add_middleware(
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
+_webui_dist = Path(__file__).resolve().parent.parent.parent / "webui" / "dist"
+
+# Admin router imports (included after verify_api_key is defined — see below)
+from proxy_app.api.logs import router as logs_router
+from proxy_app.api.config import router as config_router
+from proxy_app.api.oauth import router as oauth_router
+
 
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
@@ -692,12 +740,16 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
 
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
-    # If PROXY_API_KEY is not set or empty, skip verification (open access)
     if not PROXY_API_KEY:
         return auth
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
+
+# --- Admin API Routers (auth-protected) ---
+app.include_router(logs_router, dependencies=[Depends(verify_api_key)])
+app.include_router(config_router, dependencies=[Depends(verify_api_key)])
+app.include_router(oauth_router, dependencies=[Depends(verify_api_key)])
 
 
 # --- Anthropic API Key Header ---
@@ -950,14 +1002,16 @@ async def chat_completions(
 
         # Apply model alias rewriting (transparent redirect for unavailable models)
         if "model" in request_data:
-            # First: resolve smart "latest" aliases (dynamic, uses live model cache)
+            # Static aliases first (ENV-configured redirects)
+            request_data["model"] = apply_model_alias(request_data["model"])
+
+            # Then resolve smart "latest" aliases (dynamic, uses live model cache)
             resolved = await client.resolve_latest_async(request_data["model"])
             if resolved:
                 logging.info(
                     f"Latest alias: {request_data['model']} → {resolved}"
                 )
                 request_data["model"] = resolved
-
 
 
         # Extract and log specific reasoning parameters for monitoring.
@@ -1222,12 +1276,16 @@ async def anthropic_messages(
     try:
         # Apply model alias rewriting (transparent redirect for unavailable models)
         if body.model:
-            # First: resolve smart "latest" aliases (dynamic, uses live model cache)
+            # Static aliases first
+            rewritten = apply_model_alias(body.model)
+            if rewritten != body.model:
+                body.model = rewritten
+
+            # Then resolve smart "latest" aliases
             resolved = await client.resolve_latest_async(body.model)
             if resolved:
                 logging.info(f"Latest alias: {body.model} → {resolved}")
                 body.model = resolved
-
 
 
         # Log the request to console
@@ -1464,7 +1522,11 @@ async def embeddings(
 
 
 @app.get("/")
-def read_root():
+def read_root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and _webui_dist.is_dir() and os.environ.get("WEBUI_ENABLED", "true").lower() != "false":
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/ui", status_code=302)
     return {"Status": "API Key Proxy is running"}
 
 
@@ -1485,18 +1547,15 @@ async def list_models(
     model_ids = await client.get_all_available_models(grouped=False)
 
 
-
+    # Append canonical alias model names (cross-provider routing)
+    alias_models = client.alias_registry.get_canonical_models()
+    if alias_models:
+        model_ids = list(model_ids) + alias_models
 
     # Append smart "latest" virtual model names
     latest_models = client.latest_registry.get_virtual_models()
     if latest_models:
         model_ids = list(model_ids) + latest_models
-
-    # Append virtual "latest" models
-    if hasattr(client, "latest_registry") and client.latest_registry:
-        latest_models = client.latest_registry.get_virtual_models()
-        if latest_models:
-            model_ids = list(model_ids) + latest_models
 
     if enriched and hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
@@ -1625,6 +1684,260 @@ async def list_providers(_=Depends(verify_api_key)):
     Returns a list of all available providers.
     """
     return list(PROVIDER_PLUGINS.keys())
+
+
+@app.get("/v1/health")
+async def health_check(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+    detail: str = "summary",
+):
+    """
+    Health and diagnostics endpoint for the proxy.
+
+    Query Parameters:
+        detail: Level of detail to return.
+            - "summary" (default): status, uptime, provider/credential counts,
+              and a list of providers with recent errors.
+            - "full": Adds per-model usage stats for the current primary window
+              per provider, plus an aggregated error summary from the ring buffer.
+
+    Returns:
+        {
+            "status": "healthy",
+            "uptime_seconds": int,
+            "timestamp": str (ISO-8601),
+            "providers": {
+                "total": int,
+                "active": [str],
+                "with_errors": [str]
+            },
+            "credentials": {
+                "total": int,
+                "active": int,
+                "on_cooldown": int,
+                "exhausted": int
+            },
+            // detail=full only:
+            "models_current_window": [...],
+            "errors": { "total_errors": int, "by_provider": {...}, "by_model": {...} }
+        }
+    """
+    from datetime import datetime, timezone
+    from rotator_library.error_tracker import get_error_tracker
+
+    now_ts = time.time()
+    uptime_seconds = int(now_ts - _start_time)
+    timestamp = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
+
+    # --- Credential / provider aggregation ---
+    total_credentials = 0
+    active_credentials = 0
+    on_cooldown_credentials = 0
+    exhausted_credentials = 0
+    error_credentials = 0
+    active_providers = []
+
+    try:
+        full_stats = await client.get_quota_stats()
+        quota_providers = set(full_stats.get("providers", {}).keys())
+        for provider_name, pstats in full_stats.get("providers", {}).items():
+            active_providers.append(provider_name)
+            total_credentials += pstats.get("credential_count", 0)
+            for _cid, cdata in pstats.get("credentials", {}).items():
+                st = cdata.get("status", "active")
+                if st == "active":
+                    active_credentials += 1
+                elif st in ("needs_reauth", "error"):
+                    error_credentials += 1
+                elif st == "exhausted":
+                    exhausted_credentials += 1
+                elif st == "cooldown":
+                    on_cooldown_credentials += 1
+                elif st == "mixed":
+                    active_credentials += 1
+                else:
+                    active_credentials += 1
+        # Include providers loaded by RotatingClient but not in quota stats
+        for pname, cred_list in client.all_credentials.items():
+            if pname not in quota_providers and cred_list:
+                active_providers.append(pname)
+                cred_count = len(cred_list)
+                total_credentials += cred_count
+                active_credentials += cred_count
+    except Exception as e:
+        logging.error(f"Health endpoint: failed to get quota stats: {e}")
+        full_stats = {"providers": {}}
+
+    # Providers that have any buffered errors
+    tracker = get_error_tracker()
+    error_summary = tracker.get_error_summary()
+    providers_with_errors = sorted(error_summary.get("by_provider", {}).keys())
+
+    response = {
+        "status": "healthy",
+        "uptime_seconds": uptime_seconds,
+        "timestamp": timestamp,
+        "providers": {
+            "total": len(active_providers),
+            "active": sorted(active_providers),
+            "with_errors": providers_with_errors,
+        },
+        "credentials": {
+            "total": total_credentials,
+            "active": active_credentials,
+            "on_cooldown": on_cooldown_credentials,
+            "exhausted": exhausted_credentials,
+            "error": error_credentials,
+        },
+    }
+
+    # Outbound proxy config status
+    proxy_cfg = getattr(client, "_proxy_config", None)
+    if proxy_cfg and proxy_cfg.has_any_proxy:
+        proxy_info = {}
+        if proxy_cfg.default:
+            proxy_info["default"] = proxy_cfg.default.url
+        if proxy_cfg.provider_proxies:
+            proxy_info["providers"] = {
+                p: s.url for p, s in proxy_cfg.provider_proxies.items()
+            }
+        if proxy_cfg.credential_proxies:
+            proxy_info["credential_count"] = len(proxy_cfg.credential_proxies)
+        if proxy_cfg.rotation_pool:
+            proxy_info["rotation_pool_size"] = len(proxy_cfg.rotation_pool)
+            proxy_info["rotation_strategy"] = proxy_cfg.rotation_strategy
+            proxy_info["rotation_scope"] = proxy_cfg.rotation_scope
+        response["outbound_proxy"] = proxy_info
+
+    if detail == "full":
+        # --- Per-model stats from primary window ---
+        # Aggregate across all credentials, keyed by model name.
+        # Uses each provider's primary window (e.g. "5h", "daily").
+        model_agg: dict = {}  # model_id -> aggregated block
+
+        for provider_name, pstats in full_stats.get("providers", {}).items():
+            manager = client.get_usage_manager(provider_name)
+            primary_window_name = None
+            if manager:
+                try:
+                    primary_def = manager._window_manager.get_primary_definition()
+                    primary_window_name = primary_def.name if primary_def else None
+                except Exception:
+                    pass
+
+            for cred_data in pstats.get("credentials", {}).values():
+                for model_id, mu in cred_data.get("model_usage", {}).items():
+                    window_data = None
+                    if primary_window_name:
+                        window_data = mu.get("windows", {}).get(primary_window_name)
+
+                    if not window_data or window_data.get("request_count", 0) == 0:
+                        continue
+
+                    # Convert timestamps to ISO strings
+                    started_ts = window_data.get("first_used_at")
+                    window_started_at = (
+                        datetime.fromtimestamp(started_ts, tz=timezone.utc).isoformat()
+                        if started_ts
+                        else None
+                    )
+                    last_used_ts = window_data.get("last_used_at")
+                    last_used_str = (
+                        datetime.fromtimestamp(last_used_ts, tz=timezone.utc).isoformat()
+                        if last_used_ts
+                        else None
+                    )
+
+                    if model_id not in model_agg:
+                        model_agg[model_id] = {
+                            "model": model_id,
+                            "provider": provider_name,
+                            "window_name": primary_window_name,
+                            "window_started_at": window_started_at,
+                            "requests": 0,
+                            "success_count": 0,
+                            "failure_count": 0,
+                            "tokens": {"prompt": 0, "completion": 0, "total": 0},
+                            "approx_cost": 0.0,
+                            "last_used": None,
+                        }
+
+                    entry = model_agg[model_id]
+                    entry["requests"] += window_data.get("request_count", 0)
+                    entry["success_count"] += window_data.get("success_count", 0)
+                    entry["failure_count"] += window_data.get("failure_count", 0)
+                    entry["tokens"]["prompt"] += window_data.get("prompt_tokens", 0)
+                    entry["tokens"]["completion"] += window_data.get("completion_tokens", 0)
+                    raw_total = window_data.get("total_tokens", 0) or (
+                        window_data.get("prompt_tokens", 0)
+                        + window_data.get("completion_tokens", 0)
+                    )
+                    entry["tokens"]["total"] += raw_total
+                    if window_data.get("approx_cost"):
+                        entry["approx_cost"] += window_data["approx_cost"]
+
+                    # Newest last_used wins
+                    if last_used_str and (
+                        entry["last_used"] is None or last_used_str > entry["last_used"]
+                    ):
+                        entry["last_used"] = last_used_str
+                    # Earliest window_started_at wins
+                    if window_started_at and (
+                        entry["window_started_at"] is None
+                        or window_started_at < entry["window_started_at"]
+                    ):
+                        entry["window_started_at"] = window_started_at
+
+        # Sort by request count descending
+        models_list = sorted(
+            model_agg.values(), key=lambda m: m["requests"], reverse=True
+        )
+
+        response["models_current_window"] = models_list
+        response["errors"] = error_summary
+
+    return response
+
+
+@app.get("/v1/health/errors")
+async def health_errors(
+    _=Depends(verify_api_key),
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    limit: int = 5,
+):
+    """
+    Returns recent error records from the in-memory error ring buffer.
+
+    Query Parameters:
+        provider: Filter by provider name (e.g., "modal"). Optional.
+        model: Filter by full model ID (e.g., "modal/qwen3-coder-480b"). Optional.
+               When both are specified, both filters apply.
+        limit: Maximum number of records to return (default: 5, max: 50).
+
+    Returns:
+        {
+            "errors": [ErrorRecord, ...],   // newest first
+            "total_matching": int,
+            "limit": int
+        }
+    """
+    from rotator_library.error_tracker import get_error_tracker
+
+    tracker = get_error_tracker()
+    records, total_matching = tracker.get_recent_errors(
+        provider=provider,
+        model=model,
+        limit=limit,
+    )
+
+    return {
+        "errors": [r.to_dict() for r in records],
+        "total_matching": total_matching,
+        "limit": min(max(1, limit), 50),
+    }
 
 
 @app.get("/v1/admin/latest-aliases")
@@ -1898,6 +2211,86 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     except Exception as e:
         logging.error(f"Cost estimate failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- WebSocket for Real-Time Updates ---
+_ws_connections: set = set()
+_MAX_WS_CONNECTIONS = 10
+
+
+@app.websocket("/v1/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    if len(_ws_connections) >= _MAX_WS_CONNECTIONS:
+        await websocket.close(code=4029, reason="Too many connections")
+        return
+
+    await websocket.accept()
+
+    if PROXY_API_KEY:
+        try:
+            auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+            if auth_msg.get("type") != "auth" or auth_msg.get("token") != PROXY_API_KEY:
+                await websocket.send_json({"type": "auth_result", "ok": False})
+                await websocket.close(code=4001, reason="Unauthorized")
+                return
+            await websocket.send_json({"type": "auth_result", "ok": True})
+        except (asyncio.TimeoutError, Exception):
+            await websocket.close(code=4001, reason="Auth timeout")
+            return
+
+    _ws_connections.add(websocket)
+    try:
+        client = websocket.app.state.rotating_client
+        while True:
+            try:
+                stats = await client.get_quota_stats()
+                await websocket.send_json({"type": "quota_stats", "data": stats})
+            except Exception as e:
+                logging.debug(f"WebSocket quota_stats error: {e}")
+                try:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                except Exception:
+                    break
+
+            try:
+                from rotator_library.error_tracker import get_error_tracker
+                tracker = get_error_tracker()
+                records, _total = tracker.get_recent_errors(limit=10)
+                error_dicts = [
+                    {
+                        "timestamp": e.timestamp.isoformat() if hasattr(e.timestamp, "isoformat") else str(e.timestamp),
+                        "provider": e.provider,
+                        "model": e.model,
+                        "error_type": e.error_type,
+                        "status_code": e.status_code,
+                        "error_message": e.error_message,
+                    }
+                    for e in records
+                ]
+                await websocket.send_json({"type": "error_event", "data": error_dicts})
+            except Exception as e:
+                logging.debug(f"WebSocket error_event error: {e}")
+
+            await asyncio.sleep(10)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logging.warning(f"WebSocket error: {e}")
+    finally:
+        _ws_connections.discard(websocket)
+
+
+# --- Web UI Static File Serving ---
+if _webui_dist.is_dir() and os.environ.get("WEBUI_ENABLED", "true").lower() != "false":
+    from fastapi.responses import FileResponse as _FileResponse
+
+    @app.get("/ui/{full_path:path}")
+    async def serve_webui(full_path: str):
+        if full_path:
+            file_path = (_webui_dist / full_path).resolve()
+            if file_path.is_relative_to(_webui_dist.resolve()) and file_path.is_file():
+                return _FileResponse(file_path)
+        return _FileResponse(_webui_dist / "index.html")
 
 
 if __name__ == "__main__":
