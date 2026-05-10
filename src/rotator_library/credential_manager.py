@@ -18,7 +18,7 @@ DEFAULT_OAUTH_DIRS = {
     "qwen_code": Path.home() / ".qwen",
     "iflow": Path.home() / ".iflow",
     "antigravity": Path.home() / ".antigravity",
-    # Add other providers like 'claude' here if they have a standard CLI path
+    "anthropic": Path.home() / ".anthropic",
 }
 
 # OAuth providers that support environment variable-based credentials
@@ -28,6 +28,7 @@ ENV_OAUTH_PROVIDERS = {
     "antigravity": "ANTIGRAVITY",
     "qwen_code": "QWEN_CODE",
     "iflow": "IFLOW",
+    "anthropic": "ANTHROPIC_OAUTH",
 }
 
 
