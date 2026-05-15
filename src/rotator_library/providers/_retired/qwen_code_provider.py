@@ -431,7 +431,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             }
 
     def _stream_to_completion_response(
-        self, chunks: List[litellm.ModelResponse]
+        self, chunks: List[litellm.ModelResponseStream]
     ) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
@@ -496,6 +496,16 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             # Aggregate tool calls with proper initialization
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
+                    if hasattr(tc_chunk, "model_dump"):
+                        tc_chunk = tc_chunk.model_dump(exclude_none=True)
+                    elif hasattr(tc_chunk, "__dict__") and not isinstance(
+                        tc_chunk, dict
+                    ):
+                        tc_chunk = {
+                            k: v
+                            for k, v in tc_chunk.__dict__.items()
+                            if not k.startswith("_") and v is not None
+                        }
                     index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         # Initialize with type field for OpenAI compatibility
@@ -508,39 +518,61 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     if "type" in tc_chunk:
                         aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
+                        function_delta = tc_chunk["function"]
+                        if hasattr(function_delta, "model_dump"):
+                            function_delta = function_delta.model_dump(
+                                exclude_none=True
+                            )
+                        elif hasattr(function_delta, "__dict__") and not isinstance(
+                            function_delta, dict
+                        ):
+                            function_delta = {
+                                k: v
+                                for k, v in function_delta.__dict__.items()
+                                if not k.startswith("_") and v is not None
+                            }
                         if (
-                            "name" in tc_chunk["function"]
-                            and tc_chunk["function"]["name"] is not None
+                            "name" in function_delta
+                            and function_delta["name"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["name"] += (
-                                tc_chunk["function"]["name"]
+                                function_delta["name"]
                             )
                         if (
-                            "arguments" in tc_chunk["function"]
-                            and tc_chunk["function"]["arguments"] is not None
+                            "arguments" in function_delta
+                            and function_delta["arguments"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["arguments"] += (
-                                tc_chunk["function"]["arguments"]
+                                function_delta["arguments"]
                             )
 
             # Aggregate function calls (legacy format)
             if "function_call" in delta and delta["function_call"] is not None:
+                function_call = delta["function_call"]
+                if hasattr(function_call, "model_dump"):
+                    function_call = function_call.model_dump(exclude_none=True)
+                elif hasattr(function_call, "__dict__") and not isinstance(
+                    function_call, dict
+                ):
+                    function_call = {
+                        k: v
+                        for k, v in function_call.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
                 if "function_call" not in final_message:
                     final_message["function_call"] = {"name": "", "arguments": ""}
                 if (
-                    "name" in delta["function_call"]
-                    and delta["function_call"]["name"] is not None
+                    "name" in function_call
+                    and function_call["name"] is not None
                 ):
-                    final_message["function_call"]["name"] += delta["function_call"][
-                        "name"
-                    ]
+                    final_message["function_call"]["name"] += function_call["name"]
                 if (
-                    "arguments" in delta["function_call"]
-                    and delta["function_call"]["arguments"] is not None
+                    "arguments" in function_call
+                    and function_call["arguments"] is not None
                 ):
-                    final_message["function_call"]["arguments"] += delta[
-                        "function_call"
-                    ]["arguments"]
+                    final_message["function_call"]["arguments"] += function_call[
+                        "arguments"
+                    ]
 
             # Track finish_reason from chunks (for reference only)
             if choice_finish:
@@ -591,7 +623,10 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         credential_path = kwargs.pop("credential_identifier")
         transaction_context = kwargs.pop("transaction_context", None)
         model = kwargs["model"]
@@ -693,7 +728,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                                 for openai_chunk in self._convert_chunk_to_openai(
                                     chunk, model, stream_state
                                 ):
-                                    yield litellm.ModelResponse(**openai_chunk)
+                                    yield litellm.ModelResponseStream(**openai_chunk)
                             except json.JSONDecodeError:
                                 lib_logger.warning(
                                     f"Could not decode JSON from Qwen Code: {line}"

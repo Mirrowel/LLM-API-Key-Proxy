@@ -112,7 +112,10 @@ class DeepseekProvider(ProviderInterface):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         api_key = kwargs.pop("credential_identifier")
         transaction_context = kwargs.pop("transaction_context", None)
         file_logger = ProviderLogger(transaction_context)
@@ -213,7 +216,7 @@ class DeepseekProvider(ProviderInterface):
         payload: Dict[str, Any],
         model: str,
         file_logger: ProviderLogger,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[litellm.ModelResponseStream, None]:
         accumulator: Dict[str, Any] = {
             "message": {"role": "assistant"},
             "tool_calls": {},
@@ -248,7 +251,7 @@ class DeepseekProvider(ProviderInterface):
 
                 chunk["model"] = model
                 self._accumulate_stream_chunk(accumulator, chunk)
-                yield litellm.ModelResponse(**chunk)
+                yield litellm.ModelResponseStream(**chunk)
 
         final_response = self._final_response_from_accumulator(model, accumulator)
         file_logger.log_final_response(final_response)

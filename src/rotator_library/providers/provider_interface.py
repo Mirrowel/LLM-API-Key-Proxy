@@ -270,7 +270,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         """
         Handles the entire completion call for non-standard providers.
         """

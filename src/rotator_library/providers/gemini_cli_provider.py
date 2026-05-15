@@ -1092,7 +1092,7 @@ class GeminiCliProvider(
             yield openai_chunk
 
     def _stream_to_completion_response(
-        self, chunks: List[litellm.ModelResponse]
+        self, chunks: List[litellm.ModelResponseStream]
     ) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
@@ -1120,7 +1120,20 @@ class GeminiCliProvider(
                 continue
 
             choice = chunk.choices[0]
-            delta = choice.get("delta", {})
+            if hasattr(choice, "get"):
+                delta = choice.get("delta", {})
+                choice_finish = choice.get("finish_reason")
+            else:
+                delta = getattr(choice, "delta", None) or {}
+                if hasattr(delta, "model_dump"):
+                    delta = delta.model_dump(exclude_none=True)
+                elif hasattr(delta, "__dict__") and not isinstance(delta, dict):
+                    delta = {
+                        k: v
+                        for k, v in delta.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
+                choice_finish = getattr(choice, "finish_reason", None)
 
             # Aggregate content
             if "content" in delta and delta["content"] is not None:
@@ -1137,6 +1150,16 @@ class GeminiCliProvider(
             # Aggregate tool calls
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
+                    if hasattr(tc_chunk, "model_dump"):
+                        tc_chunk = tc_chunk.model_dump(exclude_none=True)
+                    elif hasattr(tc_chunk, "__dict__") and not isinstance(
+                        tc_chunk, dict
+                    ):
+                        tc_chunk = {
+                            k: v
+                            for k, v in tc_chunk.__dict__.items()
+                            if not k.startswith("_") and v is not None
+                        }
                     index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         aggregated_tool_calls[index] = {
@@ -1148,43 +1171,65 @@ class GeminiCliProvider(
                     if "type" in tc_chunk:
                         aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
+                        function_delta = tc_chunk["function"]
+                        if hasattr(function_delta, "model_dump"):
+                            function_delta = function_delta.model_dump(
+                                exclude_none=True
+                            )
+                        elif hasattr(function_delta, "__dict__") and not isinstance(
+                            function_delta, dict
+                        ):
+                            function_delta = {
+                                k: v
+                                for k, v in function_delta.__dict__.items()
+                                if not k.startswith("_") and v is not None
+                            }
                         if (
-                            "name" in tc_chunk["function"]
-                            and tc_chunk["function"]["name"] is not None
+                            "name" in function_delta
+                            and function_delta["name"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["name"] += (
-                                tc_chunk["function"]["name"]
+                                function_delta["name"]
                             )
                         if (
-                            "arguments" in tc_chunk["function"]
-                            and tc_chunk["function"]["arguments"] is not None
+                            "arguments" in function_delta
+                            and function_delta["arguments"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["arguments"] += (
-                                tc_chunk["function"]["arguments"]
+                                function_delta["arguments"]
                             )
 
             # Aggregate function calls (legacy format)
             if "function_call" in delta and delta["function_call"] is not None:
+                function_call = delta["function_call"]
+                if hasattr(function_call, "model_dump"):
+                    function_call = function_call.model_dump(exclude_none=True)
+                elif hasattr(function_call, "__dict__") and not isinstance(
+                    function_call, dict
+                ):
+                    function_call = {
+                        k: v
+                        for k, v in function_call.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
                 if "function_call" not in final_message:
                     final_message["function_call"] = {"name": "", "arguments": ""}
                 if (
-                    "name" in delta["function_call"]
-                    and delta["function_call"]["name"] is not None
+                    "name" in function_call
+                    and function_call["name"] is not None
                 ):
-                    final_message["function_call"]["name"] += delta["function_call"][
-                        "name"
-                    ]
+                    final_message["function_call"]["name"] += function_call["name"]
                 if (
-                    "arguments" in delta["function_call"]
-                    and delta["function_call"]["arguments"] is not None
+                    "arguments" in function_call
+                    and function_call["arguments"] is not None
                 ):
-                    final_message["function_call"]["arguments"] += delta[
-                        "function_call"
-                    ]["arguments"]
+                    final_message["function_call"]["arguments"] += function_call[
+                        "arguments"
+                    ]
 
             # Track finish_reason from chunks (respects length, content_filter, etc.)
-            if choice.get("finish_reason"):
-                chunk_finish_reason = choice["finish_reason"]
+            if choice_finish:
+                chunk_finish_reason = choice_finish
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -1390,7 +1435,10 @@ class GeminiCliProvider(
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
         transaction_context = kwargs.pop("transaction_context", None)
@@ -1562,7 +1610,9 @@ class GeminiCliProvider(
                                         ) in self._convert_chunk_to_openai(
                                             chunk, model, accumulator
                                         ):
-                                            yield litellm.ModelResponse(**openai_chunk)
+                                            yield litellm.ModelResponseStream(
+                                                **openai_chunk
+                                            )
                                     except json.JSONDecodeError:
                                         lib_logger.warning(
                                             f"Could not decode JSON from Gemini CLI: {line}"
@@ -1586,7 +1636,7 @@ class GeminiCliProvider(
                                         "total_tokens": 1,
                                     },
                                 }
-                                yield litellm.ModelResponse(**final_chunk)
+                                yield litellm.ModelResponseStream(**final_chunk)
 
                             # Success - exit the endpoint fallback loop
                             return

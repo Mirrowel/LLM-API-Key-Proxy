@@ -3234,7 +3234,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         error_details: str,
         response_id: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
-    ) -> litellm.ModelResponse:
+    ) -> litellm.ModelResponseStream:
         """
         Build streaming chunk error response when malformed call retries are exhausted.
 
@@ -3252,7 +3252,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 "total_tokens": prompt_tokens + 1,
             }
 
-        return litellm.ModelResponse(
+        return litellm.ModelResponseStream(
             **{
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -3341,7 +3341,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         error_info: Dict[str, Any],
         response_id: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
-    ) -> Optional[litellm.ModelResponse]:
+    ) -> Optional[litellm.ModelResponseStream]:
         """
         Build a streaming chunk with the auto-fixed tool call.
 
@@ -3382,7 +3382,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 "total_tokens": prompt_tokens + 1,
             }
 
-        return litellm.ModelResponse(
+        return litellm.ModelResponseStream(
             **{
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -4070,7 +4070,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         """
         Handle completion requests for Antigravity.
 
@@ -4348,7 +4351,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
     async def _collect_streaming_chunks(
         self,
-        streaming_generator: AsyncGenerator[litellm.ModelResponse, None],
+        streaming_generator: AsyncGenerator[litellm.ModelResponseStream, None],
         model: str,
         file_logger: Optional["AntigravityProviderLogger"] = None,
     ) -> litellm.ModelResponse:
@@ -4527,7 +4530,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         model: str,
         file_logger: Optional[AntigravityProviderLogger] = None,
         malformed_retry_num: Optional[int] = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[litellm.ModelResponseStream, None]:
         """Handle streaming completion.
 
         Args:
@@ -4607,7 +4610,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             gemini_chunk, model, accumulator
                         )
 
-                        yield litellm.ModelResponse(**openai_chunk)
+                        yield litellm.ModelResponseStream(**openai_chunk)
                         accumulator["yielded_any"] = True
                     except json.JSONDecodeError:
                         if file_logger:
@@ -4636,7 +4639,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 # Only include usage if we received real data during streaming
                 if accumulator.get("last_usage"):
                     final_chunk["usage"] = accumulator["last_usage"]
-                yield litellm.ModelResponse(**final_chunk)
+                yield litellm.ModelResponseStream(**final_chunk)
 
             # Log final assembled response for provider logging
             if file_logger:
@@ -4698,7 +4701,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[litellm.ModelResponseStream, None]:
         """
         Wrapper around _handle_streaming that retries on empty responses, bare 429s,
         and MALFORMED_FUNCTION_CALL errors.
