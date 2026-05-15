@@ -13,6 +13,8 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
+from ..core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
+
 if TYPE_CHECKING:
     from .config import WindowDefinition
 
@@ -330,7 +332,8 @@ class CredentialState:
 
     # Active requests (for concurrent request limiting)
     active_requests: int = 0
-    max_concurrent: Optional[int] = None
+    # Values <= 0 mean unlimited.
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT_PER_KEY
 
     # Metadata
     created_at: Optional[float] = None

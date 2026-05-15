@@ -116,8 +116,8 @@ The `acquire_key` method uses a sophisticated strategy to balance load:
 
 1.  **Filtering**: Keys currently on cooldown (global or model-specific) are excluded.
 2.  **Rotation Mode**: Determines credential selection strategy:
-    *   **Balanced Mode** (default): Credentials sorted by usage count - least-used first for even distribution
-    *   **Sequential Mode**: Credentials sorted by usage count descending - most-used first to maintain sticky behavior until exhausted
+    *   **Sequential Mode** (default): Reuses the selected credential until it errors/exhausts to preserve provider-side cache locality
+    *   **Balanced Mode**: Distributes requests across credentials for even load when explicitly configured
 3.  **Tiering**: Valid keys are split into two tiers:
     *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
     *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
@@ -1145,26 +1145,26 @@ A comprehensive credential rotation and quota management system introduced in PR
 
 Two rotation strategies are available per provider:
 
-**Balanced Mode (Default)**:
+**Balanced Mode**:
 - Distributes load evenly across all credentials
 - Least-used credentials selected first
 - Best for providers with per-minute rate limits
 - Prevents any single credential from being overused
 
-**Sequential Mode**:
+**Sequential Mode (Default)**:
 - Uses one credential until it's exhausted (429 quota error)
 - Switches to next credential only after current one fails
 - Most-used credentials selected first (sticky behavior)
 - Best for providers with daily/weekly quotas
 - Maximizes cache hit rates (e.g., Antigravity thought signatures)
-- Default for Antigravity provider
+- Default for all providers unless overridden
 
 **Configuration**:
 ```env
 # Set per provider
 ROTATION_MODE_GEMINI=sequential
 ROTATION_MODE_OPENAI=balanced
-ROTATION_MODE_ANTIGRAVITY=balanced  # Override default
+ROTATION_MODE_ANTIGRAVITY=balanced  # Override default if needed
 ```
 
 #### Per-Model Quota Tracking

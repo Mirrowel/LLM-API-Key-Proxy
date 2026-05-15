@@ -252,10 +252,13 @@ class ConfigLoader:
         env_key = f"{ENV_PREFIX_ROTATION_MODE}{provider_upper}"
         env_val = os.getenv(env_key)
         if env_val:
-            config.rotation_mode = env_val.lower()
-            if config.rotation_mode not in ("balanced", "sequential"):
-                lib_logger.warning(f"Invalid {env_key}='{env_val}'. Using 'balanced'.")
-                config.rotation_mode = "balanced"
+            rotation_mode = env_val.lower()
+            if rotation_mode in ("balanced", "sequential"):
+                config.rotation_mode = rotation_mode
+            else:
+                lib_logger.warning(
+                    f"Invalid {env_key}='{env_val}'. Keeping default '{config.rotation_mode}'."
+                )
 
         # Fair cycle enabled: FAIR_CYCLE_{PROVIDER}
         env_key = f"{ENV_PREFIX_FAIR_CYCLE}{provider_upper}"

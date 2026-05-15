@@ -537,18 +537,21 @@ WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
 # Allow 3 concurrent requests per OpenAI key
 MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3
 
-# Default is 1 (no concurrency)
+# Default is 1 request/key unless a provider overrides it.
 MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=1
+
+# 0 or any negative value means unlimited concurrency for that provider.
+MAX_CONCURRENT_REQUESTS_PER_KEY_DEEPSEEK=-1
 ```
 
 ### Rotation Modes
 
 ```env
-# balanced (default): Distribute load evenly - best for per-minute rate limits
-ROTATION_MODE_OPENAI=balanced
-
-# sequential: Use until exhausted - best for daily/weekly quotas
+# sequential (default): Use one key until it errors/exhausts, preserving provider-side cache locality
 ROTATION_MODE_GEMINI=sequential
+
+# balanced: Distribute load evenly - opt in for per-minute rate limits
+ROTATION_MODE_OPENAI=balanced
 ```
 
 ### Priority Multipliers

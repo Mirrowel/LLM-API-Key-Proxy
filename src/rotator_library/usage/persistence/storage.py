@@ -28,6 +28,7 @@ from ..types import (
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 from ...error_handler import mask_credential
+from ...core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -418,6 +419,16 @@ class UsageStorage:
                     model_or_group=key,
                 )
 
+            raw_max_concurrent = data.get(
+                "max_concurrent", DEFAULT_MAX_CONCURRENT_PER_KEY
+            )
+            try:
+                max_concurrent = int(raw_max_concurrent)
+            except (TypeError, ValueError):
+                max_concurrent = DEFAULT_MAX_CONCURRENT_PER_KEY
+            if max_concurrent <= 0:
+                max_concurrent = -1
+
             return CredentialState(
                 stable_id=stable_id,
                 provider=data.get("provider", "unknown"),
@@ -431,7 +442,7 @@ class UsageStorage:
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
                 active_requests=0,  # Always starts at 0
-                max_concurrent=data.get("max_concurrent"),
+                max_concurrent=max_concurrent,
                 created_at=data.get("created_at"),
                 last_updated=data.get("last_updated"),
             )

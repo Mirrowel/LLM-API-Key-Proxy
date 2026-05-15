@@ -34,6 +34,7 @@ from ..core.config import ConfigLoader
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_GLOBAL_TIMEOUT,
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
     DEFAULT_ROTATION_TOLERANCE,
 )
 
@@ -156,13 +157,14 @@ class RotatingClient:
         self.enable_request_logging = enable_request_logging
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
 
-        # Validate concurrent requests config
-        for provider, max_val in self.max_concurrent_requests_per_key.items():
-            if max_val < 1:
-                lib_logger.warning(
-                    f"Invalid max_concurrent for '{provider}': {max_val}. Setting to 1."
-                )
-                self.max_concurrent_requests_per_key[provider] = 1
+        # Validate concurrent requests config. None means unset/use provider
+        # default; values <= 0 are normalized to -1 (unlimited).
+        for provider, max_val in list(self.max_concurrent_requests_per_key.items()):
+            if max_val is None:
+                del self.max_concurrent_requests_per_key[provider]
+                continue
+            if max_val <= 0:
+                self.max_concurrent_requests_per_key[provider] = -1
 
         # Initialize configuration loader
         self._config_loader = ConfigLoader(PROVIDER_PLUGINS)
@@ -226,8 +228,17 @@ class RotatingClient:
 
             usage_file = self._usage_base_path / f"usage_{provider}.json"
 
-            # Get max concurrent for this provider (default to 1 if not set)
-            max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
+            # Get max concurrent for this provider. Explicit config wins;
+            # provider defaults are used next; otherwise the system default is 1.
+            if provider in self.max_concurrent_requests_per_key:
+                max_concurrent = self.max_concurrent_requests_per_key[provider]
+            else:
+                plugin_class = PROVIDER_PLUGINS.get(provider)
+                max_concurrent = getattr(
+                    plugin_class,
+                    "default_max_concurrent_per_key",
+                    DEFAULT_MAX_CONCURRENT_PER_KEY,
+                )
 
             manager = NewUsageManager(
                 provider=provider,

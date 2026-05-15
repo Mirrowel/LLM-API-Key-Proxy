@@ -266,7 +266,8 @@ class SettingsDetector:
             if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
                 provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
                 try:
-                    limits[provider] = int(value)
+                    parsed = int(value)
+                    limits[provider] = -1 if parsed <= 0 else parsed
                 except (json.JSONDecodeError, ValueError):
                     pass
         return limits
@@ -834,8 +835,11 @@ class LauncherTUI:
             self.console.print("[bold]⚡ Concurrency Limits[/bold]")
             self.console.print("━" * 70)
             for provider, limit in concurrency.items():
-                self.console.print(f"   • {provider:15} {limit} requests/key")
-            self.console.print("   • Default:        1 request/key (all others)")
+                limit_display = "*" if limit <= 0 else str(limit)
+                self.console.print(f"   • {provider:15} {limit_display} requests/key")
+            self.console.print(
+                "   • Default:        1 request/key unless provider overrides (all others)"
+            )
 
         # Model Filters (basic info only)
         if filters:

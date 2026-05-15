@@ -21,6 +21,19 @@ from typing import (
     Union,
 )
 
+from ..config import (
+    DEFAULT_CUSTOM_CAP_COOLDOWN_MODE,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE,
+    DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_FAIR_CYCLE_CROSS_TIER,
+    DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_FAIR_CYCLE_ENABLED,
+    DEFAULT_FAIR_CYCLE_TRACKING_MODE,
+    DEFAULT_ROTATION_MODE,
+    DEFAULT_ROTATION_TOLERANCE,
+    DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
+)
+
 
 # =============================================================================
 # CREDENTIAL TYPES
@@ -121,10 +134,10 @@ class FairCycleConfig:
     any credential is reused.
     """
 
-    enabled: Optional[bool] = None  # None = derive from rotation mode
-    tracking_mode: str = "model_group"  # "model_group" or "credential"
-    cross_tier: bool = False  # Track across all tiers
-    duration: int = 604800  # 7 days in seconds
+    enabled: Optional[bool] = DEFAULT_FAIR_CYCLE_ENABLED
+    tracking_mode: str = DEFAULT_FAIR_CYCLE_TRACKING_MODE
+    cross_tier: bool = DEFAULT_FAIR_CYCLE_CROSS_TIER
+    duration: int = DEFAULT_FAIR_CYCLE_DURATION
 
 
 @dataclass
@@ -140,8 +153,8 @@ class CustomCapConfig:
     model_or_group: str  # Model name or quota group name
     max_requests: Union[int, str]  # Absolute value, offset, or percentage
     max_requests_mode: str = "absolute"  # "absolute", "offset", "percentage"
-    cooldown_mode: str = "quota_reset"  # "quota_reset", "offset", "fixed"
-    cooldown_value: int = 0  # Seconds for offset/fixed modes
+    cooldown_mode: str = DEFAULT_CUSTOM_CAP_COOLDOWN_MODE
+    cooldown_value: int = DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE
 
 
 @dataclass
@@ -166,16 +179,16 @@ class ProviderConfig:
     Loaded by ConfigLoader and used by both client and usage manager.
     """
 
-    rotation_mode: str = "balanced"  # "balanced" or "sequential"
-    rotation_tolerance: float = 3.0
+    rotation_mode: str = DEFAULT_ROTATION_MODE
+    rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE
     priority_multipliers: Dict[int, int] = field(default_factory=dict)
     priority_multipliers_by_mode: Dict[str, Dict[int, int]] = field(
         default_factory=dict
     )
-    sequential_fallback_multiplier: int = 1
+    sequential_fallback_multiplier: int = DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
     fair_cycle: FairCycleConfig = field(default_factory=FairCycleConfig)
     custom_caps: List[CustomCapConfig] = field(default_factory=list)
-    exhaustion_cooldown_threshold: int = 300  # 5 minutes
+    exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
     windows: List[WindowConfig] = field(default_factory=list)
 
 

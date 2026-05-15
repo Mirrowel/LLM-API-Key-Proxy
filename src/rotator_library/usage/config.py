@@ -9,17 +9,26 @@ for usage tracking, limits, and credential selection.
 """
 
 from dataclasses import dataclass, field
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..core.constants import (
+    DEFAULT_CUSTOM_CAP_COOLDOWN_MODE,
+    DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE,
+    DEFAULT_FAIR_CYCLE_CROSS_TIER,
     DEFAULT_FAIR_CYCLE_DURATION,
+    DEFAULT_FAIR_CYCLE_ENABLED,
     DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD,
     DEFAULT_FAIR_CYCLE_RESET_COOLDOWN_THRESHOLD,
+    DEFAULT_FAIR_CYCLE_TRACKING_MODE,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_ROTATION_MODE,
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
 )
 from .types import ResetMode, RotationMode, TrackingMode, CooldownMode, CapMode
+
+lib_logger = logging.getLogger("rotator_library")
 
 
 # =============================================================================
@@ -86,11 +95,9 @@ class FairCycleConfig:
     Controls how credentials are cycled to ensure fair usage distribution.
     """
 
-    enabled: Optional[bool] = (
-        None  # None = derive from rotation mode (on for sequential)
-    )
-    tracking_mode: TrackingMode = TrackingMode.MODEL_GROUP
-    cross_tier: bool = False  # Track across all tiers
+    enabled: Optional[bool] = DEFAULT_FAIR_CYCLE_ENABLED
+    tracking_mode: TrackingMode = TrackingMode(DEFAULT_FAIR_CYCLE_TRACKING_MODE)
+    cross_tier: bool = DEFAULT_FAIR_CYCLE_CROSS_TIER
     duration: int = DEFAULT_FAIR_CYCLE_DURATION  # Cycle duration in seconds
     quota_threshold: float = (
         DEFAULT_FAIR_CYCLE_QUOTA_THRESHOLD  # Multiplier of window limit for exhaustion
@@ -375,8 +382,8 @@ class CustomCapConfig:
     model_or_group: str  # Model name or quota group name
     max_requests: int  # The numeric value
     max_requests_mode: CapMode = CapMode.ABSOLUTE  # How to interpret max_requests
-    cooldown_mode: CooldownMode = CooldownMode.QUOTA_RESET
-    cooldown_value: int = 0  # Seconds for offset/fixed modes
+    cooldown_mode: CooldownMode = CooldownMode(DEFAULT_CUSTOM_CAP_COOLDOWN_MODE)
+    cooldown_value: int = DEFAULT_CUSTOM_CAP_COOLDOWN_VALUE
 
     @classmethod
     def from_dict(
@@ -469,7 +476,7 @@ class ProviderUsageConfig:
     """
 
     # Rotation settings
-    rotation_mode: RotationMode = RotationMode.BALANCED
+    rotation_mode: RotationMode = RotationMode(DEFAULT_ROTATION_MODE)
     rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE
     sequential_fallback_multiplier: int = DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
 
@@ -667,7 +674,14 @@ def load_provider_usage_config(
     # Rotation mode from env
     env_mode = os.getenv(f"ROTATION_MODE_{provider_upper}")
     if env_mode:
-        config.rotation_mode = RotationMode(env_mode.lower())
+        mode = env_mode.lower()
+        if mode in (RotationMode.BALANCED.value, RotationMode.SEQUENTIAL.value):
+            config.rotation_mode = RotationMode(mode)
+        else:
+            lib_logger.warning(
+                f"Invalid ROTATION_MODE_{provider_upper}='{env_mode}'. "
+                f"Keeping default '{config.rotation_mode.value}'."
+            )
 
     # Sequential fallback multiplier
     env_fallback = os.getenv(f"SEQUENTIAL_FALLBACK_MULTIPLIER_{provider_upper}")

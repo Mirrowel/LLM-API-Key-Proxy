@@ -301,8 +301,8 @@ class TrackingEngine:
             True if acquired, False if at max concurrent
         """
         async with self._lock:
-            # Check concurrent limit
-            if state.max_concurrent is not None:
+            # Check concurrent limit. Values <= 0 mean unlimited.
+            if state.max_concurrent > 0:
                 if state.active_requests >= state.max_concurrent:
                     return False
 

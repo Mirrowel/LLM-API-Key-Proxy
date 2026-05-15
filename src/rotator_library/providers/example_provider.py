@@ -157,8 +157,8 @@ class ExampleProvider(ProviderPlugin):
     # Controls how credentials are selected for requests.
     #
     # Options:
-    #   "balanced"   - Weighted random selection based on usage (default)
-    #   "sequential" - Stick to one credential until exhausted, then rotate
+    #   "balanced"   - Weighted random selection based on usage
+    #   "sequential" - Stick to one credential until exhausted, then rotate (default)
     #
     # Sequential mode is better for:
     #   - Providers with per-credential rate limits

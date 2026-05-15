@@ -42,8 +42,8 @@ class ConcurrentLimitChecker(LimitChecker):
         Returns:
             LimitCheckResult indicating pass/fail
         """
-        # If no limit set, always allow
-        if state.max_concurrent is None:
+        # Values <= 0 mean unlimited.
+        if state.max_concurrent <= 0:
             return LimitCheckResult.ok()
 
         # Check if at or above limit

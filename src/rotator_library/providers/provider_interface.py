@@ -48,6 +48,7 @@ class SingletonABCMeta(ABCMeta):
 
 
 from ..config import (
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
     DEFAULT_ROTATION_MODE,
     DEFAULT_TIER_PRIORITY,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
@@ -107,6 +108,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # - "sequential": Use one credential until exhausted, then switch to next
     # See config/defaults.py for the global default value
     default_rotation_mode: str = DEFAULT_ROTATION_MODE
+
+    # Default maximum concurrent requests per credential for this provider.
+    # Values <= 0 mean unlimited. Providers can use this to opt out of the
+    # global default of one in-flight request per key.
+    default_max_concurrent_per_key: int = DEFAULT_MAX_CONCURRENT_PER_KEY
 
     # =========================================================================
     # TIER CONFIGURATION - Override in subclass

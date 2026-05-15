@@ -25,7 +25,7 @@ from typing import Dict, Optional
 # Default credential rotation mode
 # Options: "balanced" (distribute load) or "sequential" (use until exhausted)
 # Override per-provider: ROTATION_MODE_{PROVIDER}=balanced/sequential
-DEFAULT_ROTATION_MODE: str = "balanced"
+DEFAULT_ROTATION_MODE: str = "sequential"
 
 # Weight tolerance for weighted random credential selection
 # 0.0 = deterministic (always pick least-used)
@@ -53,6 +53,11 @@ DEFAULT_TIER_PRIORITY: int = 10
 # Fallback concurrency multiplier for sequential mode
 # Used when priority not in default_priority_multipliers
 DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER: int = 1
+
+# Default maximum concurrent requests per credential.
+# Providers can override this with default_max_concurrent_per_key.
+# Values <= 0 mean unlimited.
+DEFAULT_MAX_CONCURRENT_PER_KEY: int = 1
 
 # =============================================================================
 # FAIR CYCLE ROTATION DEFAULTS

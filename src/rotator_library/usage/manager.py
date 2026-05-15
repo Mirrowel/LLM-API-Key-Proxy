@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from ..core.types import CredentialInfo, RequestCompleteResult
+from ..core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
 from ..error_handler import ClassifiedError, classify_error, mask_credential
 
 from .types import (
@@ -192,7 +193,12 @@ class UsageManager:
         """
         self.provider = provider
         self._provider_plugins = provider_plugins or {}
-        self._max_concurrent_per_key = max_concurrent_per_key
+        if max_concurrent_per_key is None:
+            self._max_concurrent_per_key = DEFAULT_MAX_CONCURRENT_PER_KEY
+        elif max_concurrent_per_key <= 0:
+            self._max_concurrent_per_key = -1
+        else:
+            self._max_concurrent_per_key = max_concurrent_per_key
 
         # Load configuration
         if config:
@@ -297,17 +303,16 @@ class UsageManager:
                 # Debug: Log state before max_concurrent calculation
                 old_max_concurrent = self._states[stable_id].max_concurrent
 
-                # Always set max concurrent, applying priority multiplier
-                # Uses configured value or defaults to 1 if not set
-                base_concurrent = (
-                    self._max_concurrent_per_key
-                    if self._max_concurrent_per_key is not None
-                    else 1
-                )
-                priority = self._states[stable_id].priority
-                multiplier = self._config.get_effective_multiplier(priority)
-                effective_concurrent = base_concurrent * multiplier
-                self._states[stable_id].max_concurrent = effective_concurrent
+                # Always set max concurrent. Values <= 0 mean unlimited and
+                # bypass multiplier logic entirely.
+                if self._max_concurrent_per_key <= 0:
+                    self._states[stable_id].max_concurrent = -1
+                else:
+                    base_concurrent = self._max_concurrent_per_key
+                    priority = self._states[stable_id].priority
+                    multiplier = self._config.get_effective_multiplier(priority)
+                    effective_concurrent = base_concurrent * multiplier
+                    self._states[stable_id].max_concurrent = effective_concurrent
 
             # Clean up stale windows from tier changes
             # This handles the case where a credential's tier changed and now has
@@ -430,14 +435,14 @@ class UsageManager:
                     async with lock:
                         # Double-check availability after acquiring lock
                         if (
-                            state.max_concurrent is None
+                            state.max_concurrent <= 0
                             or state.active_requests < state.max_concurrent
                         ):
                             state.active_requests += 1
                             lib_logger.debug(
                                 f"Acquired credential {mask_credential(state.accessor, style='full')} "
-                                f"for {model} (active: {state.active_requests}"
-                                f"{f'/{state.max_concurrent}' if state.max_concurrent else ''})"
+                                f"for {model} (active: "
+                                f"{self._format_concurrency(state.active_requests, state.max_concurrent)})"
                             )
                             return CredentialContext(
                                 manager=self,
@@ -466,7 +471,7 @@ class UsageManager:
                 if sid in exclude_ids:
                     continue
                 if (
-                    state.max_concurrent is not None
+                    state.max_concurrent > 0
                     and state.active_requests >= state.max_concurrent
                 ):
                     # This one is busy but might become free
@@ -1928,8 +1933,8 @@ class UsageManager:
         max_concurrent = state.max_concurrent
         lib_logger.info(
             f"Released credential {mask_credential(state.accessor, style='full')} "
-            f"from {model} (remaining concurrent: {remaining}"
-            f"{f'/{max_concurrent}' if max_concurrent else ''})"
+            f"from {model} (remaining concurrent: "
+            f"{self._format_concurrency(remaining, max_concurrent)})"
         )
 
         # Notify all tasks waiting on this credential's condition
@@ -1937,6 +1942,11 @@ class UsageManager:
         if condition:
             async with condition:
                 condition.notify_all()
+
+    @staticmethod
+    def _format_concurrency(active: int, max_concurrent: int) -> str:
+        max_display = "*" if max_concurrent <= 0 else str(max_concurrent)
+        return f"{active}/{max_display}"
 
     async def _queue_quota_exhausted_log(
         self, accessor: str, group_key: str, quota_reset_ts: float

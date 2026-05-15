@@ -408,18 +408,21 @@ for key, value in os.environ.items():
         provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
         try:
             max_concurrent = int(value)
-            if max_concurrent < 1:
-                logging.warning(
-                    f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1)."
+            if max_concurrent <= 0:
+                max_concurrent_requests_per_key[provider] = -1
+                logging.debug(
+                    f"Loaded max concurrent requests for provider '{provider}': unlimited"
                 )
-                max_concurrent = 1
+                continue
+
             max_concurrent_requests_per_key[provider] = max_concurrent
             logging.debug(
                 f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}"
             )
         except ValueError:
             logging.warning(
-                f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1)."
+                f"Invalid max_concurrent value for provider '{provider}': {value}. "
+                "Using default (1 unless provider overrides)."
             )
 
 
