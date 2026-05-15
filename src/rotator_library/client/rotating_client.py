@@ -401,12 +401,7 @@ class RotatingClient:
         return self._executor.execute(context)
 
     def token_count(self, **kwargs) -> int:
-        """Calculate token count for text or messages.
-
-        For Antigravity provider models, this also includes the preprompt tokens
-        that get injected during actual API calls (agent instruction + identity override).
-        This ensures token counts match actual usage.
-        """
+        """Calculate token count for text or messages."""
         model = kwargs.get("model")
         text = kwargs.get("text")
         messages = kwargs.get("messages")
@@ -421,24 +416,6 @@ class RotatingClient:
             base_count = token_counter(model=model, text=text)
         else:
             raise ValueError("Either 'text' or 'messages' must be provided")
-
-        # Add preprompt tokens for Antigravity provider
-        # The Antigravity provider injects system instructions during actual API calls,
-        # so we need to account for those tokens in the count
-        provider = model.split("/")[0] if "/" in model else ""
-        if provider == "antigravity":
-            try:
-                from ..providers.antigravity_provider import (
-                    get_antigravity_preprompt_text,
-                )
-
-                preprompt_text = get_antigravity_preprompt_text()
-                if preprompt_text:
-                    preprompt_tokens = token_counter(model=model, text=preprompt_text)
-                    base_count += preprompt_tokens
-            except ImportError:
-                # Provider not available, skip preprompt token counting
-                pass
 
         return base_count
 
@@ -767,7 +744,7 @@ class RotatingClient:
         """
         Force refresh quota from external API.
 
-        For Antigravity, this fetches live quota data from the API.
+        For providers with quota API support, this fetches live quota data.
         For other providers, this is a no-op (just reloads from disk).
 
         Args:
@@ -811,7 +788,7 @@ class RotatingClient:
             if not provider_instance:
                 continue
 
-            # Check if provider supports quota refresh (like Antigravity)
+            # Check if provider supports quota refresh.
             if hasattr(provider_instance, "fetch_initial_baselines"):
                 # Get credentials to refresh
                 if credential:

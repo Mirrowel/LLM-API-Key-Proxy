@@ -5,7 +5,7 @@
 Base Quota Tracking Mixin
 
 Provides shared quota tracking infrastructure for providers that use OAuth
-credentials with quota-based rate limiting (e.g., Antigravity, Gemini CLI).
+credentials with quota-based rate limiting (e.g., Gemini CLI).
 
 This base class handles:
 - Learned costs management (load/save/lookup)
@@ -66,8 +66,8 @@ class BaseQuotaTracker:
     Base mixin class providing shared quota tracking functionality.
 
     Subclasses provide:
-    - provider_env_prefix: str (e.g., "GEMINI_CLI", "ANTIGRAVITY")
-    - cache_subdir: str (e.g., "gemini_cli", "antigravity")
+    - provider_env_prefix: str (e.g., "GEMINI_CLI")
+    - cache_subdir: str (e.g., "gemini_cli")
     - default_quota_costs: Dict[str, Dict[str, float]] - tier -> model -> cost%
     - default_quota_cost_unknown: float - fallback cost for unknown models
     - user_to_api_model_map: Dict[str, str] - optional model name mappings
@@ -166,7 +166,7 @@ class BaseQuotaTracker:
         Get the provider prefix for model names.
 
         Returns:
-            Provider prefix (e.g., "gemini_cli", "antigravity")
+            Provider prefix (e.g., "gemini_cli")
         """
         pass
 
@@ -378,7 +378,7 @@ class BaseQuotaTracker:
         # 2. Env-based credentials
         # Check for {PREFIX}_1_ACCESS_TOKEN, {PREFIX}_2_ACCESS_TOKEN, etc.
         env_prefix = self.provider_env_prefix
-        provider_name = self.cache_subdir  # e.g., "gemini_cli", "antigravity"
+        provider_name = self.cache_subdir  # e.g., "gemini_cli"
 
         for i in range(1, ENV_CREDENTIAL_DISCOVERY_LIMIT):  # Upper limit
             if os.getenv(f"{env_prefix}_{i}_ACCESS_TOKEN"):

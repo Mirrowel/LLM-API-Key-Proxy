@@ -19,7 +19,7 @@ This project consists of two components:
 - **One Endpoint, Many Providers** — Configure Gemini, OpenAI, Anthropic, and [any LiteLLM-supported provider](https://docs.litellm.ai/docs/providers) once. Access them all through a single API key
 - **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
-- **Exclusive Provider Support** — Includes custom providers not available elsewhere: **Antigravity** (Gemini 3 + Claude Sonnet/Opus 4.5), **Gemini CLI**, **Qwen Code**, and **iFlow**
+- **Exclusive Provider Support** — Includes custom providers not available elsewhere, including **Gemini CLI**
 
 ---
 
@@ -105,7 +105,6 @@ openai/gpt-4o                    ← OpenAI API
 anthropic/claude-3-5-sonnet      ← Anthropic API
 openrouter/anthropic/claude-3-opus  ← OpenRouter
 gemini_cli/gemini-2.5-pro        ← Gemini CLI (OAuth)
-antigravity/gemini-3-pro-preview ← Antigravity (Gemini 3, Claude Opus 4.5)
 ```
 
 ### Usage Examples
@@ -264,7 +263,7 @@ python -m rotator_library.credential_tool
 | Type | Providers | How to Add |
 |------|-----------|------------|
 | **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env` |
-| **OAuth** | Gemini CLI, Antigravity, Qwen Code, iFlow | Interactive browser login via credential tool |
+| **OAuth** | Gemini CLI | Interactive browser login via credential tool |
 
 ### The `.env` File
 
@@ -295,7 +294,7 @@ The proxy is powered by a standalone Python library that you can use directly in
 - **Intelligent key selection** with tiered, model-aware locking
 - **Deadline-driven requests** with configurable global timeout
 - **Automatic failover** between keys on errors
-- **OAuth support** for Gemini CLI, Antigravity, Qwen, iFlow
+- **OAuth support** for Gemini CLI
 - **Stateless deployment ready** — load credentials from environment variables
 
 ### Basic Usage
@@ -379,7 +378,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>🔑 Credential Management</b></summary>
 
 - **Auto-discovery** of API keys from environment variables
-- **OAuth discovery** from standard paths (`~/.gemini/`, `~/.qwen/`, `~/.iflow/`)
+- **OAuth discovery** from standard paths (`~/.gemini/`)
 - **Duplicate detection** warns when same account added multiple times
 - **Credential prioritization** — paid tier used before free tier
 - **Stateless deployment** — export OAuth to environment variables
@@ -410,35 +409,6 @@ The proxy includes a powerful text-based UI for configuration and management.
 - Automatic fallback to preview models on rate limit
 - Paid vs free tier detection
 
-**Antigravity:**
-
-- Gemini 3 Pro with `thinkingLevel` support
-- Gemini 2.5 Flash/Flash Lite with thinking mode
-- Claude Opus 4.5 (thinking mode)
-- Claude Sonnet 4.5 (thinking and non-thinking)
-- GPT-OSS 120B Medium
-- Thought signature caching for multi-turn conversations
-- Tool hallucination prevention
-- Quota baseline tracking with background refresh
-- Parallel tool usage instruction injection
-- **Quota Groups**: Models that share quota are automatically grouped:
-  - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
-  - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
-  - Gemini 2.5 Flash: `gemini-2.5-flash`, `gemini-2.5-flash-thinking`, `gemini-2.5-flash-lite`
-  - All models in a group deplete the usage of the group equally. So in claude group - it is beneficial to use only Opus, and forget about Sonnet and GPT-OSS.
-
-**Qwen Code:**
-
-- Dual auth (API key + OAuth Device Flow)
-- `<think>` tag parsing as `reasoning_content`
-- Tool schema cleaning
-
-**iFlow:**
-
-- Dual auth (API key + OAuth Authorization Code)
-- Hybrid auth with separate API key fetch
-- Tool schema cleaning
-
 **NVIDIA NIM:**
 
 - Dynamic model discovery
@@ -454,7 +424,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 - **Unique request directories** with full transaction details
 - **Streaming chunk capture** for debugging
 - **Performance metadata** (duration, tokens, model used)
-- **Provider-specific logs** for Qwen, iFlow, Antigravity
+- **Provider-specific logs** for active custom providers
 
 </details>
 
@@ -492,7 +462,6 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `QUOTA_GROUPS_<PROVIDER>_<GROUP>` | Models sharing quota limits |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
-| `ANTIGRAVITY_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
 </details>
 
@@ -559,11 +528,11 @@ ROTATION_MODE_OPENAI=balanced
 Paid credentials can handle more concurrent requests:
 
 ```env
-# Priority 1 (paid ultra): 10x concurrency
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_1=10
+# Priority 1: 10x concurrency
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_1=10
 
-# Priority 2 (standard paid): 3x
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
+# Priority 2: 3x
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_2=3
 ```
 
 ### Model Quota Groups
@@ -571,8 +540,8 @@ CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
 Models sharing quota limits:
 
 ```env
-# Claude models share quota - when one hits limit, both cool down
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+# Example: group provider models that share quota
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
 ```
 
 </details>
@@ -667,96 +636,6 @@ GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval in seconds (defa
 </details>
 
 <details>
-<summary><b>Antigravity (Gemini 3 + Claude Opus 4.5)</b></summary>
-
-Access Google's internal Antigravity API for cutting-edge models.
-
-**Supported Models:**
-
-- **Gemini 3 Pro** — with `thinkingLevel` support (low/high)
-- **Gemini 2.5 Flash** — with thinking mode support
-- **Gemini 2.5 Flash Lite** — configurable thinking budget
-- **Claude Opus 4.5** — Anthropic's most powerful model (thinking mode only)
-- **Claude Sonnet 4.5** — supports both thinking and non-thinking modes
-- **GPT-OSS 120B** — OpenAI-compatible model
-
-**Setup:**
-
-1. Run `python -m rotator_library.credential_tool`
-2. Select "Add OAuth Credential" → "Antigravity"
-3. Complete browser authentication
-
-**Advanced Features:**
-
-- Thought signature caching for multi-turn conversations
-- Tool hallucination prevention via parameter signature injection
-- Automatic thinking block sanitization for Claude
-- Credential prioritization (paid resets every 5 hours, free weekly)
-- Quota baseline tracking with background refresh (accurate remaining quota estimates)
-- Parallel tool usage instruction injection for Claude
-
-**Environment Variables:**
-
-```env
-ANTIGRAVITY_ACCESS_TOKEN="ya29.your-access-token"
-ANTIGRAVITY_REFRESH_TOKEN="1//your-refresh-token"
-ANTIGRAVITY_EXPIRY_DATE="1234567890000"
-ANTIGRAVITY_EMAIL="your-email@gmail.com"
-
-# Feature toggles
-ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
-ANTIGRAVITY_GEMINI3_TOOL_FIX=true
-ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval (seconds)
-ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Parallel tool instruction for Claude
-```
-
-> **Note:** Gemini 3 models require a paid-tier Google Cloud project.
-
-</details>
-
-<details>
-<summary><b>Qwen Code</b></summary>
-
-Uses OAuth Device Flow for Qwen/Dashscope APIs.
-
-**Setup:**
-
-1. Run the credential tool
-2. Select "Add OAuth Credential" → "Qwen Code"
-3. Enter the code displayed in your browser
-4. Or add API key directly: `QWEN_CODE_API_KEY_1="your-key"`
-
-**Features:**
-
-- Dual auth (API key or OAuth)
-- `<think>` tag parsing as `reasoning_content`
-- Automatic tool schema cleaning
-- Custom models via `QWEN_CODE_MODELS` env var
-
-</details>
-
-<details>
-<summary><b>iFlow</b></summary>
-
-Uses OAuth Authorization Code flow with local callback server.
-
-**Setup:**
-
-1. Run the credential tool
-2. Select "Add OAuth Credential" → "iFlow"
-3. Complete browser authentication (callback on port 11451)
-4. Or add API key directly: `IFLOW_API_KEY_1="sk-your-key"`
-
-**Features:**
-
-- Dual auth (API key or OAuth)
-- Hybrid auth (OAuth token fetches separate API key)
-- Automatic tool schema cleaning
-- Custom models via `IFLOW_MODELS` env var
-
-</details>
-
-<details>
 <summary><b>Stateless Deployment (Export to Environment Variables)</b></summary>
 
 For platforms without file persistence (Railway, Render, Vercel):
@@ -790,8 +669,6 @@ Customize OAuth callback ports if defaults conflict:
 | Provider    | Default Port | Environment Variable     |
 | ----------- | ------------ | ------------------------ |
 | Gemini CLI  | 8085         | `GEMINI_CLI_OAUTH_PORT`  |
-| Antigravity | 51121        | `ANTIGRAVITY_OAUTH_PORT` |
-| iFlow       | 11451        | `IFLOW_OAUTH_PORT`       |
 
 </details>
 
@@ -919,7 +796,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 
 **OAuth with Docker:**
 
-For OAuth providers (Antigravity, Gemini CLI, etc.), you must authenticate locally first:
+For OAuth providers such as Gemini CLI, you must authenticate locally first:
 
 1. Run `python -m rotator_library.credential_tool` on your local machine
 2. Complete OAuth flows in browser

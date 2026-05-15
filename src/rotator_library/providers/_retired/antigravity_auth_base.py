@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/antigravity_auth_base.py
 
+"""
+Retired Antigravity OAuth authentication support.
+
+This module is archived for historical reference only. Active credential setup,
+discovery, export, and provider factory wiring no longer reference it, so
+Antigravity credentials cannot be added or used through the proxy.
+"""
+
 import asyncio
 import json
 import logging

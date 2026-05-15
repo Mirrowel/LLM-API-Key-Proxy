@@ -60,7 +60,7 @@ class ConfigLoader:
 
     Usage:
         loader = ConfigLoader(provider_plugins)
-        config = loader.load_provider_config("antigravity")
+        config = loader.load_provider_config("gemini_cli")
     """
 
     def __init__(self, provider_plugins: Optional[Dict[str, type]] = None):
@@ -88,7 +88,7 @@ class ConfigLoader:
         3. Environment variables (ALWAYS win)
 
         Args:
-            provider: Provider name (e.g., "antigravity", "gemini_cli")
+            provider: Provider name (e.g., "gemini_cli")
             force_reload: If True, bypass cache and reload
 
         Returns:

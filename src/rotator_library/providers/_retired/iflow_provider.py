@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/iflow_provider.py
 
+"""
+Retired iFlow provider implementation.
+
+This module is archived for historical reference only. It is intentionally kept
+outside the active provider package scan path and must not be imported or wired
+back into runtime provider registration without a deliberate un-retirement.
+"""
+
 import copy
 import hmac
 import hashlib

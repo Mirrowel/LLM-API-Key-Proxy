@@ -12,9 +12,6 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit.
 -   **OAuth & API Key Support**: Built-in support for standard API keys and complex OAuth flows.
     -   **Gemini CLI**: Full OAuth 2.0 web flow with automatic project discovery, free-tier onboarding, and credential prioritization (paid vs free tier).
-    -   **Antigravity**: Full OAuth 2.0 support for Gemini 3, Gemini 2.5, and Claude Sonnet 4.5 models with thought signature caching(Full support for Gemini 3 and Claude models). **First on the scene to provide full support for Gemini 3** via Antigravity with advanced features like thought signature caching and tool hallucination prevention.
-    -   **Qwen Code**: Device Code flow support.
-    -   **iFlow**: Authorization Code flow with local callback handling.
 -   **Stateless Deployment Ready**: Can load complex OAuth credentials from environment variables, eliminating the need for physical credential files in containerized environments.
 -   **Intelligent Error Handling**:
     -   **Escalating Per-Model Cooldowns**: Failed keys are placed on a temporary, escalating cooldown for specific models.
@@ -89,7 +86,7 @@ client = RotatingClient(
 #### Arguments
 
 -   `api_keys` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "openai", "anthropic") to a list of API keys.
--   `oauth_credentials` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "gemini_cli", "qwen_code") to a list of file paths to OAuth credential JSON files.
+-   `oauth_credentials` (`Optional[Dict[str, List[str]]]`): A dictionary mapping provider names (e.g., "gemini_cli") to a list of file paths to OAuth credential JSON files.
 -   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error (e.g., 500, 503) occurs.
 -   `usage_file_path` (`str`, optional): Base path for usage persistence (defaults to `usage/` in the data directory). The client stores per-provider files under `usage/usage_<provider>.json` next to this path.
 -   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger. Set to `False` if you want to handle logging configuration manually.
@@ -238,23 +235,10 @@ python -m src.rotator_library.credential_tool
 ```
 
 Use this tool to:
-1.  **Initialize OAuth**: Run the interactive login flows for Gemini, Qwen, and iFlow.
+1.  **Initialize OAuth**: Run the interactive login flow for Gemini CLI.
 2.  **Export Credentials**: Generate `.env` compatible configuration blocks from your saved OAuth JSON files. This is essential for setting up stateless deployments.
 
 ## Provider Specifics
-
-### Qwen Code
--   **Auth**: Uses OAuth 2.0 Device Flow. Requires manual entry of email/identifier if not returned by the provider.
--   **Resilience**: Injects a dummy tool (`do_not_call_me`) into requests with no tools to prevent known stream corruption issues on the API.
--   **Reasoning**: Parses `<think>` tags in the response and exposes them as `reasoning_content`.
--   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from all tool schemas. Qwen's API has stricter validation than OpenAI's, and these properties cause `400 Bad Request` errors.
-
-### iFlow
--   **Auth**: Uses Authorization Code Flow with a local callback server (port 11451).
--   **Key Separation**: Distinguishes between the OAuth `access_token` (used to fetch user info) and the `api_key` (used for actual chat requests).
--   **Resilience**: Similar to Qwen, injects a placeholder tool to stabilize streaming for empty tool lists.
--   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from all tool schemas to prevent API validation errors.
--   **Custom Models**: Supports model definitions via `IFLOW_MODELS` environment variable (JSON array of model IDs or objects).
 
 ### NVIDIA NIM
 -   **Discovery**: Dynamically fetches available models from the NVIDIA API.
@@ -272,27 +256,6 @@ Use this tool to:
     - Parameter signature injection into tool descriptions
 -   **Rate Limits**: Implements smart fallback strategies (e.g., switching from `gemini-1.5-pro` to `gemini-1.5-pro-002`) when rate limits are hit.
 
-### Antigravity
--   **Auth**: Uses OAuth 2.0 flow similar to Gemini CLI, with Antigravity-specific credentials and scopes.
--   **Credential Prioritization**: Automatic detection and prioritization of paid vs free tier credentials (paid tier resets every 5 hours, free tier resets weekly).
--   **Models**: Supports Gemini 3 Pro, Gemini 2.5 Flash/Flash Lite, Claude Sonnet 4.5 (with/without thinking), Claude Opus 4.5 (thinking only), and GPT-OSS 120B via Google's internal Antigravity API.
--   **Quota Groups**: Models that share quota are automatically grouped:
-    - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
-    - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
-    - Gemini 2.5 Flash: `gemini-2.5-flash`, `gemini-2.5-flash-thinking`, `gemini-2.5-flash-lite`
-    - All models in a group deplete the usage of the group equally. So in claude group - it is beneficial to use only Opus, and forget about Sonnet and GPT-OSS.
--   **Quota Baseline Tracking**: Background job fetches quota status from API every 5 minutes to provide accurate remaining quota estimates.
--   **Thought Signature Caching**: Server-side caching of `thoughtSignature` data for multi-turn conversations with Gemini 3 models.
--   **Tool Hallucination Prevention**: Automatic injection of system instructions and parameter signatures for Gemini 3 and Claude to prevent tool parameter hallucination.
--   **Parallel Tool Usage Instruction**: Configurable instruction injection to encourage parallel tool calls (enabled by default for Claude).
--   **Thinking Support**:
-    - Gemini 3: Uses `thinkingLevel` (string: "low"/"high")
-    - Gemini 2.5 Flash: Uses `-thinking` variant when `reasoning_effort` is provided
-    - Claude Sonnet 4.5: Uses `thinkingBudget` (optional - supports both thinking and non-thinking modes)
-    - Claude Opus 4.5: Uses `thinkingBudget` (always uses thinking variant)
--   **Base URL Fallback**: Automatic fallback between sandbox and production endpoints.
--   **Fair Cycle Rotation**: Enabled by default in sequential mode. Ensures all credentials cycle before reuse.
--   **Custom Caps**: Configurable per-tier caps with offset cooldowns for pacing usage. See `config/defaults.py`.
 
 ## Error Handling and Cooldowns
 

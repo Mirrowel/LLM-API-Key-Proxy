@@ -2,6 +2,11 @@
 # Copyright (c) 2026 Mirrowel
 
 """
+Retired Antigravity quota tracking mixin.
+
+This module is archived with the retired Antigravity provider. Shared quota
+tracking primitives used by active providers remain in `providers.utilities`.
+
 Antigravity Quota Tracking Mixin
 
 Provides quota tracking, estimation, and verification methods for the

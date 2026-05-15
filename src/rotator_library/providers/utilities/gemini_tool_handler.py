@@ -6,7 +6,7 @@
 Shared tool handling mixin for Gemini-based providers.
 
 Provides tool schema transformation, response grouping, and tool choice translation
-methods used by both GeminiCliProvider and AntigravityProvider.
+methods used by GeminiCliProvider.
 """
 
 from __future__ import annotations

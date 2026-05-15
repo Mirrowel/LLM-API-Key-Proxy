@@ -77,11 +77,11 @@ class ModelResolver:
         Otherwise, returns the model name unchanged.
 
         Args:
-            model: Full model string with provider (e.g., "iflow/DS-v3.2")
-            provider: Provider name (e.g., "iflow")
+            model: Full model string with provider (e.g., "openrouter/gpt-4")
+            provider: Provider name (e.g., "openrouter")
 
         Returns:
-            Full model string with ID (e.g., "iflow/deepseek-v3.2")
+            Full model string with ID (e.g., "openrouter/openai/gpt-4")
         """
         model_name = model.split("/")[-1] if "/" in model else model
 

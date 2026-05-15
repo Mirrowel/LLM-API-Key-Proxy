@@ -151,7 +151,7 @@ class RequestExecutor:
         Check if provider has tier/priority configuration.
 
         Providers with tier support define tier_priorities mapping
-        (e.g., Antigravity, GeminiCli, NanoGpt).
+        (e.g., GeminiCli, NanoGpt).
 
         Args:
             provider: Provider name
@@ -768,12 +768,11 @@ class RequestExecutor:
                                     kwargs, context.kwargs
                                 )
 
-                            # Add stream options (but not for iflow - it returns 406)
-                            if provider != "iflow":
-                                if "stream_options" not in kwargs:
-                                    kwargs["stream_options"] = {}
-                                if "include_usage" not in kwargs["stream_options"]:
-                                    kwargs["stream_options"]["include_usage"] = True
+                            # Add stream usage metadata for active providers.
+                            if "stream_options" not in kwargs:
+                                kwargs["stream_options"] = {}
+                            if "include_usage" not in kwargs["stream_options"]:
+                                kwargs["stream_options"]["include_usage"] = True
 
                             # Get provider plugin
                             plugin = self._get_plugin_instance(provider)

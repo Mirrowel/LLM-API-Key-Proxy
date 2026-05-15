@@ -118,7 +118,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # TIER CONFIGURATION - Override in subclass
     # =========================================================================
 
-    # Provider name for env var lookups (e.g., "antigravity", "gemini_cli")
+    # Provider name for env var lookups (e.g., "gemini_cli")
     # Used for: QUOTA_GROUPS_{provider_env_name}_{GROUP}
     provider_env_name: str = ""
 
@@ -411,7 +411,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         then falls back to the class's default_rotation_mode.
 
         Args:
-            provider_name: The provider name (e.g., "antigravity", "gemini_cli")
+            provider_name: The provider name (e.g., "gemini_cli")
 
         Returns:
             "balanced" or "sequential"

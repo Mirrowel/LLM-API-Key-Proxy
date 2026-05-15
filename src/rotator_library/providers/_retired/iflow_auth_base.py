@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/iflow_auth_base.py
 
+"""
+Retired iFlow OAuth/cookie authentication support.
+
+This module is archived for historical reference only. Active credential setup,
+discovery, export, and provider factory wiring no longer reference it, so iFlow
+credentials cannot be added or used through the proxy.
+"""
+
 import secrets
 import base64
 import json

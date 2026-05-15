@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/qwen_code_provider.py
 
+"""
+Retired Qwen Code provider implementation.
+
+This module is archived for historical reference only. It is intentionally kept
+outside the active provider package scan path and must not be imported or wired
+back into runtime provider registration without a deliberate un-retirement.
+"""
+
 import copy
 import json
 import time

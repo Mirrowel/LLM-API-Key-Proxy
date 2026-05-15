@@ -1266,7 +1266,7 @@ class UsageManager:
         Get the quota group for a model, if the provider defines one.
 
         Models in the same quota group share a single quota pool.
-        For example, all Claude models in Antigravity share the same daily quota.
+        For example, related provider models can share the same daily quota.
 
         Args:
             model: Model name (with or without provider prefix)
@@ -1299,7 +1299,7 @@ class UsageManager:
 
         Returns:
             List of normalized, deduplicated model names with provider prefix
-            (e.g., ["antigravity/claude-sonnet-4.5", "antigravity/claude-opus-4.5"])
+            (e.g., ["gemini_cli/gemini-2.5-pro", "gemini_cli/gemini-3-pro-preview"])
         """
         plugin_instance = self._get_provider_plugin_instance()
 
@@ -1433,7 +1433,7 @@ class UsageManager:
                 background fetches.
             apply_exhaustion: If True, apply cooldown for exhausted quota.
                 Provider controls when this is set based on its semantics
-                (e.g., Antigravity only on initial fetch, others always
+                (e.g., providers can choose initial-only or always-on refresh
                 when remaining == 0).
 
         Returns:

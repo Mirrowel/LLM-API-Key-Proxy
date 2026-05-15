@@ -73,7 +73,7 @@ else:
 # Load main .env first
 load_dotenv(_root_dir / ".env")
 
-# Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
+# Load any additional .env files (e.g., gemini_cli_all_combined.env)
 _env_files_found = list(_root_dir.glob("*.env"))
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
@@ -1393,7 +1393,7 @@ async def get_quota_stats(
                     "total_requests": int,
                     "tokens": {...},
                     "approx_cost": float | null,
-                    "quota_groups": {...},  // For Antigravity
+                    "quota_groups": {...},
                     "credentials": [...]
                 }
             },
@@ -1423,14 +1423,14 @@ async def refresh_quota_stats(
         {
             "action": "reload" | "force_refresh",
             "scope": "all" | "provider" | "credential",
-            "provider": "antigravity",  // required if scope != "all"
-            "credential": "antigravity_oauth_1.json"  // required if scope == "credential"
+            "provider": "gemini_cli",  // required if scope != "all"
+            "credential": "gemini_cli_oauth_1.json"  // required if scope == "credential"
         }
 
     Actions:
         - reload: Re-read data from disk (no external API calls)
-        - force_refresh: For Antigravity, fetch live quota from API.
-                        For other providers, same as reload.
+        - force_refresh: Fetch live quota for providers that support it.
+                         For other providers, same as reload.
 
     Returns:
         Same as GET, plus a "refresh_result" field with operation details.
@@ -1483,7 +1483,7 @@ async def refresh_quota_stats(
             refresh_result["message"] = "Reloaded usage data from disk"
 
         elif action == "force_refresh":
-            # Force refresh from external API (for supported providers like Antigravity)
+            # Force refresh from external API for supported providers.
             result = await client.force_refresh_quota(
                 provider=provider if scope in ("provider", "credential") else None,
                 credential=credential if scope == "credential" else None,

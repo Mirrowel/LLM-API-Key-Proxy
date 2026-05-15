@@ -6,7 +6,7 @@
 Shared credential and tier management mixin for Gemini-based providers.
 
 Provides tier loading, caching, and background job methods used by both
-GeminiCliProvider and AntigravityProvider.
+GeminiCliProvider.
 """
 
 from __future__ import annotations

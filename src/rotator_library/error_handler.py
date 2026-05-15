@@ -91,7 +91,7 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
 
     Handles various error formats including:
     - Gemini CLI: "Your quota will reset after 39s."
-    - Antigravity: "quota will reset after 156h14m36s"
+    - Google RPC: "quota will reset after 156h14m36s"
     - Generic: "quota will reset after 120s", "retry after 60s"
 
     Args:
@@ -167,7 +167,7 @@ class EmptyResponseError(Exception):
     Treated as a transient server-side issue (503 equivalent).
 
     Attributes:
-        provider: The provider name (e.g., "antigravity")
+        provider: The provider name (e.g., "gemini_cli")
         model: The model that was requested
         message: Human-readable message about the error
     """
@@ -193,7 +193,7 @@ class TransientQuotaError(Exception):
     Treated as a transient server-side issue (503 equivalent), same as EmptyResponseError.
 
     Attributes:
-        provider: The provider name (e.g., "antigravity")
+        provider: The provider name (e.g., "gemini_cli")
         model: The model that was requested
         message: Human-readable message about the error
     """
@@ -507,7 +507,7 @@ def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
     """
     Extract retry delay from a JSON error response body.
 
-    Handles Antigravity/Google API error formats with details array containing:
+    Handles Google API error formats with details array containing:
     - RetryInfo with retryDelay: "562476.752463453s"
     - ErrorInfo metadata with quotaResetDelay: "156h14m36.752463453s"
 
@@ -545,7 +545,7 @@ def _extract_retry_from_json_body(json_text: str) -> Optional[int]:
                         if result is not None:
                             return result
 
-            # Check ErrorInfo metadata for quotaResetDelay (Antigravity-specific)
+            # Check ErrorInfo metadata for quotaResetDelay.
             if "google.rpc.ErrorInfo" in detail_type:
                 metadata = detail.get("metadata", {})
                 # Try both camelCase and lowercase variants
@@ -636,7 +636,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
     Handles both integer and string representations of the duration, as well as JSON bodies.
     Also checks HTTP response headers for httpx.HTTPStatusError instances.
 
-    Supports Antigravity/Google API error formats:
+    Supports Google API error formats:
     - RetryInfo with retryDelay: "562476.752463453s"
     - ErrorInfo metadata with quotaResetDelay: "156h14m36.752463453s"
     - Human-readable message: "quota will reset after 156h14m36s"
@@ -644,7 +644,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
     # 0. For httpx errors, check response body and headers
     if isinstance(error, httpx.HTTPStatusError):
         # First, try to parse the response body JSON (contains retryDelay/quotaResetDelay)
-        # This is where Antigravity puts the retry information
+            # Some Google APIs put retry information in the response body.
         try:
             response_text = error.response.text
             if response_text:
@@ -696,7 +696,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
         r"wait for\s*(\d+)\s*seconds?",
         r'"retrydelay":\s*"([\d.]+)s?"',  # retryDelay in JSON (lowercased)
         r"x-ratelimit-reset:?\s*(\d+)",
-        # Compound duration patterns (Antigravity format)
+        # Compound duration patterns.
         r"quota will reset after\s*([\dhms.]+)",  # e.g., "156h14m36s" or "120s"
         r"reset after\s*([\dhms.]+)",
         r'"quotaresetdelay":\s*"([\dhms.]+)"',  # quotaResetDelay in JSON (lowercased)

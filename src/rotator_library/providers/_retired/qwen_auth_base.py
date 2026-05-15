@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/qwen_auth_base.py
 
+"""
+Retired Qwen Code OAuth authentication support.
+
+This module is archived for historical reference only. Active credential setup,
+discovery, export, and provider factory wiring no longer reference it, so Qwen
+Code credentials cannot be added or used through the proxy.
+"""
+
 import secrets
 import hashlib
 import base64

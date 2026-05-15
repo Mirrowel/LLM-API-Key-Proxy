@@ -551,7 +551,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
         """
         Get quota info for all credentials.
 
-        This method uses the same structure as AntigravityQuotaTracker for
+        This method uses the shared quota tracker structure for
         consistency in the TUI and quota stats endpoint.
 
         Args:
@@ -642,7 +642,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                     user_model = self._api_to_user_model(model_id)
                     bucket_by_model[user_model] = bucket
 
-            # Build model_groups from quota groups (same structure as Antigravity)
+            # Build model_groups from quota groups.
             groups = self._get_effective_quota_groups()
             model_groups = {}
 

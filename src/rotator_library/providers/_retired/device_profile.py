@@ -2,7 +2,13 @@
 # Copyright (c) 2026 Mirrowel
 
 # src/rotator_library/providers/utilities/device_profile.py
+
 """
+Retired Antigravity device fingerprint utilities.
+
+This module was only used by the retired Antigravity provider and is archived
+for historical reference. Active Gemini CLI code does not import it.
+
 Device fingerprint generation, binding, and storage for Antigravity provider.
 
 This module provides complete device fingerprinting for rate-limit mitigation.

@@ -188,7 +188,7 @@ class GeminiCliProvider(
     }
 
     # Priority-based concurrency multipliers
-    # Same structure as Antigravity (by coincidence, tiers share naming)
+    # Tier priority structure mirrors the shared Google OAuth priority helpers.
     # Priority 1 (paid ultra): 5x concurrent requests
     # Priority 2 (standard paid): 3x concurrent requests
     # Others: Use sequential fallback (2x) or balanced default (1x)
@@ -208,7 +208,7 @@ class GeminiCliProvider(
         Handles the Gemini CLI error format which embeds reset time in the message:
         "You have exhausted your capacity on this model. Your quota will reset after 2s."
 
-        Unlike Antigravity which uses structured RetryInfo/quotaResetDelay metadata,
+        Unlike some Google RPC APIs which use structured RetryInfo/quotaResetDelay metadata,
         Gemini CLI embeds the reset time in a human-readable message.
 
         Example error format:
@@ -354,7 +354,7 @@ class GeminiCliProvider(
         self.model_definitions = ModelDefinitions()
         # NOTE: project_id_cache and project_tier_cache are inherited from GeminiAuthBase
 
-        # Quota refresh interval (mirrors Antigravity pattern)
+        # Quota refresh interval.
         self._quota_refresh_interval = env_int("GEMINI_CLI_QUOTA_REFRESH_INTERVAL", 300)
 
         # Track whether initial quota fetch has been done (for background job)
@@ -487,7 +487,7 @@ class GeminiCliProvider(
         Uses SHA256 hash of the first user message to create a deterministic
         UUID-formatted session ID. Falls back to random UUID if no user message.
 
-        This approach mirrors Antigravity's _generate_stable_session_id() but
+        This approach generates stable sessions without persisting conversation IDs.
         uses UUID format instead of the -{number} format to match native
         gemini-cli's crypto.randomUUID() output format.
 
@@ -1511,7 +1511,7 @@ class GeminiCliProvider(
                 final_headers.update(self._get_gemini_cli_request_headers(model_name))
 
                 # Endpoint fallback loop: try sandbox first, then production
-                # This mirrors the opencode-antigravity-auth plugin behavior
+                # Preserve the captured CLI request profile.
                 last_endpoint_error = None
                 for endpoint_idx, base_endpoint in enumerate(
                     GEMINI_CLI_ENDPOINT_FALLBACKS

@@ -187,9 +187,6 @@ class SettingsDetector:
         # (duplicated from credential_manager to avoid heavy imports)
         env_oauth_providers = {
             "gemini_cli": "GEMINI_CLI",
-            "antigravity": "ANTIGRAVITY",
-            "qwen_code": "QWEN_CODE",
-            "iflow": "IFLOW",
         }
 
         for provider, env_prefix in env_oauth_providers.items():
@@ -291,7 +288,7 @@ class SettingsDetector:
 
     @staticmethod
     def detect_provider_settings() -> dict:
-        """Detect provider-specific settings (Antigravity, Gemini CLI)"""
+        """Detect provider-specific settings (Gemini CLI)"""
         try:
             from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
         except ImportError:

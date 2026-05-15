@@ -5,7 +5,7 @@
 NanoGPT Quota Tracking Mixin
 
 Provides quota tracking for the NanoGPT provider using their subscription usage API.
-Unlike Gemini/Antigravity which track per-model quotas, NanoGPT tracks "usage units"
+Unlike Gemini providers which track per-model quotas, NanoGPT tracks "usage units"
 (successful operations) at the credential level with daily/monthly limits.
 
 API Details (from https://docs.nano-gpt.com/api-reference/endpoint/subscription-usage):

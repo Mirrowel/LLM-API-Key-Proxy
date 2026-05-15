@@ -85,7 +85,7 @@ class TransactionContext:
     """Whether logging is enabled."""
 
     provider: str
-    """Provider name (e.g., 'antigravity', 'gemini_cli')."""
+    """Provider name (e.g., 'gemini_cli', 'openai')."""
 
     model: str
     """Model name (sanitized for filesystem use)."""
@@ -130,7 +130,7 @@ class TransactionLogger:
         Initialize transaction logger.
 
         Args:
-            provider: Provider name (e.g., 'antigravity', 'openai')
+            provider: Provider name (e.g., 'gemini_cli', 'openai')
             model: Model name (will be sanitized for filesystem)
             enabled: Whether logging is enabled
             api_format: API format prefix ('oai' for OpenAI, 'ant' for Anthropic)
@@ -143,7 +143,7 @@ class TransactionLogger:
         self.api_format = api_format
 
         # Strip provider prefix from model if present
-        # e.g., "antigravity/claude-opus-4.5" → "claude-opus-4.5"
+        # e.g., "gemini_cli/gemini-2.5-pro" -> "gemini-2.5-pro"
         model_name = model
         if "/" in model_name and model_name.split("/")[0] == provider:
             model_name = model_name.split("/", 1)[1]
@@ -631,54 +631,3 @@ class ProviderLogger:
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to append to {filename}: {e}")
 
-
-class AntigravityProviderLogger(ProviderLogger):
-    """
-    Antigravity-specific provider logger.
-
-    Extends ProviderLogger with methods for logging malformed function call
-    retries and auto-fix attempts.
-    """
-
-    def log_malformed_retry_request(
-        self, retry_num: int, payload: Dict[str, Any]
-    ) -> None:
-        """
-        Log a malformed call retry request payload.
-
-        Args:
-            retry_num: The retry attempt number
-            payload: The retry request payload
-        """
-        self._write_json(f"malformed_retry_{retry_num}_request.json", payload)
-
-    def log_malformed_retry_response(self, retry_num: int, chunk: str) -> None:
-        """
-        Append a chunk to the malformed retry response log.
-
-        Args:
-            retry_num: The retry attempt number
-            chunk: Response chunk from the retry
-        """
-        self._append_text(f"malformed_retry_{retry_num}_response.log", chunk + "\n")
-
-    def log_malformed_autofix(
-        self, tool_name: str, raw_args: str, fixed_json: str
-    ) -> None:
-        """
-        Log details of an auto-fixed malformed function call.
-
-        Args:
-            tool_name: Name of the tool that was called
-            raw_args: The original malformed arguments
-            fixed_json: The fixed JSON arguments
-        """
-        self._write_json(
-            "malformed_autofix.json",
-            {
-                "tool_name": tool_name,
-                "raw_args": raw_args,
-                "fixed_json": fixed_json,
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )

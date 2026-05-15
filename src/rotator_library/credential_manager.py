@@ -15,9 +15,6 @@ lib_logger = logging.getLogger("rotator_library")
 # Standard directories where tools like `gemini login` store credentials.
 DEFAULT_OAUTH_DIRS = {
     "gemini_cli": Path.home() / ".gemini",
-    "qwen_code": Path.home() / ".qwen",
-    "iflow": Path.home() / ".iflow",
-    "antigravity": Path.home() / ".antigravity",
     # Add other providers like 'claude' here if they have a standard CLI path
 }
 
@@ -25,9 +22,6 @@ DEFAULT_OAUTH_DIRS = {
 # Maps provider name to the ENV_PREFIX used by the provider
 ENV_OAUTH_PROVIDERS = {
     "gemini_cli": "GEMINI_CLI",
-    "antigravity": "ANTIGRAVITY",
-    "qwen_code": "QWEN_CODE",
-    "iflow": "IFLOW",
 }
 
 
@@ -67,11 +61,11 @@ class CredentialManager:
         Discover OAuth credentials defined via environment variables.
 
         Supports two formats:
-        1. Single credential: ANTIGRAVITY_ACCESS_TOKEN + ANTIGRAVITY_REFRESH_TOKEN
-        2. Multiple credentials: ANTIGRAVITY_1_ACCESS_TOKEN + ANTIGRAVITY_1_REFRESH_TOKEN, etc.
+        1. Single credential: GEMINI_CLI_ACCESS_TOKEN + GEMINI_CLI_REFRESH_TOKEN
+        2. Multiple credentials: GEMINI_CLI_1_ACCESS_TOKEN + GEMINI_CLI_1_REFRESH_TOKEN, etc.
 
         Returns:
-            Dict mapping provider name to list of virtual paths (e.g., "env://antigravity/1")
+            Dict mapping provider name to list of virtual paths (e.g., "env://gemini_cli/1")
         """
         env_credentials: Dict[str, Set[str]] = {}
 
@@ -79,7 +73,7 @@ class CredentialManager:
             found_indices: Set[str] = set()
 
             # Check for numbered credentials (PROVIDER_N_ACCESS_TOKEN pattern)
-            # Pattern: ANTIGRAVITY_1_ACCESS_TOKEN, ANTIGRAVITY_2_ACCESS_TOKEN, etc.
+            # Pattern: GEMINI_CLI_1_ACCESS_TOKEN, GEMINI_CLI_2_ACCESS_TOKEN, etc.
             numbered_pattern = re.compile(rf"^{env_prefix}_(\d+)_ACCESS_TOKEN$")
 
             for key in self.env_vars.keys():

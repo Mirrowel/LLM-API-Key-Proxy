@@ -3,6 +3,12 @@
 
 # src/rotator_library/providers/antigravity_provider_v2.py
 """
+Retired Antigravity provider implementation.
+
+This module is archived for historical reference only. Antigravity is no longer
+registered, discovered, or exposed by the proxy. Do not import or rewire this
+module into active runtime paths unless Antigravity is deliberately un-retired.
+
 Antigravity Provider - Refactored Implementation
 
 A clean, well-structured provider for Google's Antigravity API, supporting:

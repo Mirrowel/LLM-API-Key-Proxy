@@ -63,9 +63,6 @@ def _ensure_providers_loaded():
 # OAuth provider display names mapping (no "(OAuth)" suffix - context makes it clear)
 OAUTH_FRIENDLY_NAMES = {
     "gemini_cli": "Gemini CLI",
-    "qwen_code": "Qwen Code",
-    "iflow": "iFlow",
-    "antigravity": "Antigravity",
 }
 
 
@@ -269,7 +266,7 @@ def _get_oauth_credentials_summary() -> dict:
         Example: {"gemini_cli": [{"email": "user@example.com", "tier": "free-tier", ...}, ...]}
     """
     provider_factory, _ = _ensure_providers_loaded()
-    oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity"]
+    oauth_providers = ["gemini_cli"]
     oauth_summary = {}
 
     for provider_name in oauth_providers:
@@ -508,7 +505,7 @@ def _display_provider_credentials(provider_name: str):
     Display all credentials for a specific OAuth provider.
 
     Args:
-        provider_name: The provider key (e.g., "gemini_cli", "qwen_code")
+        provider_name: The provider key (e.g., "gemini_cli")
     """
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -533,26 +530,19 @@ def _display_provider_credentials(provider_name: str):
     table.add_column("Email/Identifier", style="cyan")
 
     # Add tier/project columns for Google OAuth providers
-    if provider_name in ["gemini_cli", "antigravity"]:
+    if provider_name == "gemini_cli":
         table.add_column("Tier", style="green")
         table.add_column("Project", style="dim")
-    # Add type column for iFlow (OAuth vs Cookie)
-    elif provider_name == "iflow":
-        table.add_column("Type", style="magenta")
-
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
 
-        if provider_name in ["gemini_cli", "antigravity"]:
+        if provider_name == "gemini_cli":
             tier = cred.get("tier", "-")
             project = cred.get("project_id", "-")
             if project and len(project) > 20:
                 project = project[:17] + "..."
             table.add_row(str(i), file_name, email, tier or "-", project or "-")
-        elif provider_name == "iflow":
-            cred_type = cred.get("type", "oauth").capitalize()
-            table.add_row(str(i), file_name, email, cred_type)
         else:
             table.add_row(str(i), file_name, email)
 
@@ -565,7 +555,7 @@ async def _edit_oauth_credential_email(provider_name: str):
     Edit the email field of an OAuth credential.
 
     Args:
-        provider_name: The provider key (e.g., "qwen_code")
+        provider_name: The provider key (e.g., "gemini_cli")
     """
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -780,18 +770,14 @@ async def _view_oauth_credentials_detail(provider_name: str):
     table.add_column("Email/Identifier", style="cyan")
 
     # Add tier/project columns for Google OAuth providers
-    if provider_name in ["gemini_cli", "antigravity"]:
+    if provider_name == "gemini_cli":
         table.add_column("Tier", style="green")
         table.add_column("Project", style="dim")
-    # Add type column for iFlow (OAuth vs Cookie)
-    elif provider_name == "iflow":
-        table.add_column("Type", style="magenta")
-
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
 
-        if provider_name in ["gemini_cli", "antigravity"]:
+        if provider_name == "gemini_cli":
             tier = (
                 format_tier_for_display(cred.get("tier")) if cred.get("tier") else "-"
             )
@@ -799,9 +785,6 @@ async def _view_oauth_credentials_detail(provider_name: str):
             if project and len(project) > 25:
                 project = project[:22] + "..."
             table.add_row(str(i), file_name, email, tier, project or "-")
-        elif provider_name == "iflow":
-            cred_type = cred.get("type", "oauth").capitalize()
-            table.add_row(str(i), file_name, email, cred_type)
         else:
             table.add_row(str(i), file_name, email)
 
@@ -828,7 +811,7 @@ async def manage_credentials_submenu():
                     "[bold]Actions:[/bold]\n"
                     "1. Delete an API Key\n"
                     "2. Delete an OAuth Credential\n"
-                    "3. Edit OAuth Credential Email [dim](Qwen Code recommended)[/dim]"
+                    "3. Edit OAuth Credential Email"
                 ),
                 title="Choose action",
                 style="bold blue",
@@ -1049,8 +1032,7 @@ async def _edit_oauth_credential_menu():
         Panel(
             Text.from_markup(
                 "[bold yellow]Warning:[/bold yellow] Editing OAuth credentials is generally not recommended.\n"
-                "This is mainly useful for [bold]Qwen Code[/bold] where you manually enter an email identifier.\n\n"
-                "For Google OAuth providers (Gemini CLI, Antigravity), the email is automatically\n"
+                "For Gemini CLI OAuth credentials, the email is automatically\n"
                 "retrieved during authentication and changing it may cause confusion."
             ),
             style="yellow",
@@ -1065,10 +1047,7 @@ async def _edit_oauth_credential_menu():
     providers_with_creds = [(p, c) for p, c in oauth_summary.items() if c]
     for i, (provider, creds) in enumerate(providers_with_creds, 1):
         display_name = OAUTH_FRIENDLY_NAMES.get(provider, provider.title())
-        recommended = " [green](recommended)[/green]" if provider == "qwen_code" else ""
-        console.print(
-            f"  {i}. {display_name} ({len(creds)} credential(s)){recommended}"
-        )
+        console.print(f"  {i}. {display_name} ({len(creds)} credential(s))")
 
     provider_choice = Prompt.ask(
         Text.from_markup(
@@ -1211,9 +1190,6 @@ async def setup_api_key():
     # OAuth-only providers to exclude entirely from API key setup
     oauth_only_providers = {
         "gemini_cli",  # OAuth-only
-        "antigravity",  # OAuth-only
-        "qwen_code",  # OAuth is primary, don't advertise API key
-        "iflow",  # OAuth is primary
     }
 
     # Base classes to exclude
@@ -1729,52 +1705,12 @@ async def setup_new_credential(provider_name: str):
         # Build display name for better user experience
         oauth_friendly_names = {
             "gemini_cli": "Gemini CLI (OAuth)",
-            "qwen_code": "Qwen Code (OAuth - also supports API keys)",
-            "iflow": "iFlow",
-            "antigravity": "Antigravity (OAuth)",
         }
         display_name = oauth_friendly_names.get(
             provider_name, provider_name.replace("_", " ").title()
         )
 
-        # Special handling for iFlow - offer OAuth or Cookie authentication
-        if provider_name == "iflow":
-            console.print(
-                Panel(
-                    Text.from_markup(
-                        "[bold]Choose authentication method:[/bold]\n\n"
-                        "  [cyan]1.[/cyan] OAuth (Email login)\n"
-                        "     Opens browser for iFlow login\n"
-                        "     Token expires and needs periodic refresh\n\n"
-                        "  [cyan]2.[/cyan] Cookie [green](Recommended)[/green]\n"
-                        "     Paste session cookie from browser\n"
-                        "     More permanent, only API key expires"
-                    ),
-                    title="[bold blue]iFlow Authentication Method[/bold blue]",
-                    border_style="blue",
-                )
-            )
-
-            auth_choice = Prompt.ask(
-                "[bold]Select method[/bold] (or 'b' to go back)",
-                choices=["1", "2", "b"],
-                default="2",
-            )
-
-            if auth_choice.lower() == "b":
-                return
-
-            if auth_choice == "2":
-                # Cookie authentication
-                result = await auth_instance.setup_cookie_credential(
-                    _get_oauth_base_dir()
-                )
-            else:
-                # OAuth authentication
-                result = await auth_instance.setup_credential(_get_oauth_base_dir())
-        else:
-            # Other providers - use OAuth
-            result = await auth_instance.setup_credential(_get_oauth_base_dir())
+        result = await auth_instance.setup_credential(_get_oauth_base_dir())
 
         if not result.success:
             console.print(
@@ -1887,289 +1823,6 @@ async def export_gemini_cli_to_env():
 
             if env_path:
                 numbered_prefix = f"GEMINI_CLI_{cred_info['number']}"
-                success_text = Text.from_markup(
-                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
-                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
-                    f"[bold]To use this credential:[/bold]\n"
-                    f"1. Copy the contents to your main .env file, OR\n"
-                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n"
-                    f"3. Or on Windows: [bold cyan]Get-Content {Path(env_path).name} | ForEach-Object {{ $_ -replace '^([^#].*)$', 'set $1' }} | cmd[/bold cyan]\n\n"
-                    f"[bold]To combine multiple credentials:[/bold]\n"
-                    f"Copy lines from multiple .env files into one file.\n"
-                    f"Each credential uses a unique number ({numbered_prefix}_*)."
-                )
-                console.print(Panel(success_text, style="bold green", title="Success"))
-            else:
-                console.print(
-                    Panel(
-                        "Failed to export credential", style="bold red", title="Error"
-                    )
-                )
-        else:
-            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
-    except ValueError:
-        console.print(
-            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
-        )
-    except Exception as e:
-        console.print(
-            Panel(
-                f"An error occurred during export: {e}", style="bold red", title="Error"
-            )
-        )
-
-
-async def export_qwen_code_to_env():
-    """
-    Export a Qwen Code credential JSON file to .env format.
-    Uses the auth class's build_env_lines() and list_credentials() methods.
-    """
-    clear_screen("Export Qwen Code Credential")
-
-    # Get auth instance for this provider
-    provider_factory, _ = _ensure_providers_loaded()
-    auth_class = provider_factory.get_provider_auth_class("qwen_code")
-    auth_instance = auth_class()
-
-    # List available credentials using auth class
-    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
-
-    if not credentials:
-        console.print(
-            Panel(
-                "No Qwen Code credentials found. Please add one first using 'Add OAuth Credential'.",
-                style="bold red",
-                title="No Credentials",
-            )
-        )
-        return
-
-    # Display available credentials
-    cred_text = Text()
-    for i, cred_info in enumerate(credentials):
-        cred_text.append(
-            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
-        )
-
-    console.print(
-        Panel(
-            cred_text,
-            title="Available Qwen Code Credentials",
-            style="bold blue",
-        )
-    )
-
-    choice = Prompt.ask(
-        Text.from_markup(
-            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
-        ),
-        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
-        show_choices=False,
-    )
-
-    if choice.lower() == "b":
-        return
-
-    try:
-        choice_index = int(choice) - 1
-        if 0 <= choice_index < len(credentials):
-            cred_info = credentials[choice_index]
-
-            # Use auth class to export
-            env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], _get_oauth_base_dir()
-            )
-
-            if env_path:
-                numbered_prefix = f"QWEN_CODE_{cred_info['number']}"
-                success_text = Text.from_markup(
-                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
-                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
-                    f"[bold]To use this credential:[/bold]\n"
-                    f"1. Copy the contents to your main .env file, OR\n"
-                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n\n"
-                    f"[bold]To combine multiple credentials:[/bold]\n"
-                    f"Copy lines from multiple .env files into one file.\n"
-                    f"Each credential uses a unique number ({numbered_prefix}_*)."
-                )
-                console.print(Panel(success_text, style="bold green", title="Success"))
-            else:
-                console.print(
-                    Panel(
-                        "Failed to export credential", style="bold red", title="Error"
-                    )
-                )
-        else:
-            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
-    except ValueError:
-        console.print(
-            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
-        )
-    except Exception as e:
-        console.print(
-            Panel(
-                f"An error occurred during export: {e}", style="bold red", title="Error"
-            )
-        )
-
-
-async def export_iflow_to_env():
-    """
-    Export an iFlow credential JSON file to .env format.
-    Uses the auth class's build_env_lines() and list_credentials() methods.
-    """
-    clear_screen("Export iFlow Credential")
-
-    # Get auth instance for this provider
-    provider_factory, _ = _ensure_providers_loaded()
-    auth_class = provider_factory.get_provider_auth_class("iflow")
-    auth_instance = auth_class()
-
-    # List available credentials using auth class
-    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
-
-    if not credentials:
-        console.print(
-            Panel(
-                "No iFlow credentials found. Please add one first using 'Add OAuth Credential'.",
-                style="bold red",
-                title="No Credentials",
-            )
-        )
-        return
-
-    # Display available credentials
-    cred_text = Text()
-    for i, cred_info in enumerate(credentials):
-        cred_text.append(
-            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
-        )
-
-    console.print(
-        Panel(
-            cred_text,
-            title="Available iFlow Credentials",
-            style="bold blue",
-        )
-    )
-
-    choice = Prompt.ask(
-        Text.from_markup(
-            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
-        ),
-        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
-        show_choices=False,
-    )
-
-    if choice.lower() == "b":
-        return
-
-    try:
-        choice_index = int(choice) - 1
-        if 0 <= choice_index < len(credentials):
-            cred_info = credentials[choice_index]
-
-            # Use auth class to export
-            env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], _get_oauth_base_dir()
-            )
-
-            if env_path:
-                numbered_prefix = f"IFLOW_{cred_info['number']}"
-                success_text = Text.from_markup(
-                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
-                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
-                    f"[bold]To use this credential:[/bold]\n"
-                    f"1. Copy the contents to your main .env file, OR\n"
-                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n\n"
-                    f"[bold]To combine multiple credentials:[/bold]\n"
-                    f"Copy lines from multiple .env files into one file.\n"
-                    f"Each credential uses a unique number ({numbered_prefix}_*)."
-                )
-                console.print(Panel(success_text, style="bold green", title="Success"))
-            else:
-                console.print(
-                    Panel(
-                        "Failed to export credential", style="bold red", title="Error"
-                    )
-                )
-        else:
-            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
-    except ValueError:
-        console.print(
-            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
-        )
-    except Exception as e:
-        console.print(
-            Panel(
-                f"An error occurred during export: {e}", style="bold red", title="Error"
-            )
-        )
-
-
-async def export_antigravity_to_env():
-    """
-    Export an Antigravity credential JSON file to .env format.
-    Uses the auth class's build_env_lines() and list_credentials() methods.
-    """
-    clear_screen("Export Antigravity Credential")
-
-    # Get auth instance for this provider
-    provider_factory, _ = _ensure_providers_loaded()
-    auth_class = provider_factory.get_provider_auth_class("antigravity")
-    auth_instance = auth_class()
-
-    # List available credentials using auth class
-    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
-
-    if not credentials:
-        console.print(
-            Panel(
-                "No Antigravity credentials found. Please add one first using 'Add OAuth Credential'.",
-                style="bold red",
-                title="No Credentials",
-            )
-        )
-        return
-
-    # Display available credentials
-    cred_text = Text()
-    for i, cred_info in enumerate(credentials):
-        cred_text.append(
-            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
-        )
-
-    console.print(
-        Panel(
-            cred_text,
-            title="Available Antigravity Credentials",
-            style="bold blue",
-        )
-    )
-
-    choice = Prompt.ask(
-        Text.from_markup(
-            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
-        ),
-        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
-        show_choices=False,
-    )
-
-    if choice.lower() == "b":
-        return
-
-    try:
-        choice_index = int(choice) - 1
-        if 0 <= choice_index < len(credentials):
-            cred_info = credentials[choice_index]
-
-            # Use auth class to export
-            env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], _get_oauth_base_dir()
-            )
-
-            if env_path:
-                numbered_prefix = f"ANTIGRAVITY_{cred_info['number']}"
                 success_text = Text.from_markup(
                     f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
                     f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
@@ -2366,7 +2019,7 @@ async def combine_all_credentials():
     clear_screen("Combine All Credentials")
 
     # List of providers that support OAuth credentials
-    oauth_providers = ["gemini_cli", "qwen_code", "iflow", "antigravity"]
+    oauth_providers = ["gemini_cli"]
 
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -2468,22 +2121,13 @@ async def export_credentials_submenu():
                 Text.from_markup(
                     "[bold]Individual Exports:[/bold]\n"
                     "1. Export Gemini CLI credential\n"
-                    "2. Export Qwen Code credential\n"
-                    "3. Export iFlow credential\n"
-                    "4. Export Antigravity credential\n"
                     "\n"
                     "[bold]Bulk Exports (per provider):[/bold]\n"
-                    "5. Export ALL Gemini CLI credentials\n"
-                    "6. Export ALL Qwen Code credentials\n"
-                    "7. Export ALL iFlow credentials\n"
-                    "8. Export ALL Antigravity credentials\n"
+                    "2. Export ALL Gemini CLI credentials\n"
                     "\n"
                     "[bold]Combine Credentials:[/bold]\n"
-                    "9. Combine all Gemini CLI into one file\n"
-                    "10. Combine all Qwen Code into one file\n"
-                    "11. Combine all iFlow into one file\n"
-                    "12. Combine all Antigravity into one file\n"
-                    "13. Combine ALL providers into one file"
+                    "3. Combine all Gemini CLI into one file\n"
+                    "4. Combine ALL providers into one file"
                 ),
                 title="Choose export option",
                 style="bold blue",
@@ -2499,15 +2143,6 @@ async def export_credentials_submenu():
                 "2",
                 "3",
                 "4",
-                "5",
-                "6",
-                "7",
-                "8",
-                "9",
-                "10",
-                "11",
-                "12",
-                "13",
                 "b",
             ],
             show_choices=False,
@@ -2521,54 +2156,18 @@ async def export_credentials_submenu():
             await export_gemini_cli_to_env()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "2":
-            await export_qwen_code_to_env()
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "3":
-            await export_iflow_to_env()
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "4":
-            await export_antigravity_to_env()
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
         # Bulk exports (all credentials for a provider)
-        elif export_choice == "5":
+        elif export_choice == "2":
             await export_all_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "6":
-            await export_all_provider_credentials("qwen_code")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "7":
-            await export_all_provider_credentials("iflow")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "8":
-            await export_all_provider_credentials("antigravity")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
         # Combine per provider
-        elif export_choice == "9":
+        elif export_choice == "3":
             await combine_provider_credentials("gemini_cli")
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
-        elif export_choice == "10":
-            await combine_provider_credentials("qwen_code")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "11":
-            await combine_provider_credentials("iflow")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        elif export_choice == "12":
-            await combine_provider_credentials("antigravity")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
         # Combine all providers
-        elif export_choice == "13":
+        elif export_choice == "4":
             await combine_all_credentials()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()

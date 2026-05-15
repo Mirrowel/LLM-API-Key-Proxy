@@ -5,8 +5,7 @@
 """
 Shared utility functions and constants for Gemini-based providers.
 
-This module contains helper functions used by both GeminiCliProvider and
-AntigravityProvider, extracted to reduce code duplication.
+This module contains helper functions used by Gemini-based providers.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ GEMINI_CLI_ACCEPT_ENCODING = os.getenv(
     "GEMINI_CLI_ACCEPT_ENCODING", "gzip, deflate, br"
 )
 
-# Google Code Assist API endpoint (used by Gemini CLI and Antigravity providers)
+# Google Code Assist API endpoint used by Gemini CLI.
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal"
 
 # Gemini CLI endpoint fallback chain
@@ -65,33 +64,6 @@ GEMINI_CLI_ENDPOINT_FALLBACKS = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",  # Sandbox daily
     "https://cloudcode-pa.googleapis.com/v1internal",  # Production fallback
 ]
-
-# =============================================================================
-# ANTIGRAVITY ENDPOINTS
-# =============================================================================
-
-# Antigravity API endpoint constants
-# Sandbox endpoints often have different rate limits or newer features
-ANTIGRAVITY_ENDPOINT_DAILY = (
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal"
-)
-ANTIGRAVITY_ENDPOINT_PROD = "https://cloudcode-pa.googleapis.com/v1internal"
-# ANTIGRAVITY_ENDPOINT_AUTOPUSH = "https://autopush-cloudcode-pa.sandbox.googleapis.com/v1internal"  # Reserved for future use
-
-# Antigravity endpoint fallback chain for API requests
-# Order: sandbox daily -> production (matches CLIProxy/Vibeproxy behavior)
-ANTIGRAVITY_ENDPOINT_FALLBACKS = [
-    ANTIGRAVITY_ENDPOINT_DAILY,  # Daily sandbox first
-    ANTIGRAVITY_ENDPOINT_PROD,  # Production fallback
-]
-
-# Endpoint order for loadCodeAssist (project discovery)
-# Production first for better project resolution, then fallback to sandbox
-ANTIGRAVITY_LOAD_ENDPOINT_ORDER = [
-    ANTIGRAVITY_ENDPOINT_PROD,  # Prod first for discovery
-    ANTIGRAVITY_ENDPOINT_DAILY,  # Daily fallback
-]
-
 
 # =============================================================================
 # GEMINI 3 TOOL RENAMING CONSTANTS
@@ -270,7 +242,7 @@ def recursively_parse_json_strings(
         parse_json_objects: If False (default), don't parse JSON-looking strings into objects.
                            This prevents corrupting string content like write tool's "content" field.
                            If True, parse strings that look like JSON objects/arrays.
-        log_prefix: Prefix for log messages (e.g., "GeminiCli", "Antigravity")
+        log_prefix: Prefix for log messages (e.g., "GeminiCli")
 
     Additionally handles:
     - Malformed double-encoded JSON (extra trailing '}' or ']') - only when parse_json_objects=True
@@ -397,7 +369,7 @@ def recursively_parse_json_strings(
 # =============================================================================
 # TIER NAMING AND PRIORITY CONSTANTS
 # =============================================================================
-# Shared tier handling for Google/Gemini-based providers (Gemini CLI, Antigravity)
+# Shared tier handling for Google/Gemini-based providers.
 #
 # Canonical tier names are uppercase: ULTRA, PRO, FREE
 # API returns various formats: g1-pro-tier, standard-tier, free-tier, etc.
@@ -744,12 +716,12 @@ def build_project_tier_env_lines(
     """
     Build env lines for project_id and tier from credential metadata.
 
-    Used by Google OAuth providers (Gemini CLI, Antigravity) to generate
+    Used by Google OAuth providers to generate
     environment variable lines for project and tier information.
 
     Args:
         creds: Credential dict containing _proxy_metadata
-        env_prefix: Environment variable prefix (e.g., "GEMINI_CLI", "ANTIGRAVITY")
+        env_prefix: Environment variable prefix (e.g., "GEMINI_CLI")
         cred_number: Credential number for env var naming
 
     Returns:

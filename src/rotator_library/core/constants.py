@@ -61,7 +61,7 @@ ENV_PREFIX_QUOTA_GROUPS = "QUOTA_GROUPS_"
 
 # Provider-specific providers that use request_count instead of success_count
 # for credential selection (because failed requests also consume quota)
-REQUEST_COUNT_PROVIDERS = frozenset({"antigravity", "gemini_cli", "chutes", "nanogpt"})
+REQUEST_COUNT_PROVIDERS = frozenset({"gemini_cli", "chutes", "nanogpt"})
 
 # Usage manager storage
 USAGE_FILE_NAME = "usage.json"  # New format

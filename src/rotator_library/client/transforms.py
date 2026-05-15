@@ -7,10 +7,8 @@ Provider-specific request transformations.
 This module isolates all provider-specific request mutations that were
 scattered throughout client.py, including:
 - gemma-3 system message conversion
-- qwen_code provider remapping
 - Gemini safety settings and thinking parameter
 - NVIDIA thinking parameter
-- iflow stream_options removal
 - dedaluslabs tool_choice=auto removal
 
 Transforms are applied in a defined order with logging of modifications.
@@ -27,7 +25,7 @@ class ProviderTransforms:
     Centralized provider-specific request transformations.
 
     Transforms are applied in order:
-    1. Built-in transforms (gemma-3, qwen_code, etc.)
+    1. Built-in transforms (gemma-3, etc.)
     2. Provider hook transforms (from provider plugins)
     3. Safety settings conversions
     """
@@ -57,10 +55,8 @@ class ProviderTransforms:
         # Each provider can have multiple transform functions
         self._transforms: Dict[str, List[Callable]] = {
             "gemma": [self._transform_gemma_system_messages],
-            "qwen_code": [self._transform_qwen_code_provider],
             "gemini": [self._transform_gemini_safety, self._transform_gemini_thinking],
             "nvidia_nim": [self._transform_nvidia_thinking],
-            "iflow": [self._transform_iflow_stream_options],
             "dedaluslabs": [self._transform_dedaluslabs_tool_choice],
             "mistral": [self._transform_mistral_thinking],
         }
@@ -212,26 +208,6 @@ class ProviderTransforms:
             return "gemma-3: converted system->user messages"
         return None
 
-    def _transform_qwen_code_provider(
-        self,
-        kwargs: Dict[str, Any],
-        model: str,
-        provider: str,
-    ) -> Optional[str]:
-        """
-        Remap qwen_code to qwen provider for LiteLLM.
-
-        The qwen_code provider is a custom wrapper that needs to be
-        translated to the qwen provider for LiteLLM compatibility.
-        """
-        if provider != "qwen_code":
-            return None
-
-        kwargs["custom_llm_provider"] = "qwen"
-        if "/" in model:
-            kwargs["model"] = model.split("/", 1)[1]
-        return "qwen_code: remapped to qwen provider"
-
     def _transform_gemini_safety(
         self,
         kwargs: Dict[str, Any],
@@ -301,25 +277,6 @@ class ProviderTransforms:
         if plugin and hasattr(plugin, "handle_thinking_parameter"):
             plugin.handle_thinking_parameter(kwargs, model)
             return "mistral: handled thinking parameter"
-        return None
-
-    def _transform_iflow_stream_options(
-        self,
-        kwargs: Dict[str, Any],
-        model: str,
-        provider: str,
-    ) -> Optional[str]:
-        """
-        Remove stream_options for iflow provider.
-
-        The iflow provider returns HTTP 406 if stream_options is present.
-        """
-        if provider != "iflow":
-            return None
-
-        if "stream_options" in kwargs:
-            del kwargs["stream_options"]
-            return "iflow: removed stream_options"
         return None
 
     def _transform_dedaluslabs_tool_choice(

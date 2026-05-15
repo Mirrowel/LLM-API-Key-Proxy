@@ -75,7 +75,7 @@ class GoogleOAuthBase:
         - CLIENT_ID: OAuth client ID
         - CLIENT_SECRET: OAuth client secret
         - OAUTH_SCOPES: List of OAuth scopes
-        - ENV_PREFIX: Prefix for environment variables (e.g., "GEMINI_CLI", "ANTIGRAVITY")
+        - ENV_PREFIX: Prefix for environment variables (e.g., "GEMINI_CLI")
 
     Subclasses may optionally override:
         - CALLBACK_PORT: Local OAuth callback server port (default: 8085)
@@ -1280,7 +1280,7 @@ class GoogleOAuthBase:
         Persist project ID and tier to the credential file for faster future startups.
 
         This is a shared implementation for Google Cloud OAuth providers that need
-        to cache project and tier information (e.g., Gemini CLI, Antigravity).
+        to cache project and tier information (e.g., Gemini CLI).
 
         Args:
             credential_path: Path to the credential file
