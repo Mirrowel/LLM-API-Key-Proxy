@@ -42,6 +42,7 @@ from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .executor import RequestExecutor
 from .anthropic import AnthropicHandler
+from ..session_tracking import SessionTracker
 
 # Import providers and other dependencies
 from ..providers import PROVIDER_PLUGINS
@@ -100,6 +101,8 @@ class RotatingClient:
         ] = None,
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
+        session_stickiness_ttl_seconds: int = 3600,
+        session_persistence_enabled: bool = False,
     ):
         """
         Initialize the RotatingClient.
@@ -208,6 +211,11 @@ class RotatingClient:
         self.model_definitions = ModelDefinitions()
         self.provider_config = LiteLLMProviderConfig()
         self.http_client = httpx.AsyncClient()
+        self._session_tracker = SessionTracker(
+            ttl_seconds=session_stickiness_ttl_seconds,
+            persist_to_disk=session_persistence_enabled,
+            persistence_path=self.data_dir / "session_stickiness.json",
+        )
 
         # Initialize extracted components
         self._credential_filter = CredentialFilter(
@@ -400,6 +408,8 @@ class RotatingClient:
             )
             transaction_logger.log_request(kwargs)
 
+        session_id = self._session_tracker.infer_session_id(kwargs)
+
         # Build request context
         context = RequestContext(
             model=resolved_model,
@@ -408,6 +418,7 @@ class RotatingClient:
             streaming=kwargs.get("stream", False),
             credentials=self.all_credentials.get(provider, []),
             deadline=time.time() + self.global_timeout,
+            session_id=session_id,
             request=request,
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,

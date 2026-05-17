@@ -367,6 +367,7 @@ class UsageManager:
         self,
         model: str,
         quota_group: Optional[str] = None,
+        session_id: Optional[str] = None,
         exclude: Optional[Set[str]] = None,
         candidates: Optional[List[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
@@ -438,10 +439,74 @@ class UsageManager:
                 self._key_locks[stable_id] = asyncio.Lock()
 
         # Main acquisition loop - continues until deadline
+        sticky_wait_started_at: Optional[float] = None
+        sticky_wait_timed_out = False
+        sticky_wait_limit = 15.0
+        sticky_id: Optional[str] = None
         while time.time() < deadline:
             async with self._acquire_lock:
                 if time.time() >= deadline:
                     break
+
+                sticky_id = None
+                sticky_scope = normalized_model if session_id else (quota_group or normalized_model)
+                if self._config.rotation_mode == RotationMode.SEQUENTIAL:
+                    sticky_id = self._selection.sequential_strategy.get_current(
+                        self.provider,
+                        sticky_scope,
+                        session_id if session_id else None,
+                    )
+
+                sticky_state = self._states.get(sticky_id) if sticky_id else None
+                sticky_blocked_concurrently = False
+                if sticky_state:
+                    limit_result = self._limits.check_all(
+                        sticky_state, normalized_model, quota_group
+                    )
+                    sticky_blocked_concurrently = (
+                        not limit_result.allowed
+                        and limit_result.result == LimitResult.BLOCKED_CONCURRENT
+                    )
+                    if (
+                        not sticky_blocked_concurrently
+                        and sticky_id in states_to_check
+                        and sticky_id not in exclude_ids
+                    ):
+                        # Sticky credential is available or blocked for a non-concurrency reason.
+                        pass
+                    else:
+                        sticky_state = None
+
+                if sticky_state and sticky_blocked_concurrently:
+                    if sticky_wait_started_at is None:
+                        sticky_wait_started_at = time.time()
+
+                    sticky_wait_remaining = sticky_wait_limit - (
+                        time.time() - sticky_wait_started_at
+                    )
+                    remaining_budget = deadline - time.time()
+                    if sticky_wait_remaining > 0 and remaining_budget > 0:
+                        condition = self._key_conditions.get(sticky_id)
+                        wait_for = min(1.0, sticky_wait_remaining, remaining_budget)
+                        if condition:
+                            try:
+                                async with condition:
+                                    await asyncio.wait_for(condition.wait(), timeout=wait_for)
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(min(wait_for, 0.1))
+                        continue
+
+                    sticky_wait_timed_out = True
+
+                selection_exclude_ids = set(exclude_ids)
+                if sticky_wait_timed_out and sticky_id:
+                    # After the bounded wait expires, rotate away from the bound
+                    # credential. Direct session-to-credential binding would hold
+                    # the concurrency slot itself, but that is intentionally not
+                    # implemented yet.
+                    selection_exclude_ids.add(sticky_id)
 
                 # Select and increment as one short critical section so the
                 # soft optimal capacity phase observes each in-flight acquire.
@@ -450,7 +515,8 @@ class UsageManager:
                     model=normalized_model,
                     states=states_to_check,
                     quota_group=quota_group,
-                    exclude=exclude_ids,
+                    session_id=session_id,
+                    exclude=selection_exclude_ids,
                     priorities=priority_overrides,
                     deadline=deadline,
                 )
@@ -483,6 +549,8 @@ class UsageManager:
 
             for sid, state in states_to_check.items():
                 if sid in exclude_ids:
+                    continue
+                if sticky_wait_timed_out and sticky_id and sid == sticky_id:
                     continue
                 if (
                     state.max_concurrent > 0
@@ -615,6 +683,7 @@ class UsageManager:
             model=normalized_model,
             states=self._get_active_states(),
             quota_group=quota_group,
+            session_id=None,
             exclude=exclude_ids,
             deadline=deadline,
         )

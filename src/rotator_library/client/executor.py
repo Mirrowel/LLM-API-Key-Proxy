@@ -578,6 +578,7 @@ class RequestExecutor:
                 async with await usage_manager.acquire_credential(
                     model=model,
                     quota_group=quota_group,
+                    session_id=context.session_id,
                     candidates=untried,
                     priorities=filter_result.priorities,
                     deadline=deadline,
@@ -790,6 +791,7 @@ class RequestExecutor:
                     async with await usage_manager.acquire_credential(
                         model=model,
                         quota_group=quota_group,
+                        session_id=context.session_id,
                         candidates=untried,
                         priorities=filter_result.priorities,
                         deadline=deadline,

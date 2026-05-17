@@ -76,6 +76,7 @@ class RequestContext:
     streaming: bool
     credentials: List[str]
     deadline: float
+    session_id: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None

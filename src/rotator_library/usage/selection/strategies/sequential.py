@@ -38,7 +38,7 @@ class SequentialStrategy:
                 when not explicitly configured
         """
         self.fallback_multiplier = fallback_multiplier
-        # Track current "sticky" credential per (provider, model_group)
+        # Track current "sticky" credential per model session or model-group fallback.
         self._current: Dict[tuple, str] = {}
 
     @property
@@ -73,7 +73,8 @@ class SequentialStrategy:
         if len(context.candidates) == 1:
             return context.candidates[0]
 
-        key = (context.provider, context.quota_group or context.model)
+        scope = context.model if context.session_id else (context.quota_group or context.model)
+        key = (context.provider, scope, context.session_id or "__default__")
 
         # Check if current sticky credential is still available
         current = self._current.get(key)
@@ -108,15 +109,22 @@ class SequentialStrategy:
             provider: Provider name
             model_or_group: Model or quota group
         """
-        key = (provider, model_or_group)
-        if key in self._current:
+        keys_to_remove = [
+            key for key in self._current if key[0] == provider and key[1] == model_or_group
+        ]
+        for key in keys_to_remove:
             old = self._current[key]
             del self._current[key]
             lib_logger.debug(
                 f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
             )
 
-    def get_current(self, provider: str, model_or_group: str) -> Optional[str]:
+    def get_current(
+        self,
+        provider: str,
+        model_or_group: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Get the currently sticky credential.
 
@@ -127,7 +135,7 @@ class SequentialStrategy:
         Returns:
             Current sticky credential stable_id, or None
         """
-        key = (provider, model_or_group)
+        key = (provider, model_or_group, session_id or "__default__")
         return self._current.get(key)
 
     def _select_by_priority(

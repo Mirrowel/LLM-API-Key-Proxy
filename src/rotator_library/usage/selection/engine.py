@@ -70,6 +70,7 @@ class SelectionEngine:
         model: str,
         states: Dict[str, CredentialState],
         quota_group: Optional[str] = None,
+        session_id: Optional[str] = None,
         exclude: Optional[Set[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
         deadline: float = 0.0,
@@ -119,13 +120,14 @@ class SelectionEngine:
                 if reset_performed:
                     # Retry selection after reset
                     return self.select(
-                        provider,
-                        model,
-                        states,
-                        quota_group,
-                        exclude,
-                        priorities,
-                        deadline,
+                        provider=provider,
+                        model=model,
+                        states=states,
+                        quota_group=quota_group,
+                        session_id=session_id,
+                        exclude=exclude,
+                        priorities=priorities,
+                        deadline=deadline,
                     )
 
             lib_logger.debug(
@@ -162,6 +164,7 @@ class SelectionEngine:
             provider=provider,
             model=model,
             quota_group=quota_group,
+            session_id=session_id,
             candidates=strategy_candidates,
             priorities=priorities,
             usage_counts=usage_counts,
@@ -188,6 +191,7 @@ class SelectionEngine:
         model: str,
         states: Dict[str, CredentialState],
         quota_group: Optional[str] = None,
+        session_id: Optional[str] = None,
         tried: Optional[Set[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
         deadline: float = 0.0,
@@ -214,6 +218,7 @@ class SelectionEngine:
             model=model,
             states=states,
             quota_group=quota_group,
+            session_id=session_id,
             exclude=tried,
             priorities=priorities,
             deadline=deadline,

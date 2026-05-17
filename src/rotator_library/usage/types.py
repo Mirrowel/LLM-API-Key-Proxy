@@ -423,6 +423,7 @@ class SelectionContext:
     rotation_mode: RotationMode
     rotation_tolerance: float
     deadline: float
+    session_id: Optional[str] = None
 
 
 @dataclass
