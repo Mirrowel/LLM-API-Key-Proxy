@@ -55,6 +55,9 @@ from ..core.errors import (
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
+    DEFAULT_TRANSIENT_RETRY_DELAY,
+    DEFAULT_TRANSIENT_RETRY_JITTER,
+    DEFAULT_STREAM_RETRY_ON_REASONING_ONLY,
 )
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
@@ -64,6 +67,7 @@ from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
+from .stream_retry_policy import can_retry_stream_after_error
 
 if TYPE_CHECKING:
     from ..usage import UsageManager
@@ -132,6 +136,50 @@ class RequestExecutor:
         self._litellm_logger_fn = litellm_logger_fn
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
+
+    def _get_transient_retry_delay(self) -> float:
+        """Small jittered delay used before transient retries and rotations."""
+        try:
+            base = float(
+                os.environ.get("TRANSIENT_RETRY_DELAY", DEFAULT_TRANSIENT_RETRY_DELAY)
+            )
+        except (TypeError, ValueError):
+            base = DEFAULT_TRANSIENT_RETRY_DELAY
+        try:
+            jitter = float(
+                os.environ.get("TRANSIENT_RETRY_JITTER", DEFAULT_TRANSIENT_RETRY_JITTER)
+            )
+        except (TypeError, ValueError):
+            jitter = DEFAULT_TRANSIENT_RETRY_JITTER
+        return max(0.0, base) + random.uniform(0.0, max(0.0, jitter))
+
+    def _is_transient_error(self, classified: ClassifiedError) -> bool:
+        return classified.error_type in {"server_error", "api_connection", "rate_limit"}
+
+    def _stream_retry_on_reasoning_only_enabled(self) -> bool:
+        value = os.environ.get("STREAM_RETRY_ON_REASONING_ONLY")
+        if value is None:
+            return DEFAULT_STREAM_RETRY_ON_REASONING_ONLY
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    async def _sleep_before_transient_action(
+        self,
+        delay: float,
+        deadline: float,
+        reason: str,
+    ) -> bool:
+        """Sleep if the request deadline has enough budget left."""
+        if delay <= 0:
+            return True
+        remaining = deadline - time.time()
+        if delay > remaining:
+            lib_logger.info(
+                f"Skipping {reason} delay ({delay:.1f}s); only {remaining:.1f}s left"
+            )
+            return False
+        lib_logger.info(f"Waiting {delay:.1f}s before {reason}")
+        await asyncio.sleep(delay)
+        return True
 
     def _get_plugin_instance(self, provider: str) -> Optional[Any]:
         """Get or create a plugin instance for a provider."""
@@ -783,6 +831,8 @@ class RequestExecutor:
 
                             # Execute request with retries
                             for attempt in range(self._max_retries):
+                                last_streamed_chunk: Optional[str] = None
+
                                 try:
                                     lib_logger.info(
                                         f"Attempting stream with credential {mask_credential(cred)} "
@@ -832,9 +882,11 @@ class RequestExecutor:
                                             context.transaction_logger,
                                             context.kwargs,
                                         ):
+                                            last_streamed_chunk = chunk
                                             yield chunk
                                     else:
                                         async for chunk in base_stream:
+                                            last_streamed_chunk = chunk
                                             yield chunk
                                     return
 
@@ -878,7 +930,50 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
+                                    if not can_retry_stream_after_error(
+                                        last_streamed_chunk,
+                                        self._stream_retry_on_reasoning_only_enabled(),
+                                    ):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {
+                                            "error": {
+                                                "message": "Upstream stream failed after output began",
+                                                "type": classified.error_type,
+                                            }
+                                        }
+                                        yield f"data: {json.dumps(error_data)}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        return
+
+                                    small_cooldown_threshold = int(
+                                        os.environ.get(
+                                            "SMALL_COOLDOWN_RETRY_THRESHOLD",
+                                            DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
+                                        )
+                                    )
+                                    if (
+                                        should_retry_same_key(
+                                            classified, small_cooldown_threshold
+                                        )
+                                        and attempt < self._max_retries - 1
+                                    ):
+                                        wait_time = (
+                                            classified.retry_after
+                                            if classified.retry_after is not None
+                                            else self._get_transient_retry_delay()
+                                        )
+                                        if await self._sleep_before_transient_action(
+                                            wait_time, deadline, "stream retry"
+                                        ):
+                                            continue
+
                                     cred_context.mark_failure(classified)
+                                    if self._is_transient_error(classified):
+                                        await self._sleep_before_transient_action(
+                                            self._get_transient_retry_delay(),
+                                            deadline,
+                                            "credential rotation",
+                                        )
                                     break  # Rotate
 
                                 except (RateLimitError, httpx.HTTPStatusError) as e:
@@ -944,6 +1039,12 @@ class RequestExecutor:
                                             continue  # Retry same key
 
                                     cred_context.mark_failure(classified)
+                                    if self._is_transient_error(classified):
+                                        await self._sleep_before_transient_action(
+                                            self._get_transient_retry_delay(),
+                                            deadline,
+                                            "credential rotation",
+                                        )
                                     break  # Rotate
 
                                 except (
@@ -966,17 +1067,24 @@ class RequestExecutor:
                                             cred, classified, str(e)[:150]
                                         )
                                         cred_context.mark_failure(classified)
+                                        await self._sleep_before_transient_action(
+                                            self._get_transient_retry_delay(),
+                                            deadline,
+                                            "credential rotation",
+                                        )
                                         break  # Rotate
 
                                     # Calculate wait time
-                                    wait_time = classified.retry_after or (
-                                        2**attempt
-                                    ) + random.uniform(0, 1)
-                                    remaining = deadline - time.time()
-                                    if wait_time > remaining:
+                                    wait_time = (
+                                        classified.retry_after
+                                        if classified.retry_after is not None
+                                        else self._get_transient_retry_delay()
+                                    )
+                                    if not await self._sleep_before_transient_action(
+                                        wait_time, deadline, "stream retry"
+                                    ):
                                         break  # No time to wait
 
-                                    await asyncio.sleep(wait_time)
                                     continue  # Retry
 
                                 except Exception as e:
@@ -997,7 +1105,35 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
+                                    small_cooldown_threshold = int(
+                                        os.environ.get(
+                                            "SMALL_COOLDOWN_RETRY_THRESHOLD",
+                                            DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
+                                        )
+                                    )
+                                    if (
+                                        should_retry_same_key(
+                                            classified, small_cooldown_threshold
+                                        )
+                                        and attempt < self._max_retries - 1
+                                    ):
+                                        wait_time = (
+                                            classified.retry_after
+                                            if classified.retry_after is not None
+                                            else self._get_transient_retry_delay()
+                                        )
+                                        if await self._sleep_before_transient_action(
+                                            wait_time, deadline, "stream retry"
+                                        ):
+                                            continue
+
                                     cred_context.mark_failure(classified)
+                                    if self._is_transient_error(classified):
+                                        await self._sleep_before_transient_action(
+                                            self._get_transient_retry_delay(),
+                                            deadline,
+                                            "credential rotation",
+                                        )
                                     break  # Rotate
 
                         except PreRequestCallbackError:
@@ -1154,7 +1290,11 @@ class RequestExecutor:
             should_retry_same_key(classified, small_cooldown_threshold)
             and attempt < self._max_retries - 1
         ):
-            wait_time = classified.retry_after or (2**attempt) + random.uniform(0, 1)
+            wait_time = (
+                classified.retry_after
+                if classified.retry_after is not None
+                else self._get_transient_retry_delay()
+            )
             retry_reason = (
                 f" (small cooldown {classified.retry_after}s < {small_cooldown_threshold}s threshold)"
                 if is_small_cooldown
@@ -1169,6 +1309,12 @@ class RequestExecutor:
         # Record error and rotate
         error_accumulator.record_error(credential, classified, error_message)
         cred_context.mark_failure(classified)
+        if self._is_transient_error(classified):
+            wait_time = self._get_transient_retry_delay()
+            lib_logger.info(
+                f"Waiting {wait_time:.1f}s before rotating from {mask_credential(credential)}"
+            )
+            await asyncio.sleep(wait_time)
         lib_logger.info(
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )

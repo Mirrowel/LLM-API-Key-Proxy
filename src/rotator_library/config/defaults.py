@@ -154,3 +154,18 @@ COOLDOWN_RATE_LIMIT_DEFAULT: int = 60
 # short rate limits (e.g., 2-3 second capacity bursts).
 # Override: SMALL_COOLDOWN_RETRY_THRESHOLD=<seconds>
 DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD: int = 10  # 10 seconds
+
+# =============================================================================
+# TRANSIENT RETRY PACING
+# =============================================================================
+# Short delay before retrying transient failures or rotating to another key.
+# This prevents bursts from immediately replaying the same provider-side 5xx.
+# Override: TRANSIENT_RETRY_DELAY=<seconds>, TRANSIENT_RETRY_JITTER=<seconds>
+DEFAULT_TRANSIENT_RETRY_DELAY: float = 1.0
+DEFAULT_TRANSIENT_RETRY_JITTER: float = 0.5
+
+# Allow retry/rotation after a stream error only when the last emitted chunk was
+# clearly reasoning-only. Off by default because replaying streamed output can
+# duplicate or diverge for consumers that already received content.
+# Override: STREAM_RETRY_ON_REASONING_ONLY=true
+DEFAULT_STREAM_RETRY_ON_REASONING_ONLY: bool = False

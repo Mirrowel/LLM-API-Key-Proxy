@@ -756,6 +756,42 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     Returns:
         ClassifiedError with error_type, status_code, retry_after, etc.
     """
+    if isinstance(e, dict):
+        payload = e.get("error", e)
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            status = str(payload.get("status", "")).upper()
+            try:
+                status_code = int(code) if code is not None else None
+            except (TypeError, ValueError):
+                status_code = None
+            if (status_code is not None and status_code >= 500) or status in {
+                "INTERNAL",
+                "UNAVAILABLE",
+            }:
+                return ClassifiedError(
+                    error_type="server_error",
+                    original_exception=e,
+                    status_code=status_code or 503,
+                )
+
+    error_text = str(e)
+    error_type_name = type(e).__name__
+    if (
+        "MidStreamFallbackError" in error_type_name
+        or "MidStreamFallbackError" in error_text
+    ) and (
+        "InternalServerError" in error_text
+        or "HTTPStatusError" in error_text
+        or '"code":500' in error_text.replace(" ", "")
+        or "status INTERNAL" in error_text
+    ):
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=500,
+        )
+
     # Try provider-specific parsing first for 429/rate limit errors
     if provider:
         try:
@@ -925,13 +961,11 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 except Exception:
                     pass
 
-            # Apply default 30s cooldown for all server errors
-            # This prevents rapid retries against overloaded/erroring servers
+            # Let the executor apply request-scoped retry pacing for transient 5xx.
             return ClassifiedError(
                 error_type="server_error",
                 original_exception=e,
                 status_code=status_code,
-                retry_after=30,  # Default 30s cooldown for server errors
             )
 
     if isinstance(
@@ -963,7 +997,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
-            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     if isinstance(e, TransientQuotaError):
@@ -973,7 +1006,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=503,
-            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     if isinstance(e, RateLimitError):
@@ -1039,7 +1071,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type="server_error",
             original_exception=e,
             status_code=status_code or 503,
-            retry_after=30,  # Default 30s cooldown for server errors
         )
 
     # Fallback for any other unclassified errors

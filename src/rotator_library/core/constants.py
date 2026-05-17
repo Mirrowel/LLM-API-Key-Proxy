@@ -41,6 +41,9 @@ from ..config import (
     COOLDOWN_RATE_LIMIT_DEFAULT,
     # Small Cooldown Auto-Retry
     DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD,
+    DEFAULT_TRANSIENT_RETRY_DELAY,
+    DEFAULT_TRANSIENT_RETRY_JITTER,
+    DEFAULT_STREAM_RETRY_ON_REASONING_ONLY,
 )
 
 # =============================================================================
@@ -101,6 +104,9 @@ __all__ = [
     "COOLDOWN_RATE_LIMIT_DEFAULT",
     # Small Cooldown Auto-Retry
     "DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD",
+    "DEFAULT_TRANSIENT_RETRY_DELAY",
+    "DEFAULT_TRANSIENT_RETRY_JITTER",
+    "DEFAULT_STREAM_RETRY_ON_REASONING_ONLY",
     # Environment variable prefixes
     "ENV_PREFIX_ROTATION_MODE",
     "ENV_PREFIX_FAIR_CYCLE",
