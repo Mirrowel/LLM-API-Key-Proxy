@@ -749,6 +749,19 @@ def load_provider_usage_config(
     # Apply environment variable overrides
     provider_upper = provider.upper()
 
+    def _parse_concurrency_env(var_name: str) -> Optional[int]:
+        raw_value = os.getenv(var_name)
+        if raw_value is None:
+            return None
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            lib_logger.warning(
+                f"Invalid {var_name}='{raw_value}'. Expected integer; ignoring."
+            )
+            return None
+        return -1 if parsed <= 0 else parsed
+
     # Rotation mode from env
     env_mode = os.getenv(f"ROTATION_MODE_{provider_upper}")
     if env_mode:
@@ -769,49 +782,33 @@ def load_provider_usage_config(
         except ValueError:
             pass
 
-    env_optimal = os.getenv(f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}")
-    if env_optimal:
-        try:
-            parsed_optimal = int(env_optimal)
-            config.optimal_concurrent_per_key = (
-                -1 if parsed_optimal <= 0 else parsed_optimal
-            )
-        except ValueError:
-            pass
+    provider_optimal_var = f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}"
+    parsed_provider_optimal = _parse_concurrency_env(provider_optimal_var)
+    if parsed_provider_optimal is not None:
+        config.optimal_concurrent_per_key = parsed_provider_optimal
+        for mode in ("balanced", "sequential"):
+            config.optimal_concurrent_per_key_by_mode[mode] = parsed_provider_optimal
 
-    env_max = os.getenv(f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}")
-    if env_max:
-        try:
-            parsed_max = int(env_max)
-            config.max_concurrent_per_key = -1 if parsed_max <= 0 else parsed_max
-        except ValueError:
-            pass
+    provider_max_var = f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}"
+    parsed_provider_max = _parse_concurrency_env(provider_max_var)
+    if parsed_provider_max is not None:
+        config.max_concurrent_per_key = parsed_provider_max
+        for mode in ("balanced", "sequential"):
+            config.max_concurrent_per_key_by_mode[mode] = parsed_provider_max
 
     for mode in ("balanced", "sequential"):
         suffix = mode.upper()
-        env_mode_optimal = os.getenv(
+        parsed_mode_optimal = _parse_concurrency_env(
             f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}_{suffix}"
         )
-        if env_mode_optimal:
-            try:
-                parsed = int(env_mode_optimal)
-                config.optimal_concurrent_per_key_by_mode[mode] = (
-                    -1 if parsed <= 0 else parsed
-                )
-            except ValueError:
-                pass
+        if parsed_mode_optimal is not None:
+            config.optimal_concurrent_per_key_by_mode[mode] = parsed_mode_optimal
 
-        env_mode_max = os.getenv(
+        parsed_mode_max = _parse_concurrency_env(
             f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}_{suffix}"
         )
-        if env_mode_max:
-            try:
-                parsed = int(env_mode_max)
-                config.max_concurrent_per_key_by_mode[mode] = (
-                    -1 if parsed <= 0 else parsed
-                )
-            except ValueError:
-                pass
+        if parsed_mode_max is not None:
+            config.max_concurrent_per_key_by_mode[mode] = parsed_mode_max
 
     # Fair cycle enabled from env
     env_fc = os.getenv(f"FAIR_CYCLE_{provider_upper}")
