@@ -28,7 +28,10 @@ from ..types import (
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 from ...error_handler import mask_credential
-from ...core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
+from ...core.constants import (
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -429,6 +432,16 @@ class UsageStorage:
             if max_concurrent <= 0:
                 max_concurrent = -1
 
+            raw_optimal_concurrent = data.get(
+                "optimal_concurrent", DEFAULT_OPTIMAL_CONCURRENT_PER_KEY
+            )
+            try:
+                optimal_concurrent = int(raw_optimal_concurrent)
+            except (TypeError, ValueError):
+                optimal_concurrent = DEFAULT_OPTIMAL_CONCURRENT_PER_KEY
+            if optimal_concurrent <= 0:
+                optimal_concurrent = -1
+
             return CredentialState(
                 stable_id=stable_id,
                 provider=data.get("provider", "unknown"),
@@ -442,6 +455,7 @@ class UsageStorage:
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
                 active_requests=0,  # Always starts at 0
+                optimal_concurrent=optimal_concurrent,
                 max_concurrent=max_concurrent,
                 created_at=data.get("created_at"),
                 last_updated=data.get("last_updated"),
@@ -499,6 +513,7 @@ class UsageStorage:
             "totals": self._serialize_total_stats(state.totals),
             "cooldowns": cooldowns,
             "fair_cycle": fair_cycle,
+            "optimal_concurrent": state.optimal_concurrent,
             "max_concurrent": state.max_concurrent,
             "created_at": state.created_at,
             "created_at_human": _format_timestamp(state.created_at),

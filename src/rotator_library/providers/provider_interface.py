@@ -48,7 +48,6 @@ class SingletonABCMeta(ABCMeta):
 
 
 from ..config import (
-    DEFAULT_MAX_CONCURRENT_PER_KEY,
     DEFAULT_ROTATION_MODE,
     DEFAULT_TIER_PRIORITY,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
@@ -110,9 +109,27 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     default_rotation_mode: str = DEFAULT_ROTATION_MODE
 
     # Default maximum concurrent requests per credential for this provider.
-    # Values <= 0 mean unlimited. Providers can use this to opt out of the
-    # global default of one in-flight request per key.
-    default_max_concurrent_per_key: int = DEFAULT_MAX_CONCURRENT_PER_KEY
+    # None means use the rotation-mode default. Values <= 0 mean unlimited.
+    default_max_concurrent_per_key: Optional[int] = None
+
+    # Mode-specific hard concurrency defaults. None means use the generic
+    # provider default above, then the global mode default.
+    default_max_concurrent_per_key_balanced: Optional[int] = None
+    default_max_concurrent_per_key_sequential: Optional[int] = None
+
+    # Default optimal concurrent requests per credential for this provider.
+    # None means use the rotation-mode default. Values <= 0 mean no soft target.
+    default_optimal_concurrent_per_key: Optional[int] = None
+
+    # Mode-specific soft concurrency defaults. None means use the generic
+    # provider default above, then the global mode default.
+    default_optimal_concurrent_per_key_balanced: Optional[int] = None
+    default_optimal_concurrent_per_key_sequential: Optional[int] = None
+
+    # Priority multipliers to apply to optimal_concurrent. Kept separate from
+    # legacy max multipliers so generic providers do not inherit hard-cap tuning
+    # as a soft rotation preference unless they opt in.
+    default_optimal_priority_multipliers: Dict[int, int] = {}
 
     # =========================================================================
     # TIER CONFIGURATION - Override in subclass

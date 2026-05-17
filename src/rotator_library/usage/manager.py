@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from ..core.types import CredentialInfo, RequestCompleteResult
-from ..core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
 from ..error_handler import ClassifiedError, classify_error, mask_credential
 
 from .types import (
@@ -180,6 +179,7 @@ class UsageManager:
         provider_plugins: Optional[Dict[str, Any]] = None,
         config: Optional[ProviderUsageConfig] = None,
         max_concurrent_per_key: Optional[int] = None,
+        optimal_concurrent_per_key: Optional[int] = None,
     ):
         """
         Initialize UsageManager.
@@ -190,15 +190,17 @@ class UsageManager:
             provider_plugins: Dict of provider plugin classes
             config: Optional pre-built configuration
             max_concurrent_per_key: Max concurrent requests per credential
+            optimal_concurrent_per_key: Soft target before stacking on a credential
         """
         self.provider = provider
         self._provider_plugins = provider_plugins or {}
         if max_concurrent_per_key is None:
-            self._max_concurrent_per_key = DEFAULT_MAX_CONCURRENT_PER_KEY
+            self._max_concurrent_per_key = None
         elif max_concurrent_per_key <= 0:
             self._max_concurrent_per_key = -1
         else:
             self._max_concurrent_per_key = max_concurrent_per_key
+        self._explicit_optimal_concurrent_per_key = optimal_concurrent_per_key
 
         # Load configuration
         if config:
@@ -229,6 +231,7 @@ class UsageManager:
         self._states: Dict[str, CredentialState] = {}
         self._initialized = False
         self._lock = asyncio.Lock()
+        self._acquire_lock = asyncio.Lock()
         self._loaded_from_storage = False
         self._loaded_count = 0
         self._quota_exhausted_summary: Dict[str, Dict[str, float]] = {}
@@ -300,19 +303,39 @@ class UsageManager:
                 if tiers and accessor in tiers:
                     self._states[stable_id].tier = tiers[accessor]
 
-                # Debug: Log state before max_concurrent calculation
-                old_max_concurrent = self._states[stable_id].max_concurrent
-
                 # Always set max concurrent. Values <= 0 mean unlimited and
                 # bypass multiplier logic entirely.
-                if self._max_concurrent_per_key <= 0:
+                base_max_concurrent = (
+                    self._config.get_base_max_concurrent()
+                    if self._max_concurrent_per_key is None
+                    else self._max_concurrent_per_key
+                )
+                if base_max_concurrent <= 0:
                     self._states[stable_id].max_concurrent = -1
                 else:
-                    base_concurrent = self._max_concurrent_per_key
                     priority = self._states[stable_id].priority
                     multiplier = self._config.get_effective_multiplier(priority)
-                    effective_concurrent = base_concurrent * multiplier
+                    effective_concurrent = base_max_concurrent * multiplier
                     self._states[stable_id].max_concurrent = effective_concurrent
+
+                if self._explicit_optimal_concurrent_per_key is not None:
+                    optimal_concurrent = self._explicit_optimal_concurrent_per_key
+                    if optimal_concurrent <= 0:
+                        self._states[stable_id].optimal_concurrent = -1
+                    else:
+                        priority = self._states[stable_id].priority
+                        multiplier = self._config.optimal_priority_multipliers.get(
+                            priority, 1
+                        )
+                        self._states[stable_id].optimal_concurrent = (
+                            optimal_concurrent * multiplier
+                        )
+                else:
+                    self._states[stable_id].optimal_concurrent = (
+                        self._config.get_effective_optimal_concurrent(
+                            self._states[stable_id].priority
+                        )
+                    )
 
             # Clean up stale windows from tier changes
             # This handles the case where a credential's tier changed and now has
@@ -416,51 +439,42 @@ class UsageManager:
 
         # Main acquisition loop - continues until deadline
         while time.time() < deadline:
-            # Try to select a credential
-            stable_id = self._selection.select(
-                provider=self.provider,
-                model=normalized_model,
-                states=states_to_check,
-                quota_group=quota_group,
-                exclude=exclude_ids,
-                priorities=priority_overrides,
-                deadline=deadline,
-            )
+            async with self._acquire_lock:
+                if time.time() >= deadline:
+                    break
 
-            if stable_id is not None:
-                state = self._states[stable_id]
-                lock = self._key_locks.get(stable_id)
+                # Select and increment as one short critical section so the
+                # soft optimal capacity phase observes each in-flight acquire.
+                stable_id = self._selection.select(
+                    provider=self.provider,
+                    model=normalized_model,
+                    states=states_to_check,
+                    quota_group=quota_group,
+                    exclude=exclude_ids,
+                    priorities=priority_overrides,
+                    deadline=deadline,
+                )
 
-                if lock:
-                    async with lock:
-                        # Double-check availability after acquiring lock
-                        if (
-                            state.max_concurrent <= 0
-                            or state.active_requests < state.max_concurrent
-                        ):
-                            state.active_requests += 1
-                            lib_logger.debug(
-                                f"Acquired credential {mask_credential(state.accessor, style='full')} "
-                                f"for {model} (active: "
-                                f"{self._format_concurrency(state.active_requests, state.max_concurrent)})"
-                            )
-                            return CredentialContext(
-                                manager=self,
-                                credential=state.accessor,
-                                stable_id=stable_id,
-                                model=normalized_model,
-                                quota_group=quota_group,
-                            )
-                else:
-                    # No lock configured, just increment
-                    state.active_requests += 1
-                    return CredentialContext(
-                        manager=self,
-                        credential=state.accessor,
-                        stable_id=stable_id,
-                        model=normalized_model,
-                        quota_group=quota_group,
-                    )
+                if stable_id is not None:
+                    state = self._states[stable_id]
+                    if (
+                        state.max_concurrent <= 0
+                        or state.active_requests < state.max_concurrent
+                    ):
+                        state.active_requests += 1
+                        lib_logger.debug(
+                            f"Acquired credential {mask_credential(state.accessor, style='full')} "
+                            f"for {model} (active: "
+                            f"{self._format_concurrency(state.active_requests, state.max_concurrent)}; "
+                            f"optimal: {self._format_limit(state.optimal_concurrent)})"
+                        )
+                        return CredentialContext(
+                            manager=self,
+                            credential=state.accessor,
+                            stable_id=stable_id,
+                            model=normalized_model,
+                            quota_group=quota_group,
+                        )
 
             # No credential available - need to wait
             # Find the best credential to wait for (prefer lowest usage)
@@ -1947,6 +1961,10 @@ class UsageManager:
     def _format_concurrency(active: int, max_concurrent: int) -> str:
         max_display = "*" if max_concurrent <= 0 else str(max_concurrent)
         return f"{active}/{max_display}"
+
+    @staticmethod
+    def _format_limit(limit: int) -> str:
+        return "*" if limit <= 0 else str(limit)
 
     async def _queue_quota_exhausted_log(
         self, accessor: str, group_key: str, quota_reset_ts: float

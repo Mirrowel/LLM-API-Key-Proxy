@@ -255,16 +255,41 @@ class SettingsDetector:
         return models
 
     @staticmethod
+    def _split_concurrency_key(key: str, prefix: str) -> tuple[str, str | None]:
+        raw_name = key.replace(prefix, "")
+        upper_name = raw_name.upper()
+        for suffix, mode in (("_BALANCED", "balanced"), ("_SEQUENTIAL", "sequential")):
+            if upper_name.endswith(suffix):
+                return raw_name[: -len(suffix)].lower(), mode
+        return raw_name.lower(), None
+
+    @staticmethod
     def detect_concurrency_limits() -> dict:
-        """Detect max concurrent requests per key"""
+        """Detect max/optimal concurrent requests per key."""
         limits = {}
         env_vars = SettingsDetector._load_local_env()
         for key, value in env_vars.items():
-            if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
-                provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
+            if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_") or key.startswith(
+                "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"
+            ):
+                if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
+                    provider, mode = SettingsDetector._split_concurrency_key(
+                        key, "MAX_CONCURRENT_REQUESTS_PER_KEY_"
+                    )
+                    kind = "max"
+                else:
+                    provider, mode = SettingsDetector._split_concurrency_key(
+                        key, "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"
+                    )
+                    kind = "optimal"
                 try:
                     parsed = int(value)
-                    limits[provider] = -1 if parsed <= 0 else parsed
+                    target = limits.setdefault(provider, {})
+                    if mode:
+                        target = target.setdefault(mode, {})
+                    target[kind] = (
+                        -1 if parsed <= 0 else parsed
+                    )
                 except (json.JSONDecodeError, ValueError):
                     pass
         return limits
@@ -831,11 +856,43 @@ class LauncherTUI:
             self.console.print()
             self.console.print("[bold]⚡ Concurrency Limits[/bold]")
             self.console.print("━" * 70)
-            for provider, limit in concurrency.items():
-                limit_display = "*" if limit <= 0 else str(limit)
-                self.console.print(f"   • {provider:15} {limit_display} requests/key")
+            for provider, limits in concurrency.items():
+                max_limit = limits.get("max")
+                optimal_limit = limits.get("optimal")
+                max_display = (
+                    "default"
+                    if max_limit is None
+                    else ("*" if max_limit <= 0 else str(max_limit))
+                )
+                optimal_display = (
+                    "default"
+                    if optimal_limit is None
+                    else ("*" if optimal_limit <= 0 else str(optimal_limit))
+                )
+                self.console.print(
+                    f"   • {provider:15} max={max_display}, optimal={optimal_display} requests/key"
+                )
+                for mode in ("balanced", "sequential"):
+                    mode_limits = limits.get(mode)
+                    if not mode_limits:
+                        continue
+                    mode_max = mode_limits.get("max")
+                    mode_optimal = mode_limits.get("optimal")
+                    mode_max_display = (
+                        "default"
+                        if mode_max is None
+                        else ("*" if mode_max <= 0 else str(mode_max))
+                    )
+                    mode_optimal_display = (
+                        "default"
+                        if mode_optimal is None
+                        else ("*" if mode_optimal <= 0 else str(mode_optimal))
+                    )
+                    self.console.print(
+                        f"     {mode:10} max={mode_max_display}, optimal={mode_optimal_display} requests/key"
+                    )
             self.console.print(
-                "   • Default:        1 request/key unless provider overrides (all others)"
+                "   • Defaults:       max=*, optimal balanced=1, sequential=* unless provider overrides"
             )
 
         # Model Filters (basic info only)

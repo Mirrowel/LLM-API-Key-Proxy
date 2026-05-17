@@ -34,7 +34,6 @@ from ..core.config import ConfigLoader
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_GLOBAL_TIMEOUT,
-    DEFAULT_MAX_CONCURRENT_PER_KEY,
     DEFAULT_ROTATION_TOLERANCE,
 )
 
@@ -92,6 +91,13 @@ class RotatingClient:
         whitelist_models: Optional[Dict[str, List[str]]] = None,
         enable_request_logging: bool = False,
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
+        max_concurrent_requests_per_key_by_mode: Optional[
+            Dict[str, Dict[str, int]]
+        ] = None,
+        optimal_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
+        optimal_concurrent_requests_per_key_by_mode: Optional[
+            Dict[str, Dict[str, int]]
+        ] = None,
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
     ):
@@ -156,6 +162,15 @@ class RotatingClient:
         self._litellm_logger_fn = self._litellm_logger_callback
         self.enable_request_logging = enable_request_logging
         self.max_concurrent_requests_per_key = max_concurrent_requests_per_key or {}
+        self.max_concurrent_requests_per_key_by_mode = (
+            max_concurrent_requests_per_key_by_mode or {}
+        )
+        self.optimal_concurrent_requests_per_key = (
+            optimal_concurrent_requests_per_key or {}
+        )
+        self.optimal_concurrent_requests_per_key_by_mode = (
+            optimal_concurrent_requests_per_key_by_mode or {}
+        )
 
         # Validate concurrent requests config. None means unset/use provider
         # default; values <= 0 are normalized to -1 (unlimited).
@@ -165,6 +180,20 @@ class RotatingClient:
                 continue
             if max_val <= 0:
                 self.max_concurrent_requests_per_key[provider] = -1
+
+        for provider, optimal_val in list(
+            self.optimal_concurrent_requests_per_key.items()
+        ):
+            if optimal_val is None:
+                del self.optimal_concurrent_requests_per_key[provider]
+                continue
+            if optimal_val <= 0:
+                self.optimal_concurrent_requests_per_key[provider] = -1
+
+        self._normalize_mode_concurrency(self.max_concurrent_requests_per_key_by_mode)
+        self._normalize_mode_concurrency(
+            self.optimal_concurrent_requests_per_key_by_mode
+        )
 
         # Initialize configuration loader
         self._config_loader = ConfigLoader(PROVIDER_PLUGINS)
@@ -228,16 +257,19 @@ class RotatingClient:
 
             usage_file = self._usage_base_path / f"usage_{provider}.json"
 
-            # Get max concurrent for this provider. Explicit config wins;
-            # provider defaults are used next; otherwise the system default is 1.
-            if provider in self.max_concurrent_requests_per_key:
-                max_concurrent = self.max_concurrent_requests_per_key[provider]
-            else:
-                plugin_class = PROVIDER_PLUGINS.get(provider)
-                max_concurrent = getattr(
-                    plugin_class,
-                    "default_max_concurrent_per_key",
-                    DEFAULT_MAX_CONCURRENT_PER_KEY,
+            mode = config.rotation_mode.value
+            max_concurrent = self.max_concurrent_requests_per_key_by_mode.get(
+                provider, {}
+            ).get(mode)
+            if max_concurrent is None:
+                max_concurrent = self.max_concurrent_requests_per_key.get(provider)
+
+            optimal_concurrent = self.optimal_concurrent_requests_per_key_by_mode.get(
+                provider, {}
+            ).get(mode)
+            if optimal_concurrent is None:
+                optimal_concurrent = self.optimal_concurrent_requests_per_key.get(
+                    provider
                 )
 
             manager = NewUsageManager(
@@ -246,6 +278,7 @@ class RotatingClient:
                 provider_plugins=PROVIDER_PLUGINS,
                 config=config,
                 max_concurrent_per_key=max_concurrent,
+                optimal_concurrent_per_key=optimal_concurrent,
             )
             self._usage_managers[provider] = manager
 
@@ -271,6 +304,19 @@ class RotatingClient:
 
         # Initialize Anthropic compatibility handler
         self._anthropic_handler = AnthropicHandler(self)
+
+    @staticmethod
+    def _normalize_mode_concurrency(values: Dict[str, Dict[str, int]]) -> None:
+        for provider, mode_values in list(values.items()):
+            if not mode_values:
+                del values[provider]
+                continue
+            for mode, limit in list(mode_values.items()):
+                if mode not in ("balanced", "sequential") or limit is None:
+                    del mode_values[mode]
+                    continue
+                if limit <= 0:
+                    mode_values[mode] = -1
 
     async def __aenter__(self):
         await self.initialize_usage_managers()

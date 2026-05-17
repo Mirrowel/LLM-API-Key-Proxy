@@ -134,24 +134,35 @@ class SelectionEngine:
             )
             return None
 
-        # Step 3: Build selection context
+        # Step 3: Prefer credentials below their soft optimal concurrency.
+        # Hard blockers have already been applied by LimitEngine; this only
+        # controls whether we spread first or stack as a fallback.
+        below_optimal = [
+            stable_id
+            for stable_id in available
+            if states[stable_id].optimal_concurrent > 0
+            and states[stable_id].active_requests < states[stable_id].optimal_concurrent
+        ]
+        strategy_candidates = below_optimal or available
+
+        # Step 4: Build selection context
         # Get usage counts for weighting
         usage_counts = {}
-        for stable_id in available:
+        for stable_id in strategy_candidates:
             state = states[stable_id]
             usage_counts[stable_id] = self._get_usage_count(state, model, quota_group)
 
         # Build priorities map
         if priorities is None:
             priorities = {}
-            for stable_id in available:
+            for stable_id in strategy_candidates:
                 priorities[stable_id] = states[stable_id].priority
 
         context = SelectionContext(
             provider=provider,
             model=model,
             quota_group=quota_group,
-            candidates=available,
+            candidates=strategy_candidates,
             priorities=priorities,
             usage_counts=usage_counts,
             rotation_mode=self._config.rotation_mode,
@@ -159,13 +170,14 @@ class SelectionEngine:
             deadline=deadline or (time.time() + 120),
         )
 
-        # Step 4: Apply rotation strategy
+        # Step 5: Apply rotation strategy
         selected = self._strategy.select(context, states)
 
         if selected:
             lib_logger.debug(
                 f"Selected credential {selected} for {provider}/{model} "
-                f"(from {len(available)} available)"
+                f"(from {len(strategy_candidates)}/{len(available)} "
+                "capacity-phase candidates)"
             )
 
         return selected

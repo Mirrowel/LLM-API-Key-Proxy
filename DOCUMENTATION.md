@@ -110,7 +110,7 @@ This class is the stateful core of the library, managing concurrency, usage trac
     - **daily**: Legacy daily reset at `daily_reset_time_utc`
 *   **Model Quota Groups**: Models can be grouped to share quota limits. When one model in a group hits quota, all receive the same reset timestamp.
 
-#### Tiered Key Acquisition Strategy
+#### Capacity-Phase Key Acquisition Strategy
 
 The `acquire_key` method uses a sophisticated strategy to balance load:
 
@@ -118,19 +118,22 @@ The `acquire_key` method uses a sophisticated strategy to balance load:
 2.  **Rotation Mode**: Determines credential selection strategy:
     *   **Sequential Mode** (default): Reuses the selected credential until it errors/exhausts to preserve provider-side cache locality
     *   **Balanced Mode**: Distributes requests across credentials for even load when explicitly configured
-3.  **Tiering**: Valid keys are split into two tiers:
-    *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
-    *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
+3.  **Capacity Phases**: Valid keys are first filtered by hard blockers, then grouped by soft concurrency capacity:
+    *   **Below Optimal**: Healthy credentials with `active_requests < optimal_concurrent` are preferred.
+    *   **Stacking Fallback**: If every healthy credential is at or above `optimal_concurrent`, credentials remain usable until they hit `max_concurrent`.
+    *   **Blocked**: Credentials on cooldown, over quota, disallowed for the model, or at/above a positive `max_concurrent` are not selected.
 4.  **Selection Strategy** (configurable via `rotation_tolerance`):
-    *   **Deterministic (tolerance=0.0)**: Within each tier, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
+    *   **Deterministic (tolerance=0.0)**: Within the current capacity phase, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
     *   **Weighted Random (tolerance>0, default)**: Keys are selected randomly with weights biased toward less-used ones:
         - Formula: `weight = (max_usage - credential_usage) + tolerance + 1`
         - `tolerance=2.0` (recommended): Balanced randomness - credentials within 2 uses of the maximum can still be selected with reasonable probability
         - `tolerance=5.0+`: High randomness - even heavily-used credentials have significant probability
         - **Security Benefit**: Unpredictable selection patterns make rate limit detection and fingerprinting harder
         - **Load Balance**: Lower-usage credentials still preferred, maintaining reasonable distribution
-5.  **Concurrency Limits**: Checks against `max_concurrent` limits (with priority multipliers applied) to prevent overloading a single key.
+5.  **Concurrency Controls**: `optimal_concurrent` is a soft spread-before-stacking target. `max_concurrent` is the hard safety ceiling (with priority multipliers applied); values `<= 0` mean unlimited.
 6.  **Priority Groups**: When credential prioritization is enabled, higher-tier credentials (lower priority numbers) are tried first before moving to lower tiers.
+
+Balanced mode defaults to `optimal_concurrent=1` and `max_concurrent=-1`, which spreads first but does not artificially block when all credentials are busy. Sequential mode defaults to `optimal_concurrent=-1` and `max_concurrent=-1`, preserving sticky behavior unless a provider or environment override constrains it. Provider-wide and mode-specific environment variables are available as `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`, `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`, and the `_BALANCED`/`_SEQUENTIAL` variants.
 
 #### Failure Handling & Cooldowns
 

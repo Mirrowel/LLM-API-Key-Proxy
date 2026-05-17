@@ -15,7 +15,15 @@ from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from dotenv import set_key, unset_key
 
-from rotator_library.config import DEFAULT_ROTATION_MODE
+from rotator_library.config import (
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
+    DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL,
+    DEFAULT_ROTATION_MODE,
+)
 from rotator_library.utils.paths import get_data_file
 
 console = Console()
@@ -242,7 +250,7 @@ class ModelDefinitionManager:
 
 
 class ConcurrencyManager:
-    """Manages MAX_CONCURRENT_REQUESTS_PER_KEY_PROVIDER"""
+    """Manages concurrency capacity settings."""
 
     def __init__(self, settings: AdvancedSettings):
         self.settings = settings
@@ -252,7 +260,11 @@ class ConcurrencyManager:
         limits = {}
         for key, value in os.environ.items():
             if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
-                provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
+                provider, mode = self._split_key(
+                    key, "MAX_CONCURRENT_REQUESTS_PER_KEY_"
+                )
+                if mode:
+                    continue
                 try:
                     parsed = int(value)
                     limits[provider] = -1 if parsed <= 0 else parsed
@@ -260,15 +272,81 @@ class ConcurrencyManager:
                     pass
         return limits
 
-    def set_limit(self, provider: str, limit: int):
-        """Set concurrency limit"""
-        key = f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider.upper()}"
+    def get_current_optimal_limits(self) -> Dict[str, int]:
+        """Get currently configured optimal concurrency limits."""
+        limits = {}
+        for key, value in os.environ.items():
+            if key.startswith("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"):
+                provider, mode = self._split_key(
+                    key, "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"
+                )
+                if mode:
+                    continue
+                try:
+                    parsed = int(value)
+                    limits[provider] = -1 if parsed <= 0 else parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return limits
+
+    def get_current_mode_limits(self) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """Get mode-specific max/optimal concurrency limits."""
+        limits: Dict[str, Dict[str, Dict[str, int]]] = {}
+        prefixes = (
+            ("MAX_CONCURRENT_REQUESTS_PER_KEY_", "max"),
+            ("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", "optimal"),
+        )
+        for key, value in os.environ.items():
+            for prefix, kind in prefixes:
+                if not key.startswith(prefix):
+                    continue
+                provider, mode = self._split_key(key, prefix)
+                if not mode:
+                    continue
+                try:
+                    parsed = int(value)
+                    limits.setdefault(provider, {}).setdefault(mode, {})[kind] = (
+                        -1 if parsed <= 0 else parsed
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return limits
+
+    def set_limit(self, provider: str, limit: int, mode: Optional[str] = None):
+        """Set max concurrency limit."""
+        key = self._build_key("MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
         self.settings.set(key, "-1" if limit <= 0 else str(limit))
 
-    def remove_limit(self, provider: str):
-        """Remove concurrency limit (reset to default)"""
-        key = f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider.upper()}"
+    def remove_limit(self, provider: str, mode: Optional[str] = None):
+        """Remove max concurrency limit (reset to default)."""
+        key = self._build_key("MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
         self.settings.remove(key)
+
+    def set_optimal_limit(self, provider: str, limit: int, mode: Optional[str] = None):
+        """Set optimal concurrency limit."""
+        key = self._build_key("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
+        self.settings.set(key, "-1" if limit <= 0 else str(limit))
+
+    def remove_optimal_limit(self, provider: str, mode: Optional[str] = None):
+        """Remove optimal concurrency limit (reset to mode/provider default)."""
+        key = self._build_key("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
+        self.settings.remove(key)
+
+    @staticmethod
+    def _build_key(prefix: str, provider: str, mode: Optional[str] = None) -> str:
+        key = f"{prefix}{provider.upper()}"
+        if mode:
+            key = f"{key}_{mode.upper()}"
+        return key
+
+    @staticmethod
+    def _split_key(key: str, prefix: str) -> tuple[str, Optional[str]]:
+        raw_name = key.replace(prefix, "")
+        upper_name = raw_name.upper()
+        for suffix, mode in (("_BALANCED", "balanced"), ("_SEQUENTIAL", "sequential")):
+            if upper_name.endswith(suffix):
+                return raw_name[: -len(suffix)].lower(), mode
+        return raw_name.lower(), None
 
 
 class RotationModeManager:
@@ -2041,9 +2119,6 @@ class SettingsTool:
         while True:
             clear_screen()
 
-            # Get current limits from env
-            limits = self.concurrency_mgr.get_current_limits()
-
             self.console.print(
                 Panel.fit(
                     "[bold cyan]⚡ Concurrency Limits Configuration[/bold cyan]",
@@ -2054,10 +2129,6 @@ class SettingsTool:
             self.console.print()
             self.console.print("[bold]:clipboard: Current Concurrency Settings[/bold]")
             self.console.print("━" * 70)
-
-            # Build combined view with pending changes
-            all_limits: Dict[str, Dict[str, Any]] = {}
-            prefix = "MAX_CONCURRENT_REQUESTS_PER_KEY_"
 
             def parse_limit_value(value: Any) -> Any:
                 try:
@@ -2072,82 +2143,93 @@ class SettingsTool:
                     return f"{value} requests/key"
                 return "* requests/key" if parsed <= 0 else f"{parsed} requests/key"
 
-            # Add current limits (from env)
-            for provider, limit in limits.items():
-                key = f"{prefix}{provider.upper()}"
-                value = "-1" if limit <= 0 else str(limit)
-                change_type = self.settings.get_change_type(key)
-                if change_type == "remove":
-                    all_limits[provider] = {
-                        "value": value,
-                        "type": "remove",
-                        "old": None,
-                    }
-                elif change_type == "edit":
-                    new_val = self.settings.pending_changes[key]
-                    all_limits[provider] = {
-                        "value": new_val,
-                        "type": "edit",
-                        "old": value,
-                    }
-                else:
-                    all_limits[provider] = {
-                        "value": value,
-                        "type": None,
-                        "old": None,
-                    }
+            def effective_value(key: str) -> Optional[str]:
+                pending = self.settings.get_pending_value(key)
+                if pending is not _NOT_FOUND:
+                    return None if pending is None else str(pending)
+                return os.getenv(key)
 
-            # Add pending new limits (additions)
-            for key in self.settings.get_pending_keys_by_pattern(prefix=prefix):
-                if self.settings.get_change_type(key) == "add":
-                    provider = key.replace(prefix, "").lower()
-                    if provider not in all_limits:
-                        all_limits[provider] = {
-                            "value": self.settings.pending_changes[key],
-                            "type": "add",
-                            "old": None,
-                        }
+            def limit_display(key: str, default: str) -> str:
+                value = effective_value(key)
+                if value is None:
+                    return f"default {default}"
+                return format_limit_value(value)
 
-            if all_limits:
-                # Sort alphabetically
-                for provider in sorted(all_limits.keys()):
-                    info = all_limits[provider]
-                    value_display = format_limit_value(info["value"])
-                    old_display = format_limit_value(info["old"]) if info["old"] else None
-                    self.console.print(
-                        self._format_item(
-                            provider, value_display, info["type"], old_display
-                        )
+            def mode_display(provider: str) -> tuple[str, Optional[str]]:
+                key = f"ROTATION_MODE_{provider.upper()}"
+                pending = self.settings.get_pending_value(key)
+                if pending is None:
+                    return self.rotation_mgr.get_default_mode(provider), "remove"
+                if pending is not _NOT_FOUND:
+                    return str(pending).lower(), self.settings.get_change_type(key)
+                return self.rotation_mgr.get_effective_mode(provider), None
+
+            providers = set(self.get_available_providers())
+            for key in os.environ.keys() | self.settings.pending_changes.keys():
+                for prefix in (
+                    "MAX_CONCURRENT_REQUESTS_PER_KEY_",
+                    "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_",
+                ):
+                    if key.startswith(prefix):
+                        provider, _ = self.concurrency_mgr._split_key(key, prefix)
+                        providers.add(provider)
+                if key.startswith("ROTATION_MODE_"):
+                    providers.add(key.replace("ROTATION_MODE_", "").lower())
+
+            if providers:
+                for provider in sorted(providers):
+                    mode, mode_change = mode_display(provider)
+                    max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider
                     )
-                self.console.print(
-                    "   • Default:        1 request/key unless provider overrides (all others)"
-                )
+                    optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider
+                    )
+                    mode_max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode
+                    )
+                    mode_optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode
+                    )
+                    mode_label = mode
+                    if mode_change:
+                        mode_label = f"{mode} [{mode_change}]"
+                    self.console.print(f"   • [bold]{provider}[/bold] mode={mode_label}")
+                    self.console.print(
+                        f"     provider-wide: max={limit_display(max_key, '*')}, "
+                        f"optimal={limit_display(optimal_key, 'balanced=1/sequential=*')}"
+                    )
+                    self.console.print(
+                        f"     {mode}-specific: max={limit_display(mode_max_key, 'provider/global')}, "
+                        f"optimal={limit_display(mode_optimal_key, 'provider/global')}"
+                    )
             else:
-                self.console.print(
-                    "   • Default:        1 request/key unless provider overrides (all providers)"
-                )
+                self.console.print("   • No providers configured yet")
+
+            self.console.print()
+            self.console.print("   • Max is the hard ceiling; * means unlimited")
+            self.console.print("   • Optimal is the soft spread-before-stacking target")
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
             self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
-            self.console.print("   1. ➕ Add Concurrency Limit for Provider")
-            self.console.print("   2. ✏️  Edit Existing Limit")
-            self.console.print("   3. :wastebasket:  Remove Limit (reset to default)")
-            self.console.print("   4. ↩️  Back to Settings Menu")
+            self.console.print("   1. ⚙️  Configure Provider")
+            self.console.print("   2. :wastebasket:  Remove Max/Optimal Limits")
+            self.console.print("   3. ↩️  Back to Settings Menu")
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
 
             choice = Prompt.ask(
-                "Select option", choices=["1", "2", "3", "4"], show_choices=False
+                "Select option", choices=["1", "2", "3"], show_choices=False
             )
 
-            if choice == "1":
+            if choice in {"1", "2"}:
                 # Get available providers
-                available_providers = self.get_available_providers()
+                available_providers = sorted(providers or set(self.get_available_providers()))
 
                 if not available_providers:
                     self.console.print(
@@ -2174,124 +2256,110 @@ class SettingsTool:
                 else:
                     provider = available_providers[choice_idx - 1]
 
-                if provider:
-                    raw_limit = Prompt.ask(
-                        "Max concurrent requests per key (positive integer, 0/-1 for *)",
-                        default="1",
+                if not provider:
+                    input("\nPress Enter to continue...")
+                    continue
+
+                current_mode = mode_display(provider)[0]
+
+                if choice == "1":
+                    self.console.print("\n[bold]Rotation mode:[/bold]")
+                    self.console.print("   1. balanced")
+                    self.console.print("   2. sequential")
+                    mode_choice = Prompt.ask(
+                        "Select mode",
+                        choices=["1", "2"],
+                        default="1" if current_mode == "balanced" else "2",
                     )
-                    limit = parse_limit_value(raw_limit)
-                    if limit is not _NOT_FOUND:
-                        self.concurrency_mgr.set_limit(provider, limit)
-                        display = "*" if limit <= 0 else str(limit)
-                        self.console.print(
-                            f"\n[green]:white_check_mark: Concurrency limit staged for '{provider}': {display} requests/key[/green]"
-                        )
-                    else:
+                    selected_mode = "balanced" if mode_choice == "1" else "sequential"
+                    self.rotation_mgr.set_mode(provider, selected_mode)
+
+                    self.console.print("\n[bold]Concurrency setting scope:[/bold]")
+                    self.console.print("   1. Provider-wide")
+                    self.console.print(f"   2. Current mode only ({selected_mode})")
+                    scope_choice = Prompt.ask(
+                        "Select scope", choices=["1", "2"], default="1"
+                    )
+                    scope_mode = selected_mode if scope_choice == "2" else None
+
+                    max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, scope_mode
+                    )
+                    optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, scope_mode
+                    )
+                    current_max = effective_value(max_key)
+                    if current_max is None:
+                        if scope_mode == "balanced":
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED)
+                        elif scope_mode == "sequential":
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL)
+                        else:
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY)
+                    current_optimal = effective_value(optimal_key)
+                    if current_optimal is None:
+                        if scope_mode == "balanced":
+                            current_optimal = str(
+                                DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED
+                            )
+                        elif scope_mode == "sequential":
+                            current_optimal = str(
+                                DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL
+                            )
+                        else:
+                            current_optimal = str(DEFAULT_OPTIMAL_CONCURRENT_PER_KEY)
+
+                    raw_max = Prompt.ask(
+                        "Max concurrent requests per key (positive integer, 0/-1 for *)",
+                        default=str(current_max),
+                    )
+                    max_limit = parse_limit_value(raw_max)
+                    raw_optimal = Prompt.ask(
+                        "Optimal concurrent requests per key (positive integer, 0/-1 for *)",
+                        default=str(current_optimal),
+                    )
+                    optimal_limit = parse_limit_value(raw_optimal)
+
+                    if max_limit is _NOT_FOUND or optimal_limit is _NOT_FOUND:
                         self.console.print(
                             "\n[red]:x: Limit must be a positive integer or 0/-1 for unlimited[/red]"
                         )
-                    input("\nPress Enter to continue...")
-
-            elif choice == "2":
-                # Get editable limits (existing + pending additions, excluding pending removals)
-                editable = {
-                    k: v for k, v in all_limits.items() if v["type"] != "remove"
-                }
-                if not editable:
-                    self.console.print("\n[yellow]No limits to edit[/yellow]")
-                    input("\nPress Enter to continue...")
-                    continue
-
-                # Show numbered list
-                self.console.print("\n[bold]Select provider to edit:[/bold]")
-                limits_list = sorted(editable.keys())
-                for idx, prov in enumerate(limits_list, 1):
-                    self.console.print(f"   {idx}. {prov}")
-
-                choice_idx = IntPrompt.ask(
-                    "Select option",
-                    choices=[str(i) for i in range(1, len(limits_list) + 1)],
-                )
-                provider = limits_list[choice_idx - 1]
-                info = editable[provider]
-                current_limit = parse_limit_value(info["value"])
-                current_display = "*" if current_limit <= 0 else str(current_limit)
-
-                self.console.print(f"\nCurrent limit: {current_display} requests/key")
-                raw_new_limit = Prompt.ask(
-                    "New limit (positive integer, 0/-1 for *) [press Enter to keep current]",
-                    default="-1" if current_limit <= 0 else str(current_limit),
-                )
-                new_limit = parse_limit_value(raw_new_limit)
-
-                if new_limit is not _NOT_FOUND:
-                    if new_limit != current_limit:
-                        self.concurrency_mgr.set_limit(provider, new_limit)
-                        display = "*" if new_limit <= 0 else str(new_limit)
-                        self.console.print(
-                            f"\n[green]:white_check_mark: Concurrency limit updated for '{provider}': {display} requests/key[/green]"
-                        )
                     else:
-                        self.console.print("\n[yellow]No changes made[/yellow]")
+                        self.concurrency_mgr.set_limit(provider, max_limit, scope_mode)
+                        self.concurrency_mgr.set_optimal_limit(
+                            provider, optimal_limit, scope_mode
+                        )
+                        scope_label = (
+                            f"{selected_mode}-specific" if scope_mode else "provider-wide"
+                        )
+                        self.console.print(
+                            f"\n[green]:white_check_mark: Staged {scope_label} concurrency for '{provider}' "
+                            f"with rotation mode '{selected_mode}'[/green]"
+                        )
+
                 else:
-                    self.console.print("\n[red]Limit must be a positive integer or 0/-1 for unlimited[/red]")
+                    self.console.print("\n[bold]Remove which limits?[/bold]")
+                    self.console.print("   1. Provider-wide")
+                    self.console.print(f"   2. Current mode only ({current_mode})")
+                    scope_choice = Prompt.ask(
+                        "Select scope", choices=["1", "2"], default="1"
+                    )
+                    scope_mode = current_mode if scope_choice == "2" else None
+
+                    if Confirm.ask(
+                        f"Remove max and optimal concurrency limits for '{provider}'?"
+                    ):
+                        self.concurrency_mgr.remove_limit(provider, scope_mode)
+                        self.concurrency_mgr.remove_optimal_limit(provider, scope_mode)
+                        scope_label = (
+                            f"{scope_mode}-specific" if scope_mode else "provider-wide"
+                        )
+                        self.console.print(
+                            f"\n[green]:white_check_mark: {scope_label.title()} max/optimal limits marked for removal for '{provider}'[/green]"
+                        )
                 input("\nPress Enter to continue...")
 
             elif choice == "3":
-                # Get removable limits (existing ones not already pending removal)
-                removable = {
-                    k: v
-                    for k, v in all_limits.items()
-                    if v["type"] != "remove" and v["type"] != "add"
-                }
-                # For pending additions, we can "undo" by removing from pending
-                pending_adds = {
-                    k: v for k, v in all_limits.items() if v["type"] == "add"
-                }
-
-                if not removable and not pending_adds:
-                    self.console.print("\n[yellow]No limits to remove[/yellow]")
-                    input("\nPress Enter to continue...")
-                    continue
-
-                # Show numbered list
-                self.console.print(
-                    "\n[bold]Select provider to remove limit from:[/bold]"
-                )
-                limits_list = sorted(removable.keys()) + sorted(pending_adds.keys())
-                for idx, prov in enumerate(limits_list, 1):
-                    if prov in pending_adds:
-                        self.console.print(
-                            f"   {idx}. {prov} [green](pending add)[/green]"
-                        )
-                    else:
-                        self.console.print(f"   {idx}. {prov}")
-
-                choice_idx = IntPrompt.ask(
-                    "Select option",
-                    choices=[str(i) for i in range(1, len(limits_list) + 1)],
-                )
-                provider = limits_list[choice_idx - 1]
-
-                if Confirm.ask(
-                    f"Remove concurrency limit for '{provider}' "
-                    "(reset to default: 1 unless provider overrides)?"
-                ):
-                    if provider in pending_adds:
-                        # Undo pending addition
-                        key = f"{prefix}{provider.upper()}"
-                        del self.settings.pending_changes[key]
-                        self.console.print(
-                            f"\n[green]:white_check_mark: Pending limit for '{provider}' cancelled![/green]"
-                        )
-                    else:
-                        self.concurrency_mgr.remove_limit(provider)
-                        self.console.print(
-                            f"\n[green]:white_check_mark: Limit marked for removal for '{provider}'[/green]"
-                        )
-                    input("\nPress Enter to continue...")
-
-            elif choice == "4":
                 break
 
     def _show_changes_summary(self):
@@ -2309,6 +2377,7 @@ class SettingsTool:
             ("Custom Provider API Bases", "_API_BASE", "suffix"),
             ("Model Definitions", "_MODELS", "suffix"),
             ("Concurrency Limits", "MAX_CONCURRENT_REQUESTS_PER_KEY_", "prefix"),
+            ("Optimal Concurrency", "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", "prefix"),
             ("Rotation Modes", "ROTATION_MODE_", "prefix"),
             ("Priority Multipliers", "CONCURRENCY_MULTIPLIER_", "prefix"),
         ]

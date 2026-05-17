@@ -25,6 +25,12 @@ from ..core.constants import (
     DEFAULT_ROTATION_MODE,
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
+    # Usage config resolves runtime rotation-mode defaults; mode-agnostic
+    # fallbacks belong in CredentialState/storage.
+    DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL,
 )
 from .types import ResetMode, RotationMode, TrackingMode, CooldownMode, CapMode
 
@@ -486,6 +492,15 @@ class ProviderUsageConfig:
         default_factory=dict
     )
 
+    # Optimal concurrency controls the soft capacity phase before stacking.
+    optimal_concurrent_per_key: Optional[int] = None
+    optimal_concurrent_per_key_by_mode: Dict[str, int] = field(default_factory=dict)
+    optimal_priority_multipliers: Dict[int, int] = field(default_factory=dict)
+
+    # Max concurrency controls the hard safety ceiling.
+    max_concurrent_per_key: Optional[int] = None
+    max_concurrent_per_key_by_mode: Dict[str, int] = field(default_factory=dict)
+
     # Fair cycle
     fair_cycle: FairCycleConfig = field(default_factory=FairCycleConfig)
 
@@ -522,6 +537,36 @@ class ProviderUsageConfig:
 
         # Fall back
         return self.sequential_fallback_multiplier
+
+    def get_base_optimal_concurrent(self) -> int:
+        """Get the mode-aware base soft concurrency target."""
+        mode_value = self.rotation_mode.value
+        if mode_value in self.optimal_concurrent_per_key_by_mode:
+            return self.optimal_concurrent_per_key_by_mode[mode_value]
+        if self.optimal_concurrent_per_key is not None:
+            return self.optimal_concurrent_per_key
+        if self.rotation_mode == RotationMode.BALANCED:
+            return DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED
+        return DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL
+
+    def get_effective_optimal_concurrent(self, priority: int) -> int:
+        """Get optimal concurrency for a credential priority."""
+        base = self.get_base_optimal_concurrent()
+        if base <= 0:
+            return -1
+        multiplier = self.optimal_priority_multipliers.get(priority, 1)
+        return base * multiplier
+
+    def get_base_max_concurrent(self) -> int:
+        """Get the mode-aware base hard concurrency ceiling."""
+        mode_value = self.rotation_mode.value
+        if mode_value in self.max_concurrent_per_key_by_mode:
+            return self.max_concurrent_per_key_by_mode[mode_value]
+        if self.max_concurrent_per_key is not None:
+            return self.max_concurrent_per_key
+        if self.rotation_mode == RotationMode.BALANCED:
+            return DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED
+        return DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL
 
 
 # =============================================================================
@@ -589,6 +634,39 @@ def load_provider_usage_config(
                 k: dict(v)
                 for k, v in plugin_class.default_priority_multipliers_by_mode.items()
             }
+
+        if hasattr(plugin_class, "default_max_concurrent_per_key"):
+            config.max_concurrent_per_key = plugin_class.default_max_concurrent_per_key
+
+        if hasattr(plugin_class, "default_optimal_concurrent_per_key"):
+            config.optimal_concurrent_per_key = (
+                plugin_class.default_optimal_concurrent_per_key
+            )
+
+        if hasattr(plugin_class, "default_optimal_concurrent_per_key_balanced"):
+            value = plugin_class.default_optimal_concurrent_per_key_balanced
+            if value is not None:
+                config.optimal_concurrent_per_key_by_mode["balanced"] = value
+
+        if hasattr(plugin_class, "default_optimal_concurrent_per_key_sequential"):
+            value = plugin_class.default_optimal_concurrent_per_key_sequential
+            if value is not None:
+                config.optimal_concurrent_per_key_by_mode["sequential"] = value
+
+        if hasattr(plugin_class, "default_max_concurrent_per_key_balanced"):
+            value = plugin_class.default_max_concurrent_per_key_balanced
+            if value is not None:
+                config.max_concurrent_per_key_by_mode["balanced"] = value
+
+        if hasattr(plugin_class, "default_max_concurrent_per_key_sequential"):
+            value = plugin_class.default_max_concurrent_per_key_sequential
+            if value is not None:
+                config.max_concurrent_per_key_by_mode["sequential"] = value
+
+        if hasattr(plugin_class, "default_optimal_priority_multipliers"):
+            config.optimal_priority_multipliers = dict(
+                plugin_class.default_optimal_priority_multipliers
+            )
 
         # Sequential fallback multiplier
         if hasattr(plugin_class, "default_sequential_fallback_multiplier"):
@@ -690,6 +768,50 @@ def load_provider_usage_config(
             config.sequential_fallback_multiplier = int(env_fallback)
         except ValueError:
             pass
+
+    env_optimal = os.getenv(f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}")
+    if env_optimal:
+        try:
+            parsed_optimal = int(env_optimal)
+            config.optimal_concurrent_per_key = (
+                -1 if parsed_optimal <= 0 else parsed_optimal
+            )
+        except ValueError:
+            pass
+
+    env_max = os.getenv(f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}")
+    if env_max:
+        try:
+            parsed_max = int(env_max)
+            config.max_concurrent_per_key = -1 if parsed_max <= 0 else parsed_max
+        except ValueError:
+            pass
+
+    for mode in ("balanced", "sequential"):
+        suffix = mode.upper()
+        env_mode_optimal = os.getenv(
+            f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}_{suffix}"
+        )
+        if env_mode_optimal:
+            try:
+                parsed = int(env_mode_optimal)
+                config.optimal_concurrent_per_key_by_mode[mode] = (
+                    -1 if parsed <= 0 else parsed
+                )
+            except ValueError:
+                pass
+
+        env_mode_max = os.getenv(
+            f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}_{suffix}"
+        )
+        if env_mode_max:
+            try:
+                parsed = int(env_mode_max)
+                config.max_concurrent_per_key_by_mode[mode] = (
+                    -1 if parsed <= 0 else parsed
+                )
+            except ValueError:
+                pass
 
     # Fair cycle enabled from env
     env_fc = os.getenv(f"FAIR_CYCLE_{provider_upper}")

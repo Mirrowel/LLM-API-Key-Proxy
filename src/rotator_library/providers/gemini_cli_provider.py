@@ -194,6 +194,16 @@ class GeminiCliProvider(
     # Others: Use sequential fallback (2x) or balanced default (1x)
     default_priority_multipliers = {1: 2, 2: 1}
 
+    # Gemini CLI's soft target and hard cap intentionally collide: it should
+    # rotate away at the same point where additional concurrency would be unsafe.
+    default_max_concurrent_per_key = 1
+    default_max_concurrent_per_key_balanced = 1
+    default_max_concurrent_per_key_sequential = 1
+    default_optimal_concurrent_per_key = 1
+    default_optimal_concurrent_per_key_balanced = 1
+    default_optimal_concurrent_per_key_sequential = 1
+    default_optimal_priority_multipliers = {1: 2, 2: 1}
+
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
     default_sequential_fallback_multiplier = 1

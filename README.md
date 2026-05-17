@@ -390,7 +390,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>⚙️ Advanced Configuration</b></summary>
 
 - **Model whitelists/blacklists** with wildcard support
-- **Per-provider concurrency limits** (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`)
+- **Per-provider concurrency controls** (`OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` and `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`)
 - **Rotation modes** — balanced (distribute load) or sequential (use until exhausted)
 - **Priority multipliers** — higher concurrency for paid credentials
 - **Model quota groups** — shared cooldowns for related models
@@ -448,7 +448,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | Pattern | Description | Example |
 |---------|-------------|---------|
 | `<PROVIDER>_API_KEY_<N>` | API key for provider | `GEMINI_API_KEY_1` |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Concurrent request limit | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3` |
+| `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Soft spread-before-stacking target | `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI=1` |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Hard concurrent request ceiling (`<=0` means unlimited) | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=-1` |
 | `ROTATION_MODE_<PROVIDER>` | `balanced` or `sequential` | `ROTATION_MODE_GEMINI=sequential` |
 | `IGNORE_MODELS_<PROVIDER>` | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*` |
 | `WHITELIST_MODELS_<PROVIDER>` | Whitelist (overrides blacklist) | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro` |
@@ -503,15 +504,27 @@ WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
 ### Concurrency Limits
 
 ```env
-# Allow 3 concurrent requests per OpenAI key
-MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3
+# Balanced mode defaults to optimal=1 and max=-1, so it spreads first
+# but will stack on busy keys instead of blocking when every key is busy.
+ROTATION_MODE_OPENAI=balanced
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI=1
+MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=-1
 
-# Default is 1 request/key unless a provider overrides it.
-MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=1
+# Sequential mode defaults to optimal=-1 and max=-1 for sticky/unlimited use.
+ROTATION_MODE_GEMINI=sequential
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_GEMINI=-1
+MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=-1
 
-# 0 or any negative value means unlimited concurrency for that provider.
-MAX_CONCURRENT_REQUESTS_PER_KEY_DEEPSEEK=-1
+# Constrained providers can set optimal and max to the same value.
+MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI_CLI=1
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_GEMINI_CLI=1
+
+# Mode-specific forms override provider-wide values only for that mode.
+MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI_BALANCED=-1
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI_BALANCED=1
 ```
+
+`optimal` is a soft target used for capacity phases: the rotator prefers credentials below optimal, then stacks on healthy credentials when no below-optimal credential remains. `max` is the hard safety ceiling; `0` or any negative value means unlimited.
 
 ### Rotation Modes
 
@@ -525,7 +538,7 @@ ROTATION_MODE_OPENAI=balanced
 
 ### Priority Multipliers
 
-Paid credentials can handle more concurrent requests:
+Paid credentials can handle more concurrent requests. Legacy priority multipliers apply to hard max concurrency; provider-specific optimal multipliers can also raise the soft target where supported:
 
 ```env
 # Priority 1: 10x concurrency

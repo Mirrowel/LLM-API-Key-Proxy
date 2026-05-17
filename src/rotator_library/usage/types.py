@@ -13,7 +13,10 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
-from ..core.constants import DEFAULT_MAX_CONCURRENT_PER_KEY
+from ..core.constants import (
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY,
+)
 
 if TYPE_CHECKING:
     from .config import WindowDefinition
@@ -332,6 +335,8 @@ class CredentialState:
 
     # Active requests (for concurrent request limiting)
     active_requests: int = 0
+    # Soft target for selection. Values <= 0 mean no soft preference.
+    optimal_concurrent: int = DEFAULT_OPTIMAL_CONCURRENT_PER_KEY
     # Values <= 0 mean unlimited.
     max_concurrent: int = DEFAULT_MAX_CONCURRENT_PER_KEY
 

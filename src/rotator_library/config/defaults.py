@@ -55,9 +55,20 @@ DEFAULT_TIER_PRIORITY: int = 10
 DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER: int = 1
 
 # Default maximum concurrent requests per credential.
-# Providers can override this with default_max_concurrent_per_key.
+# Providers can override this with default_max_concurrent_per_key or the
+# mode-specific variants below.
 # Values <= 0 mean unlimited.
-DEFAULT_MAX_CONCURRENT_PER_KEY: int = 1
+DEFAULT_MAX_CONCURRENT_PER_KEY: int = -1
+DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED: int = -1
+DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL: int = -1
+
+# Default optimal concurrent requests per credential.
+# This is a soft selection preference, not a hard block. Balanced mode spreads
+# load before stacking; sequential mode sticks unless a provider overrides it.
+# Values <= 0 mean no soft preference.
+DEFAULT_OPTIMAL_CONCURRENT_PER_KEY: int = -1
+DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED: int = 1
+DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL: int = -1
 
 # =============================================================================
 # FAIR CYCLE ROTATION DEFAULTS

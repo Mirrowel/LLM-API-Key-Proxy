@@ -6,8 +6,8 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
 -   **Anthropic API Compatibility**: Built-in translation layer (`anthropic_compat`) enables Anthropic API clients (like Claude Code) to use any supported provider.
--   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. The base default is 1 request per key unless a provider overrides it; values can be changed with `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`, and `0` or negative values mean unlimited.
--   **Smart Key Management**: Selects the optimal key for each request using a tiered, model-aware locking strategy to maximize availability while preserving provider-side cache locality.
+-   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` is the soft spread-before-stacking target, while `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` is the hard safety ceiling. Balanced mode defaults to optimal=1/max=unlimited; sequential defaults to sticky/unlimited. `0` or negative values mean unlimited.
+-   **Smart Key Management**: Selects the optimal key for each request using a capacity-phase, model-aware locking strategy to maximize availability while preserving provider-side cache locality.
 -   **Configurable Rotation Strategy**: Sequential selection is the default. Balanced selection can be enabled for providers where even distribution is preferred.
 -   **Deadline-Driven Requests**: A global timeout ensures that no request, including all retries and key selections, exceeds a specified time limit.
 -   **OAuth & API Key Support**: Built-in support for standard API keys and complex OAuth flows.
