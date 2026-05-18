@@ -189,19 +189,19 @@ class GeminiCliProvider(
 
     # Priority-based concurrency multipliers
     # Tier priority structure mirrors the shared Google OAuth priority helpers.
-    # Priority 1 (paid ultra): 5x concurrent requests
-    # Priority 2 (standard paid): 3x concurrent requests
+    # Priority 1 (paid ultra): 4 concurrent (base 2 * 2x)
+    # Priority 2 (standard paid): 2 concurrent (base 2 * 1x)
     # Others: Use sequential fallback (2x) or balanced default (1x)
     default_priority_multipliers = {1: 2, 2: 1}
 
     # Gemini CLI's soft target and hard cap intentionally collide: it should
     # rotate away at the same point where additional concurrency would be unsafe.
-    default_max_concurrent_per_key = 1
-    default_max_concurrent_per_key_balanced = 1
-    default_max_concurrent_per_key_sequential = 1
-    default_optimal_concurrent_per_key = 1
-    default_optimal_concurrent_per_key_balanced = 1
-    default_optimal_concurrent_per_key_sequential = 1
+    default_max_concurrent_per_key = 2
+    default_max_concurrent_per_key_balanced = 2
+    default_max_concurrent_per_key_sequential = 2
+    default_optimal_concurrent_per_key = 2
+    default_optimal_concurrent_per_key_balanced = 2
+    default_optimal_concurrent_per_key_sequential = 2
     default_optimal_priority_multipliers = {1: 2, 2: 1}
 
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
