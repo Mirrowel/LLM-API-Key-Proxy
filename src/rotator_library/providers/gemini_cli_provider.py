@@ -523,6 +523,27 @@ class GeminiCliProvider(
         # Fallback to random UUID if no user message found
         return str(uuid.uuid4())
 
+    def _extract_text_content(self, content: Any) -> str:
+        """Extract text from OpenAI string or multi-part message content."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text"):
+                        parts.append(str(item["text"]))
+                    elif item.get("text"):
+                        parts.append(str(item["text"]))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                return str(text)
+        return ""
+
     def _get_gemini_cli_request_headers(self, model: str) -> Dict[str, str]:
         """
         Build request headers matching native gemini-cli client.
@@ -659,7 +680,9 @@ class GeminiCliProvider(
 
         # Separate system prompt from other messages
         if messages and messages[0].get("role") == "system":
-            system_prompt_content = messages.pop(0).get("content", "")
+            system_prompt_content = self._extract_text_content(
+                messages.pop(0).get("content", "")
+            )
             if system_prompt_content:
                 system_instruction = {
                     "role": "user",
@@ -1427,10 +1450,11 @@ class GeminiCliProvider(
             # Prepend to existing system instruction
             existing_parts = existing_system.get("parts", [])
             if existing_parts and existing_parts[0].get("text"):
+                existing_text = self._extract_text_content(existing_parts[0].get("text"))
                 existing_parts[0]["text"] = (
                     self._gemini3_system_instruction
                     + "\n\n"
-                    + existing_parts[0]["text"]
+                    + existing_text
                 )
             else:
                 existing_parts.insert(0, {"text": self._gemini3_system_instruction})

@@ -2667,16 +2667,73 @@ class AntigravityProvider(
                 parts.append({"text": content})
         elif isinstance(content, list):
             for item in content:
+                if isinstance(item, str):
+                    if item:
+                        parts.append({"text": item})
+                    continue
+                if not isinstance(item, dict):
+                    continue
                 if item.get("type") == "text":
                     text = item.get("text", "")
                     if text:
-                        parts.append({"text": text})
+                        parts.append({"text": self._extract_text_content(text)})
                 elif item.get("type") == "image_url":
                     image_part = self._parse_image_url(item.get("image_url", {}))
                     if image_part:
                         parts.append(image_part)
+                elif item.get("text"):
+                    parts.append({"text": self._extract_text_content(item.get("text"))})
+        elif isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                parts.append({"text": self._extract_text_content(text)})
 
         return parts
+
+    def _extract_text_content(self, content: Any) -> str:
+        """Extract text from string, dict, or OpenAI multi-part content."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                return str(text)
+        return ""
+
+    def _normalize_system_parts(
+        self, parts: Any, _strip_cache_control: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Ensure systemInstruction parts have string text values."""
+        normalized = []
+        if not isinstance(parts, list):
+            return normalized
+
+        for part in parts:
+            if isinstance(part, str):
+                if part:
+                    normalized.append({"text": part})
+                continue
+            if not isinstance(part, dict):
+                continue
+
+            new_part = dict(part)
+            if _strip_cache_control:
+                new_part.pop("cache_control", None)
+            if "text" in new_part:
+                text = self._extract_text_content(new_part.get("text"))
+                if not text:
+                    continue
+                new_part["text"] = text
+            normalized.append(new_part)
+        return normalized
 
     def _parse_image_url(self, image_url: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse image URL into Gemini inlineData format."""
@@ -3592,7 +3649,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             existing_sys_inst = {}
             original_key = "systemInstruction"  # Default to camelCase
 
-        existing_parts = existing_sys_inst.get("parts", [])
+        existing_parts = self._normalize_system_parts(
+            existing_sys_inst.get("parts", []), _strip_cache_control=True
+        )
 
         # Always normalize to camelCase (Antigravity API requirement)
         target_key = "systemInstruction"
@@ -4509,11 +4568,17 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if "system_instruction" in payload:
             existing = payload["system_instruction"]
             if isinstance(existing, dict) and "parts" in existing:
+                existing["parts"] = self._normalize_system_parts(
+                    existing.get("parts", []), _strip_cache_control=True
+                )
                 existing["parts"].insert(0, instruction_part)
             else:
                 payload["system_instruction"] = {
                     "role": "user",
-                    "parts": [instruction_part, {"text": str(existing)}],
+                    "parts": [
+                        instruction_part,
+                        {"text": self._extract_text_content(existing) or str(existing)},
+                    ],
                 }
         else:
             payload["system_instruction"] = {
