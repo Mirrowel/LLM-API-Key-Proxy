@@ -114,6 +114,7 @@ class TransactionLogger:
         "model",
         "streaming",
         "api_format",
+        "credential_masked",
         "_dir_available",
         "_context",
     )
@@ -150,6 +151,7 @@ class TransactionLogger:
 
         self.model = _sanitize_name(model_name)
         self.streaming = False
+        self.credential_masked: Optional[str] = None
         self.log_dir: Optional[Path] = None
         self._dir_available = False
         self._context: Optional[TransactionContext] = None
@@ -354,6 +356,7 @@ class TransactionLogger:
             "provider": self.provider,
             "model": model,
             "streaming": self.streaming,
+            "credential_masked": self.credential_masked,
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,

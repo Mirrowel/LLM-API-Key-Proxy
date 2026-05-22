@@ -18,7 +18,7 @@ import {
   type WindowInfo,
   type ModelUsageEntry,
 } from "@/api/quota"
-import { formatNumber, formatCost, getQuotaColor, formatWindowLabel, formatQuotaValue, formatTimeRemaining } from "@/lib/utils"
+import { formatNumber, formatCost, getQuotaColor, formatWindowLabel, formatQuotaValue, formatTimeRemaining, isXaiPercentOnlyQuotaGroup, formatXaiQuotaValueStr, formatPercentUsedFromRemaining } from "@/lib/utils"
 
 function shortenModelName(model: string): string {
   const m = model.toLowerCase().replace(/^(models\/|publishers\/google\/models\/)/, "")
@@ -218,7 +218,7 @@ export function Quota() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <QuotaSummaryBars quotaGroups={p.quota_groups} credentials={p.credentials} />
+                      <QuotaSummaryBars providerName={name} quotaGroups={p.quota_groups} credentials={p.credentials} />
                     </TableCell>
                     <TableCell className="text-right">{formatNumber(requests)}</TableCell>
                     <TableCell className="text-right">
@@ -260,8 +260,28 @@ function SummaryCard({ label, value }: { label: string; value: string | number }
   )
 }
 
-function QuotaSummaryBars({ quotaGroups, credentials }: { quotaGroups?: Record<string, QuotaGroup>; credentials?: Record<string, CredentialStats> }) {
-  const bars: { label: string; key: string; pct: number; valueStr: string }[] = []
+function QuotaSummaryBars({
+  providerName,
+  quotaGroups,
+  credentials,
+}: {
+  providerName?: string
+  quotaGroups?: Record<string, QuotaGroup>
+  credentials?: Record<string, CredentialStats>
+}) {
+  const bars: { label: string; key: string; pct: number; valueStr: string; pctSuffix?: string }[] = []
+
+  const xaiResetAt = (() => {
+    if (providerName !== "x-ai" || !credentials) return null
+    for (const c of Object.values(credentials)) {
+      const gu = c.group_usage?.["monthly-limit"]?.windows
+      if (!gu) continue
+      for (const w of Object.values(gu)) {
+        if (w.reset_at) return w.reset_at
+      }
+    }
+    return null
+  })()
 
   if (quotaGroups) {
     for (const [groupName, group] of Object.entries(quotaGroups)) {
@@ -270,10 +290,25 @@ function QuotaSummaryBars({ quotaGroups, credentials }: { quotaGroups?: Record<s
       const windowEntries = Object.entries(group.windows)
       for (const [windowName, win] of windowEntries) {
         if ((win.total_max ?? 0) === 0) continue
-        const label = windowEntries.length > 1 ? `${groupName}/${formatWindowLabel(windowName)}` : groupName
+        const label =
+          providerName === "x-ai" && groupName === "monthly-limit"
+            ? "SuperGrok credits"
+            : windowEntries.length > 1
+              ? `${groupName}/${formatWindowLabel(windowName)}`
+              : groupName
+        const percentOnly =
+          providerName != null && isXaiPercentOnlyQuotaGroup(providerName, groupName)
+        const valueStr = percentOnly
+          ? formatXaiQuotaValueStr(win.remaining_pct, xaiResetAt)
+          : `${formatQuotaValue(win.total_remaining, groupName)}/${formatQuotaValue(win.total_max, groupName)}`
         bars.push({
-          label, key: `${groupName}-${windowName}`, pct: win.remaining_pct ?? 0,
-          valueStr: `${formatQuotaValue(win.total_remaining, groupName)}/${formatQuotaValue(win.total_max, groupName)}`,
+          label,
+          key: `${groupName}-${windowName}`,
+          pct: win.remaining_pct ?? 0,
+          valueStr,
+          pctSuffix: percentOnly
+            ? formatPercentUsedFromRemaining(win.remaining_pct).replace(" used", "")
+            : undefined,
         })
       }
     }
@@ -333,7 +368,9 @@ function QuotaSummaryBars({ quotaGroups, credentials }: { quotaGroups?: Record<s
               className="h-1.5 flex-1"
               indicatorClassName={getQuotaColor(w.pct)}
             />
-            <span className="text-[10px] text-muted-foreground w-8 text-right">{w.pct.toFixed(0)}%</span>
+            <span className="text-[10px] text-muted-foreground w-10 text-right shrink-0">
+              {w.pctSuffix ?? `${w.pct.toFixed(0)}%`}
+            </span>
           </div>
         </div>
       ))}
@@ -418,16 +455,32 @@ function ProviderDetail({
                 .filter(([, group]) => Object.values(group.windows).some(w => (w.total_max ?? 0) > 0))
                 .map(([groupName, group]) => (
                 <div key={groupName}>
-                  <h4 className="text-sm font-medium mb-2">{groupName}</h4>
+                  <h4 className="text-sm font-medium mb-2">
+                    {isXaiPercentOnlyQuotaGroup(providerName, groupName) ? "SuperGrok credits" : groupName}
+                  </h4>
                   <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                     {(Object.entries(group.windows) as [string, WindowInfo][])
                       .filter(([, win]) => (win.total_max ?? 0) > 0)
                       .map(([windowName, win]) => (
                       <div key={windowName} className="space-y-1">
                         <div className="flex justify-between text-xs">
-                          <span>{Object.keys(group.windows).length > 1 ? formatWindowLabel(windowName) : groupName}</span>
                           <span>
-                            {formatQuotaValue(win.total_remaining, groupName)}/{formatQuotaValue(win.total_max, groupName)}
+                            {isXaiPercentOnlyQuotaGroup(providerName, groupName)
+                              ? "SuperGrok credits"
+                              : Object.keys(group.windows).length > 1
+                                ? formatWindowLabel(windowName)
+                                : groupName}
+                          </span>
+                          <span>
+                            {isXaiPercentOnlyQuotaGroup(providerName, groupName)
+                              ? formatXaiQuotaValueStr(
+                                  win.remaining_pct,
+                                  Object.values(provider.credentials ?? {})[0]?.group_usage?.[groupName]?.windows?.[windowName]?.reset_at ??
+                                    Object.values(provider.credentials ?? {}).flatMap(c =>
+                                      Object.values(c.group_usage?.[groupName]?.windows ?? {}),
+                                    )[0]?.reset_at,
+                                )
+                              : `${formatQuotaValue(win.total_remaining, groupName)}/${formatQuotaValue(win.total_max, groupName)}`}
                           </span>
                         </div>
                         <Progress
@@ -450,6 +503,7 @@ function ProviderDetail({
         {Object.entries(provider.credentials).map(([credId, cred]: [string, CredentialStats]) => (
           <CredentialCard
             key={credId}
+            providerName={providerName}
             cred={cred}
             viewMode={viewMode}
             showModels={expandedModels.has(credId)}
@@ -471,6 +525,7 @@ function resolveModelUsage(entry: ModelUsageEntry): { request_count: number; app
 }
 
 function CredentialCard({
+  providerName,
   cred,
   viewMode,
   showModels,
@@ -478,6 +533,7 @@ function CredentialCard({
   onForceRefresh,
   refreshing,
 }: {
+  providerName?: string
   cred: CredentialStats
   viewMode: "current" | "global"
   showModels: boolean
@@ -557,14 +613,29 @@ function CredentialCard({
                   .map(([windowName, win]) => {
                   const pct = win.limit > 0 ? ((win.remaining / win.limit) * 100) : 0
                   const windowCount = Object.keys(group.windows).length
-                  const resetStr = win.reset_at && (win.request_count > 0 || (group.cooldown_remaining ?? 0) > 0)
-                    ? formatTimeRemaining(win.reset_at)
-                    : null
+                  const percentOnly =
+                    providerName != null && isXaiPercentOnlyQuotaGroup(providerName, groupName)
+                  const resetStr =
+                    !percentOnly &&
+                    win.reset_at &&
+                    (win.request_count > 0 || (group.cooldown_remaining ?? 0) > 0)
+                      ? formatTimeRemaining(win.reset_at)
+                      : null
+                  const label =
+                    percentOnly
+                      ? "SuperGrok credits"
+                      : windowCount > 1
+                        ? `${groupName}/${formatWindowLabel(windowName)}`
+                        : groupName
                   return (
                     <div key={`${groupName}-${windowName}`} className="space-y-1">
                       <div className="flex justify-between text-[11px]">
-                        <span className="truncate">{windowCount > 1 ? `${groupName}/${formatWindowLabel(windowName)}` : groupName}</span>
-                        <span>{formatQuotaValue(win.remaining, groupName)}/{formatQuotaValue(win.limit, groupName)}</span>
+                        <span className="truncate">{label}</span>
+                        <span>
+                          {percentOnly
+                            ? formatXaiQuotaValueStr(pct, win.reset_at)
+                            : `${formatQuotaValue(win.remaining, groupName)}/${formatQuotaValue(win.limit, groupName)}`}
+                        </span>
                       </div>
                       <Progress
                         value={pct}

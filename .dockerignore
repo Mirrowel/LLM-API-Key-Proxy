@@ -22,9 +22,12 @@ ENV/
 
 # Build
 *.egg-info/
-dist/
 build/
 .eggs/
+
+# Web UI (only package.json, package-lock.json, and src/ are needed)
+webui/node_modules
+webui/dist
 
 # Logs (will be mounted as volume)
 logs/

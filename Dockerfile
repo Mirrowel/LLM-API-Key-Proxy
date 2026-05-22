@@ -1,4 +1,13 @@
-# Build stage
+# Web UI build stage
+FROM node:20-slim AS webui-builder
+
+WORKDIR /webui
+COPY webui/package.json webui/package-lock.json ./
+RUN npm ci
+COPY webui/ ./
+RUN npm run build
+
+# Python build stage
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
@@ -33,6 +42,9 @@ ENV PATH=/root/.local/bin:$PATH
 
 # Copy application code
 COPY src/ ./src/
+
+# Copy built web UI
+COPY --from=webui-builder /webui/dist ./webui/dist
 
 # Create directories for logs and oauth credentials
 RUN mkdir -p logs oauth_creds
