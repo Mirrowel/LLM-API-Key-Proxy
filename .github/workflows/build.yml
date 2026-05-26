@@ -181,7 +181,12 @@ jobs:
       id: version
       shell: bash
       run: |
-        sha=$(git rev-parse --short HEAD)
+        # Pin to a fixed length so build and release jobs compute the SAME
+        # short SHA. `git rev-parse --short` defaults to the minimum unique
+        # length in the local object DB, which can differ between runners
+        # (build jobs hit 7 chars, release job hit 8 in run 27859339250) and
+        # silently breaks the download-artifact pattern filter.
+        sha=$(git rev-parse --short=7 HEAD)
         echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Prepare files for artifact
@@ -229,7 +234,10 @@ jobs:
     - name: Get short SHA
       id: get_sha
       shell: bash
-      run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      # MUST stay in sync with the build job's Get short SHA step (see
+      # comment there). Both jobs pin `--short=7` so the artifact name
+      # uploaded by build matches the download pattern used here.
+      run: echo "sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
 
     - name: Generate Build Version
       id: version
@@ -263,6 +271,27 @@ jobs:
       with:
         path: release-assets
         pattern: proxy-app-build-*-${{ steps.get_sha.outputs.sha }}
+
+    - name: Verify downloaded artifacts
+      shell: bash
+      run: |
+        # Defensive check: download-artifact@v4 exits 0 even when the pattern
+        # filter matches zero artifacts, leaving release-assets/ empty or
+        # missing. This caused run 27859339250 to fail later with a cryptic
+        # "find: 'release-assets': No such file or directory" — fail loudly
+        # here instead so the cause is obvious.
+        if [ ! -d release-assets ] || [ -z "$(find release-assets -name 'proxy_app*' -type f 2>/dev/null | head -1)" ]; then
+          echo "::error::No build artifacts matched pattern proxy-app-build-*-${{ steps.get_sha.outputs.sha }}"
+          echo "release-assets directory contents (if any):"
+          ls -laR release-assets/ 2>&1 || echo "(no release-assets directory)"
+          echo "Computed short SHA on this runner: ${{ steps.get_sha.outputs.sha }}"
+          echo "Available artifacts:"
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+            --jq '.artifacts[] | "  - \(.name) (id=\(.id))"'
+          exit 1
+        fi
+        echo "✅ Found build artifacts:"
+        ls release-assets/proxy-app-build-*/
 
     - name: Archive release files
       id: archive
