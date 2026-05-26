@@ -220,6 +220,12 @@ jobs:
       shell: bash
       run: git fetch --prune --tags
 
+    - name: Configure upstream remote
+      shell: bash
+      run: |
+        git remote add upstream https://github.com/Mirrowel/LLM-API-Key-Proxy.git || true
+        git fetch upstream dev --quiet || true
+
     - name: Get short SHA
       id: get_sha
       shell: bash
@@ -345,130 +351,220 @@ jobs:
         echo "✅ cliff.toml:"
         head -20 .github/cliff.toml
 
+    - name: Generate Incremental Diff
+      id: incremental
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        BRANCH_NAME=${{ github.ref_name }}
+
+        # Ensure we have the upstream branch fetched
+        git fetch upstream dev --quiet || true
+
+        # Resolve upstream merge-base
+        UPSTREAM_REF=$(git merge-base upstream/dev HEAD 2>/dev/null || true)
+
+        # Export upstream ref for the release body markers
+        echo "upstream_ref=${UPSTREAM_REF:-}" >> $GITHUB_OUTPUT
+
+        # Compute current tree hash (represents entire working tree content)
+        CURRENT_TREE=$(git rev-parse HEAD^{tree})
+        echo "build_tree=$CURRENT_TREE" >> $GITHUB_OUTPUT
+        echo "📦 Current tree hash: $CURRENT_TREE"
+
+        # Try to fetch the previous release body for incremental diff
+        echo "Fetching previous release for branch '$BRANCH_NAME'..."
+        PREV_RELEASE=$(gh release view --repo "${{ github.repository }}" \
+          --json body,tagName \
+          --jq '.' \
+          "$(gh release list --repo "${{ github.repository }}" --limit 50 --json tagName \
+            | jq -r '.[].tagName' | grep "^$BRANCH_NAME/build-" | head -1)" 2>/dev/null || echo '{}')
+
+        PREV_BODY=$(echo "$PREV_RELEASE" | jq -r '.body // ""')
+
+        if [ -n "$UPSTREAM_REF" ] && [ -n "$PREV_BODY" ]; then
+          # Extract markers from previous release (build_tree with fork_state fallback)
+          PREV_TREE=$(echo "$PREV_BODY" | grep -oP '(?<=<!-- build_tree: ).*?(?= -->)' | head -n 1 || true)
+          PREV_UPSTREAM=$(echo "$PREV_BODY" | grep -oP '(?<=<!-- upstream_base: ).*?(?= -->)' | head -n 1 || true)
+
+          echo "📦 Previous tree hash: ${PREV_TREE:-'(none — first tree-based build)'}"
+          echo "📦 Previous upstream:  ${PREV_UPSTREAM:-'(none)'}"
+
+          # Initialize incremental notes
+          > incremental.md
+          HAS_CHANGES=false
+
+          # ═══════════════════════════════════════════════════════════
+          # 1. TREE-BASED FILE DIFF (primary change detection)
+          # ═══════════════════════════════════════════════════════════
+          if [ -n "$PREV_TREE" ] && [ "$PREV_TREE" != "$CURRENT_TREE" ]; then
+            echo "🔍 Trees differ — computing file-level diff..."
+
+            # Get list of changed files between tree objects
+            CHANGED_FILES=$(git diff-tree -r --name-only "$PREV_TREE" "$CURRENT_TREE" 2>/dev/null || true)
+
+            if [ -n "$CHANGED_FILES" ]; then
+              CHANGED_COUNT=$(echo "$CHANGED_FILES" | wc -l)
+              echo "   Found $CHANGED_COUNT changed files"
+
+              # Build a temporary file mapping each fork commit to its changed files
+              > /tmp/modified_commits.md
+              MODIFIED_COUNT=0
+
+              # Walk each commit in the fork stack and check for overlap with changed files
+              while read -r hash subject; do
+                # Get files owned by this commit
+                COMMIT_FILES=$(git diff-tree --no-commit-id --name-only -r "$hash" 2>/dev/null || true)
+                [ -z "$COMMIT_FILES" ] && continue
+
+                # Find intersection with changed files
+                MATCHING_FILES=$(comm -12 <(echo "$COMMIT_FILES" | sort) <(echo "$CHANGED_FILES" | sort) 2>/dev/null || true)
+
+                if [ -n "$MATCHING_FILES" ]; then
+                  MATCH_COUNT=$(echo "$MATCHING_FILES" | wc -l)
+                  MODIFIED_COUNT=$((MODIFIED_COUNT + 1))
+
+                  echo "- **${subject}**" >> /tmp/modified_commits.md
+
+                  # List up to 5 files, then summarize the rest
+                  FILE_NUM=0
+                  while read -r filepath; do
+                    FILE_NUM=$((FILE_NUM + 1))
+                    if [ "$FILE_NUM" -le 5 ]; then
+                      echo "  - \`$filepath\`" >> /tmp/modified_commits.md
+                    fi
+                  done <<< "$MATCHING_FILES"
+
+                  if [ "$MATCH_COUNT" -gt 5 ]; then
+                    REMAINING=$((MATCH_COUNT - 5))
+                    echo "  - ... and $REMAINING more" >> /tmp/modified_commits.md
+                  fi
+                fi
+              done < <(git log --format="%H %s" "$UPSTREAM_REF"..HEAD 2>/dev/null)
+
+              if [ "$MODIFIED_COUNT" -gt 0 ]; then
+                echo "### 🔧 Modified" >> incremental.md
+                cat /tmp/modified_commits.md >> incremental.md
+                echo "" >> incremental.md
+                HAS_CHANGES=true
+              fi
+
+              rm -f /tmp/modified_commits.md
+            fi
+          elif [ -n "$PREV_TREE" ] && [ "$PREV_TREE" = "$CURRENT_TREE" ]; then
+            echo "✅ Trees are identical — no file changes"
+          else
+            echo "ℹ️ No previous tree hash found (first tree-based build)"
+            echo "_First build with tree-based change tracking — incremental diffs will appear starting next build._" >> incremental.md
+            echo "" >> incremental.md
+            HAS_CHANGES=true
+          fi
+
+          # ═══════════════════════════════════════════════════════════
+          # 2. UPSTREAM SYNC ADVANCEMENT
+          # ═══════════════════════════════════════════════════════════
+          if [ -n "$PREV_UPSTREAM" ] && [ "$PREV_UPSTREAM" != "$UPSTREAM_REF" ]; then
+            UPSTREAM_COMMITS=$(git log --oneline --no-merges "$PREV_UPSTREAM".."$UPSTREAM_REF" 2>/dev/null || true)
+            if [ -n "$UPSTREAM_COMMITS" ]; then
+              echo "### ⬆️ Upstream Sync" >> incremental.md
+              echo "Incorporated $(echo "$UPSTREAM_COMMITS" | wc -l) commits from upstream/dev:" >> incremental.md
+              echo "$UPSTREAM_COMMITS" | while read -r commit; do
+                echo "- $commit" >> incremental.md
+              done
+              echo "" >> incremental.md
+              HAS_CHANGES=true
+            fi
+          fi
+
+          if [ "$HAS_CHANGES" = "false" ]; then
+            echo "_No file changes detected since the last build._" >> incremental.md
+            echo "" >> incremental.md
+          fi
+
+          echo "has_incremental=true" >> $GITHUB_OUTPUT
+          echo "✅ Incremental diff generated"
+        else
+          echo "ℹ️ First build or no upstream ref - skipping incremental diff"
+          echo "has_incremental=false" >> $GITHUB_OUTPUT
+        fi
+
     - name: Generate Changelog
       id: changelog
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        BRANCH_NAME=${{ github.ref_name }}
-        if [ -n "${{ github.event.inputs.manual_previous_tag }}" ]; then
-          echo "Manual tag provided: ${{ github.event.inputs.manual_previous_tag }}"
-          LAST_TAG="${{ github.event.inputs.manual_previous_tag }}"
-        else
-          echo "No manual tag, searching for latest tag on branch '$BRANCH_NAME'..."
-          
-          # Prioritize finding the latest tag with the new format (e.g., build-20250707-1-...).
-          echo "Attempting to find latest tag with new format..."
-          LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*" 2>/dev/null || true)
-          
-          # If no new format tag is found, fall back to the old, more generic pattern.
-          if [ -z "$LAST_TAG" ]; then
-            echo "No new format tag found. Falling back to search for any older build tag..."
-            LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || echo "")
-          fi
-          
-          # ═══════════════════════════════════════════════════════════
-          # PARENT BRANCH FALLBACK: Find closest parent branch's tag
-          # ═══════════════════════════════════════════════════════════
-          if [ -z "$LAST_TAG" ]; then
-            echo ""
-            echo "⚠️ No tag found for '$BRANCH_NAME', searching parent branches..."
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            
-            # Use FALLBACK_BRANCHES from config
-            FALLBACK_BRANCHES="${{ env.FALLBACK_BRANCHES }}"
-            BEST_TAG=""
-            BEST_DISTANCE=999999
-            BEST_PARENT=""
-            
-            for PARENT in $FALLBACK_BRANCHES; do
-              # Skip if same as current branch
-              [ "$PARENT" == "$BRANCH_NAME" ] && continue
-              
-              # Check if branch exists (remote first, then local)
-              if git rev-parse --verify "origin/$PARENT" >/dev/null 2>&1; then
-                BRANCH_REF="origin/$PARENT"
-              elif git rev-parse --verify "$PARENT" >/dev/null 2>&1; then
-                BRANCH_REF="$PARENT"
-              else
-                echo "   $PARENT: doesn't exist, skipping"
-                continue
-              fi
-              
-              # Find merge-base (common ancestor)
-              MERGE_BASE=$(git merge-base HEAD "$BRANCH_REF" 2>/dev/null || true)
-              if [ -z "$MERGE_BASE" ]; then
-                echo "   $PARENT: no common ancestor, skipping"
-                continue
-              fi
-              
-              # Count commits from merge-base to HEAD (distance = how far we've diverged)
-              DISTANCE=$(git rev-list --count "$MERGE_BASE"..HEAD 2>/dev/null || echo "999999")
-              
-              # Find tag at or before merge-base
-              PARENT_TAG=$(git describe --tags --abbrev=0 --match="$PARENT/build-*" "$MERGE_BASE" 2>/dev/null || true)
-              
-              if [ -n "$PARENT_TAG" ]; then
-                echo "   $PARENT: found $PARENT_TAG (distance: $DISTANCE commits)"
-                if [ "$DISTANCE" -lt "$BEST_DISTANCE" ]; then
-                  BEST_DISTANCE=$DISTANCE
-                  BEST_TAG=$PARENT_TAG
-                  BEST_PARENT=$PARENT
-                fi
-              else
-                echo "   $PARENT: no build tag found at merge-base"
-              fi
-            done
-            
-            if [ -n "$BEST_TAG" ]; then
-              LAST_TAG="$BEST_TAG"
-              echo ""
-              echo "✅ Using parent tag: $LAST_TAG (from '$BEST_PARENT', $BEST_DISTANCE commits ago)"
-            fi
-          fi
-          
-          # ═══════════════════════════════════════════════════════════
-          # ULTIMATE FALLBACK: Any ancestor tag
-          # ═══════════════════════════════════════════════════════════
-          if [ -z "$LAST_TAG" ]; then
-            echo ""
-            echo "🔍 No parent branch tag found, trying any ancestor tag..."
-            LAST_TAG=$(git describe --tags --abbrev=0 --match="*/build-*" HEAD 2>/dev/null || true)
-            if [ -n "$LAST_TAG" ]; then
-              echo "✅ Found ancestor tag: $LAST_TAG"
-            fi
-          fi
-        fi
-        
-        echo "✅ Using tag: $LAST_TAG"
-        
-        if [ -n "$LAST_TAG" ]; then
-          # Standard run: A previous tag was found.
-          echo "🔍 Generating changelog for range: $LAST_TAG..HEAD"
+        UPSTREAM_REF="${{ steps.incremental.outputs.upstream_ref }}"
+
+        if [ -n "$UPSTREAM_REF" ]; then
+          echo "Generating fork changelog against upstream/dev ($UPSTREAM_REF)"
           git-cliff \
             --config .github/cliff.toml \
             --github-repo "${{ github.repository }}" \
             --strip all \
             --output changelog.md \
-            "$LAST_TAG..HEAD"
+            "$UPSTREAM_REF..HEAD"
         else
-          # First run: No previous tag found.
-          echo "⚠️ No previous build tag found. Generating initial release changelog."
-          echo "## Initial Release" > changelog.md
-          echo "" >> changelog.md
-          echo "This is the first automated build release using this format. Future releases will contain a detailed list of changes." >> changelog.md
+          # Fallback: no upstream remote (first-party builds on upstream repo)
+          echo "No upstream remote. Using previous tag."
+          BRANCH_NAME=${{ github.ref_name }}
+          LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ]; then
+            git-cliff \
+              --config .github/cliff.toml \
+              --github-repo "${{ github.repository }}" \
+              --strip all \
+              --output changelog.md \
+              "$LAST_TAG..HEAD"
+          else
+            echo "## Initial Release" > changelog.md
+            echo "" >> changelog.md
+            echo "This is the first automated build release using this format." >> changelog.md
+          fi
         fi
 
-        # This part of the script remains to handle the output
+        # Prepend incremental diff if available
+        if [ "${{ steps.incremental.outputs.has_incremental }}" = "true" ] && [ -s incremental.md ]; then
+          RANGE_REF=""
+          if [ -n "$UPSTREAM_REF" ]; then
+            RANGE_REF="$UPSTREAM_REF"
+          else
+            BRANCH_NAME=${{ github.ref_name }}
+            LAST_TAG=$(git describe --tags --abbrev=0 --match="$BRANCH_NAME/build-*" 2>/dev/null || true)
+            if [ -n "$LAST_TAG" ]; then
+              RANGE_REF="$LAST_TAG"
+            fi
+          fi
+
+          if [ -n "$RANGE_REF" ]; then
+            COMMIT_COUNT=$(git rev-list --count "$RANGE_REF"..HEAD 2>/dev/null || echo "0")
+          else
+            COMMIT_COUNT="0"
+          fi
+
+          {
+            echo "<details>"
+            echo "<summary><b>📋 Full Fork Stack Delta ($COMMIT_COUNT changes)</b></summary>"
+            echo ""
+            cat changelog.md
+            echo ""
+            echo "</details>"
+          } > changelog_details.md
+
+          cat incremental.md changelog_details.md > changelog_combined.md
+          mv changelog_combined.md changelog.md
+          rm -f changelog_details.md
+        fi
+
         if [ -s changelog.md ]; then
           echo "✅ Changelog generated successfully"
           CHANGELOG_B64=$(base64 -w 0 changelog.md)
           echo "changelog_b64=$CHANGELOG_B64" >> $GITHUB_OUTPUT
           echo "has_changelog=true" >> $GITHUB_OUTPUT
-          echo "previous_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          echo "previous_tag=${UPSTREAM_REF:-}" >> $GITHUB_OUTPUT
+          echo "upstream_ref_short=$(echo "$UPSTREAM_REF" | cut -c1-7)" >> $GITHUB_OUTPUT
         else
-          # This is now a true error condition
           echo "❌ Critical error: Changelog is empty after generation."
           echo "has_changelog=false" >> $GITHUB_OUTPUT
         fi
@@ -811,114 +907,29 @@ jobs:
 
     - name: Create Release
       shell: bash
-      run: |
-        # Prepare changelog content - prefer resolved version if available
-        if [ -n "${{ steps.resolve_usernames.outputs.changelog_b64 }}" ]; then
-          echo "${{ steps.resolve_usernames.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
-          CHANGELOG_CONTENT=$(cat decoded_changelog.md)
-        elif [ "${{ steps.changelog.outputs.has_changelog }}" == "true" ]; then
-          echo "${{ steps.changelog.outputs.changelog_b64 }}" | base64 -d > decoded_changelog.md
-          CHANGELOG_CONTENT=$(cat decoded_changelog.md)
-        else
-          CHANGELOG_CONTENT="No significant changes detected in this release."
-        fi
-
-        # Prepare the full release notes in a temporary file
-        if [ -n "${{ steps.changelog.outputs.previous_tag }}" ]; then
-          CHANGELOG_URL="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.release_tag }}"
-        else
-          CHANGELOG_URL=""
-        fi
-
-        # Generate file descriptions table from FILE_DESCRIPTIONS config
-        FILE_TABLE="| File | Description |
-        |------|-------------|"
-        while IFS='|' read -r filename description; do
-          # Skip empty lines
-          if [ -n "$filename" ] && [ -n "$description" ]; then
-            FILE_TABLE="$FILE_TABLE
-        | \`$filename\` | $description |"
-          fi
-        done <<< "${{ env.FILE_DESCRIPTIONS }}"
-
-        # List archives
-        WINDOWS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Windows')
-        LINUX_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'Linux')
-        MACOS_ARCHIVE=$(echo "${{ steps.archive.outputs.ASSET_PATHS }}" | tr ' ' '\n' | grep 'macOS')
-        ARCHIVE_LIST="- **Windows**: \`$WINDOWS_ARCHIVE\`
-        - **Linux**: \`$LINUX_ARCHIVE\`
-        - **macOS**: \`$MACOS_ARCHIVE\`"
-
-        cat > releasenotes.md <<-EOF
-        ## Build Information
-        | Field | Value |
-        |-------|-------|
-        | 📦 **Version** | \`${{ steps.version.outputs.version }}\` |
-        | 💾 **Binary Size** | Win: \`${{ steps.metadata.outputs.win_build_size }}\`, Linux: \`${{ steps.metadata.outputs.linux_build_size }}\`, macOS: \`${{ steps.metadata.outputs.macos_build_size }}\` |
-        | 🔗 **Commit** | [\`${{ steps.get_sha.outputs.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
-        | 📅 **Build Date** | \`${{ steps.version.outputs.timestamp }}\` |
-        | ⚡ **Trigger** | \`${{ github.event_name }}\` |
-
-        ## 📋 What's Changed
-
-        $CHANGELOG_CONTENT
-
-        ### 📁 Included Files
-        Each OS-specific archive contains the following files:
-        $FILE_TABLE
-
-        ### 📦 Archives
-        $ARCHIVE_LIST
-
-        ## 🔗 Useful Links
-        - 📖 [Documentation](https://github.com/${{ github.repository }}/wiki)
-        - 🐛 [Report Issues](https://github.com/${{ github.repository }}/issues)
-        - 💬 [Discussions](https://github.com/${{ github.repository }}/discussions)
-        - 🌟 [Star this repo](https://github.com/${{ github.repository }}) if you find it useful!
-
-        ---
-        
-        > **Note**: This is an automated build release.
-
-        $CHANGELOG_URL
-        EOF
-
-        # Set release flags and notes based on the branch
-        CURRENT_BRANCH="${{ github.ref_name }}"
-        PRERELEASE_FLAG=""
-        LATEST_FLAG="--latest"
-        EXPERIMENTAL_NOTE=""
-
-        # Check if the current branch is in the stable branches list
-        if ! [[ ",${{ env.STABLE_BRANCHES }}," == *",$CURRENT_BRANCH,"* ]]; then
-          PRERELEASE_FLAG="--prerelease"
-          LATEST_FLAG="" # Do not mark non-stable branches as 'latest'
-          
-          # Generate experimental warning from template with placeholder substitution
-          EXPERIMENTAL_NOTE=$(echo '${{ env.EXPERIMENTAL_WARNING }}' | \
-            sed "s|{BRANCH}|$CURRENT_BRANCH|g" | \
-            sed "s|{VERSION}|${{ steps.version.outputs.version }}|g" | \
-            sed "s|{REPO}|${{ github.repository }}|g")
-        fi
-
-        # Prepend the experimental note if it exists
-        if [ -n "$EXPERIMENTAL_NOTE" ]; then
-          echo "$EXPERIMENTAL_NOTE" > releasenotes_temp.md
-          echo "" >> releasenotes_temp.md
-          cat releasenotes.md >> releasenotes_temp.md
-          mv releasenotes_temp.md releasenotes.md
-        fi
-        
-        # Create the release using the notes file
-        gh release create ${{ steps.version.outputs.release_tag }} \
-          --target ${{ github.sha }} \
-          --title "${{ steps.version.outputs.release_title }}" \
-          --notes-file releasenotes.md \
-          $LATEST_FLAG \
-          $PRERELEASE_FLAG \
-          ${{ steps.archive.outputs.ASSET_PATHS }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RESOLVED_CHANGELOG_B64: ${{ steps.resolve_usernames.outputs.changelog_b64 }}
+        HAS_CHANGELOG: ${{ steps.changelog.outputs.has_changelog }}
+        CHANGELOG_B64: ${{ steps.changelog.outputs.changelog_b64 }}
+        PREVIOUS_TAG: ${{ steps.changelog.outputs.previous_tag }}
+        RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        RELEASE_TITLE: ${{ steps.version.outputs.release_title }}
+        ASSET_PATHS: ${{ steps.archive.outputs.ASSET_PATHS }}
+        UPSTREAM_REF: ${{ steps.incremental.outputs.upstream_ref }}
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        WIN_SIZE: ${{ steps.metadata.outputs.win_build_size }}
+        LINUX_SIZE: ${{ steps.metadata.outputs.linux_build_size }}
+        MACOS_SIZE: ${{ steps.metadata.outputs.macos_build_size }}
+        SHORT_SHA: ${{ steps.get_sha.outputs.sha }}
+        BUILD_DATE: ${{ steps.version.outputs.timestamp }}
+        EVENT_NAME: ${{ github.event_name }}
+        BUILD_TREE: ${{ steps.incremental.outputs.build_tree }}
+        STABLE_BRANCHES: ${{ env.STABLE_BRANCHES }}
+        EXPERIMENTAL_WARNING: ${{ env.EXPERIMENTAL_WARNING }}
+        FILE_DESCRIPTIONS: ${{ env.FILE_DESCRIPTIONS }}
+      run: |
+        bash scripts/create_release.sh
 
     - name: Prune Old Releases
       if: always() # Run even if release creation failed (optional, but safer to run only on success usually. Let's stick to default behavior which is success)
