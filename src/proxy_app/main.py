@@ -73,7 +73,7 @@ else:
 # Load main .env first
 load_dotenv(_root_dir / ".env")
 
-# Load any additional .env files (e.g., antigravity_all_combined.env, gemini_cli_all_combined.env)
+# Load any additional .env files (e.g., gemini_cli_all_combined.env)
 _env_files_found = list(_root_dir.glob("*.env"))
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
@@ -127,6 +127,8 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
 print("  → Loading LiteLLM library...")
 with _console.status("[dim]Loading LiteLLM library...", spinner="dots"):
     import litellm
+
+litellm.suppress_debug_info = True
 
 # Phase 4: Application imports with granular loading messages
 print("  → Initializing proxy core...")
@@ -399,27 +401,6 @@ for key, value in os.environ.items():
             f"Loaded whitelist for provider '{provider}': {models_to_whitelist}"
         )
 
-# Load max concurrent requests per key from environment variables
-max_concurrent_requests_per_key = {}
-for key, value in os.environ.items():
-    if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
-        provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
-        try:
-            max_concurrent = int(value)
-            if max_concurrent < 1:
-                logging.warning(
-                    f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1)."
-                )
-                max_concurrent = 1
-            max_concurrent_requests_per_key[provider] = max_concurrent
-            logging.debug(
-                f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}"
-            )
-        except ValueError:
-            logging.warning(
-                f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1)."
-            )
-
 
 # --- Lifespan Management ---
 @asynccontextmanager
@@ -600,8 +581,9 @@ async def lifespan(app: FastAPI):
         ignore_models=ignore_models,
         whitelist_models=whitelist_models,
         enable_request_logging=ENABLE_REQUEST_LOGGING,
-        max_concurrent_requests_per_key=max_concurrent_requests_per_key,
     )
+
+    await client.initialize_usage_managers()
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
     # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
@@ -956,7 +938,9 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = client.acompletion(request=request, **request_data)
+            response_generator = await client.acompletion(
+                request=request, **request_data
+            )
             return StreamingResponse(
                 streaming_response_wrapper(
                     request, request_data, response_generator, raw_logger
@@ -965,9 +949,16 @@ async def chat_completions(
             )
         else:
             response = await client.acompletion(request=request, **request_data)
+
+            if isinstance(response, dict):
+                if raw_logger:
+                    raw_logger.log_final_response(
+                        status_code=429, headers=None, body=response
+                    )
+                error_detail = response.get("error", {}).get("message", str(response))
+                raise HTTPException(status_code=429, detail=error_detail)
+
             if raw_logger:
-                # Assuming response has status_code and headers attributes
-                # This might need adjustment based on the actual response object
                 response_headers = (
                     response.headers if hasattr(response, "headers") else None
                 )
@@ -1377,7 +1368,7 @@ async def get_quota_stats(
                     "total_requests": int,
                     "tokens": {...},
                     "approx_cost": float | null,
-                    "quota_groups": {...},  // For Antigravity
+                    "quota_groups": {...},
                     "credentials": [...]
                 }
             },
@@ -1407,14 +1398,14 @@ async def refresh_quota_stats(
         {
             "action": "reload" | "force_refresh",
             "scope": "all" | "provider" | "credential",
-            "provider": "antigravity",  // required if scope != "all"
-            "credential": "antigravity_oauth_1.json"  // required if scope == "credential"
+            "provider": "gemini_cli",  // required if scope != "all"
+            "credential": "gemini_cli_oauth_1.json"  // required if scope == "credential"
         }
 
     Actions:
         - reload: Re-read data from disk (no external API calls)
-        - force_refresh: For Antigravity, fetch live quota from API.
-                        For other providers, same as reload.
+        - force_refresh: Fetch live quota for providers that support it.
+                         For other providers, same as reload.
 
     Returns:
         Same as GET, plus a "refresh_result" field with operation details.
@@ -1467,7 +1458,7 @@ async def refresh_quota_stats(
             refresh_result["message"] = "Reloaded usage data from disk"
 
         elif action == "force_refresh":
-            # Force refresh from external API (for supported providers like Antigravity)
+            # Force refresh from external API for supported providers.
             result = await client.force_refresh_quota(
                 provider=provider if scope in ("provider", "credential") else None,
                 credential=credential if scope == "credential" else None,
@@ -1649,10 +1640,10 @@ if __name__ == "__main__":
                 border_style="cyan",
             )
         )
-        console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
+        console.print("[bold yellow]:warning:  Configuration Required[/bold yellow]\n")
 
         console.print("The proxy needs initial configuration:")
-        console.print("  [red]❌ No .env file found[/red]")
+        console.print("  [red]:x: No .env file found[/red]")
 
         console.print("\n[bold]Why this matters:[/bold]")
         console.print("  • The .env file stores your credentials and settings")
@@ -1665,7 +1656,7 @@ if __name__ == "__main__":
         console.print("  3. The proxy will then start normally")
 
         console.print(
-            "\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
+            "\n[bold yellow]:warning:  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
         )
         console.print("   You can remove it later if you want an unsecured proxy.\n")
 
@@ -1708,13 +1699,15 @@ if __name__ == "__main__":
 
             # Verify onboarding is complete
             if needs_onboarding():
-                console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
+                console.print("\n[bold red]:x: Configuration incomplete.[/bold red]")
                 console.print(
                     "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
                 )
                 sys.exit(1)
             else:
-                console.print("\n[bold green]✅ Configuration complete![/bold green]")
+                console.print(
+                    "\n[bold green]:white_check_mark: Configuration complete![/bold green]"
+                )
                 console.print("\nStarting proxy server...\n")
 
         import uvicorn

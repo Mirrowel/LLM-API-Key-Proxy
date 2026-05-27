@@ -15,6 +15,15 @@ from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from dotenv import set_key, unset_key
 
+from rotator_library.config import (
+    DEFAULT_MAX_CONCURRENT_PER_KEY,
+    DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED,
+    DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL,
+    DEFAULT_ROTATION_MODE,
+)
 from rotator_library.utils.paths import get_data_file
 
 console = Console()
@@ -30,21 +39,6 @@ try:
     GEMINI_CLI_DEFAULT_OAUTH_PORT = GeminiAuthBase.CALLBACK_PORT
 except ImportError:
     GEMINI_CLI_DEFAULT_OAUTH_PORT = 8085
-
-try:
-    from rotator_library.providers.antigravity_auth_base import AntigravityAuthBase
-
-    ANTIGRAVITY_DEFAULT_OAUTH_PORT = AntigravityAuthBase.CALLBACK_PORT
-except ImportError:
-    ANTIGRAVITY_DEFAULT_OAUTH_PORT = 51121
-
-try:
-    from rotator_library.providers.iflow_auth_base import (
-        CALLBACK_PORT as IFLOW_DEFAULT_OAUTH_PORT,
-    )
-except ImportError:
-    IFLOW_DEFAULT_OAUTH_PORT = 11451
-
 
 def clear_screen(subtitle: str = ""):
     """
@@ -256,7 +250,7 @@ class ModelDefinitionManager:
 
 
 class ConcurrencyManager:
-    """Manages MAX_CONCURRENT_REQUESTS_PER_KEY_PROVIDER"""
+    """Manages concurrency capacity settings."""
 
     def __init__(self, settings: AdvancedSettings):
         self.settings = settings
@@ -266,22 +260,93 @@ class ConcurrencyManager:
         limits = {}
         for key, value in os.environ.items():
             if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
-                provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
+                provider, mode = self._split_key(
+                    key, "MAX_CONCURRENT_REQUESTS_PER_KEY_"
+                )
+                if mode:
+                    continue
                 try:
-                    limits[provider] = int(value)
+                    parsed = int(value)
+                    limits[provider] = -1 if parsed <= 0 else parsed
                 except (json.JSONDecodeError, ValueError):
                     pass
         return limits
 
-    def set_limit(self, provider: str, limit: int):
-        """Set concurrency limit"""
-        key = f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider.upper()}"
-        self.settings.set(key, str(limit))
+    def get_current_optimal_limits(self) -> Dict[str, int]:
+        """Get currently configured optimal concurrency limits."""
+        limits = {}
+        for key, value in os.environ.items():
+            if key.startswith("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"):
+                provider, mode = self._split_key(
+                    key, "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_"
+                )
+                if mode:
+                    continue
+                try:
+                    parsed = int(value)
+                    limits[provider] = -1 if parsed <= 0 else parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return limits
 
-    def remove_limit(self, provider: str):
-        """Remove concurrency limit (reset to default)"""
-        key = f"MAX_CONCURRENT_REQUESTS_PER_KEY_{provider.upper()}"
+    def get_current_mode_limits(self) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """Get mode-specific max/optimal concurrency limits."""
+        limits: Dict[str, Dict[str, Dict[str, int]]] = {}
+        prefixes = (
+            ("MAX_CONCURRENT_REQUESTS_PER_KEY_", "max"),
+            ("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", "optimal"),
+        )
+        for key, value in os.environ.items():
+            for prefix, kind in prefixes:
+                if not key.startswith(prefix):
+                    continue
+                provider, mode = self._split_key(key, prefix)
+                if not mode:
+                    continue
+                try:
+                    parsed = int(value)
+                    limits.setdefault(provider, {}).setdefault(mode, {})[kind] = (
+                        -1 if parsed <= 0 else parsed
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return limits
+
+    def set_limit(self, provider: str, limit: int, mode: Optional[str] = None):
+        """Set max concurrency limit."""
+        key = self._build_key("MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
+        self.settings.set(key, "-1" if limit <= 0 else str(limit))
+
+    def remove_limit(self, provider: str, mode: Optional[str] = None):
+        """Remove max concurrency limit (reset to default)."""
+        key = self._build_key("MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
         self.settings.remove(key)
+
+    def set_optimal_limit(self, provider: str, limit: int, mode: Optional[str] = None):
+        """Set optimal concurrency limit."""
+        key = self._build_key("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
+        self.settings.set(key, "-1" if limit <= 0 else str(limit))
+
+    def remove_optimal_limit(self, provider: str, mode: Optional[str] = None):
+        """Remove optimal concurrency limit (reset to mode/provider default)."""
+        key = self._build_key("OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode)
+        self.settings.remove(key)
+
+    @staticmethod
+    def _build_key(prefix: str, provider: str, mode: Optional[str] = None) -> str:
+        key = f"{prefix}{provider.upper()}"
+        if mode:
+            key = f"{key}_{mode.upper()}"
+        return key
+
+    @staticmethod
+    def _split_key(key: str, prefix: str) -> tuple[str, Optional[str]]:
+        raw_name = key.replace(prefix, "")
+        upper_name = raw_name.upper()
+        for suffix, mode in (("_BALANCED", "balanced"), ("_SEQUENTIAL", "sequential")):
+            if upper_name.endswith(suffix):
+                return raw_name[: -len(suffix)].lower(), mode
+        return raw_name.lower(), None
 
 
 class RotationModeManager:
@@ -310,12 +375,9 @@ class RotationModeManager:
             provider_class = PROVIDER_PLUGINS.get(provider.lower())
             if provider_class and hasattr(provider_class, "default_rotation_mode"):
                 return provider_class.default_rotation_mode
-            return "balanced"
+            return DEFAULT_ROTATION_MODE
         except ImportError:
-            # Fallback defaults if import fails
-            if provider.lower() == "antigravity":
-                return "sequential"
-            return "balanced"
+            return DEFAULT_ROTATION_MODE
 
     def get_effective_mode(self, provider: str) -> str:
         """Get the effective rotation mode (configured or default)"""
@@ -431,70 +493,6 @@ class PriorityMultiplierManager:
 # PROVIDER-SPECIFIC SETTINGS DEFINITIONS
 # =============================================================================
 
-# Antigravity provider environment variables
-ANTIGRAVITY_SETTINGS = {
-    "ANTIGRAVITY_SIGNATURE_CACHE_TTL": {
-        "type": "int",
-        "default": 3600,
-        "description": "Memory cache TTL for Gemini 3 thought signatures (seconds)",
-    },
-    "ANTIGRAVITY_SIGNATURE_DISK_TTL": {
-        "type": "int",
-        "default": 86400,
-        "description": "Disk cache TTL for Gemini 3 thought signatures (seconds)",
-    },
-    "ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES": {
-        "type": "bool",
-        "default": True,
-        "description": "Preserve thought signatures in client responses",
-    },
-    "ANTIGRAVITY_ENABLE_SIGNATURE_CACHE": {
-        "type": "bool",
-        "default": True,
-        "description": "Enable signature caching for multi-turn conversations",
-    },
-    "ANTIGRAVITY_ENABLE_DYNAMIC_MODELS": {
-        "type": "bool",
-        "default": False,
-        "description": "Enable dynamic model discovery from API",
-    },
-    "ANTIGRAVITY_GEMINI3_TOOL_FIX": {
-        "type": "bool",
-        "default": True,
-        "description": "Enable Gemini 3 tool hallucination prevention",
-    },
-    "ANTIGRAVITY_CLAUDE_TOOL_FIX": {
-        "type": "bool",
-        "default": True,
-        "description": "Enable Claude tool hallucination prevention",
-    },
-    "ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION": {
-        "type": "bool",
-        "default": True,
-        "description": "Sanitize thinking blocks for Claude multi-turn conversations",
-    },
-    "ANTIGRAVITY_GEMINI3_TOOL_PREFIX": {
-        "type": "str",
-        "default": "gemini3_",
-        "description": "Prefix added to tool names for Gemini 3 disambiguation",
-    },
-    "ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT": {
-        "type": "str",
-        "default": "\n\nSTRICT PARAMETERS: {params}.",
-        "description": "Template for strict parameter hints in tool descriptions",
-    },
-    "ANTIGRAVITY_CLAUDE_DESCRIPTION_PROMPT": {
-        "type": "str",
-        "default": "\n\nSTRICT PARAMETERS: {params}.",
-        "description": "Template for Claude strict parameter hints in tool descriptions",
-    },
-    "ANTIGRAVITY_OAUTH_PORT": {
-        "type": "int",
-        "default": ANTIGRAVITY_DEFAULT_OAUTH_PORT,
-        "description": "Local port for OAuth callback server during authentication",
-    },
-}
-
 # Gemini CLI provider environment variables
 GEMINI_CLI_SETTINGS = {
     "GEMINI_CLI_SIGNATURE_CACHE_TTL": {
@@ -544,20 +542,9 @@ GEMINI_CLI_SETTINGS = {
     },
 }
 
-# iFlow provider environment variables
-IFLOW_SETTINGS = {
-    "IFLOW_OAUTH_PORT": {
-        "type": "int",
-        "default": IFLOW_DEFAULT_OAUTH_PORT,
-        "description": "Local port for OAuth callback server during authentication",
-    },
-}
-
 # Map provider names to their settings definitions
 PROVIDER_SETTINGS_MAP = {
-    "antigravity": ANTIGRAVITY_SETTINGS,
     "gemini_cli": GEMINI_CLI_SETTINGS,
-    "iflow": IFLOW_SETTINGS,
 }
 
 
@@ -673,7 +660,7 @@ class SettingsTool:
     def _get_pending_status_text(self) -> str:
         """Get formatted pending changes status text for main menu."""
         if not self.settings.has_pending():
-            return "[dim]ℹ️  No pending changes[/dim]"
+            return "[dim]:information_source:  No pending changes[/dim]"
 
         counts = self.settings.get_pending_counts()
         parts = []
@@ -690,7 +677,7 @@ class SettingsTool:
                 f"[red]{counts['remove']} removal{'s' if counts['remove'] > 1 else ''}[/red]"
             )
 
-        return f"[bold]ℹ️  Pending changes: {', '.join(parts)}[/bold]"
+        return f"[bold]:information_source:  Pending changes: {', '.join(parts)}[/bold]"
         self.running = True
 
     def get_available_providers(self) -> List[str]:
@@ -739,21 +726,21 @@ class SettingsTool:
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]🔧 Advanced Settings Configuration[/bold cyan]",
+                "[bold cyan]:wrench: Advanced Settings Configuration[/bold cyan]",
                 border_style="cyan",
             )
         )
 
         self.console.print()
-        self.console.print("[bold]⚙️  Configuration Categories[/bold]")
+        self.console.print("[bold]:gear:  Configuration Categories[/bold]")
         self.console.print()
-        self.console.print("   1. 🌐 Custom Provider API Bases")
+        self.console.print("   1. :globe_with_meridians: Custom Provider API Bases")
         self.console.print("   2. 📦 Provider Model Definitions")
         self.console.print("   3. ⚡ Concurrency Limits")
-        self.console.print("   4. 🔄 Rotation Modes")
+        self.console.print("   4. :arrows_counterclockwise: Rotation Modes")
         self.console.print("   5. 🔬 Provider-Specific Settings")
-        self.console.print("   6. 🎯 Model Filters (Ignore/Whitelist)")
-        self.console.print("   7. 💾 Save & Exit")
+        self.console.print("   6. :dart: Model Filters (Ignore/Whitelist)")
+        self.console.print("   7. :floppy_disk: Save & Exit")
         self.console.print("   8. 🚫 Exit Without Saving")
 
         self.console.print()
@@ -796,13 +783,13 @@ class SettingsTool:
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]🌐 Custom Provider API Bases[/bold cyan]",
+                    "[bold cyan]:globe_with_meridians: Custom Provider API Bases[/bold cyan]",
                     border_style="cyan",
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Configured Custom Providers[/bold]")
+            self.console.print("[bold]:clipboard: Configured Custom Providers[/bold]")
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -853,11 +840,11 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Add New Custom Provider")
             self.console.print("   2. ✏️  Edit Existing Provider")
-            self.console.print("   3. 🗑️  Remove Provider")
+            self.console.print("   3. :wastebasket:  Remove Provider")
             self.console.print("   4. ↩️  Back to Settings Menu")
 
             self.console.print()
@@ -875,7 +862,7 @@ class SettingsTool:
                     if api_base:
                         self.provider_mgr.add_provider(name, api_base)
                         self.console.print(
-                            f"\n[green]✅ Custom provider '{name}' staged![/green]"
+                            f"\n[green]:white_check_mark: Custom provider '{name}' staged![/green]"
                         )
                         self.console.print(
                             f"   To use: set {name.upper()}_API_KEY in credentials"
@@ -915,7 +902,7 @@ class SettingsTool:
                 if new_base and new_base != current_base:
                     self.provider_mgr.edit_provider(name, new_base)
                     self.console.print(
-                        f"\n[green]✅ Custom provider '{name}' updated![/green]"
+                        f"\n[green]:white_check_mark: Custom provider '{name}' updated![/green]"
                     )
                 else:
                     self.console.print("\n[yellow]No changes made[/yellow]")
@@ -962,12 +949,12 @@ class SettingsTool:
                         key = f"{name.upper()}_API_BASE"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending addition of '{name}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending addition of '{name}' cancelled![/green]"
                         )
                     else:
                         self.provider_mgr.remove_provider(name)
                         self.console.print(
-                            f"\n[green]✅ Provider '{name}' marked for removal![/green]"
+                            f"\n[green]:white_check_mark: Provider '{name}' marked for removal![/green]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -990,7 +977,7 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Configured Provider Models[/bold]")
+            self.console.print("[bold]:clipboard: Configured Provider Models[/bold]")
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -1063,12 +1050,12 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Add Models for Provider")
             self.console.print("   2. ✏️  Edit Provider Models")
             self.console.print("   3. 👁️  View Provider Models")
-            self.console.print("   4. 🗑️  Remove Provider Models")
+            self.console.print("   4. :wastebasket:  Remove Provider Models")
             self.console.print("   5. ↩️  Back to Settings Menu")
 
             self.console.print()
@@ -1141,12 +1128,12 @@ class SettingsTool:
                         key = f"{provider.upper()}{suffix}"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending models for '{provider}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending models for '{provider}' cancelled![/green]"
                         )
                     else:
                         self.model_mgr.remove_models(provider)
                         self.console.print(
-                            f"\n[green]✅ Model definitions marked for removal for '{provider}'![/green]"
+                            f"\n[green]:white_check_mark: Model definitions marked for removal for '{provider}'![/green]"
                         )
                     input("\nPress Enter to continue...")
             elif choice == "5":
@@ -1244,7 +1231,7 @@ class SettingsTool:
         if models:
             self.model_mgr.set_models(provider, models)
             self.console.print(
-                f"\n[green]✅ Model definitions saved for '{provider}'![/green]"
+                f"\n[green]:white_check_mark: Model definitions saved for '{provider}'![/green]"
             )
         else:
             self.console.print("\n[yellow]No models added[/yellow]")
@@ -1343,7 +1330,9 @@ class SettingsTool:
 
         if current_models:
             self.model_mgr.set_models(provider, current_models)
-            self.console.print(f"\n[green]✅ Models updated for '{provider}'![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: Models updated for '{provider}'![/green]"
+            )
         else:
             self.console.print(
                 "\n[yellow]No models left - removing definition[/yellow]"
@@ -1418,7 +1407,7 @@ class SettingsTool:
             input("Press Enter to continue...")
 
     def manage_provider_settings(self):
-        """Manage provider-specific settings (Antigravity, Gemini CLI)"""
+        """Manage provider-specific settings (Gemini CLI)"""
         while True:
             clear_screen()
 
@@ -1433,7 +1422,7 @@ class SettingsTool:
 
             self.console.print()
             self.console.print(
-                "[bold]📋 Available Providers with Custom Settings[/bold]"
+                "[bold]:clipboard: Available Providers with Custom Settings[/bold]"
             )
             self.console.print("━" * 70)
 
@@ -1450,7 +1439,7 @@ class SettingsTool:
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Select Provider to Configure[/bold]")
+            self.console.print("[bold]:gear:  Select Provider to Configure[/bold]")
             self.console.print()
 
             for idx, provider in enumerate(available_providers, 1):
@@ -1492,7 +1481,7 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Settings[/bold]")
+            self.console.print("[bold]:clipboard: Current Settings[/bold]")
             self.console.print("━" * 70)
 
             # Display all settings with current values and pending changes
@@ -1587,11 +1576,13 @@ class SettingsTool:
                 "[dim]* = modified from default, + = pending add, ~ = pending edit, - = pending reset[/dim]"
             )
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   E. ✏️  Edit a Setting")
-            self.console.print("   R. 🔄 Reset Setting to Default")
-            self.console.print("   A. 🔄 Reset All to Defaults")
+            self.console.print(
+                "   R. :arrows_counterclockwise: Reset Setting to Default"
+            )
+            self.console.print("   A. :arrows_counterclockwise: Reset All to Defaults")
             self.console.print("   B. ↩️  Back to Provider Selection")
 
             self.console.print()
@@ -1641,18 +1632,24 @@ class SettingsTool:
             new_value = Confirm.ask("\nEnable this setting?", default=current)
             self.provider_settings_mgr.set_value(key, new_value, definition)
             status = "enabled" if new_value else "disabled"
-            self.console.print(f"\n[green]✅ {short_key} {status}![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} {status}![/green]"
+            )
         elif setting_type == "int":
             new_value = IntPrompt.ask("\nNew value", default=current)
             self.provider_settings_mgr.set_value(key, new_value, definition)
-            self.console.print(f"\n[green]✅ {short_key} set to {new_value}![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} set to {new_value}![/green]"
+            )
         else:
             new_value = Prompt.ask(
                 "\nNew value", default=str(current) if current else ""
             ).strip()
             if new_value:
                 self.provider_settings_mgr.set_value(key, new_value, definition)
-                self.console.print(f"\n[green]✅ {short_key} updated![/green]")
+                self.console.print(
+                    f"\n[green]:white_check_mark: {short_key} updated![/green]"
+                )
             else:
                 self.console.print("\n[yellow]No changes made[/yellow]")
 
@@ -1677,7 +1674,9 @@ class SettingsTool:
 
         if Confirm.ask(f"\nReset {short_key} to default ({default})?"):
             self.provider_settings_mgr.reset_to_default(key)
-            self.console.print(f"\n[green]✅ {short_key} reset to default![/green]")
+            self.console.print(
+                f"\n[green]:white_check_mark: {short_key} reset to default![/green]"
+            )
         else:
             self.console.print("\n[yellow]No changes made[/yellow]")
 
@@ -1693,7 +1692,7 @@ class SettingsTool:
             for key in settings_list:
                 self.provider_settings_mgr.reset_to_default(key)
             self.console.print(
-                f"\n[green]✅ All {display_name} settings reset to defaults![/green]"
+                f"\n[green]:white_check_mark: All {display_name} settings reset to defaults![/green]"
             )
         else:
             self.console.print("\n[yellow]No changes made[/yellow]")
@@ -1711,22 +1710,24 @@ class SettingsTool:
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]🔄 Credential Rotation Mode Configuration[/bold cyan]",
+                    "[bold cyan]:arrows_counterclockwise: Credential Rotation Mode Configuration[/bold cyan]",
                     border_style="cyan",
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Rotation Modes Explained[/bold]")
+            self.console.print("[bold]:clipboard: Rotation Modes Explained[/bold]")
             self.console.print("━" * 70)
             self.console.print(
-                "   [cyan]balanced[/cyan]   - Rotate credentials evenly across requests (default)"
+                "   [cyan]balanced[/cyan]   - Rotate credentials evenly across requests"
             )
             self.console.print(
-                "   [cyan]sequential[/cyan] - Use one credential until exhausted (429), then switch"
+                "   [cyan]sequential[/cyan] - Use one credential until exhausted (default), then switch"
             )
             self.console.print()
-            self.console.print("[bold]📋 Current Rotation Mode Settings[/bold]")
+            self.console.print(
+                "[bold]:clipboard: Current Rotation Mode Settings[/bold]"
+            )
             self.console.print("━" * 70)
 
             # Build combined view with pending changes
@@ -1821,10 +1822,10 @@ class SettingsTool:
                 "[dim]* = custom setting (differs from provider default)[/dim]"
             )
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
             self.console.print("   1. ➕ Set Rotation Mode for Provider")
-            self.console.print("   2. 🗑️  Reset to Provider Default")
+            self.console.print("   2. :wastebasket:  Reset to Provider Default")
             self.console.print("   3. ⚡ Configure Priority Concurrency Multipliers")
             self.console.print("   4. ↩️  Back to Settings Menu")
 
@@ -1888,7 +1889,7 @@ class SettingsTool:
 
                     self.rotation_mgr.set_mode(provider, new_mode)
                     self.console.print(
-                        f"\n[green]✅ Rotation mode for '{provider}' staged as {new_mode}![/green]"
+                        f"\n[green]:white_check_mark: Rotation mode for '{provider}' staged as {new_mode}![/green]"
                     )
                     input("\nPress Enter to continue...")
 
@@ -1935,12 +1936,12 @@ class SettingsTool:
                         key = f"{prefix}{provider.upper()}"
                         del self.settings.pending_changes[key]
                         self.console.print(
-                            f"\n[green]✅ Pending mode for '{provider}' cancelled![/green]"
+                            f"\n[green]:white_check_mark: Pending mode for '{provider}' cancelled![/green]"
                         )
                     else:
                         self.rotation_mgr.remove_mode(provider)
                         self.console.print(
-                            f"\n[green]✅ Rotation mode for '{provider}' marked for reset to default ({default_mode})![/green]"
+                            f"\n[green]:white_check_mark: Rotation mode for '{provider}' marked for reset to default ({default_mode})![/green]"
                         )
                     input("\nPress Enter to continue...")
 
@@ -1965,7 +1966,9 @@ class SettingsTool:
         )
 
         self.console.print()
-        self.console.print("[bold]📋 Current Priority Multiplier Settings[/bold]")
+        self.console.print(
+            "[bold]:clipboard: Current Priority Multiplier Settings[/bold]"
+        )
         self.console.print("━" * 70)
 
         # Show all providers with their priority multipliers
@@ -2009,7 +2012,9 @@ class SettingsTool:
             self.console.print("   [dim]No priority multipliers configured[/dim]")
 
         self.console.print()
-        self.console.print("[bold]ℹ️  About Priority Multipliers:[/bold]")
+        self.console.print(
+            "[bold]:information_source:  About Priority Multipliers:[/bold]"
+        )
         self.console.print(
             "   Higher priority tiers (lower numbers) can have higher multipliers."
         )
@@ -2018,7 +2023,7 @@ class SettingsTool:
         self.console.print("━" * 70)
         self.console.print()
         self.console.print("   1. ✏️  Set Priority Multiplier")
-        self.console.print("   2. 🔄 Reset to Provider Default")
+        self.console.print("   2. :arrows_counterclockwise: Reset to Provider Default")
         self.console.print("   3. ↩️  Back")
 
         choice = Prompt.ask(
@@ -2059,7 +2064,7 @@ class SettingsTool:
                     provider, priority, multiplier
                 )
                 self.console.print(
-                    f"\n[green]✅ Priority {priority} multiplier for '{provider}' set to {multiplier}x[/green]"
+                    f"\n[green]:white_check_mark: Priority {priority} multiplier for '{provider}' set to {multiplier}x[/green]"
                 )
             else:
                 self.console.print(
@@ -2101,7 +2106,7 @@ class SettingsTool:
                     provider, priority
                 )
                 self.console.print(
-                    f"\n[green]✅ Reset priority {priority} for '{provider}' to default ({default}x)[/green]"
+                    f"\n[green]:white_check_mark: Reset priority {priority} for '{provider}' to default ({default}x)[/green]"
                 )
             else:
                 self.console.print(
@@ -2114,9 +2119,6 @@ class SettingsTool:
         while True:
             clear_screen()
 
-            # Get current limits from env
-            limits = self.concurrency_mgr.get_current_limits()
-
             self.console.print(
                 Panel.fit(
                     "[bold cyan]⚡ Concurrency Limits Configuration[/bold cyan]",
@@ -2125,84 +2127,109 @@ class SettingsTool:
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Concurrency Settings[/bold]")
+            self.console.print("[bold]:clipboard: Current Concurrency Settings[/bold]")
             self.console.print("━" * 70)
 
-            # Build combined view with pending changes
-            all_limits: Dict[str, Dict[str, Any]] = {}
-            prefix = "MAX_CONCURRENT_REQUESTS_PER_KEY_"
+            def parse_limit_value(value: Any) -> Any:
+                try:
+                    parsed = int(str(value).strip())
+                    return -1 if parsed <= 0 else parsed
+                except (TypeError, ValueError):
+                    return _NOT_FOUND
 
-            # Add current limits (from env)
-            for provider, limit in limits.items():
-                key = f"{prefix}{provider.upper()}"
-                change_type = self.settings.get_change_type(key)
-                if change_type == "remove":
-                    all_limits[provider] = {
-                        "value": str(limit),
-                        "type": "remove",
-                        "old": None,
-                    }
-                elif change_type == "edit":
-                    new_val = self.settings.pending_changes[key]
-                    all_limits[provider] = {
-                        "value": new_val,
-                        "type": "edit",
-                        "old": str(limit),
-                    }
-                else:
-                    all_limits[provider] = {
-                        "value": str(limit),
-                        "type": None,
-                        "old": None,
-                    }
+            def format_limit_value(value: Any) -> str:
+                parsed = parse_limit_value(value)
+                if parsed is _NOT_FOUND:
+                    return f"{value} requests/key"
+                return "* requests/key" if parsed <= 0 else f"{parsed} requests/key"
 
-            # Add pending new limits (additions)
-            for key in self.settings.get_pending_keys_by_pattern(prefix=prefix):
-                if self.settings.get_change_type(key) == "add":
-                    provider = key.replace(prefix, "").lower()
-                    if provider not in all_limits:
-                        all_limits[provider] = {
-                            "value": self.settings.pending_changes[key],
-                            "type": "add",
-                            "old": None,
-                        }
+            def effective_value(key: str) -> Optional[str]:
+                pending = self.settings.get_pending_value(key)
+                if pending is not _NOT_FOUND:
+                    return None if pending is None else str(pending)
+                return os.getenv(key)
 
-            if all_limits:
-                # Sort alphabetically
-                for provider in sorted(all_limits.keys()):
-                    info = all_limits[provider]
-                    value_display = f"{info['value']} requests/key"
-                    old_display = f"{info['old']} requests/key" if info["old"] else None
-                    self.console.print(
-                        self._format_item(
-                            provider, value_display, info["type"], old_display
-                        )
+            def limit_display(key: str, default: str) -> str:
+                value = effective_value(key)
+                if value is None:
+                    return f"default {default}"
+                return format_limit_value(value)
+
+            def mode_display(provider: str) -> tuple[str, Optional[str]]:
+                key = f"ROTATION_MODE_{provider.upper()}"
+                pending = self.settings.get_pending_value(key)
+                if pending is None:
+                    return self.rotation_mgr.get_default_mode(provider), "remove"
+                if pending is not _NOT_FOUND:
+                    return str(pending).lower(), self.settings.get_change_type(key)
+                return self.rotation_mgr.get_effective_mode(provider), None
+
+            providers = set(self.get_available_providers())
+            for key in os.environ.keys() | self.settings.pending_changes.keys():
+                for prefix in (
+                    "MAX_CONCURRENT_REQUESTS_PER_KEY_",
+                    "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_",
+                ):
+                    if key.startswith(prefix):
+                        provider, _ = self.concurrency_mgr._split_key(key, prefix)
+                        providers.add(provider)
+                if key.startswith("ROTATION_MODE_"):
+                    providers.add(key.replace("ROTATION_MODE_", "").lower())
+
+            if providers:
+                for provider in sorted(providers):
+                    mode, mode_change = mode_display(provider)
+                    max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider
                     )
-                self.console.print("   • Default:        1 request/key (all others)")
+                    optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider
+                    )
+                    mode_max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, mode
+                    )
+                    mode_optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, mode
+                    )
+                    mode_label = mode
+                    if mode_change:
+                        mode_label = f"{mode} [{mode_change}]"
+                    self.console.print(f"   • [bold]{provider}[/bold] mode={mode_label}")
+                    self.console.print(
+                        f"     provider-wide: max={limit_display(max_key, '*')}, "
+                        f"optimal={limit_display(optimal_key, 'balanced=1/sequential=*')}"
+                    )
+                    self.console.print(
+                        f"     {mode}-specific: max={limit_display(mode_max_key, 'provider/global')}, "
+                        f"optimal={limit_display(mode_optimal_key, 'provider/global')}"
+                    )
             else:
-                self.console.print("   • Default:        1 request/key (all providers)")
+                self.console.print("   • No providers configured yet")
+
+            self.console.print()
+            self.console.print("   • Max is the hard ceiling; * means unlimited")
+            self.console.print("   • Optimal is the soft spread-before-stacking target")
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Actions[/bold]")
+            self.console.print("[bold]:gear:  Actions[/bold]")
             self.console.print()
-            self.console.print("   1. ➕ Add Concurrency Limit for Provider")
-            self.console.print("   2. ✏️  Edit Existing Limit")
-            self.console.print("   3. 🗑️  Remove Limit (reset to default)")
-            self.console.print("   4. ↩️  Back to Settings Menu")
+            self.console.print("   1. ⚙️  Configure Provider")
+            self.console.print("   2. :wastebasket:  Remove Max/Optimal Limits")
+            self.console.print("   3. ↩️  Back to Settings Menu")
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
 
             choice = Prompt.ask(
-                "Select option", choices=["1", "2", "3", "4"], show_choices=False
+                "Select option", choices=["1", "2", "3"], show_choices=False
             )
 
-            if choice == "1":
+            if choice in {"1", "2"}:
                 # Get available providers
-                available_providers = self.get_available_providers()
+                available_providers = sorted(providers or set(self.get_available_providers()))
 
                 if not available_providers:
                     self.console.print(
@@ -2229,124 +2256,117 @@ class SettingsTool:
                 else:
                     provider = available_providers[choice_idx - 1]
 
-                if provider:
-                    limit = IntPrompt.ask(
-                        "Max concurrent requests per key (1-100)", default=1
-                    )
-                    if 1 <= limit <= 100:
-                        self.concurrency_mgr.set_limit(provider, limit)
-                        self.console.print(
-                            f"\n[green]✅ Concurrency limit staged for '{provider}': {limit} requests/key[/green]"
-                        )
-                    else:
-                        self.console.print(
-                            "\n[red]❌ Limit must be between 1-100[/red]"
-                        )
-                    input("\nPress Enter to continue...")
-
-            elif choice == "2":
-                # Get editable limits (existing + pending additions, excluding pending removals)
-                editable = {
-                    k: v for k, v in all_limits.items() if v["type"] != "remove"
-                }
-                if not editable:
-                    self.console.print("\n[yellow]No limits to edit[/yellow]")
+                if not provider:
                     input("\nPress Enter to continue...")
                     continue
 
-                # Show numbered list
-                self.console.print("\n[bold]Select provider to edit:[/bold]")
-                limits_list = sorted(editable.keys())
-                for idx, prov in enumerate(limits_list, 1):
-                    self.console.print(f"   {idx}. {prov}")
+                current_mode = mode_display(provider)[0]
 
-                choice_idx = IntPrompt.ask(
-                    "Select option",
-                    choices=[str(i) for i in range(1, len(limits_list) + 1)],
-                )
-                provider = limits_list[choice_idx - 1]
-                info = editable[provider]
-                current_limit = int(info["value"])
+                if choice == "1":
+                    self.console.print("\n[bold]Rotation mode:[/bold]")
+                    self.console.print("   1. balanced")
+                    self.console.print("   2. sequential")
+                    mode_choice = Prompt.ask(
+                        "Select mode",
+                        choices=["1", "2"],
+                        default="1" if current_mode == "balanced" else "2",
+                    )
+                    selected_mode = "balanced" if mode_choice == "1" else "sequential"
+                    self.rotation_mgr.set_mode(provider, selected_mode)
 
-                self.console.print(f"\nCurrent limit: {current_limit} requests/key")
-                new_limit = IntPrompt.ask(
-                    "New limit (1-100) [press Enter to keep current]",
-                    default=current_limit,
-                )
+                    self.console.print("\n[bold]Concurrency setting scope:[/bold]")
+                    self.console.print("   1. Provider-wide")
+                    self.console.print(f"   2. Current mode only ({selected_mode})")
+                    scope_choice = Prompt.ask(
+                        "Select scope", choices=["1", "2"], default="1"
+                    )
+                    scope_mode = selected_mode if scope_choice == "2" else None
 
-                if 1 <= new_limit <= 100:
-                    if new_limit != current_limit:
-                        self.concurrency_mgr.set_limit(provider, new_limit)
+                    max_key = self.concurrency_mgr._build_key(
+                        "MAX_CONCURRENT_REQUESTS_PER_KEY_", provider, scope_mode
+                    )
+                    optimal_key = self.concurrency_mgr._build_key(
+                        "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", provider, scope_mode
+                    )
+                    current_max = effective_value(max_key)
+                    if current_max is None:
+                        if scope_mode == "balanced":
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY_BALANCED)
+                        elif scope_mode == "sequential":
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY_SEQUENTIAL)
+                        else:
+                            current_max = str(DEFAULT_MAX_CONCURRENT_PER_KEY)
+                    current_optimal = effective_value(optimal_key)
+                    if current_optimal is None:
+                        if scope_mode == "balanced":
+                            current_optimal = str(
+                                DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_BALANCED
+                            )
+                        elif scope_mode == "sequential":
+                            current_optimal = str(
+                                DEFAULT_OPTIMAL_CONCURRENT_PER_KEY_SEQUENTIAL
+                            )
+                        else:
+                            current_optimal = str(DEFAULT_OPTIMAL_CONCURRENT_PER_KEY)
+
+                    raw_max = Prompt.ask(
+                        "Max concurrent requests per key (positive integer, 0/-1 for *)",
+                        default=str(current_max),
+                    )
+                    max_limit = parse_limit_value(raw_max)
+                    raw_optimal = Prompt.ask(
+                        "Optimal concurrent requests per key (positive integer, 0/-1 for *)",
+                        default=str(current_optimal),
+                    )
+                    optimal_limit = parse_limit_value(raw_optimal)
+
+                    if max_limit is _NOT_FOUND or optimal_limit is _NOT_FOUND:
                         self.console.print(
-                            f"\n[green]✅ Concurrency limit updated for '{provider}': {new_limit} requests/key[/green]"
+                            "\n[red]:x: Limit must be a positive integer or 0/-1 for unlimited[/red]"
                         )
                     else:
-                        self.console.print("\n[yellow]No changes made[/yellow]")
+                        self.concurrency_mgr.set_limit(provider, max_limit, scope_mode)
+                        self.concurrency_mgr.set_optimal_limit(
+                            provider, optimal_limit, scope_mode
+                        )
+                        scope_label = (
+                            f"{selected_mode}-specific" if scope_mode else "provider-wide"
+                        )
+                        self.console.print(
+                            f"\n[green]:white_check_mark: Staged {scope_label} concurrency for '{provider}' "
+                            f"with rotation mode '{selected_mode}'[/green]"
+                        )
+
                 else:
-                    self.console.print("\n[red]Limit must be between 1-100[/red]")
+                    self.console.print("\n[bold]Remove which limits?[/bold]")
+                    self.console.print("   1. Provider-wide")
+                    self.console.print(f"   2. Current mode only ({current_mode})")
+                    scope_choice = Prompt.ask(
+                        "Select scope", choices=["1", "2"], default="1"
+                    )
+                    scope_mode = current_mode if scope_choice == "2" else None
+
+                    if Confirm.ask(
+                        f"Remove max and optimal concurrency limits for '{provider}'?"
+                    ):
+                        self.concurrency_mgr.remove_limit(provider, scope_mode)
+                        self.concurrency_mgr.remove_optimal_limit(provider, scope_mode)
+                        scope_label = (
+                            f"{scope_mode}-specific" if scope_mode else "provider-wide"
+                        )
+                        self.console.print(
+                            f"\n[green]:white_check_mark: {scope_label.title()} max/optimal limits marked for removal for '{provider}'[/green]"
+                        )
                 input("\nPress Enter to continue...")
 
             elif choice == "3":
-                # Get removable limits (existing ones not already pending removal)
-                removable = {
-                    k: v
-                    for k, v in all_limits.items()
-                    if v["type"] != "remove" and v["type"] != "add"
-                }
-                # For pending additions, we can "undo" by removing from pending
-                pending_adds = {
-                    k: v for k, v in all_limits.items() if v["type"] == "add"
-                }
-
-                if not removable and not pending_adds:
-                    self.console.print("\n[yellow]No limits to remove[/yellow]")
-                    input("\nPress Enter to continue...")
-                    continue
-
-                # Show numbered list
-                self.console.print(
-                    "\n[bold]Select provider to remove limit from:[/bold]"
-                )
-                limits_list = sorted(removable.keys()) + sorted(pending_adds.keys())
-                for idx, prov in enumerate(limits_list, 1):
-                    if prov in pending_adds:
-                        self.console.print(
-                            f"   {idx}. {prov} [green](pending add)[/green]"
-                        )
-                    else:
-                        self.console.print(f"   {idx}. {prov}")
-
-                choice_idx = IntPrompt.ask(
-                    "Select option",
-                    choices=[str(i) for i in range(1, len(limits_list) + 1)],
-                )
-                provider = limits_list[choice_idx - 1]
-
-                if Confirm.ask(
-                    f"Remove concurrency limit for '{provider}' (reset to default 1)?"
-                ):
-                    if provider in pending_adds:
-                        # Undo pending addition
-                        key = f"{prefix}{provider.upper()}"
-                        del self.settings.pending_changes[key]
-                        self.console.print(
-                            f"\n[green]✅ Pending limit for '{provider}' cancelled![/green]"
-                        )
-                    else:
-                        self.concurrency_mgr.remove_limit(provider)
-                        self.console.print(
-                            f"\n[green]✅ Limit marked for removal for '{provider}'[/green]"
-                        )
-                    input("\nPress Enter to continue...")
-
-            elif choice == "4":
                 break
 
     def _show_changes_summary(self):
         """Display categorized summary of all pending changes."""
         self.console.print(
             Panel.fit(
-                "[bold cyan]📋 Pending Changes Summary[/bold cyan]",
+                "[bold cyan]:clipboard: Pending Changes Summary[/bold cyan]",
                 border_style="cyan",
             )
         )
@@ -2357,6 +2377,7 @@ class SettingsTool:
             ("Custom Provider API Bases", "_API_BASE", "suffix"),
             ("Model Definitions", "_MODELS", "suffix"),
             ("Concurrency Limits", "MAX_CONCURRENT_REQUESTS_PER_KEY_", "prefix"),
+            ("Optimal Concurrency", "OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_", "prefix"),
             ("Rotation Modes", "ROTATION_MODE_", "prefix"),
             ("Priority Multipliers", "CONCURRENCY_MULTIPLIER_", "prefix"),
         ]
@@ -2439,7 +2460,9 @@ class SettingsTool:
 
             if Confirm.ask("\n[bold yellow]Save all pending changes?[/bold yellow]"):
                 self.settings.save()
-                self.console.print("\n[green]✅ All changes saved to .env![/green]")
+                self.console.print(
+                    "\n[green]:white_check_mark: All changes saved to .env![/green]"
+                )
                 input("\nPress Enter to return to launcher...")
             else:
                 self.console.print("\n[yellow]Changes not saved[/yellow]")

@@ -22,9 +22,9 @@ This architecture cleanly separates the API interface from the resilience logic,
 
 This library is the heart of the project, containing all the logic for managing a pool of API keys, tracking their usage, and handling provider interactions to ensure application resilience.
 
-### 2.1. `client.py` - The `RotatingClient`
+### 2.1. `client/rotating_client.py` - The `RotatingClient`
 
-The `RotatingClient` is the central class that orchestrates all operations. It is designed as a long-lived, async-native object.
+The `RotatingClient` is the central class that orchestrates all operations. It is now a slim facade that delegates to modular components (executor, filters, transforms) while remaining a long-lived, async-native object.
 
 #### Initialization
 
@@ -35,7 +35,7 @@ client = RotatingClient(
     api_keys=api_keys,
     oauth_credentials=oauth_credentials,
     max_retries=2,
-    usage_file_path="key_usage.json",
+    usage_file_path="usage.json",
     configure_logging=True,
     global_timeout=30,
     abort_on_callback_error=True,
@@ -50,7 +50,7 @@ client = RotatingClient(
 -   `api_keys` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of API keys.
 -   `oauth_credentials` (`Optional[Dict[str, List[str]]]`, default: `None`): A dictionary mapping provider names to a list of file paths to OAuth credential JSON files.
 -   `max_retries` (`int`, default: `2`): The number of times to retry a request with the *same key* if a transient server error occurs.
--   `usage_file_path` (`str`, default: `"key_usage.json"`): The path to the JSON file where usage statistics are persisted.
+-   `usage_file_path` (`str`, optional): Base path for usage persistence (defaults to `usage/` in the data directory). The client stores per-provider files under `usage/usage_<provider>.json`.
 -   `configure_logging` (`bool`, default: `True`): If `True`, configures the library's logger to propagate logs to the root logger.
 -   `global_timeout` (`int`, default: `30`): A hard time limit (in seconds) for the entire request lifecycle.
 -   `abort_on_callback_error` (`bool`, default: `True`): If `True`, any exception raised by `pre_request_callback` will abort the request.
@@ -96,9 +96,9 @@ The `_safe_streaming_wrapper` is a critical component for stability. It:
 *   **Error Interception**: Detects if a chunk contains an API error (like a quota limit) instead of content, and raises a specific `StreamedAPIError`.
 *   **Quota Handling**: If a specific "quota exceeded" error is detected mid-stream multiple times, it can terminate the stream gracefully to prevent infinite retry loops on oversized inputs.
 
-### 2.2. `usage_manager.py` - Stateful Concurrency & Usage Management
+### 2.2. `usage/manager.py` - Stateful Concurrency & Usage Management
 
-This class is the stateful core of the library, managing concurrency, usage tracking, cooldowns, and quota resets.
+This class is the stateful core of the library, managing concurrency, usage tracking, cooldowns, and quota resets. Usage tracking now lives in the `rotator_library/usage/` package with per-provider managers and `usage/usage_<provider>.json` storage.
 
 #### Key Concepts
 
@@ -110,27 +110,30 @@ This class is the stateful core of the library, managing concurrency, usage trac
     - **daily**: Legacy daily reset at `daily_reset_time_utc`
 *   **Model Quota Groups**: Models can be grouped to share quota limits. When one model in a group hits quota, all receive the same reset timestamp.
 
-#### Tiered Key Acquisition Strategy
+#### Capacity-Phase Key Acquisition Strategy
 
 The `acquire_key` method uses a sophisticated strategy to balance load:
 
 1.  **Filtering**: Keys currently on cooldown (global or model-specific) are excluded.
 2.  **Rotation Mode**: Determines credential selection strategy:
-    *   **Balanced Mode** (default): Credentials sorted by usage count - least-used first for even distribution
-    *   **Sequential Mode**: Credentials sorted by usage count descending - most-used first to maintain sticky behavior until exhausted
-3.  **Tiering**: Valid keys are split into two tiers:
-    *   **Tier 1 (Ideal)**: Keys that are completely idle (0 concurrent requests).
-    *   **Tier 2 (Acceptable)**: Keys that are busy but still under their configured `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` limit for the requested model. This allows a single key to be used multiple times for the same model, maximizing throughput.
+    *   **Sequential Mode** (default): Reuses the selected credential until it errors/exhausts to preserve provider-side cache locality
+    *   **Balanced Mode**: Distributes requests across credentials for even load when explicitly configured
+3.  **Capacity Phases**: Valid keys are first filtered by hard blockers, then grouped by soft concurrency capacity:
+    *   **Below Optimal**: Healthy credentials with `active_requests < optimal_concurrent` are preferred.
+    *   **Stacking Fallback**: If every healthy credential is at or above `optimal_concurrent`, credentials remain usable until they hit `max_concurrent`.
+    *   **Blocked**: Credentials on cooldown, over quota, disallowed for the model, or at/above a positive `max_concurrent` are not selected.
 4.  **Selection Strategy** (configurable via `rotation_tolerance`):
-    *   **Deterministic (tolerance=0.0)**: Within each tier, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
+    *   **Deterministic (tolerance=0.0)**: Within the current capacity phase, keys are sorted by daily usage count and the least-used key is always selected. This provides perfect load balance but predictable patterns.
     *   **Weighted Random (tolerance>0, default)**: Keys are selected randomly with weights biased toward less-used ones:
         - Formula: `weight = (max_usage - credential_usage) + tolerance + 1`
         - `tolerance=2.0` (recommended): Balanced randomness - credentials within 2 uses of the maximum can still be selected with reasonable probability
         - `tolerance=5.0+`: High randomness - even heavily-used credentials have significant probability
         - **Security Benefit**: Unpredictable selection patterns make rate limit detection and fingerprinting harder
         - **Load Balance**: Lower-usage credentials still preferred, maintaining reasonable distribution
-5.  **Concurrency Limits**: Checks against `max_concurrent` limits (with priority multipliers applied) to prevent overloading a single key.
+5.  **Concurrency Controls**: `optimal_concurrent` is a soft spread-before-stacking target. `max_concurrent` is the hard safety ceiling (with priority multipliers applied); values `<= 0` mean unlimited.
 6.  **Priority Groups**: When credential prioritization is enabled, higher-tier credentials (lower priority numbers) are tried first before moving to lower tiers.
+
+Balanced mode defaults to `optimal_concurrent=1` and `max_concurrent=-1`, which spreads first but does not artificially block when all credentials are busy. Sequential mode defaults to `optimal_concurrent=-1` and `max_concurrent=-1`, preserving sticky behavior unless a provider or environment override constrains it. Provider-wide and mode-specific environment variables are available as `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`, `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`, and the `_BALANCED`/`_SEQUENTIAL` variants.
 
 #### Failure Handling & Cooldowns
 
@@ -194,7 +197,6 @@ async def run_background_job(
 
 | Provider | Job Name | Default Interval | Purpose |
 |----------|----------|------------------|---------|
-| Antigravity | `antigravity_quota_refresh` | 300s (5 min) | Fetches quota status from API to update remaining quota estimates |
 | Gemini CLI | `gemini_cli_quota_refresh` | 300s (5 min) | Fetches quota status from `retrieveUserQuota` API to update remaining quota estimates |
 
 ### 2.6. Credential Management Architecture
@@ -207,13 +209,9 @@ On startup (unless `SKIP_OAUTH_INIT_CHECK=true`), the manager performs a compreh
 
 1. **System-Wide Scan**: Searches for OAuth credential files in standard locations:
    - `~/.gemini/` → All `*.json` files (typically `credentials.json`)
-   - `~/.qwen/` → All `*.json` files (typically `oauth_creds.json`)
-   - `~/.iflow/` → All `*. json` files
 
 2. **Local Import**: Valid credentials are **copied** (not moved) to the project's `oauth_creds/` directory with standardized names:
    -  `gemini_cli_oauth_1.json`, `gemini_cli_oauth_2.json`, etc.
-   - `qwen_code_oauth_1.json`, `qwen_code_oauth_2.json`, etc.
-   - `iflow_oauth_1.json`, `iflow_oauth_2.json`, etc.
 
 3. **Intelligent Deduplication**: 
    - The manager inspects each credential file for a `_proxy_metadata` field containing the user's email or ID
@@ -263,35 +261,6 @@ GEMINI_CLI_2_REFRESH_TOKEN
 ...
 ```
 
-**Antigravity Environment Variables:**
-
-Same pattern as Gemini CLI:
-```
-ANTIGRAVITY_1_ACCESS_TOKEN
-ANTIGRAVITY_1_REFRESH_TOKEN
-ANTIGRAVITY_1_EXPIRY_DATE
-ANTIGRAVITY_1_EMAIL
-ANTIGRAVITY_1_PROJECT_ID (optional)
-ANTIGRAVITY_1_TIER (optional)
-```
-
-**Qwen Code Environment Variables:**
-```
-QWEN_CODE_ACCESS_TOKEN
-QWEN_CODE_REFRESH_TOKEN
-QWEN_CODE_EXPIRY_DATE
-QWEN_CODE_EMAIL
-```
-
-**iFlow Environment Variables:**
-```
-IFLOW_ACCESS_TOKEN
-IFLOW_REFRESH_TOKEN
-IFLOW_EXPIRY_DATE
-IFLOW_EMAIL
-IFLOW_API_KEY
-```
-
 **How it works:**
 - If the manager finds (e.g.) `GEMINI_CLI_ACCESS_TOKEN` or `GEMINI_CLI_1_ACCESS_TOKEN`, it constructs an in-memory credential object that mimics the file structure
 - The credential is referenced internally as `env://gemini_cli/0` (legacy) or `env://gemini_cli/1` (numbered)
@@ -306,7 +275,6 @@ env://{provider}/{index}
 Examples:
 - env://gemini_cli/1  → GEMINI_CLI_1_ACCESS_TOKEN, etc.
 - env://gemini_cli/0  → GEMINI_CLI_ACCESS_TOKEN (legacy single credential)
-- env://antigravity/1 → ANTIGRAVITY_1_ACCESS_TOKEN, etc.
 ```
 
 #### 2.6.3. Credential Tool Integration
@@ -314,7 +282,7 @@ Examples:
 The `credential_tool.py` provides a user-friendly CLI interface to the `CredentialManager`:
 
 **Key Functions:**
-1. **OAuth Setup**: Wraps provider-specific `AuthBase` classes (`GeminiAuthBase`, `QwenAuthBase`, `IFlowAuthBase`) to handle interactive login flows
+1. **OAuth Setup**: Wraps provider-specific auth classes to handle interactive login flows
 2. **Credential Export**: Reads local `.json` files and generates `.env` format output for stateless deployment
 3. **API Key Management**: Adds or updates `PROVIDER_API_KEY_N` entries in the `.env` file
 
@@ -334,16 +302,6 @@ The `sanitize_request_payload` function ensures requests are compatible with eac
    - Format: `{"type": "enabled", "budget_tokens": -1}`
    - Only valid for `gemini/gemini-2.5-pro` and `gemini/gemini-2.5-flash`
    - Removed for all other models
-
-**Provider-Specific Tool Schema Cleaning:**
-
-Implemented in individual provider classes (`QwenCodeProvider`, `IFlowProvider`):
-
-- **Recursively removes** unsupported properties from tool function schemas:
-  - `strict`: OpenAI-specific, causes validation errors on Qwen/iFlow
-  - `additionalProperties`: Same issue
-- **Prevents `400 Bad Request` errors** when using complex tool definitions
-- Applied automatically before sending requests to the provider
 
 ---
 
@@ -419,7 +377,7 @@ The `CooldownManager` handles IP or account-level rate limiting that affects all
 - All subsequent `acquire_key()` calls for that provider will wait until the cooldown expires
 
 
-### 2.10. Credential Prioritization System (`client.py` & `usage_manager.py`)
+### 2.10. Credential Prioritization System (`client/rotating_client.py` & `usage/manager.py`)
 
 The library now includes an intelligent credential prioritization system that automatically detects credential tiers and ensures optimal credential selection for each request.
 
@@ -462,7 +420,6 @@ def get_model_tier_requirement(self, model: str) -> Optional[int]:
 The following providers implement credential prioritization:
 
 - **Gemini CLI**: Paid tier (priority 1), Free tier (priority 2), Legacy/Unknown (priority 10). Gemini 3 models require paid tier.
-- **Antigravity**: Same priority system as Gemini CLI. No model-tier restrictions (all models work on all tiers). Paid tier resets every 5 hours, free tier resets weekly.
 
 **Usage Manager Integration:**
 
@@ -492,88 +449,7 @@ A modular, shared caching system for providers to persist conversation state acr
 - **Background Persistence**: Batched disk writes every 60 seconds (configurable)
 - **Automatic Cleanup**: Background task removes expired entries from memory cache
 
-### 2.15. Antigravity Quota Tracker (`providers/utilities/antigravity_quota_tracker.py`)
-
-A mixin class providing quota tracking functionality for the Antigravity provider. This enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
-
-#### Core Concepts
-
-**Quota Baseline Tracking:**
-- Periodically fetches quota status from the Antigravity `fetchAvailableModels` API
-- Stores the remaining fraction as a baseline in UsageManager
-- Tracks requests since baseline to estimate current remaining quota
-- Syncs local request count with API's authoritative values
-
-**Quota Cost Constants:**
-Based on empirical testing (see `docs/ANTIGRAVITY_QUOTA_REPORT.md`), quota costs are known per model and tier:
-
-| Tier | Model Group | Cost per Request | Requests per 100% |
-|------|-------------|------------------|-------------------|
-| standard-tier | Claude/GPT-OSS | 0.40% | 250 |
-| standard-tier | Gemini 3 Pro | 0.25% | 400 |
-| standard-tier | Gemini 2.5 Flash | 0.0333% | ~3000 |
-| free-tier | Claude/GPT-OSS | 1.333% | 75 |
-| free-tier | Gemini 3 Pro | 0.40% | 250 |
-
-**Model Name Mappings:**
-Some user-facing model names don't exist directly in the API response:
-- `claude-opus-4-5` → `claude-opus-4-5-thinking` (Opus only exists as thinking variant)
-- `gemini-3-pro-preview` → `gemini-3-pro-high` (preview maps to high by default)
-
-#### Key Methods
-
-**`fetch_quota_from_api(credential_path)`:**
-Fetches current quota status from the Antigravity API. Returns remaining fraction and reset times for all models.
-
-**`estimate_remaining_quota(credential_path, model, model_data, tier)`:**
-Estimates remaining quota based on baseline + request tracking. Returns confidence level (high/medium/low) based on baseline age.
-
-**`refresh_active_quota_baselines(credentials, usage_data)`:**
-Only refreshes baselines for credentials that have been used recently (within the refresh interval).
-
-**`discover_quota_costs(credential_path, models_to_test)`:**
-Manual utility to discover quota costs by making test requests and measuring before/after quota. Saves learned costs to `cache/antigravity/learned_quota_costs.json`.
-
-#### Integration with Background Jobs
-
-The Antigravity provider defines a background job for quota baseline refresh:
-
-```python
-def get_background_job_config(self) -> Optional[Dict[str, Any]]:
-    return {
-        "interval": 300,  # 5 minutes (configurable via ANTIGRAVITY_QUOTA_REFRESH_INTERVAL)
-        "name": "quota_baseline_refresh",
-        "run_on_start": True,
-    }
-```
-
-This job:
-1. Identifies credentials used since the last refresh
-2. Fetches current quota from the API for those credentials
-3. Updates baselines in UsageManager for accurate estimation
-
-#### Data Storage
-
-Quota baselines are stored in UsageManager's per-model data:
-
-```json
-{
-  "credential_path": {
-    "models": {
-      "antigravity/claude-sonnet-4-5": {
-        "request_count": 15,
-        "baseline_remaining_fraction": 0.94,
-        "baseline_fetched_at": 1734567890.0,
-        "requests_at_baseline": 15,
-        "quota_max_requests": 250,
-        "quota_display": "15/250"
-      }
-    }
-  }
-}
-```
-
-### 2.16. TransientQuotaError (`error_handler.py`)
+### 2.15. TransientQuotaError (`error_handler.py`)
 
 A new error type for handling bare 429 responses without retry timing information.
 
@@ -587,32 +463,12 @@ A new error type for handling bare 429 responses without retry timing informatio
 - Causes credential rotation to try the next credential
 - Does NOT trigger long-term quota cooldowns
 
-**Implementation in Antigravity:**
-```python
-# Non-streaming and streaming both retry bare 429s
-for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
-    try:
-        result = await self._handle_request(...)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            quota_info = self.parse_quota_error(e)
-            if quota_info is None:
-                # Bare 429 - retry like empty response
-                if attempt < EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
-                    await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
-                    continue
-                else:
-                    raise TransientQuotaError(provider, model, message)
-            # Has retry info - real quota exhaustion
-            raise
-```
-
 **Rationale:**
 Some 429 responses are transient rate limits rather than true quota exhaustion. These occur when the API is temporarily overloaded but the credential still has quota available. Retrying internally before rotating credentials provides better resilience.
 
-### 2.17. Gemini CLI Quota Tracker (`providers/utilities/gemini_cli_quota_tracker.py`)
+### 2.16. Gemini CLI Quota Tracker (`providers/utilities/gemini_cli_quota_tracker.py`)
 
-A mixin class providing quota tracking functionality for the Gemini CLI provider. This mirrors the Antigravity quota tracker (Section 2.15) and enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
+A mixin class providing quota tracking functionality for the Gemini CLI provider. This enables accurate remaining quota estimation based on API-fetched baselines and local request counting.
 
 #### Core Concepts
 
@@ -711,9 +567,9 @@ QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-f
 QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
 ```
 
-### 2.18. Shared Gemini OAuth Utilities (`providers/utilities/`)
+### 2.17. Shared Gemini OAuth Utilities (`providers/utilities/`)
 
-The PR refactors shared logic between Gemini CLI and Antigravity providers into reusable utility modules:
+Shared Gemini CLI logic lives in reusable utility modules:
 
 | Module | Purpose |
 |--------|---------|
@@ -724,12 +580,12 @@ The PR refactors shared logic between Gemini CLI and Antigravity providers into 
 | `gemini_tool_handler.py` | Tool schema transformation and Gemini 3 tool fix logic |
 
 **Benefits:**
-- Eliminates code duplication between Gemini CLI and Antigravity providers
+- Keeps Gemini CLI provider logic modular
 - Single source of truth for shared constants and logic
 - Easier maintenance and bug fixes
 - Consistent behavior across Google OAuth-based providers
 
-### 2.19. Fair Cycle Rotation
+### 2.18. Fair Cycle Rotation
 
 Fair Cycle Rotation ensures each credential is used at least once before any credential can be reused within a tier. This prevents a single credential from being repeatedly used and exhausted while others sit idle.
 
@@ -757,14 +613,14 @@ Fair Cycle Rotation ensures each credential is used at least once before any cre
 
 **Logging Format:**
 ```
-Acquiring key for model antigravity/claude-opus-4.5. Tried keys: 0/12(17,cd:3,fc:2)
+Acquiring key for model gemini_cli/gemini-2.5-pro. Tried keys: 0/12(17,cd:3,fc:2)
 # Breakdown: 0 tried, 12 available, 17 total, 3 on cooldown, 2 fair-cycle excluded
 ```
 
 **Persistence:**
-Cycle state is persisted in `key_usage.json` under the `__fair_cycle__` key.
+Cycle state is persisted alongside usage data in `usage/usage_<provider>.json`.
 
-### 2.20. Custom Caps
+### 2.19. Custom Caps
 
 Custom Caps allow setting custom usage limits per tier, per model/group that are MORE restrictive than actual API limits. When the custom cap is reached, the credential is put on cooldown BEFORE hitting the actual API limit.
 
@@ -786,11 +642,8 @@ CUSTOM_CAP_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<value>
 CUSTOM_CAP_COOLDOWN_{PROVIDER}_T{TIER}_{MODEL_OR_GROUP}=<mode>:<value>
 
 # Examples
-CUSTOM_CAP_ANTIGRAVITY_T2_CLAUDE=100
-CUSTOM_CAP_COOLDOWN_ANTIGRAVITY_T2_CLAUDE=quota_reset
-
-CUSTOM_CAP_ANTIGRAVITY_T3_CLAUDE=30
-CUSTOM_CAP_COOLDOWN_ANTIGRAVITY_T3_CLAUDE=offset:3600
+CUSTOM_CAP_GEMINI_CLI_T2_PRO=100
+CUSTOM_CAP_COOLDOWN_GEMINI_CLI_T2_PRO=quota_reset
 ```
 
 **Cap Values:**
@@ -919,182 +772,6 @@ The proxy accepts both Anthropic and OpenAI authentication styles:
 - `x-api-key` header (Anthropic style)
 - `Authorization: Bearer` header (OpenAI style)
 
-### 3.5. Antigravity (`antigravity_provider.py`)
-
-The most sophisticated provider implementation, supporting Google's internal Antigravity API for Gemini 3 and Claude models (including **Claude Opus 4.5**, Anthropic's most powerful model).
-
-#### Architecture
-
-- **Unified Streaming/Non-Streaming**: Single code path handles both response types with optimal transformations
-- **Thought Signature Caching**: Server-side caching of encrypted signatures for multi-turn Gemini 3 conversations
-- **Model-Specific Logic**: Automatic configuration based on model type (Gemini 3, Claude Sonnet, Claude Opus)
-- **Credential Prioritization**: Automatic tier detection with paid credentials prioritized over free (paid tier resets every 5 hours, free tier resets weekly)
-- **Sequential Rotation Mode**: Default rotation mode is sequential (use credentials until exhausted) to maximize thought signature cache hits
-- **Per-Model Quota Tracking**: Each model tracks independent usage windows with authoritative reset timestamps from quota errors
-- **Quota Groups**: Models that share quota limits are grouped together (Claude/GPT-OSS share quota, Gemini 3 Pro variants share quota, Gemini 2.5 Flash variants share quota)
-- **Priority Multipliers**: Paid tier credentials get higher concurrency limits (Priority 1: 5x, Priority 2: 3x, Priority 3+: 2x in sequential mode)
-- **Quota Baseline Tracking**: Background job fetches quota status from API to provide accurate remaining quota estimates
-- **TransientQuotaError Handling**: Bare 429 responses (without retry info) are retried internally before credential rotation
-
-#### Model Support
-
-**Gemini 3 Pro:**
-- Uses `thinkingLevel` parameter (string: "low" or "high")
-- **Tool Hallucination Prevention**:
-  - Automatic system instruction injection explaining custom tool schema rules
-  - Parameter signature injection into tool descriptions (e.g., "STRICT PARAMETERS: files (ARRAY_OF_OBJECTS[path: string REQUIRED, ...])")
-  - Namespace prefix for tool names (`gemini3_` prefix) to avoid training data conflicts
-  - Malformed JSON auto-correction (handles extra trailing braces)
-- **ThoughtSignature Management**:
-  - Caching signatures from responses for reuse in follow-up messages
-  - Automatic injection into functionCalls for multi-turn conversations
-  - Fallback to bypass value if signature unavailable
-- **Parallel Tool Usage Instruction**: Configurable instruction injection to encourage parallel tool calls (disabled by default for Gemini 3)
-
-**Gemini 2.5 Flash:**
-- Uses `-thinking` variant when `reasoning_effort` is provided
-- Shares quota with `gemini-2.5-flash-thinking` and `gemini-2.5-flash-lite` variants
-- Parallel tool usage instruction configurable
-
-**Gemini 2.5 Flash Lite:**
-- Configurable thinking budget, no name change required
-- Shares quota with Flash variants
-
-**Claude Opus 4.5:**
-- Anthropic's most powerful model, now available via Antigravity proxy
-- **Always uses thinking variant** - `claude-opus-4-5-thinking` is the only available variant (non-thinking version doesn't exist)
-- Uses `thinkingBudget` parameter for extended thinking control (-1 for auto, 0 to disable, or specific token count)
-- Full support for tool use with schema cleaning
-- Same thinking preservation and sanitization features as Sonnet
-- Increased default max output tokens to 64000 to accommodate thinking output
-
-**Claude Sonnet 4.5:**
-- Proxied through Antigravity API
-- **Supports both thinking and non-thinking modes**:
-  - With `reasoning_effort`: Uses `claude-sonnet-4-5-thinking` variant with `thinkingBudget`
-  - Without `reasoning_effort`: Uses standard `claude-sonnet-4-5` variant
-- **Thinking Preservation**: Caches thinking content using composite keys (tool_call_id + text_hash)
-- **Schema Cleaning**: Removes unsupported properties (`$schema`, `additionalProperties`, `const` → `enum`)
-- **Parallel Tool Usage Instruction**: Automatic instruction injection to encourage parallel tool calls (enabled by default for Claude)
-
-**GPT-OSS 120B Medium:**
-- OpenAI-compatible model available via Antigravity
-- Shares quota with Claude models (Claude/GPT-OSS quota group)
-
-#### Base URL Fallback
-
-Automatic fallback chain for resilience:
-1. `daily-cloudcode-pa.sandbox.googleapis.com` (primary sandbox)
-2. `autopush-cloudcode-pa.sandbox.googleapis.com` (fallback sandbox)
-3. `cloudcode-pa.googleapis.com` (production fallback)
-
-#### Message Transformation
-
-**OpenAI → Gemini Format:**
-- System messages → `systemInstruction` with parts array
-- Multi-part content (text + images) → `inlineData` format
-- Tool calls → `functionCall` with args and id
-- Tool responses → `functionResponse` with name and response
-- ThoughtSignatures preserved/injected as needed
-
-**Tool Response Grouping:**
-- Converts linear format (call, response, call, response) to grouped format
-- Groups all function calls in one `model` message
-- Groups all responses in one `user` message
-- Required for Antigravity API compatibility
-
-#### Configuration (Environment Variables)
-
-```env
-# Cache control
-ANTIGRAVITY_SIGNATURE_CACHE_TTL=3600  # Memory cache TTL
-ANTIGRAVITY_SIGNATURE_DISK_TTL=86400  # Disk cache TTL
-ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
-
-# Feature flags
-ANTIGRAVITY_PRESERVE_THOUGHT_SIGNATURES=true  # Include signatures in client responses
-ANTIGRAVITY_ENABLE_DYNAMIC_MODELS=false  # Use API model discovery
-ANTIGRAVITY_GEMINI3_TOOL_FIX=true  # Enable Gemini 3 hallucination prevention
-ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable Claude thinking mode auto-correction
-
-# Gemini 3 tool fix customization
-ANTIGRAVITY_GEMINI3_TOOL_PREFIX="gemini3_"  # Namespace prefix
-ANTIGRAVITY_GEMINI3_DESCRIPTION_PROMPT="\n\nSTRICT PARAMETERS: {params}."
-ANTIGRAVITY_GEMINI3_SYSTEM_INSTRUCTION="..."  # Full system prompt
-
-# Parallel tool usage instruction
-ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Inject parallel tool instruction for Claude (default: true)
-ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_GEMINI3=false  # Inject parallel tool instruction for Gemini 3 (default: false)
-ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION="..."  # Custom instruction text
-
-# Quota tracking
-ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Background quota refresh interval in seconds (default: 300 = 5 min)
-```
-
-#### Claude Extended Thinking Sanitization
-
-The provider now includes robust automatic sanitization for Claude's extended thinking mode, handling all common error scenarios with conversation history.
-
-**Problem**: Claude's extended thinking API requires strict consistency in thinking blocks:
-- If thinking is enabled, the final assistant turn must start with a thinking block
-- If thinking is disabled, no thinking blocks can be present in the final turn
-- Tool use loops are part of a single "assistant turn"
-- You **cannot** toggle thinking mode mid-turn (this is invalid per Claude API)
-
-**Scenarios Handled**:
-
-| Scenario | Action |
-|----------|--------|
-| Tool loop WITH thinking + thinking enabled | Preserve thinking, continue normally |
-| Tool loop WITHOUT thinking + thinking enabled | **Inject synthetic closure** to start fresh turn with thinking |
-| Thinking disabled | Strip all thinking blocks |
-| Normal conversation (no tool loop) | Strip old thinking, new response adds thinking naturally |
-| Function call ID mismatch | Three-tier recovery: ID match → name match → fallback |
-| Missing tool responses | Automatic placeholder injection |
-| Compacted/cached conversations | Recover thinking from cache post-transformation |
-
-**Key Implementation Details**:
-
-The `_sanitize_thinking_for_claude()` method now:
-- Operates on Gemini-format messages (`parts[]` with `"thought": true` markers)
-- Detects tool results as user messages with `functionResponse` parts
-- Uses `_analyze_turn_state()` to classify conversation state on Gemini format
-- Recovers thinking from cache when client strips reasoning_content
-- When enabling thinking in a tool loop started without thinking:
-  - Injects synthetic assistant message to close the previous turn
-  - Allows Claude to start fresh turn with thinking capability
-
-**Function Call Response Grouping**:
-
-The enhanced pairing system ensures conversation history integrity:
-```
-Problem: Client/proxy may mutate response IDs or lose responses during context processing
-
-Solution:
-1. Try direct ID match (tool_call_id == response.id)
-2. If no match, try function name match (tool.name == response.name)
-3. If still no match, use order-based fallback (nth tool → nth response)
-4. Repair "unknown_function" responses with correct names
-5. Create placeholders for completely missing responses
-```
-
-**Configuration**:
-```env
-ANTIGRAVITY_CLAUDE_THINKING_SANITIZATION=true  # Enable/disable auto-correction (default: true)
-```
-
-**Note**: These fixes ensure Claude thinking mode works seamlessly with tool use, model switching, context compression, and cached conversations. No manual intervention required.
-
-#### File Logging
-
-Optional transaction logging for debugging:
-- Enabled via `enable_request_logging` parameter
-- Creates `logs/antigravity_logs/TIMESTAMP_MODEL_UUID/` directory per request
-- Logs: `request_payload.json`, `response_stream.log`, `final_response.json`, `error.log`
-
----
-
-
 - **Atomic Disk Writes**: Uses temp-file-and-move pattern to prevent corruption
 
 **Key Methods:**
@@ -1128,11 +805,8 @@ GEMINI_CLI_SIGNATURE_DISK_TTL=86400  # 24 hours disk TTL
 
 ```
 cache/
-├── gemini_cli/
-│   └── gemini3_signatures.json
-└── antigravity/
-    ├── gemini3_signatures.json
-    └── claude_thinking.json
+└── gemini_cli/
+    └── gemini3_signatures.json
 ```
 
 ---
@@ -1145,26 +819,25 @@ A comprehensive credential rotation and quota management system introduced in PR
 
 Two rotation strategies are available per provider:
 
-**Balanced Mode (Default)**:
+**Balanced Mode**:
 - Distributes load evenly across all credentials
 - Least-used credentials selected first
 - Best for providers with per-minute rate limits
 - Prevents any single credential from being overused
 
-**Sequential Mode**:
+**Sequential Mode (Default)**:
 - Uses one credential until it's exhausted (429 quota error)
 - Switches to next credential only after current one fails
 - Most-used credentials selected first (sticky behavior)
 - Best for providers with daily/weekly quotas
-- Maximizes cache hit rates (e.g., Antigravity thought signatures)
-- Default for Antigravity provider
+- Maximizes provider-side cache locality
+- Default for all providers unless overridden
 
 **Configuration**:
 ```env
 # Set per provider
 ROTATION_MODE_GEMINI=sequential
 ROTATION_MODE_OPENAI=balanced
-ROTATION_MODE_ANTIGRAVITY=balanced  # Override default
 ```
 
 #### Per-Model Quota Tracking
@@ -1217,7 +890,7 @@ def parse_quota_error(error, error_body) -> Optional[Dict]:
     """
 ```
 
-**Google RPC Format** (Antigravity, Gemini CLI):
+**Google RPC Format** (Gemini CLI):
 - Parses `RetryInfo` and `ErrorInfo` from error details
 - Handles duration strings: `"143h4m52.73s"` or `"515092.73s"`
 - Extracts `quotaResetTimeStamp` and converts to Unix timestamp
@@ -1249,53 +922,13 @@ Models that share the same quota limits can be grouped:
 **Configuration**:
 ```env
 # Models in a group share quota/cooldown timing
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-sonnet-4-5-thinking,claude-opus-4-5,claude-opus-4-5-thinking,gpt-oss-120b-medium"
-QUOTA_GROUPS_ANTIGRAVITY_GEMINI_3_PRO="gemini-3-pro-high,gemini-3-pro-low,gemini-3-pro-preview"
-QUOTA_GROUPS_ANTIGRAVITY_GEMINI_2_5_FLASH="gemini-2.5-flash,gemini-2.5-flash-thinking,gemini-2.5-flash-lite"
-
-# To disable a default group:
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE=""
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
 ```
-
-**Default Quota Groups (Antigravity)**:
-
-| Group Name | Models | Shared Quota |
-|------------|--------|--------------|
-| `claude` | claude-sonnet-4-5, claude-sonnet-4-5-thinking, claude-opus-4-5, claude-opus-4-5-thinking, gpt-oss-120b-medium | Yes (Claude and GPT-OSS share quota) |
-| `gemini-3-pro` | gemini-3-pro-high, gemini-3-pro-low, gemini-3-pro-preview | Yes |
-| `gemini-2.5-flash` | gemini-2.5-flash, gemini-2.5-flash-thinking, gemini-2.5-flash-lite | Yes |
 
 **Behavior**:
 - When one model hits quota, all models in the group receive the same `quota_reset_ts`
 - Group resets only when ALL models' quotas have reset
 - Preserves unexpired cooldowns during other resets
-
-**Provider Implementation**:
-```python
-class AntigravityProvider(ProviderInterface):
-    model_quota_groups = {
-        # Claude and GPT-OSS share the same quota pool
-        "claude": [
-            "claude-sonnet-4-5",
-            "claude-sonnet-4-5-thinking",
-            "claude-opus-4-5",
-            "claude-opus-4-5-thinking",
-            "gpt-oss-120b-medium",
-        ],
-        # Gemini 3 Pro variants share quota
-        "gemini-3-pro": [
-            "gemini-3-pro-high",
-            "gemini-3-pro-low",
-            "gemini-3-pro-preview",
-        ],
-        # Gemini 2.5 Flash variants share quota
-        "gemini-2.5-flash": [
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-thinking",
-            "gemini-2.5-flash-lite",
-        ],
-    }
-```
 
 #### Priority-Based Concurrency Multipliers
 
@@ -1304,22 +937,17 @@ Credentials can be assigned to priority tiers with configurable concurrency limi
 **Configuration**:
 ```env
 # Universal multipliers (all modes)
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_1=10
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_1=5
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_2=3
 
 # Mode-specific overrides
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2_BALANCED=1  # Lower in balanced mode
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_2_BALANCED=1  # Lower in balanced mode
 ```
 
 **How it works**:
 ```python
 effective_concurrent_limit = MAX_CONCURRENT_REQUESTS_PER_KEY * tier_multiplier
 ```
-
-**Provider Defaults** (Antigravity):
-- Priority 1 (paid ultra): 5x multiplier
-- Priority 2 (standard paid): 3x multiplier  
-- Priority 3+ (free): 2x (sequential mode) or 1x (balanced mode)
 
 **Benefits**:
 - Paid credentials handle more load without manual configuration
@@ -1329,22 +957,6 @@ effective_concurrent_limit = MAX_CONCURRENT_REQUESTS_PER_KEY * tier_multiplier
 #### Reset Window Configuration
 
 Providers can specify custom reset windows per priority tier:
-
-```python
-class AntigravityProvider(ProviderInterface):
-    usage_reset_configs = {
-        frozenset([1, 2]): UsageResetConfigDef(
-            mode="per_model",
-            window_hours=5,  # 5-hour rolling window for paid tiers
-            field_name="5h_window"
-        ),
-        frozenset([3, 4, 5]): UsageResetConfigDef(
-            mode="per_model",
-            window_hours=168,  # 7-day window for free tier
-            field_name="7d_window"
-        )
-    }
-```
 
 **Supported Modes**:
 - `per_model`: Independent window per model with authoritative reset times
@@ -1387,25 +999,6 @@ A refactored, reusable OAuth2 base class that eliminates code duplication across
 - **Consistent Behavior**: Token refresh, expiry handling, and validation work identically across providers
 - **Maintainability**: OAuth bugs fixed once apply to all inheriting providers
 
-**Provider Implementation:**
-
-```python
-class AntigravityAuthBase(GoogleOAuthBase):
-    # Required overrides
-    CLIENT_ID = "antigravity-client-id"
-    CLIENT_SECRET = "antigravity-secret"
-    OAUTH_SCOPES = [
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/cclog",  # Antigravity-specific
-        "https://www.googleapis.com/auth/experimentsandconfigs",
-    ]
-    ENV_PREFIX = "ANTIGRAVITY"  # Used for env var loading
-    
-    # Optional overrides (defaults provided)
-    CALLBACK_PORT = 51121
-    CALLBACK_PATH = "/oauthcallback"
-```
-
 **Inherited Features:**
 
 - Automatic token refresh with exponential backoff
@@ -1424,14 +1017,12 @@ Each OAuth provider uses a local callback server during authentication. The call
 | Provider | Default Port | Environment Variable |
 |----------|-------------|---------------------|
 | Gemini CLI | 8085 | `GEMINI_CLI_OAUTH_PORT` |
-| Antigravity | 51121 | `ANTIGRAVITY_OAUTH_PORT` |
-| iFlow | 11451 | `IFLOW_OAUTH_PORT` |
 
 **Configuration Methods:**
 
 1. **Via TUI Settings Menu:**
    - Main Menu → `4. View Provider & Advanced Settings` → `1. Launch Settings Tool`
-   - Select the provider (Gemini CLI, Antigravity, or iFlow)
+   - Select the provider (Gemini CLI)
    - Modify the `*_OAUTH_PORT` setting
    - Use "Reset to Default" to restore the original port
 
@@ -1439,8 +1030,6 @@ Each OAuth provider uses a local callback server during authentication. The call
    ```env
    # Custom OAuth callback ports (optional)
    GEMINI_CLI_OAUTH_PORT=8085
-   ANTIGRAVITY_OAUTH_PORT=51121
-   IFLOW_OAUTH_PORT=11451
    ```
 
 **When to Change Ports:**
@@ -1514,7 +1103,7 @@ TIMEOUT_READ_NON_STREAMING=600
 - Uses longer read timeout (default 10 minutes)
 - Server may take significant time to generate the complete response before sending anything
 - Complex reasoning tasks or large outputs may legitimately take several minutes
-- Only used by Antigravity provider's `_handle_non_streaming()` method
+- Used by providers with true non-streaming paths
 
 #### Provider Usage
 
@@ -1522,13 +1111,9 @@ The following providers use `TimeoutConfig`:
 
 | Provider | Method | Timeout Type |
 |----------|--------|--------------|
-| `antigravity_provider.py` | `_handle_non_streaming()` | `non_streaming()` |
-| `antigravity_provider.py` | `_handle_streaming()` | `streaming()` |
 | `gemini_cli_provider.py` | `acompletion()` | `streaming()` |
-| `iflow_provider.py` | `acompletion()` | `streaming()` |
-| `qwen_code_provider.py` | `acompletion()` | `streaming()` |
 
-**Note:** iFlow, Qwen Code, and Gemini CLI providers always use streaming internally (even for non-streaming requests), aggregating chunks into a complete response. Only Antigravity has a true non-streaming path.
+**Note:** Gemini CLI uses streaming internally (even for non-streaming requests), aggregating chunks into a complete response.
 
 #### Tuning Recommendations
 
@@ -1566,7 +1151,7 @@ The `GeminiCliProvider` is the most complex implementation, mimicking the Google
 
 **New in PR #62**:
 - **Quota Baseline Tracking**: Background job fetches quota status from API (`retrieveUserQuota`) to provide accurate remaining quota estimates
-- **GeminiCliQuotaTracker Mixin**: Inherits from `BaseQuotaTracker` for shared quota infrastructure with Antigravity
+- **GeminiCliQuotaTracker Mixin**: Inherits from `BaseQuotaTracker` for shared quota infrastructure
 - **env:// Credential Support**: Environment-based credentials are detected and loaded via `env://gemini_cli/N` URIs
 - **Quota Groups**: Models sharing quota are grouped (`pro`, `25-flash`, `3-flash`) for accurate cooldown propagation
 - **24-Hour Fixed Windows**: All tiers use fixed 24-hour windows from first request (verified 2026-01-07)
@@ -1575,7 +1160,7 @@ The `GeminiCliProvider` is the most complex implementation, mimicking the Google
 - **Quota Parsing**: Implements `parse_quota_error()` using Google RPC format parser
 - **Tier Configuration**: Defines `tier_priorities` and `usage_reset_configs` for automatic priority resolution
 - **Sequential Rotation**: Defaults to sequential mode (uses credentials until quota exhausted)
-- **Priority Multipliers**: Same as Antigravity (P1: 5x, P2: 3x, others: 2x in sequential mode)
+- **Priority Multipliers**: P1: 5x, P2: 3x, others: 1x
 
 #### Authentication (`gemini_auth_base.py`)
 
@@ -1633,23 +1218,7 @@ QUOTA_GROUPS_GEMINI_CLI_25_FLASH="gemini-2.0-flash,gemini-2.5-flash,gemini-2.5-f
 QUOTA_GROUPS_GEMINI_CLI_3_FLASH="gemini-3-flash-preview"
 ```
 
-### 3.2. Qwen Code (`qwen_code_provider.py`)
-
-*   **Dual Auth**: Supports both standard API keys (direct) and OAuth (via `QwenAuthBase`).
-*   **Device Flow**: Implements the OAuth Device Authorization Grant (RFC 8628). It displays a code to the user and polls the token endpoint until the user authorizes the device in their browser.
-*   **Dummy Tool Injection**: To work around a Qwen API bug where streams hang if `tools` is empty but `tool_choice` logic is present, the provider injects a benign `do_not_call_me` tool.
-*   **Schema Cleaning**: Recursively removes `strict` and `additionalProperties` from tool schemas, as Qwen's validation is stricter than OpenAI's.
-*   **Reasoning Parsing**: Detects `<think>` tags in the raw stream and redirects their content to a separate `reasoning_content` field in the delta, mimicking the OpenAI o1 format.
-
-### 3.3. iFlow (`iflow_provider.py`)
-
-*   **Hybrid Auth**: Uses a custom OAuth flow (Authorization Code) to obtain an `access_token`. However, the *actual* API calls use a separate `apiKey` that is retrieved from the user's profile (`/api/oauth/getUserInfo`) using the access token.
-*   **Callback Server**: The auth flow spins up a local server (default: port `11451`, configurable via `IFLOW_OAUTH_PORT`) to capture the redirect.
-*   **Token Management**: Automatically refreshes the OAuth token and re-fetches the API key if needed.
-*   **Schema Cleaning**: Similar to Qwen, it aggressively sanitizes tool schemas to prevent 400 errors.
-*   **Dedicated Logging**: Implements `_IFlowFileLogger` to capture raw chunks for debugging proprietary API behaviors.
-
-### 3.4. Google Gemini (`gemini_provider.py`)
+### 3.2. Google Gemini (`gemini_provider.py`)
 
 *   **Thinking Parameter**: Automatically handles the `thinking` parameter transformation required for Gemini 2.5 models (`thinking` -> `gemini-2.5-pro` reasoning parameter).
 *   **Safety Settings**: Ensures default safety settings (blocking nothing) are applied if not provided, preventing over-sensitive refusals.
@@ -1773,7 +1342,7 @@ The system follows a strict hierarchy of survival:
 
 2. **Credential Management (Level 2)**: OAuth tokens are cached in memory first. If credential files are deleted, the proxy continues using cached tokens. If a token refresh succeeds but the file cannot be written, the new token is buffered for retry and saved on shutdown.
 
-3. **Usage Tracking (Level 3)**: Usage statistics (`key_usage.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
+3. **Usage Tracking (Level 3)**: Usage statistics (`usage/usage_<provider>.json`) are maintained in memory via `ResilientStateWriter`. If the file is deleted, the system tracks usage internally and attempts to recreate the file on the next save interval. Pending writes are flushed on shutdown.
 
 4. **Provider Cache (Level 4)**: The provider cache tracks disk health and continues operating in memory-only mode if disk writes fail. Has its own shutdown mechanism.
 
@@ -1785,8 +1354,6 @@ The system follows a strict hierarchy of survival:
 |-----------|--------------|--------------------------|----------------|
 | `UsageManager` | `ResilientStateWriter` | Continues in memory, retries after 30s | Yes (via registry) |
 | `GoogleOAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
-| `QwenAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
-| `IFlowAuthBase` | `safe_write_json(buffer_on_failure=True)` | Memory cache preserved, buffered for retry | Yes (via registry) |
 | `ProviderCache` | `safe_write_json` + own shutdown | Retries via own background loop | Yes (own mechanism) |
 | `DetailedLogger` | `safe_write_json` | Logs dropped, no crash | No |
 | `failure_logger` | Python `logging.RotatingFileHandler` | Falls back to NullHandler | No |
@@ -1813,7 +1380,7 @@ INFO:rotator_library.resilient_io:Shutdown flush: all 2 write(s) succeeded
 This architecture supports a robust development workflow:
 
 - **Log Cleanup**: You can safely run `rm -rf logs/` while the proxy is serving traffic. The system will recreate the directory structure on the next request.
-- **Config Reset**: Deleting `key_usage.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
+- **Config Reset**: Deleting `usage/usage_<provider>.json` resets the persistence layer, but the running instance preserves its current in-memory counts for load balancing consistency.
 - **File Recovery**: If you delete a critical file, the system attempts directory auto-recreation before every write operation.
 - **Safe Exit**: Ctrl+C triggers graceful shutdown with final data flush attempt.
 

@@ -5,12 +5,14 @@ import asyncio
 import time
 from typing import Dict
 
+
 class CooldownManager:
     """
     Manages global cooldown periods for API providers to handle IP-based rate limiting.
     This ensures that once a 429 error is received for a provider, all subsequent
     requests to that provider are paused for a specified duration.
     """
+
     def __init__(self):
         self._cooldowns: Dict[str, float] = {}
         self._lock = asyncio.Lock()
@@ -18,7 +20,9 @@ class CooldownManager:
     async def is_cooling_down(self, provider: str) -> bool:
         """Checks if a provider is currently in a cooldown period."""
         async with self._lock:
-            return provider in self._cooldowns and time.time() < self._cooldowns[provider]
+            return (
+                provider in self._cooldowns and time.time() < self._cooldowns[provider]
+            )
 
     async def start_cooldown(self, provider: str, duration: int):
         """
@@ -38,3 +42,7 @@ class CooldownManager:
                 remaining = self._cooldowns[provider] - time.time()
                 return max(0, remaining)
             return 0
+
+    async def get_remaining_cooldown(self, provider: str) -> float:
+        """Backward-compatible alias for get_cooldown_remaining."""
+        return await self.get_cooldown_remaining(provider)

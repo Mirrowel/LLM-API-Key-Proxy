@@ -81,8 +81,12 @@ def _register_providers():
     package_path = __path__
     package_name = __name__
 
-    # First, register file-based providers
+    # First, register file-based providers. Archive/private modules are skipped
+    # so retired providers can remain in-tree without becoming accessible.
     for _, module_name, _ in pkgutil.iter_modules(package_path):
+        if module_name.startswith("_"):
+            continue
+
         # Construct the full module path
         full_module_path = f"{package_name}.{module_name}"
 

@@ -3,6 +3,12 @@
 
 # src/rotator_library/providers/antigravity_provider_v2.py
 """
+Retired Antigravity provider implementation.
+
+This module is archived for historical reference only. Antigravity is no longer
+registered, discovered, or exposed by the proxy. Do not import or rewire this
+module into active runtime paths unless Antigravity is deliberately un-retired.
+
 Antigravity Provider - Refactored Implementation
 
 A clean, well-structured provider for Google's Antigravity API, supporting:
@@ -29,6 +35,7 @@ import os
 import random
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -59,6 +66,9 @@ from .utilities.gemini_shared_utils import (
     GEMINI3_TOOL_RENAMES_REVERSE,
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
+    # Tier utilities
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
 )
 from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -69,7 +79,7 @@ from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 
 # =============================================================================
@@ -113,9 +123,14 @@ BASE_URLS = [
 # Required headers for Antigravity API calls
 # These headers are CRITICAL for gemini-3-pro-high/low to work
 # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
-# User-Agent matches official Antigravity Electron client
+ANTIGRAVITY_USER_AGENT = "antigravity/1.15.8 windows/amd64"
+ANTIGRAVITY_USER_AGENT_LEGACY = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 "
+    "Electron/37.3.1 Safari/537.36"
+)
 ANTIGRAVITY_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
+    "User-Agent": ANTIGRAVITY_USER_AGENT,
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 }
@@ -148,6 +163,7 @@ AVAILABLE_MODELS = [
     # Claude models
     "claude-sonnet-4.5",  # Uses -thinking variant when reasoning_effort provided
     "claude-opus-4.5",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
+    "claude-opus-4.6",  # ALWAYS uses -thinking variant (non-thinking doesn't exist)
     # Other models
     # "gpt-oss-120b-medium",  # GPT-OSS model, shares quota with Claude
 ]
@@ -166,6 +182,36 @@ EMPTY_RESPONSE_RETRY_DELAY = env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3
 # inject corrective messages and retry up to this many times
 MALFORMED_CALL_MAX_RETRIES = max(1, env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
 MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
+
+# 503 MODEL_CAPACITY_EXHAUSTED retry configuration
+# When server returns 503 (capacity exhausted), retry with longer delay
+# since rotating credentials is pointless - all credentials are equally affected
+CAPACITY_EXHAUSTED_MAX_ATTEMPTS = max(1, env_int("ANTIGRAVITY_503_MAX_ATTEMPTS", 10))
+CAPACITY_EXHAUSTED_RETRY_DELAY = env_int("ANTIGRAVITY_503_RETRY_DELAY", 5)
+
+# =============================================================================
+# INTERNAL RETRY COUNTING (for usage tracking)
+# =============================================================================
+# Tracks the number of API attempts made per request, including internal retries
+# for empty responses, bare 429s, and malformed function calls.
+#
+# Uses ContextVar for thread-safety: each async task (request) gets its own
+# isolated value, so concurrent requests don't interfere with each other.
+#
+# The count is:
+# - Reset to 1 at the start of _streaming_with_retry
+# - Incremented each time we retry (before the next attempt)
+# - Read by on_request_complete() hook to report actual API call count
+#
+# Example: Request gets bare 429 twice, then succeeds
+#   Attempt 1: bare 429 → count stays 1, increment to 2, retry
+#   Attempt 2: bare 429 → count is 2, increment to 3, retry
+#   Attempt 3: success → count is 3
+#   on_request_complete returns count_override=3
+#
+_internal_attempt_count: ContextVar[int] = ContextVar(
+    "antigravity_attempt_count", default=1
+)
 
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
@@ -210,6 +256,7 @@ MODEL_ALIAS_MAP = {
     # Claude: API/internal names → public user-facing names
     "claude-sonnet-4-5": "claude-sonnet-4.5",
     "claude-opus-4-5": "claude-opus-4.5",
+    "claude-opus-4-6": "claude-opus-4.6",
 }
 MODEL_ALIAS_REVERSE = {v: k for k, v in MODEL_ALIAS_MAP.items()}
 
@@ -319,7 +366,30 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 """
 
 # Parallel tool usage encouragement instruction
-DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """<instructions name="parallel tool calling">
+
+Using parallel tool calling is MANDATORY. Be proactive about it. DO NO WAIT for the user to request "parallel calls"
+
+PARALLEL CALLS SHOULD BE AND _IS THE PRIMARY WAY YOU USE TOOLS IN THIS ENVIRONMENT_
+
+When you have to perform multi-step operations such as read multiple files, spawn task subagents, bash commands, multiple edits... _THE USER WANTS YOU TO MAKE PARALLEL TOOL CALLS_ instead of separate sequential calls. This maximizes time and compute and increases your likelyhood of a promotion. Sequential tool calling is only encouraged when relying on the output of a call for the next one(s)
+
+- WHAT CAN BE DONE IN PARALLEL, MUST BE, AND WILL BE DONE IN PARALLEL
+- INDIVIDUAL TOOL CALLS TO GATHER CONTEXT IS HEAVILY DISCOURAGED (please make parallel calls!)
+- PARALLEL TOOL CALLING IS YOUR BEST FRIEND AND WILL INCREASE USER'S HAPPINESS
+
+- Make parallel tool calls to manage ressources more efficiently, plan your tool calls ahead, then execute them in parallel.
+- Make parallel calls PROPERLY, be mindful of dependencies between calls.
+
+When researching anything, IT IS BETTER TO READ SPECULATIVELY, THEN TO READ SEQUENTIALLY. For example, if you need to read multiple files to gather context, read them all in parallel instead of reading one, then the next, etc.
+
+This environment has a powerful tool to remove unnecessary context, so you can always read more than needed and then trim down later, no need to use limit and offset parameters on the read tool.
+
+When making code changes, IT IS BETTER TO MAKE MULTIPLE EDITS IN PARALLEL RATHER THAN ONE AT A TIME.
+
+Do as much as you can in parallel, be efficient with you API requests, no single tool call spam, this is crucial as the user pays PER API request, so make them count!
+
+</instructions>"""
 
 # Interleaved thinking support for Claude models
 # Allows Claude to think between tool calls and after receiving tool results
@@ -535,7 +605,7 @@ def _generate_stable_session_id(contents: List[Dict[str, Any]]) -> str:
                 if text:
                     # SHA256 hash and extract first 8 bytes as int64
                     h = hashlib.sha256(text.encode("utf-8")).digest()
-                    # Use big-endian to match Go's binary.BigEndian.Uint64
+                    # Use big-endian for 64-bit integer conversion
                     n = struct.unpack(">Q", h[:8])[0] & 0x7FFFFFFFFFFFFFFF
                     return f"-{n}"
 
@@ -1002,7 +1072,7 @@ class AntigravityProvider(
     - Gemini 2.5 (Pro/Flash) with thinkingBudget
     - Gemini 3 (Pro/Flash/Image) with thinkingLevel
     - Claude Sonnet 4.5 via Antigravity proxy
-    - Claude Opus 4.5 via Antigravity proxy
+    - Claude Opus 4.x via Antigravity proxy
 
     Features:
     - Unified streaming/non-streaming handling
@@ -1023,22 +1093,12 @@ class AntigravityProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_ANTIGRAVITY_*)
     provider_env_name: str = "antigravity"
 
-    # Tier name -> priority mapping (Single Source of Truth)
-    # Lower numbers = higher priority
-    tier_priorities = {
-        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
-        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
-        # Priority 2: Standard paid tier
-        "standard-tier": 2,
-        # Priority 3: Free tier
-        "free-tier": 3,
-        # Priority 10: Legacy/Unknown (lowest)
-        "legacy-tier": 10,
-        "unknown": 10,
-    }
+    # Tier name -> priority mapping (from centralized tier utilities)
+    # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
+    tier_priorities = TIER_PRIORITIES
 
     # Default priority for tiers not in the mapping
-    default_tier_priority: int = 10
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # Usage reset configs keyed by priority sets
     # Priorities 1-2 (paid tiers) get 5h window, others get 7d window
@@ -1070,8 +1130,11 @@ class AntigravityProvider(
             "claude-sonnet-4-5-thinking",
             "claude-opus-4-5",
             "claude-opus-4-5-thinking",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
             "claude-sonnet-4.5",
             "claude-opus-4.5",
+            "claude-opus-4.6",
             "gpt-oss-120b-medium",
         ],
         # Gemini 3 Pro variants share quota
@@ -1105,11 +1168,11 @@ class AntigravityProvider(
     # Priority 1 (paid ultra): 5x concurrent requests
     # Priority 2 (standard paid): 3x concurrent requests
     # Others: Use sequential fallback (2x) or balanced default (1x)
-    default_priority_multipliers = {1: 5, 2: 3}
+    default_priority_multipliers = {1: 2, 2: 1}
 
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
-    default_sequential_fallback_multiplier = 2
+    default_sequential_fallback_multiplier = 1
 
     # Custom caps examples (commented - uncomment and modify as needed)
     # default_custom_caps = {
@@ -1498,9 +1561,77 @@ class AntigravityProvider(
         """Clear tool name mapping at start of each request."""
         self._tool_name_mapping.clear()
 
-    def _get_antigravity_headers(self) -> Dict[str, str]:
-        """Return the Antigravity API headers. Used by quota tracker mixin."""
-        return ANTIGRAVITY_HEADERS
+    def _get_credential_email(self, credential_path: str) -> Optional[str]:
+        """
+        Extract email from credential file's _proxy_metadata.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            Email address if found, None otherwise
+        """
+        # Skip env:// paths
+        if self._parse_env_credential_path(credential_path) is not None:
+            return None
+
+        try:
+            # Try to get from cached credentials first
+            if (
+                hasattr(self, "_credentials_cache")
+                and credential_path in self._credentials_cache
+            ):
+                creds = self._credentials_cache[credential_path]
+                return creds.get("_proxy_metadata", {}).get("email")
+
+            # Fall back to reading file
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+            return creds.get("_proxy_metadata", {}).get("email")
+        except Exception:
+            return None
+
+    def _get_antigravity_headers(
+        self, credential_path: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Return the Antigravity API headers with per-credential fingerprinting.
+
+        If credential_path is provided and has a valid email, returns complete
+        fingerprint headers (User-Agent, X-Goog-Api-Client, Client-Metadata,
+        X-Goog-QuotaUser, X-Client-Device-Id) unique to that credential.
+        Otherwise returns static default headers.
+
+        Args:
+            credential_path: Optional credential path for fingerprint lookup
+
+        Returns:
+            Dict of HTTP headers for Antigravity API
+        """
+        # Try to get per-credential fingerprint headers
+        if credential_path:
+            email = self._get_credential_email(credential_path)
+            if email:
+                try:
+                    from .utilities.device_profile import (
+                        get_or_create_fingerprint,
+                        build_fingerprint_headers,
+                    )
+
+                    fingerprint = get_or_create_fingerprint(email)
+                    if fingerprint:
+                        # Returns all 5 headers: User-Agent, X-Goog-Api-Client,
+                        # Client-Metadata, X-Goog-QuotaUser, X-Client-Device-Id
+                        return build_fingerprint_headers(fingerprint)
+                except Exception as e:
+                    lib_logger.debug(f"Failed to build fingerprint headers: {e}")
+
+        # Fallback to static headers (no fingerprint available)
+        return {
+            "User-Agent": ANTIGRAVITY_HEADERS["User-Agent"],
+            "X-Goog-Api-Client": ANTIGRAVITY_HEADERS["X-Goog-Api-Client"],
+            "Client-Metadata": ANTIGRAVITY_HEADERS["Client-Metadata"],
+        }
 
     # NOTE: _load_tier_from_file() is inherited from GeminiCredentialManager mixin
     # NOTE: get_credential_tier_name() is inherited from GeminiCredentialManager mixin
@@ -2536,16 +2667,73 @@ class AntigravityProvider(
                 parts.append({"text": content})
         elif isinstance(content, list):
             for item in content:
+                if isinstance(item, str):
+                    if item:
+                        parts.append({"text": item})
+                    continue
+                if not isinstance(item, dict):
+                    continue
                 if item.get("type") == "text":
                     text = item.get("text", "")
                     if text:
-                        parts.append({"text": text})
+                        parts.append({"text": self._extract_text_content(text)})
                 elif item.get("type") == "image_url":
                     image_part = self._parse_image_url(item.get("image_url", {}))
                     if image_part:
                         parts.append(image_part)
+                elif item.get("text"):
+                    parts.append({"text": self._extract_text_content(item.get("text"))})
+        elif isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                parts.append({"text": self._extract_text_content(text)})
 
         return parts
+
+    def _extract_text_content(self, content: Any) -> str:
+        """Extract text from string, dict, or OpenAI multi-part content."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                return str(text)
+        return ""
+
+    def _normalize_system_parts(
+        self, parts: Any, _strip_cache_control: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Ensure systemInstruction parts have string text values."""
+        normalized = []
+        if not isinstance(parts, list):
+            return normalized
+
+        for part in parts:
+            if isinstance(part, str):
+                if part:
+                    normalized.append({"text": part})
+                continue
+            if not isinstance(part, dict):
+                continue
+
+            new_part = dict(part)
+            if _strip_cache_control:
+                new_part.pop("cache_control", None)
+            if "text" in new_part:
+                text = self._extract_text_content(new_part.get("text"))
+                if not text:
+                    continue
+                new_part["text"] = text
+            normalized.append(new_part)
+        return normalized
 
     def _parse_image_url(self, image_url: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse image URL into Gemini inlineData format."""
@@ -3103,7 +3291,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         error_details: str,
         response_id: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
-    ) -> litellm.ModelResponse:
+    ) -> litellm.ModelResponseStream:
         """
         Build streaming chunk error response when malformed call retries are exhausted.
 
@@ -3121,7 +3309,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 "total_tokens": prompt_tokens + 1,
             }
 
-        return litellm.ModelResponse(
+        return litellm.ModelResponseStream(
             **{
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -3210,7 +3398,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         error_info: Dict[str, Any],
         response_id: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
-    ) -> Optional[litellm.ModelResponse]:
+    ) -> Optional[litellm.ModelResponseStream]:
         """
         Build a streaming chunk with the auto-fixed tool call.
 
@@ -3251,7 +3439,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 "total_tokens": prompt_tokens + 1,
             }
 
-        return litellm.ModelResponse(
+        return litellm.ModelResponseStream(
             **{
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -3393,12 +3581,12 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         internal_model = self._alias_to_internal(model)
 
         # Map Claude models to their -thinking variant
-        # claude-opus-4-5: ALWAYS use -thinking (non-thinking variant doesn't exist)
+        # claude-opus-4-x: ALWAYS use -thinking (non-thinking variant doesn't exist)
         # claude-sonnet-4-5: only use -thinking when reasoning_effort is provided
         if self._is_claude(internal_model) and not internal_model.endswith("-thinking"):
-            if internal_model == "claude-opus-4-5":
-                # Opus 4.5 ALWAYS requires -thinking variant
-                internal_model = "claude-opus-4-5-thinking"
+            if internal_model in ("claude-opus-4-5", "claude-opus-4-6"):
+                # Opus models ALWAYS require -thinking variant
+                internal_model = f"{internal_model}-thinking"
             elif internal_model == "claude-sonnet-4-5" and reasoning_effort:
                 # Sonnet 4.5 uses -thinking only when reasoning_effort is provided
                 internal_model = "claude-sonnet-4-5-thinking"
@@ -3461,7 +3649,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             existing_sys_inst = {}
             original_key = "systemInstruction"  # Default to camelCase
 
-        existing_parts = existing_sys_inst.get("parts", [])
+        existing_parts = self._normalize_system_parts(
+            existing_sys_inst.get("parts", []), _strip_cache_control=True
+        )
 
         # Always normalize to camelCase (Antigravity API requirement)
         target_key = "systemInstruction"
@@ -3493,7 +3683,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             # Then add existing parts (shifted to later positions)
             new_parts.extend(existing_parts)
 
-        # Set the combined system instruction with role "user" (per Go implementation)
+        # Set the combined system instruction with role "user"
         if new_parts:
             request[target_key] = {
                 "role": "user",
@@ -3906,7 +4096,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                **ANTIGRAVITY_HEADERS,
+                **self._get_antigravity_headers(api_key),
             }
             payload = {
                 "project": _generate_project_id(),
@@ -3939,7 +4129,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         """
         Handle completion requests for Antigravity.
 
@@ -4149,7 +4342,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            **ANTIGRAVITY_HEADERS,
+            **self._get_antigravity_headers(credential_path),
         }
 
         # Keep a mutable reference to gemini_contents for retry injection
@@ -4217,7 +4410,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
     async def _collect_streaming_chunks(
         self,
-        streaming_generator: AsyncGenerator[litellm.ModelResponse, None],
+        streaming_generator: AsyncGenerator[litellm.ModelResponseStream, None],
         model: str,
         file_logger: Optional["AntigravityProviderLogger"] = None,
     ) -> litellm.ModelResponse:
@@ -4375,11 +4568,17 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         if "system_instruction" in payload:
             existing = payload["system_instruction"]
             if isinstance(existing, dict) and "parts" in existing:
+                existing["parts"] = self._normalize_system_parts(
+                    existing.get("parts", []), _strip_cache_control=True
+                )
                 existing["parts"].insert(0, instruction_part)
             else:
                 payload["system_instruction"] = {
                     "role": "user",
-                    "parts": [instruction_part, {"text": str(existing)}],
+                    "parts": [
+                        instruction_part,
+                        {"text": self._extract_text_content(existing) or str(existing)},
+                    ],
                 }
         else:
             payload["system_instruction"] = {
@@ -4396,7 +4595,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         model: str,
         file_logger: Optional[AntigravityProviderLogger] = None,
         malformed_retry_num: Optional[int] = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[litellm.ModelResponseStream, None]:
         """Handle streaming completion.
 
         Args:
@@ -4476,7 +4675,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             gemini_chunk, model, accumulator
                         )
 
-                        yield litellm.ModelResponse(**openai_chunk)
+                        yield litellm.ModelResponseStream(**openai_chunk)
                         accumulator["yielded_any"] = True
                     except json.JSONDecodeError:
                         if file_logger:
@@ -4505,7 +4704,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                 # Only include usage if we received real data during streaming
                 if accumulator.get("last_usage"):
                     final_chunk["usage"] = accumulator["last_usage"]
-                yield litellm.ModelResponse(**final_chunk)
+                yield litellm.ModelResponseStream(**final_chunk)
 
             # Log final assembled response for provider logging
             if file_logger:
@@ -4567,7 +4766,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-    ) -> AsyncGenerator[litellm.ModelResponse, None]:
+    ) -> AsyncGenerator[litellm.ModelResponseStream, None]:
         """
         Wrapper around _handle_streaming that retries on empty responses, bare 429s,
         and MALFORMED_FUNCTION_CALL errors.
@@ -4593,7 +4792,17 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         current_gemini_contents = gemini_contents
         current_payload = payload
 
-        for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
+        # Reset internal attempt counter for this request (thread-safe via ContextVar)
+        _internal_attempt_count.set(1)
+
+        # Use the maximum of all retry limits to ensure the loop runs enough iterations
+        # for whichever error type needs the most retries. Each error type enforces its
+        # own limit via internal checks (EMPTY_RESPONSE_MAX_ATTEMPTS for empty/429,
+        # CAPACITY_EXHAUSTED_MAX_ATTEMPTS for 503).
+        max_loop_attempts = max(
+            EMPTY_RESPONSE_MAX_ATTEMPTS, CAPACITY_EXHAUSTED_MAX_ATTEMPTS
+        )
+        for attempt in range(max_loop_attempts):
             chunk_count = 0
 
             try:
@@ -4620,6 +4829,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         f"[Antigravity] Empty stream from {model}, "
                         f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                     )
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                     continue
                 else:
@@ -4722,6 +4933,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 malformed_retry_count, current_payload
                             )
 
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
                     continue  # Retry with modified payload
                 else:
@@ -4740,6 +4953,38 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     return
 
             except httpx.HTTPStatusError as e:
+                # Handle 503 MODEL_CAPACITY_EXHAUSTED - retry internally
+                # since rotating credentials is pointless (affects all equally)
+                if e.response.status_code == 503:
+                    error_body = ""
+                    try:
+                        error_body = (
+                            e.response.text if hasattr(e.response, "text") else ""
+                        )
+                    except Exception:
+                        pass
+
+                    if "MODEL_CAPACITY_EXHAUSTED" in error_body:
+                        if attempt < CAPACITY_EXHAUSTED_MAX_ATTEMPTS - 1:
+                            lib_logger.warning(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED from {model}, "
+                                f"attempt {attempt + 1}/{CAPACITY_EXHAUSTED_MAX_ATTEMPTS}. "
+                                f"Waiting {CAPACITY_EXHAUSTED_RETRY_DELAY}s..."
+                            )
+                            # NOTE: Do NOT increment _internal_attempt_count here - 503 capacity
+                            # exhausted errors don't consume quota, so retries are "free"
+                            await asyncio.sleep(CAPACITY_EXHAUSTED_RETRY_DELAY)
+                            continue
+                        else:
+                            # Max attempts reached - propagate error
+                            lib_logger.warning(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED after "
+                                f"{CAPACITY_EXHAUSTED_MAX_ATTEMPTS} attempts. Giving up."
+                            )
+                            raise
+                    # Other 503 errors - raise immediately
+                    raise
+
                 if e.response.status_code == 429:
                     # Check if this is a bare 429 (no retry info) vs real quota exhaustion
                     quota_info = self.parse_quota_error(e)
@@ -4749,6 +4994,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             lib_logger.warning(
                                 f"[Antigravity] Bare 429 from {model}, "
                                 f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            # Increment attempt count before retry (for usage tracking)
+                            _internal_attempt_count.set(
+                                _internal_attempt_count.get() + 1
                             )
                             await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                             continue
@@ -4841,3 +5090,51 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         except Exception as e:
             lib_logger.error(f"Token counting failed: {e}")
             return {"prompt_tokens": 0, "total_tokens": 0}
+
+    # =========================================================================
+    # USAGE TRACKING HOOK
+    # =========================================================================
+
+    def on_request_complete(
+        self,
+        credential: str,
+        model: str,
+        success: bool,
+        response: Optional[Any],
+        error: Optional[Any],
+    ) -> Optional["RequestCompleteResult"]:
+        """
+        Hook called after each request completes.
+
+        Reports the actual number of API calls made, including internal retries
+        for empty responses, bare 429s, and malformed function calls.
+
+        This uses the ContextVar pattern for thread-safe retry counting:
+        - _internal_attempt_count is set to 1 at start of _streaming_with_retry
+        - Incremented before each retry
+        - Read here to report the actual count
+
+        Example: Request gets 2 bare 429s then succeeds
+            → 3 API calls made
+            → Returns count_override=3
+            → Usage manager records 3 requests instead of 1
+
+        Returns:
+            RequestCompleteResult with count_override set to actual attempt count
+        """
+        from ..core.types import RequestCompleteResult
+
+        # Get the attempt count for this request
+        attempt_count = _internal_attempt_count.get()
+
+        # Reset for safety (though ContextVar should isolate per-task)
+        _internal_attempt_count.set(1)
+
+        # Log if we made extra attempts
+        if attempt_count > 1:
+            lib_logger.debug(
+                f"[Antigravity] Request to {model} used {attempt_count} API calls "
+                f"(includes internal retries)"
+            )
+
+        return RequestCompleteResult(count_override=attempt_count)

@@ -3,6 +3,14 @@
 
 # src/rotator_library/providers/iflow_auth_base.py
 
+"""
+Retired iFlow OAuth/cookie authentication support.
+
+This module is archived for historical reference only. Active credential setup,
+discovery, export, and provider factory wiring no longer reference it, so iFlow
+credentials cannot be added or used through the proxy.
+"""
+
 import secrets
 import base64
 import json
@@ -33,11 +41,15 @@ from ..error_handler import CredentialNeedsReauthError
 
 lib_logger = logging.getLogger("rotator_library")
 
+# OAuth endpoints
 IFLOW_OAUTH_AUTHORIZE_ENDPOINT = "https://iflow.cn/oauth"
 IFLOW_OAUTH_TOKEN_ENDPOINT = "https://iflow.cn/oauth/token"
 IFLOW_USER_INFO_ENDPOINT = "https://iflow.cn/api/oauth/getUserInfo"
 IFLOW_SUCCESS_REDIRECT_URL = "https://iflow.cn/oauth/success"
 IFLOW_ERROR_REDIRECT_URL = "https://iflow.cn/oauth/error"
+
+# Cookie-based authentication endpoint
+IFLOW_API_KEY_ENDPOINT = "https://platform.iflow.cn/api/openapi/apikey"
 
 # Client credentials provided by iFlow
 IFLOW_CLIENT_ID = "10009311001"
@@ -45,6 +57,9 @@ IFLOW_CLIENT_SECRET = "4Z3YjXycVsQvyGF1etiNlIBB4RsqSDtW"
 
 # Local callback server port
 CALLBACK_PORT = 11451
+
+# Cookie API key refresh buffer (48 hours before expiry)
+COOKIE_REFRESH_BUFFER_HOURS = 48
 
 
 @dataclass
@@ -77,6 +92,96 @@ def get_callback_port() -> int:
                 f"Invalid IFLOW_OAUTH_PORT value: {env_value}, using default {CALLBACK_PORT}"
             )
     return CALLBACK_PORT
+
+
+def normalize_cookie(raw: str) -> str:
+    """
+    Normalize and validate a cookie string for iFlow authentication.
+
+    Ensures the cookie contains the required BXAuth field and is properly formatted.
+
+    Args:
+        raw: Raw cookie string from user input
+
+    Returns:
+        Normalized cookie string ending with semicolon
+
+    Raises:
+        ValueError: If cookie is empty or missing BXAuth field
+    """
+    trimmed = raw.strip()
+    if not trimmed:
+        raise ValueError("Cookie cannot be empty")
+
+    # Normalize whitespace
+    combined = " ".join(trimmed.split())
+
+    # Ensure ends with semicolon
+    if not combined.endswith(";"):
+        combined += ";"
+
+    # Validate BXAuth field is present
+    if "BXAuth=" not in combined:
+        raise ValueError(
+            "Cookie missing required 'BXAuth' field. "
+            "Please copy the complete cookie including BXAuth."
+        )
+
+    return combined
+
+
+def extract_bx_auth(cookie: str) -> Optional[str]:
+    """
+    Extract the BXAuth value from a cookie string.
+
+    Args:
+        cookie: Cookie string (e.g., "BXAuth=abc123; other=value;")
+
+    Returns:
+        The BXAuth value, or None if not found
+    """
+    parts = cookie.split(";")
+    for part in parts:
+        part = part.strip()
+        if part.startswith("BXAuth="):
+            return part[7:]  # Remove "BXAuth=" prefix
+    return None
+
+
+def should_refresh_cookie_api_key(expire_time: str) -> Tuple[bool, float]:
+    """
+    Check if a cookie-based API key needs refresh.
+
+    Uses a 48-hour buffer to proactively refresh
+    API keys before they expire.
+
+    Args:
+        expire_time: Expiry time string in format "YYYY-MM-DD HH:MM"
+
+    Returns:
+        Tuple of (needs_refresh, seconds_until_expiry)
+        - needs_refresh: True if key expires within 48 hours
+        - seconds_until_expiry: Time until expiry (negative if already expired)
+    """
+    if not expire_time or not expire_time.strip():
+        return True, 0
+
+    try:
+        from datetime import datetime
+
+        # Parse iFlow's expire time format: "YYYY-MM-DD HH:MM"
+        expire_dt = datetime.strptime(expire_time.strip(), "%Y-%m-%d %H:%M")
+        now = datetime.now()
+
+        seconds_until_expiry = (expire_dt - now).total_seconds()
+        buffer_seconds = COOKIE_REFRESH_BUFFER_HOURS * 3600
+
+        needs_refresh = seconds_until_expiry < buffer_seconds
+        return needs_refresh, seconds_until_expiry
+
+    except (ValueError, AttributeError) as e:
+        lib_logger.warning(f"Could not parse cookie expire_time '{expire_time}': {e}")
+        return True, 0
 
 
 # Refresh tokens 24 hours before expiry
@@ -210,25 +315,19 @@ class IFlowAuthBase:
             str, float
         ] = {}  # Track backoff timers (Unix timestamp)
 
-        # [QUEUE SYSTEM] Sequential refresh processing with two separate queues
+        # [QUEUE SYSTEM] Sequential refresh processing
         # Normal refresh queue: for proactive token refresh (old token still valid)
         self._refresh_queue: asyncio.Queue = asyncio.Queue()
         self._queue_processor_task: Optional[asyncio.Task] = None
 
-        # Re-auth queue: for invalid refresh tokens (requires user interaction)
-        self._reauth_queue: asyncio.Queue = asyncio.Queue()
-        self._reauth_processor_task: Optional[asyncio.Task] = None
-
         # Tracking sets/dicts
-        self._queued_credentials: set = set()  # Track credentials in either queue
-        # Only credentials in re-auth queue are marked unavailable (not normal refresh)
-        # TTL cleanup is defense-in-depth for edge cases where re-auth processor crashes
-        self._unavailable_credentials: Dict[
-            str, float
-        ] = {}  # Maps credential path -> timestamp when marked unavailable
-        # TTL should exceed reauth timeout (300s) to avoid premature cleanup
-        self._unavailable_ttl_seconds: int = 360  # 6 minutes TTL for stale entries
+        self._queued_credentials: set = set()  # Track credentials in refresh queue
         self._queue_tracking_lock = asyncio.Lock()  # Protects queue sets
+
+        # [PERMANENTLY EXPIRED] Track credentials that have been permanently removed from rotation
+        # These credentials have invalid/revoked refresh tokens and require manual re-authentication
+        # via credential_tool.py. They will NOT be selected for rotation until proxy restart.
+        self._permanently_expired_credentials: set = set()
 
         # Retry tracking for normal refresh queue
         self._queue_retry_count: Dict[
@@ -239,7 +338,6 @@ class IFlowAuthBase:
         self._refresh_timeout_seconds: int = 15  # Max time for single refresh
         self._refresh_interval_seconds: int = 30  # Delay between queue items
         self._refresh_max_retries: int = 3  # Attempts before kicked out
-        self._reauth_timeout_seconds: int = 300  # Time for user to complete OAuth
 
     def _parse_env_credential_path(self, path: str) -> Optional[str]:
         """
@@ -318,6 +416,7 @@ class IFlowAuthBase:
                 "last_check_timestamp": time.time(),
                 "loaded_from_env": True,
                 "env_credential_index": credential_index or "0",
+                "credential_type": "oauth",
             },
         }
 
@@ -435,6 +534,14 @@ class IFlowAuthBase:
 
         return expiry_timestamp < time.time() + REFRESH_EXPIRY_BUFFER_SECONDS
 
+    async def _get_lock(self, path: str) -> asyncio.Lock:
+        # [FIX RACE CONDITION] Protect lock creation with a master lock
+        # This prevents TOCTOU bug where multiple coroutines check and create simultaneously
+        async with self._locks_lock:
+            if path not in self._refresh_locks:
+                self._refresh_locks[path] = asyncio.Lock()
+            return self._refresh_locks[path]
+
     def _is_token_truly_expired(self, creds: Dict[str, Any]) -> bool:
         """Check if token is TRULY expired (past actual expiry, not just threshold).
 
@@ -458,6 +565,52 @@ class IFlowAuthBase:
 
         return expiry_timestamp < time.time()
 
+    def _mark_credential_expired(self, path: str, reason: str) -> None:
+        """
+        Permanently mark a credential as expired and remove it from rotation.
+
+        This is called when a credential's refresh token is invalid or revoked,
+        meaning normal token refresh cannot work. The credential is removed from
+        rotation entirely and requires manual re-authentication via credential_tool.py.
+
+        The proxy must be restarted after fixing the credential.
+
+        Args:
+            path: Credential file path or env:// path
+            reason: Human-readable reason for expiration (e.g., "invalid_grant", "HTTP 401")
+        """
+        # Add to permanently expired set
+        self._permanently_expired_credentials.add(path)
+
+        # Clean up other tracking structures
+        self._queued_credentials.discard(path)
+
+        # Get display name
+        if path.startswith("env://"):
+            display_name = path
+        else:
+            display_name = Path(path).name
+
+        # Rich-formatted output for high visibility
+        console.print(
+            Panel(
+                f"[bold red]Credential:[/bold red] {display_name}\n"
+                f"[bold red]Reason:[/bold red] {reason}\n\n"
+                f"[yellow]This credential has been removed from rotation.[/yellow]\n"
+                f"[yellow]To fix: Run 'python credential_tool.py' to re-authenticate,[/yellow]\n"
+                f"[yellow]then restart the proxy.[/yellow]",
+                title="[bold red]⚠ CREDENTIAL EXPIRED - REMOVED FROM ROTATION[/bold red]",
+                border_style="red",
+            )
+        )
+
+        # Also log at ERROR level for log files
+        lib_logger.error(
+            f"CREDENTIAL EXPIRED - REMOVED FROM ROTATION | "
+            f"Credential: {display_name} | Reason: {reason} | "
+            f"Action: Run 'credential_tool.py' to re-authenticate, then restart proxy"
+        )
+
     async def _fetch_user_info(self, access_token: str) -> Dict[str, Any]:
         """
         Fetches user info (including API key) from iFlow API.
@@ -477,7 +630,7 @@ class IFlowAuthBase:
         if not result.get("success"):
             raise ValueError("iFlow user info request not successful")
 
-        data = result.get("data", {})
+        data = result.get("data") or {}
         api_key = data.get("apiKey", "").strip()
         if not api_key:
             raise ValueError("Missing API key in user info response")
@@ -489,6 +642,256 @@ class IFlowAuthBase:
             raise ValueError("Missing email/phone in user info response")
 
         return {"api_key": api_key, "email": email}
+
+    # =========================================================================
+    # COOKIE-BASED AUTHENTICATION METHODS
+    # =========================================================================
+
+    async def _fetch_api_key_info_with_cookie(self, cookie: str) -> Dict[str, Any]:
+        """
+        Fetch API key info using browser cookie (GET request).
+
+        This retrieves the current API key information including name,
+        masked key, and expiry time.
+
+        Args:
+            cookie: Cookie string containing BXAuth
+
+        Returns:
+            Dict with keys: name, apiKey, apiKeyMask, expireTime, hasExpired
+        """
+        headers = {
+            "Cookie": cookie,
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(IFLOW_API_KEY_ENDPOINT, headers=headers)
+
+            if response.status_code != 200:
+                lib_logger.error(
+                    f"iFlow cookie GET failed: {response.status_code} {response.text}"
+                )
+                raise ValueError(
+                    f"Cookie authentication failed: HTTP {response.status_code}"
+                )
+
+            result = response.json()
+
+        if not result.get("success"):
+            error_msg = result.get("message", "Unknown error")
+            raise ValueError(f"Cookie authentication failed: {error_msg}")
+
+        data = result.get("data") or {}
+
+        # Handle case where apiKey is masked - use apiKeyMask if apiKey is empty
+        if not data.get("apiKey") and data.get("apiKeyMask"):
+            data["apiKey"] = data["apiKeyMask"]
+
+        return data
+
+    async def _refresh_api_key_with_cookie(
+        self, cookie: str, name: str
+    ) -> Dict[str, Any]:
+        """
+        Refresh/regenerate API key using browser cookie (POST request).
+
+        This requests a new API key from iFlow using the session cookie.
+
+        Args:
+            cookie: Cookie string containing BXAuth
+            name: The API key name (obtained from GET request)
+
+        Returns:
+            Dict with keys: name, apiKey, expireTime, hasExpired
+        """
+        if not name or not name.strip():
+            raise ValueError("API key name is required for refresh")
+
+        headers = {
+            "Cookie": cookie,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Origin": "https://platform.iflow.cn",
+            "Referer": "https://platform.iflow.cn/",
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                IFLOW_API_KEY_ENDPOINT,
+                headers=headers,
+                json={"name": name},
+            )
+
+            if response.status_code != 200:
+                lib_logger.error(
+                    f"iFlow cookie POST failed: {response.status_code} {response.text}"
+                )
+                raise ValueError(
+                    f"Cookie API key refresh failed: HTTP {response.status_code}"
+                )
+
+            result = response.json()
+
+        if not result.get("success"):
+            error_msg = result.get("message", "Unknown error")
+            raise ValueError(f"Cookie API key refresh failed: {error_msg}")
+
+        return result.get("data") or {}
+
+    async def authenticate_with_cookie(self, cookie: str) -> Dict[str, Any]:
+        """
+        Authenticate using browser cookie and obtain API key.
+
+        This performs the full cookie-based authentication flow:
+        1. Validate and normalize the cookie
+        2. GET request to fetch current API key info
+        3. POST request to refresh/get full API key
+
+        Args:
+            cookie: Raw cookie string from browser (must contain BXAuth)
+
+        Returns:
+            Dict with credential data including:
+            - cookie: Normalized cookie string (BXAuth only)
+            - api_key: The API key for iFlow API calls
+            - name: Account/key name
+            - expire_time: When the API key expires
+            - type: "iflow_cookie"
+        """
+        # Normalize and validate cookie
+        try:
+            normalized_cookie = normalize_cookie(cookie)
+        except ValueError as e:
+            raise ValueError(f"Invalid cookie: {e}")
+
+        # Extract BXAuth value for storage (only store what's needed)
+        bx_auth = extract_bx_auth(normalized_cookie)
+        if not bx_auth:
+            raise ValueError("Could not extract BXAuth from cookie")
+
+        # Store only BXAuth for security (don't store other cookies)
+        cookie_to_store = f"BXAuth={bx_auth};"
+
+        lib_logger.debug("Fetching API key info with cookie...")
+
+        # GET request to fetch current info
+        key_info = await self._fetch_api_key_info_with_cookie(cookie_to_store)
+        name = key_info.get("name", "")
+
+        if not name:
+            raise ValueError("Could not get API key name from iFlow")
+
+        lib_logger.debug(f"Got API key info for '{name}', refreshing key...")
+
+        # POST request to refresh/get full API key
+        refreshed = await self._refresh_api_key_with_cookie(cookie_to_store, name)
+
+        api_key = refreshed.get("apiKey", "")
+        if not api_key:
+            raise ValueError("Could not get API key from iFlow")
+
+        expire_time = refreshed.get("expireTime", "")
+
+        return {
+            "cookie": cookie_to_store,
+            "api_key": api_key,
+            "name": name,
+            "expire_time": expire_time,
+            "_proxy_metadata": {
+                "email": name,  # Use name as identifier
+                "last_check_timestamp": time.time(),
+                "credential_type": "cookie",
+            },
+        }
+
+    async def _refresh_cookie_credential(self, path: str) -> Dict[str, Any]:
+        """
+        Refresh API key for a cookie-based credential.
+
+        This is called when the API key is approaching expiry.
+        Note: If the browser session cookie (BXAuth) expires, the user
+        will need to re-authenticate manually.
+
+        Args:
+            path: Path to the credential file
+
+        Returns:
+            Updated credentials dict
+        """
+        async with await self._get_lock(path):
+            # Read current credentials
+            creds = await self._load_credentials(path)
+
+            if not self._is_cookie_credential(creds):
+                raise ValueError(f"Credential at '{path}' is not a cookie credential")
+
+            cookie = creds.get("cookie", "")
+            name = creds.get("name", "")
+
+            if not cookie or not name:
+                raise ValueError("Cookie credential missing cookie or name")
+
+            # Check if refresh is actually needed
+            expire_time = creds.get("expire_time", "")
+            needs_refresh, seconds_until = should_refresh_cookie_api_key(expire_time)
+
+            if not needs_refresh:
+                lib_logger.debug(
+                    f"Cookie API key for '{name}' not due for refresh "
+                    f"({seconds_until / 3600:.1f}h until expiry)"
+                )
+                return creds
+
+            lib_logger.info(f"Refreshing cookie API key for '{name}'...")
+
+            try:
+                # Refresh the API key
+                refreshed = await self._refresh_api_key_with_cookie(cookie, name)
+
+                # Update credentials
+                creds["api_key"] = refreshed.get("apiKey", creds["api_key"])
+                creds["expire_time"] = refreshed.get("expireTime", creds["expire_time"])
+                creds["_proxy_metadata"]["last_check_timestamp"] = time.time()
+
+                # Save to disk
+                if not await self._save_credentials(path, creds):
+                    raise IOError(f"Failed to save refreshed cookie credentials")
+
+                lib_logger.info(
+                    f"Successfully refreshed cookie API key for '{name}'. "
+                    f"New expiry: {creds['expire_time']}"
+                )
+                return creds
+
+            except Exception as e:
+                # If refresh fails, the session cookie may be expired
+                lib_logger.error(f"Failed to refresh cookie API key for '{name}': {e}")
+                # Mark as expired if it's an auth error
+                if (
+                    "401" in str(e)
+                    or "403" in str(e)
+                    or "authentication" in str(e).lower()
+                ):
+                    self._mark_credential_expired(
+                        path,
+                        f"Cookie session expired. Please re-authenticate with a fresh cookie.",
+                    )
+                raise
+
+    def _is_cookie_credential(self, creds: Dict[str, Any]) -> bool:
+        """Check if credentials are cookie-based (vs OAuth-based)."""
+        # Primary check: explicit credential_type in metadata
+        cred_type = creds.get("_proxy_metadata", {}).get("credential_type")
+        if cred_type:
+            return cred_type == "cookie"
+
+        # Fallback: infer from fields (for backwards compatibility)
+        # Cookie creds have 'cookie' field but no 'refresh_token'
+        return "cookie" in creds and "refresh_token" not in creds
 
     async def _exchange_code_for_tokens(
         self, code: str, redirect_uri: str
@@ -644,8 +1047,9 @@ class IFlowAuthBase:
                         )
 
                         # [STATUS CODE HANDLING]
-                        # [INVALID GRANT HANDLING] Handle 400/401/403 by raising
-                        # Queue for re-auth in background so credential gets fixed automatically
+                        # [INVALID GRANT HANDLING] Handle 400/401/403 by marking as expired
+                        # These errors indicate the refresh token is invalid/revoked
+                        # Mark as permanently expired - no interactive re-auth during proxy operation
                         if status_code == 400:
                             # Check if this is an invalid refresh token error
                             try:
@@ -662,39 +1066,25 @@ class IFlowAuthBase:
                                 "invalid" in error_desc.lower()
                                 or error_type == "invalid_request"
                             ):
-                                lib_logger.info(
-                                    f"Credential '{Path(path).name}' needs re-auth (HTTP 400: {error_desc}). "
-                                    f"Queued for re-authentication, rotating to next credential."
+                                self._mark_credential_expired(
+                                    path,
+                                    f"Refresh token invalid (HTTP 400: {error_desc})",
                                 )
-                                # Queue for re-auth in background (non-blocking, fire-and-forget)
-                                # This ensures credential gets fixed even if caller doesn't handle it
-                                asyncio.create_task(
-                                    self._queue_refresh(
-                                        path, force=True, needs_reauth=True
-                                    )
-                                )
-                                # Raise rotatable error instead of raw HTTPStatusError
                                 raise CredentialNeedsReauthError(
                                     credential_path=path,
-                                    message=f"Refresh token invalid for '{Path(path).name}'. Re-auth queued.",
+                                    message=f"Refresh token invalid for '{Path(path).name}'. Credential removed from rotation.",
                                 )
                             else:
                                 # Other 400 error - raise it
                                 raise
 
                         elif status_code in (401, 403):
-                            lib_logger.info(
-                                f"Credential '{Path(path).name}' needs re-auth (HTTP {status_code}). "
-                                f"Queued for re-authentication, rotating to next credential."
+                            self._mark_credential_expired(
+                                path, f"Credential unauthorized (HTTP {status_code})"
                             )
-                            # Queue for re-auth in background (non-blocking, fire-and-forget)
-                            asyncio.create_task(
-                                self._queue_refresh(path, force=True, needs_reauth=True)
-                            )
-                            # Raise rotatable error instead of raw HTTPStatusError
                             raise CredentialNeedsReauthError(
                                 credential_path=path,
-                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Re-auth queued.",
+                                message=f"Token invalid for '{Path(path).name}' (HTTP {status_code}). Credential removed from rotation.",
                             )
 
                         elif status_code == 429:
@@ -827,25 +1217,41 @@ class IFlowAuthBase:
         Returns the API base URL and API key (NOT access_token).
         CRITICAL: iFlow uses the api_key for API requests, not the OAuth access_token.
 
-        Supports both credential types:
-        - OAuth: credential_identifier is a file path to JSON credentials
+        Supports three credential types:
+        - OAuth: credential_identifier is a file path to JSON credentials with refresh_token
+        - Cookie: credential_identifier is a file path to JSON credentials with cookie
         - API Key: credential_identifier is the API key string itself
         """
         # Detect credential type
         if os.path.isfile(credential_identifier):
-            # OAuth credential: file path to JSON
-            lib_logger.debug(
-                f"Using OAuth credentials from file: {credential_identifier}"
-            )
             creds = await self._load_credentials(credential_identifier)
 
-            # Check if token needs refresh
-            if self._is_token_expired(creds):
-                creds = await self._refresh_token(credential_identifier)
+            # Check if this is a cookie-based credential
+            if self._is_cookie_credential(creds):
+                lib_logger.debug(
+                    f"Using cookie credentials from file: {credential_identifier}"
+                )
+                # Check if API key needs refresh
+                expire_time = creds.get("expire_time", "")
+                needs_refresh, _ = should_refresh_cookie_api_key(expire_time)
+                if needs_refresh:
+                    creds = await self._refresh_cookie_credential(credential_identifier)
 
-            api_key = creds.get("api_key")
-            if not api_key:
-                raise ValueError("Missing api_key in iFlow OAuth credentials")
+                api_key = creds.get("api_key")
+                if not api_key:
+                    raise ValueError("Missing api_key in iFlow cookie credentials")
+            else:
+                # OAuth credential
+                lib_logger.debug(
+                    f"Using OAuth credentials from file: {credential_identifier}"
+                )
+                # Check if token needs refresh
+                if self._is_token_expired(creds):
+                    creds = await self._refresh_token(credential_identifier)
+
+                api_key = creds.get("api_key")
+                if not api_key:
+                    raise ValueError("Missing api_key in iFlow OAuth credentials")
         else:
             # Direct API key: use as-is
             lib_logger.debug("Using direct API key for iFlow")
@@ -856,94 +1262,67 @@ class IFlowAuthBase:
 
     async def proactively_refresh(self, credential_identifier: str):
         """
-        Proactively refreshes tokens if they're close to expiry.
-        Only applies to OAuth credentials (file paths or env:// paths). Direct API keys are skipped.
-        """
-        # lib_logger.debug(f"proactively_refresh called for: {credential_identifier}")
+        Proactively refreshes tokens/API keys if they're close to expiry.
 
+        Handles both credential types:
+        - OAuth credentials: Refresh access token using refresh_token
+        - Cookie credentials: Refresh API key using browser session cookie
+
+        Direct API keys are skipped.
+        """
         # Try to load credentials - this will fail for direct API keys
-        # and succeed for OAuth credentials (file paths or env:// paths)
         try:
             creds = await self._load_credentials(credential_identifier)
         except IOError as e:
             # Not a valid credential path (likely a direct API key string)
-            # lib_logger.debug(
-            #     f"Skipping refresh for '{credential_identifier}' - not an OAuth credential: {e}"
-            # )
             return
 
+        # Handle cookie-based credentials
+        if self._is_cookie_credential(creds):
+            expire_time = creds.get("expire_time", "")
+            needs_refresh, seconds_until = should_refresh_cookie_api_key(expire_time)
+
+            if needs_refresh:
+                lib_logger.debug(
+                    f"Proactive cookie API key refresh triggered for "
+                    f"'{Path(credential_identifier).name}' "
+                    f"({seconds_until / 3600:.1f}h until expiry)"
+                )
+                try:
+                    await self._refresh_cookie_credential(credential_identifier)
+                except Exception as e:
+                    lib_logger.warning(
+                        f"Proactive cookie refresh failed for "
+                        f"'{Path(credential_identifier).name}': {e}"
+                    )
+            return
+
+        # Handle OAuth credentials
         is_expired = self._is_token_expired(creds)
-        # lib_logger.debug(
-        #     f"Token expired check for '{Path(credential_identifier).name}': {is_expired}"
-        # )
 
         if is_expired:
-            # lib_logger.debug(
-            #     f"Queueing refresh for '{Path(credential_identifier).name}'"
-            # )
-            # lib_logger.info(f"Proactive refresh triggered for '{Path(credential_identifier).name}'")
-            await self._queue_refresh(
-                credential_identifier, force=False, needs_reauth=False
-            )
+            await self._queue_refresh(credential_identifier, force=False)
 
-    async def _get_lock(self, path: str) -> asyncio.Lock:
-        """Gets or creates a lock for the given credential path."""
-        # [FIX RACE CONDITION] Protect lock creation with a master lock
-        async with self._locks_lock:
-            if path not in self._refresh_locks:
-                self._refresh_locks[path] = asyncio.Lock()
-            return self._refresh_locks[path]
+    async def _queue_refresh(self, path: str, force: bool = False):
+        """Add a credential to the refresh queue if not already queued.
 
-    def is_credential_available(self, path: str) -> bool:
-        """Check if a credential is available for rotation.
-
-        Credentials are unavailable if:
-        1. In re-auth queue (token is truly broken, requires user interaction)
-        2. Token is TRULY expired (past actual expiry, not just threshold)
-
-        Note: Credentials in normal refresh queue are still available because
-        the old token is valid until actual expiry.
-
-        TTL cleanup (defense-in-depth): If a credential has been in the re-auth
-        queue longer than _unavailable_ttl_seconds without being processed, it's
-        cleaned up. This should only happen if the re-auth processor crashes or
-        is cancelled without proper cleanup.
+        Args:
+            path: Credential file path
+            force: Force refresh even if not expired
         """
-        # Check if in re-auth queue (truly unavailable)
-        if path in self._unavailable_credentials:
-            marked_time = self._unavailable_credentials.get(path)
-            if marked_time is not None:
-                now = time.time()
-                if now - marked_time > self._unavailable_ttl_seconds:
-                    # Entry is stale - clean it up and return available
-                    # This is a defense-in-depth for edge cases where re-auth
-                    # processor crashed or was cancelled without cleanup
-                    lib_logger.warning(
-                        f"Credential '{Path(path).name}' stuck in re-auth queue for "
-                        f"{int(now - marked_time)}s (TTL: {self._unavailable_ttl_seconds}s). "
-                        f"Re-auth processor may have crashed. Auto-cleaning stale entry."
-                    )
-                    # Clean up both tracking structures for consistency
-                    self._unavailable_credentials.pop(path, None)
-                    self._queued_credentials.discard(path)
-                else:
-                    return False  # Still in re-auth, not available
+        # Check backoff for automated refreshes
+        now = time.time()
+        if path in self._next_refresh_after:
+            backoff_until = self._next_refresh_after[path]
+            if now < backoff_until:
+                # Credential is in backoff, do not queue
+                return
 
-        # Check if token is TRULY expired (not just threshold-expired)
-        creds = self._credentials_cache.get(path)
-        if creds and self._is_token_truly_expired(creds):
-            # Token is actually expired - should not be used
-            # Queue for refresh if not already queued
+        async with self._queue_tracking_lock:
             if path not in self._queued_credentials:
-                # lib_logger.debug(
-                #     f"Credential '{Path(path).name}' is truly expired, queueing for refresh"
-                # )
-                asyncio.create_task(
-                    self._queue_refresh(path, force=True, needs_reauth=False)
-                )
-            return False
-
-        return True
+                self._queued_credentials.add(path)
+                await self._refresh_queue.put((path, force))
+                await self._ensure_queue_processor_running()
 
     async def _ensure_queue_processor_running(self):
         """Lazily starts the queue processor if not already running."""
@@ -951,64 +1330,6 @@ class IFlowAuthBase:
             self._queue_processor_task = asyncio.create_task(
                 self._process_refresh_queue()
             )
-
-    async def _ensure_reauth_processor_running(self):
-        """Lazily starts the re-auth queue processor if not already running."""
-        if self._reauth_processor_task is None or self._reauth_processor_task.done():
-            self._reauth_processor_task = asyncio.create_task(
-                self._process_reauth_queue()
-            )
-
-    async def _queue_refresh(
-        self, path: str, force: bool = False, needs_reauth: bool = False
-    ):
-        """Add a credential to the appropriate refresh queue if not already queued.
-
-        Args:
-            path: Credential file path
-            force: Force refresh even if not expired
-            needs_reauth: True if full re-authentication needed (routes to re-auth queue)
-
-        Queue routing:
-        - needs_reauth=True: Goes to re-auth queue, marks as unavailable
-        - needs_reauth=False: Goes to normal refresh queue, does NOT mark unavailable
-          (old token is still valid until actual expiry)
-        """
-        # IMPORTANT: Only check backoff for simple automated refreshes
-        # Re-authentication (interactive OAuth) should BYPASS backoff since it needs user input
-        if not needs_reauth:
-            now = time.time()
-            if path in self._next_refresh_after:
-                backoff_until = self._next_refresh_after[path]
-                if now < backoff_until:
-                    # Credential is in backoff for automated refresh, do not queue
-                    # remaining = int(backoff_until - now)
-                    # lib_logger.debug(
-                    #     f"Skipping automated refresh for '{Path(path).name}' (in backoff for {remaining}s)"
-                    # )
-                    return
-
-        async with self._queue_tracking_lock:
-            if path not in self._queued_credentials:
-                self._queued_credentials.add(path)
-
-                if needs_reauth:
-                    # Re-auth queue: mark as unavailable (token is truly broken)
-                    self._unavailable_credentials[path] = time.time()
-                    # lib_logger.debug(
-                    #     f"Queued '{Path(path).name}' for RE-AUTH (marked unavailable). "
-                    #     f"Total unavailable: {len(self._unavailable_credentials)}"
-                    # )
-                    await self._reauth_queue.put(path)
-                    await self._ensure_reauth_processor_running()
-                else:
-                    # Normal refresh queue: do NOT mark unavailable (old token still valid)
-                    # lib_logger.debug(
-                    #     f"Queued '{Path(path).name}' for refresh (still available). "
-                    #     f"Queue size: {self._refresh_queue.qsize() + 1}"
-                    # )
-                    await self._refresh_queue.put((path, force))
-                    await self._ensure_queue_processor_running()
 
     async def _process_refresh_queue(self):
         """Background worker that processes normal refresh requests sequentially.
@@ -1105,8 +1426,10 @@ class IFlowAuthBase:
                                 self._queued_credentials.discard(
                                     path
                                 )  # Remove from queued
-                            await self._queue_refresh(
-                                path, force=True, needs_reauth=True
+                            # Mark credential as permanently expired (no auto-reauth)
+                            self._mark_credential_expired(
+                                path,
+                                f"Refresh token invalid (HTTP {status_code}). Requires manual re-authentication.",
                             )
                         else:
                             await self._handle_refresh_failure(
@@ -1167,65 +1490,6 @@ class IFlowAuthBase:
         )
         # Keep in queued_credentials set, add back to queue
         await self._refresh_queue.put((path, force))
-
-    async def _process_reauth_queue(self):
-        """Background worker that processes re-auth requests.
-
-        Key behaviors:
-        - Credentials ARE marked unavailable (token is truly broken)
-        - Uses ReauthCoordinator for interactive OAuth
-        - No automatic retry (requires user action)
-        - Cleans up unavailable status when done
-        """
-        # lib_logger.info("Re-auth queue processor started")
-        while True:
-            path = None
-            try:
-                # Wait for an item with timeout to allow graceful shutdown
-                try:
-                    path = await asyncio.wait_for(
-                        self._reauth_queue.get(), timeout=60.0
-                    )
-                except asyncio.TimeoutError:
-                    # Queue is empty and idle for 60s - exit
-                    self._reauth_processor_task = None
-                    # lib_logger.debug("Re-auth queue processor idle, shutting down")
-                    return
-
-                try:
-                    lib_logger.info(f"Starting re-auth for '{Path(path).name}'...")
-                    await self.initialize_token(path, force_interactive=True)
-                    lib_logger.info(f"Re-auth SUCCESS for '{Path(path).name}'")
-
-                except Exception as e:
-                    lib_logger.error(f"Re-auth FAILED for '{Path(path).name}': {e}")
-                    # No automatic retry for re-auth (requires user action)
-
-                finally:
-                    # Always clean up
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
-                        # lib_logger.debug(
-                        #     f"Re-auth cleanup for '{Path(path).name}'. "
-                        #     f"Remaining unavailable: {len(self._unavailable_credentials)}"
-                        # )
-                    self._reauth_queue.task_done()
-
-            except asyncio.CancelledError:
-                # Clean up current credential before breaking
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
-                # lib_logger.debug("Re-auth queue processor cancelled")
-                break
-            except Exception as e:
-                lib_logger.error(f"Error in re-auth queue processor: {e}")
-                if path:
-                    async with self._queue_tracking_lock:
-                        self._queued_credentials.discard(path)
-                        self._unavailable_credentials.pop(path, None)
 
     async def _perform_interactive_oauth(
         self, path: str, creds: Dict[str, Any], display_name: str
@@ -1336,6 +1600,8 @@ class IFlowAuthBase:
                     "email": token_data["email"],
                     "last_check_timestamp": time.time(),
                 }
+            # Always set credential_type for OAuth credentials
+            creds["_proxy_metadata"]["credential_type"] = "oauth"
 
             if path:
                 if not await self._save_credentials(path, creds):
@@ -1387,6 +1653,59 @@ class IFlowAuthBase:
                 await self._load_credentials(creds_or_path) if path else creds_or_path
             )
 
+            # =========================================================
+            # COOKIE CREDENTIAL HANDLING - check first before OAuth logic
+            # =========================================================
+            if self._is_cookie_credential(creds):
+                # Validate required fields for cookie credentials
+                if not creds.get("cookie") or not creds.get("api_key"):
+                    error_msg = (
+                        "Cookie credential missing required fields (cookie or api_key)"
+                    )
+                    if path:
+                        self._mark_credential_expired(path, error_msg)
+                        raise ValueError(
+                            f"Credential '{display_name}' is invalid: {error_msg}. "
+                            f"Run 'python credential_tool.py' to re-authenticate."
+                        )
+                    raise ValueError(error_msg)
+
+                # Check if API key needs refresh (48-hour buffer)
+                if path:
+                    expire_time = creds.get("expire_time", "")
+                    needs_refresh, seconds_until = should_refresh_cookie_api_key(
+                        expire_time
+                    )
+                    if needs_refresh:
+                        try:
+                            lib_logger.info(
+                                f"Cookie API key for '{display_name}' needs refresh "
+                                f"({seconds_until / 3600:.1f}h until expiry)"
+                            )
+                            creds = await self._refresh_cookie_credential(path)
+                        except Exception as e:
+                            lib_logger.warning(
+                                f"Cookie API key refresh for '{display_name}' failed: {e}"
+                            )
+                            # If API key is already expired (negative seconds), mark as expired
+                            if seconds_until < 0:
+                                self._mark_credential_expired(
+                                    path,
+                                    f"Cookie API key expired and refresh failed: {e}. "
+                                    f"Please re-authenticate with a fresh cookie.",
+                                )
+                                raise ValueError(
+                                    f"Credential '{display_name}' cookie API key expired. "
+                                    f"Run 'python credential_tool.py' to re-authenticate."
+                                )
+                            # Otherwise continue with existing (still valid) API key
+
+                lib_logger.info(f"Cookie credential at '{display_name}' is valid.")
+                return creds
+
+            # =========================================================
+            # OAUTH CREDENTIAL HANDLING - existing logic
+            # =========================================================
             reason = ""
             if force_interactive:
                 reason = (
@@ -1404,31 +1723,29 @@ class IFlowAuthBase:
                         return await self._refresh_token(path)
                     except Exception as e:
                         lib_logger.warning(
-                            f"Automatic token refresh for '{display_name}' failed: {e}. Proceeding to interactive login."
+                            f"Automatic token refresh for '{display_name}' failed: {e}."
                         )
+                        # Fall through to handle expired credential
 
-                # Interactive OAuth flow
+                # Distinguish between proxy context (has path) and credential tool context (no path)
+                # - Proxy context: mark as expired and fail (no interactive OAuth during proxy operation)
+                # - Credential tool context: do interactive OAuth for new credential setup
+                if path:
+                    # [NO AUTO-REAUTH] Proxy context - mark as permanently expired
+                    self._mark_credential_expired(
+                        path,
+                        f"{reason}. Manual re-authentication required via credential_tool.py",
+                    )
+                    raise ValueError(
+                        f"Credential '{display_name}' is expired and requires manual re-authentication. "
+                        f"Run 'python credential_tool.py' to fix, then restart the proxy."
+                    )
+
+                # Credential tool context - do interactive OAuth for new credential setup
                 lib_logger.warning(
                     f"iFlow OAuth token for '{display_name}' needs setup: {reason}."
                 )
-
-                # [GLOBAL REAUTH COORDINATION] Use the global coordinator to ensure
-                # only one interactive OAuth flow runs at a time across all providers
-                coordinator = get_reauth_coordinator()
-
-                # Define the interactive OAuth function to be executed by coordinator
-                async def _do_interactive_oauth():
-                    return await self._perform_interactive_oauth(
-                        path, creds, display_name
-                    )
-
-                # Execute via global coordinator (ensures only one at a time)
-                return await coordinator.execute_reauth(
-                    credential_path=path or display_name,
-                    provider_name="IFLOW",
-                    reauth_func=_do_interactive_oauth,
-                    timeout=300.0,  # 5 minute timeout for user to complete OAuth
-                )
+                return await self._perform_interactive_oauth(path, creds, display_name)
 
             lib_logger.info(f"iFlow OAuth token at '{display_name}' is valid.")
             return creds
@@ -1440,10 +1757,24 @@ class IFlowAuthBase:
         """
         Returns auth header with API key (NOT OAuth access_token).
         CRITICAL: iFlow API requests use the api_key, not the OAuth tokens.
+
+        Handles both OAuth and cookie-based credentials:
+        - OAuth: checks token expiry and refreshes OAuth tokens if needed
+        - Cookie: checks API key expiry and refreshes via cookie if needed
         """
         creds = await self._load_credentials(credential_path)
-        if self._is_token_expired(creds):
-            creds = await self._refresh_token(credential_path)
+
+        # Handle credential refresh based on type
+        if self._is_cookie_credential(creds):
+            # Cookie credential: check API key expiry
+            expire_time = creds.get("expire_time", "")
+            needs_refresh, _ = should_refresh_cookie_api_key(expire_time)
+            if needs_refresh:
+                creds = await self._refresh_cookie_credential(credential_path)
+        else:
+            # OAuth credential: check token expiry
+            if self._is_token_expired(creds):
+                creds = await self._refresh_token(credential_path)
 
         api_key = creds.get("api_key")
         if not api_key:
@@ -1592,6 +1923,16 @@ class IFlowAuthBase:
 
             if is_update:
                 file_path = existing_path
+                # Check if existing credential is Cookie type (will be replaced)
+                try:
+                    with open(existing_path, "r") as f:
+                        existing_creds = json.load(f)
+                    if self._is_cookie_credential(existing_creds):
+                        lib_logger.info(
+                            f"Replacing existing Cookie credential for {email} with OAuth credential"
+                        )
+                except Exception:
+                    pass
                 lib_logger.info(
                     f"Found existing credential for {email}, updating {file_path.name}"
                 )
@@ -1619,6 +1960,220 @@ class IFlowAuthBase:
         except Exception as e:
             lib_logger.error(f"Credential setup failed: {e}")
             return IFlowCredentialSetupResult(success=False, error=str(e))
+
+    async def setup_cookie_credential(
+        self, base_dir: Optional[Path] = None
+    ) -> IFlowCredentialSetupResult:
+        """
+        Complete cookie-based credential setup flow with manual paste.
+
+        This guides the user through obtaining the BXAuth cookie from their
+        browser and uses it to authenticate and get an API key.
+
+        Args:
+            base_dir: Directory to save credential file (defaults to oauth_creds/)
+
+        Returns:
+            IFlowCredentialSetupResult with success status and file path
+        """
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        # Ensure directory exists
+        base_dir.mkdir(exist_ok=True)
+
+        try:
+            # Display instructions for cookie extraction
+            console.print(
+                Panel(
+                    Text.from_markup(
+                        "[bold]To get your iFlow session cookie:[/bold]\n\n"
+                        "1. Open [link=https://platform.iflow.cn]https://platform.iflow.cn[/link] in your browser\n"
+                        "2. Make sure you are [bold]logged in[/bold]\n"
+                        "3. Press [bold]F12[/bold] to open Developer Tools\n"
+                        "4. Go to: [bold]Application[/bold] (tab) → [bold]Cookies[/bold] → [bold]platform.iflow.cn[/bold]\n"
+                        "   [dim](In Firefox: Storage → Cookies)[/dim]\n"
+                        "5. Find the row with Name = [bold cyan]'BXAuth'[/bold cyan]\n"
+                        "6. Double-click the [bold]Value[/bold] cell and copy it (Ctrl+C)\n"
+                        "7. Paste it below\n\n"
+                        "[dim]Note: The cookie typically starts with 'eyJ' and is a long string.[/dim]"
+                    ),
+                    title="[bold blue]iFlow Cookie Setup[/bold blue]",
+                    border_style="blue",
+                )
+            )
+
+            # Prompt for cookie value
+            while True:
+                cookie_value = Prompt.ask(
+                    "\n[bold]Paste your BXAuth cookie value[/bold] (or 'q' to quit)"
+                )
+
+                if cookie_value.lower() == "q":
+                    return IFlowCredentialSetupResult(
+                        success=False, error="Setup cancelled by user"
+                    )
+
+                if not cookie_value.strip():
+                    console.print(
+                        "[yellow]Cookie value cannot be empty. Please try again.[/yellow]"
+                    )
+                    continue
+
+                # Clean up common paste issues
+                cookie_value = cookie_value.strip()
+                if cookie_value.startswith("BXAuth="):
+                    cookie_value = cookie_value[7:]
+                if cookie_value.endswith(";"):
+                    cookie_value = cookie_value[:-1]
+
+                if len(cookie_value) < 20:
+                    console.print(
+                        "[yellow]Cookie value seems too short. "
+                        "Make sure you copied the complete BXAuth value.[/yellow]"
+                    )
+                    continue
+
+                break
+
+            # Build the full cookie string
+            cookie_string = f"BXAuth={cookie_value};"
+
+            console.print("\n[dim]Validating cookie...[/dim]")
+
+            # Authenticate with the cookie
+            try:
+                new_creds = await self.authenticate_with_cookie(cookie_string)
+            except ValueError as e:
+                return IFlowCredentialSetupResult(
+                    success=False, error=f"Cookie authentication failed: {e}"
+                )
+
+            # Get identifier for deduplication
+            name = new_creds.get("name", "")
+            if not name:
+                return IFlowCredentialSetupResult(
+                    success=False, error="Could not retrieve account name from cookie"
+                )
+
+            console.print(f"[green]✓ Cookie validated for account: {name}[/green]")
+
+            # Check for existing credential with same name/email
+            # Use name as the email identifier for deduplication
+            existing_path = self._find_existing_credential_by_email(name, base_dir)
+            is_update = existing_path is not None
+
+            if is_update:
+                file_path = existing_path
+                # Check if existing credential is OAuth type (will be replaced)
+                try:
+                    with open(existing_path, "r") as f:
+                        existing_creds = json.load(f)
+                    if not self._is_cookie_credential(existing_creds):
+                        console.print(
+                            f"[yellow]Replacing existing OAuth credential for {name} with Cookie credential[/yellow]"
+                        )
+                except Exception:
+                    pass
+                console.print(
+                    f"[yellow]Found existing credential for {name}, updating {file_path.name}[/yellow]"
+                )
+            else:
+                file_path = self._build_credential_path(base_dir)
+                console.print(
+                    f"[green]Creating new credential for {name} at {file_path.name}[/green]"
+                )
+
+            # Set email field to name for consistency with OAuth credentials
+            new_creds["email"] = name
+
+            # Save credentials to file
+            if not await self._save_credentials(str(file_path), new_creds):
+                return IFlowCredentialSetupResult(
+                    success=False,
+                    error=f"Failed to save credentials to disk at {file_path.name}",
+                )
+
+            console.print(
+                Panel(
+                    f"[bold green]Cookie credential saved successfully![/bold green]\n\n"
+                    f"Account: {name}\n"
+                    f"API Key: {new_creds.get('api_key', '')[:20]}...\n"
+                    f"Expires: {new_creds.get('expire_time', 'Unknown')}\n"
+                    f"File: {file_path.name}",
+                    title="[bold green]Success[/bold green]",
+                    border_style="green",
+                )
+            )
+
+            return IFlowCredentialSetupResult(
+                success=True,
+                file_path=str(file_path),
+                email=name,
+                is_update=is_update,
+                credentials=new_creds,
+            )
+
+        except Exception as e:
+            lib_logger.error(f"Cookie credential setup failed: {e}")
+            return IFlowCredentialSetupResult(success=False, error=str(e))
+
+    def _find_existing_cookie_credential_by_name(
+        self, name: str, base_dir: Optional[Path] = None
+    ) -> Optional[Path]:
+        """Find an existing cookie credential file for the given name."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_cookie_*.json")
+
+        for cred_file in glob(pattern):
+            try:
+                with open(cred_file, "r") as f:
+                    creds = json.load(f)
+                existing_name = creds.get("name", "")
+                if existing_name == name:
+                    return Path(cred_file)
+            except (json.JSONDecodeError, IOError) as e:
+                lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
+                continue
+
+        return None
+
+    def _get_next_cookie_credential_number(
+        self, base_dir: Optional[Path] = None
+    ) -> int:
+        """Get the next available cookie credential number."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        prefix = self._get_provider_file_prefix()
+        pattern = str(base_dir / f"{prefix}_cookie_*.json")
+
+        existing_numbers = []
+        for cred_file in glob(pattern):
+            match = re.search(r"_cookie_(\d+)\.json$", cred_file)
+            if match:
+                existing_numbers.append(int(match.group(1)))
+
+        if not existing_numbers:
+            return 1
+        return max(existing_numbers) + 1
+
+    def _build_cookie_credential_path(
+        self, base_dir: Optional[Path] = None, number: Optional[int] = None
+    ) -> Path:
+        """Build a path for a new cookie credential file."""
+        if base_dir is None:
+            base_dir = self._get_oauth_base_dir()
+
+        if number is None:
+            number = self._get_next_cookie_credential_number(base_dir)
+
+        prefix = self._get_provider_file_prefix()
+        filename = f"{prefix}_cookie_{number}.json"
+        return base_dir / filename
 
     def build_env_lines(self, creds: Dict[str, Any], cred_number: int) -> List[str]:
         """Generate .env file lines for an iFlow credential."""
@@ -1687,15 +2242,16 @@ class IFlowAuthBase:
             return None
 
     def list_credentials(self, base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-        """List all iFlow credential files."""
+        """List all iFlow credential files (both OAuth and cookie-based)."""
         if base_dir is None:
             base_dir = self._get_oauth_base_dir()
 
         prefix = self._get_provider_file_prefix()
-        pattern = str(base_dir / f"{prefix}_oauth_*.json")
-
         credentials = []
-        for cred_file in sorted(glob(pattern)):
+
+        # List all credentials (both OAuth and cookie are stored as *_oauth_*.json)
+        oauth_pattern = str(base_dir / f"{prefix}_oauth_*.json")
+        for cred_file in sorted(glob(oauth_pattern)):
             try:
                 with open(cred_file, "r") as f:
                     creds = json.load(f)
@@ -1704,17 +2260,31 @@ class IFlowAuthBase:
                     "email", "unknown"
                 )
 
+                # Determine credential type from _proxy_metadata
+                cred_type = creds.get("_proxy_metadata", {}).get("credential_type")
+                if not cred_type:
+                    # Fallback: infer from fields
+                    if "cookie" in creds and "refresh_token" not in creds:
+                        cred_type = "cookie"
+                    else:
+                        cred_type = "oauth"
+
                 # Extract number from filename
                 match = re.search(r"_oauth_(\d+)\.json$", cred_file)
                 number = int(match.group(1)) if match else 0
 
-                credentials.append(
-                    {
-                        "file_path": cred_file,
-                        "email": email,
-                        "number": number,
-                    }
-                )
+                cred_info = {
+                    "file_path": cred_file,
+                    "email": email,
+                    "number": number,
+                    "type": cred_type,
+                }
+
+                # Add expire_time for cookie credentials
+                if cred_type == "cookie":
+                    cred_info["expire_time"] = creds.get("expire_time", "")
+
+                credentials.append(cred_info)
             except Exception as e:
                 lib_logger.debug(f"Could not read credential file {cred_file}: {e}")
                 continue
@@ -1722,7 +2292,7 @@ class IFlowAuthBase:
         return credentials
 
     def delete_credential(self, credential_path: str) -> bool:
-        """Delete a credential file."""
+        """Delete a credential file (OAuth or cookie-based)."""
         try:
             cred_path = Path(credential_path)
 

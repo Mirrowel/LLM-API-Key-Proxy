@@ -45,8 +45,6 @@ NATIVE_PROVIDER_PRIORITY = [
     "meta-llama",
     "nvidia",
     "moonshotai",  # Used in nvidia_nim/moonshotai/model format
-    "iflow",
-    "iflowcn",
     # These are aggregators/proxies - lower priority
     "openrouter",
     "azure",
@@ -85,7 +83,6 @@ PROVIDER_ALIASES = {
     "nvidia_nim": ["nvidia"],
     "gemini_cli": ["google"],
     "gemini": ["google"],
-    "iflow": ["iflow", "iflowcn"],  # iflow may exist as either
 }
 
 
@@ -736,7 +733,7 @@ class DataMerger:
     """
     Selects best source and creates ModelMetadata for queried model.
 
-    Key principle: For custom provider models (like antigravity/claude-opus-4-5),
+    Key principle: For custom provider models,
     we inherit technical specs from the best matching native provider source
     (like anthropic/claude-opus-4.5), but keep the queried model's identity.
     """

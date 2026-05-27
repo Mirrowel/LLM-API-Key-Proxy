@@ -19,8 +19,8 @@ services:
       - ./oauth_creds:/app/oauth_creds
       # Mount logs directory for persistent logging
       - ./logs:/app/logs
-      # Mount key_usage.json for usage statistics persistence
-      - ./key_usage.json:/app/key_usage.json
+      # Mount usage directory for usage statistics persistence
+      - ./usage:/app/usage
       # Optionally mount additional .env files (e.g., combined credential files)
       # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
     environment:

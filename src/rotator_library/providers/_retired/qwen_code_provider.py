@@ -3,13 +3,21 @@
 
 # src/rotator_library/providers/qwen_code_provider.py
 
+"""
+Retired Qwen Code provider implementation.
+
+This module is archived for historical reference only. It is intentionally kept
+outside the active provider package scan path and must not be imported or wired
+back into runtime provider registration without a deliberate un-retirement.
+"""
+
 import copy
 import json
 import time
 import os
 import httpx
 import logging
-from typing import Union, AsyncGenerator, List, Dict, Any
+from typing import Union, AsyncGenerator, List, Dict, Any, Optional
 from .provider_interface import ProviderInterface
 from .qwen_auth_base import QwenAuthBase
 from ..model_definitions import ModelDefinitions
@@ -24,7 +32,11 @@ from datetime import datetime
 lib_logger = logging.getLogger("rotator_library")
 
 
-HARDCODED_MODELS = ["qwen3-coder-plus", "qwen3-coder-flash"]
+# Hardcoded model IDs for Qwen Code provider
+# - qwen3-coder-plus: Qwen3 Coder Plus
+# - qwen3-coder-flash: Qwen3 Coder Flash
+# - coder-model: Qwen 3.5 Plus (efficient hybrid model with leading coding performance)
+HARDCODED_MODELS = ["qwen3-coder-plus", "qwen3-coder-flash", "coder-model"]
 
 # OpenAI-compatible parameters supported by Qwen Code API
 SUPPORTED_PARAMS = {
@@ -233,15 +245,29 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
         return payload
 
-    def _convert_chunk_to_openai(self, chunk: Dict[str, Any], model_id: str):
+    def _convert_chunk_to_openai(
+        self,
+        chunk: Dict[str, Any],
+        model_id: str,
+        stream_state: Optional[Dict[str, Any]] = None,
+    ):
         """
         Converts a raw Qwen SSE chunk to an OpenAI-compatible chunk.
 
         CRITICAL FIX: Handle chunks with BOTH usage and choices (final chunk)
         without early return to ensure finish_reason is properly processed.
+
+        Args:
+            chunk: Raw chunk from Qwen API
+            model_id: Model identifier for response
+            stream_state: Mutable dict to track state across chunks (e.g., tool_calls seen)
         """
         if not isinstance(chunk, dict):
             return
+
+        # Initialize stream_state if not provided
+        if stream_state is None:
+            stream_state = {}
 
         # Get choices and usage data
         choices = chunk.get("choices", [])
@@ -250,25 +276,28 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         chunk_created = chunk.get("created", int(time.time()))
 
         # Handle chunks with BOTH choices and usage (typical for final chunk)
-        # CRITICAL: Process choices FIRST to capture finish_reason, then yield usage
+        # CRITICAL: Keep as single chunk - don't split! Client needs usage to detect final chunk.
         if choices and usage_data:
             choice = choices[0]
             delta = choice.get("delta", {})
             finish_reason = choice.get("finish_reason")
 
-            # Yield the choice chunk first (contains finish_reason)
+            # Track tool_calls presence for finish_reason normalization
+            if delta.get("tool_calls"):
+                stream_state["has_tool_calls"] = True
+
+            # Ensure finish_reason is set for final chunks (with usage data)
+            # Priority: tool_calls > original finish_reason > default "stop"
+            if stream_state.get("has_tool_calls"):
+                finish_reason = "tool_calls"
+            elif not finish_reason:
+                finish_reason = "stop"
+
+            # Yield single chunk with BOTH choices and usage
             yield {
                 "choices": [
                     {"index": 0, "delta": delta, "finish_reason": finish_reason}
                 ],
-                "model": model_id,
-                "object": "chat.completion.chunk",
-                "id": chunk_id,
-                "created": chunk_created,
-            }
-            # Then yield the usage chunk
-            yield {
-                "choices": [],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk_id,
@@ -281,20 +310,51 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             }
             return
 
-        # Handle usage-only chunks
-        if usage_data:
-            yield {
-                "choices": [],
-                "model": model_id,
-                "object": "chat.completion.chunk",
-                "id": chunk_id,
-                "created": chunk_created,
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
-            }
+        # Handle usage-only chunks (Qwen API sends finish_reason and usage separately)
+        # Check if we have a buffered finish_reason chunk to combine with
+        if usage_data and not choices:
+            pending = stream_state.pop("pending_final_chunk", None)
+            if pending:
+                # Combine buffered finish_reason chunk with this usage chunk
+                finish_reason = pending["finish_reason"]
+                # Apply tool_calls priority
+                if stream_state.get("has_tool_calls"):
+                    finish_reason = "tool_calls"
+                elif not finish_reason:
+                    finish_reason = "stop"
+
+                yield {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": pending["delta"],
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "model": model_id,
+                    "object": "chat.completion.chunk",
+                    "id": pending.get("id", chunk_id),
+                    "created": pending.get("created", chunk_created),
+                    "usage": {
+                        "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                        "completion_tokens": usage_data.get("completion_tokens", 0),
+                        "total_tokens": usage_data.get("total_tokens", 0),
+                    },
+                }
+            else:
+                # No pending chunk - yield usage-only as fallback
+                yield {
+                    "choices": [],
+                    "model": model_id,
+                    "object": "chat.completion.chunk",
+                    "id": chunk_id,
+                    "created": chunk_created,
+                    "usage": {
+                        "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                        "completion_tokens": usage_data.get("completion_tokens", 0),
+                        "total_tokens": usage_data.get("total_tokens", 0),
+                    },
+                }
             return
 
         # Handle content-only chunks
@@ -304,6 +364,30 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
         choice = choices[0]
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
+
+        # Track tool_calls presence for finish_reason normalization
+        if delta.get("tool_calls"):
+            stream_state["has_tool_calls"] = True
+
+        # Normalize finish_reason: if tool_calls were seen, ensure finish_reason reflects this
+        if (
+            finish_reason
+            and stream_state.get("has_tool_calls")
+            and finish_reason != "tool_calls"
+        ):
+            finish_reason = "tool_calls"
+
+        # If this chunk has finish_reason but no usage, buffer it for combining with usage chunk
+        # Qwen API sends finish_reason and usage in separate chunks
+        if finish_reason:
+            stream_state["pending_final_chunk"] = {
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "id": chunk_id,
+                "created": chunk_created,
+            }
+            # Don't yield yet - wait for usage chunk to combine
+            return
 
         # Handle <think> tags for reasoning content
         content = delta.get("content")
@@ -337,11 +421,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     "created": chunk_created,
                 }
         else:
-            # Standard content chunk
+            # Standard content chunk (no finish_reason)
             yield {
-                "choices": [
-                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
-                ],
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk_id,
@@ -349,7 +431,7 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             }
 
     def _stream_to_completion_response(
-        self, chunks: List[litellm.ModelResponse]
+        self, chunks: List[litellm.ModelResponseStream]
     ) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
@@ -379,7 +461,25 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                 continue
 
             choice = chunk.choices[0]
-            delta = choice.get("delta", {})
+            # Handle both dict and object access patterns for choice.delta
+            if hasattr(choice, "get"):
+                delta = choice.get("delta", {})
+                choice_finish = choice.get("finish_reason")
+            elif hasattr(choice, "delta"):
+                delta = choice.delta if choice.delta else {}
+                # Convert delta to dict if it's an object
+                if hasattr(delta, "__dict__") and not isinstance(delta, dict):
+                    delta = {
+                        k: v
+                        for k, v in delta.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
+                elif hasattr(delta, "model_dump"):
+                    delta = delta.model_dump(exclude_none=True)
+                choice_finish = getattr(choice, "finish_reason", None)
+            else:
+                delta = {}
+                choice_finish = None
 
             # Aggregate content
             if "content" in delta and delta["content"] is not None:
@@ -396,6 +496,16 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
             # Aggregate tool calls with proper initialization
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
+                    if hasattr(tc_chunk, "model_dump"):
+                        tc_chunk = tc_chunk.model_dump(exclude_none=True)
+                    elif hasattr(tc_chunk, "__dict__") and not isinstance(
+                        tc_chunk, dict
+                    ):
+                        tc_chunk = {
+                            k: v
+                            for k, v in tc_chunk.__dict__.items()
+                            if not k.startswith("_") and v is not None
+                        }
                     index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         # Initialize with type field for OpenAI compatibility
@@ -408,43 +518,65 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                     if "type" in tc_chunk:
                         aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
+                        function_delta = tc_chunk["function"]
+                        if hasattr(function_delta, "model_dump"):
+                            function_delta = function_delta.model_dump(
+                                exclude_none=True
+                            )
+                        elif hasattr(function_delta, "__dict__") and not isinstance(
+                            function_delta, dict
+                        ):
+                            function_delta = {
+                                k: v
+                                for k, v in function_delta.__dict__.items()
+                                if not k.startswith("_") and v is not None
+                            }
                         if (
-                            "name" in tc_chunk["function"]
-                            and tc_chunk["function"]["name"] is not None
+                            "name" in function_delta
+                            and function_delta["name"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["name"] += (
-                                tc_chunk["function"]["name"]
+                                function_delta["name"]
                             )
                         if (
-                            "arguments" in tc_chunk["function"]
-                            and tc_chunk["function"]["arguments"] is not None
+                            "arguments" in function_delta
+                            and function_delta["arguments"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["arguments"] += (
-                                tc_chunk["function"]["arguments"]
+                                function_delta["arguments"]
                             )
 
             # Aggregate function calls (legacy format)
             if "function_call" in delta and delta["function_call"] is not None:
+                function_call = delta["function_call"]
+                if hasattr(function_call, "model_dump"):
+                    function_call = function_call.model_dump(exclude_none=True)
+                elif hasattr(function_call, "__dict__") and not isinstance(
+                    function_call, dict
+                ):
+                    function_call = {
+                        k: v
+                        for k, v in function_call.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
                 if "function_call" not in final_message:
                     final_message["function_call"] = {"name": "", "arguments": ""}
                 if (
-                    "name" in delta["function_call"]
-                    and delta["function_call"]["name"] is not None
+                    "name" in function_call
+                    and function_call["name"] is not None
                 ):
-                    final_message["function_call"]["name"] += delta["function_call"][
-                        "name"
-                    ]
+                    final_message["function_call"]["name"] += function_call["name"]
                 if (
-                    "arguments" in delta["function_call"]
-                    and delta["function_call"]["arguments"] is not None
+                    "arguments" in function_call
+                    and function_call["arguments"] is not None
                 ):
-                    final_message["function_call"]["arguments"] += delta[
-                        "function_call"
-                    ]["arguments"]
+                    final_message["function_call"]["arguments"] += function_call[
+                        "arguments"
+                    ]
 
             # Track finish_reason from chunks (for reference only)
-            if choice.get("finish_reason"):
-                chunk_finish_reason = choice["finish_reason"]
+            if choice_finish:
+                chunk_finish_reason = choice_finish
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -491,7 +623,10 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         credential_path = kwargs.pop("credential_identifier")
         transaction_context = kwargs.pop("transaction_context", None)
         model = kwargs["model"]
@@ -535,6 +670,8 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
 
         async def stream_handler(response_stream, attempt=1):
             """Handles the streaming response and converts chunks."""
+            # Track state across chunks for finish_reason normalization
+            stream_state: Dict[str, Any] = {}
             try:
                 async with response_stream as response:
                     # Check for HTTP errors before processing stream
@@ -589,9 +726,9 @@ class QwenCodeProvider(QwenAuthBase, ProviderInterface):
                             try:
                                 chunk = json.loads(data_str)
                                 for openai_chunk in self._convert_chunk_to_openai(
-                                    chunk, model
+                                    chunk, model, stream_state
                                 ):
-                                    yield litellm.ModelResponse(**openai_chunk)
+                                    yield litellm.ModelResponseStream(**openai_chunk)
                             except json.JSONDecodeError:
                                 lib_logger.warning(
                                     f"Could not decode JSON from Qwen Code: {line}"

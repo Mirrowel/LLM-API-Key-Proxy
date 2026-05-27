@@ -2,6 +2,11 @@
 # Copyright (c) 2026 Mirrowel
 
 """
+Retired Antigravity quota tracking mixin.
+
+This module is archived with the retired Antigravity provider. Shared quota
+tracking primitives used by active providers remain in `providers.utilities`.
+
 Antigravity Quota Tracking Mixin
 
 Provides quota tracking, estimation, and verification methods for the
@@ -34,7 +39,7 @@ import httpx
 from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -51,14 +56,18 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    "standard-tier": {
+    # Canonical tier names
+    "PRO": {
         # Claude/GPT-OSS group (verified: 0.6667% per request = 150 requests)
         "claude-sonnet-4-5": 150,
         "claude-sonnet-4-5-thinking": 150,
         "claude-opus-4-5": 150,
         "claude-opus-4-5-thinking": 150,
+        "claude-opus-4-6": 150,
+        "claude-opus-4-6-thinking": 150,
         "claude-sonnet-4.5": 150,
         "claude-opus-4.5": 150,
+        "claude-opus-4.6": 150,
         "gpt-oss-120b-medium": 150,
         # Gemini 3 Pro group (verified: 0.3125% per request = 320 requests)
         "gemini-3-pro-high": 320,
@@ -74,14 +83,17 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # Gemini 2.5 Pro - UNVERIFIED/UNUSED (assumed 0.1% = 1000 requests)
         "gemini-2.5-pro": 1,
     },
-    "free-tier": {
+    "FREE": {
         # Claude/GPT-OSS group (verified: 2.0% per request = 50 requests)
         "claude-sonnet-4-5": 50,
         "claude-sonnet-4-5-thinking": 50,
         "claude-opus-4-5": 50,
         "claude-opus-4-5-thinking": 50,
+        "claude-opus-4-6": 50,
+        "claude-opus-4-6-thinking": 50,
         "claude-sonnet-4.5": 50,
         "claude-opus-4.5": 50,
+        "claude-opus-4.6": 50,
         "gpt-oss-120b-medium": 50,
         # Gemini 3 Pro group (verified: 0.6667% per request = 150 requests)
         "gemini-3-pro-high": 150,
@@ -99,6 +111,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
     },
 }
 
+# Legacy tier name aliases (backwards compatibility)
+DEFAULT_MAX_REQUESTS["standard-tier"] = DEFAULT_MAX_REQUESTS["PRO"]
+DEFAULT_MAX_REQUESTS["free-tier"] = DEFAULT_MAX_REQUESTS["FREE"]
+
 # Default max requests for unknown models (1% = 100 requests)
 DEFAULT_MAX_REQUESTS_UNKNOWN = 100
 
@@ -112,6 +128,8 @@ DEFAULT_MAX_REQUESTS_UNKNOWN = 100
 _USER_TO_API_MODEL_MAP: Dict[str, str] = {
     "claude-opus-4-5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (legacy)
     "claude-opus-4.5": "claude-opus-4-5-thinking",  # Opus only exists as -thinking in API (new format)
+    "claude-opus-4-6": "claude-opus-4-6-thinking",  # Opus only exists as -thinking in API (legacy)
+    "claude-opus-4.6": "claude-opus-4-6-thinking",  # Opus only exists as -thinking in API (new format)
     "gemini-3-pro-preview": "gemini-3-pro-high",  # Preview maps to high by default
 }
 
@@ -119,6 +137,8 @@ _USER_TO_API_MODEL_MAP: Dict[str, str] = {
 _API_TO_USER_MODEL_MAP: Dict[str, str] = {
     "claude-opus-4-5-thinking": "claude-opus-4.5",  # Normalize to new user-facing name
     "claude-opus-4-5": "claude-opus-4.5",  # Normalize old format to new
+    "claude-opus-4-6-thinking": "claude-opus-4.6",  # Normalize to new user-facing name
+    "claude-opus-4-6": "claude-opus-4.6",  # Normalize old format to new
     "claude-sonnet-4-5-thinking": "claude-sonnet-4.5",  # Normalize to new user-facing name
     "claude-sonnet-4-5": "claude-sonnet-4.5",  # Normalize old format to new
     "gemini-3-pro-high": "gemini-3-pro-preview",  # Could map to preview (but high is valid too)
@@ -393,7 +413,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
+                **self._get_antigravity_headers(credential_path),
             }
 
             payload = {
@@ -479,7 +499,7 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                **self._get_antigravity_headers(),
+                **self._get_antigravity_headers(credential_path),
             }
             payload = {"project": project_id} if project_id else {}
 
@@ -990,13 +1010,22 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         self,
         quota_results: Dict[str, Dict[str, Any]],
         usage_manager: "UsageManager",
+        force: bool = False,
+        is_initial_fetch: bool = False,
     ) -> int:
         """
         Store fetched quota baselines into UsageManager.
 
+        Antigravity-specific override: API quota only updates in ~20% increments,
+        so local tracking is more accurate. Exhaustion check is only applied on
+        initial fetch (restart), not on subsequent background refreshes.
+
         Args:
             quota_results: Dict from fetch_quota_from_api or fetch_initial_baselines
             usage_manager: UsageManager instance to store baselines in
+            force: If True, always use API values (for manual refresh)
+            is_initial_fetch: If True, this is the first fetch on startup.
+                Exhaustion check is only applied when this is True.
 
         Returns:
             Number of baselines successfully stored
@@ -1009,6 +1038,8 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
         # Aggregate cooldown info for consolidated logging
         # Structure: {short_cred_name: {group_or_model: hours_until_reset}}
         cooldowns_by_cred: Dict[str, Dict[str, float]] = {}
+        # Track cleared cooldowns for consolidated logging
+        cleared_cooldowns_by_cred: Dict[str, List[str]] = {}
 
         for cred_path, quota_data in quota_results.items():
             if quota_data.get("status") != "success":
@@ -1052,16 +1083,53 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
                 # Extract reset_timestamp (already parsed to float in fetch_quota_from_api)
                 reset_timestamp = model_info.get("reset_timestamp")
 
+                # Only use reset_timestamp when quota is actually used
+                # (remaining == 1.0 means 100% left, timer is bogus)
+                valid_reset_ts = reset_timestamp if remaining < 1.0 else None
+
                 # Store with provider prefix for consistency with usage tracking
                 prefixed_model = f"antigravity/{user_model}"
+                quota_used = None
+                if max_requests is not None:
+                    quota_used = int((1.0 - remaining) * max_requests)
+                quota_group = self.get_model_quota_group(user_model)
+
+                # ANTIGRAVITY-SPECIFIC: Only apply exhaustion on initial fetch
+                # (API only updates in ~20% increments, so we rely on local tracking
+                # for subsequent refreshes)
+                apply_exhaustion = is_initial_fetch and (remaining == 0.0)
+
+                # Clear cooldowns if API shows quota is available
+                # This handles both force refresh and baseline refresh (proxy restart)
+                if remaining > 0.0:
+                    cooldown_target = quota_group or prefixed_model
+                    cleared = await usage_manager.clear_cooldown_if_exists(
+                        cred_path,
+                        model_or_group=cooldown_target,
+                    )
+                    if cleared:
+                        if short_cred not in cleared_cooldowns_by_cred:
+                            cleared_cooldowns_by_cred[short_cred] = []
+                        if cooldown_target not in cleared_cooldowns_by_cred[short_cred]:
+                            cleared_cooldowns_by_cred[short_cred].append(
+                                cooldown_target
+                            )
+
                 cooldown_info = await usage_manager.update_quota_baseline(
-                    cred_path, prefixed_model, remaining, max_requests, reset_timestamp
+                    cred_path,
+                    prefixed_model,
+                    quota_max_requests=max_requests,
+                    quota_reset_ts=valid_reset_ts,
+                    quota_used=quota_used,
+                    quota_group=quota_group,
+                    force=force,
+                    apply_exhaustion=apply_exhaustion,
                 )
 
                 # Aggregate cooldown info if returned
                 if cooldown_info:
-                    group_or_model = cooldown_info["group_or_model"]
-                    hours = cooldown_info["hours_until_reset"]
+                    group_or_model = cooldown_info["model"]
+                    hours = cooldown_info["cooldown_hours"]
                     if short_cred not in cooldowns_by_cred:
                         cooldowns_by_cred[short_cred] = {}
                     # Only keep first occurrence per group/model (avoids duplicates)
@@ -1073,14 +1141,18 @@ class AntigravityQuotaTracker(BaseQuotaTracker):
 
         # Log consolidated message for all cooldowns
         if cooldowns_by_cred:
-            # Build message: "oauth_1[claude 3.4h, gemini-3-pro 2.1h], oauth_2[claude 5.2h]"
-            parts = []
-            for cred_name, groups in sorted(cooldowns_by_cred.items()):
-                group_strs = [f"{g} {h:.1f}h" for g, h in sorted(groups.items())]
-                parts.append(f"{cred_name}[{', '.join(group_strs)}]")
-            lib_logger.info(f"Antigravity quota exhausted: {', '.join(parts)}")
+            lib_logger.debug("Antigravity quota baseline refresh: cooldowns recorded")
         else:
             lib_logger.debug("Antigravity quota baseline refresh: no cooldowns needed")
+
+        # Log consolidated message for cleared cooldowns
+        if cleared_cooldowns_by_cred:
+            total_cleared = sum(len(v) for v in cleared_cooldowns_by_cred.values())
+            lib_logger.info(
+                f"Antigravity baseline refresh: cleared cooldowns for "
+                f"{total_cleared} model/group(s) across "
+                f"{len(cleared_cooldowns_by_cred)} credential(s)"
+            )
 
         return stored_count
 

@@ -36,10 +36,17 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import httpx
 
 from .base_quota_tracker import BaseQuotaTracker
-from .gemini_shared_utils import CODE_ASSIST_ENDPOINT
+from .gemini_shared_utils import (
+    CODE_ASSIST_ENDPOINT,
+    GEMINI_CLI_UA_VERSION,
+    GEMINI_CLI_NODE_CLIENT_VERSION,
+    GEMINI_CLI_GL_NODE_VERSION,
+    GEMINI_CLI_PLATFORM_ARCH,
+    GEMINI_CLI_ACCEPT_ENCODING,
+)
 
 if TYPE_CHECKING:
-    from ...usage_manager import UsageManager
+    from ...usage import UsageManager
 
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
@@ -55,10 +62,12 @@ lib_logger = logging.getLogger("rotator_library")
 # Learned values (from file) override these defaults if available.
 
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    "standard-tier": {
+    # Canonical tier names
+    "PRO": {
         # Pro group (verified: 0.4% per request = 250 requests)
         "gemini-2.5-pro": 250,
         "gemini-3-pro-preview": 250,
+        "gemini-3.1-pro-preview": 250,
         # Flash group - 2.5 (verified: ~0.0667% per request = 1500 requests)
         # gemini-2.0-flash shares quota with 2.5-flash models
         "gemini-2.0-flash": 1500,
@@ -67,10 +76,11 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         # 3-Flash group (verified: ~0.0667% per request = 1500 requests)
         "gemini-3-flash-preview": 1500,
     },
-    "free-tier": {
+    "FREE": {
         # Pro group (verified: 1.0% per request = 100 requests)
         "gemini-2.5-pro": 100,
         "gemini-3-pro-preview": 100,
+        "gemini-3.1-pro-preview": 100,
         # Flash group - 2.5 (verified: 0.1% per request = 1000 requests)
         "gemini-2.0-flash": 1000,
         "gemini-2.5-flash": 1000,
@@ -79,6 +89,10 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-3-flash-preview": 1000,
     },
 }
+
+# Legacy tier name aliases (backwards compatibility)
+DEFAULT_MAX_REQUESTS["standard-tier"] = DEFAULT_MAX_REQUESTS["PRO"]
+DEFAULT_MAX_REQUESTS["free-tier"] = DEFAULT_MAX_REQUESTS["FREE"]
 
 # Default max requests for unknown models (1% = 100 requests)
 DEFAULT_MAX_REQUESTS_UNKNOWN = 1000
@@ -128,10 +142,15 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
     def _get_gemini_cli_headers(self) -> Dict[str, str]:
         """Get standard headers for Gemini CLI API requests."""
         return {
-            "User-Agent": "google-api-nodejs-client/9.15.1",
-            "X-Goog-Api-Client": "gl-node/22.17.0",
+            "User-Agent": (
+                f"GeminiCLI/{GEMINI_CLI_UA_VERSION} ({GEMINI_CLI_PLATFORM_ARCH}) "
+                f"google-api-nodejs-client/{GEMINI_CLI_NODE_CLIENT_VERSION}"
+            ),
+            "X-Goog-Api-Client": f"gl-node/{GEMINI_CLI_GL_NODE_VERSION}",
             "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-            "Accept": "application/json",
+            "Accept": "*/*",
+            "Accept-Encoding": GEMINI_CLI_ACCEPT_ENCODING,
+            "Connection": "close",
             "Content-Type": "application/json",
         }
 
@@ -532,7 +551,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
         """
         Get quota info for all credentials.
 
-        This method uses the same structure as AntigravityQuotaTracker for
+        This method uses the shared quota tracker structure for
         consistency in the TUI and quota stats endpoint.
 
         Args:
@@ -623,7 +642,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                     user_model = self._api_to_user_model(model_id)
                     bucket_by_model[user_model] = bucket
 
-            # Build model_groups from quota groups (same structure as Antigravity)
+            # Build model_groups from quota groups.
             groups = self._get_effective_quota_groups()
             model_groups = {}
 

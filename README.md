@@ -19,7 +19,7 @@ This project consists of two components:
 - **One Endpoint, Many Providers** — Configure Gemini, OpenAI, Anthropic, and [any LiteLLM-supported provider](https://docs.litellm.ai/docs/providers) once. Access them all through a single API key
 - **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
-- **Exclusive Provider Support** — Includes custom providers not available elsewhere: **Antigravity** (Gemini 3 + Claude Sonnet/Opus 4.5), **Gemini CLI**, **Qwen Code**, and **iFlow**
+- **Exclusive Provider Support** — Includes custom providers not available elsewhere, including **Gemini CLI**
 
 ---
 
@@ -53,6 +53,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/usage:/app/usage \
   -e SKIP_OAUTH_INIT_CHECK=true \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
 ```
@@ -60,13 +61,13 @@ docker run -d \
 **Using Docker Compose:**
 
 ```bash
-# Create your .env file and key_usage.json first, then:
+# Create your .env file and usage directory first, then:
 cp .env.example .env
-touch key_usage.json
+mkdir usage
 docker compose up -d
 ```
 
-> **Important:** You must create both `.env` and `key_usage.json` files before running Docker Compose. If `key_usage.json` doesn't exist, Docker will create it as a directory instead of a file, causing errors.
+> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
 
 > **Note:** For OAuth providers, complete authentication locally first using the credential tool, then mount the `oauth_creds/` directory or export credentials to environment variables.
 
@@ -104,7 +105,6 @@ openai/gpt-4o                    ← OpenAI API
 anthropic/claude-3-5-sonnet      ← Anthropic API
 openrouter/anthropic/claude-3-opus  ← OpenRouter
 gemini_cli/gemini-2.5-pro        ← Gemini CLI (OAuth)
-antigravity/gemini-3-pro-preview ← Antigravity (Gemini 3, Claude Opus 4.5)
 ```
 
 ### Usage Examples
@@ -263,7 +263,7 @@ python -m rotator_library.credential_tool
 | Type | Providers | How to Add |
 |------|-----------|------------|
 | **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env` |
-| **OAuth** | Gemini CLI, Antigravity, Qwen Code, iFlow | Interactive browser login via credential tool |
+| **OAuth** | Gemini CLI | Interactive browser login via credential tool |
 
 ### The `.env` File
 
@@ -294,7 +294,7 @@ The proxy is powered by a standalone Python library that you can use directly in
 - **Intelligent key selection** with tiered, model-aware locking
 - **Deadline-driven requests** with configurable global timeout
 - **Automatic failover** between keys on errors
-- **OAuth support** for Gemini CLI, Antigravity, Qwen, iFlow
+- **OAuth support** for Gemini CLI
 - **Stateless deployment ready** — load credentials from environment variables
 
 ### Basic Usage
@@ -335,10 +335,11 @@ The proxy includes a powerful text-based UI for configuration and management.
 ### TUI Features
 
 - **🚀 Run Proxy** — Start the server with saved settings
-- **⚙️ Configure Settings** — Host, port, API key, request logging
+- **⚙️ Configure Settings** — Host, port, API key, request logging, raw I/O logging
 - **🔑 Manage Credentials** — Add/edit API keys and OAuth credentials
-- **📊 View Status** — See configured providers and credential counts
-- **🔧 Advanced Settings** — Custom providers, model definitions, concurrency
+- **📊 View Provider & Advanced Settings** — Inspect providers and launch the settings tool
+- **📈 View Quota & Usage Stats (Alpha)** — Usage, quota windows, fair-cycle status
+- **🔄 Reload Configuration** — Refresh settings without restarting
 
 ### Configuration Files
 
@@ -346,6 +347,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 |------|----------|
 | `.env` | All credentials and advanced settings |
 | `launcher_config.json` | TUI-specific settings (host, port, logging) |
+| `quota_viewer_config.json` | Quota viewer remotes + per-provider display toggles |
+| `usage/usage_<provider>.json` | Usage persistence per provider |
 
 ---
 
@@ -375,7 +378,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>🔑 Credential Management</b></summary>
 
 - **Auto-discovery** of API keys from environment variables
-- **OAuth discovery** from standard paths (`~/.gemini/`, `~/.qwen/`, `~/.iflow/`)
+- **OAuth discovery** from standard paths (`~/.gemini/`)
 - **Duplicate detection** warns when same account added multiple times
 - **Credential prioritization** — paid tier used before free tier
 - **Stateless deployment** — export OAuth to environment variables
@@ -387,7 +390,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>⚙️ Advanced Configuration</b></summary>
 
 - **Model whitelists/blacklists** with wildcard support
-- **Per-provider concurrency limits** (`MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`)
+- **Per-provider concurrency controls** (`OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` and `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>`)
 - **Rotation modes** — balanced (distribute load) or sequential (use until exhausted)
 - **Priority multipliers** — higher concurrency for paid credentials
 - **Model quota groups** — shared cooldowns for related models
@@ -406,35 +409,6 @@ The proxy includes a powerful text-based UI for configuration and management.
 - Automatic fallback to preview models on rate limit
 - Paid vs free tier detection
 
-**Antigravity:**
-
-- Gemini 3 Pro with `thinkingLevel` support
-- Gemini 2.5 Flash/Flash Lite with thinking mode
-- Claude Opus 4.5 (thinking mode)
-- Claude Sonnet 4.5 (thinking and non-thinking)
-- GPT-OSS 120B Medium
-- Thought signature caching for multi-turn conversations
-- Tool hallucination prevention
-- Quota baseline tracking with background refresh
-- Parallel tool usage instruction injection
-- **Quota Groups**: Models that share quota are automatically grouped:
-  - Claude/GPT-OSS: `claude-sonnet-4-5`, `claude-opus-4-5`, `gpt-oss-120b-medium`
-  - Gemini 3 Pro: `gemini-3-pro-high`, `gemini-3-pro-low`, `gemini-3-pro-preview`
-  - Gemini 2.5 Flash: `gemini-2.5-flash`, `gemini-2.5-flash-thinking`, `gemini-2.5-flash-lite`
-  - All models in a group deplete the usage of the group equally. So in claude group - it is beneficial to use only Opus, and forget about Sonnet and GPT-OSS.
-
-**Qwen Code:**
-
-- Dual auth (API key + OAuth Device Flow)
-- `<think>` tag parsing as `reasoning_content`
-- Tool schema cleaning
-
-**iFlow:**
-
-- Dual auth (API key + OAuth Authorization Code)
-- Hybrid auth with separate API key fetch
-- Tool schema cleaning
-
 **NVIDIA NIM:**
 
 - Dynamic model discovery
@@ -446,10 +420,11 @@ The proxy includes a powerful text-based UI for configuration and management.
 <summary><b>📝 Logging & Debugging</b></summary>
 
 - **Per-request file logging** with `--enable-request-logging`
+- **Raw I/O logging** with `--enable-raw-logging` (proxy boundary payloads)
 - **Unique request directories** with full transaction details
 - **Streaming chunk capture** for debugging
 - **Performance metadata** (duration, tokens, model used)
-- **Provider-specific logs** for Qwen, iFlow, Antigravity
+- **Provider-specific logs** for active custom providers
 
 </details>
 
@@ -473,7 +448,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | Pattern | Description | Example |
 |---------|-------------|---------|
 | `<PROVIDER>_API_KEY_<N>` | API key for provider | `GEMINI_API_KEY_1` |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Concurrent request limit | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3` |
+| `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Soft spread-before-stacking target | `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI=1` |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` | Hard concurrent request ceiling (`<=0` means unlimited) | `MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=-1` |
 | `ROTATION_MODE_<PROVIDER>` | `balanced` or `sequential` | `ROTATION_MODE_GEMINI=sequential` |
 | `IGNORE_MODELS_<PROVIDER>` | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*` |
 | `WHITELIST_MODELS_<PROVIDER>` | Whitelist (overrides blacklist) | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro` |
@@ -487,7 +463,6 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `QUOTA_GROUPS_<PROVIDER>_<GROUP>` | Models sharing quota limits |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
-| `ANTIGRAVITY_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
 </details>
 
@@ -529,33 +504,48 @@ WHITELIST_MODELS_OPENAI="gpt-4o-2024-08-06-preview"
 ### Concurrency Limits
 
 ```env
-# Allow 3 concurrent requests per OpenAI key
-MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=3
+# Balanced mode defaults to optimal=1 and max=-1, so it spreads first
+# but will stack on busy keys instead of blocking when every key is busy.
+ROTATION_MODE_OPENAI=balanced
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI=1
+MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI=-1
 
-# Default is 1 (no concurrency)
-MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=1
+# Sequential mode defaults to optimal=-1 and max=-1 for sticky/unlimited use.
+ROTATION_MODE_GEMINI=sequential
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_GEMINI=-1
+MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=-1
+
+# Constrained providers can set optimal and max to the same value.
+MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI_CLI=1
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_GEMINI_CLI=1
+
+# Mode-specific forms override provider-wide values only for that mode.
+MAX_CONCURRENT_REQUESTS_PER_KEY_OPENAI_BALANCED=-1
+OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_OPENAI_BALANCED=1
 ```
+
+`optimal` is a soft target used for capacity phases: the rotator prefers credentials below optimal, then stacks on healthy credentials when no below-optimal credential remains. `max` is the hard safety ceiling; `0` or any negative value means unlimited.
 
 ### Rotation Modes
 
 ```env
-# balanced (default): Distribute load evenly - best for per-minute rate limits
-ROTATION_MODE_OPENAI=balanced
-
-# sequential: Use until exhausted - best for daily/weekly quotas
+# sequential (default): Use one key until it errors/exhausts, preserving provider-side cache locality
 ROTATION_MODE_GEMINI=sequential
+
+# balanced: Distribute load evenly - opt in for per-minute rate limits
+ROTATION_MODE_OPENAI=balanced
 ```
 
 ### Priority Multipliers
 
-Paid credentials can handle more concurrent requests:
+Paid credentials can handle more concurrent requests. Legacy priority multipliers apply to hard max concurrency; provider-specific optimal multipliers can also raise the soft target where supported:
 
 ```env
-# Priority 1 (paid ultra): 10x concurrency
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_1=10
+# Priority 1: 10x concurrency
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_1=10
 
-# Priority 2 (standard paid): 3x
-CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
+# Priority 2: 3x
+CONCURRENCY_MULTIPLIER_GEMINI_CLI_PRIORITY_2=3
 ```
 
 ### Model Quota Groups
@@ -563,8 +553,8 @@ CONCURRENCY_MULTIPLIER_ANTIGRAVITY_PRIORITY_2=3
 Models sharing quota limits:
 
 ```env
-# Claude models share quota - when one hits limit, both cool down
-QUOTA_GROUPS_ANTIGRAVITY_CLAUDE="claude-sonnet-4-5,claude-opus-4-5"
+# Example: group provider models that share quota
+QUOTA_GROUPS_GEMINI_CLI_PRO="gemini-2.5-pro,gemini-3-pro-preview"
 ```
 
 </details>
@@ -659,96 +649,6 @@ GEMINI_CLI_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval in seconds (defa
 </details>
 
 <details>
-<summary><b>Antigravity (Gemini 3 + Claude Opus 4.5)</b></summary>
-
-Access Google's internal Antigravity API for cutting-edge models.
-
-**Supported Models:**
-
-- **Gemini 3 Pro** — with `thinkingLevel` support (low/high)
-- **Gemini 2.5 Flash** — with thinking mode support
-- **Gemini 2.5 Flash Lite** — configurable thinking budget
-- **Claude Opus 4.5** — Anthropic's most powerful model (thinking mode only)
-- **Claude Sonnet 4.5** — supports both thinking and non-thinking modes
-- **GPT-OSS 120B** — OpenAI-compatible model
-
-**Setup:**
-
-1. Run `python -m rotator_library.credential_tool`
-2. Select "Add OAuth Credential" → "Antigravity"
-3. Complete browser authentication
-
-**Advanced Features:**
-
-- Thought signature caching for multi-turn conversations
-- Tool hallucination prevention via parameter signature injection
-- Automatic thinking block sanitization for Claude
-- Credential prioritization (paid resets every 5 hours, free weekly)
-- Quota baseline tracking with background refresh (accurate remaining quota estimates)
-- Parallel tool usage instruction injection for Claude
-
-**Environment Variables:**
-
-```env
-ANTIGRAVITY_ACCESS_TOKEN="ya29.your-access-token"
-ANTIGRAVITY_REFRESH_TOKEN="1//your-refresh-token"
-ANTIGRAVITY_EXPIRY_DATE="1234567890000"
-ANTIGRAVITY_EMAIL="your-email@gmail.com"
-
-# Feature toggles
-ANTIGRAVITY_ENABLE_SIGNATURE_CACHE=true
-ANTIGRAVITY_GEMINI3_TOOL_FIX=true
-ANTIGRAVITY_QUOTA_REFRESH_INTERVAL=300  # Quota refresh interval (seconds)
-ANTIGRAVITY_PARALLEL_TOOL_INSTRUCTION_CLAUDE=true  # Parallel tool instruction for Claude
-```
-
-> **Note:** Gemini 3 models require a paid-tier Google Cloud project.
-
-</details>
-
-<details>
-<summary><b>Qwen Code</b></summary>
-
-Uses OAuth Device Flow for Qwen/Dashscope APIs.
-
-**Setup:**
-
-1. Run the credential tool
-2. Select "Add OAuth Credential" → "Qwen Code"
-3. Enter the code displayed in your browser
-4. Or add API key directly: `QWEN_CODE_API_KEY_1="your-key"`
-
-**Features:**
-
-- Dual auth (API key or OAuth)
-- `<think>` tag parsing as `reasoning_content`
-- Automatic tool schema cleaning
-- Custom models via `QWEN_CODE_MODELS` env var
-
-</details>
-
-<details>
-<summary><b>iFlow</b></summary>
-
-Uses OAuth Authorization Code flow with local callback server.
-
-**Setup:**
-
-1. Run the credential tool
-2. Select "Add OAuth Credential" → "iFlow"
-3. Complete browser authentication (callback on port 11451)
-4. Or add API key directly: `IFLOW_API_KEY_1="sk-your-key"`
-
-**Features:**
-
-- Dual auth (API key or OAuth)
-- Hybrid auth (OAuth token fetches separate API key)
-- Automatic tool schema cleaning
-- Custom models via `IFLOW_MODELS` env var
-
-</details>
-
-<details>
 <summary><b>Stateless Deployment (Export to Environment Variables)</b></summary>
 
 For platforms without file persistence (Railway, Render, Vercel):
@@ -782,8 +682,6 @@ Customize OAuth callback ports if defaults conflict:
 | Provider    | Default Port | Environment Variable     |
 | ----------- | ------------ | ------------------------ |
 | Gemini CLI  | 8085         | `GEMINI_CLI_OAUTH_PORT`  |
-| Antigravity | 51121        | `ANTIGRAVITY_OAUTH_PORT` |
-| iFlow       | 11451        | `IFLOW_OAUTH_PORT`       |
 
 </details>
 
@@ -801,6 +699,7 @@ Options:
   --host TEXT                Host to bind (default: 0.0.0.0)
   --port INTEGER             Port to run on (default: 8000)
   --enable-request-logging   Enable detailed per-request logging
+  --enable-raw-logging       Capture raw proxy I/O payloads
   --add-credential           Launch interactive credential setup tool
 ```
 
@@ -812,6 +711,9 @@ python src/proxy_app/main.py --host 127.0.0.1 --port 9000
 
 # Run with logging
 python src/proxy_app/main.py --enable-request-logging
+
+# Run with raw I/O logging
+python src/proxy_app/main.py --enable-raw-logging
 
 # Add credentials without starting proxy
 python src/proxy_app/main.py --add-credential
@@ -850,8 +752,8 @@ The proxy is available as a multi-architecture Docker image (amd64/arm64) from G
 cp .env.example .env
 nano .env
 
-# 2. Create key_usage.json file (required before first run)
-touch key_usage.json
+# 2. Create usage directory (usage_*.json files are created automatically)
+mkdir usage
 
 # 3. Start the proxy
 docker compose up -d
@@ -860,13 +762,13 @@ docker compose up -d
 docker compose logs -f
 ```
 
-> **Important:** You must create `key_usage.json` before running Docker Compose. If this file doesn't exist on the host, Docker will create it as a directory instead of a file, causing the container to fail.
+> **Important:** Create the `usage/` directory before running Docker Compose so usage stats persist on the host.
 
 **Manual Docker Run:**
 
 ```bash
-# Create key_usage.json if it doesn't exist
-touch key_usage.json
+# Create usage directory if it doesn't exist
+mkdir usage
 
 docker run -d \
   --name llm-api-proxy \
@@ -875,7 +777,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/key_usage.json:/app/key_usage.json \
+  -v $(pwd)/usage:/app/usage \
   -e SKIP_OAUTH_INIT_CHECK=true \
   -e PYTHONUNBUFFERED=1 \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
@@ -895,7 +797,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 | `.env`           | Configuration and API keys (read-only) |
 | `oauth_creds/`   | OAuth credential files (persistent)    |
 | `logs/`          | Request logs and detailed logging      |
-| `key_usage.json` | Usage statistics persistence           |
+| `usage/`       | Usage statistics persistence (`usage_*.json`) |
 
 **Image Tags:**
 
@@ -907,7 +809,7 @@ docker compose -f docker-compose.dev.yml up -d --build
 
 **OAuth with Docker:**
 
-For OAuth providers (Antigravity, Gemini CLI, etc.), you must authenticate locally first:
+For OAuth providers such as Gemini CLI, you must authenticate locally first:
 
 1. Run `python -m rotator_library.credential_tool` on your local machine
 2. Complete OAuth flows in browser

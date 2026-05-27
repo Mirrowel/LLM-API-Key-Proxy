@@ -19,7 +19,7 @@ from .provider_interface import ProviderInterface
 from .utilities.firmware_quota_tracker import FirmwareQuotaTracker
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 import logging
 
@@ -184,12 +184,23 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
 
                         # Store baseline in usage manager
                         # Since Firmware.ai uses credential-level quota, we use a virtual model name
+                        if remaining_fraction <= 0.0 and reset_ts:
+                            stable_id = usage_manager.registry.get_stable_id(
+                                api_key, usage_manager.provider
+                            )
+                            state = usage_manager.states.get(stable_id)
+                            if state:
+                                await usage_manager.tracking.apply_cooldown(
+                                    state=state,
+                                    reason="quota_exhausted",
+                                    until=reset_ts,
+                                    model_or_group="firmware/_quota",
+                                    source="api_quota",
+                                )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "firmware/_quota",  # Virtual model for credential-level tracking
-                            remaining_fraction,
-                            # No max_requests - Firmware.ai doesn't expose this
-                            reset_timestamp=reset_ts,
+                            quota_reset_ts=reset_ts,
                         )
 
                         lib_logger.debug(
@@ -199,7 +210,9 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
                         )
 
                 except Exception as e:
-                    lib_logger.warning(f"Failed to refresh Firmware.ai quota usage: {e}")
+                    lib_logger.warning(
+                        f"Failed to refresh Firmware.ai quota usage: {e}"
+                    )
 
         # Fetch all credentials in parallel with shared HTTP client
         async with httpx.AsyncClient(timeout=30.0) as client:

@@ -24,6 +24,14 @@ from .utilities.gemini_shared_utils import (
     FINISH_REASON_MAP,
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_ENDPOINT_FALLBACKS,
+    GEMINI_CLI_UA_VERSION,
+    GEMINI_CLI_NODE_CLIENT_VERSION,
+    GEMINI_CLI_GL_NODE_VERSION,
+    GEMINI_CLI_PLATFORM_ARCH,
+    GEMINI_CLI_ACCEPT_ENCODING,
+    # Tier utilities
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
 )
 from ..transaction_logger import ProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -63,6 +71,7 @@ AVAILABLE_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
 ]
 
@@ -146,22 +155,12 @@ class GeminiCliProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_GEMINI_CLI_*)
     provider_env_name: str = "gemini_cli"
 
-    # Tier name -> priority mapping (Single Source of Truth)
-    # Same tier names as Antigravity (coincidentally), but defined separately
-    tier_priorities = {
-        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
-        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
-        # Priority 2: Standard paid tier
-        "standard-tier": 2,
-        # Priority 3: Free tier
-        "free-tier": 3,
-        # Priority 10: Legacy/Unknown (lowest)
-        "legacy-tier": 10,
-        "unknown": 10,
-    }
+    # Tier name -> priority mapping (from centralized tier utilities)
+    # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
+    tier_priorities = TIER_PRIORITIES
 
     # Default priority for tiers not in the mapping
-    default_tier_priority: int = 10
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # Usage reset configs for Gemini CLI
     # Verified 2026-01-07: 24-hour fixed window from first request for ALL tiers
@@ -189,15 +188,25 @@ class GeminiCliProvider(
     }
 
     # Priority-based concurrency multipliers
-    # Same structure as Antigravity (by coincidence, tiers share naming)
-    # Priority 1 (paid ultra): 5x concurrent requests
-    # Priority 2 (standard paid): 3x concurrent requests
+    # Tier priority structure mirrors the shared Google OAuth priority helpers.
+    # Priority 1 (paid ultra): 4 concurrent (base 2 * 2x)
+    # Priority 2 (standard paid): 2 concurrent (base 2 * 1x)
     # Others: Use sequential fallback (2x) or balanced default (1x)
-    default_priority_multipliers = {1: 5, 2: 3}
+    default_priority_multipliers = {1: 2, 2: 1}
+
+    # Gemini CLI's soft target and hard cap intentionally collide: it should
+    # rotate away at the same point where additional concurrency would be unsafe.
+    default_max_concurrent_per_key = 2
+    default_max_concurrent_per_key_balanced = 2
+    default_max_concurrent_per_key_sequential = 2
+    default_optimal_concurrent_per_key = 2
+    default_optimal_concurrent_per_key_balanced = 2
+    default_optimal_concurrent_per_key_sequential = 2
+    default_optimal_priority_multipliers = {1: 2, 2: 1}
 
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
-    default_sequential_fallback_multiplier = 2
+    default_sequential_fallback_multiplier = 1
 
     @staticmethod
     def parse_quota_error(
@@ -209,7 +218,7 @@ class GeminiCliProvider(
         Handles the Gemini CLI error format which embeds reset time in the message:
         "You have exhausted your capacity on this model. Your quota will reset after 2s."
 
-        Unlike Antigravity which uses structured RetryInfo/quotaResetDelay metadata,
+        Unlike some Google RPC APIs which use structured RetryInfo/quotaResetDelay metadata,
         Gemini CLI embeds the reset time in a human-readable message.
 
         Example error format:
@@ -355,7 +364,7 @@ class GeminiCliProvider(
         self.model_definitions = ModelDefinitions()
         # NOTE: project_id_cache and project_tier_cache are inherited from GeminiAuthBase
 
-        # Quota refresh interval (mirrors Antigravity pattern)
+        # Quota refresh interval.
         self._quota_refresh_interval = env_int("GEMINI_CLI_QUOTA_REFRESH_INTERVAL", 300)
 
         # Track whether initial quota fetch has been done (for background job)
@@ -413,7 +422,6 @@ class GeminiCliProvider(
         self._learned_costs: Dict[str, Dict[str, float]] = {}
         self._learned_costs_loaded: bool = False
 
-
     # =========================================================================
     # CREDENTIAL TIER LOOKUP (Provider-specific - uses cache)
     # =========================================================================
@@ -464,9 +472,9 @@ class GeminiCliProvider(
     # =========================================================================
 
     def _is_gemini_3(self, model: str) -> bool:
-        """Check if model is Gemini 3 (requires special handling)."""
+        """Check if model is Gemini 3 family (3.0/3.1+, requires special handling)."""
         model_name = model.split("/")[-1].replace(":thinking", "")
-        return model_name.startswith("gemini-3-")
+        return model_name.startswith("gemini-3-") or model_name.startswith("gemini-3.")
 
     def _generate_user_prompt_id(self) -> str:
         """
@@ -489,7 +497,7 @@ class GeminiCliProvider(
         Uses SHA256 hash of the first user message to create a deterministic
         UUID-formatted session ID. Falls back to random UUID if no user message.
 
-        This approach mirrors Antigravity's _generate_stable_session_id() but
+        This approach generates stable sessions without persisting conversation IDs.
         uses UUID format instead of the -{number} format to match native
         gemini-cli's crypto.randomUUID() output format.
 
@@ -515,55 +523,77 @@ class GeminiCliProvider(
         # Fallback to random UUID if no user message found
         return str(uuid.uuid4())
 
+    def _extract_text_content(self, content: Any) -> str:
+        """Extract text from OpenAI string or multi-part message content."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text"):
+                        parts.append(str(item["text"]))
+                    elif item.get("text"):
+                        parts.append(str(item["text"]))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                return str(text)
+        return ""
+
     def _get_gemini_cli_request_headers(self, model: str) -> Dict[str, str]:
         """
         Build request headers matching native gemini-cli client.
 
-        For the OAuth/Code Assist path, native gemini-cli only sends:
-        - Content-Type: application/json (handled by httpx)
-        - Authorization: Bearer <token> (handled by auth_header)
-        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch})
+        Header behavior changed across CLI versions:
 
-        Headers NOT sent by native CLI (confirmed via explore agent analysis):
-        - X-Goog-Api-Client: Not used in Code Assist path (only in SDK/API key path)
-        - Client-Metadata: Not sent as HTTP header (only in request body for management endpoints)
-        - X-Goog-User-Project: Only used in MCP path, causes 403 errors in Code Assist
+        - Older observations (v0.28.x OAuth/Code Assist path) showed a minimal
+          set where only User-Agent was explicitly present.
+          References:
+          - gemini-cli/packages/core/src/code_assist/server.ts
+          - gemini-cli/packages/core/src/core/contentGenerator.ts
 
-        Source: gemini-cli/packages/core/src/code_assist/server.ts:332
-        Source: gemini-cli/packages/core/src/core/contentGenerator.ts:129
+        - Newer captures (v0.31.x) include additional fingerprint headers for
+          content generation calls. We intentionally mirror that profile here
+          to match current request wire format.
+
+        For streamGenerateContent/countTokens requests we send:
+        - User-Agent: GeminiCLI/${version}/${model} (${platform}; ${arch}) google-api-nodejs-client/${version}
+        - X-Goog-Api-Client: gl-node/${version}
+        - Accept: */*
+        - Accept-Encoding: gzip, deflate, br
+        - Connection: close
+
+        Note: Client-Metadata is still sent in request bodies for management
+        endpoints (loadCodeAssist/onboardUser/etc.), not as a header for
+        generateContent/countTokens.
         """
         model_name = model.split("/")[-1].replace(":thinking", "")
 
-        # Hardcoded to Windows x64 platform (matching common development environment)
-        # Native format: GeminiCLI/${version}/${model} (${platform}; ${arch})
-        user_agent = f"GeminiCLI/0.26.0/{model_name} (win32; x64)"
+        user_agent = (
+            f"GeminiCLI/{GEMINI_CLI_UA_VERSION}/{model_name} "
+            f"({GEMINI_CLI_PLATFORM_ARCH}) "
+            f"google-api-nodejs-client/{GEMINI_CLI_NODE_CLIENT_VERSION}"
+        )
 
-        # =========================================================================
-        # COMMENTED OUT HEADERS - Not sent by native gemini-cli for Code Assist path
-        # Keeping these for reference as they worked well for SDK mimicry.
-        # Uncomment if rate limiting issues arise and you want to try SDK fingerprinting.
-        # =========================================================================
-
-        # X-Goog-Api-Client: Mimics @google/genai SDK but native CLI doesn't send this
-        # for OAuth/Code Assist path (only set when using API key authentication)
-        # x_goog_api_client = "gl-node/22.17.0 gdcl/1.30.0"
-
-        # Client-Metadata: Native CLI sends this in REQUEST BODY for management endpoints
-        # (loadCodeAssist, onboardUser, listExperiments, recordCodeAssistMetrics)
-        # but NOT as an HTTP header for generateContent requests.
-        # client_metadata = (
-        #     "ideType=IDE_UNSPECIFIED,"
-        #     "pluginType=GEMINI,"
-        #     "ideVersion=0.26.0,"
-        #     "platform=WINDOWS_AMD64,"
-        #     "updateChannel=stable"
-        # )
+        # Historical/debug reference values that were previously used when
+        # mimicking older/minimal request fingerprints:
+        # - X-Goog-Api-Client: "gl-node/22.17.0 gdcl/1.30.0"
+        # - Client-Metadata header (not used here for content generation):
+        #   "ideType=IDE_UNSPECIFIED,pluginType=GEMINI,ideVersion=0.28.0,"
+        #   "platform=WINDOWS_AMD64,updateChannel=stable"
+        # These notes are intentionally preserved for future regression
+        # analysis when upstream Gemini CLI behavior changes.
 
         return {
             "User-Agent": user_agent,
-            # "X-Goog-Api-Client": x_goog_api_client,  # Not sent by native CLI
-            # "Client-Metadata": client_metadata,      # Not sent as header by native CLI
-            # "Accept": "application/json",            # Not explicitly sent by native CLI
+            "X-Goog-Api-Client": f"gl-node/{GEMINI_CLI_GL_NODE_VERSION}",
+            "Accept": "*/*",
+            "Accept-Encoding": GEMINI_CLI_ACCEPT_ENCODING,
+            "Connection": "close",
         }
 
     def _get_available_models(self) -> List[str]:
@@ -650,7 +680,9 @@ class GeminiCliProvider(
 
         # Separate system prompt from other messages
         if messages and messages[0].get("role") == "system":
-            system_prompt_content = messages.pop(0).get("content", "")
+            system_prompt_content = self._extract_text_content(
+                messages.pop(0).get("content", "")
+            )
             if system_prompt_content:
                 system_instruction = {
                     "role": "user",
@@ -1093,7 +1125,7 @@ class GeminiCliProvider(
             yield openai_chunk
 
     def _stream_to_completion_response(
-        self, chunks: List[litellm.ModelResponse]
+        self, chunks: List[litellm.ModelResponseStream]
     ) -> litellm.ModelResponse:
         """
         Manually reassembles streaming chunks into a complete response.
@@ -1121,7 +1153,20 @@ class GeminiCliProvider(
                 continue
 
             choice = chunk.choices[0]
-            delta = choice.get("delta", {})
+            if hasattr(choice, "get"):
+                delta = choice.get("delta", {})
+                choice_finish = choice.get("finish_reason")
+            else:
+                delta = getattr(choice, "delta", None) or {}
+                if hasattr(delta, "model_dump"):
+                    delta = delta.model_dump(exclude_none=True)
+                elif hasattr(delta, "__dict__") and not isinstance(delta, dict):
+                    delta = {
+                        k: v
+                        for k, v in delta.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
+                choice_finish = getattr(choice, "finish_reason", None)
 
             # Aggregate content
             if "content" in delta and delta["content"] is not None:
@@ -1138,6 +1183,16 @@ class GeminiCliProvider(
             # Aggregate tool calls
             if "tool_calls" in delta and delta["tool_calls"]:
                 for tc_chunk in delta["tool_calls"]:
+                    if hasattr(tc_chunk, "model_dump"):
+                        tc_chunk = tc_chunk.model_dump(exclude_none=True)
+                    elif hasattr(tc_chunk, "__dict__") and not isinstance(
+                        tc_chunk, dict
+                    ):
+                        tc_chunk = {
+                            k: v
+                            for k, v in tc_chunk.__dict__.items()
+                            if not k.startswith("_") and v is not None
+                        }
                     index = tc_chunk.get("index", 0)
                     if index not in aggregated_tool_calls:
                         aggregated_tool_calls[index] = {
@@ -1149,43 +1204,65 @@ class GeminiCliProvider(
                     if "type" in tc_chunk:
                         aggregated_tool_calls[index]["type"] = tc_chunk["type"]
                     if "function" in tc_chunk:
+                        function_delta = tc_chunk["function"]
+                        if hasattr(function_delta, "model_dump"):
+                            function_delta = function_delta.model_dump(
+                                exclude_none=True
+                            )
+                        elif hasattr(function_delta, "__dict__") and not isinstance(
+                            function_delta, dict
+                        ):
+                            function_delta = {
+                                k: v
+                                for k, v in function_delta.__dict__.items()
+                                if not k.startswith("_") and v is not None
+                            }
                         if (
-                            "name" in tc_chunk["function"]
-                            and tc_chunk["function"]["name"] is not None
+                            "name" in function_delta
+                            and function_delta["name"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["name"] += (
-                                tc_chunk["function"]["name"]
+                                function_delta["name"]
                             )
                         if (
-                            "arguments" in tc_chunk["function"]
-                            and tc_chunk["function"]["arguments"] is not None
+                            "arguments" in function_delta
+                            and function_delta["arguments"] is not None
                         ):
                             aggregated_tool_calls[index]["function"]["arguments"] += (
-                                tc_chunk["function"]["arguments"]
+                                function_delta["arguments"]
                             )
 
             # Aggregate function calls (legacy format)
             if "function_call" in delta and delta["function_call"] is not None:
+                function_call = delta["function_call"]
+                if hasattr(function_call, "model_dump"):
+                    function_call = function_call.model_dump(exclude_none=True)
+                elif hasattr(function_call, "__dict__") and not isinstance(
+                    function_call, dict
+                ):
+                    function_call = {
+                        k: v
+                        for k, v in function_call.__dict__.items()
+                        if not k.startswith("_") and v is not None
+                    }
                 if "function_call" not in final_message:
                     final_message["function_call"] = {"name": "", "arguments": ""}
                 if (
-                    "name" in delta["function_call"]
-                    and delta["function_call"]["name"] is not None
+                    "name" in function_call
+                    and function_call["name"] is not None
                 ):
-                    final_message["function_call"]["name"] += delta["function_call"][
-                        "name"
-                    ]
+                    final_message["function_call"]["name"] += function_call["name"]
                 if (
-                    "arguments" in delta["function_call"]
-                    and delta["function_call"]["arguments"] is not None
+                    "arguments" in function_call
+                    and function_call["arguments"] is not None
                 ):
-                    final_message["function_call"]["arguments"] += delta[
-                        "function_call"
-                    ]["arguments"]
+                    final_message["function_call"]["arguments"] += function_call[
+                        "arguments"
+                    ]
 
             # Track finish_reason from chunks (respects length, content_filter, etc.)
-            if choice.get("finish_reason"):
-                chunk_finish_reason = choice["finish_reason"]
+            if choice_finish:
+                chunk_finish_reason = choice_finish
 
         # Handle usage data from the last chunk that has it
         for chunk in reversed(chunks):
@@ -1373,10 +1450,11 @@ class GeminiCliProvider(
             # Prepend to existing system instruction
             existing_parts = existing_system.get("parts", [])
             if existing_parts and existing_parts[0].get("text"):
+                existing_text = self._extract_text_content(existing_parts[0].get("text"))
                 existing_parts[0]["text"] = (
                     self._gemini3_system_instruction
                     + "\n\n"
-                    + existing_parts[0]["text"]
+                    + existing_text
                 )
             else:
                 existing_parts.insert(0, {"text": self._gemini3_system_instruction})
@@ -1391,7 +1469,10 @@ class GeminiCliProvider(
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         model = kwargs["model"]
         credential_path = kwargs.pop("credential_identifier")
         transaction_context = kwargs.pop("transaction_context", None)
@@ -1512,7 +1593,7 @@ class GeminiCliProvider(
                 final_headers.update(self._get_gemini_cli_request_headers(model_name))
 
                 # Endpoint fallback loop: try sandbox first, then production
-                # This mirrors the opencode-antigravity-auth plugin behavior
+                # Preserve the captured CLI request profile.
                 last_endpoint_error = None
                 for endpoint_idx, base_endpoint in enumerate(
                     GEMINI_CLI_ENDPOINT_FALLBACKS
@@ -1563,7 +1644,9 @@ class GeminiCliProvider(
                                         ) in self._convert_chunk_to_openai(
                                             chunk, model, accumulator
                                         ):
-                                            yield litellm.ModelResponse(**openai_chunk)
+                                            yield litellm.ModelResponseStream(
+                                                **openai_chunk
+                                            )
                                     except json.JSONDecodeError:
                                         lib_logger.warning(
                                             f"Could not decode JSON from Gemini CLI: {line}"
@@ -1587,7 +1670,7 @@ class GeminiCliProvider(
                                         "total_tokens": 1,
                                     },
                                 }
-                                yield litellm.ModelResponse(**final_chunk)
+                                yield litellm.ModelResponseStream(**final_chunk)
 
                             # Success - exit the endpoint fallback loop
                             return

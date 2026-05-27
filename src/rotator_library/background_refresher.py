@@ -234,9 +234,13 @@ class BackgroundRefresher:
         # Run immediately on start if configured
         if run_on_start:
             try:
-                await provider.run_background_job(
-                    self._client.usage_manager, credentials
-                )
+                usage_manager = self._client.usage_managers.get(provider_name)
+                if usage_manager is None:
+                    lib_logger.debug(
+                        f"Skipping {provider_name} {job_name}: no UsageManager"
+                    )
+                    return
+                await provider.run_background_job(usage_manager, credentials)
                 lib_logger.debug(f"{provider_name} {job_name}: initial run complete")
             except Exception as e:
                 lib_logger.error(
@@ -247,9 +251,13 @@ class BackgroundRefresher:
         while True:
             try:
                 await asyncio.sleep(interval)
-                await provider.run_background_job(
-                    self._client.usage_manager, credentials
-                )
+                usage_manager = self._client.usage_managers.get(provider_name)
+                if usage_manager is None:
+                    lib_logger.debug(
+                        f"Skipping {provider_name} {job_name}: no UsageManager"
+                    )
+                    return
+                await provider.run_background_job(usage_manager, credentials)
                 lib_logger.debug(f"{provider_name} {job_name}: periodic run complete")
             except asyncio.CancelledError:
                 lib_logger.debug(f"{provider_name} {job_name}: cancelled")
@@ -259,6 +267,7 @@ class BackgroundRefresher:
 
     async def _run(self):
         """The main loop for OAuth token refresh."""
+        await self._client.initialize_usage_managers()
         # Initialize credentials (load persisted tiers) before starting
         await self._initialize_credentials()
 

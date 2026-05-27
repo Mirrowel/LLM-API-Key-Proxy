@@ -25,7 +25,7 @@ import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 from .provider_interface import ProviderInterface, UsageResetConfigDef
 from .utilities.nanogpt_quota_tracker import NanoGptQuotaTracker
@@ -74,8 +74,8 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     # Active subscriptions get highest priority
     tier_priorities = {
         "subscription-active": 1,  # Active subscription
-        "subscription-grace": 2,   # Grace period (subscription lapsed but still has access)
-        "no-subscription": 3,      # No active subscription (pay-as-you-go only)
+        "subscription-grace": 2,  # Grace period (subscription lapsed but still has access)
+        "no-subscription": 3,  # No active subscription (pay-as-you-go only)
     }
     default_tier_priority = 3
 
@@ -85,8 +85,6 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         "daily": ["_daily"],
         "monthly": ["_monthly"],
     }
-
-
 
     def __init__(self):
         self.model_definitions = ModelDefinitions()
@@ -410,29 +408,49 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
                         monthly_remaining = monthly_data.get("remaining", 0)
 
                         # Calculate remaining fractions
-                        daily_fraction = daily_remaining / daily_limit if daily_limit > 0 else 1.0
-                        monthly_fraction = monthly_remaining / monthly_limit if monthly_limit > 0 else 1.0
+                        daily_fraction = (
+                            daily_remaining / daily_limit if daily_limit > 0 else 1.0
+                        )
+                        monthly_fraction = (
+                            monthly_remaining / monthly_limit
+                            if monthly_limit > 0
+                            else 1.0
+                        )
 
                         # Get reset timestamps
                         daily_reset_ts = daily_data.get("reset_at", 0)
                         monthly_reset_ts = monthly_data.get("reset_at", 0)
 
                         # Store daily quota baseline
+                        daily_used = (
+                            int((1.0 - daily_fraction) * daily_limit)
+                            if daily_limit > 0
+                            else 0
+                        )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "nanogpt/_daily",
-                            daily_fraction,
-                            max_requests=daily_limit,
-                            reset_timestamp=daily_reset_ts if daily_reset_ts > 0 else None,
+                            quota_max_requests=daily_limit,
+                            quota_reset_ts=daily_reset_ts
+                            if daily_reset_ts > 0
+                            else None,
+                            quota_used=daily_used,
                         )
 
                         # Store monthly quota baseline
+                        monthly_used = (
+                            int((1.0 - monthly_fraction) * monthly_limit)
+                            if monthly_limit > 0
+                            else 0
+                        )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "nanogpt/_monthly",
-                            monthly_fraction,
-                            max_requests=monthly_limit,
-                            reset_timestamp=monthly_reset_ts if monthly_reset_ts > 0 else None,
+                            quota_max_requests=monthly_limit,
+                            quota_reset_ts=monthly_reset_ts
+                            if monthly_reset_ts > 0
+                            else None,
+                            quota_used=monthly_used,
                         )
 
                         lib_logger.debug(

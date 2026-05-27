@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from dataclasses import dataclass
 from typing import (
     List,
@@ -19,7 +19,33 @@ import httpx
 import litellm
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
+
+
+# =============================================================================
+# SINGLETON METACLASS FOR PROVIDERS
+# =============================================================================
+
+
+class SingletonABCMeta(ABCMeta):
+    """
+    Metaclass that combines ABC functionality with singleton pattern.
+
+    All classes using this metaclass (including subclasses of ProviderInterface)
+    will be singletons - only one instance per class exists.
+
+    This prevents the bug where multiple provider instances are created
+    by different components (RotatingClient, UsageManager, Hooks, etc.),
+    each with their own caches and state.
+    """
+
+    _instances: Dict[type, Any] = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in SingletonABCMeta._instances:
+            SingletonABCMeta._instances[cls] = super().__call__(*args, **kwargs)
+        return SingletonABCMeta._instances[cls]
+
 
 from ..config import (
     DEFAULT_ROTATION_MODE,
@@ -68,7 +94,7 @@ UsageConfigMap = Dict[UsageConfigKey, UsageResetConfigDef]  # priority_set -> co
 QuotaGroupMap = Dict[str, List[str]]  # group_name -> [models]
 
 
-class ProviderInterface(ABC):
+class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     """
     An interface for API provider-specific functionality, including model
     discovery and custom API call handling for non-standard providers.
@@ -82,11 +108,34 @@ class ProviderInterface(ABC):
     # See config/defaults.py for the global default value
     default_rotation_mode: str = DEFAULT_ROTATION_MODE
 
+    # Default maximum concurrent requests per credential for this provider.
+    # None means use the rotation-mode default. Values <= 0 mean unlimited.
+    default_max_concurrent_per_key: Optional[int] = None
+
+    # Mode-specific hard concurrency defaults. None means use the generic
+    # provider default above, then the global mode default.
+    default_max_concurrent_per_key_balanced: Optional[int] = None
+    default_max_concurrent_per_key_sequential: Optional[int] = None
+
+    # Default optimal concurrent requests per credential for this provider.
+    # None means use the rotation-mode default. Values <= 0 mean no soft target.
+    default_optimal_concurrent_per_key: Optional[int] = None
+
+    # Mode-specific soft concurrency defaults. None means use the generic
+    # provider default above, then the global mode default.
+    default_optimal_concurrent_per_key_balanced: Optional[int] = None
+    default_optimal_concurrent_per_key_sequential: Optional[int] = None
+
+    # Priority multipliers to apply to optimal_concurrent. Kept separate from
+    # legacy max multipliers so generic providers do not inherit hard-cap tuning
+    # as a soft rotation preference unless they opt in.
+    default_optimal_priority_multipliers: Dict[int, int] = {}
+
     # =========================================================================
     # TIER CONFIGURATION - Override in subclass
     # =========================================================================
 
-    # Provider name for env var lookups (e.g., "antigravity", "gemini_cli")
+    # Provider name for env var lookups (e.g., "gemini_cli")
     # Used for: QUOTA_GROUPS_{provider_env_name}_{GROUP}
     provider_env_name: str = ""
 
@@ -238,7 +287,10 @@ class ProviderInterface(ABC):
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
-    ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
+    ) -> Union[
+        litellm.ModelResponse,
+        AsyncGenerator[litellm.ModelResponseStream, None],
+    ]:
         """
         Handles the entire completion call for non-standard providers.
         """
@@ -254,19 +306,7 @@ class ProviderInterface(ABC):
             f"{self.__class__.__name__} does not implement custom aembedding."
         )
 
-    def convert_safety_settings(
-        self, settings: Dict[str, str]
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Converts a generic safety settings dictionary to the provider-specific format.
-
-        Args:
-            settings: A dictionary with generic harm categories and thresholds.
-
-        Returns:
-            A list of provider-specific safety setting objects or None.
-        """
-        return None
+    # convert_safety_settings() removed — see gemini_provider.py for details.
 
     # [NEW] Add new methods for OAuth providers
     async def get_auth_header(self, credential_identifier: str) -> Dict[str, str]:
@@ -391,7 +431,7 @@ class ProviderInterface(ABC):
         then falls back to the class's default_rotation_mode.
 
         Args:
-            provider_name: The provider name (e.g., "antigravity", "gemini_cli")
+            provider_name: The provider name (e.g., "gemini_cli")
 
         Returns:
             "balanced" or "sequential"

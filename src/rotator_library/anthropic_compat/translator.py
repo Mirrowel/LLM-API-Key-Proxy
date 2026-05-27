@@ -34,7 +34,7 @@ THINKING_BUDGET_THRESHOLDS = {
 
 # Providers that support granular reasoning effort levels (low_medium, medium_high, etc.)
 # Other providers will receive simplified levels (low, medium, high)
-GRANULAR_REASONING_PROVIDERS = {"antigravity"}
+GRANULAR_REASONING_PROVIDERS = set()
 
 
 def _budget_to_reasoning_effort(budget_tokens: int, model: str) -> str:

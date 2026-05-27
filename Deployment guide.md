@@ -69,51 +69,15 @@ OPENROUTER_API_KEY_1="your-openrouter-key"
     - Supported providers: Check LiteLLM docs for a full list and specifics (e.g., GEMINI, OPENROUTER, NVIDIA_NIM).
     - Tip: Start with 1-2 providers to test. Don't share this file publicly!
 
-### Advanced: Stateless Deployment for OAuth Providers (Gemini CLI, Qwen, iFlow)
+### Advanced: Stateless Deployment for OAuth Providers (Gemini CLI)
 
-If you are using providers that require complex OAuth files (like **Gemini CLI**, **Qwen Code**, or **iFlow**), you don't need to upload the JSON files manually. The proxy includes a tool to "export" these credentials into environment variables.
+If you are using providers that require complex OAuth files (like **Gemini CLI**), you don't need to upload the JSON files manually. The proxy includes a tool to "export" these credentials into environment variables.
 
 1.  Run the credential tool locally: `python -m rotator_library.credential_tool`
 2.  Select the "Export ... to .env" option for your provider.
 3.  The tool will generate a file (e.g., `gemini_cli_user_at_gmail.env`) containing variables like `GEMINI_CLI_ACCESS_TOKEN`, `GEMINI_CLI_REFRESH_TOKEN`, etc.
 4.  Copy the contents of this file and paste them directly into your `.env` file or Render's "Environment Variables" section.
 5.  The proxy will automatically detect and use these variables—no file upload required!
-
-### Advanced: Antigravity OAuth Provider
-
-The Antigravity provider requires OAuth2 authentication similar to Gemini CLI. It provides access to:
-
-- Gemini 2.5 models (Pro/Flash)
-- Gemini 3 models (Pro/Image-preview) - **requires paid-tier Google Cloud project**
-- Claude Sonnet 4.5 via Google's Antigravity proxy
-
-**Setting up Antigravity locally:**
-
-1. Run the credential tool: `python -m rotator_library.credential_tool`
-2. Select "Add OAuth Credential" and choose "Antigravity"
-3. Complete the OAuth flow in your browser
-4. The credential is saved to `oauth_creds/antigravity_oauth_1.json`
-
-**Exporting for stateless deployment:**
-
-1. Run: `python -m rotator_library.credential_tool`
-2. Select "Export Antigravity to .env"
-3. Copy the generated environment variables to your deployment platform:
-   ```env
-   ANTIGRAVITY_ACCESS_TOKEN="..."
-   ANTIGRAVITY_REFRESH_TOKEN="..."
-   ANTIGRAVITY_EXPIRY_DATE="..."
-   ANTIGRAVITY_EMAIL="your-email@gmail.com"
-   ```
-
-**Important Notes:**
-
-- Antigravity uses Google OAuth with additional scopes for cloud platform access
-- Gemini 3 models require a paid-tier Google Cloud project (free tier will fail)
-- The provider automatically handles thought signature caching for multi-turn conversations
-- Tool hallucination prevention is enabled by default for Gemini 3 models
-
-4. Save the file. (We'll upload it to Render in Step 5.)
 
 ## Step 4: Create a New Web Service on Render
 
@@ -271,7 +235,7 @@ docker pull ghcr.io/mirrowel/llm-api-key-proxy:20250106-143022-abc1234
 
 ### Setting Up OAuth Providers with Docker
 
-OAuth providers (Antigravity, Gemini CLI, Qwen Code, iFlow) require interactive browser authentication. Since Docker containers run headless, you must authenticate **outside the container** first.
+OAuth providers (Gemini CLI) require interactive browser authentication. Since Docker containers run headless, you must authenticate **outside the container** first.
 
 #### Option 1: Authenticate Locally, Mount Credentials (Recommended)
 
@@ -314,13 +278,11 @@ python -m rotator_library.credential_tool
 3. **Add the exported variables to your `.env` file:**
 
 ```env
-# Example for Antigravity
-ANTIGRAVITY_ACCESS_TOKEN="ya29.a0AfB_byD..."
-ANTIGRAVITY_REFRESH_TOKEN="1//0gL6dK9..."
-ANTIGRAVITY_EXPIRY_DATE="1735901234567"
-ANTIGRAVITY_EMAIL="user@gmail.com"
-ANTIGRAVITY_CLIENT_ID="1071006060591-..."
-ANTIGRAVITY_CLIENT_SECRET="GOCSPX-..."
+# Example for Gemini CLI
+GEMINI_CLI_ACCESS_TOKEN="ya29.a0AfB_byD..."
+GEMINI_CLI_REFRESH_TOKEN="1//0gL6dK9..."
+GEMINI_CLI_EXPIRY_DATE="1735901234567"
+GEMINI_CLI_EMAIL="user@gmail.com"
 ```
 
 4. **Deploy with Docker:**
@@ -385,11 +347,11 @@ The image is built for both `linux/amd64` and `linux/arm64` architectures, so it
 
 ## Appendix: Deploying to a Custom VPS
 
-If you're deploying the proxy to a **custom VPS** (DigitalOcean, AWS EC2, Linode, etc.) instead of Render.com, you'll encounter special considerations when setting up OAuth providers (Antigravity, Gemini CLI, iFlow). This section covers the professional deployment workflow.
+If you're deploying the proxy to a **custom VPS** (DigitalOcean, AWS EC2, Linode, etc.) instead of Render.com, you'll encounter special considerations when setting up OAuth providers (Gemini CLI). This section covers the professional deployment workflow.
 
 ### Understanding the OAuth Callback Problem
 
-OAuth providers like Antigravity, Gemini CLI, and iFlow require an interactive authentication flow that:
+OAuth providers like Gemini CLI require an interactive authentication flow that:
 
 1. Opens a browser for you to log in
 2. Redirects back to a **local callback server** running on specific ports
@@ -399,10 +361,7 @@ The callback servers bind to `localhost` on these ports:
 
 | Provider        | Port  | Notes                                          |
 | --------------- | ----- | ---------------------------------------------- |
-| **Antigravity** | 51121 | Google OAuth with extended scopes              |
 | **Gemini CLI**  | 8085  | Google OAuth for Gemini API                    |
-| **iFlow**       | 11451 | Authorization Code flow with API key fetch     |
-| **Qwen Code**   | N/A   | Uses Device Code flow - works on remote VPS ✅ |
 
 **The Issue**: When running on a remote VPS, your local browser cannot reach `http://localhost:51121` (or other callback ports) on the remote server, causing authentication to fail with a "connection refused" error.
 
@@ -436,10 +395,7 @@ python -m rotator_library.credential_tool
 
 Select **"Add OAuth Credential"** and choose your provider:
 
-- Antigravity
 - Gemini CLI
-- iFlow
-- Qwen Code (works directly on VPS, but can authenticate locally too)
 
 The tool will:
 
@@ -452,23 +408,16 @@ The tool will:
 
 Still in the credential tool, select the export option for each provider:
 
-- **"Export Antigravity to .env"**
 - **"Export Gemini CLI to .env"**
-- **"Export iFlow to .env"**
-- **"Export Qwen Code to .env"**
 
 The tool generates a `.env` file snippet like:
 
 ```env
-# Antigravity OAuth Credentials
-ANTIGRAVITY_ACCESS_TOKEN="ya29.a0AfB_byD..."
-ANTIGRAVITY_REFRESH_TOKEN="1//0gL6dK9..."
-ANTIGRAVITY_EXPIRY_DATE="1735901234567"
-ANTIGRAVITY_EMAIL="user@gmail.com"
-ANTIGRAVITY_CLIENT_ID="1071006060591-..."
-ANTIGRAVITY_CLIENT_SECRET="GOCSPX-..."
-ANTIGRAVITY_TOKEN_URI="https://oauth2.googleapis.com/token"
-ANTIGRAVITY_UNIVERSE_DOMAIN="googleapis.com"
+# Gemini CLI OAuth Credentials
+GEMINI_CLI_ACCESS_TOKEN="ya29.a0AfB_byD..."
+GEMINI_CLI_REFRESH_TOKEN="1//0gL6dK9..."
+GEMINI_CLI_EXPIRY_DATE="1735901234567"
+GEMINI_CLI_EMAIL="user@gmail.com"
 ```
 
 Copy these variables to a file (e.g., `oauth_credentials.env`).
@@ -524,12 +473,10 @@ From your **local machine**, open a terminal and run:
 
 ```bash
 # Forward all OAuth callback ports at once
-ssh -L 51121:localhost:51121 -L 8085:localhost:8085 -L 11451:localhost:11451 user@your-vps-ip
+ssh -L 8085:localhost:8085 user@your-vps-ip
 
 # Alternative: Forward ports individually as needed
-ssh -L 51121:localhost:51121 user@your-vps-ip  # For Antigravity
 ssh -L 8085:localhost:8085 user@your-vps-ip    # For Gemini CLI
-ssh -L 11451:localhost:11451 user@your-vps-ip  # For iFlow
 ```
 
 **Keep this SSH session open** during the entire authentication process.
@@ -594,10 +541,7 @@ ls -la /path/to/LLM-API-Key-Proxy/oauth_creds/
 
 Expected files:
 
-- `antigravity_oauth_1.json`
 - `gemini_cli_oauth_1.json`
-- `iflow_oauth_1.json`
-- `qwen_code_oauth_1.json`
 
 #### Configure .env to Use Credential Files
 
@@ -634,7 +578,7 @@ On your VPS, edit `.env`:
 
 - [ ] Never commit `.env` or `oauth_creds/` to version control
 - [ ] Use environment variables instead of credential files in production
-- [ ] Secure your VPS firewall - **do not** open OAuth callback ports (51121, 8085, 11451) to public internet
+- [ ] Secure your VPS firewall - **do not** open OAuth callback ports (51121, 8085) to public internet
 - [ ] Use SSH port forwarding only during initial authentication
 - [ ] Rotate credentials regularly using the credential tool's export feature
 - [ ] Set file permissions on `.env`: `chmod 600 .env`
@@ -647,7 +591,6 @@ OAuth callback ports should **never** be publicly exposed:
 # ❌ DO NOT DO THIS - keeps ports closed
 # sudo ufw allow 51121/tcp
 # sudo ufw allow 8085/tcp
-# sudo ufw allow 11451/tcp
 
 # ✅ Only open your proxy API port
 sudo ufw allow 8000/tcp
@@ -712,11 +655,11 @@ sudo journalctl -u llm-proxy -f
 
 ```bash
 # Check if environment variables are set
-printenv | grep -E '(ANTIGRAVITY|GEMINI_CLI|IFLOW|QWEN_CODE)'
+printenv | grep -E 'GEMINI_CLI'
 
 # Verify .env file exists and is readable
 ls -la .env
-cat .env | grep -E '(ANTIGRAVITY|GEMINI_CLI|IFLOW|QWEN_CODE)'
+cat .env | grep -E 'GEMINI_CLI'
 
 # Check credential files if using file-based approach
 ls -la oauth_creds/

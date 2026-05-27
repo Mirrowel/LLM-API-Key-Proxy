@@ -23,10 +23,10 @@ class ModelDefinitions:
        - The 'id' field is optional - if not provided, the model name (key) is used as the ID
 
     Examples:
-    - IFLOW_MODELS='["glm-4.6", "qwen3-max"]' - simple array format
-    - IFLOW_MODELS='{"glm-4.6": {}}' - dict format, uses "glm-4.6" as both name and ID
-    - IFLOW_MODELS='{"custom-name": {"id": "actual-id"}}' - dict format with custom ID
-    - IFLOW_MODELS='{"model": {"id": "id", "options": {"temperature": 0.7}}}' - with options
+    - MYSERVER_MODELS='["model-a", "model-b"]' - simple array format
+    - MYSERVER_MODELS='{"model-a": {}}' - dict format, uses "model-a" as both name and ID
+    - MYSERVER_MODELS='{"custom-name": {"id": "actual-id"}}' - dict format with custom ID
+    - MYSERVER_MODELS='{"model": {"id": "id", "options": {"temperature": 0.7}}}' - with options
 
     This class is a singleton - instantiated once and shared across all providers.
     """
