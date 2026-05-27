@@ -21,6 +21,8 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 -   **Advanced Model Requirements**: Support for model-tier restrictions (e.g., Gemini 3 requires paid-tier credentials).
 -   **Robust Streaming Support**: Includes a wrapper for streaming responses that reassembles fragmented JSON chunks.
 -   **Detailed Usage Tracking**: Tracks daily and global usage for each key, persisted per provider in `usage/usage_<provider>.json`.
+-   **Classifier-Scoped Routing**: Isolate user-owned provider credentials by `classifier + provider` while preserving the existing global/default provider pools.
+-   **Private Credential Identity**: Scoped private credentials are tracked by safe `private:<fingerprint>` identifiers so raw user API keys are not written to usage files.
 -   **Automatic Daily Resets**: Automatically resets cooldowns and archives stats daily.
 -   **Provider Agnostic**: Works with any provider supported by `litellm`.
 -   **Extensible**: Easily add support for new providers through a simple plugin-based architecture.
@@ -135,6 +137,7 @@ asyncio.run(main())
 This is the primary method for making API calls. It's a wrapper around `litellm.acompletion` that adds the core logic for key acquisition, selection, and retries.
 
 -   **Parameters**: Accepts the same keyword arguments as `litellm.acompletion`. The `model` parameter is required and must be a string in the format `provider/model_name`.
+-   **Scoped parameters**: Also accepts optional `classifier`, `api_keys`, `providers`, and `private` keyword arguments for classifier-scoped routing.
 -   **Returns**:
     -   For non-streaming requests, it returns the `litellm` response object.
     -   For streaming requests, it returns an async generator that yields OpenAI-compatible Server-Sent Events (SSE). The wrapper ensures that key locks are released and usage is recorded only after the stream is fully consumed.
@@ -157,19 +160,102 @@ asyncio.run(stream_example())
 
 #### `async def aembedding(self, **kwargs) -> Any:`
 
-A wrapper around `litellm.aembedding` that provides the same key management and retry logic for embedding requests.
+A wrapper around `litellm.aembedding` that provides the same key management and retry logic for embedding requests. It accepts the same scoped parameters as `acompletion`: `classifier`, `api_keys`, `providers`, and `private`.
 
 #### `def token_count(self, model: str, text: str = None, messages: List[Dict[str, str]] = None) -> int:`
 
 Calculates the token count for a given text or list of messages using `litellm.token_counter`.
 
-#### `async def get_available_models(self, provider: str) -> List[str]:`
+#### `async def get_available_models(self, provider: str, ...) -> List[str]:`
 
 Fetches a list of available models for a specific provider, applying any configured whitelists or blacklists. Results are cached in memory.
 
-#### `async def get_all_available_models(self, grouped: bool = True) -> Union[Dict[str, List[str]], List[str]]:`
+Scoped model discovery accepts `classifier`, `api_keys`, `providers`, `private`, `model_filters`, and `force_refresh`. Classified discovery uses only classifier/request credentials, honors request/registered provider `base_url` overrides, does not fall back to global keys, and caches by provider config, filters, and a safe fingerprint of the scoped credential set.
 
-Fetches a dictionary of all available models, grouped by provider, or as a single flat list if `grouped=False`.
+#### `async def get_all_available_models(self, grouped: bool = True, ...) -> Union[Dict[str, List[str]], List[str]]:`
+
+Fetches a dictionary of all available models, grouped by provider, or as a single flat list if `grouped=False`. It accepts the same scoped discovery parameters as `get_available_models`.
+
+#### `async def get_quota_stats(self, provider_filter: str = None, classifier: str = None) -> dict:`
+
+Returns usage and quota stats. Without `classifier`, default stats preserve previous behavior and skip classifier-scoped managers. With `classifier`, only usage managers for that classifier are included.
+
+### Classifier-Scoped Routing
+
+Classifier-scoped routing lets a host application use one `RotatingClient` for both platform-owned keys and user-owned provider connections.
+
+Default/global call:
+
+```python
+response = await client.acompletion(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "Use the platform pool"}],
+)
+```
+
+Classified/stateless call:
+
+```python
+response = await client.acompletion(
+    model="logfare/my-model",
+    messages=[{"role": "user", "content": "Use my own key"}],
+    classifier="user_123",
+    api_keys={"logfare": ["user-logfare-key"]},
+    providers={"logfare": {"base_url": "https://logfare.example/v1"}},
+    private=True,
+)
+```
+
+Rules:
+
+- `classifier + provider` is the isolation boundary.
+- Classified requests use only request-supplied or registered classifier credentials.
+- Classified requests never inherit global/default API keys.
+- Provider definitions/base URLs can be inherited or overridden without mutating global provider config.
+- `private=True` stores safe `private:<fingerprint>` identifiers in usage state and hides `full_path` in stats.
+- Scoped usage files are stored under `usage/classifiers/<safe_classifier>/usage_<provider>.json`.
+
+### Registered Scope Management
+
+Registered scopes keep classifier state in memory so callers do not need to pass provider config and keys on every request.
+
+```python
+await client.register_scope(
+    "user_123",
+    providers={"logfare": {"base_url": "https://logfare.example/v1"}},
+    api_keys={"logfare": ["user-logfare-key"]},
+    private=True,
+)
+
+response = await client.acompletion(
+    model="logfare/my-model",
+    messages=[{"role": "user", "content": "Use the registered scope"}],
+    classifier="user_123",
+)
+```
+
+Management methods:
+
+```python
+await client.register_scope(classifier, providers=None, api_keys=None, private=True)
+await client.update_scope(classifier, providers=None, api_keys=None, private=None)
+await client.get_scope(classifier, include_secrets=False)
+await client.remove_scope(classifier)
+
+await client.add_scope_provider(classifier, provider, config)
+await client.update_scope_provider(classifier, provider, config)
+await client.remove_scope_provider(classifier, provider)
+await client.list_scope_providers(classifier)
+
+await client.add_scope_credentials(classifier, provider, keys, private=True)
+await client.set_scope_credentials(classifier, provider, keys, private=True)
+await client.remove_scope_credentials(classifier, provider, credential_ids=None)
+await client.list_scope_credentials(classifier, provider=None, include_secrets=False)
+```
+
+`get_scope()` and `list_scope_credentials()` do not return raw keys unless `include_secrets=True` is explicitly requested. Registered scopes are runtime state only; the host application remains responsible for durable encrypted secret storage, user permissions, and billing policy.
+
+For full examples and edge cases, see [Classifier-Scoped Routing](../../docs/CLASSIFIER_SCOPED_ROUTING.md).
 
 #### `async def anthropic_messages(self, request, raw_request=None, pre_request_callback=None) -> Any:`
 

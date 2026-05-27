@@ -693,7 +693,11 @@ class ProviderConfig:
         """Get the set of detected custom provider names."""
         return self._custom_providers.copy()
 
-    def convert_for_litellm(self, **kwargs) -> Dict[str, Any]:
+    def convert_for_litellm(
+        self,
+        provider_override: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """
         Convert model params for LiteLLM call.
 
@@ -714,7 +718,14 @@ class ProviderConfig:
 
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
         provider = model.split("/")[0].lower()
-        api_base = self._api_bases.get(provider)
+        provider_override = provider_override or {}
+        api_base = (
+            provider_override.get("base_url")
+            or provider_override.get("api_base")
+            or self._api_bases.get(provider)
+        )
+        if isinstance(api_base, str):
+            api_base = api_base.rstrip("/")
 
         if not api_base:
             # No override configured for this provider

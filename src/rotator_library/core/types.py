@@ -80,6 +80,10 @@ class RequestContext:
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None
+    usage_manager_key: Optional[str] = None
+    provider_config: Optional[Dict[str, Any]] = None
+    credential_secrets: Dict[str, str] = field(default_factory=dict)
+    classifier: Optional[str] = None
 
 
 @dataclass

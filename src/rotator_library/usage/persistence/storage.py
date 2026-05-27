@@ -165,7 +165,8 @@ class UsageStorage:
                     data["credentials"][stable_id] = self._serialize_credential_state(
                         state
                     )
-                    data["accessor_index"][state.accessor] = stable_id
+                    if not str(state.accessor).startswith("private:"):
+                        data["accessor_index"][state.accessor] = stable_id
 
                 saved = self._writer.write(data)
 
@@ -499,6 +500,7 @@ class UsageStorage:
         return {
             "provider": state.provider,
             "accessor": state.accessor,
+            "private": str(state.accessor).startswith("private:"),
             "display_name": state.display_name,
             "tier": state.tier,
             "priority": state.priority,

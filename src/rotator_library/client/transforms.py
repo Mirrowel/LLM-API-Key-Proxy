@@ -80,6 +80,7 @@ class ProviderTransforms:
         model: str,
         credential: str,
         kwargs: Dict[str, Any],
+        provider_config_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Apply all applicable transforms to request kwargs.
@@ -127,7 +128,10 @@ class ProviderTransforms:
 
         # 4. Apply LiteLLM conversion if config available
         if self._config and hasattr(self._config, "convert_for_litellm"):
-            kwargs = self._config.convert_for_litellm(**kwargs)
+            kwargs = self._config.convert_for_litellm(
+                provider_override=provider_config_override,
+                **kwargs,
+            )
 
         if modifications:
             lib_logger.debug(

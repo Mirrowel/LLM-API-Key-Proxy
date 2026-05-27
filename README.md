@@ -19,6 +19,7 @@ This project consists of two components:
 - **One Endpoint, Many Providers** — Configure Gemini, OpenAI, Anthropic, and [any LiteLLM-supported provider](https://docs.litellm.ai/docs/providers) once. Access them all through a single API key
 - **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
+- **Classifier-Scoped Routing** — Use isolated per-user/provider credential pools in the library without leaking user keys into global rotation
 - **Exclusive Provider Support** — Includes custom providers not available elsewhere, including **Gemini CLI**
 
 ---
@@ -315,6 +316,38 @@ async with client:
     )
 ```
 
+### Classifier-Scoped Routing
+
+Applications that use `rotator_library` directly can isolate user-owned provider keys with a `classifier`. This keeps platform/global keys separate from user-owned credentials while reusing the same retry, rotation, streaming, model discovery, and usage tracking machinery.
+
+```python
+response = await client.acompletion(
+    model="logfare/my-model",
+    messages=[{"role": "user", "content": "Use my connected provider"}],
+    classifier="user_123",
+    api_keys={"logfare": ["user-logfare-key"]},
+    providers={
+        "logfare": {
+            "base_url": "https://user-logfare.example/v1",
+            "protocol": "openai_chat_completions",
+        }
+    },
+    private=True,
+)
+```
+
+Key behavior:
+
+- No `classifier`: existing global/provider pool behavior is preserved.
+- With `classifier`: only credentials supplied for that classifier/request or registered classifier are used.
+- Classified requests never fall back to global API keys.
+- `private=True` stores safe `private:<fingerprint>` identifiers in usage files instead of raw API keys.
+- Usage files are isolated under `usage/classifiers/<safe_classifier>/usage_<provider>.json`.
+- Scoped model discovery uses the same classifier/provider/key isolation and separate cache entries, including a safe fingerprint of the scoped credential set.
+- Registered scope APIs let host apps add, update, fetch, and remove classifier provider configs and credentials at runtime.
+
+See [Classifier-Scoped Routing](docs/CLASSIFIER_SCOPED_ROUTING.md) for the full API, examples, privacy rules, model discovery behavior, and limitations.
+
 ### Library Documentation
 
 See the [Library README](src/rotator_library/README.md) for complete documentation including:
@@ -323,6 +356,7 @@ See the [Library README](src/rotator_library/README.md) for complete documentati
 - Error handling and cooldown strategies
 - Provider plugin system
 - Credential prioritization
+- Classifier-scoped routing and registered scope management
 
 ---
 
@@ -349,6 +383,7 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `launcher_config.json` | TUI-specific settings (host, port, logging) |
 | `quota_viewer_config.json` | Quota viewer remotes + per-provider display toggles |
 | `usage/usage_<provider>.json` | Usage persistence per provider |
+| `usage/classifiers/<safe_classifier>/usage_<provider>.json` | Classifier-scoped library usage persistence |
 
 ---
 

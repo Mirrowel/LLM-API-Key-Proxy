@@ -69,6 +69,7 @@ client = RotatingClient(
 *   **Execution Logic**: Executing API calls via `litellm` with a robust, **deadline-driven** retry and key selection strategy.
 *   **Streaming Safety**: Providing a safe, stateful wrapper (`_safe_streaming_wrapper`) for handling streaming responses, buffering incomplete JSON chunks, and detecting mid-stream errors.
 *   **Model Filtering**: Filtering available models using configurable whitelists and blacklists.
+*   **Classifier-Scoped Routing**: Resolving per-request or registered classifier scopes so user-owned provider keys do not mix with platform/default pools.
 *   **Request Sanitization**: Automatically cleaning invalid parameters (like `dimensions` for non-OpenAI models) via `request_sanitizer.py`.
 
 #### Model Filtering Logic
@@ -79,6 +80,141 @@ The logic applies in the following order:
 1.  **Whitelist Check**: If a provider has a whitelist defined (`WHITELIST_MODELS_<PROVIDER>`), any model on that list will **always be available**, even if it matches a blacklist pattern. This acts as a definitive override.
 2.  **Blacklist Check**: For any model *not* on the whitelist, the client checks the blacklist (`IGNORE_MODELS_<PROVIDER>`). If the model matches a blacklist pattern (supports wildcards like `*-preview`), it is excluded.
 3.  **Default**: If a model is on neither list, it is included.
+
+For classifier-scoped model discovery, global filters do not propagate by default. Scoped callers can pass `model_filters` to `get_available_models()` or `get_all_available_models()`; these filters are applied only to that classified model-listing operation and do not block completions.
+
+#### Classifier-Scoped Routing
+
+Classifier-scoped routing is the multi-tenant isolation layer in `RotatingClient`. It lets one long-lived client serve both global/platform models and user-owned provider credentials without constructing a separate `RotatingClient` per user.
+
+The isolation key is:
+
+```text
+classifier + provider
+```
+
+No classifier preserves the original behavior:
+
+```text
+provider -> global/default credential pool -> usage/usage_<provider>.json
+```
+
+With a classifier, the resolver builds an effective scope from:
+
+```text
+global/default provider templates
++ registered classifier state
++ request overlay
+= effective request scope
+```
+
+Credential resolution for classified requests is intentionally stricter:
+
+```text
+request api_keys[provider]
+or registered classifier credentials[provider]
+or no credentials
+```
+
+Global/default API keys are never inherited by classified requests. This is the primary guard that prevents a user-owned model request from accidentally charging or exposing platform credentials.
+
+Provider config resolution is more permissive:
+
+```text
+request providers[provider]
+or registered classifier provider config
+or global/default provider API base/template
+or built-in provider behavior
+```
+
+This allows a classifier to use a globally known custom provider alias such as `logfare` while still supplying only user-owned keys.
+
+The scoped request metadata is carried on `RequestContext`:
+
+```text
+usage_manager_key     -> lookup key for classifier/provider usage manager
+provider_config       -> request-local provider base URL/protocol override
+credential_secrets    -> safe credential id -> raw secret map for this request
+classifier            -> external isolation label
+```
+
+The executor continues to rotate over `context.credentials`, but for private scoped credentials those values are safe identifiers such as `private:<fingerprint>`. The raw secret is resolved from `context.credential_secrets` only when injecting `api_key` or `credential_identifier` into the provider call.
+
+#### Stateless Scoped Calls
+
+Stateless scoped calls pass everything needed for the operation:
+
+```python
+await client.acompletion(
+    model="logfare/my-model",
+    messages=[{"role": "user", "content": "Hello"}],
+    classifier="user_123",
+    api_keys={"logfare": ["user-key"]},
+    providers={"logfare": {"base_url": "https://logfare.example/v1"}},
+    private=True,
+)
+```
+
+The call uses only the `logfare` keys supplied for the operation. Keys for unrelated providers in the `api_keys` dict are ignored.
+
+#### Registered Scoped Calls
+
+Registered scope state is held in memory and can be managed externally:
+
+```python
+await client.register_scope(
+    "user_123",
+    providers={"logfare": {"base_url": "https://logfare.example/v1"}},
+    api_keys={"logfare": ["user-key"]},
+    private=True,
+)
+
+await client.acompletion(
+    model="logfare/my-model",
+    messages=[{"role": "user", "content": "Hello"}],
+    classifier="user_123",
+)
+```
+
+Registered management methods include whole-scope operations and provider/credential operations:
+
+```text
+register_scope, update_scope, get_scope, remove_scope
+add_scope_provider, update_scope_provider, remove_scope_provider, list_scope_providers
+add_scope_credentials, set_scope_credentials, remove_scope_credentials, list_scope_credentials
+```
+
+`get_scope()` and `list_scope_credentials()` hide secrets unless `include_secrets=True` is requested. The library does not persist registered secrets; host applications remain responsible for user identity, authorization, encrypted durable storage, and billing.
+
+#### Private Credential Persistence
+
+For `private=True`, raw API keys are converted to HMAC fingerprints before entering usage tracking:
+
+```text
+private:<HMAC-SHA256 fingerprint>
+```
+
+The HMAC key is `ROTATOR_LIBRARY_FINGERPRINT_KEY` when set, otherwise the resolved data directory path. Private usage files contain only the safe identifier, not the raw API key.
+
+Private credential persistence behavior:
+
+```text
+usage/classifiers/<safe_classifier>/usage_<provider>.json
+credentials[*].accessor = private:<fingerprint>
+credentials[*].private = true
+accessor_index excludes private credentials
+stats credentials[*].full_path = null
+```
+
+Legacy/global non-private credentials keep the previous persistence shape for backward compatibility.
+
+#### Scoped Model Discovery And Stats
+
+`get_available_models()` and `get_all_available_models()` accept the same scope arguments as requests: `classifier`, `api_keys`, `providers`, `private`, plus `model_filters` and `force_refresh`.
+
+Cache keys include classifier, provider, provider override, and model filters so different users can reuse the same provider name without sharing model discovery results.
+
+`get_quota_stats(classifier=...)` selects only usage managers under that classifier. Without `classifier`, stats skip classifier-scoped managers to preserve previous global/default behavior.
 
 #### Request Lifecycle: A Deadline-Driven Approach
 

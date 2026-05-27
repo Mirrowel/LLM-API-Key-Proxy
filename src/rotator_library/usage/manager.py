@@ -263,10 +263,8 @@ class UsageManager:
             tiers: Optional tier overrides (accessor -> tier name)
         """
         async with self._lock:
-            if self._initialized:
-                return
             # Load persisted state
-            if self._storage:
+            if not self._initialized and self._storage:
                 (
                     self._states,
                     fair_cycle_global,
@@ -985,11 +983,13 @@ class UsageManager:
             elif has_group_cooldown:
                 status = "cooldown"
 
+            is_private = str(state.accessor).startswith("private:")
             cred_stats = {
                 "stable_id": stable_id,
                 "accessor_masked": mask_credential(state.accessor, style="full"),
-                "full_path": state.accessor,
+                "full_path": None if is_private else state.accessor,
                 "identifier": mask_credential(state.accessor, style="full"),
+                "private": is_private,
                 "email": state.display_name,
                 "tier": state.tier,
                 "priority": state.priority,

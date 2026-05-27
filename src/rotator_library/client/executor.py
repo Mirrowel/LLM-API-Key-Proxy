@@ -373,7 +373,11 @@ class RequestExecutor:
         """
         # Apply transforms
         kwargs = await self._transforms.apply(
-            provider, model, cred, context.kwargs.copy()
+            provider,
+            model,
+            cred,
+            context.kwargs.copy(),
+            provider_config_override=context.provider_config,
         )
 
         # Sanitize request payload
@@ -501,7 +505,7 @@ class RequestExecutor:
         provider = context.provider
         model = context.model
 
-        usage_manager = self._usage_managers.get(provider)
+        usage_manager = self._usage_managers.get(context.usage_manager_key or provider)
         if not usage_manager:
             raise NoAvailableKeysError(f"No UsageManager for provider {provider}")
 
@@ -584,6 +588,7 @@ class RequestExecutor:
                     deadline=deadline,
                 ) as cred_context:
                     cred = cred_context.credential
+                    credential_secret = context.credential_secrets.get(cred, cred)
                     retry_state.record_attempt(cred)
 
                     state = getattr(usage_manager, "states", {}).get(
@@ -620,13 +625,13 @@ class RequestExecutor:
 
                                 # Make the API call
                                 if plugin and plugin.has_custom_logic():
-                                    kwargs["credential_identifier"] = cred
+                                    kwargs["credential_identifier"] = credential_secret
                                     response = await plugin.acompletion(
                                         self._http_client, **kwargs
                                     )
                                 else:
                                     # Standard LiteLLM call
-                                    kwargs["api_key"] = cred
+                                    kwargs["api_key"] = credential_secret
                                     self._apply_litellm_logger(kwargs)
                                     # Remove internal context before litellm call
                                     kwargs.pop("transaction_context", None)
@@ -797,6 +802,7 @@ class RequestExecutor:
                         deadline=deadline,
                     ) as cred_context:
                         cred = cred_context.credential
+                        credential_secret = context.credential_secrets.get(cred, cred)
                         retry_state.record_attempt(cred)
 
                         state = getattr(usage_manager, "states", {}).get(
@@ -847,12 +853,12 @@ class RequestExecutor:
 
                                     # Make the API call
                                     if plugin and plugin.has_custom_logic():
-                                        kwargs["credential_identifier"] = cred
+                                        kwargs["credential_identifier"] = credential_secret
                                         stream = await plugin.acompletion(
                                             self._http_client, **kwargs
                                         )
                                     else:
-                                        kwargs["api_key"] = cred
+                                        kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call
@@ -1328,7 +1334,10 @@ class RequestExecutor:
         context: RequestContext,
         filter_result: "FilterResult",
     ) -> None:
-        if usage_manager.initialized:
+        is_scoped_manager = bool(
+            context.usage_manager_key and context.usage_manager_key != context.provider
+        )
+        if usage_manager.initialized and not is_scoped_manager:
             return
         await usage_manager.initialize(
             context.credentials,
