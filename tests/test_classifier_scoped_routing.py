@@ -647,6 +647,34 @@ def test_model_discovery_cache_key_changes_with_scoped_credentials(tmp_path):
     assert seen == ["Bearer secret-a", "Bearer secret-b"]
 
 
+def test_usage_registry_scope_paths_do_not_depend_on_scope_manager_construction_order(tmp_path):
+    client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
+    safe_classifier = client._safe_scope_name("constructor/order")
+
+    async def run_test():
+        original_scope_manager = client._scope_manager
+        try:
+            client._scope_manager = None
+            usage_key = await client._usage_registry.ensure_scoped_usage_manager(
+                "logfare", "constructor/order", ["scoped-key"]
+            )
+            assert usage_key == f"classifier:{safe_classifier}:logfare"
+            assert usage_key in client.usage_managers
+            expected_path = (
+                Path(tmp_path)
+                / "usage"
+                / "classifiers"
+                / safe_classifier
+                / "usage_logfare.json"
+            )
+            assert client.usage_managers[usage_key]._storage.file_path == expected_path
+        finally:
+            client._scope_manager = original_scope_manager
+            await _close(client)
+
+    run_async(run_test())
+
+
 def test_provider_config_override_routes_without_global_mutation(tmp_path):
     client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
 

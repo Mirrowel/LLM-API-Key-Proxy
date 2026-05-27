@@ -15,16 +15,9 @@ The original client.py was ~3000 lines. This facade is ~300 lines,
 with all complexity moved to specialized modules.
 """
 
-import asyncio
-import fnmatch
-import hashlib
-import hmac
 import json
 import logging
 import os
-import random
-import re
-import time
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union, TYPE_CHECKING
 
@@ -32,9 +25,6 @@ import httpx
 import litellm
 from litellm.litellm_core_utils.token_counter import token_counter
 
-from ..core.types import RequestContext
-from ..core.errors import NoAvailableKeysError, mask_credential
-from ..core.config import ConfigLoader
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_GLOBAL_TIMEOUT,
@@ -46,6 +36,11 @@ from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .executor import RequestExecutor
 from .anthropic import AnthropicHandler
+from .scopes import ScopeManager
+from .model_discovery import ModelDiscoveryService
+from .usage_managers import UsageManagerRegistry
+from .request_builder import RequestContextBuilder
+from .quota import QuotaService
 from ..session_tracking import SessionTracker
 
 # Import providers and other dependencies
@@ -54,7 +49,6 @@ from ..cooldown_manager import CooldownManager
 from ..credential_manager import CredentialManager
 from ..background_refresher import BackgroundRefresher
 from ..model_definitions import ModelDefinitions
-from ..transaction_logger import TransactionLogger
 from ..provider_config import ProviderConfig as LiteLLMProviderConfig
 from ..utils.paths import get_default_root, get_logs_dir, get_oauth_dir
 from ..utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
@@ -62,7 +56,6 @@ from ..failure_logger import configure_failure_logger
 
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
-from ..usage.config import load_provider_usage_config, WindowDefinition
 
 if TYPE_CHECKING:
     from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
@@ -203,9 +196,6 @@ class RotatingClient:
             self.optimal_concurrent_requests_per_key_by_mode
         )
 
-        # Initialize configuration loader
-        self._config_loader = ConfigLoader(PROVIDER_PLUGINS)
-
         # Initialize components
         self._provider_plugins = PROVIDER_PLUGINS
         self._provider_instances: Dict[str, Any] = {}
@@ -240,9 +230,6 @@ class RotatingClient:
             provider_instances=self._provider_instances,
         )
 
-        # Initialize UsageManagers (one per provider) using new usage package
-        self._usage_managers: Dict[str, NewUsageManager] = {}
-
         # Resolve usage file path base
         if usage_file_path:
             base_path = Path(usage_file_path)
@@ -253,47 +240,25 @@ class RotatingClient:
             self._usage_base_path = self.data_dir / "usage"
         self._usage_base_path.mkdir(parents=True, exist_ok=True)
 
-        # Build provider configs using ConfigLoader
-        provider_configs = {}
-        for provider in self.all_credentials.keys():
-            provider_configs[provider] = self._config_loader.load_provider_config(
-                provider
-            )
-
-        # Create UsageManager for each provider
-        for provider, credentials in self.all_credentials.items():
-            config = load_provider_usage_config(provider, PROVIDER_PLUGINS)
-            # Override tolerance from constructor param
-            config.rotation_tolerance = rotation_tolerance
-
-            self._apply_usage_reset_config(provider, credentials, config)
-
-            usage_file = self._usage_base_path / f"usage_{provider}.json"
-
-            mode = config.rotation_mode.value
-            max_concurrent = self.max_concurrent_requests_per_key_by_mode.get(
-                provider, {}
-            ).get(mode)
-            if max_concurrent is None:
-                max_concurrent = self.max_concurrent_requests_per_key.get(provider)
-
-            optimal_concurrent = self.optimal_concurrent_requests_per_key_by_mode.get(
-                provider, {}
-            ).get(mode)
-            if optimal_concurrent is None:
-                optimal_concurrent = self.optimal_concurrent_requests_per_key.get(
-                    provider
-                )
-
-            manager = NewUsageManager(
-                provider=provider,
-                file_path=usage_file,
-                provider_plugins=PROVIDER_PLUGINS,
-                config=config,
-                max_concurrent_per_key=max_concurrent,
-                optimal_concurrent_per_key=optimal_concurrent,
-            )
-            self._usage_managers[provider] = manager
+        self._usage_registry = UsageManagerRegistry(
+            all_credentials=self.all_credentials,
+            usage_base_path=self._usage_base_path,
+            provider_plugins=PROVIDER_PLUGINS,
+            max_concurrent_requests_per_key=self.max_concurrent_requests_per_key,
+            max_concurrent_requests_per_key_by_mode=(
+                self.max_concurrent_requests_per_key_by_mode
+            ),
+            optimal_concurrent_requests_per_key=self.optimal_concurrent_requests_per_key,
+            optimal_concurrent_requests_per_key_by_mode=(
+                self.optimal_concurrent_requests_per_key_by_mode
+            ),
+            rotation_tolerance=rotation_tolerance,
+            get_provider_instance=self._get_provider_instance,
+            scope_usage_key=self._scope_usage_key,
+            scope_usage_file=self._scope_usage_file,
+        )
+        self._usage_registry.create_global_managers()
+        self._usage_managers = self._usage_registry.managers
 
         # Initialize executor with new usage managers
         self._executor = RequestExecutor(
@@ -312,14 +277,44 @@ class RotatingClient:
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
-        self._usage_initialized = False
-        self._usage_init_lock = asyncio.Lock()
-        self._scope_lock = asyncio.Lock()
-        self._registered_scopes: Dict[str, Dict[str, Any]] = {}
         fingerprint_key = os.environ.get("ROTATOR_LIBRARY_FINGERPRINT_KEY")
         if not fingerprint_key:
             fingerprint_key = str(self.data_dir)
         self._fingerprint_key = fingerprint_key.encode("utf-8")
+        self._scope_manager = ScopeManager(
+            all_credentials=self.all_credentials,
+            usage_base_path=self._usage_base_path,
+            fingerprint_key=self._fingerprint_key,
+            model_list_cache=self._model_list_cache,
+            ensure_scoped_usage_manager=self._ensure_scoped_usage_manager,
+        )
+        self._model_discovery = ModelDiscoveryService(
+            all_credentials=self.all_credentials,
+            model_list_cache=self._model_list_cache,
+            normalize_provider_map=self._normalize_provider_map,
+            normalize_api_key_map=self._normalize_api_key_map,
+            scope_usage_key=self._scope_usage_key,
+            get_registered_scope=self._get_registered_scope,
+            resolve_scope_for_provider=self._resolve_scope_for_provider,
+            get_provider_instance=self._get_provider_instance,
+            get_http_client=lambda: self.http_client,
+            provider_config=self.provider_config,
+            model_resolver=self._model_resolver,
+        )
+        self._request_builder = RequestContextBuilder(
+            resolve_scope_for_provider=self._resolve_scope_for_provider,
+            model_resolver=self._model_resolver,
+            session_tracker=self._session_tracker,
+            get_global_timeout=lambda: self.global_timeout,
+            get_enable_request_logging=lambda: self.enable_request_logging,
+        )
+        self._quota_service = QuotaService(
+            usage_managers=self._usage_managers,
+            all_credentials=self.all_credentials,
+            provider_plugins=self._provider_plugins,
+            safe_scope_name=self._safe_scope_name,
+            get_provider_instance=self._get_provider_instance,
+        )
 
         # Initialize Anthropic compatibility handler
         self._anthropic_handler = AnthropicHandler(self)
@@ -345,32 +340,7 @@ class RotatingClient:
         await self.close()
 
     async def initialize_usage_managers(self) -> None:
-        """Initialize usage managers once before background jobs run."""
-        if self._usage_initialized:
-            return
-        async with self._usage_init_lock:
-            if self._usage_initialized:
-                return
-            for provider, manager in self._usage_managers.items():
-                credentials = self.all_credentials.get(provider, [])
-                priorities, tiers = self._get_credential_metadata(provider, credentials)
-                await manager.initialize(
-                    credentials, priorities=priorities, tiers=tiers
-                )
-            summaries = []
-            for provider, manager in self._usage_managers.items():
-                credentials = self.all_credentials.get(provider, [])
-                status = (
-                    f"loaded {manager.loaded_credentials}"
-                    if manager.loaded_from_storage
-                    else "fresh"
-                )
-                summaries.append(f"{provider}:{len(credentials)} ({status})")
-            if summaries:
-                lib_logger.info(
-                    f"Usage managers initialized: {', '.join(sorted(summaries))}"
-                )
-            self._usage_initialized = True
+        await self._usage_registry.initialize_usage_managers()
 
     async def close(self):
         """Close the HTTP client and save usage data."""
@@ -383,41 +353,19 @@ class RotatingClient:
 
     @staticmethod
     def _safe_scope_name(classifier: str) -> str:
-        """Convert an external classifier label into a safe directory name."""
-        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", classifier.strip())[:80]
-        if cleaned and cleaned == classifier:
-            return cleaned
-        digest = hashlib.sha256(classifier.encode("utf-8")).hexdigest()[:12]
-        return f"{cleaned or 'scope'}_{digest}"
+        return ScopeManager.safe_scope_name(classifier)
 
     @staticmethod
     def _normalize_provider_map(
         providers: Optional[Dict[str, Dict[str, Any]]],
     ) -> Dict[str, Dict[str, Any]]:
-        if not providers:
-            return {}
-        return {
-            str(provider).lower(): dict(config or {})
-            for provider, config in providers.items()
-        }
+        return ScopeManager.normalize_provider_map(providers)
 
     @staticmethod
     def _normalize_api_key_map(
         api_keys: Optional[Dict[str, Any]],
     ) -> Dict[str, List[str]]:
-        if not api_keys:
-            return {}
-        normalized: Dict[str, List[str]] = {}
-        for provider, keys in api_keys.items():
-            if keys is None:
-                continue
-            if isinstance(keys, str):
-                values = [keys]
-            else:
-                values = [str(key) for key in keys if key]
-            if values:
-                normalized[str(provider).lower()] = values
-        return normalized
+        return ScopeManager.normalize_api_key_map(api_keys)
 
     def _fingerprint_credential(
         self,
@@ -425,15 +373,12 @@ class RotatingClient:
         classifier: Optional[str],
         secret: str,
     ) -> str:
-        scope = classifier or "default"
-        message = f"{scope}:{provider}:{secret}".encode("utf-8")
-        digest = hmac.new(self._fingerprint_key, message, hashlib.sha256).hexdigest()
-        return f"private:{digest[:32]}"
+        return self._scope_manager.fingerprint_credential(provider, classifier, secret)
 
     def _scope_usage_key(self, provider: str, classifier: Optional[str]) -> str:
         if classifier is None:
             return provider
-        return f"classifier:{self._safe_scope_name(classifier)}:{provider}"
+        return f"classifier:{ScopeManager.safe_scope_name(classifier)}:{provider}"
 
     def _scope_usage_file(self, provider: str, classifier: Optional[str]) -> Path:
         if classifier is None:
@@ -441,25 +386,14 @@ class RotatingClient:
         return (
             self._usage_base_path
             / "classifiers"
-            / self._safe_scope_name(classifier)
+            / ScopeManager.safe_scope_name(classifier)
             / f"usage_{provider}.json"
         )
 
     def _get_concurrency_settings(
         self, provider: str, mode: str
     ) -> tuple[Optional[int], Optional[int]]:
-        max_concurrent = self.max_concurrent_requests_per_key_by_mode.get(
-            provider, {}
-        ).get(mode)
-        if max_concurrent is None:
-            max_concurrent = self.max_concurrent_requests_per_key.get(provider)
-
-        optimal_concurrent = self.optimal_concurrent_requests_per_key_by_mode.get(
-            provider, {}
-        ).get(mode)
-        if optimal_concurrent is None:
-            optimal_concurrent = self.optimal_concurrent_requests_per_key.get(provider)
-        return max_concurrent, optimal_concurrent
+        return self._usage_registry.get_concurrency_settings(provider, mode)
 
     async def _ensure_scoped_usage_manager(
         self,
@@ -467,49 +401,12 @@ class RotatingClient:
         classifier: Optional[str],
         credentials: Optional[List[str]] = None,
     ) -> str:
-        usage_key = self._scope_usage_key(provider, classifier)
-        if usage_key in self._usage_managers:
-            return usage_key
-
-        async with self._scope_lock:
-            if usage_key in self._usage_managers:
-                return usage_key
-
-            config = load_provider_usage_config(provider, PROVIDER_PLUGINS)
-            config.rotation_tolerance = self._rotation_tolerance
-            self._apply_usage_reset_config(provider, credentials or [], config)
-            mode = config.rotation_mode.value
-            max_concurrent, optimal_concurrent = self._get_concurrency_settings(
-                provider, mode
-            )
-            usage_file = self._scope_usage_file(provider, classifier)
-            usage_file.parent.mkdir(parents=True, exist_ok=True)
-            self._usage_managers[usage_key] = NewUsageManager(
-                provider=provider,
-                file_path=usage_file,
-                provider_plugins=PROVIDER_PLUGINS,
-                config=config,
-                max_concurrent_per_key=max_concurrent,
-                optimal_concurrent_per_key=optimal_concurrent,
-            )
-        return usage_key
+        return await self._usage_registry.ensure_scoped_usage_manager(
+            provider, classifier, credentials
+        )
 
     async def _get_registered_scope(self, classifier: str) -> Dict[str, Any]:
-        async with self._scope_lock:
-            scope = self._registered_scopes.get(classifier, {})
-            return {
-                "providers": {
-                    provider: dict(config)
-                    for provider, config in scope.get("providers", {}).items()
-                },
-                "credentials": {
-                    provider: {
-                        "keys": list(entry.get("keys", [])),
-                        "private": bool(entry.get("private", True)),
-                    }
-                    for provider, entry in scope.get("credentials", {}).items()
-                },
-            }
+        return await self._scope_manager.get_registered_scope(classifier)
 
     async def _resolve_scope_for_provider(
         self,
@@ -519,59 +416,13 @@ class RotatingClient:
         request_providers: Optional[Dict[str, Dict[str, Any]]],
         private: bool,
     ) -> Dict[str, Any]:
-        api_key_map = self._normalize_api_key_map(request_api_keys)
-        provider_map = self._normalize_provider_map(request_providers)
-        isolated = classifier is not None or bool(api_key_map) or bool(provider_map)
-
-        if not isolated:
-            return {
-                "usage_manager_key": provider,
-                "credentials": self.all_credentials.get(provider, []),
-                "credential_secrets": {},
-                "provider_config": None,
-                "classifier": None,
-            }
-
-        registered = await self._get_registered_scope(classifier) if classifier else {}
-
-        provider_config: Dict[str, Any] = {}
-        if provider in registered.get("providers", {}):
-            provider_config.update(registered["providers"][provider])
-        if provider in provider_map:
-            provider_config.update(provider_map[provider])
-
-        raw_credentials: List[str] = []
-        credential_private = private
-        if provider in api_key_map:
-            raw_credentials = api_key_map[provider]
-        elif provider in registered.get("credentials", {}):
-            credential_entry = registered["credentials"][provider]
-            raw_credentials = list(credential_entry.get("keys", []))
-            credential_private = bool(credential_entry.get("private", True))
-
-        scope_name = classifier or "default"
-        credentials: List[str] = []
-        credential_secrets: Dict[str, str] = {}
-        if credential_private:
-            for secret in raw_credentials:
-                credential_id = self._fingerprint_credential(
-                    provider, scope_name, secret
-                )
-                credentials.append(credential_id)
-                credential_secrets[credential_id] = secret
-        else:
-            credentials = list(raw_credentials)
-
-        usage_manager_key = await self._ensure_scoped_usage_manager(
-            provider, scope_name, raw_credentials
+        return await self._scope_manager.resolve_scope_for_provider(
+            provider,
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
         )
-        return {
-            "usage_manager_key": usage_manager_key,
-            "credentials": credentials,
-            "credential_secrets": credential_secrets,
-            "provider_config": provider_config or None,
-            "classifier": scope_name,
-        }
 
     async def register_scope(
         self,
@@ -580,13 +431,9 @@ class RotatingClient:
         api_keys: Optional[Dict[str, Any]] = None,
         private: bool = True,
     ) -> Dict[str, Any]:
-        """Create or replace registered provider/credential state for a classifier."""
-        async with self._scope_lock:
-            self._registered_scopes[classifier] = {"providers": {}, "credentials": {}}
-        await self.update_scope(
+        return await self._scope_manager.register_scope(
             classifier, providers=providers, api_keys=api_keys, private=private
         )
-        return await self.get_scope(classifier)
 
     async def update_scope(
         self,
@@ -595,50 +442,21 @@ class RotatingClient:
         api_keys: Optional[Dict[str, Any]] = None,
         private: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Merge provider configs and credentials into a registered classifier."""
-        async with self._scope_lock:
-            scope = self._registered_scopes.setdefault(
-                classifier, {"providers": {}, "credentials": {}}
-            )
-            scope["providers"].update(self._normalize_provider_map(providers))
-            for provider, keys in self._normalize_api_key_map(api_keys).items():
-                scope["credentials"][provider] = {
-                    "keys": list(keys),
-                    "private": True if private is None else bool(private),
-                }
-        return await self.get_scope(classifier)
+        return await self._scope_manager.update_scope(
+            classifier, providers=providers, api_keys=api_keys, private=private
+        )
 
     async def get_scope(
         self,
         classifier: str,
         include_secrets: bool = False,
     ) -> Dict[str, Any]:
-        """Fetch registered state for a classifier."""
-        scope = await self._get_registered_scope(classifier)
-        credentials = {}
-        for provider, entry in scope.get("credentials", {}).items():
-            credentials[provider] = {
-                "count": len(entry.get("keys", [])),
-                "private": bool(entry.get("private", True)),
-            }
-            if include_secrets:
-                credentials[provider]["keys"] = list(entry.get("keys", []))
-        return {
-            "classifier": classifier,
-            "providers": scope.get("providers", {}),
-            "credentials": credentials,
-        }
+        return await self._scope_manager.get_scope(
+            classifier, include_secrets=include_secrets
+        )
 
     async def remove_scope(self, classifier: str) -> None:
-        """Remove registered state for a classifier."""
-        async with self._scope_lock:
-            self._registered_scopes.pop(classifier, None)
-            prefix = f"classifier:{self._safe_scope_name(classifier)}:"
-            self._model_list_cache = {
-                key: value
-                for key, value in self._model_list_cache.items()
-                if not key.startswith(prefix)
-            }
+        await self._scope_manager.remove_scope(classifier)
 
     async def add_scope_provider(
         self,
@@ -646,7 +464,7 @@ class RotatingClient:
         provider: str,
         config: Dict[str, Any],
     ) -> Dict[str, Any]:
-        return await self.update_scope(classifier, providers={provider: config})
+        return await self._scope_manager.add_scope_provider(classifier, provider, config)
 
     async def update_scope_provider(
         self,
@@ -654,17 +472,15 @@ class RotatingClient:
         provider: str,
         config: Dict[str, Any],
     ) -> Dict[str, Any]:
-        return await self.add_scope_provider(classifier, provider, config)
+        return await self._scope_manager.update_scope_provider(
+            classifier, provider, config
+        )
 
     async def remove_scope_provider(self, classifier: str, provider: str) -> None:
-        provider = provider.lower()
-        async with self._scope_lock:
-            scope = self._registered_scopes.get(classifier)
-            if scope:
-                scope.get("providers", {}).pop(provider, None)
+        await self._scope_manager.remove_scope_provider(classifier, provider)
 
     async def list_scope_providers(self, classifier: str) -> Dict[str, Dict[str, Any]]:
-        return (await self._get_registered_scope(classifier)).get("providers", {})
+        return await self._scope_manager.list_scope_providers(classifier)
 
     async def add_scope_credentials(
         self,
@@ -673,18 +489,9 @@ class RotatingClient:
         keys: Any,
         private: bool = True,
     ) -> Dict[str, Any]:
-        provider = provider.lower()
-        new_keys = self._normalize_api_key_map({provider: keys}).get(provider, [])
-        async with self._scope_lock:
-            scope = self._registered_scopes.setdefault(
-                classifier, {"providers": {}, "credentials": {}}
-            )
-            entry = scope["credentials"].setdefault(
-                provider, {"keys": [], "private": private}
-            )
-            entry["keys"].extend(new_keys)
-            entry["private"] = private
-        return await self.get_scope(classifier)
+        return await self._scope_manager.add_scope_credentials(
+            classifier, provider, keys, private=private
+        )
 
     async def set_scope_credentials(
         self,
@@ -693,10 +500,8 @@ class RotatingClient:
         keys: Any,
         private: bool = True,
     ) -> Dict[str, Any]:
-        return await self.update_scope(
-            classifier,
-            api_keys={provider: keys},
-            private=private,
+        return await self._scope_manager.set_scope_credentials(
+            classifier, provider, keys, private=private
         )
 
     async def remove_scope_credentials(
@@ -705,29 +510,9 @@ class RotatingClient:
         provider: str,
         credential_ids: Optional[List[str]] = None,
     ) -> None:
-        provider = provider.lower()
-        async with self._scope_lock:
-            scope = self._registered_scopes.get(classifier)
-            if not scope:
-                return
-            if credential_ids is None:
-                scope.get("credentials", {}).pop(provider, None)
-                return
-            entry = scope.get("credentials", {}).get(provider)
-            if not entry:
-                return
-            remove_ids = set(credential_ids)
-            private = bool(entry.get("private", True))
-            kept = []
-            for key in entry.get("keys", []):
-                credential_id = (
-                    self._fingerprint_credential(provider, classifier, key)
-                    if private
-                    else key
-                )
-                if credential_id not in remove_ids:
-                    kept.append(key)
-            entry["keys"] = kept
+        await self._scope_manager.remove_scope_credentials(
+            classifier, provider, credential_ids=credential_ids
+        )
 
     async def list_scope_credentials(
         self,
@@ -735,21 +520,9 @@ class RotatingClient:
         provider: Optional[str] = None,
         include_secrets: bool = False,
     ) -> Dict[str, Any]:
-        scope = await self._get_registered_scope(classifier)
-        credentials = scope.get("credentials", {})
-        if provider:
-            credentials = {provider.lower(): credentials.get(provider.lower(), {})}
-        result: Dict[str, Any] = {}
-        for prov, entry in credentials.items():
-            private = bool(entry.get("private", True))
-            ids = [
-                self._fingerprint_credential(prov, classifier, key) if private else key
-                for key in entry.get("keys", [])
-            ]
-            result[prov] = {"credential_ids": ids, "private": private}
-            if include_secrets:
-                result[prov]["keys"] = list(entry.get("keys", []))
-        return result
+        return await self._scope_manager.list_scope_credentials(
+            classifier, provider=provider, include_secrets=include_secrets
+        )
 
     async def acompletion(
         self,
@@ -757,75 +530,9 @@ class RotatingClient:
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Union[Any, AsyncGenerator[str, None]]:
-        """
-        Dispatcher for completion requests.
-
-        Returns:
-            Response object or async generator for streaming
-        """
-        classifier = kwargs.pop("classifier", None)
-        request_api_keys = kwargs.pop("api_keys", None)
-        request_providers = kwargs.pop("providers", None)
-        private = bool(kwargs.pop("private", False))
-        kwargs.pop("model_filters", None)
-
-        model = kwargs.get("model", "")
-        provider = model.split("/")[0] if "/" in model else ""
-        if not provider:
-            raise ValueError(
-                f"Invalid model format or no credentials for provider: {model}"
-            )
-        scope = await self._resolve_scope_for_provider(
-            provider,
-            classifier,
-            request_api_keys,
-            request_providers,
-            private,
+        context = await self._request_builder.build_completion_context(
+            request, pre_request_callback, kwargs
         )
-
-        if not scope["credentials"]:
-            raise ValueError(
-                f"Invalid model format or no credentials for provider: {model}"
-            )
-
-        # Extract internal logging parameters (not passed to API)
-        parent_log_dir = kwargs.pop("_parent_log_dir", None)
-
-        # Resolve model ID
-        resolved_model = self._model_resolver.resolve_model_id(model, provider)
-        kwargs["model"] = resolved_model
-
-        # Create transaction logger if enabled
-        transaction_logger = None
-        if self.enable_request_logging:
-            transaction_logger = TransactionLogger(
-                provider=provider,
-                model=resolved_model,
-                enabled=True,
-                parent_dir=parent_log_dir,
-            )
-            transaction_logger.log_request(kwargs)
-
-        session_id = self._session_tracker.infer_session_id(kwargs)
-
-        # Build request context
-        context = RequestContext(
-            model=resolved_model,
-            provider=provider,
-            kwargs=kwargs,
-            streaming=kwargs.get("stream", False),
-            credentials=scope["credentials"],
-            deadline=time.time() + self.global_timeout,
-            session_id=session_id,
-            request=request,
-            pre_request_callback=pre_request_callback,
-            transaction_logger=transaction_logger,
-            usage_manager_key=scope["usage_manager_key"],
-            provider_config=scope["provider_config"],
-            credential_secrets=scope["credential_secrets"],
-            classifier=scope["classifier"],
-        )
-
         return await self._executor.execute(context)
 
     async def aembedding(
@@ -834,50 +541,9 @@ class RotatingClient:
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Any:
-        """
-        Execute an embedding request with retry logic.
-        """
-        classifier = kwargs.pop("classifier", None)
-        request_api_keys = kwargs.pop("api_keys", None)
-        request_providers = kwargs.pop("providers", None)
-        private = bool(kwargs.pop("private", False))
-        kwargs.pop("model_filters", None)
-
-        model = kwargs.get("model", "")
-        provider = model.split("/")[0] if "/" in model else ""
-        if not provider:
-            raise ValueError(
-                f"Invalid model format or no credentials for provider: {model}"
-            )
-        scope = await self._resolve_scope_for_provider(
-            provider,
-            classifier,
-            request_api_keys,
-            request_providers,
-            private,
+        context = await self._request_builder.build_embedding_context(
+            request, pre_request_callback, kwargs
         )
-
-        if not scope["credentials"]:
-            raise ValueError(
-                f"Invalid model format or no credentials for provider: {model}"
-            )
-
-        # Build request context (embeddings are never streaming)
-        context = RequestContext(
-            model=model,
-            provider=provider,
-            kwargs=kwargs,
-            streaming=False,
-            credentials=scope["credentials"],
-            deadline=time.time() + self.global_timeout,
-            request=request,
-            pre_request_callback=pre_request_callback,
-            usage_manager_key=scope["usage_manager_key"],
-            provider_config=scope["provider_config"],
-            credential_secrets=scope["credential_secrets"],
-            classifier=scope["classifier"],
-        )
-
         return await self._executor.execute(context)
 
     def token_count(self, **kwargs) -> int:
@@ -907,22 +573,13 @@ class RotatingClient:
         model_filters: Optional[Dict[str, Any]],
         credentials: Optional[List[str]] = None,
     ) -> str:
-        if classifier is None and not provider_config and not model_filters:
-            return provider
-        credential_fingerprint = hashlib.sha256(
-            json.dumps(sorted(credentials or []), sort_keys=True).encode("utf-8")
-        ).hexdigest()[:12]
-        payload = json.dumps(
-            {
-                "provider_config": provider_config or {},
-                "model_filters": model_filters or {},
-                "credentials": credential_fingerprint,
-            },
-            sort_keys=True,
-            default=str,
+        return self._model_discovery.model_cache_key(
+            provider,
+            classifier,
+            provider_config,
+            model_filters,
+            credentials,
         )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-        return f"{self._scope_usage_key(provider, classifier)}:{digest}"
 
     @staticmethod
     def _filter_values(
@@ -930,16 +587,7 @@ class RotatingClient:
         provider: str,
         names: tuple[str, ...],
     ) -> List[str]:
-        if not model_filters:
-            return []
-        provider_filters = model_filters.get(provider, model_filters)
-        if not isinstance(provider_filters, dict):
-            return []
-        for name in names:
-            value = provider_filters.get(name)
-            if value:
-                return list(value) if not isinstance(value, str) else [value]
-        return []
+        return ModelDiscoveryService.filter_values(model_filters, provider, names)
 
     def _is_scoped_model_allowed(
         self,
@@ -948,28 +596,9 @@ class RotatingClient:
         classifier: Optional[str],
         model_filters: Optional[Dict[str, Any]],
     ) -> bool:
-        if classifier is None and not model_filters:
-            return self._model_resolver.is_model_allowed(model, provider)
-
-        whitelist = self._filter_values(
-            model_filters, provider, ("whitelist", "whitelist_models", "allow")
+        return self._model_discovery.is_scoped_model_allowed(
+            model, provider, classifier, model_filters
         )
-        blacklist = self._filter_values(
-            model_filters, provider, ("blacklist", "ignore", "ignore_models", "deny")
-        )
-        model_name = model.split("/", 1)[1] if "/" in model else model
-
-        if whitelist:
-            return any(
-                fnmatch.fnmatch(model, pattern) or fnmatch.fnmatch(model_name, pattern)
-                for pattern in whitelist
-            )
-        if blacklist:
-            return not any(
-                fnmatch.fnmatch(model, pattern) or fnmatch.fnmatch(model_name, pattern)
-                for pattern in blacklist
-            )
-        return True
 
     async def _get_openai_compatible_models(
         self,
@@ -977,24 +606,9 @@ class RotatingClient:
         api_key: str,
         provider_config: Optional[Dict[str, Any]],
     ) -> List[str]:
-        api_base = None
-        if provider_config:
-            api_base = provider_config.get("base_url") or provider_config.get("api_base")
-        if not api_base:
-            api_base = self.provider_config.get_api_base(provider)
-        if not api_base:
-            return []
-
-        response = await self.http_client.get(
-            f"{str(api_base).rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+        return await self._model_discovery.get_openai_compatible_models(
+            provider, api_key, provider_config
         )
-        response.raise_for_status()
-        return [
-            f"{provider}/{model['id']}"
-            for model in response.json().get("data", [])
-            if isinstance(model, dict) and model.get("id")
-        ]
 
     async def get_available_models(
         self,
@@ -1006,69 +620,15 @@ class RotatingClient:
         model_filters: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> List[str]:
-        """Get available models for a provider with scoped caching."""
-        provider = provider.lower()
-        if not provider:
-            return []
-        scope = await self._resolve_scope_for_provider(
+        return await self._model_discovery.get_available_models(
             provider,
-            classifier,
-            api_keys,
-            providers,
-            private,
+            classifier=classifier,
+            api_keys=api_keys,
+            providers=providers,
+            private=private,
+            model_filters=model_filters,
+            force_refresh=force_refresh,
         )
-        credentials = scope["credentials"]
-        if not credentials:
-            return []
-
-        cache_key = self._model_cache_key(
-            provider,
-            scope["classifier"],
-            scope["provider_config"],
-            model_filters,
-            credentials,
-        )
-        if not force_refresh and cache_key in self._model_list_cache:
-            return self._model_list_cache[cache_key]
-
-        shuffled = list(credentials)
-        random.shuffle(shuffled)
-        plugin = self._get_provider_instance(provider)
-
-        for cred in shuffled:
-            api_key = scope["credential_secrets"].get(cred, cred)
-            try:
-                has_base_override = bool(
-                    scope["provider_config"]
-                    and (
-                        scope["provider_config"].get("base_url")
-                        or scope["provider_config"].get("api_base")
-                    )
-                )
-                if has_base_override or not plugin:
-                    models = await self._get_openai_compatible_models(
-                        provider, api_key, scope["provider_config"]
-                    )
-                else:
-                    models = await plugin.get_models(api_key, self.http_client)
-
-                final = [
-                    model
-                    for model in models
-                    if self._is_scoped_model_allowed(
-                        model, provider, scope["classifier"], model_filters
-                    )
-                ]
-                self._model_list_cache[cache_key] = final
-                return final
-
-            except Exception as e:
-                lib_logger.debug(
-                    f"Failed to get models for {provider} with {mask_credential(cred)}: {e}"
-                )
-                continue
-
-        return []
 
     async def get_all_available_models(
         self,
@@ -1080,139 +640,25 @@ class RotatingClient:
         model_filters: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> Union[Dict[str, List[str]], List[str]]:
-        """Get all available models across all providers."""
-        provider_configs = self._normalize_provider_map(providers)
-        request_keys = self._normalize_api_key_map(api_keys)
-        if classifier is None and not request_keys and not provider_configs:
-            provider_names = list(self.all_credentials.keys())
-        else:
-            registered = await self._get_registered_scope(classifier) if classifier else {}
-            provider_names = sorted(
-                set(request_keys)
-                | set(provider_configs)
-                | set(registered.get("credentials", {}))
-            )
-
-        tasks = [
-            self.get_available_models(
-                provider,
-                classifier=classifier,
-                api_keys=api_keys,
-                providers=providers,
-                private=private,
-                model_filters=model_filters,
-                force_refresh=force_refresh,
-            )
-            for provider in provider_names
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_models: Dict[str, List[str]] = {}
-        for provider, result in zip(provider_names, results):
-            if isinstance(result, Exception):
-                lib_logger.error(f"Failed to get models for {provider}: {result}")
-                all_models[provider] = []
-            else:
-                all_models[provider] = result
-
-        if grouped:
-            return all_models
-        else:
-            flat = []
-            for models in all_models.values():
-                flat.extend(models)
-            return flat
+        return await self._model_discovery.get_all_available_models(
+            grouped=grouped,
+            classifier=classifier,
+            api_keys=api_keys,
+            providers=providers,
+            private=private,
+            model_filters=model_filters,
+            force_refresh=force_refresh,
+        )
 
     async def get_quota_stats(
         self,
         provider_filter: Optional[str] = None,
         classifier: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get quota and usage stats for all credentials.
-
-        Args:
-            provider_filter: Optional provider name to filter results
-
-        Returns:
-            Dict with stats per provider
-        """
-        providers = {}
-
-        classifier_prefix = (
-            f"classifier:{self._safe_scope_name(classifier)}:"
-            if classifier is not None
-            else None
+        return await self._quota_service.get_quota_stats(
+            provider_filter=provider_filter,
+            classifier=classifier,
         )
-
-        for manager_key, manager in self._usage_managers.items():
-            if classifier_prefix and not manager_key.startswith(classifier_prefix):
-                continue
-            if classifier is None and manager_key.startswith("classifier:"):
-                continue
-
-            provider_name = manager.provider
-            if provider_filter and provider_name != provider_filter:
-                continue
-
-            stats = await manager.get_stats_for_endpoint()
-            if classifier is not None:
-                stats["classifier"] = classifier
-
-            # Skip providers with no activity (filters out invalid/unused providers)
-            if stats.get("total_requests", 0) == 0:
-                continue
-
-            providers[manager_key if classifier is not None else provider_name] = stats
-
-        summary = {
-            "total_providers": len(providers),
-            "total_credentials": 0,
-            "active_credentials": 0,
-            "exhausted_credentials": 0,
-            "total_requests": 0,
-            "tokens": {
-                "input_cached": 0,
-                "input_uncached": 0,
-                "input_cache_pct": 0,
-                "output": 0,
-            },
-            "approx_total_cost": None,
-        }
-
-        for prov in providers.values():
-            summary["total_credentials"] += prov.get("credential_count", 0)
-            summary["active_credentials"] += prov.get("active_count", 0)
-            summary["exhausted_credentials"] += prov.get("exhausted_count", 0)
-            summary["total_requests"] += prov.get("total_requests", 0)
-            tokens = prov.get("tokens", {})
-            summary["tokens"]["input_cached"] += tokens.get("input_cached", 0)
-            summary["tokens"]["input_uncached"] += tokens.get("input_uncached", 0)
-            summary["tokens"]["output"] += tokens.get("output", 0)
-
-        total_input = (
-            summary["tokens"]["input_cached"] + summary["tokens"]["input_uncached"]
-        )
-        summary["tokens"]["input_cache_pct"] = (
-            round(summary["tokens"]["input_cached"] / total_input * 100, 1)
-            if total_input > 0
-            else 0
-        )
-
-        approx_total_cost = 0.0
-        has_cost = False
-        for prov in providers.values():
-            cost = prov.get("approx_cost")
-            if cost:
-                approx_total_cost += cost
-                has_cost = True
-        summary["approx_total_cost"] = approx_total_cost if has_cost else None
-
-        return {
-            "providers": providers,
-            "summary": summary,
-            "data_source": "cache",
-            "timestamp": time.time(),
-        }
 
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         """Get discovered OAuth credentials."""
@@ -1234,25 +680,7 @@ class RotatingClient:
         provider: str,
         credentials: List[str],
     ) -> tuple[Dict[str, int], Dict[str, str]]:
-        """Resolve priority and tier metadata for credentials."""
-        plugin = self._get_provider_instance(provider)
-        priorities: Dict[str, int] = {}
-        tiers: Dict[str, str] = {}
-
-        if not plugin:
-            return priorities, tiers
-
-        for credential in credentials:
-            if hasattr(plugin, "get_credential_priority"):
-                priority = plugin.get_credential_priority(credential)
-                if priority is not None:
-                    priorities[credential] = priority
-            if hasattr(plugin, "get_credential_tier_name"):
-                tier_name = plugin.get_credential_tier_name(credential)
-                if tier_name:
-                    tiers[credential] = tier_name
-
-        return priorities, tiers
+        return self._usage_registry.get_credential_metadata(provider, credentials)
 
     def get_usage_manager(self, provider: str) -> Optional[NewUsageManager]:
         """
@@ -1264,12 +692,12 @@ class RotatingClient:
         Returns:
             UsageManager for the provider, or None if not found
         """
-        return self._usage_managers.get(provider)
+        return self._usage_registry.get_usage_manager(provider)
 
     @property
     def usage_managers(self) -> Dict[str, NewUsageManager]:
         """Get all new usage managers."""
-        return self._usage_managers
+        return self._usage_registry.managers
 
     def _apply_usage_reset_config(
         self,
@@ -1277,45 +705,7 @@ class RotatingClient:
         credentials: List[str],
         config: Any,
     ) -> None:
-        """Apply provider-specific usage reset config to window definitions."""
-        if not credentials:
-            return
-
-        plugin = self._get_provider_instance(provider)
-        if not plugin or not hasattr(plugin, "get_usage_reset_config"):
-            return
-
-        try:
-            reset_config = plugin.get_usage_reset_config(credentials[0])
-        except Exception as exc:
-            lib_logger.debug(f"Failed to load usage reset config for {provider}: {exc}")
-            return
-
-        if not reset_config:
-            return
-
-        window_seconds = reset_config.get("window_seconds")
-        if not window_seconds:
-            return
-
-        mode = reset_config.get("mode", "credential")
-        applies_to = "credential" if mode == "credential" else "model"
-
-        if window_seconds == 86400:
-            window_name = "daily"
-        elif window_seconds % 3600 == 0:
-            window_name = f"{window_seconds // 3600}h"
-        else:
-            window_name = "window"
-
-        config.windows = [
-            WindowDefinition.rolling(
-                name=window_name,
-                duration_seconds=int(window_seconds),
-                is_primary=True,
-                applies_to=applies_to,
-            ),
-        ]
+        self._usage_registry.apply_usage_reset_config(provider, credentials, config)
 
     def _sanitize_litellm_log(self, log_data: dict) -> dict:
         """Remove large/sensitive fields from LiteLLM logs."""
@@ -1380,118 +770,17 @@ class RotatingClient:
     # =========================================================================
 
     async def reload_usage_from_disk(self) -> None:
-        """
-        Force reload usage data from disk.
-
-        Useful when wanting fresh stats without making external API calls.
-        """
-        for manager in self._usage_managers.values():
-            await manager.reload_from_disk()
+        await self._quota_service.reload_usage_from_disk()
 
     async def force_refresh_quota(
         self,
         provider: Optional[str] = None,
         credential: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Force refresh quota from external API.
-
-        For providers with quota API support, this fetches live quota data.
-        For other providers, this is a no-op (just reloads from disk).
-
-        Args:
-            provider: If specified, only refresh this provider
-            credential: If specified, only refresh this specific credential
-
-        Returns:
-            Refresh result dict with success/failure info
-        """
-        result = {
-            "action": "force_refresh",
-            "scope": "credential"
-            if credential
-            else ("provider" if provider else "all"),
-            "provider": provider,
-            "credential": credential,
-            "credentials_refreshed": 0,
-            "success_count": 0,
-            "failed_count": 0,
-            "duration_ms": 0,
-            "errors": [],
-        }
-
-        start_time = time.time()
-
-        # Determine which providers to refresh
-        if provider:
-            providers_to_refresh = (
-                [provider] if provider in self.all_credentials else []
-            )
-        else:
-            providers_to_refresh = list(self.all_credentials.keys())
-
-        for prov in providers_to_refresh:
-            provider_class = self._provider_plugins.get(prov)
-            if not provider_class:
-                continue
-
-            # Get or create provider instance
-            provider_instance = self._get_provider_instance(prov)
-            if not provider_instance:
-                continue
-
-            # Check if provider supports quota refresh.
-            if hasattr(provider_instance, "fetch_initial_baselines"):
-                # Get credentials to refresh
-                if credential:
-                    # Find full path for this credential
-                    creds_to_refresh = []
-                    for cred_path in self.all_credentials.get(prov, []):
-                        if cred_path.endswith(credential) or cred_path == credential:
-                            creds_to_refresh.append(cred_path)
-                            break
-                else:
-                    creds_to_refresh = self.all_credentials.get(prov, [])
-
-                if not creds_to_refresh:
-                    continue
-
-                try:
-                    # Fetch live quota from API for ALL specified credentials
-                    quota_results = await provider_instance.fetch_initial_baselines(
-                        creds_to_refresh
-                    )
-
-                    # Store baselines in usage manager
-                    usage_manager = self._usage_managers.get(prov)
-                    if usage_manager and hasattr(
-                        provider_instance, "_store_baselines_to_usage_manager"
-                    ):
-                        stored = await provider_instance._store_baselines_to_usage_manager(
-                            quota_results,
-                            usage_manager,
-                            force=True,
-                            is_initial_fetch=True,  # Manual refresh checks exhaustion
-                        )
-                        result["success_count"] += stored
-
-                    result["credentials_refreshed"] += len(creds_to_refresh)
-
-                    # Count failures
-                    for cred_path, data in quota_results.items():
-                        if data.get("status") != "success":
-                            result["failed_count"] += 1
-                            result["errors"].append(
-                                f"{Path(cred_path).name}: {data.get('error', 'Unknown error')}"
-                            )
-
-                except Exception as e:
-                    lib_logger.error(f"Failed to refresh quota for {prov}: {e}")
-                    result["errors"].append(f"{prov}: {str(e)}")
-                    result["failed_count"] += len(creds_to_refresh)
-
-        result["duration_ms"] = int((time.time() - start_time) * 1000)
-        return result
+        return await self._quota_service.force_refresh_quota(
+            provider=provider,
+            credential=credential,
+        )
 
     # =========================================================================
     # ANTHROPIC API COMPATIBILITY METHODS
