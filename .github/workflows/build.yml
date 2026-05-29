@@ -1,5 +1,12 @@
 name: Build and Release Executable
 
+# TODO(definitive-release-workflow): Keep this release workflow aligned with
+# opencode-agent-variants where practical. The intended shared shape is:
+# centralized config, branch/channel release policy, generated release notes,
+# author resolution, community contributor detection, and project-specific
+# packaging steps. Do not extract into a separate shared workflow unless more
+# projects need it; keep the two workflows readable sibling implementations.
+
 # ╔═══════════════════════════════════════════════════════════════════════════════════════╗
 # ║                              CONFIGURATION SECTION                                     ║
 # ║  Edit the values below to customize build triggers, release contents, and behavior.   ║
@@ -652,39 +659,55 @@ jobs:
         if [ -n "$PREV_TAG" ]; then
           echo "🔍 Layer PR: Generating Community Contributions section..."
           
-          # Get all merge commits in the range
-          MERGE_COMMITS=$(git log "$PREV_TAG".."$CURRENT_SHA" --oneline --grep="Merge pull request" 2>/dev/null || true)
-          
-          if [ -n "$MERGE_COMMITS" ]; then
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PR_NUMBERS=""
+
+          # Layer PR-1: parse PR numbers from commit subjects. This keeps the old
+          # merge-commit behavior and also catches squash commits that include #123.
+          SUBJECT_PRS=$(git log "$PREV_TAG".."$CURRENT_SHA" --format='%s' 2>/dev/null | grep -oE 'Merge pull request #[0-9]+|#[0-9]+' | grep -oE '[0-9]+' || true)
+          PR_NUMBERS=$(printf '%s\n%s\n' "$PR_NUMBERS" "$SUBJECT_PRS")
+
+          # Layer PR-2: GraphQL associatedPullRequests catches squash/rebase flows
+          # even when the commit subject does not include a PR number.
+          COMMIT_SHAS=$(git rev-list "$PREV_TAG".."$CURRENT_SHA" 2>/dev/null || true)
+          while read -r SHA; do
+            if [ -z "$SHA" ]; then
+              continue
+            fi
+            ASSOCIATED_PRS=$(gh api graphql \
+              -f owner="$OWNER" \
+              -f name="$REPO_NAME" \
+              -f oid="$SHA" \
+              -f query='query($owner:String!, $name:String!, $oid:GitObjectID!) { repository(owner:$owner, name:$name) { object(oid:$oid) { ... on Commit { associatedPullRequests(first: 10) { nodes { number } } } } } }' \
+              --jq '.data.repository.object.associatedPullRequests.nodes[].number' 2>/dev/null || true)
+            PR_NUMBERS=$(printf '%s\n%s\n' "$PR_NUMBERS" "$ASSOCIATED_PRS")
+          done <<< "$COMMIT_SHAS"
+
+          PR_NUMBERS=$(printf '%s\n' "$PR_NUMBERS" | grep -E '^[0-9]+$' | sort -n | uniq || true)
+
+          if [ -n "$PR_NUMBERS" ]; then
             PR_SECTION=""
-            
-            while IFS= read -r commit_line; do
-              if [ -n "$commit_line" ]; then
-                # Extract PR number from "Merge pull request #XX from ..."
-                PR_NUM=$(echo "$commit_line" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
-                
-                if [ -n "$PR_NUM" ]; then
-                  # Fetch PR info from GitHub API
-                  PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
-                    --jq '{title: .title, author: .user.login}' 2>/dev/null || echo "{}")
-                  
-                  PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
-                  PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
-                  
-                  if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ]; then
-                    PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUM"
-                    PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
-                    PR_COUNT=$((PR_COUNT + 1))
-                    echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
-                  else
-                    echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
-                  fi
-                fi
+            while read -r PR_NUM; do
+              if [ -z "$PR_NUM" ]; then
+                continue
               fi
-            done <<< "$MERGE_COMMITS"
-            
+              PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
+                --jq '{title: .title, author: .user.login, url: .html_url}' 2>/dev/null || echo "{}")
+              PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
+              PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
+              PR_URL=$(echo "$PR_INFO" | jq -r '.url // empty')
+
+              if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ] && [ -n "$PR_URL" ]; then
+                PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
+                PR_COUNT=$((PR_COUNT + 1))
+                echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
+              else
+                echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
+              fi
+            done <<< "$PR_NUMBERS"
+
             if [ "$PR_COUNT" -gt 0 ]; then
-              # Append PR section to changelog
               {
                 echo ""
                 echo "### 💜 Community Contributions"
@@ -696,7 +719,7 @@ jobs:
               echo "   ✅ Added $PR_COUNT PRs to Community Contributions section"
             fi
           else
-            echo "   ℹ️ No merge commits found in range"
+            echo "   ℹ️ No associated PRs found in range"
           fi
         else
           echo "⚠️ Layer PR: Skipped (no previous tag available)"
