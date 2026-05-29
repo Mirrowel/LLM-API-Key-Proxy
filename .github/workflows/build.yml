@@ -114,8 +114,10 @@ on:
     paths:
       - 'src/proxy_app/**'       # Main application source code
       - 'src/rotator_library/**' # Key rotation library
-      - '.github/workflows/build.yml'  # This workflow file
-      - 'cliff.toml'             # Changelog configuration
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #                                         JOBS
@@ -241,6 +243,21 @@ jobs:
         BRANCH_NAME=${{ github.ref_name }}
         DATE_STAMP_NEW=$(date +'%Y%m%d')
         DATE_STAMP_OLD=$(date +'%Y.%m.%d')
+
+        EXISTING_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName,targetCommitish \
+          --jq ".[] | select(.tagName | startswith(\"$BRANCH_NAME/build-\")) | select(.targetCommitish == \"${{ github.sha }}\") | .tagName" \
+          | head -n 1)
+
+        if [ -n "$EXISTING_TAG" ]; then
+          echo "Release already exists for this commit: $EXISTING_TAG"
+          echo "release_title=Build ($BRANCH_NAME): ${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "release_tag=$EXISTING_TAG" >> $GITHUB_OUTPUT
+          echo "archive_version_part=${EXISTING_TAG%%/*}-${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "version=${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+          echo "should_release=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
         
         # Find the number of releases already created today for this branch, matching either old or new format.
         # We use grep -E for an OR condition and wrap it to prevent failures when no matches are found.
@@ -258,14 +275,17 @@ jobs:
         echo "archive_version_part=$BRANCH_NAME-$VERSION" >> $GITHUB_OUTPUT
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "should_release=true" >> $GITHUB_OUTPUT
 
     - name: Download build artifacts
+      if: steps.version.outputs.should_release == 'true'
       uses: actions/download-artifact@v4
       with:
         path: release-assets
         pattern: proxy-app-build-*-${{ steps.get_sha.outputs.sha }}
 
     - name: Archive release files
+      if: steps.version.outputs.should_release == 'true'
       id: archive
       shell: bash
       run: |
@@ -328,6 +348,7 @@ jobs:
         echo "ASSET_PATHS=$ASSET_PATHS" >> $GITHUB_OUTPUT
 
     - name: Install git-cliff
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -345,6 +366,7 @@ jobs:
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
 
     - name: Prepare git-cliff config
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         # Inject the GitHub repo URL into your template
@@ -353,6 +375,7 @@ jobs:
         head -20 .github/cliff.toml
 
     - name: Generate Changelog
+      if: steps.version.outputs.should_release == 'true'
       id: changelog
       shell: bash
       env:
@@ -481,6 +504,7 @@ jobs:
         fi
 
     - name: Resolve GitHub Usernames in Changelog
+      if: steps.version.outputs.should_release == 'true'
       id: resolve_usernames
       shell: bash
       env:
@@ -755,6 +779,7 @@ jobs:
         fi
 
     - name: Debug artifact contents
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         echo "🔍 Debugging artifact contents..."
@@ -771,6 +796,7 @@ jobs:
         find release-assets -type f 2>/dev/null || echo "No files found in release-assets"
 
     - name: Generate Build Metadata
+      if: steps.version.outputs.should_release == 'true'
       id: metadata
       shell: bash
       env:
@@ -833,6 +859,7 @@ jobs:
         echo "  - Contributors: $CONTRIBUTORS_LIST"
 
     - name: Create Release
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         # Prepare changelog content - prefer resolved version if available
@@ -944,10 +971,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Prune Old Releases
-      if: always() # Run even if release creation failed (optional, but safer to run only on success usually. Let's stick to default behavior which is success)
-      # Actually, if release creation failed, we probably don't want to prune.
-      # But wait, the user might want to prune even if the new release fails? No, usually we prune to make space for the new one or clean up after.
-      # Let's stick to running only on success of previous steps.
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
