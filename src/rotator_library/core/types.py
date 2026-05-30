@@ -89,6 +89,10 @@ class RequestContext:
     provider_config: Optional[Dict[str, Any]] = None
     credential_secrets: Dict[str, str] = field(default_factory=dict)
     classifier: Optional[str] = None
+    routing_targets: Optional[Any] = None
+    routing_group_name: Optional[str] = None
+    routing_target_index: int = 0
+    routing_attempt_history: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
