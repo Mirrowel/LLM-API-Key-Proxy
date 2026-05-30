@@ -1,10 +1,15 @@
 import os
 import sys
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from rotator_library.session_tracking import SessionTracker, SessionTrackingHints
+from rotator_library.client.streaming import StreamingHandler
 
 
 class SessionTrackerTests(unittest.TestCase):
@@ -37,6 +42,27 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertNotEqual(session_a.session_id, session_b.session_id)
         self.assertIsNone(session_a.affinity_key)
 
+    def test_shared_system_and_user_prompt_does_not_become_sticky_by_itself(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        request = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a shared coding harness with stable instructions used by many independent sessions.",
+                },
+                {
+                    "role": "user",
+                    "content": "Please review this standalone request carefully and provide the exact structured output.",
+                },
+            ]
+        }
+
+        session_a = tracker.infer_session(request, provider="gemini", model="pro")
+        session_b = tracker.infer_session(request, provider="gemini", model="pro")
+
+        self.assertNotEqual(session_a.session_id, session_b.session_id)
+        self.assertIsNone(session_a.affinity_key)
+
     def test_explicit_ids_are_weak_unless_configured_as_trusted(self):
         request = {"conversation_id": "stable-client-id"}
 
@@ -51,6 +77,17 @@ class SessionTrackerTests(unittest.TestCase):
         )
         first = trusted.infer_session(request, provider="gemini", model="pro")
         second = trusted.infer_session(request, provider="gemini", model="pro")
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_trusted_explicit_fields_can_come_from_env(self):
+        request = {"conversation_id": "stable-client-id"}
+
+        with patch.dict(os.environ, {"TRUSTED_SESSION_ID_FIELDS": "conversation_id"}):
+            tracker = SessionTracker(ttl_seconds=3600)
+
+        first = tracker.infer_session(request, provider="gemini", model="pro")
+        second = tracker.infer_session(request, provider="gemini", model="pro")
+
         self.assertEqual(first.session_id, second.session_id)
 
     def test_multiple_message_anchors_reuse_session_when_tools_are_pruned(self):
@@ -121,6 +158,53 @@ class SessionTrackerTests(unittest.TestCase):
             ]
         }
         continued = tracker.infer_session(next_request, provider="gemini", model="pro")
+
+        self.assertEqual(inferred.session_id, continued.session_id)
+
+    def test_record_response_uses_stored_namespace_when_tracking_namespace_omitted(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        hints = SessionTrackingHints(session_scope="quota-group-pro")
+        request = {
+            "messages": [
+                {"role": "user", "content": "Investigate scoped response tracking with enough text."},
+                {"role": "assistant", "content": "The response anchor must stay in the provider session scope."},
+            ]
+        }
+        inferred = tracker.infer_session(
+            request, provider="gemini", model="pro", scope_key="gemini", hints=hints
+        )
+        tracker.record_response(
+            inferred.session_id,
+            provider="gemini",
+            model="pro",
+            scope_key="gemini",
+            response={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "The scoped response anchor survived without passing the tracking namespace.",
+                        }
+                    }
+                ]
+            },
+        )
+
+        continued = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "The scoped response anchor survived without passing the tracking namespace.",
+                    },
+                    {"role": "user", "content": "Continue within the same provider session scope."},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+            scope_key="gemini",
+            hints=hints,
+        )
 
         self.assertEqual(inferred.session_id, continued.session_id)
 
@@ -216,6 +300,87 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertNotEqual(parent.session_id, child.session_id)
         self.assertTrue(child.possible_compaction)
         self.assertEqual(parent.session_id, child.lineage_parent_session_id)
+
+    def test_compaction_detection_is_conservative_to_early_system_messages(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_summary = {
+            "messages": [
+                {"role": "user", "content": "Summary of previous conversation: continue this task."}
+            ]
+        }
+
+        inferred = tracker.infer_session(user_summary, provider="gemini", model="pro")
+
+        self.assertFalse(inferred.possible_compaction)
+
+    def test_persistence_round_trips_current_schema_with_anchor_metadata(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": "Persist this first detailed user anchor for the session tracker."},
+                {"role": "assistant", "content": "Persist this second detailed assistant anchor as well."},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+            )
+            first = tracker.infer_session(request, provider="gemini", model="pro")
+            tracker.flush()
+
+            restored = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+            )
+            second = restored.infer_session(request, provider="gemini", model="pro")
+
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_unversioned_persistence_is_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sessions": {
+                            "old-session": {
+                                "namespace": "provider:gemini:model:pro",
+                                "expires_at": 9999999999,
+                                "anchors": [],
+                            }
+                        },
+                        "anchors": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+            )
+
+        self.assertEqual(tracker._sessions, {})
+        self.assertEqual(tracker._anchors, {})
+
+    def test_streaming_chunk_collector_preserves_response_anchors(self):
+        handler = StreamingHandler()
+        assistant_parts = []
+        tool_call_ids = []
+
+        handler._collect_session_response_anchors(
+            'data: {"choices":[{"delta":{"content":"hello ","tool_calls":[{"id":"call_1"}]}}]}\n\n',
+            assistant_parts,
+            tool_call_ids,
+        )
+
+        self.assertEqual(assistant_parts, ["hello "])
+        self.assertEqual(tool_call_ids, ["call_1"])
 
 
 if __name__ == "__main__":

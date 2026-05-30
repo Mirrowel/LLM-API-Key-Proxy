@@ -10,6 +10,7 @@ Good for providers that benefit from request caching.
 
 import hashlib
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -55,6 +56,7 @@ class SequentialStrategy:
         self.max_sticky_entries = max(100, max_sticky_entries)
         # Track current "sticky" credential per model session or model-group fallback.
         self._current: Dict[tuple, _StickyEntry] = {}
+        self._lock = threading.RLock()
 
     @property
     def name(self) -> str:
@@ -82,6 +84,14 @@ class SequentialStrategy:
         Returns:
             Selected stable_id, or None if no candidates
         """
+        with self._lock:
+            return self._select_locked(context, states)
+
+    def _select_locked(
+        self,
+        context: SelectionContext,
+        states: Dict[str, CredentialState],
+    ) -> Optional[str]:
         if not context.candidates:
             return None
 
@@ -165,15 +175,16 @@ class SequentialStrategy:
             provider: Provider name
             model_or_group: Model or quota group
         """
-        keys_to_remove = [
-            key for key in self._current if key[0] == provider and key[1] == model_or_group
-        ]
-        for key in keys_to_remove:
-            old = self._current[key].credential
-            del self._current[key]
-            lib_logger.debug(
-                f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
-            )
+        with self._lock:
+            keys_to_remove = [
+                key for key in self._current if key[0] == provider and key[1] == model_or_group
+            ]
+            for key in keys_to_remove:
+                old = self._current[key].credential
+                del self._current[key]
+                lib_logger.debug(
+                    f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
+                )
 
     def get_current(
         self,
@@ -191,14 +202,15 @@ class SequentialStrategy:
         Returns:
             Current sticky credential stable_id, or None
         """
-        key = (provider, model_or_group, session_id or "__default__")
-        entry = self._current.get(key)
-        if not entry:
-            return None
-        if time.time() - entry.last_seen > self.sticky_entry_ttl_seconds:
-            del self._current[key]
-            return None
-        return entry.credential
+        with self._lock:
+            key = (provider, model_or_group, session_id or "__default__")
+            entry = self._current.get(key)
+            if not entry:
+                return None
+            if time.time() - entry.last_seen > self.sticky_entry_ttl_seconds:
+                del self._current[key]
+                return None
+            return entry.credential
 
     def _prune_sticky(self, now: float) -> None:
         expired = [
@@ -270,9 +282,10 @@ class SequentialStrategy:
         Args:
             provider: If specified, only clear for this provider
         """
-        if provider:
-            keys_to_remove = [k for k in self._current if k[0] == provider]
-            for key in keys_to_remove:
-                del self._current[key]
-        else:
-            self._current.clear()
+        with self._lock:
+            if provider:
+                keys_to_remove = [k for k in self._current if k[0] == provider]
+                for key in keys_to_remove:
+                    del self._current[key]
+            else:
+                self._current.clear()

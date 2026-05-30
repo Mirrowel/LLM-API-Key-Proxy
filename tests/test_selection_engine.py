@@ -2,11 +2,11 @@ import unittest
 import os
 import sys
 import time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from rotator_library.usage.config import ProviderUsageConfig, FairCycleConfig
+from rotator_library.usage.config import ProviderUsageConfig, FairCycleConfig, load_provider_usage_config
 from rotator_library.usage.selection.engine import SelectionEngine
 from rotator_library.usage.selection.strategies.sequential import SequentialStrategy
 from rotator_library.usage.types import SelectionContext
@@ -251,6 +251,47 @@ class SelectionEngineTests(unittest.TestCase):
             entry.last_seen = time.time() - 2
 
         self.assertIsNone(strategy.get_current("gemini", "gemini-2.5-pro", "session-1"))
+
+    def test_sequential_trims_oldest_sticky_entries_when_over_max(self):
+        strategy = SequentialStrategy()
+        strategy.max_sticky_entries = 2
+        states = {
+            f"cred_{idx}": self._make_state(f"cred_{idx}", str(idx))
+            for idx in range(3)
+        }
+
+        for idx in range(3):
+            context = SelectionContext(
+                provider="gemini",
+                model="gemini-2.5-pro",
+                quota_group="shared-group",
+                candidates=list(states.keys()),
+                priorities={key: 1 for key in states},
+                usage_counts={key: 0 for key in states},
+                rotation_mode=RotationMode.SEQUENTIAL,
+                rotation_tolerance=0.0,
+                deadline=0.0,
+                session_id=f"session-{idx}",
+            )
+            strategy.select(context, states)
+            for entry in strategy._current.values():
+                entry.last_seen -= 10
+
+        self.assertLessEqual(len(strategy._current), 2)
+        self.assertIsNone(strategy.get_current("gemini", "gemini-2.5-pro", "session-0"))
+
+    def test_session_sticky_env_config_is_parsed(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SESSION_STICKY_ENTRY_TTL_SECONDS_GEMINI": "123",
+                "SESSION_STICKY_MAX_ENTRIES_GEMINI": "456",
+            },
+        ):
+            config = load_provider_usage_config("gemini", {})
+
+        self.assertEqual(config.session_sticky_entry_ttl_seconds, 123)
+        self.assertEqual(config.session_sticky_max_entries, 456)
 
 
 if __name__ == "__main__":

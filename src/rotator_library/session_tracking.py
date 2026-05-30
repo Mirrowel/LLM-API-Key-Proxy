@@ -157,6 +157,7 @@ class SessionTracker:
     _STRONG_SCORE = 100
     _MEDIUM_SCORE = 35
     _WEAK_SCORE = 5
+    _PERSISTENCE_SCHEMA_VERSION = 1
 
     def __init__(
         self,
@@ -234,12 +235,17 @@ class SessionTracker:
             scope_key=scope_key,
             session_scope=hints.session_scope if hints else None,
         )
-        anchors = self._build_anchors(request_data, namespace, hints)
+        possible_compaction = self._looks_like_compaction(request_data)
+        anchors = self._build_anchors(
+            request_data,
+            namespace,
+            hints,
+            allow_system_continuity=possible_compaction,
+        )
         if not anchors:
             return SessionInference(session_id=None, tracking_namespace=namespace)
 
         match = self._best_match(anchors, namespace, now)
-        possible_compaction = self._looks_like_compaction(request_data)
 
         # Compaction is useful lineage information but should not hard-stick the
         # new compacted context unless a genuinely strong anchor survived.
@@ -308,7 +314,10 @@ class SessionTracker:
             if not session_id or response is None or session_id not in self._sessions:
                 return
             now = time.time()
-            namespace = tracking_namespace or self._namespace(provider, model, scope_key=scope_key)
+            state = self._sessions[session_id]
+            namespace = tracking_namespace or state.namespace or self._namespace(
+                provider, model, scope_key=scope_key
+            )
             anchors = self._anchors_from_response(response, namespace)
             if anchors:
                 self._refresh_and_bridge(session_id, namespace, anchors, now)
@@ -430,6 +439,8 @@ class SessionTracker:
         request_data: Dict[str, Any],
         namespace: str,
         hints: Optional[Any],
+        *,
+        allow_system_continuity: bool = False,
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
         anchors.extend(self._anchors_from_provider_hints(hints, namespace))
@@ -437,7 +448,13 @@ class SessionTracker:
 
         messages = request_data.get("messages") or []
         if isinstance(messages, list) and messages:
-            anchors.extend(self._anchors_from_messages(messages, namespace))
+            anchors.extend(
+                self._anchors_from_messages(
+                    messages,
+                    namespace,
+                    allow_system_continuity=allow_system_continuity,
+                )
+            )
 
         return self._dedupe_anchors(anchors)
 
@@ -511,6 +528,7 @@ class SessionTracker:
         namespace: str,
         *,
         source: str = "message",
+        allow_system_continuity: bool = False,
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
         normalized_messages: List[Dict[str, Any]] = []
@@ -565,7 +583,15 @@ class SessionTracker:
                 normalized_text = self._normalize_text(text)
                 if first_user_text is None and role == "user":
                     first_user_text = normalized_text
-                if self._is_substantial_text(normalized_text):
+                # System/developer prompts are commonly shared by an agent
+                # harness. They can describe request shape, but must not be
+                # treated as continuity evidence between independent sessions.
+                contributes_continuity = not (
+                    source == "message"
+                    and role.lower() in {"system", "developer"}
+                    and not allow_system_continuity
+                )
+                if contributes_continuity and self._is_substantial_text(normalized_text):
                     anchors.append(
                         SessionAnchor(
                             self._scoped(namespace, f"message:{role}:{self._hash_text(normalized_text)}"),
@@ -727,9 +753,9 @@ class SessionTracker:
         if not isinstance(data, dict):
             return
         now = time.time()
-        if "sessions" not in data and "anchors" not in data:
+        if data.get("schema_version") != self._PERSISTENCE_SCHEMA_VERSION:
             lib_logger.info(
-                "Ignoring legacy session_stickiness.json format; session persistence will rebuild in memory."
+                "Ignoring unsupported session_stickiness.json format; session persistence will rebuild in memory."
             )
             return
         sessions = data.get("sessions", {})
@@ -778,6 +804,7 @@ class SessionTracker:
             return
         self._last_save_attempt = now
         payload = {
+            "schema_version": self._PERSISTENCE_SCHEMA_VERSION,
             "sessions": {
                 session_id: {
                     "namespace": state.namespace,

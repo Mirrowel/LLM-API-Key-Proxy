@@ -994,6 +994,11 @@ Provider plugins may implement `get_session_tracking_hints()` to contribute
 provider-specific anchors or a provider session scope. The hook supplies evidence
 only; credential selection remains centralized in the rotator.
 
+Compaction lineage detection is intentionally conservative telemetry. It only
+recognizes summary-like early `system`/`developer` messages and does not force
+sticky continuation, because broad matching on ordinary user/assistant text can
+over-bind unrelated sessions.
+
 #### Per-Model Quota Tracking
 
 Instead of tracking usage at the credential level, the system now supports granular per-model tracking:
