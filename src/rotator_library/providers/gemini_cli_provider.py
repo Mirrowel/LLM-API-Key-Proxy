@@ -39,6 +39,7 @@ from .utilities.gemini_credential_manager import GeminiCredentialManager
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
 from ..utils.paths import get_cache_dir
+from ..session_tracking import SessionTrackingHints
 import litellm
 from litellm.exceptions import RateLimitError
 from ..error_handler import extract_retry_after_from_body
@@ -496,19 +497,13 @@ class GeminiCliProvider(
 
     def _generate_stable_session_id(self, contents: List[Dict[str, Any]]) -> str:
         """
-        Generate a stable session ID based on the first user message.
+        Generate a stable upstream Gemini session ID from multiple anchors.
 
-        This ensures:
-        - Same conversation = same session_id (even across server restarts)
-        - Different conversations = different session_ids
-        - Multi-user scenarios are properly isolated
-
-        Uses SHA256 hash of the first user message to create a deterministic
-        UUID-formatted session ID. Falls back to random UUID if no user message.
-
-        This approach generates stable sessions without persisting conversation IDs.
-        uses UUID format instead of the -{number} format to match native
-        gemini-cli's crypto.randomUUID() output format.
+        Older logic used only the first user message, which over-bound common
+        prompts and missed continuity after context mutation. This mirrors the
+        core tracker direction: collect deterministic evidence from substantial
+        message text and tool/function parts, then only create a deterministic ID
+        when enough evidence exists. Otherwise a random UUID is safer.
 
         Args:
             contents: List of message contents in Gemini format
@@ -516,21 +511,48 @@ class GeminiCliProvider(
         Returns:
             UUID-formatted session ID string
         """
-        # Find first user message text
+        anchors: List[str] = []
         for content in contents:
-            if content.get("role") == "user":
-                parts = content.get("parts", [])
-                for part in parts:
-                    if isinstance(part, dict):
-                        text = part.get("text", "")
-                        if text:
-                            # SHA256 hash and use first 16 bytes to create UUID
-                            h = hashlib.sha256(text.encode("utf-8")).digest()
-                            # Format as UUID (8-4-4-4-12 hex chars)
-                            return f"{h[:4].hex()}-{h[4:6].hex()}-{h[6:8].hex()}-{h[8:10].hex()}-{h[10:16].hex()}"
+            role = content.get("role", "")
+            for part in content.get("parts", []) or []:
+                if not isinstance(part, dict):
+                    continue
+                text = str(part.get("text") or "").strip()
+                if len(text) >= 24 and len(text.split()) >= 4:
+                    anchors.append(f"text:{role}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}")
+                function_call = part.get("functionCall") or part.get("function_call")
+                if isinstance(function_call, dict):
+                    name = function_call.get("name")
+                    call_id = function_call.get("id") or function_call.get("call_id")
+                    anchors.append(f"function_call:{name}:{call_id or ''}")
+                function_response = part.get("functionResponse") or part.get("function_response")
+                if isinstance(function_response, dict):
+                    name = function_response.get("name")
+                    response_id = function_response.get("id") or function_response.get("call_id")
+                    anchors.append(f"function_response:{name}:{response_id or ''}")
 
-        # Fallback to random UUID if no user message found
+        anchors = sorted(set(anchors))
+        if len(anchors) >= 2 or any(anchor.startswith("function_") for anchor in anchors):
+            digest = hashlib.sha256(json.dumps(anchors[:16]).encode("utf-8")).digest()
+            return f"{digest[:4].hex()}-{digest[4:6].hex()}-{digest[6:8].hex()}-{digest[8:10].hex()}-{digest[10:16].hex()}"
+
+        # Fallback to random UUID if the visible request is too small or generic.
         return str(uuid.uuid4())
+
+    def get_session_tracking_hints(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        model: str = "",
+    ) -> SessionTrackingHints:
+        """Expose Gemini CLI-specific session evidence to core routing.
+
+        Gemini's native session payload is built after request conversion, so the
+        generic tracker still does most of the work here. This hook gives the
+        provider a modular expansion point for future native cache/session markers
+        without letting provider code directly control credential selection.
+        """
+        return SessionTrackingHints()
 
     def _extract_text_content(self, content: Any) -> str:
         """Extract text from OpenAI string or multi-part message content."""

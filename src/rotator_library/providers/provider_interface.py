@@ -190,6 +190,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # See config/defaults.py for the global default value
     default_sequential_fallback_multiplier: int = DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER
 
+    # Seconds to wait for a session-bound sequential credential that is blocked
+    # only by concurrency. Providers with expensive context caching can increase
+    # this; latency-sensitive providers can lower it or set it to 0.
+    default_session_sticky_wait_seconds: Optional[float] = None
+
     # =========================================================================
     # FAIR CYCLE ROTATION - Override in subclass
     # =========================================================================
@@ -284,6 +289,27 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         bypassing the standard litellm call.
         """
         return False
+
+    def get_session_tracking_hints(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        model: str = "",
+    ) -> Optional[Any]:
+        """Return provider-specific evidence for core session tracking.
+
+        Providers can expose stable native markers, custom request structure, or
+        a preferred affinity key before credential selection. The return value is
+        intentionally evidence-only: providers must not select credentials or
+        mutate sticky state. Core routing merges these hints with generic anchors
+        and applies the same confidence policy for every provider.
+
+        Expansion path: providers that know their upstream cache/session scope can
+        return a richer ``SessionTrackingHints`` object from
+        ``rotator_library.session_tracking``. Returning ``None`` keeps the generic
+        OpenAI-compatible tracker behavior.
+        """
+        return None
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs

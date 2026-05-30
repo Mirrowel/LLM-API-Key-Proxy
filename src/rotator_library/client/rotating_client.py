@@ -100,6 +100,7 @@ class RotatingClient:
         data_dir: Optional[Union[str, Path]] = None,
         session_stickiness_ttl_seconds: int = 3600,
         session_persistence_enabled: bool = False,
+        session_persistence_flush_interval_seconds: float = 5.0,
     ):
         """
         Initialize the RotatingClient.
@@ -210,6 +211,7 @@ class RotatingClient:
             ttl_seconds=session_stickiness_ttl_seconds,
             persist_to_disk=session_persistence_enabled,
             persistence_path=self.data_dir / "session_stickiness.json",
+            persistence_flush_interval_seconds=session_persistence_flush_interval_seconds,
         )
 
         # Initialize extracted components
@@ -307,6 +309,7 @@ class RotatingClient:
             session_tracker=self._session_tracker,
             get_global_timeout=lambda: self.global_timeout,
             get_enable_request_logging=lambda: self.enable_request_logging,
+            get_provider_instance=self._get_provider_instance,
         )
         self._quota_service = QuotaService(
             usage_managers=self._usage_managers,
@@ -347,6 +350,8 @@ class RotatingClient:
         # Save and shutdown new usage managers
         for manager in self._usage_managers.values():
             await manager.shutdown()
+
+        self._session_tracker.flush()
 
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()

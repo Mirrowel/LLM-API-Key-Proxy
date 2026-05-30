@@ -17,7 +17,7 @@ import codecs
 import json
 import logging
 import re
-from typing import Any, AsyncGenerator, AsyncIterator, Dict, Optional, TYPE_CHECKING
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import litellm
 
@@ -49,6 +49,7 @@ class StreamingHandler:
         request: Optional[Any] = None,
         cred_context: Optional["CredentialContext"] = None,
         skip_cost_calculation: bool = False,
+        response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a LiteLLM stream with error handling and usage tracking.
@@ -78,6 +79,8 @@ class StreamingHandler:
         prompt_tokens_uncached = 0
         completion_tokens = 0
         thinking_tokens = 0
+        assistant_parts: List[str] = []
+        tool_call_ids: List[str] = []
 
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
@@ -103,6 +106,11 @@ class StreamingHandler:
                         accumulated_finish_reason,
                         has_tool_calls,
                         model,
+                    )
+                    self._collect_session_response_anchors(
+                        processed.sse_string,
+                        assistant_parts,
+                        tool_call_ids,
                     )
 
                     # Update tracking state
@@ -239,8 +247,56 @@ class StreamingHandler:
                         approx_cost=approx_cost,
                     )
 
+                if response_callback and (assistant_parts or tool_call_ids):
+                    response_callback(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "".join(assistant_parts),
+                                        "tool_calls": [
+                                            {"id": call_id} for call_id in tool_call_ids
+                                        ],
+                                    }
+                                }
+                            ]
+                        }
+                    )
+
                 # Yield [DONE] for completed streams
                 yield "data: [DONE]\n\n"
+
+    def _collect_session_response_anchors(
+        self,
+        sse_string: str,
+        assistant_parts: List[str],
+        tool_call_ids: List[str],
+    ) -> None:
+        """Collect lightweight response evidence for session tracking.
+
+        Streaming providers emit assistant text and tool-call IDs across many
+        chunks. We keep a synthetic assistant message so the core tracker can use
+        the same response-anchor path as non-streaming responses.
+        """
+        if not sse_string.startswith("data: "):
+            return
+        payload = sse_string[6:].strip()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        for choice in data.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                assistant_parts.append(str(content))
+            for tool_call in delta.get("tool_calls") or []:
+                call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+                if call_id:
+                    tool_call_ids.append(str(call_id))
 
     def _process_chunk(
         self,

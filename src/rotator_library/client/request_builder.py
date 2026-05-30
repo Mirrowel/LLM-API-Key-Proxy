@@ -4,6 +4,7 @@
 """RequestContext construction for RotatingClient public request methods."""
 
 import time
+import inspect
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..core.types import RequestContext
@@ -24,12 +25,14 @@ class RequestContextBuilder:
         session_tracker: Any,
         get_global_timeout: Callable[[], int],
         get_enable_request_logging: Callable[[], bool],
+        get_provider_instance: Optional[Callable[[str], Any]] = None,
     ):
         self._resolve_scope_for_provider = resolve_scope_for_provider
         self._model_resolver = model_resolver
         self._session_tracker = session_tracker
         self._get_global_timeout = get_global_timeout
         self._get_enable_request_logging = get_enable_request_logging
+        self._get_provider_instance = get_provider_instance
 
     @staticmethod
     def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool]:
@@ -47,6 +50,30 @@ class RequestContextBuilder:
     @staticmethod
     def _raise_no_provider(model: str) -> None:
         raise ValueError(f"Invalid model format or no credentials for provider: {model}")
+
+    async def _get_session_hints(
+        self,
+        provider: str,
+        model: str,
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Ask the provider for optional session evidence before routing.
+
+        Providers can understand native request shapes better than the generic
+        OpenAI-compatible tracker, but they should only return evidence. The core
+        tracker still decides whether that evidence is strong enough for sticky
+        routing.
+        """
+        if not self._get_provider_instance:
+            return None
+        plugin = self._get_provider_instance(provider)
+        hook = getattr(plugin, "get_session_tracking_hints", None) if plugin else None
+        if not hook:
+            return None
+        result = hook(kwargs, model=model)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def build_completion_context(
         self,
@@ -86,6 +113,13 @@ class RequestContextBuilder:
             )
             transaction_logger.log_request(kwargs)
 
+        session = self._session_tracker.infer_session(
+            kwargs,
+            provider=provider,
+            model=resolved_model,
+            hints=await self._get_session_hints(provider, resolved_model, kwargs),
+        )
+
         return RequestContext(
             model=resolved_model,
             provider=provider,
@@ -93,7 +127,11 @@ class RequestContextBuilder:
             streaming=kwargs.get("stream", False),
             credentials=scope["credentials"],
             deadline=time.time() + self._get_global_timeout(),
-            session_id=self._session_tracker.infer_session_id(kwargs),
+            session_id=session.session_id,
+            session_affinity_key=session.affinity_key,
+            session_tracker=self._session_tracker,
+            session_possible_compaction=session.possible_compaction,
+            session_lineage_parent_id=session.lineage_parent_session_id,
             request=request,
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,
@@ -127,6 +165,13 @@ class RequestContextBuilder:
         if not scope["credentials"]:
             self._raise_no_provider(model)
 
+        session = self._session_tracker.infer_session(
+            kwargs,
+            provider=provider,
+            model=model,
+            hints=await self._get_session_hints(provider, model, kwargs),
+        )
+
         return RequestContext(
             model=model,
             provider=provider,
@@ -134,6 +179,11 @@ class RequestContextBuilder:
             streaming=False,
             credentials=scope["credentials"],
             deadline=time.time() + self._get_global_timeout(),
+            session_id=session.session_id,
+            session_affinity_key=session.affinity_key,
+            session_tracker=self._session_tracker,
+            session_possible_compaction=session.possible_compaction,
+            session_lineage_parent_id=session.lineage_parent_session_id,
             request=request,
             pre_request_callback=pre_request_callback,
             usage_manager_key=scope["usage_manager_key"],

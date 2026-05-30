@@ -83,7 +83,7 @@ class SequentialStrategy:
 
         if context.session_id:
             selected = self._select_initial_for_session(
-                context.session_id,
+                context.session_affinity_key or context.session_id,
                 context.candidates,
                 context.priorities,
             )
@@ -110,14 +110,16 @@ class SequentialStrategy:
 
     def _select_initial_for_session(
         self,
-        session_id: str,
+        affinity_seed: str,
         candidates: List[str],
         priorities: Dict[str, int],
     ) -> Optional[str]:
         """Pick a stable first credential for a new session.
 
         Sequential mode still honors tier priority first, but spreads new
-        sessions across equal-priority candidates to improve cache locality.
+        sessions across equal-priority candidates to improve cache locality. The
+        seed may be a deterministic affinity key when tracking evidence is strong
+        enough, otherwise it falls back to the live session id.
         """
         if not candidates:
             return None
@@ -131,7 +133,7 @@ class SequentialStrategy:
         if not eligible:
             return None
 
-        digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+        digest = hashlib.sha256(affinity_seed.encode("utf-8")).digest()
         index = int.from_bytes(digest[:8], "big") % len(eligible)
         return eligible[index]
 

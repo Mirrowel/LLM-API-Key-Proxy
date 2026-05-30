@@ -77,6 +77,10 @@ class RequestContext:
     credentials: List[str]
     deadline: float
     session_id: Optional[str] = None
+    session_affinity_key: Optional[str] = None
+    session_tracker: Optional[Any] = None
+    session_possible_compaction: bool = False
+    session_lineage_parent_id: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None

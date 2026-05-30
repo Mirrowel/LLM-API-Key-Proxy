@@ -367,6 +367,7 @@ class UsageManager:
         model: str,
         quota_group: Optional[str] = None,
         session_id: Optional[str] = None,
+        session_affinity_key: Optional[str] = None,
         exclude: Optional[Set[str]] = None,
         candidates: Optional[List[str]] = None,
         priorities: Optional[Dict[str, int]] = None,
@@ -440,7 +441,7 @@ class UsageManager:
         # Main acquisition loop - continues until deadline
         sticky_wait_started_at: Optional[float] = None
         sticky_wait_timed_out = False
-        sticky_wait_limit = 15.0
+        sticky_wait_limit = self._config.session_sticky_wait_seconds
         sticky_id: Optional[str] = None
         while time.time() < deadline:
             async with self._acquire_lock:
@@ -515,6 +516,7 @@ class UsageManager:
                     states=states_to_check,
                     quota_group=quota_group,
                     session_id=session_id,
+                    session_affinity_key=session_affinity_key,
                     exclude=selection_exclude_ids,
                     priorities=priority_overrides,
                     deadline=deadline,

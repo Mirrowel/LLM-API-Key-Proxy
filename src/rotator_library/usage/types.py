@@ -424,6 +424,7 @@ class SelectionContext:
     rotation_tolerance: float
     deadline: float
     session_id: Optional[str] = None
+    session_affinity_key: Optional[str] = None
 
 
 @dataclass

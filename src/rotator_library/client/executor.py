@@ -583,6 +583,7 @@ class RequestExecutor:
                     model=model,
                     quota_group=quota_group,
                     session_id=context.session_id,
+                    session_affinity_key=context.session_affinity_key,
                     candidates=untried,
                     priorities=filter_result.priorities,
                     deadline=deadline,
@@ -662,6 +663,7 @@ class RequestExecutor:
                                     approx_cost=approx_cost,
                                     response_headers=response_headers,
                                 )
+                                self._record_session_response(context, response)
 
                                 lib_logger.info(
                                     f"Recorded usage from response object for key {mask_credential(cred)}"
@@ -797,6 +799,7 @@ class RequestExecutor:
                         model=model,
                         quota_group=quota_group,
                         session_id=context.session_id,
+                        session_affinity_key=context.session_affinity_key,
                         candidates=untried,
                         priorities=filter_result.priorities,
                         deadline=deadline,
@@ -874,6 +877,9 @@ class RequestExecutor:
                                         context.request,
                                         cred_context,
                                         skip_cost_calculation=skip_cost_calculation,
+                                        response_callback=lambda response: self._record_session_response(
+                                            context, response
+                                        ),
                                     )
 
                                     lib_logger.info(
@@ -1327,6 +1333,25 @@ class RequestExecutor:
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )
         return ErrorAction.ROTATE
+
+    def _record_session_response(self, context: RequestContext, response: Any) -> None:
+        """Let the tracker learn anchors emitted by a successful response.
+
+        Response anchors are additive evidence for the next request. Failures are
+        ignored because a failed response should not mutate session identity.
+        """
+        tracker = context.session_tracker
+        if not tracker or not context.session_id:
+            return
+        try:
+            tracker.record_response(
+                context.session_id,
+                provider=context.provider,
+                model=context.model,
+                response=response,
+            )
+        except Exception as exc:
+            lib_logger.debug("Session response tracking failed: %s", exc)
 
     async def _ensure_initialized(
         self,

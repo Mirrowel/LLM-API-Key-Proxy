@@ -517,6 +517,11 @@ class ProviderUsageConfig:
     # Window definitions
     windows: List[WindowDefinition] = field(default_factory=list)
 
+    # Sequential session stickiness may briefly wait for a bound credential that
+    # is only blocked by concurrency. Configuring this keeps cache-locality
+    # deployments from forcing the same latency tradeoff on low-latency ones.
+    session_sticky_wait_seconds: float = 15.0
+
     def get_effective_multiplier(self, priority: int) -> int:
         """
         Get the effective multiplier for a priority level.
@@ -674,6 +679,11 @@ def load_provider_usage_config(
             if fallback is not None:
                 config.sequential_fallback_multiplier = fallback
 
+        if hasattr(plugin_class, "default_session_sticky_wait_seconds"):
+            sticky_wait = plugin_class.default_session_sticky_wait_seconds
+            if sticky_wait is not None:
+                config.session_sticky_wait_seconds = max(0.0, float(sticky_wait))
+
         # Fair cycle
         if hasattr(plugin_class, "default_fair_cycle_config"):
             fc_config = plugin_class.default_fair_cycle_config
@@ -779,6 +789,17 @@ def load_provider_usage_config(
             config.sequential_fallback_multiplier = int(env_fallback)
         except ValueError:
             pass
+
+    env_sticky_wait = os.getenv(f"SESSION_STICKY_WAIT_SECONDS_{provider_upper}")
+    if env_sticky_wait is None:
+        env_sticky_wait = os.getenv("SESSION_STICKY_WAIT_SECONDS")
+    if env_sticky_wait:
+        try:
+            config.session_sticky_wait_seconds = max(0.0, float(env_sticky_wait))
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid session sticky wait value '{env_sticky_wait}'. Keeping default."
+            )
 
     provider_optimal_var = f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}"
     parsed_provider_optimal = _parse_concurrency_env(provider_optimal_var)
