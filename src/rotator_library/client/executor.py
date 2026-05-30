@@ -62,6 +62,8 @@ from ..core.constants import (
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
+from ..routing import FallbackPolicy, clone_context_for_target
+from ..routing.types import RouteTarget
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
@@ -495,8 +497,101 @@ class RequestExecutor:
         """
         if context.streaming:
             return self._execute_streaming(context)
+        elif context.routing_targets:
+            return await self._execute_non_streaming_with_fallback(context)
         else:
             return await self._execute_non_streaming(context)
+
+    async def _execute_non_streaming_with_fallback(self, context: RequestContext) -> Any:
+        """Execute an ordered non-streaming fallback target chain.
+
+        The normal single-target path remains `_execute_non_streaming()`. This
+        wrapper only runs when request building has populated `routing_targets`,
+        preserving existing behavior for all current requests.
+        """
+
+        targets = tuple(context.routing_targets or ())
+        if not targets:
+            return await self._execute_non_streaming(context)
+        policy = FallbackPolicy()
+        last_failure: Any = None
+        self._log_routing_trace(
+            context,
+            "routing_decision",
+            {"requested_model": context.model, "target_count": len(targets)},
+            metadata={"group": context.routing_group_name, "targets": [_target_trace(target) for target in targets]},
+        )
+        for index, target in enumerate(targets):
+            target_context = clone_context_for_target(
+                context,
+                target,
+                target_index=index,
+                usage_manager_key=target.provider,
+            )
+            self._log_routing_trace(
+                context,
+                "routing_target_attempt_started",
+                _target_trace(target),
+                metadata={"target_index": index, "group": context.routing_group_name},
+            )
+            try:
+                result = await self._execute_non_streaming(target_context)
+            except Exception as exc:
+                last_failure = exc
+                error_type = _route_error_type(exc)
+                self._log_routing_trace(
+                    context,
+                    "routing_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
+                )
+                if index >= len(targets) - 1 or not policy.should_fallback(error_type):
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
+                    raise
+                self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
+                continue
+
+            error_type = _route_error_type_from_response(result)
+            if error_type:
+                last_failure = result
+                self._log_routing_trace(
+                    context,
+                    "routing_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type},
+                )
+                if index < len(targets) - 1 and policy.should_fallback(error_type):
+                    self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
+                    continue
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
+                return result
+
+            self._log_routing_trace(
+                context,
+                "routing_target_attempt_succeeded",
+                _target_trace(target),
+                metadata={"target_index": index},
+            )
+            return result
+
+        if isinstance(last_failure, Exception):
+            raise last_failure
+        return last_failure
+
+    @staticmethod
+    def _log_routing_trace(context: RequestContext, pass_name: str, data: Any, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Record routing trace entries without affecting request execution."""
+
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            data,
+            direction="metadata",
+            stage="routing",
+            metadata=metadata or {},
+            snapshot=False,
+        )
 
     async def _prepare_execution(
         self,
@@ -1558,3 +1653,43 @@ class RequestExecutor:
                 lib_logger.debug(
                     f"Failed to assemble/log final streaming response: {e}"
                 )
+
+
+def _target_trace(target: RouteTarget) -> Dict[str, Any]:
+    """Return non-secret route target metadata for transaction traces."""
+
+    return {
+        "name": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "protocol": target.protocol,
+    }
+
+
+def _route_error_type(error: BaseException) -> str:
+    """Map an exception to a fallback-policy error type."""
+
+    explicit = getattr(error, "error_type", None)
+    if explicit:
+        return str(explicit).lower()
+    classified = classify_error(error)
+    return classified.error_type
+
+
+def _route_error_type_from_response(response: Any) -> Optional[str]:
+    """Infer retryability from the proxy's structured error response."""
+
+    if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return None
+    error = response["error"]
+    error_type = str(error.get("type", "")).lower()
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    normal_summary = str(details.get("normal_error_summary", "")).lower()
+    if any(token in normal_summary for token in ("rate_limit", "quota", "capacity")):
+        return "rate_limit"
+    if any(token in normal_summary for token in ("server_error", "api_connection", "transient")):
+        return "server_error"
+    if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
+        return "rate_limit"
+    return None
