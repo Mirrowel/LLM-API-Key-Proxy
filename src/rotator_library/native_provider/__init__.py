@@ -6,5 +6,6 @@
 from .context import NativeProviderContext
 from .executor import NativeProviderExecutor
 from .http import NativeHTTPTransport
+from .streaming import stream_event_payload
 
-__all__ = ["NativeHTTPTransport", "NativeProviderContext", "NativeProviderExecutor"]
+__all__ = ["NativeHTTPTransport", "NativeProviderContext", "NativeProviderExecutor", "stream_event_payload"]

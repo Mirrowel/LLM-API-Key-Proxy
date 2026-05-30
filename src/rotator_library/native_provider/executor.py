@@ -5,13 +5,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine
 from ..protocols import get_protocol
 from .context import NativeProviderContext
 from .http import NativeHTTPTransport
+from .streaming import stream_event_payload
 
 
 class NativeProviderExecutor:
@@ -66,6 +67,50 @@ class NativeProviderExecutor:
                 )
             raise
 
+    async def stream(self, raw_request: dict[str, Any], context: NativeProviderContext, transport: NativeHTTPTransport) -> AsyncGenerator[Any, None]:
+        """Execute a streaming native provider request and yield client events."""
+
+        logger = context.transaction_logger
+        protocol = get_protocol(context.protocol_name)
+        self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
+        try:
+            protocol_context = context.protocol_context()
+            request_payload = dict(raw_request)
+            request_payload["stream"] = True
+            unified_request = protocol.parse_request(request_payload, protocol_context)
+            provider_request = protocol.build_request(unified_request, protocol_context)
+            adapters = [get_adapter(name) for name in context.adapter_names]
+            provider_request = await run_adapter_chain(adapters, provider_request, context.adapter_context(), stage="request")
+            cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
+            provider_request, _ = await cache_engine.inject(
+                "request",
+                provider_request,
+                context.field_cache_context(),
+                transaction_logger=logger,
+            )
+            self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
+            async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
+                self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
+                event = protocol.parse_stream_event(raw_chunk, protocol_context)
+                event_payload = stream_event_payload(event)
+                self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
+                await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
+                formatted = protocol.format_stream_event(event, protocol_context)
+                self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
+                yield formatted
+        except Exception as exc:
+            if logger:
+                logger.log_transform_error(
+                    "native_provider_stream",
+                    exc,
+                    payload=raw_request,
+                    stage="provider",
+                    protocol=context.protocol_name,
+                    transport=context.transport,
+                    metadata={"provider": context.provider, "model": context.model},
+                )
+            raise
+
     @staticmethod
     def _trace(
         context: NativeProviderContext,
@@ -75,6 +120,7 @@ class NativeProviderExecutor:
         direction: str,
         stage: str,
         metadata: dict[str, Any] | None = None,
+        snapshot: bool = True,
     ) -> None:
         if not context.transaction_logger:
             return
@@ -94,4 +140,5 @@ class NativeProviderExecutor:
                 "classifier": context.classifier,
                 **(metadata or {}),
             },
+            snapshot=snapshot,
         )
