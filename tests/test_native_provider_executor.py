@@ -72,6 +72,7 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
     assert client.calls[0]["json"]["model"] == "provider/gpt-test"
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "native_protocol_selected" in pass_names
+    assert "after_field_cache_injection" in pass_names
     assert "native_provider_request" in pass_names
     assert "raw_native_provider_response" in pass_names
     assert "parsed_native_provider_response" in pass_names

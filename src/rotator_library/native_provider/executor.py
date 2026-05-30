@@ -45,6 +45,7 @@ class NativeProviderExecutor:
                 context.field_cache_context(),
                 transaction_logger=logger,
             )
+            self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
             self._trace(context, "native_provider_request", provider_request, direction="request", stage="provider")
             raw_response = await transport.post_json(context.endpoint, headers=context.headers, payload=provider_request)
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
@@ -88,6 +89,7 @@ class NativeProviderExecutor:
                 context.field_cache_context(),
                 transaction_logger=logger,
             )
+            self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
@@ -95,6 +97,14 @@ class NativeProviderExecutor:
                 event_payload = stream_event_payload(event)
                 self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
                 await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
+                self._trace(
+                    context,
+                    "after_field_cache_stream_extraction",
+                    {"source": "stream_event"},
+                    direction="stream",
+                    stage="adapter",
+                    snapshot=False,
+                )
                 formatted = protocol.format_stream_event(event, protocol_context)
                 self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
                 yield formatted

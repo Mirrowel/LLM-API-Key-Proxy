@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from rotator_library.adapters import AdapterContext, get_adapter, run_adapter_chain
 from rotator_library.providers import PROVIDER_PLUGINS
 from rotator_library.providers.copilot_provider import CopilotProvider
 
@@ -36,8 +37,22 @@ def test_copilot_provider_declares_openai_chat_protocol_and_adapter() -> None:
 
     assert provider.get_protocol_name("gpt-4.1") == "openai_chat"
     assert provider.get_adapter_names("gpt-4.1") == ("suppress_developer_role",)
-    assert provider.get_adapter_config("gpt-4.1") == {"suppress_developer_role": {"replacement_role": "system"}}
+    assert provider.get_adapter_config("gpt-4.1") == {"suppress_developer_role": {"mode": "system"}}
     assert provider.get_field_cache_rules("gpt-4.1") == ()
+
+
+@pytest.mark.asyncio
+async def test_copilot_adapter_config_converts_developer_role_to_system() -> None:
+    provider = CopilotProvider()
+
+    result = await run_adapter_chain(
+        [get_adapter("suppress_developer_role")],
+        {"messages": [{"role": "developer", "content": "rules"}]},
+        AdapterContext(adapter_config=provider.get_adapter_config("gpt-4.1")),
+        stage="request",
+    )
+
+    assert result["messages"][0]["role"] == "system"
 
 
 def test_copilot_provider_builds_native_headers_and_endpoint(monkeypatch) -> None:

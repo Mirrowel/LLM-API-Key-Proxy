@@ -35,7 +35,8 @@ def test_antigravity_provider_restores_safe_declarations() -> None:
     provider = AntigravityProvider()
 
     assert provider.get_protocol_name("gemini-3-flash") == "gemini"
-    assert provider.get_adapter_names("gemini-3-flash") == ("field_rename",)
+    assert provider.get_adapter_names("gemini-3-flash") == ()
+    assert provider.get_adapter_config("gemini-3-flash") == {}
     assert provider.get_model_tier_requirement("antigravity/gemini-3-flash") is None
     rules = provider.get_field_cache_rules("gemini-3-flash")
     assert rules[0].name == "antigravity_thought_signature"
