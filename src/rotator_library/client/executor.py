@@ -1503,6 +1503,14 @@ class RequestExecutor:
         chunks = []
 
         async for sse_line in stream:
+            transaction_logger.log_transform_pass(
+                "raw_stream_chunk",
+                sse_line,
+                direction="stream",
+                stage="client",
+                transport="sse",
+                snapshot=False,
+            )
             yield sse_line
 
             # Parse and accumulate for final logging
@@ -1524,6 +1532,13 @@ class RequestExecutor:
         if chunks:
             try:
                 final_response = TransactionLogger.assemble_streaming_response(chunks)
+                transaction_logger.log_transform_pass(
+                    "assembled_stream_response",
+                    final_response,
+                    direction="response",
+                    stage="client",
+                    transport="sse",
+                )
                 transaction_logger.log_response(final_response)
             except Exception as e:
                 lib_logger.debug(
