@@ -3,12 +3,14 @@
 
 """Responses API service, storage, and streaming helpers."""
 
+from .bridge import ResponsesBridge
 from .store import InMemoryResponsesStore, ProviderCacheResponsesStore, ResponsesStore
 from .types import StoredResponse, generate_response_id
 
 __all__ = [
     "InMemoryResponsesStore",
     "ProviderCacheResponsesStore",
+    "ResponsesBridge",
     "ResponsesStore",
     "StoredResponse",
     "generate_response_id",
