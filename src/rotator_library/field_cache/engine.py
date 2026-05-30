@@ -88,6 +88,7 @@ class FieldCacheEngine:
         operations: list[FieldCacheOperation] = []
         for rule in self._rules_for_source(source):
             operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
+            self._trace(transaction_logger, "before_field_cache_extraction", payload, rule, operation, source=source)
             if not operation.cache_key:
                 operation.skipped = True
                 operation.reason = "missing_required_scope"
@@ -123,6 +124,7 @@ class FieldCacheEngine:
             operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
             if not rule.inject:
                 continue
+            self._trace(transaction_logger, "before_field_cache_injection", updated, rule, operation, target=target)
             if not operation.cache_key:
                 operation.skipped = True
                 operation.reason = "missing_required_scope"
