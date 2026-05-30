@@ -205,6 +205,75 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(parent.session_id, repeated_child.lineage_parent_session_id)
         self.assertNotEqual(child.session_id, repeated_child.session_id)
 
+    def test_size_only_long_prompt_overlap_does_not_create_compaction_lineage(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        long_text = " ".join(
+            [
+                "This is a normal long prompt without compaction markers that repeats",
+                "ordinary request context and should not be treated as a summary descendant.",
+            ]
+            * 8
+        )
+        original = {
+            "messages": [
+                {"role": "user", "content": long_text},
+                {"role": "assistant", "content": "A normal second message adds continuity evidence."},
+            ]
+        }
+        repeated = {"messages": [{"role": "user", "content": long_text}]}
+
+        tracker.infer_session(original, provider="gemini", model="pro")
+        inferred = tracker.infer_session(repeated, provider="gemini", model="pro")
+
+        self.assertFalse(inferred.possible_compaction)
+        self.assertIsNone(inferred.lineage_parent_session_id)
+
+    def test_size_only_two_message_history_overlap_does_not_create_compaction_lineage(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        first = " ".join(["First ordinary long request message without summary markers."] * 30)
+        second = " ".join(["Second ordinary long request message without summary markers."] * 30)
+        request = {
+            "messages": [
+                {"role": "user", "content": first},
+                {"role": "assistant", "content": second},
+            ]
+        }
+
+        tracker.infer_session(request, provider="gemini", model="pro")
+        inferred = tracker.infer_session(request, provider="gemini", model="pro")
+
+        self.assertFalse(inferred.possible_compaction)
+
+    def test_stale_persistence_job_does_not_overwrite_newer_snapshot(self):
+        writes = []
+
+        class FakeWriter:
+            def write(self, payload):
+                writes.append(payload)
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=Path(temp_dir) / "session_stickiness.json",
+                persistence_flush_interval_seconds=0,
+            )
+            tracker._writer = FakeWriter()
+
+            with tracker._lock:
+                tracker._dirty = True
+                tracker._dirty_generation = 5
+                old_job = tracker._prepare_save_locked(force=True)
+                tracker._dirty_generation = 6
+                new_job = tracker._prepare_save_locked(force=True)
+
+            tracker._write_save_job(new_job)
+            tracker._write_save_job(old_job)
+
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(tracker._last_persisted_generation, 6)
+
     def test_best_match_tie_breaks_deterministically(self):
         tracker = SessionTracker(ttl_seconds=3600)
         now = 1000.0

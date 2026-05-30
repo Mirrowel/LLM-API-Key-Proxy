@@ -248,6 +248,10 @@ class StreamingHandler:
                     )
 
                 if response_callback and (assistant_parts or tool_call_ids):
+                    # Intentionally only record response anchors after a complete
+                    # stream. Partial/aborted streams can contain text the client
+                    # never accepted, so using them for identity would over-bind
+                    # failed or disconnected sessions.
                     response_callback(
                         {
                             "choices": [

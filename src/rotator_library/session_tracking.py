@@ -183,6 +183,7 @@ class SessionTracker:
         self._sessions: Dict[str, _SessionState] = {}
         self._dirty = False
         self._dirty_generation = 0
+        self._last_persisted_generation = 0
         self._last_save_attempt = 0.0
         self._writer: Optional[ResilientStateWriter] = None
         self._lock = threading.RLock()
@@ -567,11 +568,14 @@ class SessionTracker:
     ) -> bool:
         if not match:
             return False
-        if match.is_sticky_match or match.response_matches > 0:
-            return True
         # Explicit summary markers are allowed to produce weaker lineage because
         # the result is telemetry and still starts a new live sticky session.
-        return marker_compaction and match.score > 0
+        if marker_compaction:
+            return match.score > 0
+        # Size-only probes are much noisier. Require overlap with prior response
+        # anchors so ordinary long repeated prompts/history are not classified as
+        # compaction descendants from normal message overlap alone.
+        return match.response_matches > 0
 
     def _anchors_from_provider_hints(
         self,
@@ -977,7 +981,11 @@ class SessionTracker:
             return
         writer, payload, generation = save_job
         with self._save_io_lock:
+            if generation < self._last_persisted_generation:
+                return
             success = writer.write(payload)
+            if success:
+                self._last_persisted_generation = generation
         if not success:
             return
         with self._lock:
@@ -987,16 +995,6 @@ class SessionTracker:
     def _mark_dirty(self) -> None:
         self._dirty_generation += 1
         self._dirty = True
-
-    def _save(self, *, force: bool = False) -> None:
-        """Compatibility helper for direct internal tests; public paths avoid locked I/O."""
-        with self._lock:
-            save_job = self._prepare_save_locked(force=force)
-        self._write_save_job(save_job)
-
-    def _clear_dirty_if_current(self, generation: int) -> None:
-        if self._dirty_generation == generation:
-            self._dirty = False
 
     def _namespace(
         self,
