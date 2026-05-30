@@ -110,8 +110,6 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        if isinstance(unified_response.raw, dict):
-            return deepcopy(unified_response.raw)
         message = unified_response.messages[0] if unified_response.messages else UnifiedMessage(role="assistant")
         payload = {
             "id": unified_response.id,
@@ -124,7 +122,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             "usage": self._format_usage(unified_response.usage),
         }
         payload.update(deepcopy(unified_response.extra))
-        return payload
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -220,20 +218,21 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 text=block.get("thinking"),
                 signature=block.get("signature"),
                 redacted=block_type == "redacted_thinking",
+                raw=deepcopy(block),
                 extra=_without(block, {"type", "thinking", "signature"}),
             )
             return ContentBlock(type=block_type, reasoning=reasoning, raw=deepcopy(block))
         if block_type == "tool_use":
             return ContentBlock(
                 type="tool_use",
-                tool_call=ToolCall(id=block.get("id"), name=block.get("name"), arguments=deepcopy(block.get("input")), type="tool_use"),
+                tool_call=ToolCall(id=block.get("id"), name=block.get("name"), arguments=deepcopy(block.get("input")), type="tool_use", raw=deepcopy(block)),
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "id", "name", "input"}),
             )
         if block_type == "tool_result":
             return ContentBlock(
                 type="tool_result",
-                tool_result=ToolResult(tool_call_id=block.get("tool_use_id"), content=deepcopy(block.get("content")), is_error=block.get("is_error")),
+                tool_result=ToolResult(tool_call_id=block.get("tool_use_id"), content=deepcopy(block.get("content")), is_error=block.get("is_error"), raw=deepcopy(block)),
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "tool_use_id", "content", "is_error"}),
             )
@@ -242,12 +241,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def _format_content(self, blocks: Iterable[ContentBlock]) -> list[dict[str, Any]]:
         formatted = []
         for block in blocks:
-            if isinstance(block.raw, dict):
-                formatted.append(deepcopy(block.raw))
-            elif block.type == "text":
-                formatted.append({"type": "text", "text": block.text or ""})
+            if block.type == "text":
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": "text"}
+                payload["type"] = "text"
+                payload["text"] = block.text or ""
+                formatted.append(payload)
             elif block.reasoning:
-                payload = {"type": block.reasoning.type}
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": block.reasoning.type}
+                payload["type"] = block.reasoning.type
                 if block.reasoning.text is not None:
                     payload["thinking"] = block.reasoning.text
                 if block.reasoning.signature is not None:
@@ -255,9 +256,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 payload.update(deepcopy(block.reasoning.extra))
                 formatted.append(payload)
             elif block.tool_call:
-                formatted.append({"type": "tool_use", "id": block.tool_call.id, "name": block.tool_call.name, "input": deepcopy(block.tool_call.arguments)})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": "tool_use"}
+                payload.update({"type": "tool_use", "id": block.tool_call.id, "name": block.tool_call.name, "input": deepcopy(block.tool_call.arguments)})
+                formatted.append(payload)
             elif block.tool_result:
-                payload = {"type": "tool_result", "tool_use_id": block.tool_result.tool_call_id, "content": deepcopy(block.tool_result.content)}
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": "tool_result"}
+                payload.update({"type": "tool_result", "tool_use_id": block.tool_result.tool_call_id, "content": deepcopy(block.tool_result.content)})
                 if block.tool_result.is_error is not None:
                     payload["is_error"] = block.tool_result.is_error
                 formatted.append(payload)

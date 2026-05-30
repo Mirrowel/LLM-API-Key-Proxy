@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from src.rotator_library.protocols import get_protocol, list_protocols
+from rotator_library.protocols import get_protocol, list_protocols
 
 
 def test_openai_chat_protocol_is_discovered_with_aliases() -> None:
@@ -70,6 +70,27 @@ def test_openai_chat_request_round_trip_preserves_tools_and_reasoning() -> None:
     assert unified.tools[0].input_schema["properties"]["q"]["type"] == "string"
     assert rebuilt["vendor_extension"] == {"kept": True}
     assert rebuilt["messages"][3]["reasoning_content"] == "internal chain"
+
+
+def test_openai_chat_build_uses_mutated_unified_fields_and_preserves_block_extras() -> None:
+    adapter = get_protocol("openai_chat")
+    raw = {
+        "model": "openai/gpt-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "before", "cache_control": {"type": "ephemeral"}}],
+            }
+        ],
+    }
+
+    unified = adapter.parse_request(raw)
+    unified.messages[0].content[0].text = "after"
+    rebuilt = adapter.build_request(unified)
+
+    assert isinstance(rebuilt["messages"][0]["content"], list)
+    assert rebuilt["messages"][0]["content"][0]["text"] == "after"
+    assert rebuilt["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_openai_chat_response_extracts_usage_cost_and_reasoning() -> None:

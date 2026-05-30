@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
 from typing import Any, ClassVar, Iterable, Mapping, Optional
 
 
@@ -36,7 +39,24 @@ def serialize_value(value: Any) -> Any:
         return {str(k): serialize_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [serialize_value(v) for v in value]
-    return deepcopy(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        import json
+
+        json.dumps(value)
+        return deepcopy(value)
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 def copy_mapping(value: Optional[Mapping[str, Any]]) -> JsonObject:
@@ -110,7 +130,10 @@ class Usage(ProtocolSerializable):
 
     def __post_init__(self) -> None:
         if self.total_tokens <= 0:
-            self.total_tokens = self.input_tokens + self.output_tokens + self.reasoning_tokens
+            # Most APIs report reasoning/thinking tokens as a detail of output
+            # tokens. Protocol-specific normalizers can provide a larger total
+            # when a provider documents reasoning as a separate bucket.
+            self.total_tokens = self.input_tokens + self.output_tokens
 
 
 @dataclass
@@ -121,9 +144,10 @@ class ReasoningBlock(ProtocolSerializable):
     text: Optional[str] = None
     signature: Optional[str] = None
     redacted: bool = False
+    raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("type", "text", "signature", "redacted", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("type", "text", "signature", "redacted", "raw", "extra")
 
 
 @dataclass
@@ -135,9 +159,10 @@ class ToolCall(ProtocolSerializable):
     arguments: Any = None
     type: str = "function"
     index: Optional[int] = None
+    raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("id", "name", "arguments", "type", "index", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("id", "name", "arguments", "type", "index", "raw", "extra")
 
 
 @dataclass
@@ -147,9 +172,10 @@ class ToolResult(ProtocolSerializable):
     tool_call_id: Optional[str] = None
     content: Any = None
     is_error: Optional[bool] = None
+    raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("tool_call_id", "content", "is_error", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("tool_call_id", "content", "is_error", "raw", "extra")
 
 
 @dataclass

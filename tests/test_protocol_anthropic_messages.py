@@ -2,7 +2,22 @@ from __future__ import annotations
 
 import json
 
-from src.rotator_library.protocols import get_protocol, list_protocols
+from rotator_library.protocols import get_protocol, list_protocols
+
+
+def test_anthropic_build_uses_mutated_unified_thinking_signature() -> None:
+    adapter = get_protocol("anthropic_messages")
+    raw = {
+        "model": "anthropic/claude-test",
+        "messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "before", "signature": "sig_1"}]}],
+    }
+
+    unified = adapter.parse_request(raw)
+    unified.messages[0].content[0].reasoning.text = "after"
+    rebuilt = adapter.build_request(unified)
+
+    assert rebuilt["messages"][0]["content"][0]["thinking"] == "after"
+    assert rebuilt["messages"][0]["content"][0]["signature"] == "sig_1"
 
 
 def test_anthropic_messages_protocol_is_discovered_with_aliases() -> None:

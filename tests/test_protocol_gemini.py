@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from src.rotator_library.protocols import get_protocol, list_protocols
+from rotator_library.protocols import get_protocol, list_protocols
 
 
 def test_gemini_protocol_is_discovered_with_aliases() -> None:
@@ -46,6 +46,25 @@ def test_gemini_request_round_trip_preserves_parts_tools_and_settings() -> None:
     assert rebuilt["generationConfig"] == {"temperature": 0.3}
     assert rebuilt["safetySettings"][0]["threshold"] == "BLOCK_NONE"
     assert rebuilt["vendor_extension"] == {"kept": True}
+
+
+def test_gemini_parses_multiple_function_declarations() -> None:
+    adapter = get_protocol("gemini")
+    raw = {
+        "contents": [],
+        "tools": [
+            {
+                "functionDeclarations": [
+                    {"name": "one", "parameters": {"type": "object"}},
+                    {"name": "two", "parameters": {"type": "object"}},
+                ]
+            }
+        ],
+    }
+
+    unified = adapter.parse_request(raw)
+
+    assert [tool.name for tool in unified.tools] == ["one", "two"]
 
 
 def test_gemini_response_extracts_usage_and_thought_signature() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from src.rotator_library.protocols import get_protocol, list_protocols
+from rotator_library.protocols import get_protocol, list_protocols
 
 
 def test_responses_protocol_is_discovered_with_aliases_and_websocket_support() -> None:
@@ -10,7 +10,8 @@ def test_responses_protocol_is_discovered_with_aliases_and_websocket_support() -
 
     assert "responses" in list_protocols()
     assert get_protocol("openai_responses") is adapter
-    assert adapter.supports_transport("websocket") is True
+    assert adapter.supports_transport("websocket") is False
+    assert adapter.is_future_transport("websocket") is True
 
 
 def test_responses_request_round_trip_preserves_previous_response_and_tools() -> None:

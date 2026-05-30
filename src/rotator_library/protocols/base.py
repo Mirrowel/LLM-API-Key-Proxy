@@ -35,11 +35,17 @@ class ProtocolAdapter:
     name: ClassVar[str] = "base"
     aliases: ClassVar[tuple[str, ...]] = ()
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    future_transports: ClassVar[tuple[str, ...]] = ()
 
     def supports_transport(self, transport_name: str) -> bool:
         """Return whether this protocol can format the requested transport."""
 
         return transport_name in self.supported_transports
+
+    def is_future_transport(self, transport_name: str) -> bool:
+        """Return whether this protocol has an intentional future transport seam."""
+
+        return transport_name in self.future_transports
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         """Parse a raw client/provider request into a unified request."""

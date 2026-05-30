@@ -63,7 +63,7 @@ class GeminiProtocol(ProtocolAdapter):
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=[self._parse_content(content) for content in request.get("contents") or []],
             system=self._parse_system(request.get("systemInstruction") or request.get("system_instruction")),
-            tools=[self._parse_tool(tool) for tool in request.get("tools") or []],
+            tools=self._parse_tools(request.get("tools") or []),
             stream=bool(request.get("stream", False)),
             generation_params={"generationConfig": generation_config, "safetySettings": safety_settings},
             raw=deepcopy(raw_request),
@@ -116,8 +116,6 @@ class GeminiProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        if isinstance(unified_response.raw, dict):
-            return deepcopy(unified_response.raw)
         candidates = []
         for index, message in enumerate(unified_response.messages):
             candidate = {"index": index, "content": self._format_content(message)}
@@ -133,7 +131,7 @@ class GeminiProtocol(ProtocolAdapter):
             "promptFeedback": deepcopy(unified_response.metadata.get("promptFeedback")),
         }
         payload.update(deepcopy(unified_response.extra))
-        return payload
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -216,7 +214,7 @@ class GeminiProtocol(ProtocolAdapter):
         if "text" in part:
             reasoning = None
             if part.get("thought") or part.get("thoughtSignature"):
-                reasoning = ReasoningBlock(type="gemini_thought", text=part.get("text"), signature=part.get("thoughtSignature"), extra=_without(part, {"text", "thought", "thoughtSignature"}))
+                reasoning = ReasoningBlock(type="gemini_thought", text=part.get("text"), signature=part.get("thoughtSignature"), raw=deepcopy(part), extra=_without(part, {"text", "thought", "thoughtSignature"}))
             return ContentBlock(type="text", text=part.get("text", ""), reasoning=reasoning, raw=deepcopy(part), extra=_without(part, {"text"}))
         if "inlineData" in part or "inline_data" in part:
             source = part.get("inlineData") or part.get("inline_data")
@@ -226,27 +224,34 @@ class GeminiProtocol(ProtocolAdapter):
             return ContentBlock(type="file_data", source=deepcopy(source), raw=deepcopy(part), extra=_without(part, {"fileData", "file_data"}))
         if "functionCall" in part or "function_call" in part:
             call = part.get("functionCall") or part.get("function_call") or {}
-            return ContentBlock(type="function_call", tool_call=ToolCall(name=call.get("name"), arguments=deepcopy(call.get("args")), type="function_call"), raw=deepcopy(part), extra=_without(part, {"functionCall", "function_call"}))
+            return ContentBlock(type="function_call", tool_call=ToolCall(name=call.get("name"), arguments=deepcopy(call.get("args")), type="function_call", raw=deepcopy(call)), raw=deepcopy(part), extra=_without(part, {"functionCall", "function_call"}))
         if "functionResponse" in part or "function_response" in part:
             response = part.get("functionResponse") or part.get("function_response") or {}
-            return ContentBlock(type="function_response", tool_result=ToolResult(tool_call_id=response.get("name"), content=deepcopy(response.get("response"))), raw=deepcopy(part), extra=_without(part, {"functionResponse", "function_response"}))
+            return ContentBlock(type="function_response", tool_result=ToolResult(tool_call_id=response.get("name"), content=deepcopy(response.get("response")), raw=deepcopy(response)), raw=deepcopy(part), extra=_without(part, {"functionResponse", "function_response"}))
         return ContentBlock(type="unknown", raw=deepcopy(part), extra=deepcopy(part))
 
     def _format_parts(self, blocks: Iterable[ContentBlock]) -> list[dict[str, Any]]:
         parts = []
         for block in blocks:
-            if isinstance(block.raw, dict):
-                parts.append(deepcopy(block.raw))
-            elif block.tool_call:
-                parts.append({"functionCall": {"name": block.tool_call.name, "args": deepcopy(block.tool_call.arguments)}})
+            if block.tool_call:
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {}
+                payload["functionCall"] = {"name": block.tool_call.name, "args": deepcopy(block.tool_call.arguments)}
+                parts.append(payload)
             elif block.tool_result:
-                parts.append({"functionResponse": {"name": block.tool_result.tool_call_id, "response": deepcopy(block.tool_result.content)}})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {}
+                payload["functionResponse"] = {"name": block.tool_result.tool_call_id, "response": deepcopy(block.tool_result.content)}
+                parts.append(payload)
             elif block.type == "inline_data":
-                parts.append({"inlineData": deepcopy(block.source)})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {}
+                payload["inlineData"] = deepcopy(block.source)
+                parts.append(payload)
             elif block.type == "file_data":
-                parts.append({"fileData": deepcopy(block.source)})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {}
+                payload["fileData"] = deepcopy(block.source)
+                parts.append(payload)
             else:
-                payload = {"text": block.text or ""}
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {}
+                payload["text"] = block.text or ""
                 if block.reasoning:
                     payload["thought"] = True
                     if block.reasoning.signature:
@@ -255,17 +260,35 @@ class GeminiProtocol(ProtocolAdapter):
                 parts.append(payload)
         return parts
 
-    def _parse_tool(self, tool: dict[str, Any]) -> ToolDefinition:
-        payload = dict(tool or {})
-        declarations = payload.get("functionDeclarations") or payload.get("function_declarations") or []
-        first = declarations[0] if declarations and isinstance(declarations[0], dict) else payload
-        return ToolDefinition(
-            name=str(first.get("name") or ""),
-            description=first.get("description"),
-            input_schema=deepcopy(first.get("parameters") or {}),
-            type="function",
-            extra={"raw": deepcopy(tool)},
-        )
+    def _parse_tools(self, tools: Iterable[dict[str, Any]]) -> list[ToolDefinition]:
+        parsed: list[ToolDefinition] = []
+        for tool in tools:
+            payload = dict(tool or {})
+            declarations = payload.get("functionDeclarations") or payload.get("function_declarations") or []
+            if declarations:
+                for index, declaration in enumerate(declarations):
+                    if not isinstance(declaration, dict):
+                        continue
+                    parsed.append(
+                        ToolDefinition(
+                            name=str(declaration.get("name") or ""),
+                            description=declaration.get("description"),
+                            input_schema=deepcopy(declaration.get("parameters") or {}),
+                            type="function",
+                            extra={"raw_container": deepcopy(tool), "declaration_index": index},
+                        )
+                    )
+                continue
+            parsed.append(
+                ToolDefinition(
+                    name=str(payload.get("name") or payload.get("type") or "gemini_tool"),
+                    description=payload.get("description"),
+                    input_schema=deepcopy(payload.get("parameters") or {}),
+                    type=str(payload.get("type") or next(iter(payload.keys()), "tool")),
+                    extra={"raw": deepcopy(tool)},
+                )
+            )
+        return parsed
 
     def _format_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         raw = tool.extra.get("raw")

@@ -38,11 +38,18 @@ def register_protocol(protocol_class: Type[ProtocolAdapter], *, replace: bool = 
     name = protocol_class.name
     if not name:
         raise ValueError(f"Protocol {protocol_class.__name__} must define a name")
+    alias_owner = PROTOCOL_ALIASES.get(name)
+    if alias_owner and alias_owner != name and not replace:
+        raise ValueError(f"Protocol name conflicts with registered alias: {name}")
 
     existing = PROTOCOL_PLUGINS.get(name)
     if existing and existing is not protocol_class and not replace:
         raise ValueError(f"Protocol name already registered: {name}")
 
+    if replace and existing and existing is not protocol_class:
+        for alias, owner in list(PROTOCOL_ALIASES.items()):
+            if owner == name:
+                PROTOCOL_ALIASES.pop(alias, None)
     PROTOCOL_PLUGINS[name] = protocol_class
     _PROTOCOL_INSTANCES.pop(name, None)
 
