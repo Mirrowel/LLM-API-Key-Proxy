@@ -608,7 +608,14 @@ class RequestExecutor:
                         # Log transformed request if it differs from original
                         if context.transaction_logger:
                             context.transaction_logger.log_transformed_request(
-                                kwargs, context.kwargs
+                                kwargs,
+                                context.kwargs,
+                                credential_id=cred_context.stable_id,
+                                metadata={
+                                    "session_id": context.session_id,
+                                    "scope_key": context.usage_manager_key,
+                                    "classifier": context.classifier,
+                                },
                             )
 
                         # Get provider plugin
@@ -824,7 +831,14 @@ class RequestExecutor:
                             # Log transformed request if it differs from original
                             if context.transaction_logger:
                                 context.transaction_logger.log_transformed_request(
-                                    kwargs, context.kwargs
+                                    kwargs,
+                                    context.kwargs,
+                                    credential_id=cred_context.stable_id,
+                                    metadata={
+                                        "session_id": context.session_id,
+                                        "scope_key": context.usage_manager_key,
+                                        "classifier": context.classifier,
+                                    },
                                 )
 
                             # Add stream usage metadata for active providers.
