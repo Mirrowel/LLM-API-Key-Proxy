@@ -597,6 +597,8 @@ class RequestExecutor:
         Returns:
             Response object or async generator for streaming
         """
+        if context.streaming and context.routing_targets:
+            return self._execute_streaming_with_fallback(context)
         if context.streaming:
             return self._execute_streaming(context)
         elif context.routing_targets:
@@ -679,6 +681,74 @@ class RequestExecutor:
         if isinstance(last_failure, Exception):
             raise last_failure
         return last_failure
+
+    async def _execute_streaming_with_fallback(self, context: RequestContext) -> AsyncGenerator[str, None]:
+        """Execute streaming fallback targets with pre-output-only failover."""
+
+        targets = tuple(context.routing_targets or ())
+        if not targets:
+            async for chunk in self._execute_streaming(context):
+                yield chunk
+            return
+        policy = FallbackPolicy()
+        self._log_routing_trace(
+            context,
+            "routing_decision",
+            {"requested_model": context.model, "target_count": len(targets), "stream": True},
+            metadata={"group": context.routing_group_name, "targets": [_target_trace(target) for target in targets]},
+        )
+        for index, target in enumerate(targets):
+            emitted_output = False
+            target_context = clone_context_for_target(
+                context,
+                target,
+                target_index=index,
+                usage_manager_key=target.provider,
+            )
+            self._log_routing_trace(
+                context,
+                "routing_stream_target_attempt_started",
+                _target_trace(target),
+                metadata={"target_index": index, "group": context.routing_group_name},
+            )
+            try:
+                async for chunk in self._execute_streaming(target_context):
+                    if _stream_chunk_is_visible_output(chunk):
+                        emitted_output = True
+                    yield chunk
+                self._log_routing_trace(
+                    context,
+                    "routing_stream_target_attempt_succeeded",
+                    _target_trace(target),
+                    metadata={"target_index": index, "emitted_output": emitted_output},
+                )
+                return
+            except Exception as exc:
+                error_type = _route_error_type(exc)
+                self._log_routing_trace(
+                    context,
+                    "routing_stream_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output},
+                )
+                if emitted_output:
+                    self._log_routing_trace(
+                        context,
+                        "routing_stream_fallback_blocked_after_output",
+                        _target_trace(target),
+                        metadata={"target_index": index, "error_type": error_type},
+                    )
+                    raise
+                if index < len(targets) - 1 and policy.should_fallback(error_type, stream=True, emitted_output=False):
+                    self._log_routing_trace(
+                        context,
+                        "routing_fallback_selected",
+                        _target_trace(targets[index + 1]),
+                        metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type, "stream": True},
+                    )
+                    continue
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True})
+                raise
 
     @staticmethod
     def _log_routing_trace(context: RequestContext, pass_name: str, data: Any, *, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -1812,3 +1882,22 @@ def _route_error_type_from_response(response: Any) -> Optional[str]:
     if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
         return "rate_limit"
     return None
+
+
+def _stream_chunk_is_visible_output(chunk: str) -> bool:
+    """Return whether a stream chunk should block cross-target fallback."""
+
+    text = chunk.strip()
+    if not text or text == "data: [DONE]":
+        return False
+    if text.startswith("data:"):
+        payload = text[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            return False
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return True
+        if isinstance(data, dict) and "error" in data:
+            return False
+    return True
