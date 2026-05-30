@@ -8,6 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from ..field_cache.paths import extract_path, inject_path
 from .base import AdapterContext, PayloadAdapter
 
 
@@ -101,3 +102,63 @@ class ReasoningContentAdapter(PayloadAdapter):
                     message[output_field] = message[source_field]
                     break
         return updated
+
+
+class FieldRenameAdapter(PayloadAdapter):
+    """Copy configured values between paths on raw payloads.
+
+    Config shape:
+    `{ "rules": [{ "source_path": "a.b", "target_path": "c.d", "stage": "request", "move": false }] }`
+
+    This adapter is conservative by design: it copies the last matched value by
+    default, delegates target ambiguity checks to `inject_path`, and only removes
+    the source for simple dotted-key paths when `move=true`.
+    """
+
+    name = "field_rename"
+    aliases = ("field_copy",)
+
+    async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
+        return self._transform_stage(payload, context, "request")
+
+    async def transform_response(self, payload: Any, context: AdapterContext) -> Any:
+        return self._transform_stage(payload, context, "response")
+
+    async def transform_stream_event(self, payload: Any, context: AdapterContext) -> Any:
+        return self._transform_stage(payload, context, "stream_event")
+
+    def _transform_stage(self, payload: Any, context: AdapterContext, stage: str) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        updated = deepcopy(payload)
+        for rule in context.config_for(self.name).get("rules", []):
+            if rule.get("stage", stage) != stage:
+                continue
+            values = extract_path(updated, rule["source_path"])
+            if not values:
+                continue
+            value = values if rule.get("as_list") else values[-1]
+            inject_path(
+                updated,
+                rule["target_path"],
+                value,
+                when_missing_only=bool(rule.get("when_missing_only", False)),
+            )
+            if rule.get("move"):
+                _delete_simple_path(updated, rule["source_path"])
+        return updated
+
+
+def _delete_simple_path(payload: dict[str, Any], path: str) -> None:
+    """Delete a simple dotted dict path after a conservative move operation."""
+
+    parts = path.split(".")
+    if any("[" in part or part == "*" for part in parts):
+        return
+    current: Any = payload
+    for part in parts[:-1]:
+        if not isinstance(current, dict):
+            return
+        current = current.get(part)
+    if isinstance(current, dict):
+        current.pop(parts[-1], None)

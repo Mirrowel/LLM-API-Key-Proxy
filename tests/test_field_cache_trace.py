@@ -67,6 +67,26 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
 
 
 @pytest.mark.asyncio
+async def test_stream_sourced_rule_injection_trace_uses_request_direction(tmp_path) -> None:
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+    rule = FieldCacheRule(
+        name="provider_session_id",
+        source="stream_event",
+        path="metadata.provider_session_id",
+        inject=FieldCacheInjection(target="request", path="metadata.provider_session_id"),
+    )
+    engine = FieldCacheEngine([rule])
+    context = FieldCacheContext(provider="openai", model="gpt-test", session_id="session_1", classifier="global")
+
+    await engine.extract("stream_event", {"metadata": {"provider_session_id": "sid_1"}}, context, transaction_logger=logger)
+    await engine.inject("request", {"metadata": {}}, context, transaction_logger=logger)
+
+    entries = _trace_entries(logger.log_dir)
+    injection_entries = [entry for entry in entries if "injection" in entry["pass_name"]]
+    assert {entry["direction"] for entry in injection_entries} == {"request"}
+
+
+@pytest.mark.asyncio
 async def test_field_cache_errors_emit_transform_log_error(tmp_path) -> None:
     logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
     rule = FieldCacheRule(

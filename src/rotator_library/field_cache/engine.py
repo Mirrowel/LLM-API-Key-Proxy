@@ -57,7 +57,9 @@ class FieldCacheEngine:
 
     The engine is isolated from request execution in Phase 3. It defaults to
     copying payloads before injection so tests and future providers can reason
-    about mutations explicitly.
+    about mutations explicitly. Turn-specific and per-tool modes are validated
+    but limited until later phases add richer conversation indexing and
+    per-tool-call injection targets.
     """
 
     def __init__(self, rules: Iterable[FieldCacheRule], store: Optional[FieldCacheStore] = None) -> None:
@@ -98,7 +100,7 @@ class FieldCacheEngine:
             try:
                 values = extract_path(payload, rule.path)
                 operation.matched = len(values)
-                operation.sample_values = values[:3]
+                operation.sample_values = _sample_values(values)
                 if values:
                     await self._store_values(rule, operation.cache_key, values)
                     operation.changed = True
@@ -146,7 +148,7 @@ class FieldCacheEngine:
                     value,
                     when_missing_only=rule.inject.when_missing_only,
                 )
-                operation.sample_values = value if isinstance(value, list) else [value]
+                operation.sample_values = _sample_values(value if isinstance(value, list) else [value])
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_inject", exc, updated, rule)
                 raise
@@ -192,7 +194,7 @@ class FieldCacheEngine:
         transaction_logger.log_transform_pass(
             pass_name,
             payload,
-            direction="stream" if rule.source == "stream_event" else "request" if "injection" in pass_name else "response",
+            direction=_trace_direction(pass_name, rule.source, extra_metadata),
             stage="adapter",
             metadata={
                 "rule_name": rule.name,
@@ -228,3 +230,28 @@ def _last_value(value: Any) -> Any:
     if isinstance(value, list):
         return value[-1] if value else None
     return value
+
+
+def _trace_direction(pass_name: str, source: str, metadata: dict[str, Any]) -> str:
+    if "injection" in pass_name:
+        target = metadata.get("target")
+        if target in {"stream_event", "unified_stream_event"}:
+            return "stream"
+        if target in {"request", "unified_request", "metadata"}:
+            return "request"
+        return "response"
+    if source in {"stream_event", "unified_stream_event"}:
+        return "stream"
+    if source in {"request", "unified_request"}:
+        return "request"
+    return "response"
+
+
+def _sample_values(values: list[Any], *, max_items: int = 3, max_text: int = 500) -> list[Any]:
+    samples: list[Any] = []
+    for value in values[:max_items]:
+        if isinstance(value, str) and len(value) > max_text:
+            samples.append(f"{value[:max_text]}...<truncated {len(value) - max_text} chars>")
+        else:
+            samples.append(value)
+    return samples

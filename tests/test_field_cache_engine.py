@@ -84,6 +84,30 @@ async def test_scope_isolation_by_session_and_classifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scope_isolation_by_credential_and_provider() -> None:
+    rule = _reasoning_rule(scope=("provider", "model", "credential"))
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": "cred-a"}}]},
+        _context(provider="openai", credential_id="credential-a"),
+    )
+    await engine.extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": "cred-b"}}]},
+        _context(provider="openai", credential_id="credential-b"),
+    )
+
+    updated, _ = await engine.inject("request", {"messages": [{}]}, _context(provider="openai", credential_id="credential-a"))
+
+    assert updated["messages"][-1]["reasoning_content"] == "cred-a"
+    assert build_cache_key(rule, _context(provider="openai", credential_id="credential-a")) != build_cache_key(
+        rule, _context(provider="other", credential_id="credential-a")
+    )
+
+
+@pytest.mark.asyncio
 async def test_missing_session_scope_skips_by_default() -> None:
     engine = FieldCacheEngine([_reasoning_rule()])
 
@@ -118,6 +142,21 @@ async def test_stream_event_extraction() -> None:
     updated, _ = await engine.inject("request", {"metadata": {}}, _context())
 
     assert updated["metadata"]["provider_session_id"] == "sid_1"
+
+
+@pytest.mark.asyncio
+async def test_trace_sample_values_are_truncated() -> None:
+    rule = _reasoning_rule()
+    engine = FieldCacheEngine([rule])
+    long_value = "x" * 700
+
+    operations = await engine.extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": long_value}}]},
+        _context(),
+    )
+
+    assert operations[0].sample_values[0].endswith("...<truncated 200 chars>")
 
 
 def test_per_tool_call_requires_tool_call_id_path() -> None:

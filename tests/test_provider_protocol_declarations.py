@@ -15,6 +15,20 @@ class DeclarationProvider(ProviderInterface):
         return []
 
 
+class BareProvider(ProviderInterface):
+    async def get_models(self, api_key, client):
+        return []
+
+
+def test_provider_interface_plain_defaults_are_noop() -> None:
+    provider = BareProvider()
+
+    assert provider.get_protocol_name("model") is None
+    assert provider.get_adapter_names("model") == ()
+    assert provider.get_adapter_config("model") == {}
+    assert provider.get_field_cache_rules("model") == ()
+
+
 def test_provider_interface_defaults_are_noop_for_protocol_stack() -> None:
     provider = DeclarationProvider()
 

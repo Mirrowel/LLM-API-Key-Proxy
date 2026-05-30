@@ -19,7 +19,9 @@ def test_adapter_registry_auto_discovers_builtins_and_aliases() -> None:
 
     assert "noop" in adapters
     assert "model_override" in adapters
+    assert "field_rename" in adapters
     assert resolve_adapter_name("passthrough") == "noop"
+    assert resolve_adapter_name("field_copy") == "field_rename"
     assert get_adapter_class("override_model").name == "model_override"
     assert get_adapter("none") is get_adapter("noop")
 
@@ -82,6 +84,26 @@ async def test_reasoning_content_adapter_copies_common_reasoning_field() -> None
     result = await run_adapter_chain([get_adapter("reasoning_content")], payload, AdapterContext(), stage="response")
 
     assert result["choices"][0]["message"]["reasoning_content"] == "hidden"
+
+
+@pytest.mark.asyncio
+async def test_field_rename_adapter_copies_and_moves_configured_fields() -> None:
+    payload = {"old": {"field": "value"}, "messages": [{}]}
+    context = AdapterContext(
+        adapter_config={
+            "field_rename": {
+                "rules": [
+                    {"source_path": "old.field", "target_path": "messages[-1].new_field", "move": True}
+                ]
+            }
+        }
+    )
+
+    result = await run_adapter_chain([get_adapter("field_rename")], payload, context, stage="request")
+
+    assert result["messages"][-1]["new_field"] == "value"
+    assert "field" not in result["old"]
+    assert payload["old"]["field"] == "value"
 
 
 @pytest.mark.asyncio
