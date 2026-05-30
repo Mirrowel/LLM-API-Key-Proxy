@@ -133,6 +133,12 @@ class RequestContextBuilder:
             scope_key=scope["usage_manager_key"],
             hints=await self._get_session_hints(provider, resolved_model, kwargs),
         )
+        if transaction_logger:
+            transaction_logger.set_trace_context(
+                session_id=session.session_id,
+                scope_key=scope["usage_manager_key"],
+                classifier=scope["classifier"],
+            )
 
         return RequestContext(
             model=resolved_model,

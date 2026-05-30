@@ -22,6 +22,7 @@ def test_log_request_writes_legacy_file_and_raw_trace(tmp_path) -> None:
     assert (logger.log_dir / "request.json").exists()
     entries = _trace_entries(logger.log_dir)
     assert entries[0]["pass_name"] == "raw_client_request"
+    assert entries[0]["request_id"] == logger.request_id
     assert entries[0]["direction"] == "request"
     assert entries[0]["data"]["api_key"] == REDACTED
     assert (logger.log_dir / "transforms" / "0001_raw_client_request.json").exists()
@@ -29,13 +30,18 @@ def test_log_request_writes_legacy_file_and_raw_trace(tmp_path) -> None:
 
 def test_log_transformed_request_records_trace_even_when_legacy_file_skips(tmp_path) -> None:
     logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+    logger.set_trace_context(session_id="session_1", scope_key="scope_1", classifier="class_a")
     request = {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}
 
-    logger.log_transformed_request(request, dict(request))
+    logger.log_transformed_request(request, dict(request), credential_id="cred_1")
 
     entries = _trace_entries(logger.log_dir)
     assert entries[0]["pass_name"] == "prepared_provider_request"
     assert entries[0]["changed_from_previous"] is False
+    assert entries[0]["credential_id"] == "cred_1"
+    assert entries[0]["session_id"] == "session_1"
+    assert entries[0]["scope_key"] == "scope_1"
+    assert entries[0]["classifier"] == "class_a"
     assert not (logger.log_dir / "request_transformed.json").exists()
 
 
@@ -73,6 +79,7 @@ def test_provider_logger_writes_provider_trace_entries(tmp_path) -> None:
         "provider_error",
     ]
     assert entries[0]["component"] == "provider"
+    assert entries[0]["request_id"] == logger.request_id
     assert entries[0]["data"]["credential_identifier"] == REDACTED
     assert (logger.log_dir / "provider" / "request_payload.json").exists()
 
@@ -106,3 +113,30 @@ def test_transaction_logger_disabled_writes_no_trace(tmp_path) -> None:
 
     assert logger.log_dir is None
     assert not list(tmp_path.iterdir())
+
+
+def test_provider_error_trace_scrubs_header_like_secret_text(tmp_path) -> None:
+    logger = TransactionLogger("gemini_cli", "gemini_cli/gemini-test", parent_dir=tmp_path)
+    provider_logger = ProviderLogger(logger.get_context())
+
+    provider_logger.log_error("upstream failed Authorization: Bearer secret-token")
+
+    entries = _trace_entries(logger.log_dir)
+    assert entries[0]["pass_name"] == "provider_error"
+    assert "secret-token" not in entries[0]["data"]["message"]
+    assert "[REDACTED]" in entries[0]["data"]["message"]
+
+
+def test_log_transform_error_uses_standard_shape_and_scrubs_text(tmp_path) -> None:
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+
+    logger.log_transform_error(
+        "after_field_cache_injection",
+        RuntimeError("bad Authorization: Bearer secret"),
+        payload={"cookie": "sid=secret"},
+    )
+
+    entries = _trace_entries(logger.log_dir)
+    assert entries[0]["pass_name"] == "transform_log_error"
+    assert entries[0]["data"]["failed_pass_name"] == "after_field_cache_injection"
+    assert "secret" not in json.dumps(entries[0]["data"])

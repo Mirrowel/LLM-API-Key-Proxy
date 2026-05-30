@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .transform_trace import TransformTraceWriter
+from .transform_trace import TransformTraceWriter, provider_snapshot_namespace
 from .utils.paths import get_logs_dir
 
 lib_logger = logging.getLogger("rotator_library")
@@ -97,6 +97,18 @@ class TransactionContext:
     model: str
     """Model name (sanitized for filesystem use)."""
 
+    trace_model: Optional[str] = None
+    """Exact model name used in transform trace entries."""
+
+    session_id: Optional[str] = None
+    """Inferred session id for trace correlation, when available."""
+
+    scope_key: Optional[str] = None
+    """Usage scope key for trace correlation, when available."""
+
+    classifier: Optional[str] = None
+    """Classifier/private routing label for trace correlation, when available."""
+
     trace_enabled: bool = False
     """Whether provider loggers should append transform trace entries."""
 
@@ -122,6 +134,10 @@ class TransactionLogger:
         "request_id",
         "provider",
         "model",
+        "trace_model",
+        "session_id",
+        "scope_key",
+        "classifier",
         "streaming",
         "api_format",
         "_dir_available",
@@ -151,6 +167,10 @@ class TransactionLogger:
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())[:8]  # 8-char short ID
         self.provider = provider
+        self.trace_model = model
+        self.session_id: Optional[str] = None
+        self.scope_key: Optional[str] = None
+        self.classifier: Optional[str] = None
         self.api_format = api_format
 
         # Strip provider prefix from model if present
@@ -190,7 +210,8 @@ class TransactionLogger:
                 self.log_dir,
                 component="client",
                 provider=provider,
-                model=self.model,
+                model=self.trace_model,
+                request_id=self.request_id,
                 enabled=True,
             )
         except Exception as e:
@@ -211,9 +232,39 @@ class TransactionLogger:
                 enabled=self.enabled,
                 provider=self.provider,
                 model=self.model,
+                trace_model=self.trace_model,
+                session_id=self.session_id,
+                scope_key=self.scope_key,
+                classifier=self.classifier,
                 trace_enabled=bool(self._trace_writer),
             )
         return self._context
+
+    def set_trace_context(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        scope_key: Optional[str] = None,
+        classifier: Optional[str] = None,
+    ) -> None:
+        """Attach routing/session metadata discovered after logger creation."""
+
+        if session_id is not None:
+            self.session_id = session_id
+        if scope_key is not None:
+            self.scope_key = scope_key
+        if classifier is not None:
+            self.classifier = classifier
+        if self._trace_writer:
+            self._trace_writer.update_context(
+                session_id=self.session_id,
+                scope_key=self.scope_key,
+                classifier=self.classifier,
+            )
+        if self._context:
+            self._context.session_id = self.session_id
+            self._context.scope_key = self.scope_key
+            self._context.classifier = self.classifier
 
     def log_transform_pass(
         self,
@@ -227,6 +278,7 @@ class TransactionLogger:
         transport: Optional[str] = None,
         changed_from_previous: Optional[bool] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        scrub_strings: bool = False,
         snapshot: bool = True,
     ) -> None:
         """Record an additive transform trace entry if tracing is available."""
@@ -243,7 +295,39 @@ class TransactionLogger:
             transport=transport,
             changed_from_previous=changed_from_previous,
             metadata=metadata,
+            scrub_strings=scrub_strings,
             snapshot=snapshot,
+        )
+
+    def log_transform_error(
+        self,
+        failed_pass_name: str,
+        error: BaseException,
+        *,
+        payload: Any = None,
+        stage: str = "client",
+        protocol: Optional[str] = None,
+        transport: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record a standardized transform/logging failure without raising."""
+
+        error_data = {
+            "failed_pass_name": failed_pass_name,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "payload": payload,
+        }
+        self.log_transform_pass(
+            "transform_log_error",
+            error_data,
+            direction="error",
+            stage=stage,
+            protocol=protocol,
+            transport=transport,
+            metadata=metadata,
+            scrub_strings=True,
+            snapshot=False,
         )
 
     def log_request(
@@ -279,6 +363,9 @@ class TransactionLogger:
         self,
         transformed_data: Dict[str, Any],
         original_data: Dict[str, Any],
+        *,
+        credential_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Log the transformed request if it differs from the original.
@@ -310,8 +397,10 @@ class TransactionLogger:
             transformed_data,
             direction="request",
             stage="client",
+            credential_id=credential_id,
             transport="sse" if transformed_data.get("stream") else "http",
             changed_from_previous=changed_from_previous,
+            metadata=metadata,
         )
 
         if changed_from_previous is False:
@@ -655,7 +744,12 @@ class ProviderLogger:
                     context.log_dir,
                     component="provider",
                     provider=context.provider,
-                    model=context.model,
+                    model=context.trace_model or context.model,
+                    request_id=context.request_id,
+                    session_id=context.session_id,
+                    scope_key=context.scope_key,
+                    classifier=context.classifier,
+                    snapshot_namespace=provider_snapshot_namespace(),
                     enabled=True,
                 )
         except Exception as e:
@@ -670,6 +764,7 @@ class ProviderLogger:
         direction: str,
         stage: str = "provider",
         transport: Optional[str] = None,
+        scrub_strings: bool = False,
         snapshot: bool = True,
     ) -> None:
         if not self.enabled or not self._trace_writer:
@@ -680,6 +775,7 @@ class ProviderLogger:
             direction=direction,
             stage=stage,
             transport=transport,
+            scrub_strings=scrub_strings,
             snapshot=snapshot,
         )
 
@@ -740,6 +836,7 @@ class ProviderLogger:
             "provider_error",
             {"timestamp_utc": timestamp, "message": error_message},
             direction="error",
+            scrub_strings=True,
             snapshot=False,
         )
         self._append_text("error.log", f"[{timestamp}] {error_message}\n")
