@@ -270,6 +270,13 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]
     ] = {}
 
+    # Native protocol/adapter declarations introduced for the experimental
+    # protocol stack. Defaults are intentionally no-op so existing providers keep
+    # the LiteLLM-backed execution path until they opt into native protocols.
+    protocol_name: Optional[str] = None
+    adapter_names: Tuple[str, ...] = ()
+    field_cache_rules: Tuple[Any, ...] = ()
+
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -312,6 +319,48 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         OpenAI-compatible tracker behavior.
         """
         return None
+
+    def get_protocol_name(self, model: str = "") -> Optional[str]:
+        """Return the native protocol adapter name this provider prefers.
+
+        Providers may override this method when protocol choice varies by model.
+        Returning ``None`` keeps the current fallback execution behavior. Later
+        provider phases will use this as the bridge from provider declarations to
+        native protocol parsing/building.
+        """
+
+        return self.protocol_name
+
+    def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
+        """Return ordered adapter names for this provider/model.
+
+        The order is significant and is preserved by the adapter chain runner.
+        Providers can override this for model-specific quirks without mutating the
+        global adapter registry.
+        """
+
+        return tuple(self.adapter_names)
+
+    def get_adapter_config(self, model: str = "") -> Dict[str, Dict[str, Any]]:
+        """Return adapter-specific config keyed by adapter name.
+
+        Config is intentionally a plain dict so custom providers can define it in
+        env/JSON later without importing adapter classes. Phase 10 will add formal
+        config loading and validation.
+        """
+
+        return {}
+
+    def get_field_cache_rules(self, model: str = "") -> Tuple[Any, ...]:
+        """Return field-cache rules for provider-specific protocol state.
+
+        Rules preserve provider state such as reasoning content, thought
+        signatures, prompt cache keys, provider session IDs, and response IDs.
+        They are not a replacement for ``SessionTracker``; session tracking still
+        decides continuity and credential affinity.
+        """
+
+        return tuple(self.field_cache_rules)
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
