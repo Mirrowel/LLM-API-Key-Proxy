@@ -5,6 +5,10 @@ import pytest
 from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesWebSocketFormatter
 
 
+def _event_names(events: list[str]) -> list[str]:
+    return [line.removeprefix("event: ") for event in events for line in event.splitlines() if line.startswith("event: ")]
+
+
 class FakeStreamingClient:
     async def acompletion(self, **kwargs):
         async def chunks():
@@ -33,11 +37,14 @@ async def test_stream_response_emits_responses_sse_events_and_stores_final_respo
     events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient())]
 
     event_text = "".join(events)
-    assert "event: response.created" in event_text
-    assert "event: response.output_item.added" in event_text
-    assert "event: response.output_text.delta" in event_text
-    assert "event: response.output_item.done" in event_text
-    assert "event: response.completed" in event_text
+    assert _event_names(events) == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_item.done",
+        "response.completed",
+    ]
     assert event_text.endswith("data: [DONE]\n\n")
 
     response_id = events[0].split('"id": "')[1].split('"')[0]
