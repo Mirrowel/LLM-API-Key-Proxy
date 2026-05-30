@@ -496,6 +496,10 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `ROTATION_TOLERANCE` | `0.0`=deterministic, `3.0`=weighted random (default) |
 | `CONCURRENCY_MULTIPLIER_<PROVIDER>_PRIORITY_<N>` | Concurrency multiplier per priority tier |
 | `QUOTA_GROUPS_<PROVIDER>_<GROUP>` | Models sharing quota limits |
+| `SESSION_STICKY_WAIT_SECONDS[_<PROVIDER>]` | Sequential-mode wait for a session-bound key blocked only by concurrency |
+| `SESSION_STICKY_ENTRY_TTL_SECONDS[_<PROVIDER>]` | TTL for in-memory session-to-credential sticky entries |
+| `SESSION_STICKY_MAX_ENTRIES[_<PROVIDER>]` | Max in-memory sequential sticky entries before LRU pruning |
+| `TRUSTED_SESSION_ID_FIELDS` | Comma-separated explicit request ID fields to trust as strong evidence; unset by default |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
@@ -569,6 +573,23 @@ ROTATION_MODE_GEMINI=sequential
 
 # balanced: Distribute load evenly - opt in for per-minute rate limits
 ROTATION_MODE_OPENAI=balanced
+```
+
+### Session Stickiness
+
+Sequential mode can keep related chat requests on the same credential when the session tracker has enough scoped evidence. Tracking is provider/model/scope-bound, so classifier/private credential pools do not share sticky sessions.
+
+```env
+# Wait up to 15s for a session-bound credential if it is only busy by concurrency.
+SESSION_STICKY_WAIT_SECONDS=15
+SESSION_STICKY_WAIT_SECONDS_GEMINI_CLI=15
+
+# Bound the in-memory sticky session cache.
+SESSION_STICKY_ENTRY_TTL_SECONDS=3600
+SESSION_STICKY_MAX_ENTRIES=10000
+
+# Optional and conservative: only set this if your clients send stable IDs.
+TRUSTED_SESSION_ID_FIELDS="conversation_id,thread_id"
 ```
 
 ### Priority Multipliers

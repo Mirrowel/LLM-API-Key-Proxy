@@ -70,10 +70,23 @@ class RequestContextBuilder:
         hook = getattr(plugin, "get_session_tracking_hints", None) if plugin else None
         if not hook:
             return None
-        result = hook(kwargs, model=model)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
+        try:
+            result = hook(kwargs, model=model)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except Exception as exc:
+            # Hints are optional evidence. A provider bug here should not prevent
+            # request construction or credential routing.
+            import logging
+
+            logging.getLogger("rotator_library").debug(
+                "Provider session tracking hints failed for %s/%s: %s",
+                provider,
+                model,
+                exc,
+            )
+            return None
 
     async def build_completion_context(
         self,
@@ -117,6 +130,7 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=resolved_model,
+            scope_key=scope["usage_manager_key"],
             hints=await self._get_session_hints(provider, resolved_model, kwargs),
         )
 
@@ -132,6 +146,7 @@ class RequestContextBuilder:
             session_tracker=self._session_tracker,
             session_possible_compaction=session.possible_compaction,
             session_lineage_parent_id=session.lineage_parent_session_id,
+            session_tracking_namespace=session.tracking_namespace,
             request=request,
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,
@@ -169,6 +184,7 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=model,
+            scope_key=scope["usage_manager_key"],
             hints=await self._get_session_hints(provider, model, kwargs),
         )
 
@@ -184,6 +200,7 @@ class RequestContextBuilder:
             session_tracker=self._session_tracker,
             session_possible_compaction=session.possible_compaction,
             session_lineage_parent_id=session.lineage_parent_session_id,
+            session_tracking_namespace=session.tracking_namespace,
             request=request,
             pre_request_callback=pre_request_callback,
             usage_manager_key=scope["usage_manager_key"],

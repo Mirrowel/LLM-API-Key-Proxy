@@ -139,4 +139,6 @@ cache/antigravity/thought_signatures.json
 !tests/
 tests/*
 !tests/test_classifier_scoped_routing.py
+!tests/test_session_tracking.py
+!tests/test_selection_engine.py
 docs/ignored/

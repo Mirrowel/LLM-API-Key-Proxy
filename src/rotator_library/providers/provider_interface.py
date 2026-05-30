@@ -194,6 +194,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # only by concurrency. Providers with expensive context caching can increase
     # this; latency-sensitive providers can lower it or set it to 0.
     default_session_sticky_wait_seconds: Optional[float] = None
+    default_session_sticky_entry_ttl_seconds: Optional[int] = None
+    default_session_sticky_max_entries: Optional[int] = None
 
     # =========================================================================
     # FAIR CYCLE ROTATION - Override in subclass

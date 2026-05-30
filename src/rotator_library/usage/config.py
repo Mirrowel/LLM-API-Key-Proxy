@@ -521,6 +521,8 @@ class ProviderUsageConfig:
     # is only blocked by concurrency. Configuring this keeps cache-locality
     # deployments from forcing the same latency tradeoff on low-latency ones.
     session_sticky_wait_seconds: float = 15.0
+    session_sticky_entry_ttl_seconds: int = 3600
+    session_sticky_max_entries: int = 10000
 
     def get_effective_multiplier(self, priority: int) -> int:
         """
@@ -684,6 +686,16 @@ def load_provider_usage_config(
             if sticky_wait is not None:
                 config.session_sticky_wait_seconds = max(0.0, float(sticky_wait))
 
+        if hasattr(plugin_class, "default_session_sticky_entry_ttl_seconds"):
+            sticky_ttl = plugin_class.default_session_sticky_entry_ttl_seconds
+            if sticky_ttl is not None:
+                config.session_sticky_entry_ttl_seconds = max(1, int(sticky_ttl))
+
+        if hasattr(plugin_class, "default_session_sticky_max_entries"):
+            sticky_max = plugin_class.default_session_sticky_max_entries
+            if sticky_max is not None:
+                config.session_sticky_max_entries = max(100, int(sticky_max))
+
         # Fair cycle
         if hasattr(plugin_class, "default_fair_cycle_config"):
             fc_config = plugin_class.default_fair_cycle_config
@@ -799,6 +811,28 @@ def load_provider_usage_config(
         except ValueError:
             lib_logger.warning(
                 f"Invalid session sticky wait value '{env_sticky_wait}'. Keeping default."
+            )
+
+    env_sticky_ttl = os.getenv(f"SESSION_STICKY_ENTRY_TTL_SECONDS_{provider_upper}")
+    if env_sticky_ttl is None:
+        env_sticky_ttl = os.getenv("SESSION_STICKY_ENTRY_TTL_SECONDS")
+    if env_sticky_ttl:
+        try:
+            config.session_sticky_entry_ttl_seconds = max(1, int(env_sticky_ttl))
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid session sticky entry TTL value '{env_sticky_ttl}'. Keeping default."
+            )
+
+    env_sticky_max = os.getenv(f"SESSION_STICKY_MAX_ENTRIES_{provider_upper}")
+    if env_sticky_max is None:
+        env_sticky_max = os.getenv("SESSION_STICKY_MAX_ENTRIES")
+    if env_sticky_max:
+        try:
+            config.session_sticky_max_entries = max(100, int(env_sticky_max))
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid session sticky max entries value '{env_sticky_max}'. Keeping default."
             )
 
     provider_optimal_var = f"OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_{provider_upper}"

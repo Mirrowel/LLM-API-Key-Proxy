@@ -974,7 +974,25 @@ Two rotation strategies are available per provider:
 # Set per provider
 ROTATION_MODE_GEMINI=sequential
 ROTATION_MODE_OPENAI=balanced
+
+# Optional sequential session-stickiness controls
+SESSION_STICKY_WAIT_SECONDS=15
+SESSION_STICKY_ENTRY_TTL_SECONDS=3600
+SESSION_STICKY_MAX_ENTRIES=10000
 ```
+
+#### Session Stickiness
+
+Sequential routing uses scoped session evidence to keep related chat requests on
+the same credential where possible. Evidence is always bound to the resolved
+credential scope, provider, and model/session scope, so classifier/private scopes
+do not share sticky sessions. Explicit request IDs are weak by default because
+some clients generate random IDs per request; set `TRUSTED_SESSION_ID_FIELDS` only
+when the client-provided fields are known stable.
+
+Provider plugins may implement `get_session_tracking_hints()` to contribute
+provider-specific anchors or a provider session scope. The hook supplies evidence
+only; credential selection remains centralized in the rotator.
 
 #### Per-Model Quota Tracking
 

@@ -25,7 +25,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -48,6 +50,8 @@ class SessionAnchor:
 
     value: str
     strength: str = "medium"  # "strong", "medium", or "weak"
+    source: str = "generic"
+    group: Optional[str] = None
 
 
 @dataclass
@@ -81,6 +85,7 @@ class SessionInference:
     match_score: int = 0
     possible_compaction: bool = False
     lineage_parent_session_id: Optional[str] = None
+    tracking_namespace: Optional[str] = None
 
 
 @dataclass
@@ -98,6 +103,8 @@ class _AnchorRecord:
     session_id: str
     namespace: str
     strength: str
+    source: str
+    group: Optional[str]
     expires_at: float
     last_seen: float
 
@@ -109,16 +116,28 @@ class _MatchCandidate:
     strong_matches: int = 0
     medium_matches: int = 0
     weak_matches: int = 0
+    medium_groups: set[str] = field(default_factory=set)
+    provider_matches: int = 0
+    response_matches: int = 0
 
     @property
     def confidence(self) -> str:
-        if self.strong_matches > 0 or self.score >= 100:
+        if self.strong_matches > 0:
             return "strong"
-        if self.score >= 70 and self.medium_matches >= 2:
+        if self.score >= 70 and self.medium_matches >= 2 and self.has_diverse_medium_evidence:
             return "probable"
         if self.score > 0:
             return "weak"
         return "none"
+
+    @property
+    def has_diverse_medium_evidence(self) -> bool:
+        """Avoid treating one repeated long prompt as a whole conversation."""
+        return (
+            len(self.medium_groups) >= 2
+            or self.provider_matches > 0
+            or self.response_matches > 0
+        )
 
     @property
     def is_sticky_match(self) -> bool:
@@ -147,6 +166,7 @@ class SessionTracker:
         persistence_flush_interval_seconds: float = 5.0,
         max_anchor_records: int = 10000,
         max_anchors_per_session: int = 256,
+        trusted_explicit_fields: Optional[Iterable[str]] = None,
     ) -> None:
         self.ttl_seconds = max(1, ttl_seconds)
         self.persist_to_disk = persist_to_disk
@@ -154,11 +174,15 @@ class SessionTracker:
         self.persistence_flush_interval_seconds = max(0.0, persistence_flush_interval_seconds)
         self.max_anchor_records = max(100, max_anchor_records)
         self.max_anchors_per_session = max(16, max_anchors_per_session)
+        if trusted_explicit_fields is None:
+            trusted_explicit_fields = self._trusted_fields_from_env()
+        self.trusted_explicit_fields = {field for field in trusted_explicit_fields if field}
         self._anchors: Dict[str, _AnchorRecord] = {}
         self._sessions: Dict[str, _SessionState] = {}
         self._dirty = False
         self._last_save_attempt = 0.0
         self._writer: Optional[ResilientStateWriter] = None
+        self._lock = threading.RLock()
         if self.persist_to_disk:
             self._load()
             if self.persistence_path:
@@ -178,16 +202,41 @@ class SessionTracker:
         *,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        scope_key: Optional[str] = None,
         hints: Optional[Any] = None,
     ) -> SessionInference:
         """Infer live session and deterministic affinity from a request payload."""
+        with self._lock:
+            return self._infer_session_locked(
+                request_data,
+                provider=provider,
+                model=model,
+                scope_key=scope_key,
+                hints=hints,
+            )
+
+    def _infer_session_locked(
+        self,
+        request_data: Dict[str, Any],
+        *,
+        provider: Optional[str],
+        model: Optional[str],
+        scope_key: Optional[str],
+        hints: Optional[Any],
+    ) -> SessionInference:
         now = time.time()
         self._prune(now)
 
-        namespace = self._namespace(provider, model)
+        hints = self._coerce_hints(hints)
+        namespace = self._namespace(
+            provider,
+            model,
+            scope_key=scope_key,
+            session_scope=hints.session_scope if hints else None,
+        )
         anchors = self._build_anchors(request_data, namespace, hints)
         if not anchors:
-            return SessionInference(session_id=None)
+            return SessionInference(session_id=None, tracking_namespace=namespace)
 
         match = self._best_match(anchors, namespace, now)
         possible_compaction = self._looks_like_compaction(request_data)
@@ -210,6 +259,7 @@ class SessionTracker:
                 confidence=match.confidence,
                 match_score=match.score,
                 possible_compaction=possible_compaction,
+                tracking_namespace=namespace,
             )
 
         parent_id = match.session_id if match and possible_compaction else None
@@ -235,6 +285,7 @@ class SessionTracker:
             match_score=match.score if match else 0,
             possible_compaction=possible_compaction,
             lineage_parent_session_id=parent_id,
+            tracking_namespace=namespace,
         )
 
     def record_response(
@@ -243,6 +294,8 @@ class SessionTracker:
         *,
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        scope_key: Optional[str] = None,
+        tracking_namespace: Optional[str] = None,
         response: Any = None,
     ) -> None:
         """Attach response-derived anchors to an existing live session.
@@ -251,17 +304,19 @@ class SessionTracker:
         call emitted by it. Recording those anchors makes tracking resilient to
         gradual context pruning without needing a dedicated compaction protocol.
         """
-        if not session_id or response is None or session_id not in self._sessions:
-            return
-        now = time.time()
-        namespace = self._namespace(provider, model)
-        anchors = self._anchors_from_response(response, namespace)
-        if anchors:
-            self._refresh_and_bridge(session_id, namespace, anchors, now)
+        with self._lock:
+            if not session_id or response is None or session_id not in self._sessions:
+                return
+            now = time.time()
+            namespace = tracking_namespace or self._namespace(provider, model, scope_key=scope_key)
+            anchors = self._anchors_from_response(response, namespace)
+            if anchors:
+                self._refresh_and_bridge(session_id, namespace, anchors, now)
 
     def flush(self) -> None:
         """Force persistence of dirty state when optional disk storage is enabled."""
-        self._save(force=True)
+        with self._lock:
+            self._save(force=True)
 
     def _create_session(
         self,
@@ -309,6 +364,8 @@ class SessionTracker:
                 session_id=session_id,
                 namespace=namespace,
                 strength=anchor.strength,
+                source=anchor.source,
+                group=anchor.group,
                 expires_at=expires_at,
                 last_seen=now,
             )
@@ -338,6 +395,13 @@ class SessionTracker:
             elif strength == "medium":
                 candidate.score += self._MEDIUM_SCORE
                 candidate.medium_matches += 1
+                group = anchor.group or record.group
+                if group and anchor.source != "window" and record.source != "window":
+                    candidate.medium_groups.add(group)
+                if anchor.source == "provider" or record.source == "provider":
+                    candidate.provider_matches += 1
+                if anchor.source == "response" or record.source == "response":
+                    candidate.response_matches += 1
             else:
                 candidate.score += self._WEAK_SCORE
                 candidate.weak_matches += 1
@@ -345,6 +409,21 @@ class SessionTracker:
         if not candidates:
             return None
         return max(candidates.values(), key=lambda item: item.score)
+
+    def _coerce_hints(self, hints: Optional[Any]) -> Optional[SessionTrackingHints]:
+        if not hints:
+            return None
+        if isinstance(hints, SessionTrackingHints):
+            return hints
+        if isinstance(hints, dict):
+            return SessionTrackingHints(
+                strong_anchors=list(hints.get("strong_anchors") or []),
+                medium_anchors=list(hints.get("medium_anchors") or []),
+                weak_anchors=list(hints.get("weak_anchors") or []),
+                affinity_key=hints.get("affinity_key"),
+                session_scope=hints.get("session_scope"),
+            )
+        return None
 
     def _build_anchors(
         self,
@@ -364,18 +443,11 @@ class SessionTracker:
 
     def _anchors_from_provider_hints(
         self,
-        hints: Optional[Any],
+        hints: Optional[SessionTrackingHints],
         namespace: str,
     ) -> List[SessionAnchor]:
         if not hints:
             return []
-        if isinstance(hints, dict):
-            hints = SessionTrackingHints(
-                strong_anchors=list(hints.get("strong_anchors") or []),
-                medium_anchors=list(hints.get("medium_anchors") or []),
-                weak_anchors=list(hints.get("weak_anchors") or []),
-                affinity_key=hints.get("affinity_key"),
-            )
         anchors: List[SessionAnchor] = []
         for strength, attr in (
             ("strong", "strong_anchors"),
@@ -383,10 +455,24 @@ class SessionTracker:
             ("weak", "weak_anchors"),
         ):
             for value in getattr(hints, attr, []) or []:
-                anchors.append(SessionAnchor(self._scoped(namespace, f"provider:{value}"), strength))
+                anchors.append(
+                    SessionAnchor(
+                        self._scoped(namespace, f"provider:{value}"),
+                        strength,
+                        source="provider",
+                        group=f"provider:{value}",
+                    )
+                )
         affinity_key = getattr(hints, "affinity_key", None)
         if affinity_key:
-            anchors.append(SessionAnchor(self._scoped(namespace, f"provider_affinity:{affinity_key}"), "strong"))
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, f"provider_affinity:{affinity_key}"),
+                    "strong",
+                    source="provider",
+                    group="provider_affinity",
+                )
+            )
         return anchors
 
     def _anchors_from_explicit_ids(
@@ -408,13 +494,23 @@ class SessionTracker:
         ):
             value = request_data.get(key)
             if value:
-                anchors.append(SessionAnchor(self._scoped(namespace, f"explicit:{key}:{value}"), "weak"))
+                strength = "strong" if key in self.trusted_explicit_fields else "weak"
+                anchors.append(
+                    SessionAnchor(
+                        self._scoped(namespace, f"explicit:{key}:{value}"),
+                        strength,
+                        source="explicit",
+                        group=f"explicit:{key}",
+                    )
+                )
         return anchors
 
     def _anchors_from_messages(
         self,
         messages: List[Dict[str, Any]],
         namespace: str,
+        *,
+        source: str = "message",
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
         normalized_messages: List[Dict[str, Any]] = []
@@ -434,7 +530,14 @@ class SessionTracker:
                 tool_id = str(tool_call_id)
                 tool_ids.append(tool_id)
                 normalized["tool_call_id"] = tool_id
-                anchors.append(SessionAnchor(self._scoped(namespace, f"tool:{tool_id}"), "strong"))
+                anchors.append(
+                    SessionAnchor(
+                        self._scoped(namespace, f"tool:{tool_id}"),
+                        "strong",
+                        source="tool",
+                        group=f"tool:{tool_id}",
+                    )
+                )
 
             tool_calls = message.get("tool_calls") or []
             if isinstance(tool_calls, list) and tool_calls:
@@ -447,7 +550,14 @@ class SessionTracker:
                         call_id = str(call_id)
                         call_ids.append(call_id)
                         tool_ids.append(call_id)
-                        anchors.append(SessionAnchor(self._scoped(namespace, f"tool:{call_id}"), "strong"))
+                        anchors.append(
+                            SessionAnchor(
+                                self._scoped(namespace, f"tool:{call_id}"),
+                                "strong",
+                                source="tool",
+                                group=f"tool:{call_id}",
+                            )
+                        )
                 if call_ids:
                     normalized["tool_calls"] = call_ids
 
@@ -460,10 +570,19 @@ class SessionTracker:
                         SessionAnchor(
                             self._scoped(namespace, f"message:{role}:{self._hash_text(normalized_text)}"),
                             "medium",
+                            source=source,
+                            group=f"{source}:{index}",
                         )
                     )
                     for chunk_hash in self._content_chunk_hashes(normalized_text):
-                        anchors.append(SessionAnchor(self._scoped(namespace, f"chunk:{chunk_hash}"), "medium"))
+                        anchors.append(
+                            SessionAnchor(
+                                self._scoped(namespace, f"chunk:{chunk_hash}"),
+                                "medium",
+                                source=source,
+                                group=f"{source}:{index}",
+                            )
+                        )
 
             # Positional message hashes are intentionally medium: they are useful
             # when history is unchanged, but pruning can move or remove them.
@@ -471,13 +590,34 @@ class SessionTracker:
                 normalized_messages.append(normalized)
 
         if tool_ids:
-            anchors.append(SessionAnchor(self._scoped(namespace, "tool_group:" + self._hash_json(sorted(tool_ids))), "strong"))
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, "tool_group:" + self._hash_json(sorted(tool_ids))),
+                    "strong",
+                    source="tool",
+                    group="tool_group",
+                )
+            )
 
         if normalized_messages:
-            anchors.append(SessionAnchor(self._scoped(namespace, "window:" + self._hash_json(normalized_messages)), "medium"))
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, "window:" + self._hash_json(normalized_messages)),
+                    "medium",
+                    source="window",
+                    group=None,
+                )
+            )
 
         if first_user_text:
-            anchors.append(SessionAnchor(self._scoped(namespace, "first_user:" + self._hash_text(first_user_text)), "weak"))
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, "first_user:" + self._hash_text(first_user_text)),
+                    "weak",
+                    source="first_user",
+                    group="first_user",
+                )
+            )
 
         return anchors
 
@@ -494,7 +634,7 @@ class SessionTracker:
                 response_message = dict(message)
                 response_message.setdefault("role", "assistant")
                 messages.append(response_message)
-        return self._anchors_from_messages(messages, namespace) if messages else []
+        return self._anchors_from_messages(messages, namespace, source="response") if messages else []
 
     def _affinity_from_anchors(
         self,
@@ -504,8 +644,17 @@ class SessionTracker:
         strong = sorted(anchor.value for anchor in anchors if anchor.strength == "strong")
         if strong:
             return self._scoped(namespace, "affinity:" + self._hash_json(strong[:4]))
-        medium = sorted(anchor.value for anchor in anchors if anchor.strength == "medium")
-        if len(medium) >= 2:
+        medium_anchors = [anchor for anchor in anchors if anchor.strength == "medium"]
+        medium_groups = {
+            anchor.group
+            for anchor in medium_anchors
+            if anchor.group and anchor.source != "window"
+        }
+        has_provider_or_response = any(
+            anchor.source in {"provider", "response"} for anchor in medium_anchors
+        )
+        medium = sorted(anchor.value for anchor in medium_anchors)
+        if len(medium) >= 2 and (len(medium_groups) >= 2 or has_provider_or_response):
             return self._scoped(namespace, "affinity:" + self._hash_json(medium[:8]))
         return None
 
@@ -513,13 +662,22 @@ class SessionTracker:
         messages = request_data.get("messages") or []
         if not isinstance(messages, list) or not messages:
             return False
-        joined = "\n".join(self._extract_text(message.get("content")) for message in messages[:4] if isinstance(message, dict))
+        summary_texts: List[str] = []
+        for message in messages[:2]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).lower()
+            if role not in {"system", "developer"}:
+                continue
+            summary_texts.append(self._extract_text(message.get("content")))
+        joined = "\n".join(summary_texts)
         lowered = joined.lower()
         markers = (
-            "summary",
-            "summarized",
-            "compressed",
-            "compacted",
+            "summary of previous conversation",
+            "summary of the previous conversation",
+            "summarized conversation",
+            "compressed context",
+            "compacted context",
             "conversation so far",
             "previous conversation",
             "context reminder",
@@ -531,7 +689,7 @@ class SessionTracker:
             return
         sorted_anchors = sorted(
             state.anchors,
-            key=lambda value: self._anchors.get(value, _AnchorRecord("", "", "weak", 0, 0)).last_seen,
+            key=lambda value: self._anchors.get(value, _AnchorRecord("", "", "weak", "", None, 0, 0)).last_seen,
         )
         for value in sorted_anchors[: len(state.anchors) - self.max_anchors_per_session]:
             state.anchors.discard(value)
@@ -569,8 +727,13 @@ class SessionTracker:
         if not isinstance(data, dict):
             return
         now = time.time()
-        sessions = data.get("sessions", {}) if "sessions" in data else {}
-        anchors = data.get("anchors", {}) if "anchors" in data else data
+        if "sessions" not in data and "anchors" not in data:
+            lib_logger.info(
+                "Ignoring legacy session_stickiness.json format; session persistence will rebuild in memory."
+            )
+            return
+        sessions = data.get("sessions", {})
+        anchors = data.get("anchors", {})
         for session_id, payload in sessions.items():
             if not isinstance(payload, dict):
                 continue
@@ -597,6 +760,8 @@ class SessionTracker:
                 session_id=session_id,
                 namespace=namespace,
                 strength=str(payload.get("strength") or "medium"),
+                source=str(payload.get("source") or "generic"),
+                group=payload.get("group"),
                 expires_at=expires_at,
                 last_seen=float(payload.get("last_seen", now)),
             )
@@ -628,6 +793,8 @@ class SessionTracker:
                     "session_id": record.session_id,
                     "namespace": record.namespace,
                     "strength": record.strength,
+                    "source": record.source,
+                    "group": record.group,
                     "expires_at": record.expires_at,
                     "last_seen": record.last_seen,
                 }
@@ -646,10 +813,24 @@ class SessionTracker:
     def _mark_dirty(self) -> None:
         self._dirty = True
 
-    def _namespace(self, provider: Optional[str], model: Optional[str]) -> str:
+    def _namespace(
+        self,
+        provider: Optional[str],
+        model: Optional[str],
+        *,
+        scope_key: Optional[str] = None,
+        session_scope: Optional[str] = None,
+    ) -> str:
+        # The resolved usage/classifier scope is part of the namespace so sticky
+        # evidence never leaks between private/classifier-scoped credential pools.
+        allowed_scope = scope_key or "default"
         provider_key = provider or "global"
-        model_key = model or "default"
-        return f"provider:{provider_key}:model:{model_key}"
+        model_key = session_scope or model or "default"
+        return f"scope:{allowed_scope}:provider:{provider_key}:model:{model_key}"
+
+    def _trusted_fields_from_env(self) -> List[str]:
+        raw = os.getenv("TRUSTED_SESSION_ID_FIELDS", "")
+        return [part.strip() for part in raw.split(",") if part.strip()]
 
     def _scoped(self, namespace: str, value: str) -> str:
         return f"{namespace}:{value}"
@@ -722,10 +903,11 @@ class SessionTracker:
         return hashlib.sha256(self._normalize_text(text).encode("utf-8")).hexdigest()
 
     def _dedupe_anchors(self, anchors: Iterable[SessionAnchor]) -> List[SessionAnchor]:
-        best: Dict[str, str] = {}
+        best: Dict[str, SessionAnchor] = {}
         for anchor in anchors:
             if not anchor.value:
                 continue
             current = best.get(anchor.value)
-            best[anchor.value] = anchor.strength if current is None else self._strongest(current, anchor.strength)
-        return [SessionAnchor(value, strength) for value, strength in best.items()]
+            if current is None or self._strongest(anchor.strength, current.strength) == anchor.strength:
+                best[anchor.value] = anchor
+        return list(best.values())

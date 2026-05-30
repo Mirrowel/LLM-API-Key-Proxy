@@ -10,12 +10,20 @@ Good for providers that benefit from request caching.
 
 import hashlib
 import logging
+import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from ...types import CredentialState, SelectionContext, RotationMode
 from ....error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+@dataclass
+class _StickyEntry:
+    credential: str
+    last_seen: float
 
 
 class SequentialStrategy:
@@ -29,7 +37,12 @@ class SequentialStrategy:
     credential benefit from caching (e.g., context caching in LLMs).
     """
 
-    def __init__(self, fallback_multiplier: int = 1):
+    def __init__(
+        self,
+        fallback_multiplier: int = 1,
+        sticky_entry_ttl_seconds: int = 3600,
+        max_sticky_entries: int = 10000,
+    ):
         """
         Initialize sequential strategy.
 
@@ -38,8 +51,10 @@ class SequentialStrategy:
                 when not explicitly configured
         """
         self.fallback_multiplier = fallback_multiplier
+        self.sticky_entry_ttl_seconds = max(1, sticky_entry_ttl_seconds)
+        self.max_sticky_entries = max(100, max_sticky_entries)
         # Track current "sticky" credential per model session or model-group fallback.
-        self._current: Dict[tuple, str] = {}
+        self._current: Dict[tuple, _StickyEntry] = {}
 
     @property
     def name(self) -> str:
@@ -70,6 +85,9 @@ class SequentialStrategy:
         if not context.candidates:
             return None
 
+        now = time.time()
+        self._prune_sticky(now)
+
         if len(context.candidates) == 1:
             return context.candidates[0]
 
@@ -78,8 +96,9 @@ class SequentialStrategy:
 
         # Check if current sticky credential is still available
         current = self._current.get(key)
-        if current and current in context.candidates:
-            return current
+        if current and current.credential in context.candidates:
+            current.last_seen = now
+            return current.credential
 
         if context.session_id:
             selected = self._select_initial_for_session(
@@ -98,7 +117,8 @@ class SequentialStrategy:
 
         # Make it sticky
         if selected:
-            self._current[key] = selected
+            self._current[key] = _StickyEntry(selected, now)
+            self._trim_sticky()
             masked = (
                 mask_credential(states[selected].accessor, style="full")
                 if selected in states
@@ -149,7 +169,7 @@ class SequentialStrategy:
             key for key in self._current if key[0] == provider and key[1] == model_or_group
         ]
         for key in keys_to_remove:
-            old = self._current[key]
+            old = self._current[key].credential
             del self._current[key]
             lib_logger.debug(
                 f"Sequential: marked {mask_credential(old, style='full')} exhausted for {key}"
@@ -172,7 +192,29 @@ class SequentialStrategy:
             Current sticky credential stable_id, or None
         """
         key = (provider, model_or_group, session_id or "__default__")
-        return self._current.get(key)
+        entry = self._current.get(key)
+        if not entry:
+            return None
+        if time.time() - entry.last_seen > self.sticky_entry_ttl_seconds:
+            del self._current[key]
+            return None
+        return entry.credential
+
+    def _prune_sticky(self, now: float) -> None:
+        expired = [
+            key
+            for key, entry in self._current.items()
+            if now - entry.last_seen > self.sticky_entry_ttl_seconds
+        ]
+        for key in expired:
+            del self._current[key]
+
+    def _trim_sticky(self) -> None:
+        if len(self._current) <= self.max_sticky_entries:
+            return
+        overage = len(self._current) - self.max_sticky_entries
+        for key, _entry in sorted(self._current.items(), key=lambda item: item[1].last_seen)[:overage]:
+            del self._current[key]
 
     def _select_by_priority(
         self,

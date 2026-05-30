@@ -56,7 +56,11 @@ class SelectionEngine:
 
         # Initialize strategies
         self._balanced = BalancedStrategy(config.rotation_tolerance)
-        self._sequential = SequentialStrategy(config.sequential_fallback_multiplier)
+        self._sequential = SequentialStrategy(
+            config.sequential_fallback_multiplier,
+            sticky_entry_ttl_seconds=config.session_sticky_entry_ttl_seconds,
+            max_sticky_entries=config.session_sticky_max_entries,
+        )
 
         # Current strategy
         if config.rotation_mode == RotationMode.SEQUENTIAL:
