@@ -27,3 +27,18 @@ class NativeHTTPTransport:
         if hasattr(response, "json"):
             return response.json()
         return response
+
+    async def stream_json_lines(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any]):
+        """Yield provider stream chunks from an injected streaming-capable client.
+
+        Tests and provider-specific clients can expose `stream_json_lines()` to
+        avoid binding this foundation to one HTTP client's streaming API. A later
+        streaming phase can add richer `httpx.stream()` support without changing
+        native provider executor semantics.
+        """
+
+        if hasattr(self.client, "stream_json_lines"):
+            async for chunk in self.client.stream_json_lines(endpoint, headers=headers, json=payload):
+                yield chunk
+            return
+        raise NotImplementedError("Injected native HTTP client does not expose stream_json_lines")
