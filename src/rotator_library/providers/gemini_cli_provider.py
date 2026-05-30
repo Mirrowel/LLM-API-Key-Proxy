@@ -13,6 +13,7 @@ from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
 from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .gemini_auth_base import GeminiAuthBase
 from .provider_cache import ProviderCache
+from ..field_cache import FieldCacheInjection, FieldCacheRule
 from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
 from .utilities.gemini_shared_utils import (
     env_bool,
@@ -155,6 +156,24 @@ class GeminiCliProvider(
 
     # Provider name for env var lookups (QUOTA_GROUPS_GEMINI_CLI_*)
     provider_env_name: str = "gemini_cli"
+
+    # Native protocol declarations for the Phase 5 opt-in execution seam. The
+    # existing custom Gemini CLI execution path remains active; these metadata
+    # hooks let future native routing reuse the Gemini protocol and field-cache
+    # engine without rewriting this provider first.
+    protocol_name: str = "gemini"
+    adapter_names: tuple[str, ...] = ()
+    field_cache_rules = (
+        FieldCacheRule(
+            name="gemini_cli_thought_signature",
+            source="response",
+            path="candidates.*.content.parts.*.thoughtSignature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "mirror existing Gemini CLI thoughtSignature preservation in the native cache seam"},
+        ),
+    )
 
     # Tier name -> priority mapping (from centralized tier utilities)
     # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
