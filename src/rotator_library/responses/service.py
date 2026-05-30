@@ -7,13 +7,25 @@ from __future__ import annotations
 
 import time
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from ..protocols import ProtocolContext
 from ..protocols.responses import ResponsesProtocol
 from .bridge import ResponsesBridge
 from .store import InMemoryResponsesStore, ResponsesStore
+from .streaming import (
+    ResponsesSSEFormatter,
+    ResponsesStreamState,
+    output_item_added_payload,
+    output_item_done_payload,
+    output_text_delta_payload,
+    parse_chat_sse_chunk,
+    response_completed_payload,
+    response_created_payload,
+    response_failed_payload,
+)
 from .types import StoredResponse
+from .types import generate_response_id
 
 
 class ResponsesServiceError(ValueError):
@@ -88,6 +100,85 @@ class ResponsesService:
 
         self._trace(transaction_logger, "final_responses_response", response_payload, direction="response", stage="final")
         return response_payload
+
+    async def stream_response(
+        self,
+        raw_request: dict[str, Any],
+        client: Any,
+        *,
+        request: Optional[Any] = None,
+        transaction_logger: Optional[Any] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a Responses API request as HTTP SSE events."""
+
+        if not raw_request.get("model"):
+            raise ResponsesServiceError("'model' is required", status_code=400)
+        formatter = ResponsesSSEFormatter()
+        stream_request = dict(raw_request)
+        stream_request["stream"] = True
+        self._trace(transaction_logger, "raw_responses_request", stream_request, direction="request", stage="client")
+        unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport="sse"))
+        self._trace(transaction_logger, "parsed_unified_request", unified.to_dict(), direction="request", stage="protocol")
+        parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
+        chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+        bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
+        chat_kwargs["stream"] = True
+        self._trace(
+            transaction_logger,
+            "responses_bridge_chat_request",
+            chat_kwargs,
+            direction="request",
+            stage="adapter",
+            metadata={"bridge_metadata": bridge_metadata, "transport": "sse"},
+        )
+
+        response_id = generate_response_id()
+        state = ResponsesStreamState(response_id=response_id, model=unified.model)
+        usage = None
+        item_started = False
+        yield formatter.format_event("response.created", response_created_payload(response_id, unified.model))
+        try:
+            chat_stream = await client.acompletion(request=request, **chat_kwargs)
+            async for raw_chunk in chat_stream:
+                self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
+                chunk = parse_chat_sse_chunk(raw_chunk)
+                if not chunk or chunk.get("type") == "done":
+                    continue
+                self._trace(transaction_logger, "parsed_unified_stream_event", chunk, direction="stream", stage="protocol")
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                delta = _chunk_text_delta(chunk)
+                if not delta:
+                    continue
+                if not item_started:
+                    item_started = True
+                    added = output_item_added_payload(state)
+                    self._trace(transaction_logger, "formatted_responses_stream_event", added, direction="stream", stage="final")
+                    yield formatter.format_event("response.output_item.added", added)
+                state = ResponsesStreamState(
+                    response_id=state.response_id,
+                    model=state.model,
+                    output_text=state.output_text + delta,
+                    output_item_id=state.output_item_id,
+                )
+                event = output_text_delta_payload(state, delta)
+                self._trace(transaction_logger, "formatted_responses_stream_event", event, direction="stream", stage="final")
+                yield formatter.format_event("response.output_text.delta", event)
+
+            if not item_started:
+                yield formatter.format_event("response.output_item.added", output_item_added_payload(state))
+            done_item = output_item_done_payload(state)
+            yield formatter.format_event("response.output_item.done", done_item)
+            completed = response_completed_payload(state, _usage_to_responses_stream(usage))
+            await self._store_stream_response(stream_request, completed, parent)
+            self._trace(transaction_logger, "stored_responses_stream_response", completed, direction="metadata", stage="final")
+            yield formatter.format_event("response.completed", completed)
+            yield formatter.done()
+        except Exception as exc:
+            failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
+            self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
+            yield formatter.format_event("response.failed", failed)
+            yield formatter.done()
 
     async def get_response(self, response_id: str) -> dict[str, Any]:
         """Return a stored response payload or raise a 404-compatible error."""
@@ -184,9 +275,45 @@ class ResponsesService:
             metadata=metadata or {},
         )
 
+    @staticmethod
+    def _log_transform_error(transaction_logger: Optional[Any], pass_name: str, error: BaseException, payload: Any) -> None:
+        if transaction_logger:
+            transaction_logger.log_transform_error(pass_name, error, payload=payload, stage="adapter", protocol="responses")
+
+    async def _store_stream_response(
+        self,
+        raw_request: dict[str, Any],
+        response_payload: dict[str, Any],
+        parent: Optional[StoredResponse],
+    ) -> None:
+        if not raw_request.get("store", True):
+            return
+        await self.store.save(self._stored_response(raw_request, response_payload, parent))
+
 
 def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     value = raw_request.get("input")
     if value is None:
         return []
     return deepcopy(value if isinstance(value, list) else [value])
+
+
+def _chunk_text_delta(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+    if not isinstance(delta, dict):
+        return ""
+    content = delta.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def _usage_to_responses_stream(usage: Any) -> Any:
+    if not isinstance(usage, dict):
+        return usage
+    return {
+        "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
+        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
+        "total_tokens": usage.get("total_tokens", 0),
+    }

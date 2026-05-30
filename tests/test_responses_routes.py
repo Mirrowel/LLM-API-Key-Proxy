@@ -8,6 +8,13 @@ from rotator_library.responses import InMemoryResponsesStore, ResponsesService
 
 class FakeClient:
     async def acompletion(self, **kwargs):
+        if kwargs.get("stream"):
+            async def chunks():
+                yield 'data: {"choices":[{"delta":{"content":"route"}}]}\n\n'
+                yield 'data: {"choices":[{"delta":{"content":" stream"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+
+            return chunks()
         return {
             "id": "chat_route_1",
             "model": kwargs["model"],
@@ -63,10 +70,11 @@ def test_get_delete_and_input_items_routes() -> None:
     assert missing.status_code == 404
 
 
-def test_post_responses_stream_checkpoint_returns_501_until_streaming_slice() -> None:
+def test_post_responses_stream_returns_sse_events() -> None:
     client = _client()
 
     response = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello", "stream": True})
 
-    assert response.status_code == 501
-    assert response.json()["detail"]["error"]["type"] == "not_implemented_error"
+    assert response.status_code == 200
+    assert "event: response.created" in response.text
+    assert "event: response.completed" in response.text

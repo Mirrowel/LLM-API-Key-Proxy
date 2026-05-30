@@ -1054,7 +1054,11 @@ async def responses_create(
         logger.log_request(headers=dict(request.headers), body=request_data)
     try:
         if request_data.get("stream"):
-            raise ResponsesServiceError("Responses streaming is not enabled in this checkpoint", status_code=501, error_type="not_implemented_error")
+            return StreamingResponse(
+                service.stream_response(request_data, client, request=request),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
         result = await service.create_response(request_data, client, request=request)
         if logger:
             logger.log_final_response(status_code=200, headers=None, body=result)
