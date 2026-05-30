@@ -11,8 +11,37 @@ from typing import Any, Literal, Protocol
 ExecutionMode = Literal["auto", "native", "custom", "litellm_fallback"]
 StreamingFallbackPolicy = Literal["pre_output_only", "never"]
 
-DEFAULT_FAILOVER_ON = frozenset({"rate_limit", "quota", "capacity", "server_error", "api_connection", "transient", "unsupported_operation"})
-DEFAULT_STOP_ON = frozenset({"auth", "authentication", "validation", "permanent", "pre_request_callback", "cancelled"})
+DEFAULT_FAILOVER_ON = frozenset(
+    {
+        "rate_limit",
+        "quota_exceeded",
+        "server_error",
+        "api_connection",
+        "unsupported_operation",
+        # Human-friendly aliases for config files; classifier output uses the
+        # names above, but config authors should not need to know every internal
+        # error string.
+        "quota",
+        "capacity",
+        "transient",
+    }
+)
+DEFAULT_STOP_ON = frozenset(
+    {
+        "authentication",
+        "forbidden",
+        "invalid_request",
+        "context_window_exceeded",
+        "credential_reauth_needed",
+        "pre_request_callback_error",
+        "cancelled",
+        # Config aliases retained for readability.
+        "auth",
+        "validation",
+        "permanent",
+        "pre_request_callback",
+    }
+)
 
 
 @dataclass(frozen=True)

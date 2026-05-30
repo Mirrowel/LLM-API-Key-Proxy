@@ -57,6 +57,27 @@ async def test_non_streaming_fallback_group_tries_next_target_on_retryable_error
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_fallback_group_falls_back_on_quota_exceeded() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_execute(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            raise ClassifiedFailure("quota_exceeded")
+        return {"id": "ok", "model": context.model}
+
+    executor._execute_non_streaming = MethodType(fake_execute, executor)
+
+    result = await executor._execute_non_streaming_with_fallback(
+        _context(routing_targets=(parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1")))
+    )
+
+    assert result == {"id": "ok", "model": "openai/gpt-5.1"}
+    assert attempts == ["codex", "openai"]
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_fallback_group_stops_on_permanent_error() -> None:
     executor = RequestExecutor.__new__(RequestExecutor)
     attempts = []
