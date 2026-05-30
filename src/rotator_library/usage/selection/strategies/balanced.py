@@ -24,6 +24,9 @@ class BalancedStrategy:
     higher probability of being selected. The tolerance parameter
     controls how much randomness is introduced.
 
+    Balanced mode intentionally remains session-agnostic; session stickiness
+    currently belongs to sequential mode so balancing semantics stay intact.
+
     Weight formula: weight = (max_usage - credential_usage) + tolerance + 1
     """
 

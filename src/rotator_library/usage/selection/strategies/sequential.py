@@ -8,11 +8,11 @@ Uses one credential until exhausted, then moves to the next.
 Good for providers that benefit from request caching.
 """
 
+import hashlib
 import logging
 from typing import Dict, List, Optional
 
 from ...types import CredentialState, SelectionContext, RotationMode
-from ....error_handler import mask_credential
 from ....error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
@@ -81,13 +81,20 @@ class SequentialStrategy:
         if current and current in context.candidates:
             return current
 
-        # Current not available - select new one by tier -> usage -> recency
-        selected = self._select_by_priority(
-            context.candidates,
-            context.priorities,
-            context.usage_counts,
-            states,
-        )
+        if context.session_id:
+            selected = self._select_initial_for_session(
+                context.session_id,
+                context.candidates,
+                context.priorities,
+            )
+        else:
+            # Current not available - select new one by tier -> usage -> recency
+            selected = self._select_by_priority(
+                context.candidates,
+                context.priorities,
+                context.usage_counts,
+                states,
+            )
 
         # Make it sticky
         if selected:
@@ -100,6 +107,33 @@ class SequentialStrategy:
             lib_logger.debug(f"Sequential: switched to credential {masked} for {key}")
 
         return selected
+
+    def _select_initial_for_session(
+        self,
+        session_id: str,
+        candidates: List[str],
+        priorities: Dict[str, int],
+    ) -> Optional[str]:
+        """Pick a stable first credential for a new session.
+
+        Sequential mode still honors tier priority first, but spreads new
+        sessions across equal-priority candidates to improve cache locality.
+        """
+        if not candidates:
+            return None
+
+        best_priority = min(priorities.get(candidate, 999) for candidate in candidates)
+        eligible = sorted(
+            candidate
+            for candidate in candidates
+            if priorities.get(candidate, 999) == best_priority
+        )
+        if not eligible:
+            return None
+
+        digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:8], "big") % len(eligible)
+        return eligible[index]
 
     def mark_exhausted(self, provider: str, model_or_group: str) -> None:
         """

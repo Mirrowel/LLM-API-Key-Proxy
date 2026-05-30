@@ -130,5 +130,5 @@ jobs:
           package-name: llm-api-key-proxy
           package-type: container
           min-versions-to-keep: 20
-          delete-only-untagged-versions: false
+          delete-only-untagged-versions: true
           ignore-versions: ".*latest.*"

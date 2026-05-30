@@ -819,9 +819,17 @@ async def streaming_response_wrapper(
                                 final_message[key] = value
                             elif key not in final_message:
                                 final_message[key] = value
-                            elif isinstance(final_message.get(key), str):
+                            elif isinstance(final_message.get(key), str) and isinstance(
+                                value, str
+                            ):
                                 final_message[key] += value
+                            elif isinstance(final_message.get(key), list) and isinstance(
+                                value, list
+                            ):
+                                final_message[key].extend(value)
                             else:
+                                # Provider extension fields can change shape across
+                                # chunks; replacing is safer than crashing the stream.
                                 final_message[key] = value
 
                     if "finish_reason" in choice and choice["finish_reason"]:

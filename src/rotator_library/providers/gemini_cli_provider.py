@@ -476,6 +476,15 @@ class GeminiCliProvider(
         model_name = model.split("/")[-1].replace(":thinking", "")
         return model_name.startswith("gemini-3-") or model_name.startswith("gemini-3.")
 
+    def _needs_thought_signature(self, model: str) -> bool:
+        """Return whether tool-call turns must preserve Gemini thought signatures."""
+        model_name = model.split("/")[-1].replace(":thinking", "")
+        return (
+            model_name.startswith("gemini-3-")
+            or model_name.startswith("gemini-3.")
+            or model_name.startswith("gemini-2.5-")
+        )
+
     def _generate_user_prompt_id(self) -> str:
         """
         Generate a unique prompt ID matching native gemini-cli format.
@@ -543,6 +552,67 @@ class GeminiCliProvider(
             if text:
                 return str(text)
         return ""
+
+    def _parse_content_parts(
+        self,
+        content: Any,
+        model: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Parse OpenAI message content into Gemini content parts.
+
+        Supports plain strings and multipart lists containing text and data-URL
+        images. Invalid list items are skipped defensively so one malformed part
+        does not break the whole request transform.
+        """
+        parts: List[Dict[str, Any]] = []
+
+        if isinstance(content, str):
+            if content:
+                parts.append({"text": content})
+            return parts
+
+        if not isinstance(content, list):
+            return parts
+
+        for item in content:
+            if not isinstance(item, dict):
+                lib_logger.warning(
+                    f"Skipping non-dict item in content list for {model or 'unknown model'}: "
+                    f"{type(item).__name__}"
+                )
+                continue
+
+            if item.get("type") == "text" or item.get("text"):
+                text = item.get("text", "")
+                if text:
+                    parts.append({"text": str(text)})
+                continue
+
+            if item.get("type") != "image_url":
+                continue
+
+            image_value = item.get("image_url", {})
+            image_url = image_value.get("url", "") if isinstance(image_value, dict) else ""
+            if image_url.startswith("data:"):
+                try:
+                    header, data = image_url.split(",", 1)
+                    mime_type = header.split(":")[1].split(";")[0]
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": data,
+                            }
+                        }
+                    )
+                except Exception as e:
+                    lib_logger.warning(f"Failed to parse image data URL: {e}")
+            else:
+                lib_logger.warning(
+                    f"Non-data-URL images not supported: {image_url[:50]}..."
+                )
+
+        return parts
 
     def _get_gemini_cli_request_headers(self, model: str) -> Dict[str, str]:
         """
@@ -671,12 +741,13 @@ class GeminiCliProvider(
         - System instruction extraction
         - Multi-part content (text, images)
         - Tool calls and responses
-        - Gemini 3 thoughtSignature preservation
+        - Gemini thoughtSignature preservation for models that require it
         """
         messages = copy.deepcopy(messages)  # Don't mutate original
         system_instruction = None
         gemini_contents = []
         is_gemini_3 = self._is_gemini_3(model)
+        needs_thought_signature = self._needs_thought_signature(model)
 
         # Separate system prompt from other messages
         if messages and messages[0].get("role") == "system":
@@ -717,45 +788,10 @@ class GeminiCliProvider(
                 pending_tool_parts = []
 
             if role == "user":
-                if isinstance(content, str):
-                    # Simple text content
-                    if content:
-                        parts.append({"text": content})
-                elif isinstance(content, list):
-                    # Multi-part content (text, images, etc.)
-                    for item in content:
-                        if item.get("type") == "text":
-                            text = item.get("text", "")
-                            if text:
-                                parts.append({"text": text})
-                        elif item.get("type") == "image_url":
-                            # Handle image data URLs
-                            image_url = item.get("image_url", {}).get("url", "")
-                            if image_url.startswith("data:"):
-                                try:
-                                    # Parse: data:image/png;base64,iVBORw0KG...
-                                    header, data = image_url.split(",", 1)
-                                    mime_type = header.split(":")[1].split(";")[0]
-                                    parts.append(
-                                        {
-                                            "inlineData": {
-                                                "mimeType": mime_type,
-                                                "data": data,
-                                            }
-                                        }
-                                    )
-                                except Exception as e:
-                                    lib_logger.warning(
-                                        f"Failed to parse image data URL: {e}"
-                                    )
-                            else:
-                                lib_logger.warning(
-                                    f"Non-data-URL images not supported: {image_url[:50]}..."
-                                )
+                parts = self._parse_content_parts(content, model)
 
             elif role == "assistant":
-                if isinstance(content, str):
-                    parts.append({"text": content})
+                parts.extend(self._parse_content_parts(content, model))
                 if msg.get("tool_calls"):
                     # Track if we've seen the first function call in this message
                     # Per Gemini docs: Only the FIRST parallel function call gets a signature
@@ -787,10 +823,10 @@ class GeminiCliProvider(
                                 }
                             }
 
-                            # Add thoughtSignature for Gemini 3
+                            # Add thoughtSignature for models that require it.
                             # Per Gemini docs: Only the FIRST parallel function call gets a signature.
                             # Subsequent parallel calls should NOT have a thoughtSignature field.
-                            if is_gemini_3:
+                            if needs_thought_signature:
                                 sig = tool_call.get("thought_signature")
                                 if not sig and tool_id and self._enable_signature_cache:
                                     sig = self._signature_cache.retrieve(tool_id)
@@ -802,9 +838,13 @@ class GeminiCliProvider(
                                     func_part["thoughtSignature"] = (
                                         "skip_thought_signature_validator"
                                     )
-                                    lib_logger.debug(
-                                        f"Missing thoughtSignature for first func call {tool_id}, using bypass"
-                                    )
+                                    if is_gemini_3:
+                                        # Gemini 2.5 requires the field but does not
+                                        # reliably emit recoverable signatures, so keep
+                                        # its expected fallback path silent.
+                                        lib_logger.debug(
+                                            f"Missing thoughtSignature for first func call {tool_id}, using bypass"
+                                        )
                                 # Subsequent parallel calls: no signature field at all
 
                                 first_func_in_msg = False
@@ -987,6 +1027,7 @@ class GeminiCliProvider(
         candidate = candidates[0]
         parts = candidate.get("content", {}).get("parts", [])
         is_gemini_3 = self._is_gemini_3(model_id)
+        needs_thought_signature = self._needs_thought_signature(model_id)
 
         for part in parts:
             delta = {}
@@ -1045,9 +1086,9 @@ class GeminiCliProvider(
                     },
                 }
 
-                # Handle thoughtSignature for Gemini 3
+                # Handle thoughtSignature for Gemini models that require it.
                 # Store signature for each tool call (needed for parallel tool calls)
-                if is_gemini_3 and has_sig:
+                if needs_thought_signature and has_sig:
                     sig = part["thoughtSignature"]
 
                     if self._enable_signature_cache:

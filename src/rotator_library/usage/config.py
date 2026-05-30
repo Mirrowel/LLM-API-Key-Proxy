@@ -725,8 +725,6 @@ def load_provider_usage_config(
                         )
                         if cap is not None:
                             config.custom_caps.append(cap)
-                        if cap is not None:
-                            config.custom_caps.append(cap)
 
         # Windows
         if hasattr(plugin_class, "usage_window_definitions"):
@@ -948,7 +946,11 @@ def load_provider_usage_config(
 def _parse_custom_cap_env_key(
     remainder: str,
 ) -> Tuple[Optional[Union[int, Tuple[int, ...], str]], Optional[str]]:
-    """Parse the tier and model/group from a custom cap env var remainder."""
+    """Parse the tier and model/group from a custom cap env var remainder.
+
+    The first numeric segment is the tier. Remaining segments are the model or
+    quota-group key so numeric Gemini groups like ``25_FLASH`` are preserved.
+    """
     if not remainder:
         return None, None
 
@@ -958,7 +960,6 @@ def _parse_custom_cap_env_key(
 
     tier_key: Union[int, Tuple[int, ...], str, None] = None
     model_key: Optional[str] = None
-    tier_parts: List[int] = []
 
     for i, part in enumerate(remaining_parts):
         if part == "DEFAULT":
@@ -966,21 +967,14 @@ def _parse_custom_cap_env_key(
             model_key = "_".join(remaining_parts[i + 1 :])
             break
         if part.isdigit():
-            tier_parts.append(int(part))
-            continue
-
-        if not tier_parts:
-            return None, None
-        if len(tier_parts) == 1:
-            tier_key = tier_parts[0]
-        else:
-            tier_key = tuple(tier_parts)
-        model_key = "_".join(remaining_parts[i:])
-        break
-    else:
+            tier_key = int(part)
+            model_key = "_".join(remaining_parts[i + 1 :])
+            break
         return None, None
 
     if model_key:
         model_key = model_key.lower().replace("_", "-")
+    else:
+        return None, None
 
     return tier_key, model_key

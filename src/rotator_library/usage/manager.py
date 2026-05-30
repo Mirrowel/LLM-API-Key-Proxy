@@ -32,6 +32,7 @@ from .types import (
 )
 from .config import (
     ProviderUsageConfig,
+    WindowDefinition,
     load_provider_usage_config,
     get_default_windows,
     CapMode,
@@ -1672,7 +1673,7 @@ class UsageManager:
 
     def _get_window_definitions_for_state(
         self, state: CredentialState
-    ) -> List["WindowDefinition"]:
+    ) -> List[WindowDefinition]:
         """
         Get the window definitions for a credential based on its tier.
 
@@ -1685,8 +1686,6 @@ class UsageManager:
         Returns:
             List of WindowDefinition objects for this credential's tier
         """
-        from .config import WindowDefinition
-
         plugin_class = self._provider_plugins.get(self.provider)
         if not plugin_class:
             # No plugin - use current config windows
@@ -1731,13 +1730,15 @@ class UsageManager:
         else:
             window_name = "window"
 
+        applies_to = "credential" if matching_config.mode == "credential" else "model"
+
         # Create WindowDefinition for this tier
         return [
             WindowDefinition.rolling(
                 name=window_name,
                 duration_seconds=window_seconds,
                 is_primary=True,
-                applies_to=matching_config.field_name or "model",
+                applies_to=applies_to,
             )
         ]
 
