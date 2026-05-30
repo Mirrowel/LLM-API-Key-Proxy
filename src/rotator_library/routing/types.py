@@ -11,7 +11,7 @@ from typing import Any, Literal, Protocol
 ExecutionMode = Literal["auto", "native", "custom", "litellm_fallback"]
 StreamingFallbackPolicy = Literal["pre_output_only", "never"]
 
-DEFAULT_FAILOVER_ON = frozenset({"rate_limit", "quota", "capacity", "server_error", "api_connection", "transient"})
+DEFAULT_FAILOVER_ON = frozenset({"rate_limit", "quota", "capacity", "server_error", "api_connection", "transient", "unsupported_operation"})
 DEFAULT_STOP_ON = frozenset({"auth", "authentication", "validation", "permanent", "pre_request_callback", "cancelled"})
 
 

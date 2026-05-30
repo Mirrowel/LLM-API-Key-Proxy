@@ -64,6 +64,7 @@ from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
 from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.types import RouteTarget
+from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
@@ -75,6 +76,14 @@ if TYPE_CHECKING:
     from ..usage import UsageManager
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+class RoutingExecutionError(RuntimeError):
+    """Internal error used when a routed target cannot use its requested mode."""
+
+    def __init__(self, message: str, error_type: str = "unsupported_operation") -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class RequestExecutor:
@@ -480,6 +489,99 @@ class RequestExecutor:
                     raise PreRequestCallbackError(str(e)) from e
                 lib_logger.warning(f"Pre-request callback failed: {e}")
 
+    async def _execute_provider_request(
+        self,
+        provider: str,
+        model: str,
+        plugin: Any,
+        credential_secret: str,
+        credential_id: str,
+        kwargs: Dict[str, Any],
+        context: RequestContext,
+    ) -> Any:
+        """Execute one provider request using routed execution-mode rules."""
+
+        target = _current_route_target(context)
+        execution = target.execution if target else "auto"
+        if execution == "litellm_fallback":
+            self._log_routing_trace(
+                context,
+                "routing_litellm_fallback",
+                _target_trace(target) if target else {"provider": provider, "model": model},
+            )
+            return await self._execute_litellm_request(kwargs, credential_secret)
+
+        if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
+            if not plugin or not plugin.has_custom_logic():
+                raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
+            kwargs["credential_identifier"] = credential_secret
+            return await plugin.acompletion(self._http_client, **kwargs)
+
+        if execution == "native" or (execution == "auto" and _provider_native_protocol(plugin, model, target)):
+            native_context = self._build_native_provider_context(
+                provider,
+                model,
+                plugin,
+                credential_secret,
+                credential_id,
+                context,
+                target,
+            )
+            self._log_routing_trace(
+                context,
+                "routing_native_execution_selected",
+                _target_trace(target) if target else {"provider": provider, "model": model},
+                metadata={"protocol": native_context.protocol_name},
+            )
+            return await NativeProviderExecutor().execute(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
+
+        return await self._execute_litellm_request(kwargs, credential_secret)
+
+    async def _execute_litellm_request(self, kwargs: Dict[str, Any], credential_secret: str) -> Any:
+        """Execute the existing LiteLLM request path."""
+
+        kwargs["api_key"] = credential_secret
+        self._apply_litellm_logger(kwargs)
+        kwargs.pop("transaction_context", None)
+        return await litellm.acompletion(**kwargs)
+
+    def _build_native_provider_context(
+        self,
+        provider: str,
+        model: str,
+        plugin: Any,
+        credential_secret: str,
+        credential_id: str,
+        context: RequestContext,
+        target: Optional[RouteTarget],
+    ) -> NativeProviderContext:
+        """Build native provider context from provider declarations."""
+
+        if not plugin:
+            raise RoutingExecutionError(f"Provider {provider} has no plugin for native execution")
+        protocol_name = _provider_native_protocol(plugin, model, target)
+        if not protocol_name:
+            raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
+        if not hasattr(plugin, "get_native_endpoint") or not hasattr(plugin, "get_native_headers"):
+            raise RoutingExecutionError(f"Provider {provider} has no native endpoint/header helpers")
+        endpoint = plugin.get_native_endpoint(model=model, operation="chat")
+        headers = plugin.get_native_headers(credential_secret, model=model, operation="chat")
+        return NativeProviderContext(
+            provider=provider,
+            model=model,
+            protocol_name=protocol_name,
+            endpoint=endpoint,
+            headers=headers,
+            credential_id=credential_id,
+            session_id=context.session_id,
+            scope_key=context.usage_manager_key,
+            classifier=context.classifier,
+            adapter_names=tuple(plugin.get_adapter_names(model) if hasattr(plugin, "get_adapter_names") else ()),
+            adapter_config=dict(plugin.get_adapter_config(model) if hasattr(plugin, "get_adapter_config") else {}),
+            field_cache_rules=tuple(plugin.get_field_cache_rules(model) if hasattr(plugin, "get_field_cache_rules") else ()),
+            transaction_logger=context.transaction_logger,
+        )
+
     async def execute(
         self,
         context: RequestContext,
@@ -726,19 +828,15 @@ class RequestExecutor:
                                 # Pre-request callback
                                 await self._run_pre_request_callback(context, kwargs)
 
-                                # Make the API call
-                                if plugin and plugin.has_custom_logic():
-                                    kwargs["credential_identifier"] = credential_secret
-                                    response = await plugin.acompletion(
-                                        self._http_client, **kwargs
-                                    )
-                                else:
-                                    # Standard LiteLLM call
-                                    kwargs["api_key"] = credential_secret
-                                    self._apply_litellm_logger(kwargs)
-                                    # Remove internal context before litellm call
-                                    kwargs.pop("transaction_context", None)
-                                    response = await litellm.acompletion(**kwargs)
+                                response = await self._execute_provider_request(
+                                    provider,
+                                    model,
+                                    plugin,
+                                    credential_secret,
+                                    cred_context.stable_id,
+                                    kwargs,
+                                    context,
+                                )
 
                                 # Success! Extract token usage if available
                                 (
@@ -1665,6 +1763,27 @@ def _target_trace(target: RouteTarget) -> Dict[str, Any]:
         "execution": target.execution,
         "protocol": target.protocol,
     }
+
+
+def _current_route_target(context: RequestContext) -> Optional[RouteTarget]:
+    """Return the currently selected route target from context metadata."""
+
+    targets = tuple(context.routing_targets or ())
+    if not targets:
+        return None
+    if context.routing_target_index < 0 or context.routing_target_index >= len(targets):
+        return None
+    return targets[context.routing_target_index]
+
+
+def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget]) -> Optional[str]:
+    """Resolve native protocol from target override or provider declaration."""
+
+    if target and target.protocol:
+        return target.protocol
+    if plugin and hasattr(plugin, "get_protocol_name"):
+        return plugin.get_protocol_name(model)
+    return None
 
 
 def _route_error_type(error: BaseException) -> str:
