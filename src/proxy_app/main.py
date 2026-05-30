@@ -140,6 +140,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
+    from rotator_library.responses import ResponsesService, ResponsesServiceError
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -592,6 +593,10 @@ async def lifespan(app: FastAPI):
     # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
+    # Phase 4 Responses API compatibility service. It currently bridges through
+    # the existing chat-completions client path; later native providers can reuse
+    # the same route/storage surface without changing clients.
+    app.state.responses_service = ResponsesService()
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -661,6 +666,16 @@ def get_rotating_client(request: Request) -> RotatingClient:
 def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     """Dependency to get the embedding batcher instance from the app state."""
     return request.app.state.embedding_batcher
+
+
+def get_responses_service(request: Request) -> ResponsesService:
+    """Dependency to get the Responses API service instance from app state."""
+
+    service = getattr(request.app.state, "responses_service", None)
+    if service is None:
+        service = ResponsesService()
+        request.app.state.responses_service = service
+    return service
 
 
 async def verify_api_key(auth: str = Depends(api_key_header)):
@@ -1009,6 +1024,93 @@ async def chat_completions(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _responses_error_response(error: ResponsesServiceError) -> dict[str, Any]:
+    """Return an OpenAI-compatible error payload for Responses routes."""
+
+    return {"error": {"message": str(error), "type": error.error_type, "code": error.status_code}}
+
+
+@app.post("/v1/responses")
+async def responses_create(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """OpenAI-compatible Responses API create endpoint.
+
+    Phase 4 non-streaming requests bridge through the current completion engine.
+    Streaming requests are handled by the dedicated SSE checkpoint in this phase.
+    """
+
+    logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    try:
+        request_data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+    if logger:
+        logger.log_request(headers=dict(request.headers), body=request_data)
+    try:
+        if request_data.get("stream"):
+            raise ResponsesServiceError("Responses streaming is not enabled in this checkpoint", status_code=501, error_type="not_implemented_error")
+        result = await service.create_response(request_data, client, request=request)
+        if logger:
+            logger.log_final_response(status_code=200, headers=None, body=result)
+        return JSONResponse(content=result)
+    except ResponsesServiceError as e:
+        payload = _responses_error_response(e)
+        if logger:
+            logger.log_final_response(status_code=e.status_code, headers=None, body=payload)
+        raise HTTPException(status_code=e.status_code, detail=payload)
+    except Exception as e:
+        logging.error(f"Responses endpoint error: {e}")
+        if logger:
+            logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/responses/{response_id}")
+async def responses_get(
+    response_id: str,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Retrieve a stored Responses object by ID."""
+
+    try:
+        return JSONResponse(content=await service.get_response(response_id))
+    except ResponsesServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
+
+
+@app.delete("/v1/responses/{response_id}")
+async def responses_delete(
+    response_id: str,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Delete a stored Responses object by ID."""
+
+    try:
+        return JSONResponse(content=await service.delete_response(response_id))
+    except ResponsesServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+async def responses_input_items(
+    response_id: str,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Return stored input items for a Responses object."""
+
+    try:
+        return JSONResponse(content=await service.list_input_items(response_id))
+    except ResponsesServiceError as e:
+        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
 
 
 # --- Anthropic Messages API Endpoint ---
