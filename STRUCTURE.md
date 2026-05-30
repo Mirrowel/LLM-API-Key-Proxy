@@ -37,12 +37,13 @@
 - Key files: `__init__.py`, `rotating_client.py` (in `client/`), `provider_interface.py` (in `providers/`), `usage_manager.py`, `session_tracking.py`
 
 **`src/rotator_library/session_tracking.py`:**
-- Purpose: Evidence-based session inference with scoped anchors, confidence scoring, compaction detection, and deterministic affinity routing
-- Contains: `SessionTracker`, `SessionAnchor`, `SessionTrackingHints`, `SessionInference`
-- Key data types: `SessionAnchor` (evidence with strength/source/group), `SessionTrackingHints` (provider-supplied evidence), `SessionInference` (result with session_id, affinity_key, confidence, namespace)
+- Purpose: Evidence-based session inference with scoped anchors, confidence scoring, compaction probe detection, and deterministic affinity routing
+- Contains: `SessionTracker`, `SessionAnchor`, `SessionTrackingHints`, `SessionInference`, `_MatchCandidate` (with `last_seen` tiebreaker)
+- Key data types: `SessionAnchor` (evidence with strength/source/group), `SessionTrackingHints` (provider-supplied evidence), `SessionInference` (result with session_id, affinity_key, confidence, lineage_parent_session_id, namespace)
 - Anchor strength levels: `strong` (tool-call IDs, provider affinity keys), `medium` (message content hashes, response anchors), `weak` (first-user text, untrusted explicit IDs)
 - Scope isolation: Namespaces are `scope:{scope_key}:provider:{provider}:model:{model}` to prevent credential pool leakage
-- Persistence: Optional JSON disk storage via `ResilientStateWriter` with configurable flush interval
+- Compaction probes: Separate anchor path (`_build_compaction_probe_anchors()`) identifies lineage parents from large early messages or explicit summarization markers; probe indexes are suppressed from normal continuity anchors; system/developer prompts excluded from continuity evidence
+- Persistence: Schema-versioned JSON disk storage via `ResilientStateWriter` with generation-based write deduplication (`_dirty_generation` / `_save_io_lock`) and configurable flush interval
 - Configuration: `TRUSTED_SESSION_ID_FIELDS` env var for trusted explicit ID fields; `max_anchor_records`, `max_anchors_per_session`, `persistence_flush_interval_seconds` constructor args
 
 **`src/rotator_library/client/`:**
@@ -87,7 +88,7 @@
 
 **`src/rotator_library/usage/selection/strategies/sequential.py`:**
 - Purpose: Sequential credential rotation with TTL-based sticky entries and affinity-based placement
-- Contains: `SequentialStrategy` with `_StickyEntry` (credential + last_seen), TTL pruning, max-entry trimming, and `session_affinity_key` for deterministic first-pick
+- Contains: `SequentialStrategy` with `_StickyEntry` (credential + last_seen), TTL pruning, max-entry trimming, `session_affinity_key` for deterministic first-pick, and `threading.RLock` for thread-safe access across `select`, `mark_exhausted`, `get_current`, `clear_sticky`
 
 **`src/rotator_library/usage/identity/`:**
 - Purpose: Stable credential identity management
