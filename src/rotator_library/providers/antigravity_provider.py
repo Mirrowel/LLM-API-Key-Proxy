@@ -56,7 +56,7 @@ class AntigravityProvider(ProviderInterface):
 
     provider_env_name = "antigravity"
     protocol_name = "gemini"
-    adapter_names = ("field_rename",)
+    adapter_names: tuple[str, ...] = ()
     field_cache_rules = (
         FieldCacheRule(
             name="antigravity_thought_signature",
@@ -118,7 +118,7 @@ class AntigravityProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
         """Configure minimal payload path copies needed by native tests."""
 
-        return {"field_rename": {"rules": []}}
+        return {}
 
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """Antigravity exposes no restored model-tier restriction."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from rotator_library.adapters import AdapterContext, get_adapter, run_adapter_chain
 from rotator_library.providers import PROVIDER_PLUGINS
 from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
 
@@ -36,10 +37,24 @@ def test_claude_code_provider_declares_native_protocol_adapters_and_cache_rules(
 
     assert provider.get_protocol_name("claude-sonnet-4-5") == "anthropic_messages"
     assert provider.get_adapter_names("claude-sonnet-4-5") == ("suppress_developer_role",)
-    assert provider.get_adapter_config("claude-sonnet-4-5") == {"suppress_developer_role": {"replacement_role": "user"}}
+    assert provider.get_adapter_config("claude-sonnet-4-5") == {"suppress_developer_role": {"mode": "user"}}
     rules = provider.get_field_cache_rules("claude-sonnet-4-5")
     assert rules[0].name == "claude_code_thinking_signature"
     assert rules[0].scope == ("provider", "model", "credential", "session")
+
+
+@pytest.mark.asyncio
+async def test_claude_code_adapter_config_converts_developer_role_to_user() -> None:
+    provider = ClaudeCodeProvider()
+
+    result = await run_adapter_chain(
+        [get_adapter("suppress_developer_role")],
+        {"messages": [{"role": "developer", "content": "rules"}]},
+        AdapterContext(adapter_config=provider.get_adapter_config("claude-sonnet-4-5")),
+        stage="request",
+    )
+
+    assert result["messages"][0]["role"] == "user"
 
 
 def test_claude_code_provider_builds_native_headers_and_endpoint(monkeypatch) -> None:

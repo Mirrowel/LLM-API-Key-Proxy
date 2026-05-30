@@ -50,6 +50,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert pass_names.count("raw_native_provider_stream_chunk") == 2
     assert pass_names.count("parsed_native_stream_event") == 2
     assert "after_field_cache_extraction" in pass_names
+    assert "after_field_cache_stream_extraction" in pass_names
     assert pass_names.count("formatted_client_stream_event") == 2
 
 

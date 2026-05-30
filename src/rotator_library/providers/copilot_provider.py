@@ -66,7 +66,7 @@ class CopilotProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, str]]:
         """Configure role suppression declaratively for OpenAI-compatible chat."""
 
-        return {"suppress_developer_role": {"replacement_role": "system"}}
+        return {"suppress_developer_role": {"mode": "system"}}
 
     @staticmethod
     def _with_prefix(model: str) -> str:

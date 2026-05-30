@@ -84,7 +84,7 @@ class ClaudeCodeProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
         """Configure adapters without hardcoding provider transforms."""
 
-        return {"suppress_developer_role": {"replacement_role": "user"}}
+        return {"suppress_developer_role": {"mode": "user"}}
 
     @staticmethod
     def _with_prefix(model: str) -> str:
