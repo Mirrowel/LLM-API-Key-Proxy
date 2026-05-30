@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""Antigravity provider integration skeleton restored from safe retired pieces."""
+
+from __future__ import annotations
+
+import os
+from typing import Any, List, Optional
+
+import httpx
+
+from ..field_cache import FieldCacheInjection, FieldCacheRule
+from .provider_interface import ProviderInterface
+
+BASE_URLS = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal",
+    "https://cloudcode-pa.googleapis.com/v1internal",
+]
+ANTIGRAVITY_HEADERS = {
+    "User-Agent": "antigravity/1.15.8 windows/amd64",
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
+}
+AVAILABLE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro-preview",
+    "gemini-3-flash",
+    "claude-sonnet-4.5",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+]
+MODEL_ALIAS_MAP = {
+    "rev19-uic3-1p": "gemini-2.5-computer-use-preview-10-2025",
+    "gemini-3-pro-image": "gemini-3-pro-image-preview",
+    "gemini-3-pro-low": "gemini-3-pro-preview",
+    "gemini-3-pro-high": "gemini-3-pro-preview",
+    "claude-sonnet-4-5": "claude-sonnet-4.5",
+    "claude-opus-4-5": "claude-opus-4.5",
+    "claude-opus-4-6": "claude-opus-4.6",
+}
+MODEL_ALIAS_REVERSE = {public: internal for internal, public in MODEL_ALIAS_MAP.items()}
+EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-2.5-pro"}
+
+
+class AntigravityProvider(ProviderInterface):
+    """Safe restored Antigravity integration path.
+
+    The retired provider contained valuable model/header/endpoint knowledge mixed
+    with fragile device-profile and monolithic transform logic. This active
+    skeleton restores only stable declarations and helpers so native provider
+    work can proceed behind tests before any live routing is enabled.
+    """
+
+    provider_env_name = "antigravity"
+    protocol_name = "gemini"
+    adapter_names = ("field_rename",)
+    field_cache_rules = (
+        FieldCacheRule(
+            name="antigravity_thought_signature",
+            source="response",
+            path="candidates.*.content.parts.*.thoughtSignature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
+        ),
+    )
+    model_quota_groups = {
+        "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash"],
+        "claude": ["claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"],
+    }
+    default_rotation_mode = "sequential"
+
+    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+        """Fetch available Antigravity models or return the restored safe list."""
+
+        try:
+            response = await client.post(self.get_native_endpoint(operation="models"), headers=self.get_native_headers(api_key), json={}, timeout=30)
+            response.raise_for_status()
+            models = self._models_from_response(response.json())
+            if models:
+                return [self._with_prefix(model) for model in models]
+        except Exception:
+            return [self._with_prefix(model) for model in AVAILABLE_MODELS]
+        return [self._with_prefix(model) for model in AVAILABLE_MODELS]
+
+    def get_api_base(self) -> str:
+        """Return the first configured Antigravity base URL."""
+
+        configured = os.getenv("ANTIGRAVITY_API_BASE")
+        return configured.rstrip("/") if configured else BASE_URLS[0]
+
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "generate") -> dict[str, str]:
+        """Return static Antigravity headers plus bearer auth.
+
+        Retired per-device fingerprint headers are intentionally not restored;
+        they are brittle and should only return if a current service requirement
+        is verified with tests.
+        """
+
+        return {
+            "Authorization": f"Bearer {credential_identifier}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            **ANTIGRAVITY_HEADERS,
+        }
+
+    def get_native_endpoint(self, model: str = "", operation: str = "generate") -> str:
+        """Return Antigravity internal operation endpoints."""
+
+        if operation == "models":
+            return f"{self.get_api_base()}:fetchAvailableModels"
+        return f"{self.get_api_base()}:streamGenerateContent?alt=sse"
+
+    def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
+        """Configure minimal payload path copies needed by native tests."""
+
+        return {"field_rename": {"rules": []}}
+
+    def get_model_tier_requirement(self, model: str) -> Optional[int]:
+        """Antigravity exposes no restored model-tier restriction."""
+
+        return None
+
+    def normalize_model_for_tracking(self, model: str) -> str:
+        """Normalize internal names to public aliases while preserving prefix."""
+
+        if "/" in model:
+            provider, clean_model = model.split("/", 1)
+            return f"{provider}/{self._api_to_user_model(clean_model)}"
+        return self._api_to_user_model(model)
+
+    @staticmethod
+    def _with_prefix(model: str) -> str:
+        if model.startswith("antigravity/"):
+            return model
+        return f"antigravity/{model}"
+
+    @staticmethod
+    def _alias_to_internal(alias: str) -> str:
+        return MODEL_ALIAS_REVERSE.get(alias, alias)
+
+    @staticmethod
+    def _api_to_user_model(internal: str) -> str:
+        return MODEL_ALIAS_MAP.get(internal, internal)
+
+    def _models_from_response(self, payload: dict[str, Any]) -> list[str]:
+        raw_models: list[str] = []
+        if isinstance(payload.get("models"), dict):
+            raw_models.extend(payload["models"].keys())
+        if isinstance(payload.get("data"), list):
+            raw_models.extend(item.get("id") for item in payload["data"] if isinstance(item, dict) and item.get("id"))
+        result = []
+        for model in raw_models:
+            public = self._api_to_user_model(str(model))
+            if public not in EXCLUDED_MODELS and public in AVAILABLE_MODELS and public not in result:
+                result.append(public)
+        return result
