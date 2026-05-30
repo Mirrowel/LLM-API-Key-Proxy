@@ -213,6 +213,8 @@ class SequentialStrategy:
             return entry.credential
 
     def _prune_sticky(self, now: float) -> None:
+        # Locking contract: callers must hold self._lock. This helper is kept
+        # private so select/get_current can batch prune + selection atomically.
         expired = [
             key
             for key, entry in self._current.items()
@@ -222,6 +224,7 @@ class SequentialStrategy:
             del self._current[key]
 
     def _trim_sticky(self) -> None:
+        # Locking contract: callers must hold self._lock.
         if len(self._current) <= self.max_sticky_entries:
             return
         overage = len(self._current) - self.max_sticky_entries

@@ -119,6 +119,7 @@ class _MatchCandidate:
     medium_groups: set[str] = field(default_factory=set)
     provider_matches: int = 0
     response_matches: int = 0
+    last_seen: float = 0.0
 
     @property
     def confidence(self) -> str:
@@ -181,9 +182,11 @@ class SessionTracker:
         self._anchors: Dict[str, _AnchorRecord] = {}
         self._sessions: Dict[str, _SessionState] = {}
         self._dirty = False
+        self._dirty_generation = 0
         self._last_save_attempt = 0.0
         self._writer: Optional[ResilientStateWriter] = None
         self._lock = threading.RLock()
+        self._save_io_lock = threading.Lock()
         if self.persist_to_disk:
             self._load()
             if self.persistence_path:
@@ -208,13 +211,16 @@ class SessionTracker:
     ) -> SessionInference:
         """Infer live session and deterministic affinity from a request payload."""
         with self._lock:
-            return self._infer_session_locked(
+            result = self._infer_session_locked(
                 request_data,
                 provider=provider,
                 model=model,
                 scope_key=scope_key,
                 hints=hints,
             )
+            save_job = self._prepare_save_locked()
+        self._write_save_job(save_job)
+        return result
 
     def _infer_session_locked(
         self,
@@ -235,17 +241,30 @@ class SessionTracker:
             scope_key=scope_key,
             session_scope=hints.session_scope if hints else None,
         )
-        possible_compaction = self._looks_like_compaction(request_data)
-        anchors = self._build_anchors(
+        compaction_probe_anchors = self._build_compaction_probe_anchors(request_data, namespace)
+        compaction_match = (
+            self._best_match(compaction_probe_anchors, namespace, now)
+            if compaction_probe_anchors
+            else None
+        )
+        marker_compaction = self._looks_like_compaction(request_data)
+        possible_compaction = marker_compaction or self._is_compaction_parent_match(
+            compaction_match,
+            marker_compaction=marker_compaction,
+        )
+        normal_anchors = self._build_anchors(
             request_data,
             namespace,
             hints,
-            allow_system_continuity=possible_compaction,
+            suppressed_continuity_indexes=(
+                self._compaction_probe_indexes(request_data) if possible_compaction else None
+            ),
         )
-        if not anchors:
+
+        if not normal_anchors and not compaction_probe_anchors:
             return SessionInference(session_id=None, tracking_namespace=namespace)
 
-        match = self._best_match(anchors, namespace, now)
+        match = self._best_match(normal_anchors, namespace, now) if normal_anchors else None
 
         # Compaction is useful lineage information but should not hard-stick the
         # new compacted context unless a genuinely strong anchor survived.
@@ -255,9 +274,9 @@ class SessionTracker:
             state = self._refresh_and_bridge(
                 match.session_id,
                 namespace,
-                anchors,
+                normal_anchors,
                 now,
-                affinity_key=self._affinity_from_anchors(anchors, namespace),
+                affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
             )
             return SessionInference(
                 session_id=state.session_id,
@@ -268,14 +287,21 @@ class SessionTracker:
                 tracking_namespace=namespace,
             )
 
-        parent_id = match.session_id if match and possible_compaction else None
+        parent_id = (
+            compaction_match.session_id
+            if self._is_compaction_parent_match(
+                compaction_match,
+                marker_compaction=marker_compaction,
+            )
+            else (match.session_id if match and possible_compaction else None)
+        )
         session_id = str(uuid.uuid4())
         state = self._create_session(
             session_id,
             namespace,
-            anchors,
+            normal_anchors,
             now,
-            affinity_key=self._affinity_from_anchors(anchors, namespace),
+            affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
         )
         if parent_id:
             lib_logger.info(
@@ -310,6 +336,7 @@ class SessionTracker:
         call emitted by it. Recording those anchors makes tracking resilient to
         gradual context pruning without needing a dedicated compaction protocol.
         """
+        save_job = None
         with self._lock:
             if not session_id or response is None or session_id not in self._sessions:
                 return
@@ -321,11 +348,14 @@ class SessionTracker:
             anchors = self._anchors_from_response(response, namespace)
             if anchors:
                 self._refresh_and_bridge(session_id, namespace, anchors, now)
+            save_job = self._prepare_save_locked()
+        self._write_save_job(save_job)
 
     def flush(self) -> None:
         """Force persistence of dirty state when optional disk storage is enabled."""
         with self._lock:
-            self._save(force=True)
+            save_job = self._prepare_save_locked(force=True)
+        self._write_save_job(save_job)
 
     def _create_session(
         self,
@@ -382,7 +412,6 @@ class SessionTracker:
         self._trim_session_anchors(state)
         self._trim_global_anchors()
         self._mark_dirty()
-        self._save()
         return state
 
     def _best_match(
@@ -397,6 +426,7 @@ class SessionTracker:
             if not record or record.expires_at <= now or record.namespace != namespace:
                 continue
             candidate = candidates.setdefault(record.session_id, _MatchCandidate(record.session_id))
+            candidate.last_seen = max(candidate.last_seen, record.last_seen)
             strength = self._strongest(anchor.strength, record.strength)
             if strength == "strong":
                 candidate.score += self._STRONG_SCORE
@@ -417,7 +447,19 @@ class SessionTracker:
 
         if not candidates:
             return None
-        return max(candidates.values(), key=lambda item: item.score)
+        return max(
+            candidates.values(),
+            key=lambda item: (
+                item.score,
+                item.strong_matches,
+                item.medium_matches,
+                len(item.medium_groups),
+                item.response_matches,
+                item.provider_matches,
+                item.last_seen,
+                item.session_id,
+            ),
+        )
 
     def _coerce_hints(self, hints: Optional[Any]) -> Optional[SessionTrackingHints]:
         if not hints:
@@ -441,6 +483,7 @@ class SessionTracker:
         hints: Optional[Any],
         *,
         allow_system_continuity: bool = False,
+        suppressed_continuity_indexes: Optional[set[int]] = None,
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
         anchors.extend(self._anchors_from_provider_hints(hints, namespace))
@@ -453,10 +496,82 @@ class SessionTracker:
                     messages,
                     namespace,
                     allow_system_continuity=allow_system_continuity,
+                    suppressed_continuity_indexes=suppressed_continuity_indexes,
                 )
             )
 
         return self._dedupe_anchors(anchors)
+
+    def _build_compaction_probe_anchors(
+        self,
+        request_data: Dict[str, Any],
+        namespace: str,
+    ) -> List[SessionAnchor]:
+        """Build temporary anchors for compaction lineage lookup only.
+
+        Compaction summaries often replace prior user/assistant history and may
+        be sent as system, developer, user, or assistant messages. These anchors
+        are compared against existing response/message anchors to identify a
+        likely parent, but they are not stored on the newly-created child session.
+        """
+        messages = request_data.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            return []
+
+        anchors: List[SessionAnchor] = []
+        probe_indexes = self._compaction_probe_indexes(request_data)
+        for index, message in enumerate(messages[:2]):
+            if index not in probe_indexes:
+                continue
+            if not isinstance(message, dict):
+                continue
+            text = self._normalize_text(self._extract_text(message.get("content")))
+            role = str(message.get("role", ""))
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, f"message:{role}:{self._hash_text(text)}"),
+                    "medium",
+                    source="compaction_probe",
+                    group=f"compaction_probe:{index}",
+                )
+            )
+            for chunk_hash in self._content_chunk_hashes(text):
+                anchors.append(
+                    SessionAnchor(
+                        self._scoped(namespace, f"chunk:{chunk_hash}"),
+                        "medium",
+                        source="compaction_probe",
+                        group=f"compaction_probe:{index}",
+                    )
+                )
+        return self._dedupe_anchors(anchors)
+
+    def _compaction_probe_indexes(self, request_data: Dict[str, Any]) -> set[int]:
+        messages = request_data.get("messages") or []
+        if not isinstance(messages, list):
+            return set()
+        indexes: set[int] = set()
+        for index, message in enumerate(messages[:2]):
+            if not isinstance(message, dict):
+                continue
+            text = self._normalize_text(self._extract_text(message.get("content")))
+            if self._is_compaction_probe_text(text):
+                indexes.add(index)
+        return indexes
+
+    def _is_compaction_parent_match(
+        self,
+        match: Optional[_MatchCandidate],
+        *,
+        marker_compaction: bool,
+    ) -> bool:
+        if not match:
+            return False
+        if match.is_sticky_match or match.response_matches > 0:
+            return True
+        # Explicit summary markers are allowed to produce weaker lineage because
+        # the result is telemetry and still starts a new live sticky session.
+        return marker_compaction and match.score > 0
 
     def _anchors_from_provider_hints(
         self,
@@ -529,6 +644,7 @@ class SessionTracker:
         *,
         source: str = "message",
         allow_system_continuity: bool = False,
+        suppressed_continuity_indexes: Optional[set[int]] = None,
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
         normalized_messages: List[Dict[str, Any]] = []
@@ -591,6 +707,8 @@ class SessionTracker:
                     and role.lower() in {"system", "developer"}
                     and not allow_system_continuity
                 )
+                if suppressed_continuity_indexes and index in suppressed_continuity_indexes:
+                    contributes_continuity = False
                 if contributes_continuity and self._is_substantial_text(normalized_text):
                     anchors.append(
                         SessionAnchor(
@@ -697,7 +815,18 @@ class SessionTracker:
                 continue
             summary_texts.append(self._extract_text(message.get("content")))
         joined = "\n".join(summary_texts)
-        lowered = joined.lower()
+        return self._has_compaction_marker(joined)
+
+    def _is_compaction_probe_text(self, text: str) -> bool:
+        if not text:
+            return False
+        # Large early messages are often generated summaries even without an
+        # explicit marker. Short text needs a marker to avoid matching ordinary
+        # first user prompts as lineage probes.
+        return self._has_compaction_marker(text) or len(text) >= 400 or len(text.split()) >= 80
+
+    def _has_compaction_marker(self, text: str) -> bool:
+        lowered = text.lower()
         markers = (
             "summary of previous conversation",
             "summary of the previous conversation",
@@ -796,12 +925,16 @@ class SessionTracker:
                 _SessionState(session_id=session_id, namespace=namespace, expires_at=expires_at),
             ).anchors.add(value)
 
-    def _save(self, *, force: bool = False) -> None:
+    def _prepare_save_locked(
+        self,
+        *,
+        force: bool = False,
+    ) -> Optional[tuple[ResilientStateWriter, Dict[str, Any], int]]:
         if not self.persist_to_disk or not self.persistence_path or not self._dirty:
-            return
+            return None
         now = time.time()
         if not force and now - self._last_save_attempt < self.persistence_flush_interval_seconds:
-            return
+            return None
         self._last_save_attempt = now
         payload = {
             "schema_version": self._PERSISTENCE_SCHEMA_VERSION,
@@ -834,11 +967,36 @@ class SessionTracker:
                 lib_logger,
                 serializer=lambda data: json.dumps(data, indent=2, sort_keys=True),
             )
-        if self._writer.write(payload):
-            self._dirty = False
+        return self._writer, payload, self._dirty_generation
+
+    def _write_save_job(
+        self,
+        save_job: Optional[tuple[ResilientStateWriter, Dict[str, Any], int]],
+    ) -> None:
+        if save_job is None:
+            return
+        writer, payload, generation = save_job
+        with self._save_io_lock:
+            success = writer.write(payload)
+        if not success:
+            return
+        with self._lock:
+            if self._dirty_generation == generation:
+                self._dirty = False
 
     def _mark_dirty(self) -> None:
+        self._dirty_generation += 1
         self._dirty = True
+
+    def _save(self, *, force: bool = False) -> None:
+        """Compatibility helper for direct internal tests; public paths avoid locked I/O."""
+        with self._lock:
+            save_job = self._prepare_save_locked(force=force)
+        self._write_save_job(save_job)
+
+    def _clear_dirty_if_current(self, generation: int) -> None:
+        if self._dirty_generation == generation:
+            self._dirty = False
 
     def _namespace(
         self,

@@ -994,10 +994,15 @@ Provider plugins may implement `get_session_tracking_hints()` to contribute
 provider-specific anchors or a provider session scope. The hook supplies evidence
 only; credential selection remains centralized in the rotator.
 
-Compaction lineage detection is intentionally conservative telemetry. It only
-recognizes summary-like early `system`/`developer` messages and does not force
-sticky continuation, because broad matching on ordinary user/assistant text can
-over-bind unrelated sessions.
+Compaction lineage detection is intentionally conservative telemetry. It can use
+summary-like or unusually large early messages in any role as temporary parent
+lookup evidence, but those probe-only anchors are not stored on the child session
+and do not force sticky continuation.
+
+When optional session persistence is enabled, `session_stickiness.json` is
+schema-versioned. Upgrades that change the schema intentionally ignore older
+session-stickiness files and rebuild in-memory state instead of attempting an
+unsafe migration.
 
 #### Per-Model Quota Tracking
 

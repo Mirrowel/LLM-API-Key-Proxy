@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from rotator_library.session_tracking import SessionTracker, SessionTrackingHints
+from rotator_library.session_tracking import (
+    SessionAnchor,
+    SessionTracker,
+    SessionTrackingHints,
+    _AnchorRecord,
+)
 from rotator_library.client.streaming import StreamingHandler
 
 
@@ -160,6 +165,79 @@ class SessionTrackerTests(unittest.TestCase):
         continued = tracker.infer_session(next_request, provider="gemini", model="pro")
 
         self.assertEqual(inferred.session_id, continued.session_id)
+
+    def test_compaction_probe_detects_user_summary_from_prior_response(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        request = {
+            "messages": [
+                {"role": "user", "content": "Prepare a detailed durable summary for later compaction."}
+            ]
+        }
+        parent = tracker.infer_session(request, provider="gemini", model="pro")
+        summary = " ".join(
+            [
+                "The compaction summary says the routing investigation found that response anchors",
+                "should identify a parent session without continuing sticky routing for the child context.",
+            ]
+            * 8
+        )
+        tracker.record_response(
+            parent.session_id,
+            provider="gemini",
+            model="pro",
+            response={"choices": [{"message": {"role": "assistant", "content": summary}}]},
+        )
+
+        child = tracker.infer_session(
+            {"messages": [{"role": "user", "content": summary}]},
+            provider="gemini",
+            model="pro",
+        )
+        repeated_child = tracker.infer_session(
+            {"messages": [{"role": "user", "content": summary}]},
+            provider="gemini",
+            model="pro",
+        )
+
+        self.assertTrue(child.possible_compaction)
+        self.assertEqual(parent.session_id, child.lineage_parent_session_id)
+        self.assertNotEqual(parent.session_id, child.session_id)
+        self.assertEqual(parent.session_id, repeated_child.lineage_parent_session_id)
+        self.assertNotEqual(child.session_id, repeated_child.session_id)
+
+    def test_best_match_tie_breaks_deterministically(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        now = 1000.0
+        namespace = "scope:test:provider:gemini:model:pro"
+        tracker._anchors["anchor-a"] = _AnchorRecord(
+            session_id="session-a",
+            namespace=namespace,
+            strength="medium",
+            source="message",
+            group="message:0",
+            expires_at=now + 100,
+            last_seen=now,
+        )
+        tracker._anchors["anchor-b"] = _AnchorRecord(
+            session_id="session-b",
+            namespace=namespace,
+            strength="medium",
+            source="message",
+            group="message:1",
+            expires_at=now + 100,
+            last_seen=now,
+        )
+
+        match = tracker._best_match(
+            [
+                SessionAnchor("anchor-b", "medium", source="message", group="message:1"),
+                SessionAnchor("anchor-a", "medium", source="message", group="message:0"),
+            ],
+            namespace,
+            now,
+        )
+
+        self.assertEqual(match.session_id, "session-b")
 
     def test_record_response_uses_stored_namespace_when_tracking_namespace_omitted(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -330,6 +408,7 @@ class SessionTrackerTests(unittest.TestCase):
             )
             first = tracker.infer_session(request, provider="gemini", model="pro")
             tracker.flush()
+            persisted = json.loads(path.read_text(encoding="utf-8"))
 
             restored = SessionTracker(
                 ttl_seconds=3600,
@@ -339,6 +418,7 @@ class SessionTrackerTests(unittest.TestCase):
             )
             second = restored.infer_session(request, provider="gemini", model="pro")
 
+        self.assertEqual(persisted["schema_version"], 1)
         self.assertEqual(first.session_id, second.session_id)
 
     def test_unversioned_persistence_is_ignored(self):
