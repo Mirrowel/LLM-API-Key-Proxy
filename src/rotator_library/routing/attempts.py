@@ -18,6 +18,8 @@ def clone_context_for_target(
     *,
     credentials: Sequence[str] | None = None,
     usage_manager_key: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+    credential_secrets: dict[str, str] | None = None,
     target_index: int = 0,
 ) -> RequestContext:
     """Return a target-specific request context without mutating the original.
@@ -36,5 +38,7 @@ def clone_context_for_target(
         kwargs=kwargs,
         credentials=list(credentials) if credentials is not None else list(context.credentials),
         usage_manager_key=usage_manager_key if usage_manager_key is not None else target.provider,
+        provider_config=provider_config if provider_config is not None else context.provider_config,
+        credential_secrets=dict(credential_secrets) if credential_secrets is not None else dict(context.credential_secrets),
         routing_target_index=target_index,
     )

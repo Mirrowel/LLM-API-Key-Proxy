@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .policy import FallbackPolicy
-from .types import RouteAttemptResult, RouteTarget, RoutingDecision
+from .types import FallbackGroup, RouteAttemptResult, RouteTarget, RoutingDecision
 
 AttemptCallback = Callable[[RouteTarget, int], Awaitable[Any]]
 
@@ -38,8 +38,19 @@ class FallbackAttemptRunner:
     async def run(self, decision: RoutingDecision, attempt: AttemptCallback, *, stream: bool = False) -> Any:
         """Try targets in order until one succeeds or fallback is exhausted."""
 
+        return await self.run_group(decision, None, attempt, stream=stream)
+
+    async def run_group(
+        self,
+        decision: RoutingDecision,
+        group: FallbackGroup | None,
+        attempt: AttemptCallback,
+        *,
+        stream: bool = False,
+    ) -> Any:
+        """Try targets while honoring optional group-specific policy overrides."""
+
         attempts: list[RouteAttemptResult] = []
-        group = None
         for index, target in enumerate(decision.targets):
             try:
                 return await attempt(target, index)

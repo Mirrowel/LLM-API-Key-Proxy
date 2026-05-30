@@ -630,7 +630,10 @@ class RequestExecutor:
                 context,
                 target,
                 target_index=index,
-                usage_manager_key=target.provider,
+                credentials=_target_scope_value(target, "credentials", context.credentials),
+                usage_manager_key=_target_scope_value(target, "usage_manager_key", target.provider),
+                provider_config=_target_scope_value(target, "provider_config", context.provider_config),
+                credential_secrets=_target_scope_value(target, "credential_secrets", context.credential_secrets),
             )
             self._log_routing_trace(
                 context,
@@ -642,7 +645,7 @@ class RequestExecutor:
                 result = await self._execute_non_streaming(target_context)
             except Exception as exc:
                 last_failure = exc
-                error_type = _route_error_type(exc)
+                error_type = _route_error_type(exc, target.provider)
                 self._log_routing_trace(
                     context,
                     "routing_target_attempt_failed",
@@ -703,7 +706,10 @@ class RequestExecutor:
                 context,
                 target,
                 target_index=index,
-                usage_manager_key=target.provider,
+                credentials=_target_scope_value(target, "credentials", context.credentials),
+                usage_manager_key=_target_scope_value(target, "usage_manager_key", target.provider),
+                provider_config=_target_scope_value(target, "provider_config", context.provider_config),
+                credential_secrets=_target_scope_value(target, "credential_secrets", context.credential_secrets),
             )
             self._log_routing_trace(
                 context,
@@ -724,7 +730,7 @@ class RequestExecutor:
                 )
                 return
             except Exception as exc:
-                error_type = _route_error_type(exc)
+                error_type = _route_error_type(exc, target.provider)
                 self._log_routing_trace(
                     context,
                     "routing_stream_target_attempt_failed",
@@ -1856,13 +1862,24 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     return None
 
 
-def _route_error_type(error: BaseException) -> str:
+def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
+    """Read request-scope metadata attached by routing resolution."""
+
+    scope = target.metadata.get("request_scope") if isinstance(target.metadata, dict) else None
+    if isinstance(scope, dict) and key in scope:
+        return scope[key]
+    return default
+
+
+def _route_error_type(error: BaseException, provider: Optional[str] = None) -> str:
     """Map an exception to a fallback-policy error type."""
 
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
     explicit = getattr(error, "error_type", None)
     if explicit:
         return str(explicit).lower()
-    classified = classify_error(error)
+    classified = classify_error(error, provider)
     return classified.error_type
 
 
@@ -1885,7 +1902,13 @@ def _route_error_type_from_response(response: Any) -> Optional[str]:
 
 
 def _stream_chunk_is_visible_output(chunk: str) -> bool:
-    """Return whether a stream chunk should block cross-target fallback."""
+    """Return whether a stream chunk should block cross-target fallback.
+
+    Only client-visible model output should lock the route. Empty frames, DONE
+    sentinels, and structured error frames are not considered visible output, so
+    a provider that fails before producing content can still fall through to the
+    next ordered target.
+    """
 
     text = chunk.strip()
     if not text or text == "data: [DONE]":

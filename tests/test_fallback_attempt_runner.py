@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rotator_library.routing import FallbackAttemptRunner, FallbackExhaustedError, RoutingDecision, parse_route_target
+from rotator_library.routing.types import FallbackGroup
 
 
 class ClassifiedFailure(Exception):
@@ -73,3 +74,25 @@ async def test_attempt_runner_blocks_stream_fallback_after_output() -> None:
 
     assert len(exc.value.attempts) == 1
     assert exc.value.attempts[0].emitted_output is True
+
+
+@pytest.mark.asyncio
+async def test_attempt_runner_honors_group_policy_overrides() -> None:
+    group = FallbackGroup(
+        name="custom",
+        targets=_decision().targets,
+        failover_on=frozenset({"authentication"}),
+        stop_on=frozenset({"validation"}),
+    )
+    calls = []
+
+    async def attempt(target, index):
+        calls.append(index)
+        if index == 0:
+            raise ClassifiedFailure("authentication")
+        return {"target": target.prefixed_model}
+
+    result = await FallbackAttemptRunner().run_group(_decision(), group, attempt)
+
+    assert result == {"target": "openai/gpt-5.1"}
+    assert calls == [0, 1]
