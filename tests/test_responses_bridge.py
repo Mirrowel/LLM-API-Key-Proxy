@@ -61,6 +61,16 @@ def test_bridge_preserves_tool_definitions() -> None:
     ]
 
 
+def test_bridge_preserves_unsupported_fields_for_trace_metadata() -> None:
+    protocol = ResponsesProtocol()
+    bridge = ResponsesBridge(protocol)
+    unified = protocol.parse_request({"model": "gpt-test", "input": "Hi", "custom_unsupported": 42})
+
+    kwargs = bridge.to_chat_kwargs(unified)
+
+    assert kwargs["_responses_bridge"]["extra"]["custom_unsupported"] == 42
+
+
 def test_bridge_converts_chat_response_to_responses_payload() -> None:
     protocol = ResponsesProtocol()
     bridge = ResponsesBridge(protocol)

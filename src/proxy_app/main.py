@@ -141,6 +141,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from rotator_library.responses import ResponsesService, ResponsesServiceError
+    from rotator_library.transaction_logger import TransactionLogger
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -1052,14 +1053,15 @@ async def responses_create(
         raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
     if logger:
         logger.log_request(headers=dict(request.headers), body=request_data)
+    transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
         if request_data.get("stream"):
             return StreamingResponse(
-                service.stream_response(request_data, client, request=request),
+                service.stream_response(request_data, client, request=request, transaction_logger=transaction_logger),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
             )
-        result = await service.create_response(request_data, client, request=request)
+        result = await service.create_response(request_data, client, request=request, transaction_logger=transaction_logger)
         if logger:
             logger.log_final_response(status_code=200, headers=None, body=result)
         return JSONResponse(content=result)
