@@ -67,7 +67,8 @@ class ResponsesProtocol(ProtocolAdapter):
 
     name: ClassVar[str] = "responses"
     aliases: ClassVar[tuple[str, ...]] = ("openai_responses", "response_api")
-    supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse", "websocket")
+    supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    future_transports: ClassVar[tuple[str, ...]] = ("websocket",)
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
@@ -127,9 +128,7 @@ class ResponsesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        if isinstance(unified_response.raw, dict):
-            return deepcopy(unified_response.raw)
-        output = deepcopy(unified_response.output) if unified_response.output else [self._format_output_message(message, index) for index, message in enumerate(unified_response.messages)]
+        output = [self._format_output_message(message, index) for index, message in enumerate(unified_response.messages)]
         payload = {
             "id": unified_response.id,
             "object": unified_response.metadata.get("object", "response"),
@@ -140,7 +139,7 @@ class ResponsesProtocol(ProtocolAdapter):
             "usage": unified_response.usage.to_dict() if unified_response.usage else None,
         }
         payload.update(deepcopy(unified_response.extra))
-        return payload
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -225,7 +224,16 @@ class ResponsesProtocol(ProtocolAdapter):
 
     def _format_input_message(self, message: UnifiedMessage) -> dict[str, Any]:
         if isinstance(message.raw, dict):
-            return deepcopy(message.raw)
+            payload = deepcopy(message.raw)
+            if payload.get("type") == "function_call_output":
+                payload["call_id"] = message.tool_call_id or payload.get("call_id")
+                result = message.content[0].tool_result if message.content and message.content[0].tool_result else None
+                if result:
+                    payload["output"] = deepcopy(result.content)
+                return payload
+            payload["role"] = message.role
+            payload["content"] = self._format_content(message.content)
+            return payload
         return {"type": "message", "role": message.role, "content": self._format_content(message.content)}
 
     def _parse_output_item(self, item: dict[str, Any]) -> UnifiedMessage | None:
@@ -239,13 +247,30 @@ class ResponsesProtocol(ProtocolAdapter):
             )
         if item_type == "reasoning":
             reasoning = ReasoningBlock(type="reasoning", text=_reasoning_text(item), extra={k: deepcopy(v) for k, v in item.items() if k not in {"type", "summary"}})
+            reasoning.raw = deepcopy(item)
             return UnifiedMessage(role="assistant", content=[ContentBlock(type="reasoning", reasoning=reasoning, raw=deepcopy(item))], reasoning=[reasoning], raw=deepcopy(item))
         if item_type in {"function_call", "custom_tool_call"}:
-            call = ToolCall(id=item.get("call_id") or item.get("id"), name=item.get("name"), arguments=item.get("arguments") or item.get("input"), type=str(item_type))
+            call = ToolCall(id=item.get("call_id") or item.get("id"), name=item.get("name"), arguments=item.get("arguments") or item.get("input"), type=str(item_type), raw=deepcopy(item))
             return UnifiedMessage(role="assistant", content=[ContentBlock(type=str(item_type), tool_call=call, raw=deepcopy(item))], tool_calls=[call], raw=deepcopy(item))
         return None
 
     def _format_output_message(self, message: UnifiedMessage, index: int) -> dict[str, Any]:
+        if isinstance(message.raw, dict):
+            payload = deepcopy(message.raw)
+            item_type = payload.get("type")
+            if item_type == "message":
+                payload["role"] = message.role
+                payload["content"] = self._format_content(message.content)
+                return payload
+            if item_type == "reasoning" and message.reasoning:
+                payload["summary"] = [{"type": "summary_text", "text": message.reasoning[0].text or ""}]
+                return payload
+            if item_type in {"function_call", "custom_tool_call"} and message.tool_calls:
+                call = message.tool_calls[0]
+                payload["call_id"] = call.id
+                payload["name"] = call.name
+                payload["arguments"] = deepcopy(call.arguments)
+                return payload
         return {"id": f"msg_{index}", "type": "message", "role": message.role, "content": self._format_content(message.content)}
 
     def _parse_content(self, content: Any) -> list[ContentBlock]:
@@ -275,12 +300,18 @@ class ResponsesProtocol(ProtocolAdapter):
     def _format_content(self, blocks: Iterable[ContentBlock]) -> list[dict[str, Any]]:
         formatted = []
         for block in blocks:
-            if isinstance(block.raw, dict):
-                formatted.append(deepcopy(block.raw))
-            elif block.type in {"input_text", "output_text", "text"}:
-                formatted.append({"type": block.type, "text": block.text or ""})
+            if block.type in {"input_text", "output_text", "text"}:
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": block.type}
+                payload["type"] = block.type
+                payload["text"] = block.text or ""
+                payload.update(deepcopy(block.extra))
+                formatted.append(payload)
             elif block.type in {"input_image", "image_url"}:
-                formatted.append({"type": block.type, "image_url": deepcopy(block.source)})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": block.type}
+                payload["type"] = block.type
+                payload["image_url"] = deepcopy(block.source)
+                payload.update(deepcopy(block.extra))
+                formatted.append(payload)
             else:
                 payload = {"type": block.type}
                 payload.update(deepcopy(block.extra))

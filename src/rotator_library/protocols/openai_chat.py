@@ -148,8 +148,6 @@ class OpenAIChatProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        if isinstance(unified_response.raw, dict):
-            return deepcopy(unified_response.raw)
         choices = []
         for index, message in enumerate(unified_response.messages):
             choices.append(
@@ -168,7 +166,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "usage": unified_response.usage.to_dict() if unified_response.usage else None,
         }
         payload.update(deepcopy(unified_response.extra))
-        return payload
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -295,7 +293,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 continue
             block_type = block.get("type", "text")
             if block_type == "text":
-                blocks.append(ContentBlock(type="text", text=block.get("text", ""), raw=deepcopy(block)))
+                blocks.append(ContentBlock(type="text", text=block.get("text", ""), raw=deepcopy(block), extra=_without(block, {"type", "text"})))
             elif block_type in {"image_url", "input_image"}:
                 blocks.append(ContentBlock(type=block_type, source=deepcopy(block.get("image_url") or block.get("source")), raw=deepcopy(block), extra=_without(block, {"type", "image_url", "source"})))
             else:
@@ -306,14 +304,20 @@ class OpenAIChatProtocol(ProtocolAdapter):
         block_list = list(blocks)
         if not block_list:
             return None
-        if all(block.type == "text" for block in block_list):
+        if all(block.type == "text" and not isinstance(block.raw, dict) and not block.extra for block in block_list):
             return first_text(block_list) or ""
         formatted = []
         for block in block_list:
             if block.type == "text":
-                formatted.append({"type": "text", "text": block.text or ""})
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": "text"}
+                payload["type"] = payload.get("type", "text")
+                payload["text"] = block.text or ""
+                payload.update(deepcopy(block.extra))
+                formatted.append(payload)
             elif block.type in {"image_url", "input_image"}:
-                payload = {"type": block.type, "image_url": deepcopy(block.source)}
+                payload = deepcopy(block.raw) if isinstance(block.raw, dict) else {"type": block.type}
+                payload["type"] = block.type
+                payload["image_url"] = deepcopy(block.source)
                 payload.update(deepcopy(block.extra))
                 formatted.append(payload)
             elif isinstance(block.raw, dict):
@@ -358,16 +362,21 @@ class OpenAIChatProtocol(ProtocolAdapter):
             arguments=arguments,
             type=str(payload.get("type") or "function"),
             index=payload.get("index"),
-            extra=_without(payload, {"id", "function", "type", "index", "name"}),
+            raw=deepcopy(call),
+            extra={**_without(function, {"name", "arguments"}), **_without(payload, {"id", "function", "type", "index", "name"})},
         )
 
     def _format_tool_call(self, call: ToolCall) -> dict[str, Any]:
-        payload = {"type": call.type, "function": {"name": call.name or "", "arguments": _format_arguments(call.arguments)}}
+        payload = deepcopy(call.raw) if isinstance(call.raw, dict) else {}
+        payload["type"] = call.type
         if call.id:
             payload["id"] = call.id
         if call.index is not None:
             payload["index"] = call.index
-        payload.update(deepcopy(call.extra))
+        function = deepcopy(payload.get("function")) if isinstance(payload.get("function"), dict) else {}
+        function["name"] = call.name or ""
+        function["arguments"] = _format_arguments(call.arguments)
+        payload["function"] = function
         return payload
 
 

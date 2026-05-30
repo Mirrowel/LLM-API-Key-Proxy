@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from decimal import Decimal
 
 import pytest
 
-from src.rotator_library.protocols import (
+from rotator_library.protocols import (
     ContentBlock,
     ProtocolAdapter,
     ProtocolContext,
@@ -82,6 +84,44 @@ def test_register_protocol_rejects_duplicate_alias() -> None:
 
     with pytest.raises(ValueError, match="alias already registered"):
         register_protocol(SecondProtocol)
+
+
+def test_register_protocol_rejects_name_that_conflicts_with_existing_alias() -> None:
+    class AliasOwnerProtocol(ProtocolAdapter):
+        name = "alias_owner_protocol"
+        aliases = ("reserved_protocol_name",)
+
+    class ConflictingNameProtocol(ProtocolAdapter):
+        name = "reserved_protocol_name"
+
+    register_protocol(AliasOwnerProtocol, replace=True)
+
+    with pytest.raises(ValueError, match="name conflicts with registered alias"):
+        register_protocol(ConflictingNameProtocol)
+
+
+def test_protocol_serialization_handles_common_non_json_values() -> None:
+    value = serialize_value(
+        {
+            "bytes": b"hello",
+            "decimal": Decimal("1.25"),
+            "datetime": datetime(2026, 1, 2, 3, 4, 5),
+            "object": object(),
+        }
+    )
+
+    assert value["bytes"] == "hello"
+    assert value["decimal"] == 1.25
+    assert value["datetime"] == "2026-01-02T03:04:05"
+    json.dumps(value)
+
+
+def test_usage_total_does_not_double_count_reasoning_by_default() -> None:
+    from rotator_library.protocols import Usage
+
+    usage = Usage(input_tokens=10, output_tokens=5, reasoning_tokens=3)
+
+    assert usage.total_tokens == 15
 
 
 def test_protocol_error_includes_pass_and_payload_preview() -> None:
