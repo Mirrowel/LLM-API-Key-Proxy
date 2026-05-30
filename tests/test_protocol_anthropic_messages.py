@@ -59,7 +59,24 @@ def test_anthropic_request_round_trip_preserves_thinking_tools_and_cache_metadat
     assert unified.messages[2].content[0].tool_result.tool_call_id == "toolu_1"
     assert unified.tools[0].input_schema == {"type": "object"}
     assert rebuilt["vendor_extension"] == {"kept": True}
+    assert isinstance(rebuilt["system"], list)
+    assert rebuilt["system"][0]["text"] == "system"
     assert rebuilt["messages"][1]["content"][0]["signature"] == "sig_1"
+
+
+def test_anthropic_system_preserves_block_metadata() -> None:
+    adapter = get_protocol("anthropic_messages")
+    raw = {
+        "model": "anthropic/claude-test",
+        "system": [{"type": "text", "text": "system", "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    unified = adapter.parse_request(raw)
+    unified.system[0].text = "updated"
+    rebuilt = adapter.build_request(unified)
+
+    assert rebuilt["system"] == [{"type": "text", "text": "updated", "cache_control": {"type": "ephemeral"}}]
 
 
 def test_anthropic_response_extracts_content_and_usage() -> None:

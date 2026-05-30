@@ -81,6 +81,25 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
     assert unified.usage.cost.provider_reported_cost == 0.02
 
 
+def test_responses_format_preserves_unknown_output_items() -> None:
+    adapter = get_protocol("responses")
+    raw = {
+        "id": "resp_1",
+        "model": "openai/gpt-test",
+        "output": [
+            {"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "before"}]},
+            {"id": "future_1", "type": "future_item", "custom": {"kept": True}},
+        ],
+    }
+
+    unified = adapter.parse_response(raw)
+    unified.messages[0].content[0].text = "after"
+    rebuilt = adapter.format_response(unified)
+
+    assert rebuilt["output"][0]["content"][0]["text"] == "after"
+    assert rebuilt["output"][1] == {"id": "future_1", "type": "future_item", "custom": {"kept": True}}
+
+
 def test_responses_stream_event_parses_text_delta_and_completed_response() -> None:
     adapter = get_protocol("responses")
     delta = {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "Hi"}

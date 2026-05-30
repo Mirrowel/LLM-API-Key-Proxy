@@ -173,7 +173,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         block_list = list(blocks)
         if not block_list:
             return None
-        if all(block.type == "text" for block in block_list):
+        if all(block.type == "text" and not isinstance(block.raw, dict) and not block.extra for block in block_list):
             return first_text(block_list) or ""
         return self._format_content(block_list)
 

@@ -85,7 +85,7 @@ class GeminiProtocol(ProtocolAdapter):
         if safety_settings:
             payload["safetySettings"] = deepcopy(safety_settings)
         if unified_request.tools:
-            payload["tools"] = [self._format_tool(tool) for tool in unified_request.tools]
+            payload["tools"] = self._format_tools(unified_request.tools)
         if unified_request.stream:
             payload["stream"] = True
         payload.update(deepcopy(unified_request.extra))
@@ -262,7 +262,7 @@ class GeminiProtocol(ProtocolAdapter):
 
     def _parse_tools(self, tools: Iterable[dict[str, Any]]) -> list[ToolDefinition]:
         parsed: list[ToolDefinition] = []
-        for tool in tools:
+        for container_index, tool in enumerate(tools):
             payload = dict(tool or {})
             declarations = payload.get("functionDeclarations") or payload.get("function_declarations") or []
             if declarations:
@@ -275,7 +275,7 @@ class GeminiProtocol(ProtocolAdapter):
                             description=declaration.get("description"),
                             input_schema=deepcopy(declaration.get("parameters") or {}),
                             type="function",
-                            extra={"raw_container": deepcopy(tool), "declaration_index": index},
+                            extra={"raw_container": deepcopy(tool), "container_index": container_index, "declaration_index": index},
                         )
                     )
                 continue
@@ -289,6 +289,28 @@ class GeminiProtocol(ProtocolAdapter):
                 )
             )
         return parsed
+
+    def _format_tools(self, tools: Iterable[ToolDefinition]) -> list[dict[str, Any]]:
+        grouped: dict[int, dict[str, Any]] = {}
+        ungrouped: list[dict[str, Any]] = []
+        for tool in tools:
+            raw_container = tool.extra.get("raw_container")
+            container_index = tool.extra.get("container_index")
+            declaration_index = tool.extra.get("declaration_index")
+            if isinstance(raw_container, dict) and isinstance(container_index, int) and isinstance(declaration_index, int):
+                container = grouped.setdefault(container_index, deepcopy(raw_container))
+                declarations = container.setdefault("functionDeclarations", [])
+                while len(declarations) <= declaration_index:
+                    declarations.append({})
+                declaration = deepcopy(declarations[declaration_index]) if isinstance(declarations[declaration_index], dict) else {}
+                declaration["name"] = tool.name
+                if tool.description is not None:
+                    declaration["description"] = tool.description
+                declaration["parameters"] = deepcopy(tool.input_schema)
+                declarations[declaration_index] = declaration
+                continue
+            ungrouped.append(self._format_tool(tool))
+        return [grouped[index] for index in sorted(grouped)] + ungrouped
 
     def _format_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         raw = tool.extra.get("raw")

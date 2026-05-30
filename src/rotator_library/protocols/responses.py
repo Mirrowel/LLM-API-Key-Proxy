@@ -110,10 +110,11 @@ class ResponsesProtocol(ProtocolAdapter):
         response = _as_dict(raw_response)
         output = deepcopy(response.get("output") or [])
         messages: list[UnifiedMessage] = []
-        for item in output:
+        for index, item in enumerate(output):
             if isinstance(item, dict):
                 parsed = self._parse_output_item(item)
                 if parsed:
+                    parsed.extra["_output_index"] = index
                     messages.append(parsed)
         return UnifiedResponse(
             id=response.get("id"),
@@ -128,7 +129,16 @@ class ResponsesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        output = [self._format_output_message(message, index) for index, message in enumerate(unified_response.messages)]
+        if unified_response.output:
+            output = deepcopy(unified_response.output)
+            for fallback_index, message in enumerate(unified_response.messages):
+                output_index = message.extra.get("_output_index", fallback_index)
+                if isinstance(output_index, int) and 0 <= output_index < len(output):
+                    output[output_index] = self._format_output_message(message, output_index)
+                else:
+                    output.append(self._format_output_message(message, fallback_index))
+        else:
+            output = [self._format_output_message(message, index) for index, message in enumerate(unified_response.messages)]
         payload = {
             "id": unified_response.id,
             "object": unified_response.metadata.get("object", "response"),

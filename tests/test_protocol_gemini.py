@@ -63,8 +63,13 @@ def test_gemini_parses_multiple_function_declarations() -> None:
     }
 
     unified = adapter.parse_request(raw)
+    unified.tools[1].description = "Second tool"
+    rebuilt = adapter.build_request(unified)
 
     assert [tool.name for tool in unified.tools] == ["one", "two"]
+    assert len(rebuilt["tools"]) == 1
+    assert [declaration["name"] for declaration in rebuilt["tools"][0]["functionDeclarations"]] == ["one", "two"]
+    assert rebuilt["tools"][0]["functionDeclarations"][1]["description"] == "Second tool"
 
 
 def test_gemini_response_extracts_usage_and_thought_signature() -> None:
