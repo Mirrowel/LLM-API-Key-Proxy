@@ -6,6 +6,7 @@
 from .bridge import ResponsesBridge
 from .service import ResponsesService, ResponsesServiceError
 from .store import InMemoryResponsesStore, ProviderCacheResponsesStore, ResponsesStore
+from .streaming import ResponsesSSEFormatter, ResponsesWebSocketFormatter
 from .types import StoredResponse, generate_response_id
 
 __all__ = [
@@ -14,7 +15,9 @@ __all__ = [
     "ResponsesBridge",
     "ResponsesService",
     "ResponsesServiceError",
+    "ResponsesSSEFormatter",
     "ResponsesStore",
+    "ResponsesWebSocketFormatter",
     "StoredResponse",
     "generate_response_id",
 ]
