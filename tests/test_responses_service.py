@@ -42,6 +42,10 @@ class FakeInternalClient(FakeClient):
                         "session_affinity_key": "affinity-parent",
                         "usage_manager_key": "scope-parent",
                         "classifier": "global",
+                        "session_tracker": None,
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "session_tracking_namespace": "namespace",
                     },
                 )()
             )
@@ -191,6 +195,51 @@ async def test_internal_client_context_metadata_is_stored_with_response() -> Non
     assert stored is not None
     assert stored.session_id == "session-parent"
     assert stored.metadata["session_affinity_key"] == "affinity-parent"
+
+
+@pytest.mark.asyncio
+async def test_responses_service_records_response_id_session_anchor() -> None:
+    class Tracker:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def record_response(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    tracker = Tracker()
+
+    class Client(FakeInternalClient):
+        async def acompletion(self, **kwargs):
+            callback = kwargs.pop("_request_context_callback", None)
+            kwargs.pop("_session_tracking_hints", None)
+            if callback:
+                callback(
+                    type(
+                        "Context",
+                        (),
+                        {
+                            "session_id": "session-parent",
+                            "session_affinity_key": "affinity-parent",
+                            "usage_manager_key": "scope-parent",
+                            "classifier": "global",
+                            "session_tracker": tracker,
+                            "provider": "openai",
+                            "model": "gpt-test",
+                            "session_tracking_namespace": "namespace",
+                        },
+                    )()
+                )
+            self.calls.append(kwargs)
+            return {
+                "id": "resp_parent",
+                "model": kwargs["model"],
+                "choices": [{"message": {"role": "assistant", "content": "Hello back"}, "finish_reason": "stop"}],
+            }
+
+    await ResponsesService(store=InMemoryResponsesStore()).create_response({"model": "gpt-test", "input": "Hello"}, Client())
+
+    assert tracker.calls[0][0][0] == "session-parent"
+    assert tracker.calls[0][1]["response"] == {"id": "resp_parent", "object": "response"}
 
 
 @pytest.mark.asyncio
