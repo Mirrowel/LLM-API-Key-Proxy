@@ -47,3 +47,23 @@ def test_executor_accounts_for_non_streaming_usage_and_cost_trace(tmp_path, monk
     entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
     assert entries[-1]["pass_name"] == "usage_accounting_summary"
     assert entries[-1]["data"]["usage"]["total_tokens"] == usage.total_tokens
+
+
+def test_executor_accounting_uses_configured_env_pricing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_PRICE_OPENAI_GPT_TEST_INPUT", "2.0")
+    executor = _executor()
+    response = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=0))
+    context = RequestContext(
+        provider="openai",
+        model="gpt-test",
+        kwargs={},
+        streaming=False,
+        credentials=[],
+        deadline=0,
+        transaction_logger=TransactionLogger("openai", "gpt-test", parent_dir=tmp_path),
+    )
+
+    _, cost = executor._account_for_response_usage("openai", "gpt-test", response, context)
+
+    assert cost.pricing_source == "env"
+    assert cost.input_cost == 6.0
