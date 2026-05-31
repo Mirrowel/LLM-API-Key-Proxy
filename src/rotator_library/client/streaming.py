@@ -217,6 +217,9 @@ class StreamingHandler:
                         has_tool_calls,
                         model,
                     )
+                    if not processed.sse_string:
+                        stream_completed = True
+                        break
                     self._collect_session_response_anchors(
                         processed.sse_string,
                         assistant_parts,
@@ -486,7 +489,7 @@ class StreamingHandler:
         if isinstance(chunk, str):
             stripped = chunk.strip()
             if stripped == "[DONE]" or stripped == "data: [DONE]":
-                return ProcessedChunk(sse_string="data: [DONE]\n\n")
+                return ProcessedChunk(sse_string="", finish_reason="stop")
             if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
                 usage = _usage_from_sse_string(chunk)
                 return ProcessedChunk(sse_string=chunk if chunk.endswith("\n\n") else f"{chunk}\n\n", usage=usage)

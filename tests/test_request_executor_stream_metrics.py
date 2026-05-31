@@ -200,3 +200,13 @@ async def test_streaming_handler_passes_through_formatted_sse_chunks(monkeypatch
 
     assert chunks[0] == 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_streaming_handler_does_not_duplicate_direct_done_sentinel(monkeypatch) -> None:
+    async def done_stream():
+        yield "data: [DONE]\n\n"
+
+    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(done_stream(), "cred", "openai/gpt-test")]
+
+    assert chunks == ["data: [DONE]\n\n"]
