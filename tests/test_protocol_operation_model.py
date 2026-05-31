@@ -93,3 +93,18 @@ def test_count_tokens_operation_can_be_context_selected() -> None:
     assert gemini.usage is not None
     assert gemini.usage.total_tokens == 14
     assert get_protocol("gemini").format_response(gemini) == {"totalTokens": 14}
+
+    anthropic.usage.input_tokens = 13
+    gemini.usage.total_tokens = 15
+    assert get_protocol("anthropic_messages").format_response(anthropic)["input_tokens"] == 13
+    assert get_protocol("gemini").format_response(gemini)["totalTokens"] == 15
+
+
+def test_context_operation_helpers_reject_unsupported_operations() -> None:
+    context = ProtocolContext(provider_options={"operation": OPERATION_EMBEDDINGS})
+
+    anthropic = get_protocol("anthropic_messages").parse_request({"model": "m", "messages": []}, context)
+    gemini = get_protocol("gemini").parse_request({"contents": []}, context)
+
+    assert anthropic.operation == OPERATION_MESSAGES
+    assert gemini.operation == OPERATION_CHAT

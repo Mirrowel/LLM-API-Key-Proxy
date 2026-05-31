@@ -26,3 +26,5 @@ def test_openai_embeddings_protocol_round_trip_and_usage() -> None:
     assert response.data[0]["embedding"] == [0.1, 0.2]
     assert response.usage is not None
     assert response.usage.input_tokens == 4
+    assert adapter.format_response(response)["data"] == response.data
+    assert adapter.format_response(response)["usage"]["total_tokens"] == 4

@@ -117,8 +117,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         if unified_response.operation == OPERATION_COUNT_TOKENS:
             usage = unified_response.usage
-            payload = {"input_tokens": usage.input_tokens if usage else 0}
-            payload.update(deepcopy(unified_response.extra))
+            payload = deepcopy(unified_response.extra)
+            # Normalized usage wins over raw preserved fields so later adapters
+            # can correct counts without stale provider keys shadowing them.
+            payload["input_tokens"] = usage.input_tokens if usage else 0
             return payload
         message = unified_response.messages[0] if unified_response.messages else UnifiedMessage(role="assistant")
         payload = {
@@ -334,13 +336,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
+    supported = {OPERATION_MESSAGES, OPERATION_COUNT_TOKENS}
     if context and isinstance(context.provider_options, dict):
         operation = normalize_operation(context.provider_options.get("operation"))
-        if operation != OPERATION_UNKNOWN:
+        if operation in supported:
             return operation
     if context and isinstance(context.metadata, dict):
         operation = normalize_operation(context.metadata.get("operation"))
-        if operation != OPERATION_UNKNOWN:
+        if operation in supported:
             return operation
     return default
 

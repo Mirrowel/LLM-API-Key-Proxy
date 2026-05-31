@@ -57,6 +57,7 @@ def test_openai_audio_transcription_and_speech_shapes() -> None:
     assert adapter.build_request(speech)["voice"] == "alloy"
     assert text_response.operation == OPERATION_AUDIO_TRANSCRIPTION
     assert text_response.output == ["hello world"]
+    assert adapter.format_response(text_response)["text"] == "hello world"
     assert translation_response.operation == "audio_translation"
     assert binary_response.content_type == "application/octet-stream"
     assert adapter.format_response(binary_response) == b"RIFF"
