@@ -373,6 +373,16 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         return self.native_streaming_supported
 
+    def get_model_pricing(self, model: str = "") -> Optional[Any]:
+        """Return optional local pricing metadata for advisory cost tracking.
+
+        Providers can return `usage.costs.ModelPricing` or a compatible dict.
+        The default is `None`, which lets cost accounting safely fall back to
+        LiteLLM model metadata or report pricing as unavailable.
+        """
+
+        return None
+
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[
