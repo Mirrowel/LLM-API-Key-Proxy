@@ -66,6 +66,8 @@ from ..retry_policy import decide_provider_cooldown, provider_cooldown_env
 from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from ..usage.accounting import UsageRecord, extract_usage_record
+from ..usage.costs import CostBreakdown, CostCalculator
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
@@ -919,16 +921,15 @@ class RequestExecutor:
                                 )
 
                                 # Success! Extract token usage if available
-                                (
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    prompt_tokens_cached,
-                                    prompt_tokens_cache_write,
-                                    thinking_tokens,
-                                ) = self._extract_usage_tokens(response)
-                                approx_cost = self._calculate_cost(
-                                    provider, model, response
+                                usage_record, cost_breakdown = self._account_for_response_usage(
+                                    provider, model, response, context
                                 )
+                                prompt_tokens = usage_record.prompt_tokens_for_mark_success
+                                completion_tokens = usage_record.completion_tokens
+                                prompt_tokens_cached = usage_record.cache_read_tokens
+                                prompt_tokens_cache_write = usage_record.cache_write_tokens
+                                thinking_tokens = usage_record.reasoning_tokens
+                                approx_cost = cost_breakdown.total_cost
                                 response_headers = self._extract_response_headers(
                                     response
                                 )
@@ -1785,6 +1786,68 @@ class RequestExecutor:
             raise ValueError(result)
 
     def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
+        """Extract legacy usage tuple through the normalized usage record."""
+
+        record = extract_usage_record(response)
+        return (
+            record.prompt_tokens_for_mark_success,
+            record.completion_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+            record.reasoning_tokens,
+        )
+
+    def _account_for_response_usage(
+        self,
+        provider: str,
+        model: str,
+        response: Any,
+        context: RequestContext,
+    ) -> tuple[UsageRecord, CostBreakdown]:
+        """Normalize usage and advisory cost for one successful response."""
+
+        usage_record = extract_usage_record(
+            response,
+            provider=provider,
+            model=model,
+            source="executor_response",
+        )
+        plugin = self._get_plugin_instance(provider)
+        cost_breakdown = CostCalculator(provider_plugin=plugin).calculate(
+            usage_record,
+            model=model,
+            response=response,
+        )
+        self._trace_usage_accounting(context, usage_record, cost_breakdown)
+        return usage_record, cost_breakdown
+
+    @staticmethod
+    def _trace_usage_accounting(
+        context: RequestContext,
+        usage_record: UsageRecord,
+        cost_breakdown: CostBreakdown,
+    ) -> None:
+        """Record normalized usage/cost trace data without affecting requests."""
+
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            "usage_accounting_summary",
+            {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
+            direction="metadata",
+            stage="final",
+            metadata={
+                "provider": usage_record.provider,
+                "model": usage_record.model,
+                "source": usage_record.source,
+                "pricing_source": cost_breakdown.pricing_source,
+            },
+            snapshot=False,
+        )
+
+    def _legacy_extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
+        """Previous extraction logic kept temporarily for comparison/debugging."""
+
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
