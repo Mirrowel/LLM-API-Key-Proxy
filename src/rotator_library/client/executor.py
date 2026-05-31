@@ -598,7 +598,7 @@ class RequestExecutor:
             )
             return await plugin.acompletion(self._http_client, **kwargs)
 
-        if execution == "native" or (execution == "auto" and _provider_native_protocol(plugin, model, target)):
+        if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution)):
             native_context, native_request = self._build_native_provider_context(
                 provider,
                 model,
@@ -2403,6 +2403,25 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     if plugin and hasattr(plugin, "get_protocol_name"):
         return plugin.get_protocol_name(model)
     return None
+
+
+def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], kwargs: Dict[str, Any], *, stream: bool, execution: str) -> bool:
+    """Return whether auto routing should use provider-native execution."""
+
+    protocol_name = _provider_native_protocol(plugin, model, target)
+    if not plugin or not protocol_name:
+        return False
+    native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+    request_payload = _native_request_payload(kwargs)
+    request_payload["_proxy_model"] = model
+    if native_model:
+        request_payload["model"] = native_model
+    operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+    hook = getattr(plugin, "should_use_native_protocol", None)
+    if callable(hook):
+        return bool(hook(model=native_model, operation=operation, stream=stream, execution=execution))
+    support = getattr(plugin, "supports_native_operation", None)
+    return bool(support(native_model, operation) if callable(support) else True)
 
 
 def _strip_provider_prefix(model: str) -> str:
