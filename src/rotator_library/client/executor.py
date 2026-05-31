@@ -675,18 +675,20 @@ class RequestExecutor:
         protocol_name = _provider_native_protocol(plugin, model, target)
         if not protocol_name:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
-        if not hasattr(plugin, "get_native_endpoint") or not hasattr(plugin, "get_native_headers"):
-            raise RoutingExecutionError(f"Provider {provider} has no native endpoint/header helpers")
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
         request_payload = _native_request_payload(raw_request or {})
+        request_payload["_proxy_model"] = public_model
         if native_model:
             request_payload["model"] = native_model
         operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+        if hasattr(plugin, "supports_native_operation") and not plugin.supports_native_operation(native_model, operation):
+            raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
         if hasattr(plugin, "prepare_native_request"):
             prepared = plugin.prepare_native_request(request_payload, model=native_model, operation=operation)
             if prepared is not request_payload:
                 request_payload = dict(prepared)
+            request_payload.pop("_proxy_model", None)
             self._log_executor_trace(
                 context,
                 "provider_native_request_prepared",
@@ -696,14 +698,19 @@ class RequestExecutor:
                 credential_id=credential_id,
                 metadata={"provider": provider, "model": public_model, "native_model": native_model, "operation": operation},
             )
-        endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
-        headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
+        request_payload.pop("_proxy_model", None)
+        try:
+            endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
+            headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
+        except NotImplementedError as exc:
+            raise RoutingExecutionError(str(exc)) from exc
         native_context = NativeProviderContext(
             provider=provider,
             model=native_model,
             protocol_name=protocol_name,
             endpoint=endpoint,
             operation=operation,
+            client_protocol_name="openai_chat",
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,

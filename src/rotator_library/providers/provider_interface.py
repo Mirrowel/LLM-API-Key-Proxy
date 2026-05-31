@@ -373,6 +373,26 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         return self.native_streaming_supported
 
+    def supports_native_operation(self, model: str = "", operation: str = "chat") -> bool:
+        """Return whether this provider supports a native operation."""
+
+        protocol_name = self.get_protocol_name(model)
+        if not protocol_name:
+            return False
+        try:
+            from ..protocols import get_protocol
+
+            return get_protocol(protocol_name).supports_operation(operation)
+        except Exception:
+            return False
+
+    def should_use_native_protocol(self, model: str = "", operation: str = "chat", *, stream: bool = False, execution: str = "auto") -> bool:
+        """Return whether routing should use this provider's native protocol."""
+
+        if stream and not self.supports_native_streaming(model, operation):
+            return False
+        return bool(self.get_protocol_name(model) and self.supports_native_operation(model, operation))
+
     def get_native_operation(self, model: str = "", request: Optional[Dict[str, Any]] = None, stream: bool = False) -> str:
         """Return the provider-native operation for a request.
 
@@ -384,6 +404,16 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
 
         return "chat"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        """Return the upstream endpoint for a native operation."""
+
+        raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
+
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
+        """Return non-payload HTTP headers for native requests."""
+
+        raise NotImplementedError(f"{self.__class__.__name__} does not define native headers")
 
     def normalize_native_model(self, model: str) -> str:
         """Return the upstream model name for native provider calls.

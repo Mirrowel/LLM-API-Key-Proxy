@@ -73,7 +73,10 @@ class NativeProviderExecutor:
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
-            provider_response = protocol.format_response(unified_response, protocol_context)
+            response_protocol = get_protocol(context.client_protocol_name) if context.client_protocol_name else protocol
+            response_context = context.protocol_context(target_protocol=response_protocol.name)
+            self._trace(context, "native_response_protocol_selected", {"protocol": response_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
+            provider_response = response_protocol.format_response(unified_response, response_context)
             self._trace(context, "formatted_native_response", provider_response, direction="response", stage="protocol")
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
@@ -186,7 +189,8 @@ class NativeProviderExecutor:
                     stage="adapter",
                     snapshot=False,
                 )
-                formatted = protocol.format_stream_event(event, protocol_context)
+                response_protocol = get_protocol(context.client_protocol_name) if context.client_protocol_name else protocol
+                formatted = response_protocol.format_stream_event(event, context.protocol_context(target_protocol=response_protocol.name))
                 self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
                 yield formatted
         except Exception as exc:
