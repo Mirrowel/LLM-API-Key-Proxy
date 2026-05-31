@@ -47,15 +47,3 @@ def test_executor_accounts_for_non_streaming_usage_and_cost_trace(tmp_path, monk
     entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
     assert entries[-1]["pass_name"] == "usage_accounting_summary"
     assert entries[-1]["data"]["usage"]["total_tokens"] == usage.total_tokens
-
-
-def test_executor_extract_usage_tokens_uses_normalized_record() -> None:
-    response = SimpleNamespace(
-        usage=SimpleNamespace(
-            prompt_tokens=10,
-            completion_tokens=5,
-            completion_tokens_details={"reasoning_tokens": 2},
-        )
-    )
-
-    assert _executor()._extract_usage_tokens(response) == (10, 3, 0, 0, 2)

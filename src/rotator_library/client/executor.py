@@ -1785,18 +1785,6 @@ class RequestExecutor:
         if isinstance(result, str):
             raise ValueError(result)
 
-    def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
-        """Extract legacy usage tuple through the normalized usage record."""
-
-        record = extract_usage_record(response)
-        return (
-            record.prompt_tokens_for_mark_success,
-            record.completion_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-            record.reasoning_tokens,
-        )
-
     def _account_for_response_usage(
         self,
         provider: str,
@@ -1852,7 +1840,7 @@ class RequestExecutor:
 
         Delegates to normalize_usage_for_response which handles both
         dicts (streaming) and pydantic objects (non-streaming).
-        Internal tracking values from _extract_usage_tokens are unaffected.
+        Internal tracking values from UsageRecord accounting are unaffected.
         """
         if hasattr(response, "usage") and response.usage:
             normalize_usage_for_response(response.usage, model)
