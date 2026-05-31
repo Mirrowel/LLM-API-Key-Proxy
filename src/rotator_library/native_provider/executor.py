@@ -64,6 +64,8 @@ class NativeProviderExecutor:
                 transaction_logger=logger,
             )
             self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
+            await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
             self._trace(context, "native_provider_request", provider_request, direction="request", stage="provider")
             raw_response = await transport.post_json(context.endpoint, headers=context.headers, payload=provider_request)
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
@@ -153,6 +155,8 @@ class NativeProviderExecutor:
                 transaction_logger=logger,
             )
             self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
+            await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
@@ -295,6 +299,8 @@ def _redact_field_cache_paths(data: Any, context: NativeProviderContext, directi
     for rule in context.field_cache_rules:
         paths: list[str] = []
         if direction == "request" and rule.inject:
+            paths.append(rule.inject.path)
+        if direction == "metadata" and rule.inject and rule.inject.target == "metadata":
             paths.append(rule.inject.path)
         if direction in {"response", "stream"}:
             paths.append(rule.path)
