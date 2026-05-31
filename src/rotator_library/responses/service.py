@@ -73,9 +73,9 @@ class ResponsesService:
         if raw_request.get("stream"):
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
-        self._trace(transaction_logger, "raw_responses_request", raw_request, direction="request", stage="client")
+        self._trace(transaction_logger, "responses_raw_request", raw_request, direction="request", stage="client")
         unified = self.protocol.parse_request(raw_request, ProtocolContext(source_protocol="responses"))
-        self._trace(transaction_logger, "parsed_unified_request", unified.to_dict(), direction="request", stage="protocol")
+        self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
 
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
@@ -90,18 +90,18 @@ class ResponsesService:
         )
 
         chat_response = await client.acompletion(request=request, **chat_kwargs)
-        self._trace(transaction_logger, "raw_chat_bridge_response", self._response_to_dict(chat_response), direction="response", stage="provider")
+        self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
 
         response_payload = self.bridge.from_chat_response(chat_response, unified)
-        self._trace(transaction_logger, "parsed_unified_response", response_payload, direction="response", stage="protocol")
+        self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
         if raw_request.get("store", True):
             stored = self._stored_response(raw_request, response_payload, parent)
             await self.store.save(stored)
-            self._trace(transaction_logger, "stored_responses_response", stored.to_dict(), direction="metadata", stage="final")
+            self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
-        self._trace(transaction_logger, "final_responses_response", response_payload, direction="response", stage="final")
+        self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
         return response_payload
 
     async def stream_response(
@@ -119,9 +119,9 @@ class ResponsesService:
         formatter = ResponsesSSEFormatter()
         stream_request = dict(raw_request)
         stream_request["stream"] = True
-        self._trace(transaction_logger, "raw_responses_request", stream_request, direction="request", stage="client")
+        self._trace(transaction_logger, "responses_raw_request", stream_request, direction="request", stage="client")
         unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport="sse"))
-        self._trace(transaction_logger, "parsed_unified_request", unified.to_dict(), direction="request", stage="protocol")
+        self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
@@ -148,7 +148,9 @@ class ResponsesService:
             stage="client",
             metadata={"transport": "sse"},
         )
-        yield formatter.format_event("response.created", response_created_payload(response_id, unified.model))
+        created = response_created_payload(response_id, unified.model)
+        self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": "sse"})
+        yield formatter.format_event("response.created", created)
         try:
             chat_stream = await client.acompletion(request=request, **chat_kwargs)
             async for raw_chunk in chat_stream:
@@ -175,7 +177,7 @@ class ResponsesService:
                 if not item_started:
                     item_started = True
                     added = output_item_added_payload(state)
-                    self._trace(transaction_logger, "formatted_responses_stream_event", added, direction="stream", stage="final")
+                    self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": "sse"})
                     yield formatter.format_event("response.output_item.added", added)
                 state = ResponsesStreamState(
                     response_id=state.response_id,
@@ -202,17 +204,20 @@ class ResponsesService:
                         stage="final",
                         metadata={"transport": "sse"},
                     )
-                self._trace(transaction_logger, "formatted_responses_stream_event", event, direction="stream", stage="final")
+                self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": "sse"})
                 yield formatter.format_event("response.output_text.delta", event)
 
             if not item_started:
-                yield formatter.format_event("response.output_item.added", output_item_added_payload(state))
+                added = output_item_added_payload(state)
+                self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": "sse"})
+                yield formatter.format_event("response.output_item.added", added)
             done_item = output_item_done_payload(state)
+            self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": "sse"})
             yield formatter.format_event("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
             await self._store_stream_response(stream_request, completed, parent)
-            self._trace(transaction_logger, "stored_responses_stream_response", completed, direction="metadata", stage="final")
+            self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
             monitor.complete()
             self._trace(
                 transaction_logger,
@@ -230,12 +235,14 @@ class ResponsesService:
                 stage="final",
                 metadata={"transport": "sse"},
             )
+            self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": "sse"})
             yield formatter.format_event("response.completed", completed)
             yield formatter.done()
         except Exception as exc:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
+            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"})
             self._trace(
                 transaction_logger,
                 "stream_metrics_final",

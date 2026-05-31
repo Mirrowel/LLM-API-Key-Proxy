@@ -112,12 +112,12 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
 
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert pass_names == [
-        "raw_responses_request",
-        "parsed_unified_request",
+        "responses_raw_request",
+        "responses_parsed_request",
         "responses_bridge_chat_request",
-        "raw_chat_bridge_response",
-        "parsed_unified_response",
+        "responses_bridge_chat_response",
+        "responses_parsed_response",
         "usage_accounting_summary",
-        "stored_responses_response",
-        "final_responses_response",
+        "responses_stored_response",
+        "responses_final_response",
     ]
