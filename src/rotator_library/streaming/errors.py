@@ -54,6 +54,7 @@ def decide_streaming_error_action(
         provider_cooldown_default_seconds=provider_cooldown_default_seconds,
         cooldown_on_quota=cooldown_on_quota,
         last_streamed_chunk=last_streamed_chunk,
+        provider=provider,
         model=model,
         original_error=error,
     )
@@ -74,6 +75,7 @@ def _cooldown_decision(
     provider_cooldown_default_seconds: int,
     cooldown_on_quota: bool,
     last_streamed_chunk: str | None,
+    provider: str,
     model: str | None,
     original_error: Exception,
 ) -> ProviderCooldownDecision:
@@ -85,6 +87,7 @@ def _cooldown_decision(
         provider_cooldown_min_seconds=provider_cooldown_min_seconds,
         default_duration=provider_cooldown_default_seconds,
         cooldown_on_quota=cooldown_on_quota,
+        provider=provider,
         model=model,
         original_error=original_error,
     )

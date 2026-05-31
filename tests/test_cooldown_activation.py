@@ -170,3 +170,4 @@ def test_streaming_provider_cooldown_gate_allows_only_pre_output_failures() -> N
     assert _can_start_stream_provider_cooldown(None) is True
     assert _can_start_stream_provider_cooldown('data: {"error":{"type":"rate_limit"}}\n\n') is True
     assert _can_start_stream_provider_cooldown('data: {"choices":[{"delta":{"content":"visible"}}]}\n\n') is False
+    assert _can_start_stream_provider_cooldown('data: {"usage":{"total_tokens":1}}\n\n', emitted_output=True) is False

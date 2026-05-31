@@ -80,6 +80,7 @@ def decide_provider_cooldown(
     provider_cooldown_min_seconds: int,
     default_duration: int = DEFAULT_PROVIDER_COOLDOWN_DEFAULT_SECONDS,
     cooldown_on_quota: bool = False,
+    provider: Optional[str] = None,
     model: Optional[str] = None,
     original_error: Any = None,
     failure_history: "FailureHistory | None" = None,
@@ -113,7 +114,7 @@ def decide_provider_cooldown(
         backoff_level = 0
         duration = int(default_duration)
         if failure_history is not None:
-            backoff = failure_history.backoff_for(error_type=error_type, scope=scope, model=model if scope == "model" else None, default_duration=duration)
+            backoff = failure_history.backoff_for(provider=provider, error_type=error_type, scope=scope, model=model if scope == "model" else None, default_duration=duration)
             duration = backoff.duration
             backoff_level = backoff.level
         return ProviderCooldownDecision(True, duration=duration, reason="model_capacity_cooldown" if scope == "model" else "default_transient_cooldown", scope=scope, model=model if scope == "model" else None, backoff_level=backoff_level)
@@ -161,7 +162,7 @@ class FailureHistory:
 
         return tuple(self._entries)
 
-    def backoff_for(self, *, error_type: str, scope: str, model: Optional[str], default_duration: int) -> BackoffDecision:
+    def backoff_for(self, *, provider: Optional[str], error_type: str, scope: str, model: Optional[str], default_duration: int) -> BackoffDecision:
         """Return bounded backoff for repeated transient failures."""
 
         window = _env_int("PROVIDER_BACKOFF_WINDOW_SECONDS", 60)
@@ -173,6 +174,7 @@ class FailureHistory:
             entry
             for entry in self._entries
             if now - entry.timestamp <= window
+            and (provider is None or entry.provider == provider)
             and entry.error_type == error_type
             and entry.scope == scope
             and (scope != "model" or entry.model == model)

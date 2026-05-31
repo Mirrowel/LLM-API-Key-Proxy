@@ -1417,6 +1417,7 @@ class RequestExecutor:
                             # Execute request with retries
                             for attempt in range(self._max_retries):
                                 last_streamed_chunk: Optional[str] = None
+                                stream_visible_output_emitted = False
 
                                 try:
                                     lib_logger.info(
@@ -1527,10 +1528,14 @@ class RequestExecutor:
                                             plugin=plugin,
                                         ):
                                             last_streamed_chunk = chunk
+                                            if _stream_chunk_is_visible_output(chunk):
+                                                stream_visible_output_emitted = True
                                             yield chunk
                                     else:
                                         async for chunk in base_stream:
                                             last_streamed_chunk = chunk
+                                            if _stream_chunk_is_visible_output(chunk):
+                                                stream_visible_output_emitted = True
                                             yield chunk
                                     return
 
@@ -1539,7 +1544,8 @@ class RequestExecutor:
                                     original = getattr(e, "data", e)
                                     classified = classify_error(original, provider)
                                     if _can_start_stream_provider_cooldown(
-                                        last_streamed_chunk
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
                                     ):
                                         await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=original)
                                     log_failure(
@@ -1578,10 +1584,7 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
-                                    if not can_retry_stream_after_error(
-                                        last_streamed_chunk,
-                                        self._stream_retry_on_reasoning_only_enabled(),
-                                    ):
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {
                                             "error": {
@@ -1628,7 +1631,8 @@ class RequestExecutor:
                                     last_exception = e
                                     classified = classify_error(e, provider)
                                     if _can_start_stream_provider_cooldown(
-                                        last_streamed_chunk
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
                                     ):
                                         await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
@@ -1666,6 +1670,13 @@ class RequestExecutor:
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                            yield line
+                                        return
 
                                     # Check for small cooldown - retry same key instead of rotating
                                     small_cooldown_threshold = int(
@@ -1707,7 +1718,8 @@ class RequestExecutor:
                                     last_exception = e
                                     classified = classify_error(e, provider)
                                     if _can_start_stream_provider_cooldown(
-                                        last_streamed_chunk
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
                                     ):
                                         await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
@@ -1717,6 +1729,13 @@ class RequestExecutor:
                                         error=e,
                                         request_headers=request_headers,
                                     )
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                            yield line
+                                        return
 
                                     if attempt >= self._max_retries - 1:
                                         error_accumulator.record_error(
@@ -1748,13 +1767,19 @@ class RequestExecutor:
                                         raise
                                     last_exception = e
                                     classified = classify_error(e, provider)
-                                    if _can_start_stream_provider_cooldown(last_streamed_chunk):
+                                    if _can_start_stream_provider_cooldown(last_streamed_chunk, emitted_output=stream_visible_output_emitted):
                                         await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(api_key=cred, model=model, attempt=attempt + 1, error=e, request_headers=request_headers)
                                     error_accumulator.record_error(cred, classified, str(e)[:150])
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                            yield line
+                                        return
                                     cred_context.mark_failure(classified)
                                     break
 
@@ -1762,7 +1787,8 @@ class RequestExecutor:
                                     last_exception = e
                                     classified = classify_error(e, provider)
                                     if _can_start_stream_provider_cooldown(
-                                        last_streamed_chunk
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
                                     ):
                                         await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
@@ -1779,6 +1805,13 @@ class RequestExecutor:
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                            yield line
+                                        return
 
                                     small_cooldown_threshold = int(
                                         os.environ.get(
@@ -2039,6 +2072,7 @@ class RequestExecutor:
             provider_cooldown_min_seconds=min_seconds,
             default_duration=default_seconds,
             cooldown_on_quota=cooldown_on_quota,
+            provider=provider,
             model=model,
             original_error=original_error,
             failure_history=getattr(self, "_failure_history", None),
@@ -2823,7 +2857,17 @@ def _stream_chunk_payload(chunk: str) -> Optional[Dict[str, Any]]:
     return parsed
 
 
-def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str]) -> bool:
+def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str], *, emitted_output: bool = False) -> bool:
     """Return whether a streaming failure occurred before visible output."""
 
+    if emitted_output:
+        return False
     return last_streamed_chunk is None or not _stream_chunk_is_visible_output(last_streamed_chunk)
+
+
+def _can_retry_stream_after_error(last_streamed_chunk: Optional[str], allow_reasoning_only_retry: bool, *, emitted_output: bool = False) -> bool:
+    """Return whether a stream can retry/rotate without duplicating output."""
+
+    if emitted_output:
+        return False
+    return can_retry_stream_after_error(last_streamed_chunk, allow_reasoning_only_retry)

@@ -123,6 +123,7 @@ def test_failure_history_escalates_repeated_transient_backoff(monkeypatch) -> No
         small_cooldown_threshold=10,
         provider_cooldown_min_seconds=10,
         default_duration=10,
+        provider="openai",
         failure_history=history,
     )
 
@@ -134,10 +135,38 @@ def test_failure_history_escalates_repeated_transient_backoff(monkeypatch) -> No
         small_cooldown_threshold=10,
         provider_cooldown_min_seconds=10,
         default_duration=10,
+        provider="openai",
         failure_history=history,
     )
     assert decision.duration == 20
     assert decision.backoff_level == 2
+
+
+def test_failure_history_backoff_is_provider_scoped(monkeypatch) -> None:
+    history = FailureHistory(clock=lambda: 1000.0)
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "2")
+    monkeypatch.setenv("PROVIDER_BACKOFF_BASE_SECONDS", "10")
+    history.record(provider="provider-a", model=None, error_type="server_error", scope="provider", duration=10, reason="test")
+
+    provider_b = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        provider="provider-b",
+        failure_history=history,
+    )
+    provider_a = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        provider="provider-a",
+        failure_history=history,
+    )
+
+    assert provider_b.backoff_level == 0
+    assert provider_a.backoff_level == 1
 
 
 def test_shared_classifier_handles_structured_dict_status_codes() -> None:
