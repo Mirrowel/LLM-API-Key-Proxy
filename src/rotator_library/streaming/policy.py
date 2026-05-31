@@ -21,6 +21,8 @@ def can_retry_stream_after_error(last_streamed_chunk: Optional[str], allow_reaso
 
     if last_streamed_chunk is None:
         return True
+    if is_stream_heartbeat_or_comment(last_streamed_chunk):
+        return True
     if not allow_reasoning_only_retry:
         return False
     data = _sse_json(last_streamed_chunk, malformed_is_visible=False)
@@ -69,6 +71,15 @@ def is_visible_stream_output(chunk: Optional[str], *, protocol: str = "openai_ch
     if protocol == "responses":
         return _responses_visible(data)
     return _openai_chat_visible(data)
+
+
+def is_stream_heartbeat_or_comment(chunk: Optional[str]) -> bool:
+    """Return true for SSE comment-only frames that must not affect retry state."""
+
+    if chunk is None:
+        return False
+    payload = chunk.strip()
+    return bool(payload) and all(line.startswith(":") for line in payload.splitlines() if line.strip())
 
 
 _MALFORMED_VISIBLE = object()

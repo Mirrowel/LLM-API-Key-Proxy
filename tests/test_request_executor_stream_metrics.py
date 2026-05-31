@@ -70,6 +70,16 @@ class DisconnectedRequest:
         return True
 
 
+class DelayedDisconnectedRequest:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def is_disconnected(self) -> bool:
+        self.calls += 1
+        await asyncio.sleep(0.01)
+        return self.calls >= 1
+
+
 def _trace_passes(log_dir):
     return [json.loads(line)["pass_name"] for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
@@ -117,6 +127,18 @@ async def test_streaming_handler_closes_upstream_on_client_disconnect(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_streaming_handler_closes_upstream_when_disconnect_happens_during_wait(monkeypatch) -> None:
+    monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+    stream = HangingStream()
+
+    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test", request=DelayedDisconnectedRequest())]
+
+    assert chunks == []
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
 async def test_streaming_handler_emits_configured_heartbeats(monkeypatch) -> None:
     monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
     monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
@@ -139,6 +161,18 @@ async def test_streaming_handler_ttfb_timeout_closes_upstream(monkeypatch) -> No
 
     assert stream.closed is True
     assert exc.value.data["error"]["details"]["timeout_type"] == "ttfb"
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_closes_upstream_even_when_disconnect_close_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.01")
+    monkeypatch.setenv("STREAM_CANCEL_UPSTREAM_ON_DISCONNECT", "false")
+    stream = HangingStream()
+
+    with pytest.raises(StreamedAPIError):
+        _ = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test")]
+
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio
