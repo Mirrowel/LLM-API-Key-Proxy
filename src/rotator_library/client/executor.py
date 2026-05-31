@@ -71,7 +71,7 @@ from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
-from .stream_retry_policy import can_retry_stream_after_error
+from ..streaming.policy import can_retry_stream_after_error, is_visible_stream_output
 
 if TYPE_CHECKING:
     from ..usage import UsageManager
@@ -2057,20 +2057,7 @@ def _stream_chunk_is_visible_output(chunk: str) -> bool:
     next ordered target.
     """
 
-    text = chunk.strip()
-    if not text or text == "data: [DONE]":
-        return False
-    if text.startswith("data:"):
-        payload = text[len("data:") :].strip()
-        if not payload or payload == "[DONE]":
-            return False
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return True
-        if isinstance(data, dict) and "error" in data:
-            return False
-    return True
+    return is_visible_stream_output(chunk)
 
 
 def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str]) -> bool:

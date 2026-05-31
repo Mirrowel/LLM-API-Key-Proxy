@@ -5,6 +5,7 @@
 
 from .events import StreamEvent, stream_event_from_sse_chunk
 from .metrics import StreamMetrics, StreamMonitor
+from .policy import can_retry_stream_after_error, is_visible_stream_output
 from .transport import JSONLineStreamFormatter, SSEStreamFormatter, WebSocketStreamFormatter
 
 __all__ = [
@@ -14,5 +15,7 @@ __all__ = [
     "StreamMetrics",
     "StreamMonitor",
     "WebSocketStreamFormatter",
+    "can_retry_stream_after_error",
+    "is_visible_stream_output",
     "stream_event_from_sse_chunk",
 ]
