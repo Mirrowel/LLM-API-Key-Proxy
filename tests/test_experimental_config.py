@@ -4,6 +4,7 @@ import pytest
 
 from rotator_library.config.experimental import (
     ExperimentalConfigError,
+    as_int,
     env_price_key,
     get_stream_runtime_settings,
     load_config_from_mapping,
@@ -71,3 +72,9 @@ def test_field_cache_rules_parse_wildcard_then_model_specific() -> None:
 
 def test_env_price_key_sanitizes_provider_and_model() -> None:
     assert env_price_key("openai", "gpt-5.1-mini", "cache_read") == "MODEL_PRICE_OPENAI_GPT_5_1_MINI_CACHE_READ"
+
+
+def test_as_int_parses_integers_with_redacted_errors() -> None:
+    assert as_int("5", name="TEST_INT") == 5
+    with pytest.raises(ExperimentalConfigError, match="TEST_INT"):
+        as_int("not-secret-value", name="TEST_INT")

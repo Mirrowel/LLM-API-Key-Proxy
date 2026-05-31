@@ -205,6 +205,15 @@ def as_float(value: Any, *, name: str) -> float:
         raise ExperimentalConfigError(f"Invalid number for {name}") from exc
 
 
+def as_int(value: Any, *, name: str) -> int:
+    """Parse a JSON/env integer value with redacted errors."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ExperimentalConfigError(f"Invalid integer for {name}") from exc
+
+
 def env_price_key(provider: str, model: str, suffix: str) -> str:
     """Return normalized model-price environment variable name."""
 
@@ -276,6 +285,8 @@ def _optional_positive_float(value: Any, name: str) -> Optional[float]:
     if value in (None, ""):
         return None
     parsed = as_float(value, name=name)
+    # Zero and negative values mean "not configured" for timeout-like knobs.
+    # Runtime enforcement is intentionally disabled by default.
     return parsed if parsed > 0 else None
 
 

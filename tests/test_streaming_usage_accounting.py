@@ -77,3 +77,13 @@ async def test_streaming_without_usage_still_marks_success_with_zero_usage() -> 
     assert cred_context.success_kwargs["thinking_tokens"] == 0
     assert cred_context.success_kwargs["prompt_tokens_cache_read"] == 0
     assert cred_context.success_kwargs["prompt_tokens_cache_write"] == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_usage_uses_configured_env_pricing(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_PRICE_OPENAI_GPT_TEST_INPUT", "2.0")
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "openai/gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["approx_cost"] == 120.0
