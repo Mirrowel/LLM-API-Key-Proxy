@@ -34,6 +34,12 @@ class ResponsesStreamEvent:
     payload: dict[str, Any]
     terminal: bool = False
 
+    @property
+    def heartbeat(self) -> bool:
+        """Return whether this event is transport metadata, not model output."""
+
+        return self.event_name == "heartbeat"
+
 
 class ResponsesSSEFormatter:
     """Format Responses API events as HTTP Server-Sent Events."""
@@ -46,9 +52,17 @@ class ResponsesSSEFormatter:
     def format_stream_event(self, event: ResponsesStreamEvent) -> str:
         """Format one transport-neutral event for HTTP SSE."""
 
+        if event.heartbeat:
+            return self.format_heartbeat(str(event.payload.get("comment") or "heartbeat"))
         if event.terminal:
             return self.done()
         return self.format_event(event.event_name, event.payload)
+
+    def format_heartbeat(self, comment: str = "heartbeat") -> str:
+        """Return a non-visible SSE comment heartbeat frame."""
+
+        safe_comment = comment.replace("\r", " ").replace("\n", " ")
+        return f": {safe_comment}\n\n"
 
     def done(self) -> str:
         """Return the final compatibility sentinel used by many SSE clients."""
@@ -68,6 +82,8 @@ class ResponsesWebSocketFormatter:
     def format_stream_event(self, event: ResponsesStreamEvent) -> str:
         """Format one transport-neutral event as a WebSocket message payload."""
 
+        if event.heartbeat:
+            return json.dumps({"event": "heartbeat", "data": {"visible_output": False}}, ensure_ascii=False)
         if event.terminal:
             return json.dumps({"event": "done", "data": {}}, ensure_ascii=False)
         return self.format_event(event.event_name, event.payload)

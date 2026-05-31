@@ -68,6 +68,32 @@ class ClosingOpenAIStream:
         self.closed = True
 
 
+class IteratorOnlyCloseStream:
+    def __init__(self) -> None:
+        self.iterator = IteratorOnlyCloseStreamIterator()
+
+    def __aiter__(self):
+        return self.iterator
+
+
+class IteratorOnlyCloseStreamIterator:
+    def __init__(self) -> None:
+        self.closed = False
+        self._chunks = iter(['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'])
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_anthropic_stream_traces_and_closes_on_disconnect(tmp_path) -> None:
     logger = TransactionLogger("anthropic", "claude-test", parent_dir=tmp_path)
@@ -84,6 +110,19 @@ async def test_anthropic_stream_traces_and_closes_on_disconnect(tmp_path) -> Non
     assert "anthropic_stream_source_chunk" in pass_names
     assert "anthropic_stream_disconnected" in pass_names
     assert "anthropic_stream_upstream_closed" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_closes_iterator_only_upstream() -> None:
+    stream = IteratorOnlyCloseStream()
+
+    async def disconnected() -> bool:
+        return True
+
+    chunks = [chunk async for chunk in anthropic_streaming_wrapper(stream, "claude-test", is_disconnected=disconnected)]
+
+    assert chunks == []
+    assert stream.iterator.closed is True
 
 
 @pytest.mark.asyncio
