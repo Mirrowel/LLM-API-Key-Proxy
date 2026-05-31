@@ -31,3 +31,18 @@ async def test_streaming_handler_emits_lifecycle_metrics_without_changing_output
     assert "stream_first_visible_output" in pass_names
     assert "stream_completed" in pass_names
     assert "stream_metrics_final" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_TRACE_METRICS", "false")
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+
+    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_chunks(), "cred", "openai/gpt-test", transaction_logger=logger)]
+
+    assert chunks[0].startswith("data: ")
+    assert chunks[-1] == "data: [DONE]\n\n"
+    if (logger.log_dir / "transform_trace.jsonl").exists():
+        pass_names = _trace_passes(logger.log_dir)
+        assert "stream_started" not in pass_names
+        assert "stream_metrics_final" not in pass_names

@@ -86,8 +86,12 @@ class StreamingHandler:
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
         monitor = StreamMonitor(clock=time.monotonic)
+        from ..config.experimental import get_stream_runtime_settings
+
+        stream_settings = get_stream_runtime_settings()
+        lifecycle_logger = transaction_logger if stream_settings.trace_metrics else None
         self._log_stream_lifecycle(
-            transaction_logger,
+            lifecycle_logger,
             "stream_started",
             monitor,
             StreamEvent("started", protocol="openai_chat"),
@@ -116,7 +120,7 @@ class StreamingHandler:
                     )
                     if monitor.metrics.first_byte_at is None:
                         self._log_stream_lifecycle(
-                            transaction_logger,
+                            lifecycle_logger,
                             "stream_first_byte",
                             monitor,
                             raw_event,
@@ -145,7 +149,7 @@ class StreamingHandler:
                     monitor.record_event(event)
                     if first_visible:
                         self._log_stream_lifecycle(
-                            transaction_logger,
+                            lifecycle_logger,
                             "stream_first_visible_output",
                             monitor,
                             event,
@@ -277,13 +281,13 @@ class StreamingHandler:
 
                 monitor.complete()
                 self._log_stream_lifecycle(
-                    transaction_logger,
+                    lifecycle_logger,
                     "stream_completed",
                     monitor,
                     StreamEvent("completed", protocol="openai_chat"),
                 )
                 self._log_stream_lifecycle(
-                    transaction_logger,
+                    lifecycle_logger,
                     "stream_metrics_final",
                     monitor,
                     StreamEvent("metadata", protocol="openai_chat"),
@@ -295,7 +299,7 @@ class StreamingHandler:
             elif request and await request.is_disconnected():
                 monitor.cancel()
                 self._log_stream_lifecycle(
-                    transaction_logger,
+                    lifecycle_logger,
                     "stream_cancelled",
                     monitor,
                     StreamEvent("cancelled", protocol="openai_chat"),
