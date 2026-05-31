@@ -65,3 +65,15 @@ def test_policy_normalizes_user_facing_aliases() -> None:
     assert normalize_route_error_type("context_length_exceeded") == "context_window_exceeded"
     assert FallbackPolicy().should_fallback("network") is True
     assert FallbackPolicy().should_fallback("validation") is False
+
+
+def test_policy_normalizes_common_structured_provider_aliases() -> None:
+    assert normalize_route_error_type("invalid_api_key") == "authentication"
+    assert normalize_route_error_type("unauthorized") == "authentication"
+    assert normalize_route_error_type("invalid_argument") == "invalid_request"
+    assert normalize_route_error_type("max_tokens_exceeded") == "context_window_exceeded"
+    assert normalize_route_error_type("rate_limited") == "rate_limit"
+    assert normalize_route_error_type("too_many_requests") == "rate_limit"
+    assert normalize_route_error_type("resource_exhausted") == "quota_exceeded"
+    assert normalize_route_error_type("unavailable") == "server_error"
+    assert normalize_route_error_type("deadline_exceeded") == "api_connection"
