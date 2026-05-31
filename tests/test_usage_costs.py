@@ -40,6 +40,27 @@ def test_skip_cost_provider_returns_zero_skipped_breakdown() -> None:
     assert cost.pricing_source == "skipped"
 
 
+def test_provider_reported_cost_wins_over_advisory_pricing() -> None:
+    usage = UsageRecord(input_tokens=10, completion_tokens=10, provider_reported_cost=0.123, cost_currency="EUR", cost_source="provider_actual")
+
+    cost = CostCalculator(provider_plugin=PricingProvider(), use_litellm_fallback=False).calculate(usage, model="test")
+
+    assert cost.total_cost == 0.123
+    assert cost.provider_reported_cost == 0.123
+    assert cost.currency == "EUR"
+    assert cost.pricing_source == "provider_actual"
+    assert cost.input_cost == 0.0
+
+
+def test_skip_cost_still_wins_over_provider_reported_cost() -> None:
+    usage = UsageRecord(provider_reported_cost=0.123)
+
+    cost = CostCalculator(provider_plugin=SkipCostProvider()).calculate(usage, model="test")
+
+    assert cost.total_cost == 0.0
+    assert cost.pricing_source == "skipped"
+
+
 def test_missing_pricing_returns_unavailable_zero() -> None:
     cost = CostCalculator(use_litellm_fallback=False).calculate(UsageRecord(input_tokens=100), model="unknown-model")
 
