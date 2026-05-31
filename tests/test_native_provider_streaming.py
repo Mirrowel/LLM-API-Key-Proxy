@@ -5,7 +5,7 @@ import json
 import pytest
 
 from rotator_library.adapters import PayloadAdapter, register_adapter
-from rotator_library.field_cache import FieldCacheRule
+from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.transaction_logger import TransactionLogger
 
@@ -110,3 +110,42 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
     assert events[0]["choices"][0]["delta"]["content"] == "adapted"
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "after_stream_event_adapter_chain" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_native_provider_stream_extracts_unified_stream_events_for_later_requests() -> None:
+    rule = FieldCacheRule(
+        name="unified_stream_text",
+        source="unified_stream_event",
+        path="delta.content.0.text",
+        inject=FieldCacheInjection(target="request", path="metadata.cached_stream_text"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        field_cache_rules=(rule,),
+    )
+    executor = NativeProviderExecutor()
+
+    _ = [
+        event
+        async for event in executor.stream(
+            {"model": "gpt-test", "messages": []},
+            context,
+            NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "stream-state"}}]}, "[DONE]"])),
+        )
+    ]
+    second_client = FakeStreamingClient(["[DONE]"])
+    _ = [
+        event
+        async for event in executor.stream(
+            {"model": "gpt-test", "messages": []},
+            context,
+            NativeHTTPTransport(second_client),
+        )
+    ]
+
+    assert second_client.calls[0]["json"]["metadata"]["cached_stream_text"] == "stream-state"

@@ -123,6 +123,26 @@ async def test_missing_session_scope_skips_by_default() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_credential_scope_skips_instead_of_sharing_none_bucket() -> None:
+    rule = _reasoning_rule(scope=("provider", "model", "credential"))
+    engine = FieldCacheEngine([rule])
+
+    operations = await engine.extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": "x"}}]},
+        _context(credential_id=None),
+    )
+    updated, injection_operations = await engine.inject("request", {"messages": [{}]}, _context(credential_id=None))
+
+    assert operations[0].skipped is True
+    assert operations[0].reason == "missing_required_scope"
+    assert injection_operations[0].skipped is True
+    assert injection_operations[0].reason == "missing_required_scope"
+    assert updated == {"messages": [{}]}
+    assert build_cache_key(rule, _context(credential_id=None)) is None
+
+
+@pytest.mark.asyncio
 async def test_missing_path_is_noop() -> None:
     engine = FieldCacheEngine([_reasoning_rule()])
 

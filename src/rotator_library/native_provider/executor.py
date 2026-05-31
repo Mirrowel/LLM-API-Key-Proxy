@@ -13,6 +13,7 @@ from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import ProtocolError, get_protocol, serialize_value
+from ..protocols.types import UnifiedRequest
 from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
@@ -41,15 +42,21 @@ class NativeProviderExecutor:
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
+            cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
+            context = await self._inject_metadata(context, cache_engine)
             protocol_context = context.protocol_context()
             unified_request = protocol.parse_request(raw_request, protocol_context)
             self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
+            await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            unified_request = await self._inject_unified_request(unified_request, context, cache_engine)
             provider_request = protocol.build_request(unified_request, protocol_context)
             self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             adapters = [get_adapter(name) for name in context.adapter_names]
-            provider_request = await run_adapter_chain(adapters, provider_request, context.adapter_context(), stage="request")
+            adapter_context = context.adapter_context()
+            adapter_context.transaction_logger = None
+            provider_request = await run_adapter_chain(adapters, provider_request, adapter_context, stage="request")
             self._trace(context, "after_request_adapter_chain", provider_request, direction="request", stage="adapter")
-            cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             provider_request, _ = await cache_engine.inject(
                 "request",
                 provider_request,
@@ -62,9 +69,13 @@ class NativeProviderExecutor:
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
             unified_response = protocol.parse_response(raw_response, protocol_context)
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
+            await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             provider_response = protocol.format_response(unified_response, protocol_context)
             self._trace(context, "formatted_native_response", provider_response, direction="response", stage="protocol")
-            provider_response = await run_adapter_chain(adapters, provider_response, context.adapter_context(), stage="response")
+            adapter_context = context.adapter_context()
+            adapter_context.transaction_logger = None
+            provider_response = await run_adapter_chain(adapters, provider_response, adapter_context, stage="response")
             self._trace(context, "after_response_adapter_chain", provider_response, direction="response", stage="adapter")
             await cache_engine.extract("response", provider_response, context.field_cache_context(), transaction_logger=logger)
             usage_record = extract_usage_record(
@@ -118,17 +129,23 @@ class NativeProviderExecutor:
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
+            cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
+            context = await self._inject_metadata(context, cache_engine)
             protocol_context = context.protocol_context()
             request_payload = dict(raw_request)
             request_payload["stream"] = True
             unified_request = protocol.parse_request(request_payload, protocol_context)
             self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
+            await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            unified_request = await self._inject_unified_request(unified_request, context, cache_engine)
             provider_request = protocol.build_request(unified_request, protocol_context)
             self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             adapters = [get_adapter(name) for name in context.adapter_names]
-            provider_request = await run_adapter_chain(adapters, provider_request, context.adapter_context(), stage="request")
+            adapter_context = context.adapter_context()
+            adapter_context.transaction_logger = None
+            provider_request = await run_adapter_chain(adapters, provider_request, adapter_context, stage="request")
             self._trace(context, "after_request_adapter_chain", provider_request, direction="request", stage="adapter")
-            cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             provider_request, _ = await cache_engine.inject(
                 "request",
                 provider_request,
@@ -152,6 +169,8 @@ class NativeProviderExecutor:
                 adapter_context.transaction_logger = None
                 event = await run_adapter_chain(adapters, event, adapter_context, stage="stream_event")
                 self._trace(context, "after_stream_event_adapter_chain", event, direction="stream", stage="adapter", snapshot=False)
+                await cache_engine.extract("unified_stream_event", serialize_value(event), context.field_cache_context(), transaction_logger=logger)
+                self._trace(context, "after_unified_stream_event_field_cache_extraction", {"source": "unified_stream_event"}, direction="stream", stage="adapter", snapshot=False)
                 event_payload = stream_event_payload(event)
                 self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
                 await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
@@ -224,6 +243,42 @@ class NativeProviderExecutor:
             payload={"provider": context.provider, "model": context.model, "operation": context.operation},
         )
 
+    async def _inject_metadata(self, context: NativeProviderContext, cache_engine: FieldCacheEngine) -> NativeProviderContext:
+        """Inject cached metadata before protocol/adapter contexts are built."""
+
+        metadata, operations = await cache_engine.inject(
+            "metadata",
+            dict(context.metadata),
+            context.field_cache_context(),
+            transaction_logger=context.transaction_logger,
+        )
+        if operations:
+            self._trace(context, "after_metadata_field_cache_injection", metadata, direction="metadata", stage="adapter", snapshot=False)
+        if metadata == context.metadata:
+            return context
+        return replace(context, metadata=metadata)
+
+    async def _inject_unified_request(
+        self,
+        unified_request: UnifiedRequest,
+        context: NativeProviderContext,
+        cache_engine: FieldCacheEngine,
+    ) -> UnifiedRequest:
+        """Inject cached values into a serialized unified request and hydrate it."""
+
+        serialized = serialize_value(unified_request)
+        injected, operations = await cache_engine.inject(
+            "unified_request",
+            serialized,
+            context.field_cache_context(),
+            transaction_logger=context.transaction_logger,
+        )
+        if operations:
+            self._trace(context, "after_unified_request_field_cache_injection", injected, direction="request", stage="adapter")
+        if injected == serialized:
+            return unified_request
+        return _hydrate_unified_request(unified_request, injected)
+
 
 def _redact_field_cache_paths(data: Any, context: NativeProviderContext, direction: str) -> Any:
     """Redact configured cache paths before broad native payload traces.
@@ -251,6 +306,38 @@ def _redact_field_cache_paths(data: Any, context: NativeProviderContext, directi
             except (FieldCachePathError, TypeError, ValueError):
                 continue
     return redacted
+
+
+def _hydrate_unified_request(original: UnifiedRequest, injected: Any) -> UnifiedRequest:
+    """Hydrate common unified-request fields after serialized cache injection.
+
+    Field-cache path injection operates on JSON-like dictionaries. Protocol
+    builders still expect `UnifiedRequest`, so this helper copies supported
+    top-level fields back onto the dataclass while leaving complex message/tool
+    objects untouched unless providers handle them through provider-payload rules.
+    """
+
+    if not isinstance(injected, dict):
+        return original
+    safe_fields = {
+        "operation",
+        "model",
+        "stream",
+        "input",
+        "modalities",
+        "files",
+        "generation_params",
+        "response_format",
+        "previous_response_id",
+        "metadata",
+        "raw",
+        "extra",
+    }
+    values = {field_name: getattr(original, field_name) for field_name in UnifiedRequest._fields}
+    for field_name in safe_fields:
+        if field_name in injected:
+            values[field_name] = injected[field_name]
+    return UnifiedRequest(**values)
 
 
 def _trace_redaction_paths(paths: list[str], *, direction: str) -> list[str]:
