@@ -28,9 +28,15 @@ class CooldownManager:
         """
         Initiates or extends a cooldown period for a provider.
         The cooldown is set to the current time plus the specified duration.
+
+        A shorter new cooldown must not shorten an existing longer cooldown;
+        provider-wide throttles often arrive concurrently from several requests.
         """
         async with self._lock:
-            self._cooldowns[provider] = time.time() + duration
+            new_expiry = time.time() + max(0, duration)
+            current_expiry = self._cooldowns.get(provider, 0)
+            if new_expiry > current_expiry:
+                self._cooldowns[provider] = new_expiry
 
     async def get_cooldown_remaining(self, provider: str) -> float:
         """
