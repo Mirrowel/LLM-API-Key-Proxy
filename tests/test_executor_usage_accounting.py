@@ -67,3 +67,19 @@ def test_executor_accounting_uses_configured_env_pricing(tmp_path, monkeypatch) 
 
     assert cost.pricing_source == "env"
     assert cost.input_cost == 6.0
+
+
+def test_normalize_response_usage_handles_dict_responses() -> None:
+    response = {
+        "usage": {
+            "prompt_tokens": 4,
+            "completion_tokens": 1,
+            "completion_tokens_details": {"reasoning_tokens": 3},
+        }
+    }
+
+    result = RequestExecutor._normalize_response_usage(response, "gpt-test")
+
+    assert result is response
+    assert response["usage"]["completion_tokens"] == 4
+    assert response["usage"]["total_tokens"] == 8
