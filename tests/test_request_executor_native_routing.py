@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rotator_library.client import executor as executor_module
 from rotator_library.client.executor import RequestExecutor, RoutingExecutionError
 from rotator_library.core.types import RequestContext
+from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.routing import parse_route_target
 
 
@@ -49,6 +52,18 @@ class NativePlugin:
 
     def get_field_cache_rules(self, model=""):
         return ()
+
+
+class NativePluginWithRule(NativePlugin):
+    def get_field_cache_rules(self, model=""):
+        return (
+            FieldCacheRule(
+                name="state",
+                source="response",
+                path="provider.path",
+                inject=FieldCacheInjection(target="request", path="metadata.state"),
+            ),
+        )
 
 
 class CustomPlugin:
@@ -96,6 +111,49 @@ async def test_native_declared_provider_uses_native_executor_in_auto_mode() -> N
     assert response["id"] == "chat_native"
     assert http_client.calls[0]["endpoint"] == "https://native.test/chat"
     assert http_client.calls[0]["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_native_context_merges_json_field_cache_rules(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "field_cache": {
+                    "provider": {
+                        "*": [
+                            {
+                                "name": "state",
+                                "source": "response",
+                                "path": "json.path",
+                                "inject": {"target": "request", "path": "metadata.state"},
+                            },
+                            {
+                                "name": "extra",
+                                "source": "response",
+                                "path": "json.extra",
+                                "inject": {"target": "request", "path": "metadata.extra"},
+                            },
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", str(config_path))
+
+    native_context = _executor()._build_native_provider_context(
+        "provider",
+        "provider/gpt-test",
+        NativePluginWithRule(),
+        "secret",
+        "stable",
+        _context(),
+        None,
+    )
+
+    assert [rule.name for rule in native_context.field_cache_rules] == ["state", "extra"]
+    assert native_context.field_cache_rules[0].path == "json.path"
 
 
 @pytest.mark.asyncio
