@@ -297,19 +297,20 @@ class ResponsesService:
         parent = await self.store.get(response_id)
         if parent is None:
             raise ResponsesServiceError(f"Previous response not found: {response_id}", status_code=404, error_type="not_found_error")
-        self._trace(
-            transaction_logger,
-            "responses_previous_response_loaded",
-            parent.to_dict(),
-            direction="metadata",
-            stage="adapter",
-            metadata={
-                "previous_response_id": response_id,
-                "output_count": len(parent.output_items),
-                "input_item_count": len(parent.input_items),
-                "bridge_context_expanded": True,
-            },
-        )
+        if transaction_logger:
+            self._trace(
+                transaction_logger,
+                "responses_previous_response_loaded",
+                parent.to_dict(),
+                direction="metadata",
+                stage="adapter",
+                metadata={
+                    "previous_response_id": response_id,
+                    "output_count": len(parent.output_items),
+                    "input_item_count": len(parent.input_items),
+                    "bridge_context_expanded": True,
+                },
+            )
         return parent
 
     def _stored_response(
@@ -379,6 +380,8 @@ class ResponsesService:
     ) -> None:
         """Trace normalized Responses usage without changing stored payloads."""
 
+        if not transaction_logger:
+            return
         usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
         if not usage:
             return

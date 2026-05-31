@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import rotator_library.responses.service as responses_service_module
 from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, StoredResponse
 from rotator_library.transaction_logger import TransactionLogger
 
@@ -121,3 +122,36 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
         "responses_stored_response",
         "responses_final_response",
     ]
+
+
+def test_trace_responses_usage_returns_before_conversion_without_logger(monkeypatch) -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    def fail_extract(*args, **kwargs):
+        raise AssertionError("usage conversion should be skipped when tracing is disabled")
+
+    monkeypatch.setattr(responses_service_module, "extract_usage_record", fail_extract)
+
+    service._trace_responses_usage(None, {"usage": {"input_tokens": 1}}, "gpt-test", source="test")
+
+
+@pytest.mark.asyncio
+async def test_previous_response_trace_payload_skipped_without_logger() -> None:
+    class Parent:
+        id = "resp_parent"
+        response = {"output": []}
+        output_items = []
+        input_items = []
+
+        def to_dict(self):
+            raise AssertionError("previous response trace payload should not be built without a logger")
+
+    class Store(InMemoryResponsesStore):
+        async def get(self, response_id):
+            return Parent()
+
+    service = ResponsesService(store=Store())
+
+    parent = await service._load_previous_response("resp_parent", None)
+
+    assert parent.id == "resp_parent"
