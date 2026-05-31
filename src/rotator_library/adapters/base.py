@@ -107,11 +107,12 @@ async def run_adapter_chain(
     """
 
     current = payload if mutate else deepcopy(payload)
-    original = deepcopy(current)
+    tracing_enabled = context.transaction_logger is not None
+    original = deepcopy(current) if tracing_enabled else None
     adapter_names = [adapter.name for adapter in adapters]
     _trace(context, "before_adapter_chain", current, stage=stage, metadata={"adapters": adapter_names})
     for adapter in adapters:
-        before = deepcopy(current)
+        before = deepcopy(current) if tracing_enabled else None
         try:
             current = await adapter.transform(stage, current, context)
         except Exception as exc:
@@ -119,7 +120,7 @@ async def run_adapter_chain(
                 context.transaction_logger.log_transform_error(
                     f"adapter:{adapter.name}:{stage}",
                     exc,
-                    payload=before,
+                    payload=before if before is not None else current,
                     stage="adapter",
                     protocol=context.protocol,
                     transport=context.transport,
@@ -131,13 +132,13 @@ async def run_adapter_chain(
             "after_adapter",
             current,
             stage=stage,
-            metadata={"adapter": adapter.name, "adapter_stage": stage, "changed": current != before},
+            metadata={"adapter": adapter.name, "adapter_stage": stage, "changed": (current != before) if before is not None else None},
         )
     _trace(
         context,
         "after_adapter_chain",
         current,
         stage=stage,
-        metadata={"adapters": adapter_names, "adapter_stage": stage, "adapter_count": len(adapter_names), "changed": original != current},
+        metadata={"adapters": adapter_names, "adapter_stage": stage, "adapter_count": len(adapter_names), "changed": (original != current) if original is not None else None},
     )
     return current

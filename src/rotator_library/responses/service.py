@@ -216,8 +216,11 @@ class ResponsesService:
             yield formatter.format_event("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
-            await self._store_stream_response(stream_request, completed, parent)
-            self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
+            stored = await self._store_stream_response(stream_request, completed, parent)
+            if stored:
+                self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
+            else:
+                self._trace(transaction_logger, "responses_store_skipped", {"response_id": completed.get("id")}, direction="metadata", stage="final")
             monitor.complete()
             self._trace(
                 transaction_logger,
@@ -242,7 +245,7 @@ class ResponsesService:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
-            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"})
+            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"}, scrub_strings=True)
             self._trace(
                 transaction_logger,
                 "stream_metrics_final",
@@ -337,6 +340,7 @@ class ResponsesService:
         direction: str,
         stage: str,
         metadata: Optional[dict[str, Any]] = None,
+        scrub_strings: bool = False,
     ) -> None:
         if not transaction_logger:
             return
@@ -347,6 +351,7 @@ class ResponsesService:
             stage=stage,
             protocol="responses",
             metadata=metadata or {},
+            scrub_strings=scrub_strings,
         )
 
     @staticmethod
@@ -382,10 +387,11 @@ class ResponsesService:
         raw_request: dict[str, Any],
         response_payload: dict[str, Any],
         parent: Optional[StoredResponse],
-    ) -> None:
+    ) -> bool:
         if not raw_request.get("store", True):
-            return
+            return False
         await self.store.save(self._stored_response(raw_request, response_payload, parent))
+        return True
 
 
 def _input_items(raw_request: dict[str, Any]) -> list[Any]:
