@@ -5,6 +5,7 @@ from types import MethodType
 
 import pytest
 
+from rotator_library.client import executor as executor_module
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
 from rotator_library.routing import parse_route_target
@@ -170,3 +171,14 @@ async def test_streaming_fallback_exhaustion_trace_uses_sanitized_summaries(tmp_
     exhausted = [entry for entry in entries if entry["pass_name"] == "routing_fallback_exhausted"][-1]
     assert exhausted["metadata"]["fallback_targets"][0]["message"] == ""
     assert exhausted["metadata"]["streaming_policy"] == "never"
+
+
+def test_stream_timeout_details_merge_into_aggregate_error() -> None:
+    error_data = {"error": {"type": "proxy_error", "details": {"attempts": 1}}}
+    stream_error = {"error": {"type": "api_connection", "details": {"timeout_type": "ttfb", "timeout_seconds": 0.1}}}
+
+    executor_module._merge_stream_error_details(error_data, stream_error)
+
+    assert error_data["error"]["type"] == "api_connection"
+    assert error_data["error"]["details"]["attempts"] == 1
+    assert error_data["error"]["details"]["timeout_type"] == "ttfb"

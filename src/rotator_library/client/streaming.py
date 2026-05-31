@@ -483,6 +483,13 @@ class StreamingHandler:
             ProcessedChunk with SSE string and metadata
         """
         # Convert chunk to dict
+        if isinstance(chunk, str):
+            stripped = chunk.strip()
+            if stripped == "[DONE]" or stripped == "data: [DONE]":
+                return ProcessedChunk(sse_string="data: [DONE]\n\n")
+            if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                usage = _usage_from_sse_string(chunk)
+                return ProcessedChunk(sse_string=chunk if chunk.endswith("\n\n") else f"{chunk}\n\n", usage=usage)
         if hasattr(chunk, "model_dump"):
             chunk_dict = chunk.model_dump()
         elif hasattr(chunk, "dict"):
@@ -701,6 +708,28 @@ def _stream_timeout_error(monitor: StreamMonitor, settings: Any) -> Optional[tup
                 "stream_stall_timeout",
             )
     return None
+
+
+def _usage_from_sse_string(chunk: str) -> Optional[dict[str, Any]]:
+    """Extract usage from already formatted SSE chunks when native streams pass through."""
+
+    text = chunk.strip()
+    data_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if not data_lines:
+        return None
+    payload = "\n".join(data_lines).strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    usage = data.get("usage") if isinstance(data, dict) else None
+    return usage if isinstance(usage, dict) else None
 
 
 class StreamBuffer:

@@ -125,6 +125,8 @@ class NativeProviderExecutor:
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
                 event_payload = stream_event_payload(event)
                 self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
+                if event.type == "done":
+                    break
                 await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
                 self._trace(
                     context,

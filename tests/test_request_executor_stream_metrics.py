@@ -189,3 +189,14 @@ async def test_streaming_handler_stall_timeout_after_first_byte(monkeypatch) -> 
     assert chunks and chunks[0].startswith("data: ")
     assert stream.closed is True
     assert exc.value.data["error"]["details"]["timeout_type"] == "stall"
+
+
+@pytest.mark.asyncio
+async def test_streaming_handler_passes_through_formatted_sse_chunks(monkeypatch) -> None:
+    async def formatted_stream():
+        yield 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+
+    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(formatted_stream(), "cred", "openai/gpt-test")]
+
+    assert chunks[0] == 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    assert chunks[-1] == "data: [DONE]\n\n"

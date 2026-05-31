@@ -64,7 +64,7 @@ class FakeHttpxClient:
 
 @pytest.mark.asyncio
 async def test_native_http_transport_streams_httpx_lines() -> None:
-    response = FakeStreamResponse(["", 'data: {"delta":"hi"}', "data: [DONE]"])
+    response = FakeStreamResponse(["", ": heartbeat", 'data: {"delta":"hi"}', "data: [DONE]"])
     client = FakeHttpxClient(response)
 
     chunks = [chunk async for chunk in NativeHTTPTransport(client).stream_json_lines("https://example.test/stream", headers={"h": "v"}, payload={"p": True})]
