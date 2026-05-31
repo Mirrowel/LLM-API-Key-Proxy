@@ -73,6 +73,8 @@ class CodexProvider(ProviderInterface):
     def supports_native_streaming(self, model: str = "", operation: str = "responses") -> bool:
         """Return false until the generic native stream wrapper is compatible."""
 
+        if self._get_runtime_config(model).native_streaming_supported is not None:
+            return super().supports_native_streaming(model, operation)
         return False
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:

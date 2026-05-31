@@ -427,6 +427,13 @@ def _validate_provider_sections(value: Any) -> None:
         unsupported = set(str(key) for key in raw) - _PROVIDER_CONFIG_KEYS
         if unsupported:
             raise ExperimentalConfigError(f"providers.{provider} contains unsupported keys: {', '.join(sorted(unsupported))}")
+        _configured_protocol(raw.get("protocol_name"))
+        _configured_adapters(raw.get("adapter_names"))
+        _configured_adapter_config(raw.get("adapter_config", {}))
+        if "native_streaming_supported" in raw:
+            as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
+        if "model_quota_groups" in raw:
+            _configured_quota_groups(raw.get("model_quota_groups"))
 
 
 def _configured_protocol(value: Any) -> Optional[str]:

@@ -784,11 +784,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Env format: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
         Set empty string to disable a default group.
         """
-        configured_groups = self._get_runtime_config().model_quota_groups
-        base_groups: QuotaGroupMap = {
-            group: list(models)
-            for group, models in (configured_groups if configured_groups is not None else self.model_quota_groups).items()
-        }
+        configured_groups = self._get_runtime_config().model_quota_groups or {}
+        base_groups: QuotaGroupMap = {group: list(models) for group, models in self.model_quota_groups.items()}
+        for group, models in configured_groups.items():
+            base_groups[group] = list(models)
         if not self.provider_env_name:
             return base_groups
 

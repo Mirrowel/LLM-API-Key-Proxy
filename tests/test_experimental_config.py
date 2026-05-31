@@ -10,7 +10,6 @@ from rotator_library.config.experimental import (
     get_responses_store_runtime_settings,
     get_retry_runtime_settings,
     get_stream_runtime_settings,
-    get_provider_runtime_config,
     load_config_from_mapping,
     load_experimental_config,
     parse_field_cache_rules,
@@ -148,9 +147,9 @@ def test_provider_config_rejects_unsupported_keys() -> None:
 
 def test_provider_config_validates_protocol_and_adapter_names() -> None:
     with pytest.raises(ExperimentalConfigError):
-        get_provider_runtime_config("openai", config=load_config_from_mapping({"providers": {"openai": {"protocol_name": "missing_protocol"}}}), env={})
+        load_config_from_mapping({"providers": {"openai": {"protocol_name": "missing_protocol"}}})
     with pytest.raises(ExperimentalConfigError):
-        get_provider_runtime_config("openai", config=load_config_from_mapping({"providers": {"openai": {"adapter_names": ["missing_adapter"]}}}), env={})
+        load_config_from_mapping({"providers": {"openai": {"adapter_names": ["missing_adapter"]}}})
 
 
 def test_retry_runtime_settings_malformed_env_preserves_defaults() -> None:

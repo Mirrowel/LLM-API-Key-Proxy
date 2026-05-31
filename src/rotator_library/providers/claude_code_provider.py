@@ -94,6 +94,8 @@ class ClaudeCodeProvider(ProviderInterface):
     def supports_native_streaming(self, model: str = "", operation: str = "messages") -> bool:
         """Return false until the generic native stream wrapper is compatible."""
 
+        if self._get_runtime_config(model).native_streaming_supported is not None:
+            return super().supports_native_streaming(model, operation)
         return False
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "messages") -> dict[str, Any]:
@@ -113,7 +115,10 @@ class ClaudeCodeProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
         """Configure adapters without hardcoding provider transforms."""
 
-        return {"suppress_developer_role": {"mode": "user"}}
+        config = {"suppress_developer_role": {"mode": "user"}}
+        for adapter, override in super().get_adapter_config(model).items():
+            config.setdefault(adapter, {}).update(override)
+        return config
 
     @staticmethod
     def _with_prefix(model: str) -> str:

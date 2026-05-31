@@ -71,6 +71,8 @@ class CopilotProvider(ProviderInterface):
     def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
         """Return false until the generic native stream wrapper is compatible."""
 
+        if self._get_runtime_config(model).native_streaming_supported is not None:
+            return super().supports_native_streaming(model, operation)
         return False
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
@@ -82,7 +84,10 @@ class CopilotProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, str]]:
         """Configure role suppression declaratively for OpenAI-compatible chat."""
 
-        return {"suppress_developer_role": {"mode": "system"}}
+        config = {"suppress_developer_role": {"mode": "system"}}
+        for adapter, override in super().get_adapter_config(model).items():
+            config.setdefault(adapter, {}).update(override)
+        return config
 
     @staticmethod
     def _with_prefix(model: str) -> str:

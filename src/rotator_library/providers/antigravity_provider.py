@@ -153,6 +153,8 @@ class AntigravityProvider(ProviderInterface):
     def supports_native_streaming(self, model: str = "", operation: str = "generate") -> bool:
         """Return false until native stream wrapping is provider-safe."""
 
+        if self._get_runtime_config(model).native_streaming_supported is not None:
+            return super().supports_native_streaming(model, operation)
         return False
 
     def get_native_endpoint(self, model: str = "", operation: str = "generate") -> str:
@@ -167,13 +169,16 @@ class AntigravityProvider(ProviderInterface):
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
         """Configure the safe Antigravity internal request envelope."""
 
-        return {
+        config = {
             "antigravity_envelope": {
                 "project": os.getenv("ANTIGRAVITY_PROJECT", ""),
                 "user_agent": ANTIGRAVITY_HEADERS["User-Agent"],
                 "request_type": os.getenv("ANTIGRAVITY_REQUEST_TYPE", "CHAT_COMPLETION"),
             }
         }
+        for adapter, override in super().get_adapter_config(model).items():
+            config.setdefault(adapter, {}).update(override)
+        return config
 
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """Antigravity exposes no restored model-tier restriction."""
