@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
@@ -211,12 +212,15 @@ class StreamingHandler:
                     error_buffer.reset()
 
                     # Process chunk
+                    cost_event_record = _usage_record_from_sse_cost_chunk(chunk, model=model)
                     processed = self._process_chunk(
                         chunk,
                         accumulated_finish_reason,
                         has_tool_calls,
                         model,
                     )
+                    if cost_event_record.provider_reported_cost is not None:
+                        usage_record = _merge_usage_cost(usage_record, cost_event_record)
                     if not processed.sse_string:
                         stream_completed = True
                         break
@@ -247,11 +251,14 @@ class StreamingHandler:
                         # Only update if not already tool_calls (highest priority)
                         accumulated_finish_reason = processed.finish_reason
                     if processed.usage and isinstance(processed.usage, dict):
-                        usage_record = extract_usage_record(
+                        next_usage_record = extract_usage_record(
                             processed.usage,
                             model=model,
                             source="stream_final_chunk",
                         )
+                        if next_usage_record.provider_reported_cost is None and usage_record.provider_reported_cost is not None:
+                            next_usage_record = _merge_usage_cost(next_usage_record, usage_record)
+                        usage_record = next_usage_record
                         prompt_tokens = usage_record.input_tokens + usage_record.cache_read_tokens
                         completion_tokens = usage_record.completion_tokens
                         thinking_tokens = usage_record.reasoning_tokens
@@ -733,6 +740,72 @@ def _usage_from_sse_string(chunk: str) -> Optional[dict[str, Any]]:
         return None
     usage = data.get("usage") if isinstance(data, dict) else None
     return usage if isinstance(usage, dict) else None
+
+
+def _usage_record_from_sse_cost_chunk(chunk: Any, *, model: str) -> UsageRecord:
+    """Extract provider-reported stream cost from SSE comments/events."""
+
+    if not isinstance(chunk, str):
+        return UsageRecord(source="stream_cost_event", model=model)
+    cost_payload = _sse_cost_payload(chunk)
+    if cost_payload is None:
+        return UsageRecord(source="stream_cost_event", model=model)
+    if isinstance(cost_payload, (int, float, str)):
+        cost_payload = {"provider_reported_cost": cost_payload, "source": "sse_cost"}
+    if not isinstance(cost_payload, dict):
+        return UsageRecord(source="stream_cost_event", model=model)
+    return extract_usage_record(
+        {"usage": {"provider_reported_cost": cost_payload.get("provider_reported_cost", cost_payload.get("total_cost", cost_payload.get("cost"))), "currency": cost_payload.get("currency", "USD"), "cost_details": cost_payload}},
+        model=model,
+        source="stream_cost_event",
+    )
+
+
+def _sse_cost_payload(chunk: str) -> Any:
+    """Parse `: cost ...` comments and `event: cost` frames."""
+
+    event_type: Optional[str] = None
+    data_lines: list[str] = []
+    for line in chunk.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(":"):
+            comment = stripped[1:].strip()
+            if comment.startswith("cost"):
+                return _parse_cost_text(comment[4:].strip())
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if event_type == "cost" and data_lines:
+        return _parse_cost_text("\n".join(data_lines).strip())
+    return None
+
+
+def _parse_cost_text(text: str) -> Any:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+
+def _merge_usage_cost(base: UsageRecord, cost_record: UsageRecord) -> UsageRecord:
+    """Copy provider-reported cost onto an existing normalized usage record."""
+
+    if cost_record.provider_reported_cost is None:
+        return base
+    return replace(
+        base,
+        provider_reported_cost=cost_record.provider_reported_cost,
+        cost_currency=cost_record.cost_currency,
+        cost_source=cost_record.cost_source,
+    )
 
 
 class StreamBuffer:
