@@ -100,6 +100,15 @@ async def test_streaming_without_usage_still_marks_success_with_zero_usage() -> 
 
 
 @pytest.mark.asyncio
+async def test_streaming_completed_calls_success_callback() -> None:
+    called = []
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_zero_usage_chunks(), "cred", "gpt-test", success_callback=lambda: called.append(True))]
+
+    assert called == [True]
+
+
+@pytest.mark.asyncio
 async def test_streaming_usage_uses_configured_env_pricing(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_PRICE_OPENAI_GPT_TEST_INPUT", "2.0")
     cred_context = FakeCredentialContext()

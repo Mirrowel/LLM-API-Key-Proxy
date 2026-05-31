@@ -142,6 +142,42 @@ def test_failure_history_escalates_repeated_transient_backoff(monkeypatch) -> No
     assert decision.backoff_level == 2
 
 
+def test_single_generic_transient_without_retry_after_does_not_cooldown(monkeypatch) -> None:
+    history = FailureHistory(clock=lambda: 1000.0)
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "3")
+
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        provider="openai",
+        failure_history=history,
+    )
+
+    assert decision.should_start is False
+    assert decision.reason == "transient_backoff_threshold_not_met"
+
+
+def test_failure_history_clear_resets_repeated_transient_backoff(monkeypatch) -> None:
+    history = FailureHistory(clock=lambda: 1000.0)
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "2")
+    history.record(provider="openai", model=None, error_type="server_error", scope="provider", duration=0, reason="first")
+
+    history.clear(provider="openai", model="gpt-test")
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        provider="openai",
+        failure_history=history,
+    )
+
+    assert history.snapshot() == ()
+    assert decision.should_start is False
+
+
 def test_failure_history_backoff_is_provider_scoped(monkeypatch) -> None:
     history = FailureHistory(clock=lambda: 1000.0)
     monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "2")

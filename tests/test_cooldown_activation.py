@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from rotator_library.client.executor import RequestExecutor, _can_start_stream_provider_cooldown
+from rotator_library.client.executor import RequestExecutor, RoutingExecutionError, _can_start_stream_provider_cooldown
 from rotator_library.cooldown_manager import CooldownManager
 from rotator_library.core.types import RequestContext
 from rotator_library.error_handler import ClassifiedError
@@ -26,6 +26,16 @@ class FakeCooldown:
     async def get_max_remaining(self, provider, *, model=None):
         self.waits.append((provider, model))
         return 0
+
+
+class BudgetCooldown(FakeCooldown):
+    def __init__(self, remaining: float) -> None:
+        super().__init__()
+        self.remaining = remaining
+
+    async def get_max_remaining(self, provider, *, model=None):
+        self.waits.append((provider, model))
+        return self.remaining
 
 
 @pytest.mark.asyncio
@@ -164,6 +174,33 @@ async def test_wait_for_cooldown_uses_model_scope_when_available() -> None:
     await _executor(cooldown)._wait_for_cooldown("openai", 9999999999.0, model="gpt-5")
 
     assert cooldown.waits == [("openai", "gpt-5")]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cooldown_exceeding_budget_fails_fast() -> None:
+    cooldown = BudgetCooldown(remaining=60)
+
+    with pytest.raises(RoutingExecutionError) as exc:
+        await _executor(cooldown)._wait_for_cooldown("openai", 1.0, model="gpt-5")
+
+    assert exc.value.error_type == "rate_limit"
+    assert cooldown.waits == [("openai", "gpt-5")]
+
+
+@pytest.mark.asyncio
+async def test_generic_transient_records_history_before_starting_cooldown(monkeypatch) -> None:
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "2")
+    monkeypatch.setenv("PROVIDER_COOLDOWN_DEFAULT_SECONDS", "10")
+    monkeypatch.setenv("PROVIDER_COOLDOWN_MIN_SECONDS", "10")
+    cooldown = FakeCooldown()
+    executor = _executor(cooldown)
+
+    await executor._maybe_start_provider_cooldown("openai", _classified("server_error"), context=None, model="gpt-5")
+    assert cooldown.scoped_started == []
+    assert executor._failure_history.snapshot()[0].reason == "transient_backoff_threshold_not_met"
+
+    await executor._maybe_start_provider_cooldown("openai", _classified("server_error"), context=None, model="gpt-5")
+    assert cooldown.scoped_started == [("openai", 10, None, "provider", "default_transient_cooldown")]
 
 
 def test_streaming_provider_cooldown_gate_allows_only_pre_output_failures() -> None:

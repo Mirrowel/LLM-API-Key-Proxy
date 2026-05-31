@@ -773,6 +773,7 @@ class RequestExecutor:
             metadata={"group": context.routing_group_name, "targets": [_target_trace(target) for target in targets]},
         )
         for index, target in enumerate(targets):
+            attempt_started_at = time.monotonic()
             target_context = clone_context_for_target(
                 context,
                 target,
@@ -800,7 +801,9 @@ class RequestExecutor:
                     metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
                 )
                 target_failures.append(_target_failure_summary(target, error_type))
-                if index >= len(targets) - 1 or not policy.should_fallback(error_type, group=context.routing_group):
+                fallback_allowed = index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if not fallback_allowed:
                     self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
                     raise
                 self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
@@ -816,11 +819,13 @@ class RequestExecutor:
                     metadata={"target_index": index, "error_type": error_type},
                 )
                 target_failures.append(_target_failure_summary(target, error_type, status_code=_route_status_code_from_response(result)))
-                if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group):
+                fallback_allowed = index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, status_code=_route_status_code_from_response(result), fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if fallback_allowed:
                     self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                     continue
                 self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
-                return _with_fallback_summary(result, target_failures)
+                return _with_fallback_summary(result, target_failures, context.routing_attempt_history)
 
             self._log_routing_trace(
                 context,
@@ -828,6 +833,7 @@ class RequestExecutor:
                 _target_trace(target),
                 metadata={"target_index": index},
             )
+            _append_routing_attempt_history(context, target, index, success=True, duration_ms=_elapsed_ms(attempt_started_at))
             return result
 
         if isinstance(last_failure, Exception):
@@ -851,6 +857,7 @@ class RequestExecutor:
             metadata={"group": context.routing_group_name, "streaming_policy": _group_streaming_policy(context.routing_group), "targets": [_target_trace(target) for target in targets]},
         )
         for index, target in enumerate(targets):
+            attempt_started_at = time.monotonic()
             emitted_output = False
             pending_chunks: List[str] = []
             terminal_error_type: Optional[str] = None
@@ -896,7 +903,9 @@ class RequestExecutor:
                         metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output, "terminal_error_frame": True},
                     )
                     target_failures.append(_target_failure_summary(target, error_type))
-                    if index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
+                    fallback_allowed = index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False)
+                    _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, emitted_output=emitted_output, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                    if fallback_allowed:
                         self._log_routing_trace(
                             context,
                             "routing_fallback_selected",
@@ -916,6 +925,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "emitted_output": emitted_output},
                 )
+                _append_routing_attempt_history(context, target, index, success=True, emitted_output=emitted_output, duration_ms=_elapsed_ms(attempt_started_at))
                 return
             except Exception as exc:
                 error_type = _route_error_type(exc, target.provider)
@@ -926,6 +936,8 @@ class RequestExecutor:
                     metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output},
                 )
                 target_failures.append(_target_failure_summary(target, error_type))
+                fallback_allowed = (not emitted_output) and index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, emitted_output=emitted_output, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
                 if emitted_output:
                     self._log_routing_trace(
                         context,
@@ -934,7 +946,7 @@ class RequestExecutor:
                         metadata={"target_index": index, "error_type": error_type},
                     )
                     raise
-                if index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
+                if fallback_allowed:
                     self._log_routing_trace(
                         context,
                         "routing_fallback_selected",
@@ -1200,6 +1212,7 @@ class RequestExecutor:
                                     approx_cost=approx_cost,
                                     response_headers=response_headers,
                                 )
+                                self._clear_failure_history_on_success(provider, model)
                                 self._record_session_response(context, response)
 
                                 lib_logger.info(
@@ -1533,6 +1546,7 @@ class RequestExecutor:
                                         response_callback=lambda response: self._record_session_response(
                                             context, response
                                         ),
+                                        success_callback=lambda: self._clear_failure_history_on_success(provider, model),
                                         transaction_logger=context.transaction_logger,
                                     )
 
@@ -1956,7 +1970,19 @@ class RequestExecutor:
                 lib_logger.warning(
                     f"Provider {provider} cooldown ({remaining:.1f}s) exceeds budget ({budget:.1f}s)"
                 )
-                return  # Will fail on no keys available
+                self._log_provider_cooldown_trace(
+                    context,
+                    "cooldown_wait_exceeds_budget",
+                    provider,
+                    ClassifiedError(error_type="rate_limit", original_exception=RuntimeError("cooldown exceeds budget"), retry_after=int(remaining)),
+                    int(remaining),
+                    "cooldown_exceeds_budget",
+                    model=model,
+                )
+                raise RoutingExecutionError(
+                    f"Provider {provider} cooldown exceeds request budget",
+                    error_type="rate_limit",
+                )
             lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
             self._log_cooldown_wait_trace(context, provider, model, remaining)
             await asyncio.sleep(remaining)
@@ -2103,6 +2129,10 @@ class RequestExecutor:
             failure_history=getattr(self, "_failure_history", None),
         )
         if not decision.should_start:
+            if decision.reason == "transient_backoff_threshold_not_met" and classified.error_type in {"server_error", "api_connection"}:
+                history = getattr(self, "_failure_history", None)
+                if history is not None:
+                    history.record(provider=provider, model=decision.model, error_type=classified.error_type, scope=decision.scope, duration=0, reason=decision.reason)
             self._log_provider_cooldown_trace(
                 context,
                 "provider_cooldown_skipped",
@@ -2136,6 +2166,13 @@ class RequestExecutor:
             )
         except Exception as exc:
             lib_logger.debug("Failed to start provider cooldown for %s: %s", provider, exc)
+
+    def _clear_failure_history_on_success(self, provider: str, model: Optional[str]) -> None:
+        """Clear transient failure history after a successful provider/model call."""
+
+        history = getattr(self, "_failure_history", None)
+        if history is not None and hasattr(history, "clear"):
+            history.clear(provider=provider, model=model)
 
     @staticmethod
     def _log_provider_cooldown_trace(
@@ -2747,6 +2784,45 @@ def _target_failure_summary(target: RouteTarget, error_type: str, *, status_code
     return summary
 
 
+def _append_routing_attempt_history(
+    context: RequestContext,
+    target: RouteTarget,
+    target_index: int,
+    *,
+    success: bool,
+    error_type: Optional[str] = None,
+    status_code: Optional[int] = None,
+    emitted_output: Optional[bool] = None,
+    fallback_allowed: Optional[bool] = None,
+    duration_ms: Optional[int] = None,
+) -> None:
+    """Append sanitized live fallback-attempt metadata to the request context."""
+
+    entry: Dict[str, Any] = {
+        "target_index": target_index,
+        "target": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "success": success,
+    }
+    if error_type is not None:
+        entry["error_type"] = normalize_route_error_type(error_type)
+    if status_code is not None:
+        entry["status_code"] = status_code
+    if emitted_output is not None:
+        entry["emitted_output"] = bool(emitted_output)
+    if fallback_allowed is not None:
+        entry["fallback_allowed"] = bool(fallback_allowed)
+    if duration_ms is not None:
+        entry["duration_ms"] = max(0, duration_ms)
+    context.routing_attempt_history.append(entry)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
 def _group_streaming_policy(group: Any) -> str:
     """Return the active streaming fallback policy for trace and decisions."""
 
@@ -2826,7 +2902,7 @@ def _summary_hard_stop_type(summary: str) -> str:
     return "invalid_request"
 
 
-def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]]) -> Any:
+def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]], attempt_history: Optional[List[Dict[str, Any]]] = None) -> Any:
     """Attach fallback target summaries to a structured error response."""
 
     if not target_failures or not isinstance(response, dict) or not isinstance(response.get("error"), dict):
@@ -2834,6 +2910,8 @@ def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]])
     details = response["error"].setdefault("details", {})
     if isinstance(details, dict):
         details["fallback_targets"] = list(target_failures)
+        if attempt_history:
+            details["routing_attempt_history"] = list(attempt_history)
     return response
 
 

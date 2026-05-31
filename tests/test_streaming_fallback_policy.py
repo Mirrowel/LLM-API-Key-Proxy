@@ -74,10 +74,14 @@ async def test_streaming_fallback_tries_next_target_before_output() -> None:
 
     executor._execute_streaming = MethodType(fake_stream, executor)
 
-    chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
+    context = _context()
+    chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(context)]
 
     assert attempts == ["codex", "openai"]
     assert chunks[-1] == "data: [DONE]\n\n"
+    assert context.routing_attempt_history[0]["error_type"] == "rate_limit"
+    assert context.routing_attempt_history[0]["fallback_allowed"] is True
+    assert context.routing_attempt_history[1]["success"] is True
 
 
 @pytest.mark.asyncio

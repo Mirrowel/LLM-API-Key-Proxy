@@ -51,11 +51,15 @@ async def test_non_streaming_fallback_group_tries_next_target_on_retryable_error
     attempts = []
     targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
 
-    result = await _executor_with_attempts(attempts)._execute_non_streaming_with_fallback(_context(routing_targets=targets))
+    context = _context(routing_targets=targets)
+    result = await _executor_with_attempts(attempts)._execute_non_streaming_with_fallback(context)
 
     assert result == {"id": "ok", "model": "openai/gpt-5.1"}
     assert [attempt.provider for attempt in attempts] == ["codex", "openai"]
     assert [attempt.kwargs["model"] for attempt in attempts] == ["codex/gpt-5.1-codex", "openai/gpt-5.1"]
+    assert context.routing_attempt_history[0]["error_type"] == "rate_limit"
+    assert context.routing_attempt_history[0]["fallback_allowed"] is True
+    assert context.routing_attempt_history[1]["success"] is True
 
 
 @pytest.mark.asyncio
