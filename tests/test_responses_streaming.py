@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesStoreSettings, ResponsesStreamEvent, ResponsesWebSocketFormatter
@@ -15,7 +17,7 @@ class FakeStreamingClient:
         async def chunks():
             yield 'data: {"id":"chat_stream","model":"gpt-test","choices":[{"delta":{"role":"assistant"}}]}\n\n'
             yield 'data: {"id":"chat_stream","model":"gpt-test","choices":[{"delta":{"content":"Hel"}}]}\n\n'
-            yield 'data: {"id":"chat_stream","model":"gpt-test","choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\n'
+            yield 'data: {"id":"chat_stream","model":"gpt-test","choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"cost_details":{"total_cost":0.044,"source":"stream_provider"}}}\n\n'
             yield "data: [DONE]\n\n"
 
         return chunks()
@@ -75,7 +77,7 @@ async def test_stream_response_emits_responses_sse_events_and_stores_final_respo
     stored = await store.get(response_id)
     assert stored is not None
     assert stored.output_items[0]["content"][0]["text"] == "Hello"
-    assert stored.usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    assert stored.usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "cost_details": {"total_cost": 0.044, "source": "stream_provider"}}
 
 
 @pytest.mark.asyncio
@@ -210,6 +212,8 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "responses_stream_event_created" in trace_text
     assert "responses_stream_event_output_text_delta" in trace_text
     assert "responses_stream_event_completed" in trace_text
+    usage_entry = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines() if '"usage_accounting_summary"' in line][-1]
+    assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.044
 
 
 @pytest.mark.asyncio

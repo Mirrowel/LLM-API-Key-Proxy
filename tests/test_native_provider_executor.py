@@ -59,7 +59,7 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
         "id": "chat_1",
         "model": "provider/gpt-test",
         "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "hidden"}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost_details": {"total_cost": 0.01, "source": "native_provider"}},
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_cost": 0.01},
     }
     client = FakeHTTPClient(response)
 
