@@ -109,6 +109,24 @@ def test_reference_extended_cost_breakdown_aliases_are_summed() -> None:
     assert record.provider_reported_cost == 0.055
 
 
+def test_upstream_inference_total_wins_over_split_fields() -> None:
+    record = extract_usage_record(
+        {
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cost_details": {
+                    "upstream_inference_cost": 0.04,
+                    "upstream_inference_prompt_cost": 0.01,
+                    "upstream_inference_completions_cost": 0.03,
+                },
+            }
+        }
+    )
+
+    assert record.provider_reported_cost == 0.04
+
+
 def test_openai_object_usage_extracts_attributes() -> None:
     response = SimpleNamespace(
         usage=SimpleNamespace(
