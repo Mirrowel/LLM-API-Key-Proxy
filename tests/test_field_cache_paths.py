@@ -54,6 +54,15 @@ def test_inject_path_respects_when_missing_only() -> None:
     assert payload["metadata"]["prompt_cache_key"] == "existing"
 
 
+def test_inject_path_can_insert_at_final_list_index() -> None:
+    payload = {"messages": [{"role": "user"}]}
+
+    changed = inject_path(payload, "messages.0", {"role": "system"}, insert=True)
+
+    assert changed is True
+    assert payload["messages"] == [{"role": "system"}, {"role": "user"}]
+
+
 def test_inject_path_rejects_wildcards_and_missing_lists() -> None:
     with pytest.raises(FieldCachePathError):
         inject_path({"choices": []}, "choices.*.message.reasoning_content", "x")
