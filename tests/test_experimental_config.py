@@ -133,6 +133,35 @@ def test_field_cache_rules_match_unprefixed_model_alias() -> None:
     assert [rule.name for rule in rules] == ["signature"]
 
 
+def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
+    config = load_config_from_mapping(
+        {
+            "field_cache": {
+                "provider": {
+                    "*": [
+                        {
+                            "name": "tool_state",
+                            "source": "stream_event",
+                            "path": "raw.tool.state",
+                            "mode": "per_tool_call",
+                            "ttl_seconds": 120,
+                            "metadata": {"tool_container_path": "tools"},
+                            "inject": {"target": "request", "path": "metadata.tool_state", "insert": True},
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    rule = parse_field_cache_rules(config, "provider", "model")[0]
+
+    assert rule.ttl_seconds == 120
+    assert rule.metadata == {"tool_container_path": "tools"}
+    assert rule.inject is not None
+    assert rule.inject.insert is True
+
+
 def test_field_cache_rule_rejects_invalid_config_values() -> None:
     config = load_config_from_mapping(
         {
