@@ -59,7 +59,7 @@ class FallbackAttemptRunner:
                 emitted_output = bool(getattr(exc, "emitted_output", False))
                 attempts.append(RouteAttemptResult(target=target, success=False, error_type=error_type, emitted_output=emitted_output))
                 has_next = index < len(decision.targets) - 1
-                if not has_next or not self.policy.should_fallback(error_type, group=group, emitted_output=emitted_output, stream=stream):
+                if not has_next or (stream and getattr(group, "streaming_policy", "pre_output_only") == "never") or not self.policy.should_fallback(error_type, group=group, emitted_output=emitted_output, stream=stream):
                     raise FallbackExhaustedError(decision, tuple(attempts)) from exc
         raise FallbackExhaustedError(decision, tuple(attempts))
 

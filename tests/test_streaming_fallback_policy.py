@@ -122,7 +122,8 @@ async def test_streaming_fallback_treats_error_chunk_as_not_visible_output() -> 
         attempts.append(context.provider)
         if len(attempts) == 1:
             yield 'data: {"error":{"type":"rate_limit"}}\n\n'
-            raise StreamFailure("rate_limit")
+            yield "data: [DONE]\n\n"
+            return
         yield "data: [DONE]\n\n"
 
     executor._execute_streaming = MethodType(fake_stream, executor)
@@ -130,7 +131,7 @@ async def test_streaming_fallback_treats_error_chunk_as_not_visible_output() -> 
     chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
 
     assert attempts == ["codex", "openai"]
-    assert chunks[-1] == "data: [DONE]\n\n"
+    assert chunks == ["data: [DONE]\n\n"]
 
 
 @pytest.mark.asyncio

@@ -374,7 +374,28 @@ def test_route_error_type_from_response_hard_stop_wins_over_retry_summary() -> N
 
 def test_route_error_type_from_response_uses_structured_status_codes() -> None:
     assert executor_module._route_error_type_from_response({"error": {"code": 403}}) == "forbidden"
+    assert executor_module._route_error_type_from_response({"error": {"status": 401}}) == "authentication"
+    assert executor_module._route_error_type_from_response({"error": {"details": {"status": 403}}}) == "forbidden"
     assert executor_module._route_error_type_from_response({"error": {"details": {"status_code": 503}}}) == "server_error"
+
+
+def test_route_error_type_from_response_reads_abnormal_errors_before_proxy_summary() -> None:
+    response = {
+        "error": {
+            "type": "proxy_all_credentials_exhausted",
+            "details": {
+                "normal_error_summary": "rate_limit quota",
+                "abnormal_errors": [{"error_type": "authentication", "status_code": 401}],
+            },
+        }
+    }
+
+    assert executor_module._route_error_type_from_response(response) == "authentication"
+
+
+def test_stream_chunk_error_type_detects_terminal_error_frames() -> None:
+    assert executor_module._stream_chunk_error_type('data: {"error":{"type":"rate_limit"}}\n\n') == "rate_limit"
+    assert executor_module._stream_chunk_error_type('event: response.failed\ndata: {"error":{"type":"authentication"}}\n\n') == "authentication"
 
 
 def test_target_failure_summary_is_structural_and_sanitized() -> None:
