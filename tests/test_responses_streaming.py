@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesWebSocketFormatter
+from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesStoreSettings, ResponsesWebSocketFormatter
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -77,7 +77,8 @@ async def test_stream_response_store_false_does_not_persist(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_stream_response_errors_emit_failed_event() -> None:
-    service = ResponsesService(store=InMemoryResponsesStore())
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
 
     events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, FailingStreamingClient())]
 
@@ -85,6 +86,21 @@ async def test_stream_response_errors_emit_failed_event() -> None:
     assert "event: response.failed" in event_text
     assert "stream exploded" in event_text
     assert event_text.endswith("data: [DONE]\n\n")
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stored is not None
+    assert stored.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_can_skip_failed_storage() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store, store_settings=ResponsesStoreSettings(store_failed=False))
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, FailingStreamingClient())]
+
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    assert await store.get(response_id) is None
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,21 @@ def generate_response_id() -> str:
 
 
 @dataclass
+class ResponsesStoreSettings:
+    """Runtime policy for Responses object storage.
+
+    The defaults preserve Phase 4 behavior. Operators can opt into TTL, bounded
+    memory, failed-response persistence, or in-progress updates without changing
+    the store interface or introducing a database.
+    """
+
+    ttl_seconds: Optional[int] = None
+    max_items: Optional[int] = None
+    store_failed: bool = True
+    store_in_progress: bool = False
+
+
+@dataclass
 class StoredResponse:
     """Persisted response object used for retrieval and continuation.
 
