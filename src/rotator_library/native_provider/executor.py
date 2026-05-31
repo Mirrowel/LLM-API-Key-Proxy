@@ -14,6 +14,7 @@ from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import get_protocol, serialize_value
 from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
+from ..usage.costs import CostCalculator
 from .context import NativeProviderContext
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
@@ -70,10 +71,11 @@ class NativeProviderExecutor:
                 model=context.model,
                 source="native_provider_response",
             )
+            cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
             self._trace(
                 context,
                 "usage_accounting_summary",
-                {"usage": usage_record.to_dict()},
+                {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
                 direction="metadata",
                 stage="final",
                 snapshot=False,
