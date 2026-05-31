@@ -59,10 +59,26 @@ class SlowAcquireStreamingClient:
     def __init__(self, stream: DelayedCloseableStream, delay: float) -> None:
         self.stream = stream
         self.delay = delay
+        self.calls = 0
 
     async def acompletion(self, **kwargs):
+        self.calls += 1
         await asyncio.sleep(self.delay)
         return self.stream
+
+
+class CancelAwareAcquireClient:
+    def __init__(self, delay: float = 1.0) -> None:
+        self.cancelled = False
+        self.delay = delay
+
+    async def acompletion(self, **kwargs):
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return DelayedCloseableStream([], [])
 
 
 class DisconnectRequest:
@@ -374,10 +390,65 @@ async def test_stream_response_acquire_wait_can_emit_heartbeat(monkeypatch) -> N
     stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"], [0.0, 0.0])
     service = ResponsesService(store=InMemoryResponsesStore())
 
-    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, SlowAcquireStreamingClient(stream, 0.03))]
+    client = SlowAcquireStreamingClient(stream, 0.03)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client)]
 
     assert ": heartbeat\n\n" in events
+    assert client.calls == 1
     assert "event: response.completed" in "".join(events)
+
+
+@pytest.mark.asyncio
+async def test_stream_response_heartbeat_does_not_drop_completed_first_chunk(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    stream = DelayedCloseableStream(
+        ['data: {"choices":[{"delta":{"content":"kept"}}]}\n\n', "data: [DONE]\n\n"],
+        [0.05, 0.0],
+    )
+    service = ResponsesService(store=InMemoryResponsesStore())
+    events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))
+
+    created = await anext(events)
+    heartbeat = await anext(events)
+    await asyncio.sleep(0.06)
+    added = await anext(events)
+    delta = await anext(events)
+    await events.aclose()
+
+    assert created.event_name == "response.created"
+    assert heartbeat.heartbeat is True
+    assert added.event_name == "response.output_item.added"
+    assert delta.event_name == "response.output_text.delta"
+    assert delta.payload["delta"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_stream_events_aclose_cancels_pending_read_after_heartbeat(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [1.0])
+    service = ResponsesService(store=InMemoryResponsesStore())
+    events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))
+
+    assert (await anext(events)).event_name == "response.created"
+    assert (await anext(events)).heartbeat is True
+    await events.aclose()
+
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stream_events_aclose_cancels_pending_acquire_after_heartbeat(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    client = CancelAwareAcquireClient()
+    service = ResponsesService(store=InMemoryResponsesStore())
+    events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, client)
+
+    assert (await anext(events)).event_name == "response.created"
+    assert (await anext(events)).heartbeat is True
+    await events.aclose()
+
+    assert client.cancelled is True
 
 
 @pytest.mark.asyncio
