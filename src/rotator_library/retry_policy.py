@@ -17,6 +17,7 @@ from typing import Optional
 
 from .error_handler import ClassifiedError, classify_error, should_retry_same_key, should_rotate_on_error
 from .routing import FallbackPolicy
+from .routing.policy import normalize_route_error_type
 from .routing.types import FallbackGroup
 
 DEFAULT_PROVIDER_COOLDOWN_DEFAULT_SECONDS = 30
@@ -38,8 +39,8 @@ def classify_route_error(error: BaseException, provider: Optional[str] = None) -
         return "cancelled"
     explicit = getattr(error, "error_type", None)
     if explicit:
-        return str(explicit).lower()
-    return classify_error(error, provider).error_type
+        return normalize_route_error_type(str(explicit))
+    return normalize_route_error_type(classify_error(error, provider).error_type)
 
 
 def should_retry_same_credential(classified_error: ClassifiedError, small_cooldown_threshold: int) -> bool:

@@ -34,8 +34,14 @@ def _context(*, logger=None) -> RequestContext:
     )
 
 
+def _context_never_streaming_fallback(*, logger=None) -> RequestContext:
+    context = _context(logger=logger)
+    context.routing_group = FallbackGroup(name="code_chain", targets=context.routing_targets, failover_on=frozenset({"rate_limit"}), streaming_policy="never")
+    return context
+
+
 @pytest.mark.asyncio
-async def test_streaming_fallback_honors_group_override_before_output() -> None:
+async def test_streaming_fallback_hard_stops_auth_even_with_group_override() -> None:
     executor = RequestExecutor.__new__(RequestExecutor)
     attempts = []
 
@@ -47,10 +53,10 @@ async def test_streaming_fallback_honors_group_override_before_output() -> None:
 
     executor._execute_streaming = MethodType(fake_stream, executor)
 
-    chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
+    with pytest.raises(StreamFailure):
+        [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
 
-    assert attempts == ["codex", "openai"]
-    assert chunks == ["data: [DONE]\n\n"]
+    assert attempts == ["codex"]
 
 
 @pytest.mark.asyncio
@@ -125,3 +131,41 @@ async def test_streaming_fallback_treats_error_chunk_as_not_visible_output() -> 
 
     assert attempts == ["codex", "openai"]
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_respects_never_policy_before_output() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_stream(self, context):
+        attempts.append(context.provider)
+        raise StreamFailure("rate_limit")
+        yield ""
+
+    executor._execute_streaming = MethodType(fake_stream, executor)
+
+    with pytest.raises(StreamFailure):
+        [chunk async for chunk in executor._execute_streaming_with_fallback(_context_never_streaming_fallback())]
+
+    assert attempts == ["codex"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_exhaustion_trace_uses_sanitized_summaries(tmp_path) -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    logger = TransactionLogger("routing", "code", parent_dir=tmp_path)
+
+    async def fake_stream(self, context):
+        raise StreamFailure("rate_limit")
+        yield ""
+
+    executor._execute_streaming = MethodType(fake_stream, executor)
+
+    with pytest.raises(StreamFailure):
+        [chunk async for chunk in executor._execute_streaming_with_fallback(_context_never_streaming_fallback(logger=logger))]
+
+    entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    exhausted = [entry for entry in entries if entry["pass_name"] == "routing_fallback_exhausted"][-1]
+    assert exhausted["metadata"]["fallback_targets"][0]["message"] == ""
+    assert exhausted["metadata"]["streaming_policy"] == "never"

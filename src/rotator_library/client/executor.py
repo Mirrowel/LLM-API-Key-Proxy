@@ -65,6 +65,7 @@ from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
 from ..retry_policy import decide_provider_cooldown, provider_cooldown_env
 from ..routing import FallbackPolicy, clone_context_for_target
+from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
@@ -789,7 +790,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
                 )
-                target_failures.append(_target_failure_summary(target, error_type, str(exc)))
+                target_failures.append(_target_failure_summary(target, error_type))
                 if index >= len(targets) - 1 or not policy.should_fallback(error_type, group=context.routing_group):
                     self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
                     raise
@@ -805,7 +806,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type},
                 )
-                target_failures.append(_target_failure_summary(target, error_type, _route_error_message_from_response(result)))
+                target_failures.append(_target_failure_summary(target, error_type, status_code=_route_status_code_from_response(result)))
                 if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group):
                     self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                     continue
@@ -833,11 +834,12 @@ class RequestExecutor:
                 yield chunk
             return
         policy = FallbackPolicy()
+        target_failures: List[Dict[str, Any]] = []
         self._log_routing_trace(
             context,
             "routing_decision",
             {"requested_model": context.model, "target_count": len(targets), "stream": True},
-            metadata={"group": context.routing_group_name, "targets": [_target_trace(target) for target in targets]},
+            metadata={"group": context.routing_group_name, "streaming_policy": _group_streaming_policy(context.routing_group), "targets": [_target_trace(target) for target in targets]},
         )
         for index, target in enumerate(targets):
             emitted_output = False
@@ -876,6 +878,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output},
                 )
+                target_failures.append(_target_failure_summary(target, error_type))
                 if emitted_output:
                     self._log_routing_trace(
                         context,
@@ -884,7 +887,7 @@ class RequestExecutor:
                         metadata={"target_index": index, "error_type": error_type},
                     )
                     raise
-                if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
+                if index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
                     self._log_routing_trace(
                         context,
                         "routing_fallback_selected",
@@ -892,7 +895,7 @@ class RequestExecutor:
                         metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type, "stream": True},
                     )
                     continue
-                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True})
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True, "streaming_policy": _group_streaming_policy(context.routing_group), "fallback_targets": target_failures})
                 raise
 
     @staticmethod
@@ -2519,9 +2522,9 @@ def _route_error_type(error: BaseException, provider: Optional[str] = None) -> s
         return "cancelled"
     explicit = getattr(error, "error_type", None)
     if explicit:
-        return str(explicit).lower()
+        return normalize_route_error_type(str(explicit))
     classified = classify_error(error, provider)
-    return classified.error_type
+    return normalize_route_error_type(classified.error_type)
 
 
 def _route_error_type_from_response(response: Any) -> Optional[str]:
@@ -2530,42 +2533,135 @@ def _route_error_type_from_response(response: Any) -> Optional[str]:
     if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
         return None
     error = response["error"]
-    error_type = str(error.get("type", "")).lower()
     details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    candidates = _structured_error_candidates(error, details)
+    hard_stop = _first_route_error_candidate(candidates, _HARD_STOP_ROUTE_ERRORS)
+    if hard_stop:
+        return hard_stop
+    retryable = _first_route_error_candidate(candidates, _RETRYABLE_ROUTE_ERRORS)
+    if retryable:
+        return retryable
     normal_summary = str(details.get("normal_error_summary", "")).lower()
+    if any(token in normal_summary for token in ("authentication", "forbidden", "invalid_request", "context_window", "credential_reauth", "configuration_error")):
+        return _summary_hard_stop_type(normal_summary)
     if any(token in normal_summary for token in ("rate_limit", "quota", "capacity")):
-        return "rate_limit"
+        return "quota_exceeded" if "quota" in normal_summary else "rate_limit"
     if any(token in normal_summary for token in ("server_error", "api_connection", "transient")):
-        return "server_error"
+        return "api_connection" if "api_connection" in normal_summary else "server_error"
+    error_type = normalize_route_error_type(str(error.get("type", "")))
     if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
         return "rate_limit"
     return None
 
 
-def _route_error_message_from_response(response: Any) -> str:
-    """Extract a short non-secret message from a structured proxy error."""
+def _route_status_code_from_response(response: Any) -> Optional[int]:
+    """Return a structured status code without reading raw provider text."""
 
     if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
-        return ""
-    message = str(response["error"].get("message", ""))
-    return message[:150]
+        return None
+    error = response["error"]
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    for candidate in (details.get("status_code"), error.get("status_code"), error.get("code")):
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
-def _target_failure_summary(target: RouteTarget, error_type: str, message: str = "") -> Dict[str, Any]:
+def _target_failure_summary(target: RouteTarget, error_type: str, *, status_code: Optional[int] = None) -> Dict[str, Any]:
     """Return a client-safe fallback target failure summary."""
 
-    return {
+    summary = {
         "target": target.name,
         "provider": target.provider,
         "model": target.prefixed_model,
         "execution": target.execution,
-        "error_type": error_type,
+        "error_type": normalize_route_error_type(error_type),
         # Provider error text can contain raw upstream payload fragments or
         # credential-like identifiers. Keep the cross-target summary structural;
         # detailed per-credential errors remain in the existing sanitized error
         # accumulator.
         "message": "",
     }
+    if status_code is not None:
+        summary["status_code"] = status_code
+    return summary
+
+
+def _group_streaming_policy(group: Any) -> str:
+    """Return the active streaming fallback policy for trace and decisions."""
+
+    return str(getattr(group, "streaming_policy", "pre_output_only") or "pre_output_only")
+
+
+def _streaming_policy_allows_fallback(group: Any) -> bool:
+    """Return whether a group permits pre-output streaming fallback."""
+
+    return _group_streaming_policy(group) != "never"
+
+
+_HARD_STOP_ROUTE_ERRORS = {
+    "authentication",
+    "forbidden",
+    "invalid_request",
+    "context_window_exceeded",
+    "credential_reauth_needed",
+    "pre_request_callback_error",
+    "cancelled",
+    "configuration_error",
+}
+_RETRYABLE_ROUTE_ERRORS = {"rate_limit", "quota_exceeded", "server_error", "api_connection", "unsupported_operation"}
+
+
+def _structured_error_candidates(error: Dict[str, Any], details: Dict[str, Any]) -> List[str]:
+    """Return normalized structured error hints before reading free-form text."""
+
+    values: List[Any] = [
+        error.get("type"),
+        error.get("code"),
+        error.get("status"),
+        details.get("classification"),
+        details.get("error_type"),
+        details.get("status"),
+    ]
+    status_code = _route_status_code_from_response({"error": error})
+    if status_code == 400:
+        values.append("invalid_request")
+    elif status_code == 401:
+        values.append("authentication")
+    elif status_code == 403:
+        values.append("forbidden")
+    elif status_code == 429:
+        values.append("rate_limit")
+    elif status_code is not None and status_code >= 500:
+        values.append("server_error")
+    return [normalize_route_error_type(str(value)) for value in values if value not in (None, "")]
+
+
+def _first_route_error_candidate(candidates: List[str], allowed: set[str]) -> Optional[str]:
+    """Return the first structured candidate in an allowed policy set."""
+
+    for candidate in candidates:
+        if candidate in allowed:
+            return candidate
+    return None
+
+
+def _summary_hard_stop_type(summary: str) -> str:
+    """Map legacy summary text to a hard-stop category without using raw text."""
+
+    if "credential_reauth" in summary:
+        return "credential_reauth_needed"
+    if "context_window" in summary:
+        return "context_window_exceeded"
+    if "configuration_error" in summary or "config" in summary:
+        return "configuration_error"
+    if "forbidden" in summary:
+        return "forbidden"
+    if "authentication" in summary:
+        return "authentication"
+    return "invalid_request"
 
 
 def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]]) -> Any:

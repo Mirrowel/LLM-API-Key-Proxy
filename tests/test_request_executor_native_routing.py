@@ -360,6 +360,31 @@ def test_native_request_payload_drops_litellm_only_fields() -> None:
     assert payload == {"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]}
 
 
+def test_route_error_type_from_response_hard_stop_wins_over_retry_summary() -> None:
+    response = {
+        "error": {
+            "type": "authentication",
+            "message": "provider said quota secret-token",
+            "details": {"normal_error_summary": "rate_limit quota capacity", "status_code": 401},
+        }
+    }
+
+    assert executor_module._route_error_type_from_response(response) == "authentication"
+
+
+def test_route_error_type_from_response_uses_structured_status_codes() -> None:
+    assert executor_module._route_error_type_from_response({"error": {"code": 403}}) == "forbidden"
+    assert executor_module._route_error_type_from_response({"error": {"details": {"status_code": 503}}}) == "server_error"
+
+
+def test_target_failure_summary_is_structural_and_sanitized() -> None:
+    summary = executor_module._target_failure_summary(parse_route_target("openai/gpt"), "rate-limit", status_code=429)
+
+    assert summary["error_type"] == "rate_limit"
+    assert summary["status_code"] == 429
+    assert summary["message"] == ""
+
+
 def test_explicit_native_streaming_fails_when_provider_does_not_support_it() -> None:
     target = parse_route_target("provider/gpt-test@native")
 

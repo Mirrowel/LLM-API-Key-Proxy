@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .policy import FallbackPolicy
+from .policy import FallbackPolicy, normalize_route_error_type
 from .types import FallbackGroup, RouteAttemptResult, RouteTarget, RoutingDecision
 
 AttemptCallback = Callable[[RouteTarget, int], Awaitable[Any]]
@@ -65,4 +65,4 @@ class FallbackAttemptRunner:
 
 
 def _error_type(error: BaseException) -> str:
-    return str(getattr(error, "error_type", error.__class__.__name__)).lower()
+    return normalize_route_error_type(str(getattr(error, "error_type", error.__class__.__name__)))
