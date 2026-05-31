@@ -34,11 +34,15 @@ class NativeProviderExecutor:
         protocol = get_protocol(context.protocol_name)
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
+            self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             protocol_context = context.protocol_context()
             unified_request = protocol.parse_request(raw_request, protocol_context)
+            self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
             provider_request = protocol.build_request(unified_request, protocol_context)
+            self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             adapters = [get_adapter(name) for name in context.adapter_names]
             provider_request = await run_adapter_chain(adapters, provider_request, context.adapter_context(), stage="request")
+            self._trace(context, "after_request_adapter_chain", provider_request, direction="request", stage="adapter")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             provider_request, _ = await cache_engine.inject(
                 "request",
@@ -51,9 +55,11 @@ class NativeProviderExecutor:
             raw_response = await transport.post_json(context.endpoint, headers=context.headers, payload=provider_request)
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
             unified_response = protocol.parse_response(raw_response, protocol_context)
+            self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             provider_response = protocol.format_response(unified_response, protocol_context)
-            self._trace(context, "parsed_native_provider_response", provider_response, direction="response", stage="protocol")
+            self._trace(context, "formatted_native_response", provider_response, direction="response", stage="protocol")
             provider_response = await run_adapter_chain(adapters, provider_response, context.adapter_context(), stage="response")
+            self._trace(context, "after_response_adapter_chain", provider_response, direction="response", stage="adapter")
             await cache_engine.extract("response", provider_response, context.field_cache_context(), transaction_logger=logger)
             usage_record = extract_usage_record(
                 provider_response,
@@ -90,13 +96,17 @@ class NativeProviderExecutor:
         protocol = get_protocol(context.protocol_name)
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
+            self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             protocol_context = context.protocol_context()
             request_payload = dict(raw_request)
             request_payload["stream"] = True
             unified_request = protocol.parse_request(request_payload, protocol_context)
+            self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
             provider_request = protocol.build_request(unified_request, protocol_context)
+            self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             adapters = [get_adapter(name) for name in context.adapter_names]
             provider_request = await run_adapter_chain(adapters, provider_request, context.adapter_context(), stage="request")
+            self._trace(context, "after_request_adapter_chain", provider_request, direction="request", stage="adapter")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             provider_request, _ = await cache_engine.inject(
                 "request",
@@ -109,6 +119,7 @@ class NativeProviderExecutor:
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 event = protocol.parse_stream_event(raw_chunk, protocol_context)
+                self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
                 event_payload = stream_event_payload(event)
                 self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
                 await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)

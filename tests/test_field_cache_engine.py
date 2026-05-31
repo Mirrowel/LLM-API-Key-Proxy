@@ -13,6 +13,11 @@ from rotator_library.field_cache import (
     ProviderCacheFieldStore,
     build_cache_key,
 )
+from rotator_library.transaction_logger import TransactionLogger
+
+
+def _trace_entries(log_dir):
+    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
 def _reasoning_rule(mode: str = "last", scope=("provider", "model", "session")) -> FieldCacheRule:
@@ -157,6 +162,29 @@ async def test_trace_sample_values_are_truncated() -> None:
     )
 
     assert operations[0].sample_values[0].endswith("...<truncated 200 chars>")
+
+
+@pytest.mark.asyncio
+async def test_field_cache_traces_start_and_complete_even_without_matching_rules(tmp_path) -> None:
+    logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
+    engine = FieldCacheEngine([])
+
+    operations = await engine.extract("response", {"choices": []}, _context(), transaction_logger=logger)
+    updated, injection_operations = await engine.inject("request", {"messages": []}, _context(), transaction_logger=logger)
+
+    assert operations == []
+    assert injection_operations == []
+    assert updated == {"messages": []}
+    entries = _trace_entries(logger.log_dir)
+    pass_names = [entry["pass_name"] for entry in entries]
+    assert pass_names == [
+        "field_cache_extraction_start",
+        "field_cache_extraction_complete",
+        "field_cache_injection_start",
+        "field_cache_injection_complete",
+    ]
+    assert entries[1]["metadata"]["rule_count"] == 0
+    assert entries[-1]["metadata"]["operation_count"] == 0
 
 
 def test_per_tool_call_requires_tool_call_id_path() -> None:

@@ -88,7 +88,9 @@ class FieldCacheEngine:
         transaction_logger: Optional[Any] = None,
     ) -> list[FieldCacheOperation]:
         operations: list[FieldCacheOperation] = []
-        for rule in self._rules_for_source(source):
+        rules = self._rules_for_source(source)
+        self._trace_summary(transaction_logger, "field_cache_extraction_start", payload, source=source, target=None, rules=rules, operations=operations)
+        for rule in rules:
             operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
             self._trace(transaction_logger, "before_field_cache_extraction", payload, rule, operation, source=source)
             if not operation.cache_key:
@@ -109,6 +111,7 @@ class FieldCacheEngine:
                 raise
             operations.append(operation)
             self._trace(transaction_logger, "after_field_cache_extraction", payload, rule, operation, source=source)
+        self._trace_summary(transaction_logger, "field_cache_extraction_complete", payload, source=source, target=None, rules=rules, operations=operations)
         return operations
 
     async def inject(
@@ -122,7 +125,9 @@ class FieldCacheEngine:
     ) -> tuple[Any, list[FieldCacheOperation]]:
         updated = payload if mutate else deepcopy(payload)
         operations: list[FieldCacheOperation] = []
-        for rule in self._rules_for_injection(target):
+        rules = self._rules_for_injection(target)
+        self._trace_summary(transaction_logger, "field_cache_injection_start", updated, source=None, target=target, rules=rules, operations=operations)
+        for rule in rules:
             operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
             if not rule.inject:
                 continue
@@ -154,6 +159,7 @@ class FieldCacheEngine:
                 raise
             operations.append(operation)
             self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+        self._trace_summary(transaction_logger, "field_cache_injection_complete", updated, source=None, target=target, rules=rules, operations=operations)
         return updated, operations
 
     def _rules_for_source(self, source: str) -> list[FieldCacheRule]:
@@ -212,6 +218,39 @@ class FieldCacheEngine:
                 **extra_metadata,
             },
             snapshot=rule.source != "stream_event",
+        )
+
+    def _trace_summary(
+        self,
+        transaction_logger: Optional[Any],
+        pass_name: str,
+        payload: Any,
+        *,
+        source: Optional[str],
+        target: Optional[str],
+        rules: list[FieldCacheRule],
+        operations: list[FieldCacheOperation],
+    ) -> None:
+        """Record cache-pass boundaries even when no individual rule matches."""
+
+        if not transaction_logger:
+            return
+        transaction_logger.log_transform_pass(
+            pass_name,
+            payload,
+            direction="request" if target else "response" if source == "response" else "stream" if source == "stream_event" else "metadata",
+            stage="adapter",
+            metadata={
+                "source": source,
+                "target": target,
+                "rule_count": len(rules),
+                "operation_count": len(operations),
+                "matched_count": sum(operation.matched for operation in operations),
+                "changed_count": sum(1 for operation in operations if operation.changed),
+                "hit_count": sum(1 for operation in operations if operation.hit),
+                "skipped_count": sum(1 for operation in operations if operation.skipped),
+            },
+            snapshot=(source != "stream_event"),
         )
 
     def _log_error(self, transaction_logger: Optional[Any], pass_name: str, error: BaseException, payload: Any, rule: FieldCacheRule) -> None:
