@@ -100,3 +100,6 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "stream_first_visible_output" in trace_text
     assert "stream_completed" in trace_text
     assert "stream_metrics_final" in trace_text
+    assert "responses_stream_event_created" in trace_text
+    assert "responses_stream_event_output_text_delta" in trace_text
+    assert "responses_stream_event_completed" in trace_text
