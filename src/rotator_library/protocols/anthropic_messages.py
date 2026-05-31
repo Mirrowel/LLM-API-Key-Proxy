@@ -94,6 +94,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = _as_dict(raw_response)
+        operation = _response_operation(response, context)
         message = UnifiedMessage(
             role=str(response.get("role") or "assistant"),
             content=self._parse_content(response.get("content")),
@@ -102,10 +103,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
         self._promote_message_blocks(message)
         return UnifiedResponse(
-            operation=_response_operation(response, context),
+            operation=operation,
             id=response.get("id"),
             model=response.get("model") or getattr(context, "model", None),
-            messages=[message] if response else [],
+            messages=[] if operation == OPERATION_COUNT_TOKENS else [message] if response else [],
             stop_reason=response.get("stop_reason"),
             usage=self.extract_usage(response, context),
             metadata={"stop_sequence": response.get("stop_sequence"), "type": response.get("type")},
@@ -114,6 +115,11 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        if unified_response.operation == OPERATION_COUNT_TOKENS:
+            usage = unified_response.usage
+            payload = {"input_tokens": usage.input_tokens if usage else 0}
+            payload.update(deepcopy(unified_response.extra))
+            return payload
         message = unified_response.messages[0] if unified_response.messages else UnifiedMessage(role="assistant")
         payload = {
             "id": unified_response.id,

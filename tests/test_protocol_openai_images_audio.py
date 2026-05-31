@@ -55,6 +55,7 @@ def test_openai_audio_transcription_and_speech_shapes() -> None:
     assert adapter.build_request(translation)["prompt"] == "mutated hint"
     assert speech.operation == OPERATION_SPEECH
     assert adapter.build_request(speech)["voice"] == "alloy"
+    assert text_response.operation == OPERATION_AUDIO_TRANSCRIPTION
     assert text_response.output == ["hello world"]
     assert translation_response.operation == "audio_translation"
     assert binary_response.content_type == "application/octet-stream"

@@ -27,7 +27,7 @@ class OllamaProtocol(ProtocolAdapter):
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
-        operation = _ollama_operation(request)
+        operation = _ollama_operation(request, context)
         input_field = "input"
         if operation == OPERATION_EMBEDDINGS and "input" not in request and "prompt" in request:
             # Older Ollama embeddings endpoints use `prompt`; newer endpoints use
@@ -41,13 +41,15 @@ class OllamaProtocol(ProtocolAdapter):
             stream=bool(request.get("stream", False)),
             input=deepcopy(request.get(input_field) if operation == OPERATION_EMBEDDINGS else request.get("prompt")),
             generation_params={k: deepcopy(request[k]) for k in _OPTION_FIELDS if k in request},
-            metadata={"embedding_input_field": input_field} if operation == OPERATION_EMBEDDINGS else {},
+            metadata={**({"embedding_input_field": input_field} if operation == OPERATION_EMBEDDINGS else {}), "has_stream": "stream" in request},
             raw=deepcopy(raw_request),
             extra={k: deepcopy(v) for k, v in request.items() if k not in _CORE_FIELDS},
         )
 
     def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": unified_request.model, "stream": unified_request.stream}
+        payload: dict[str, Any] = {"model": unified_request.model}
+        if unified_request.stream or unified_request.metadata.get("has_stream"):
+            payload["stream"] = unified_request.stream
         if unified_request.operation == OPERATION_OLLAMA_CHAT:
             payload["messages"] = [_message_to_ollama(message) for message in unified_request.messages]
         elif unified_request.operation == OPERATION_EMBEDDINGS:
@@ -72,7 +74,7 @@ class OllamaProtocol(ProtocolAdapter):
         elif "response" in response:
             output.append(response.get("response"))
         return UnifiedResponse(
-            operation=_ollama_operation(response),
+            operation=_ollama_operation(response, context),
             model=response.get("model") or getattr(context, "model", None),
             messages=messages,
             output=output,
@@ -92,13 +94,21 @@ class OllamaProtocol(ProtocolAdapter):
             delta = _message_from_ollama(data["message"])
         elif data.get("response"):
             delta = UnifiedMessage(role="assistant", content=[ContentBlock(type="text", text=str(data["response"]))])
-        return UnifiedStreamEvent(type=event_type, operation=_ollama_operation(data), delta=delta, usage=_ollama_usage(data), raw=deepcopy(raw_event), extra=deepcopy(data))
+        return UnifiedStreamEvent(type=event_type, operation=_ollama_operation(data, context), delta=delta, usage=_ollama_usage(data), raw=deepcopy(raw_event), extra=deepcopy(data))
 
 
-def _ollama_operation(request: dict[str, Any]) -> str:
+def _ollama_operation(request: dict[str, Any], context: ProtocolContext | None = None) -> str:
     explicit = normalize_operation(request.get("operation"))
     if explicit in {OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, OPERATION_EMBEDDINGS}:
         return explicit
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation in {OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, OPERATION_EMBEDDINGS}:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation in {OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, OPERATION_EMBEDDINGS}:
+            return operation
     if "messages" in request or "message" in request:
         return OPERATION_OLLAMA_CHAT
     if "prompt" in request and request.get("endpoint") != "embeddings":

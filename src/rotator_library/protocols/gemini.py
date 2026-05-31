@@ -120,6 +120,11 @@ class GeminiProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        if unified_response.operation == OPERATION_COUNT_TOKENS:
+            usage = unified_response.usage
+            payload = {"totalTokens": usage.total_tokens if usage else 0}
+            payload.update(deepcopy(unified_response.extra))
+            return payload
         candidates = []
         for index, message in enumerate(unified_response.messages):
             candidate = {"index": index, "content": self._format_content(message)}
