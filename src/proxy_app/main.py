@@ -598,8 +598,9 @@ async def lifespan(app: FastAPI):
     # the existing chat-completions client path; later native providers can reuse
     # the same route/storage surface without changing clients.
     from rotator_library.config.experimental import get_responses_store_settings
+    from rotator_library.responses import create_configured_responses_store
 
-    app.state.responses_service = ResponsesService(store_settings=get_responses_store_settings())
+    app.state.responses_service = ResponsesService(store=create_configured_responses_store(), store_settings=get_responses_store_settings())
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -677,8 +678,9 @@ def get_responses_service(request: Request) -> ResponsesService:
     service = getattr(request.app.state, "responses_service", None)
     if service is None:
         from rotator_library.config.experimental import get_responses_store_settings
+        from rotator_library.responses import create_configured_responses_store
 
-        service = ResponsesService(store_settings=get_responses_store_settings())
+        service = ResponsesService(store=create_configured_responses_store(), store_settings=get_responses_store_settings())
         request.app.state.responses_service = service
     return service
 
@@ -1054,7 +1056,7 @@ async def responses_create(
     try:
         request_data = await request.json()
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+        return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON in request body.", "type": "invalid_request_error", "code": 400}})
     if logger:
         logger.log_request(headers=dict(request.headers), body=request_data)
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
@@ -1074,12 +1076,12 @@ async def responses_create(
         payload = _responses_error_response(e)
         if logger:
             logger.log_final_response(status_code=e.status_code, headers=None, body=payload)
-        raise HTTPException(status_code=e.status_code, detail=payload)
+        return JSONResponse(status_code=e.status_code, content=payload)
     except Exception as e:
         logging.error(f"Responses endpoint error: {e}")
         if logger:
             logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(status_code=500, content={"error": {"message": str(e), "type": "internal_error", "code": 500}})
 
 
 @app.get("/v1/responses/{response_id}")
@@ -1093,7 +1095,7 @@ async def responses_get(
     try:
         return JSONResponse(content=await service.get_response(response_id))
     except ResponsesServiceError as e:
-        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 
 
 @app.delete("/v1/responses/{response_id}")
@@ -1107,7 +1109,7 @@ async def responses_delete(
     try:
         return JSONResponse(content=await service.delete_response(response_id))
     except ResponsesServiceError as e:
-        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 
 
 @app.get("/v1/responses/{response_id}/input_items")
@@ -1121,7 +1123,7 @@ async def responses_input_items(
     try:
         return JSONResponse(content=await service.list_input_items(response_id))
     except ResponsesServiceError as e:
-        raise HTTPException(status_code=e.status_code, detail=_responses_error_response(e))
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 
 
 # --- Anthropic Messages API Endpoint ---

@@ -88,7 +88,8 @@ class ResponsesService:
 
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         try:
-            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+            parent_lineage = await self._load_response_lineage(parent)
+            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
             self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
             raise
@@ -191,7 +192,8 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         try:
-            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+            parent_lineage = await self._load_response_lineage(parent)
+            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
             self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
             raise
@@ -373,6 +375,23 @@ class ResponsesService:
         if items is None:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
         return {"object": "list", "data": items}
+
+    async def _load_response_lineage(self, parent: Optional[StoredResponse], *, max_depth: int = 20) -> list[StoredResponse]:
+        """Return parent continuation lineage from oldest to newest."""
+
+        if parent is None:
+            return []
+        lineage: list[StoredResponse] = []
+        seen: set[str] = set()
+        current: Optional[StoredResponse] = parent
+        while current is not None and current.id not in seen and len(lineage) < max_depth:
+            seen.add(current.id)
+            lineage.append(current)
+            previous_id = current.request.get("previous_response_id") if isinstance(current.request, dict) else None
+            if not previous_id:
+                break
+            current = await self.store.get(str(previous_id))
+        return list(reversed(lineage))
 
     async def _load_previous_response(self, response_id: Optional[str], transaction_logger: Optional[Any]) -> Optional[StoredResponse]:
         if not response_id:

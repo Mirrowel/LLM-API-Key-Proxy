@@ -7,6 +7,7 @@ from rotator_library.config.experimental import (
     as_int,
     env_price_key,
     get_responses_store_settings,
+    get_responses_store_runtime_settings,
     get_retry_runtime_settings,
     get_stream_runtime_settings,
     load_config_from_mapping,
@@ -92,6 +93,40 @@ def test_responses_store_settings_env_overrides_json() -> None:
     assert settings.max_items == 5
     assert settings.store_failed is True
     assert settings.store_in_progress is True
+
+
+def test_responses_store_runtime_settings_env_overrides_json(tmp_path) -> None:
+    config = load_config_from_mapping(
+        {
+            "responses": {
+                "store": {
+                    "backend": "memory",
+                    "cache_name": "json_responses",
+                    "cache_prefix": "json_prefix",
+                    "cache_dir": str(tmp_path / "json-cache"),
+                    "cache_memory_ttl_seconds": 10,
+                    "cache_disk_ttl_seconds": 20,
+                }
+            }
+        }
+    )
+
+    settings = get_responses_store_runtime_settings(
+        config=config,
+        env={"RESPONSES_STORE_BACKEND": "provider_cache", "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "30"},
+    )
+
+    assert settings.backend == "provider_cache"
+    assert settings.cache_name == "json_responses"
+    assert settings.cache_prefix == "json_prefix"
+    assert settings.cache_dir == str(tmp_path / "json-cache")
+    assert settings.cache_memory_ttl_seconds == 30
+    assert settings.cache_disk_ttl_seconds == 20
+
+
+def test_responses_store_runtime_rejects_unknown_backend() -> None:
+    with pytest.raises(ExperimentalConfigError):
+        get_responses_store_runtime_settings(config=load_config_from_mapping({"responses": {"store": {"backend": "sqlite"}}}), env={})
 
 
 def test_new_config_sections_still_reject_secret_like_keys() -> None:

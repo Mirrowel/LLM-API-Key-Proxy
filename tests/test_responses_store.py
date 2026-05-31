@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from rotator_library.responses import InMemoryResponsesStore, ProviderCacheResponsesStore, StoredResponse, generate_response_id
+from rotator_library.responses import InMemoryResponsesStore, ProviderCacheResponsesStore, StoredResponse, create_configured_responses_store, generate_response_id
 
 
 def _stored(response_id: str = "resp_test") -> StoredResponse:
@@ -128,3 +128,24 @@ async def test_provider_cache_store_uses_key_delete_when_available() -> None:
 
     assert await store.delete(stored.id) is True
     assert await store.get(stored.id) is None
+
+
+@pytest.mark.asyncio
+async def test_configured_provider_cache_store_persists_between_instances(tmp_path) -> None:
+    env = {
+        "RESPONSES_STORE_BACKEND": "provider_cache",
+        "RESPONSES_STORE_CACHE_NAME": "responses_test",
+        "RESPONSES_STORE_CACHE_PREFIX": "responses",
+        "RESPONSES_STORE_CACHE_DIR": str(tmp_path),
+        "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "60",
+        "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS": "60",
+    }
+    first_store = create_configured_responses_store(env=env)
+    stored = _stored("resp_durable")
+
+    await first_store.save(stored)
+    second_store = create_configured_responses_store(env=env)
+    loaded = await second_store.get(stored.id)
+
+    assert loaded is not None
+    assert loaded.to_dict() == stored.to_dict()
