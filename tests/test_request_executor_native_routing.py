@@ -90,6 +90,18 @@ class NativePluginWithVendorRule(NativePlugin):
         )
 
 
+class NativePluginWithStreamVendorRule(NativePlugin):
+    def get_field_cache_rules(self, model=""):
+        return (
+            FieldCacheRule(
+                name="vendor_state",
+                source="stream_event",
+                path="raw.choices.0.message.vendor_state",
+                allow_missing_session=True,
+            ),
+        )
+
+
 class CustomPlugin:
     def __init__(self):
         self.calls = []
@@ -223,7 +235,7 @@ def test_executor_stream_trace_redaction_uses_native_field_cache_paths() -> None
     context = _context(parse_route_target("provider/gpt-test"))
     sse_line = 'data: {"choices":[{"delta":{"content":"ok"},"message":{"vendor_state":"opaque-vendor-state"}}]}\n\n'
 
-    redacted = executor_module._redact_stream_sse_for_trace(sse_line, context, NativePluginWithVendorRule())
+    redacted = executor_module._redact_stream_sse_for_trace(sse_line, context, NativePluginWithStreamVendorRule())
 
     parsed = json.loads(redacted[6:].strip())
 

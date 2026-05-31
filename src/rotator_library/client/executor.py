@@ -2299,11 +2299,25 @@ def _redact_context_field_cache_paths(payload: Any, context: RequestContext, dir
             continue
         if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event", "response", "unified_response"}:
             continue
-        try:
-            _redact_trace_path(redacted, parse_path(rule.path))
-        except (FieldCachePathError, TypeError, ValueError):
-            continue
+        for path in _trace_redaction_paths((rule.path,), direction=direction):
+            try:
+                tokens = parse_path(path)
+                _redact_trace_path(redacted, tokens)
+                _redact_trace_leaf_key(redacted, tokens)
+            except (FieldCachePathError, TypeError, ValueError):
+                continue
     return redacted
+
+
+def _trace_redaction_paths(paths: tuple[str, ...] | list[str], *, direction: str) -> list[str]:
+    """Return configured paths plus raw-stream envelope fallbacks for traces."""
+
+    expanded: list[str] = []
+    for path in paths:
+        expanded.append(path)
+        if direction == "stream" and path.startswith("raw."):
+            expanded.append(path[4:])
+    return expanded
 
 
 def _redact_stream_sse_for_trace(sse_line: str, context: Optional[RequestContext], plugin: Any) -> str:
@@ -2355,6 +2369,23 @@ def _redact_trace_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
                     _redact_trace_path(item, rest)
                 else:
                     value[index] = REDACTED
+
+
+def _redact_trace_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    """Redact terminal configured cache keys across duplicated trace envelopes."""
+
+    leaf = next((token.value for token in reversed(tokens) if token.kind == "key"), None)
+    if not leaf:
+        return
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if key == leaf:
+                value[key] = REDACTED
+            else:
+                _redact_trace_leaf_key(item, tokens)
+    elif isinstance(value, list):
+        for item in value:
+            _redact_trace_leaf_key(item, tokens)
 
 
 def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[Any, ...]:
