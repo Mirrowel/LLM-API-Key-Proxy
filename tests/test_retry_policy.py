@@ -169,6 +169,22 @@ def test_failure_history_backoff_is_provider_scoped(monkeypatch) -> None:
     assert provider_a.backoff_level == 1
 
 
+def test_failure_history_backoff_requires_matching_provider(monkeypatch) -> None:
+    history = FailureHistory(clock=lambda: 1000.0)
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "2")
+    history.record(provider="provider-a", model=None, error_type="server_error", scope="provider", duration=10, reason="test")
+
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        failure_history=history,
+    )
+
+    assert decision.backoff_level == 0
+
+
 def test_shared_classifier_handles_structured_dict_status_codes() -> None:
     assert classify_error({"error": {"status": 401}}).error_type == "authentication"
     assert classify_error({"error": {"details": {"status_code": 403}}}).error_type == "forbidden"

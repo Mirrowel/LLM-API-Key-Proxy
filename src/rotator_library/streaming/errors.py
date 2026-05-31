@@ -38,6 +38,7 @@ def decide_streaming_error_action(
     cooldown_on_quota: bool = False,
     allow_reasoning_only_retry: bool = False,
     model: str | None = None,
+    emitted_output: bool = False,
 ) -> StreamingErrorDecision:
     """Classify a stream failure without sleeping or mutating state.
 
@@ -54,13 +55,14 @@ def decide_streaming_error_action(
         provider_cooldown_default_seconds=provider_cooldown_default_seconds,
         cooldown_on_quota=cooldown_on_quota,
         last_streamed_chunk=last_streamed_chunk,
+        emitted_output=emitted_output,
         provider=provider,
         model=model,
         original_error=error,
     )
     if not should_rotate_on_error(classified):
         return _decision(classified, "fail", cooldown, "non_rotatable")
-    if not can_retry_stream_after_error(last_streamed_chunk, allow_reasoning_only_retry):
+    if emitted_output or not can_retry_stream_after_error(last_streamed_chunk, allow_reasoning_only_retry):
         return _decision(classified, "fallback_blocked_after_output", cooldown, "visible_output")
     if should_retry_same_key(classified, small_cooldown_threshold) and attempt < max_retries - 1:
         return _decision(classified, "retry_same", cooldown, "retry_same_credential")
@@ -75,11 +77,12 @@ def _cooldown_decision(
     provider_cooldown_default_seconds: int,
     cooldown_on_quota: bool,
     last_streamed_chunk: str | None,
+    emitted_output: bool,
     provider: str,
     model: str | None,
     original_error: Exception,
 ) -> ProviderCooldownDecision:
-    if is_visible_stream_output(last_streamed_chunk):
+    if emitted_output or is_visible_stream_output(last_streamed_chunk):
         return ProviderCooldownDecision(False, reason="visible_output")
     return decide_provider_cooldown(
         classified,
