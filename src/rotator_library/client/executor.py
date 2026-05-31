@@ -89,7 +89,7 @@ lib_logger = logging.getLogger("rotator_library")
 class RoutingExecutionError(RuntimeError):
     """Internal error used when a routed target cannot use its requested mode."""
 
-    def __init__(self, message: str, error_type: str = "unsupported_operation") -> None:
+    def __init__(self, message: str, error_type: str = "configuration_error") -> None:
         super().__init__(message)
         self.error_type = error_type
 
@@ -1437,8 +1437,42 @@ class RequestExecutor:
                                     target = _current_route_target(context)
                                     execution = target.execution if target else "auto"
 
-                                    # Make the API call
-                                    if _should_use_native_streaming(plugin, model, target, execution, provider):
+                                    # Make the API call. Keep execution-mode precedence aligned with
+                                    # the non-streaming path: explicit LiteLLM wins, explicit custom
+                                    # requires custom logic, explicit native fails closed, and auto
+                                    # prefers custom before native streaming.
+                                    if execution == "litellm_fallback":
+                                        kwargs["api_key"] = credential_secret
+                                        kwargs["stream"] = True
+                                        self._apply_litellm_logger(kwargs)
+                                        kwargs.pop("transaction_context", None)
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "litellm_stream", "provider": provider, "model": model},
+                                        )
+                                        stream = await litellm.acompletion(**kwargs)
+                                    elif execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
+                                        if not plugin or not plugin.has_custom_logic():
+                                            raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
+                                        kwargs["credential_identifier"] = credential_secret
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "custom_stream", "provider": provider, "model": model},
+                                        )
+                                        stream = await plugin.acompletion(
+                                            self._http_client, **kwargs
+                                        )
+                                    elif _should_use_native_streaming(plugin, model, target, execution, provider):
                                         native_context, native_request = self._build_native_provider_context(
                                             provider,
                                             model,
@@ -1459,20 +1493,6 @@ class RequestExecutor:
                                             metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
                                         )
                                         stream = self._get_native_executor().stream(native_request, native_context, NativeHTTPTransport(self._http_client))
-                                    elif plugin and plugin.has_custom_logic():
-                                        kwargs["credential_identifier"] = credential_secret
-                                        self._log_executor_trace(
-                                            context,
-                                            "provider_execution_request",
-                                            kwargs,
-                                            direction="request",
-                                            stage="provider",
-                                            credential_id=cred_context.stable_id,
-                                            metadata={"execution": "custom_stream", "provider": provider, "model": model},
-                                        )
-                                        stream = await plugin.acompletion(
-                                            self._http_client, **kwargs
-                                        )
                                     else:
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True

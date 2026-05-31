@@ -48,3 +48,35 @@ def test_clone_context_for_target_preserves_request_metadata() -> None:
     assert cloned.session_id == "session-1"
     assert cloned.classifier == "global"
     assert cloned.routing_group_name == "chain"
+
+
+def test_clone_context_for_target_rewrites_standard_session_namespace() -> None:
+    original = RequestContext(
+        model="openai/gpt-5",
+        provider="openai",
+        kwargs={"model": "openai/gpt-5"},
+        streaming=False,
+        credentials=["cred-a"],
+        deadline=123.0,
+        session_tracking_namespace="scope:openai:provider:openai:model:openai/gpt-5",
+    )
+
+    cloned = clone_context_for_target(original, parse_route_target("anthropic/claude"))
+
+    assert cloned.session_tracking_namespace == "scope:openai:provider:anthropic:model:anthropic/claude"
+
+
+def test_clone_context_for_target_preserves_custom_session_namespace() -> None:
+    original = RequestContext(
+        model="openai/gpt-5",
+        provider="openai",
+        kwargs={"model": "openai/gpt-5"},
+        streaming=False,
+        credentials=["cred-a"],
+        deadline=123.0,
+        session_tracking_namespace="custom-namespace",
+    )
+
+    cloned = clone_context_for_target(original, parse_route_target("anthropic/claude"))
+
+    assert cloned.session_tracking_namespace == "custom-namespace"

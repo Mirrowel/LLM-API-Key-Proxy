@@ -419,6 +419,14 @@ def test_route_error_type_from_response_uses_structured_status_codes() -> None:
     assert executor_module._route_error_type_from_response({"error": {"code": 403}}) == "forbidden"
     assert executor_module._route_error_type_from_response({"error": {"status": 401}}) == "authentication"
     assert executor_module._route_error_type_from_response({"error": {"details": {"status": 403}}}) == "forbidden"
+
+
+def test_route_error_type_from_response_uses_structured_aliases() -> None:
+    assert executor_module._route_error_type_from_response({"error": {"type": "invalid_api_key"}}) == "authentication"
+    assert executor_module._route_error_type_from_response({"error": {"code": "invalid_argument"}}) == "invalid_request"
+    assert executor_module._route_error_type_from_response({"error": {"code": "resource_exhausted"}}) == "quota_exceeded"
+    assert executor_module._route_error_type_from_response({"error": {"code": "unavailable"}}) == "server_error"
+    assert executor_module._route_error_type_from_response({"error": {"code": "deadline_exceeded"}}) == "api_connection"
     assert executor_module._route_error_type_from_response({"error": {"details": {"status_code": 503}}}) == "server_error"
 
 
@@ -543,4 +551,4 @@ async def test_native_execution_mode_fails_when_provider_has_no_native_declarati
     with pytest.raises(RoutingExecutionError) as exc:
         await _executor()._execute_provider_request("provider", "provider/gpt-test", None, "secret", "stable", dict(context.kwargs), context)
 
-    assert exc.value.error_type == "unsupported_operation"
+    assert exc.value.error_type == "configuration_error"

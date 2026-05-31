@@ -41,4 +41,17 @@ def clone_context_for_target(
         provider_config=provider_config if provider_config is not None else context.provider_config,
         credential_secrets=dict(credential_secrets) if credential_secrets is not None else dict(context.credential_secrets),
         routing_target_index=target_index,
+        session_tracking_namespace=_namespace_for_target(context.session_tracking_namespace, target),
     )
+
+
+def _namespace_for_target(namespace: str | None, target: RouteTarget) -> str | None:
+    """Rewrite standard session namespaces for the fallback target provider/model."""
+
+    if not namespace or ":provider:" not in namespace or ":model:" not in namespace:
+        return namespace
+    prefix, _, rest = namespace.partition(":provider:")
+    _provider, sep, _model = rest.partition(":model:")
+    if not sep:
+        return namespace
+    return f"{prefix}:provider:{target.provider}:model:{target.prefixed_model}"
