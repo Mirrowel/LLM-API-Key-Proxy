@@ -74,6 +74,7 @@ def test_antigravity_model_aliases_and_tracking_normalization() -> None:
 
     assert provider._alias_to_internal("claude-sonnet-4.5") == "claude-sonnet-4-5"
     assert provider.normalize_native_model("antigravity/claude-sonnet-4.5") == "claude-sonnet-4-5"
+    assert provider.normalize_native_model("antigravity/gemini-3-pro-preview") == "gemini-3-pro-preview"
     assert provider.normalize_model_for_tracking("antigravity/claude-sonnet-4-5") == "antigravity/claude-sonnet-4.5"
 
 

@@ -41,7 +41,8 @@ MODEL_ALIAS_MAP = {
     "claude-opus-4-5": "claude-opus-4.5",
     "claude-opus-4-6": "claude-opus-4.6",
 }
-MODEL_ALIAS_REVERSE = {public: internal for internal, public in MODEL_ALIAS_MAP.items()}
+_AMBIGUOUS_REVERSE_ALIASES = {"gemini-3-pro-preview"}
+MODEL_ALIAS_REVERSE = {public: internal for internal, public in MODEL_ALIAS_MAP.items() if public not in _AMBIGUOUS_REVERSE_ALIASES}
 EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-2.5-pro"}
 
 
