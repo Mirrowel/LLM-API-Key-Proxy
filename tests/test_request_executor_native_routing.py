@@ -219,6 +219,18 @@ def test_executor_trace_redaction_uses_native_field_cache_response_paths() -> No
     assert payload["choices"][0]["message"]["vendor_state"] == "opaque-vendor-state"
 
 
+def test_executor_stream_trace_redaction_uses_native_field_cache_paths() -> None:
+    context = _context(parse_route_target("provider/gpt-test"))
+    sse_line = 'data: {"choices":[{"delta":{"content":"ok"},"message":{"vendor_state":"opaque-vendor-state"}}]}\n\n'
+
+    redacted = executor_module._redact_stream_sse_for_trace(sse_line, context, NativePluginWithVendorRule())
+
+    parsed = json.loads(redacted[6:].strip())
+
+    assert "opaque-vendor-state" not in redacted
+    assert parsed["choices"][0]["message"]["vendor_state"] == "[REDACTED]"
+
+
 @pytest.mark.asyncio
 async def test_litellm_fallback_execution_is_explicit(monkeypatch) -> None:
     calls = []
