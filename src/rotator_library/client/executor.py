@@ -62,6 +62,7 @@ from ..core.constants import (
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
+from ..retry_policy import decide_provider_cooldown, provider_cooldown_env
 from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
@@ -974,6 +975,7 @@ class RequestExecutor:
                                     error_accumulator,
                                     retry_state,
                                     request_headers,
+                                    context,
                                 )
 
                                 if action == ErrorAction.RETRY_SAME:
@@ -1524,6 +1526,7 @@ class RequestExecutor:
         error_accumulator: RequestErrorAccumulator,
         retry_state: RetryState,
         request_headers: Dict[str, Any],
+        context: Optional[RequestContext] = None,
     ) -> str:
         """
         Handle an error and determine next action.
@@ -1572,6 +1575,8 @@ class RequestExecutor:
             cred_context.mark_failure(classified)
             return ErrorAction.FAIL
 
+        await self._maybe_start_provider_cooldown(provider, classified, context=context)
+
         # Check if should retry same key (including small cooldown auto-retry)
         small_cooldown_threshold = int(
             os.environ.get(
@@ -1616,6 +1621,84 @@ class RequestExecutor:
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )
         return ErrorAction.ROTATE
+
+    async def _maybe_start_provider_cooldown(
+        self,
+        provider: str,
+        classified: ClassifiedError,
+        *,
+        context: Optional[RequestContext],
+    ) -> None:
+        """Start provider-wide cooldown for large provider-level throttles.
+
+        This is intentionally conservative: small retry-after values stay on the
+        same credential path, and quota cooldown is disabled by default because
+        most quota errors are per credential or account.
+        """
+
+        if not self._cooldown:
+            return
+        small_cooldown_threshold = int(
+            os.environ.get(
+                "SMALL_COOLDOWN_RETRY_THRESHOLD", DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD
+            )
+        )
+        min_seconds, default_seconds, cooldown_on_quota = provider_cooldown_env()
+        decision = decide_provider_cooldown(
+            classified,
+            small_cooldown_threshold=small_cooldown_threshold,
+            provider_cooldown_min_seconds=min_seconds,
+            default_duration=default_seconds,
+            cooldown_on_quota=cooldown_on_quota,
+        )
+        if not decision.should_start:
+            self._log_provider_cooldown_trace(
+                context,
+                "provider_cooldown_skipped",
+                provider,
+                classified,
+                decision.duration,
+                decision.reason,
+            )
+            return
+        try:
+            await self._cooldown.start_cooldown(provider, decision.duration)
+            self._log_provider_cooldown_trace(
+                context,
+                "provider_cooldown_started",
+                provider,
+                classified,
+                decision.duration,
+                decision.reason,
+            )
+        except Exception as exc:
+            lib_logger.debug("Failed to start provider cooldown for %s: %s", provider, exc)
+
+    @staticmethod
+    def _log_provider_cooldown_trace(
+        context: Optional[RequestContext],
+        pass_name: str,
+        provider: str,
+        classified: ClassifiedError,
+        duration: int,
+        reason: str,
+    ) -> None:
+        if not context or not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            {"provider": provider, "error_type": classified.error_type, "duration": duration},
+            direction="metadata",
+            stage="retry",
+            metadata={
+                "provider": provider,
+                "duration": duration,
+                "error_type": classified.error_type,
+                "retry_after_present": classified.retry_after is not None,
+                "reason": reason,
+            },
+            snapshot=False,
+        )
 
     def _record_session_response(self, context: RequestContext, response: Any) -> None:
         """Let the tracker learn anchors emitted by a successful response.

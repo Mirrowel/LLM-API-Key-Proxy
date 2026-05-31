@@ -4,7 +4,19 @@ import asyncio
 
 import pytest
 
+from rotator_library.client.executor import RequestExecutor
 from rotator_library.cooldown_manager import CooldownManager
+from rotator_library.core.types import RequestContext
+from rotator_library.error_handler import ClassifiedError
+from rotator_library.transaction_logger import TransactionLogger
+
+
+class FakeCooldown:
+    def __init__(self) -> None:
+        self.started = []
+
+    async def start_cooldown(self, provider, duration):
+        self.started.append((provider, duration))
 
 
 @pytest.mark.asyncio
@@ -22,3 +34,57 @@ async def test_start_cooldown_extends_but_does_not_shorten() -> None:
     assert after_shorter > 25
     assert after_shorter <= initial
     assert after_longer > after_shorter
+
+
+def _classified(error_type: str, retry_after=None) -> ClassifiedError:
+    return ClassifiedError(error_type, original_exception=Exception(error_type), retry_after=retry_after)
+
+
+def _executor(cooldown) -> RequestExecutor:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    executor._cooldown = cooldown
+    return executor
+
+
+def _context(logger) -> RequestContext:
+    return RequestContext(
+        model="openai/gpt-test",
+        provider="openai",
+        kwargs={"model": "openai/gpt-test"},
+        streaming=False,
+        credentials=["cred"],
+        deadline=9999999999.0,
+        transaction_logger=logger,
+    )
+
+
+@pytest.mark.asyncio
+async def test_large_retry_after_starts_provider_cooldown_and_traces(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SMALL_COOLDOWN_RETRY_THRESHOLD", "10")
+    monkeypatch.setenv("PROVIDER_COOLDOWN_MIN_SECONDS", "10")
+    cooldown = FakeCooldown()
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+
+    await _executor(cooldown)._maybe_start_provider_cooldown(
+        "openai",
+        _classified("rate_limit", retry_after=60),
+        context=_context(logger),
+    )
+
+    assert cooldown.started == [("openai", 60)]
+    trace = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "provider_cooldown_started" in trace
+
+
+@pytest.mark.asyncio
+async def test_small_retry_after_skips_provider_cooldown(monkeypatch) -> None:
+    monkeypatch.setenv("SMALL_COOLDOWN_RETRY_THRESHOLD", "10")
+    cooldown = FakeCooldown()
+
+    await _executor(cooldown)._maybe_start_provider_cooldown(
+        "openai",
+        _classified("rate_limit", retry_after=3),
+        context=None,
+    )
+
+    assert cooldown.started == []
