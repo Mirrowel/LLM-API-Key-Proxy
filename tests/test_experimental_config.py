@@ -10,6 +10,7 @@ from rotator_library.config.experimental import (
     get_responses_store_runtime_settings,
     get_retry_runtime_settings,
     get_stream_runtime_settings,
+    get_provider_runtime_config,
     load_config_from_mapping,
     load_experimental_config,
     parse_field_cache_rules,
@@ -134,10 +135,22 @@ def test_new_config_sections_still_reject_secret_like_keys() -> None:
         load_config_from_mapping({"responses": {"store": {"authorization": "hidden"}}})
 
 
-@pytest.mark.parametrize("secret_key", ["secret_key", "secret-key", "apiKey", "client-secret", "oauth_token", "oauthToken", "oauth-token", "id_token", "oauth_token_secret"])
+@pytest.mark.parametrize("secret_key", ["secret_key", "secret-key", "apiKey", "client-secret", "oauth_token", "oauthToken", "oauth-token", "id_token", "oauth_token_secret", "credential", "credentials", "providerCredential", "oauthCredentials"])
 def test_secret_key_variants_are_rejected(secret_key: str) -> None:
     with pytest.raises(ExperimentalConfigError):
         load_config_from_mapping({"retry": {secret_key: "hidden"}})
+
+
+def test_provider_config_rejects_unsupported_keys() -> None:
+    with pytest.raises(ExperimentalConfigError):
+        load_config_from_mapping({"providers": {"openai": {"api_base": "https://example.test"}}})
+
+
+def test_provider_config_validates_protocol_and_adapter_names() -> None:
+    with pytest.raises(ExperimentalConfigError):
+        get_provider_runtime_config("openai", config=load_config_from_mapping({"providers": {"openai": {"protocol_name": "missing_protocol"}}}), env={})
+    with pytest.raises(ExperimentalConfigError):
+        get_provider_runtime_config("openai", config=load_config_from_mapping({"providers": {"openai": {"adapter_names": ["missing_adapter"]}}}), env={})
 
 
 def test_retry_runtime_settings_malformed_env_preserves_defaults() -> None:

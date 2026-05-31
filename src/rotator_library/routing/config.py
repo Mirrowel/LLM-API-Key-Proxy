@@ -114,6 +114,8 @@ def _validate_model_routes(model_routes: Mapping[str, str], groups: Mapping[str,
     for key, route in model_routes.items():
         if route.startswith("group:") and route[len("group:") :] not in groups:
             raise RoutingConfigError(f"model route {key} references unknown fallback group {route}")
+        if not route.startswith("group:"):
+            parse_route_target(route)
 
 
 def _string_set(value: object, default: frozenset[str]) -> frozenset[str]:

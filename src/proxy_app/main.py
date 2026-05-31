@@ -62,6 +62,7 @@ _start_time = time.time()
 # Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
 from glob import glob
+from proxy_app.startup_display import mask_secret_for_display as _mask_secret_for_display
 
 # Get the application root directory (EXE dir if frozen, else CWD)
 # Inlined here to avoid triggering heavy rotator_library imports before loading screen
@@ -84,10 +85,11 @@ if _env_files_found:
     _env_names = [_ef.name for _ef in _env_files_found]
     print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
 
+
 # Get proxy API key for display
 proxy_api_key = os.getenv("PROXY_API_KEY")
 if proxy_api_key:
-    key_display = f"✓ {proxy_api_key}"
+    key_display = f"✓ {_mask_secret_for_display(proxy_api_key)}"
 else:
     key_display = "✗ Not Set (INSECURE - anyone can access!)"
 

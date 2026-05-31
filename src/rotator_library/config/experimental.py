@@ -23,7 +23,8 @@ from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
 _KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
-_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "password")
+_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "credential", "credentials", "password")
+_PROVIDER_CONFIG_KEYS = {"protocol_name", "adapter_names", "adapter_config", "native_streaming_supported", "field_cache", "model_quota_groups"}
 
 
 class ExperimentalConfigError(ValueError):
@@ -97,6 +98,18 @@ class ResponsesStoreRuntimeSettings:
     cache_disk_ttl_seconds: int = 172800
 
 
+@dataclass(frozen=True)
+class ProviderRuntimeConfig:
+    """Safe provider metadata loaded from optional JSON config."""
+
+    protocol_name: Optional[str] = None
+    adapter_names: Optional[tuple[str, ...]] = None
+    adapter_config: dict[str, dict[str, Any]] = field(default_factory=dict)
+    native_streaming_supported: Optional[bool] = None
+    field_cache_rules: tuple[FieldCacheRule, ...] = ()
+    model_quota_groups: Optional[dict[str, list[str]]] = None
+
+
 def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Mapping[str, str] | None = None) -> ExperimentalConfig:
     """Load optional JSON config from an explicit path or config env var."""
 
@@ -111,6 +124,7 @@ def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Ma
     if not isinstance(data, dict):
         raise ExperimentalConfigError("JSON config root must be an object")
     _reject_secret_keys(data)
+    _validate_provider_sections(data.get("providers", {}))
     warnings = tuple(f"Unknown config section '{key}' ignored by current runtime" for key in data if key not in _KNOWN_SECTIONS)
     unknown = {key: value for key, value in data.items() if key not in _KNOWN_SECTIONS}
     return ExperimentalConfig(
@@ -131,6 +145,7 @@ def load_config_from_mapping(data: Mapping[str, Any]) -> ExperimentalConfig:
     """Build config from an in-memory mapping for tests and provider helpers."""
 
     _reject_secret_keys(data)
+    _validate_provider_sections(data.get("providers", {}))
     warnings = tuple(f"Unknown config section '{key}' ignored by current runtime" for key in data if key not in _KNOWN_SECTIONS)
     return ExperimentalConfig(
         routing=_dict_section(data, "routing"),
@@ -265,6 +280,40 @@ def get_responses_store_runtime_settings(
     )
 
 
+def get_provider_runtime_config(
+    provider: str,
+    model: str = "",
+    *,
+    config: ExperimentalConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ProviderRuntimeConfig:
+    """Return safe JSON-configured provider metadata for one provider/model."""
+
+    source = env if env is not None else os.environ
+    active = config if config is not None else load_experimental_config(env=source)
+    providers = active.providers if isinstance(active.providers, dict) else {}
+    raw = providers.get(provider, {})
+    if not isinstance(raw, Mapping) or not raw:
+        return ProviderRuntimeConfig()
+    _validate_provider_sections({provider: raw})
+    protocol_name = _configured_protocol(raw.get("protocol_name"))
+    adapter_names = _configured_adapters(raw.get("adapter_names"))
+    adapter_config = _configured_adapter_config(raw.get("adapter_config", {}))
+    native_streaming_supported = None
+    if "native_streaming_supported" in raw:
+        native_streaming_supported = as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
+    field_cache_rules = _configured_provider_field_cache(provider, model, raw.get("field_cache"))
+    model_quota_groups = _configured_quota_groups(raw.get("model_quota_groups")) if "model_quota_groups" in raw else None
+    return ProviderRuntimeConfig(
+        protocol_name=protocol_name,
+        adapter_names=adapter_names,
+        adapter_config=adapter_config,
+        native_streaming_supported=native_streaming_supported,
+        field_cache_rules=field_cache_rules,
+        model_quota_groups=model_quota_groups,
+    )
+
+
 def parse_field_cache_rules(config: ExperimentalConfig, provider: str, model: str) -> tuple[FieldCacheRule, ...]:
     """Parse configured field-cache rules for a provider/model.
 
@@ -367,6 +416,93 @@ def _reject_secret_keys(value: Any, path: str = "config") -> None:
             _reject_secret_keys(nested, f"{path}[{index}]")
 
 
+def _validate_provider_sections(value: Any) -> None:
+    if value in (None, {}):
+        return
+    if not isinstance(value, Mapping):
+        raise ExperimentalConfigError("providers config section must be an object")
+    for provider, raw in value.items():
+        if not isinstance(raw, Mapping):
+            raise ExperimentalConfigError(f"providers.{provider} must be an object")
+        unsupported = set(str(key) for key in raw) - _PROVIDER_CONFIG_KEYS
+        if unsupported:
+            raise ExperimentalConfigError(f"providers.{provider} contains unsupported keys: {', '.join(sorted(unsupported))}")
+
+
+def _configured_protocol(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    name = str(value)
+    try:
+        from ..protocols import get_protocol
+
+        get_protocol(name)
+    except Exception as exc:
+        raise ExperimentalConfigError(f"Unknown provider protocol_name {name!r}") from exc
+    return name
+
+
+def _configured_adapters(value: Any) -> Optional[tuple[str, ...]]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        names = tuple(part.strip() for part in value.split(",") if part.strip())
+    elif isinstance(value, (list, tuple)):
+        names = tuple(str(part) for part in value)
+    else:
+        raise ExperimentalConfigError("providers.adapter_names must be a string or list")
+    for name in names:
+        _validate_adapter_name(name)
+    return names
+
+
+def _configured_adapter_config(value: Any) -> dict[str, dict[str, Any]]:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, Mapping):
+        raise ExperimentalConfigError("providers.adapter_config must be an object")
+    result: dict[str, dict[str, Any]] = {}
+    for name, config in value.items():
+        adapter_name = str(name)
+        _validate_adapter_name(adapter_name)
+        if not isinstance(config, Mapping):
+            raise ExperimentalConfigError("providers.adapter_config entries must be objects")
+        result[adapter_name] = dict(config)
+    return result
+
+
+def _validate_adapter_name(name: str) -> None:
+    try:
+        from ..adapters import get_adapter
+
+        get_adapter(name)
+    except Exception as exc:
+        raise ExperimentalConfigError(f"Unknown provider adapter {name!r}") from exc
+
+
+def _configured_provider_field_cache(provider: str, model: str, value: Any) -> tuple[FieldCacheRule, ...]:
+    if value in (None, {}, []):
+        return ()
+    if isinstance(value, list):
+        section = {provider: {"*": value}}
+    elif isinstance(value, Mapping):
+        section = {provider: dict(value)}
+    else:
+        raise ExperimentalConfigError("providers.field_cache must be an object or list")
+    return parse_field_cache_rules(load_config_from_mapping({"field_cache": section}), provider, model)
+
+
+def _configured_quota_groups(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping):
+        raise ExperimentalConfigError("providers.model_quota_groups must be an object")
+    result: dict[str, list[str]] = {}
+    for group, models in value.items():
+        if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+            raise ExperimentalConfigError("providers.model_quota_groups values must be string arrays")
+        result[str(group)] = list(models)
+    return result
+
+
 def _pricing_from_env(provider: str, model: str, env: Mapping[str, str]) -> Optional[ModelPricing]:
     suffixes = {
         "input": "INPUT",
@@ -380,7 +516,10 @@ def _pricing_from_env(provider: str, model: str, env: Mapping[str, str]) -> Opti
         key = env_price_key(provider, model, suffix)
         raw = env.get(key)
         if raw not in (None, ""):
-            values[field_name] = as_float(raw, name=key)
+            try:
+                values[field_name] = as_float(raw, name=key)
+            except ExperimentalConfigError:
+                continue
     if not values:
         return None
     return ModelPricing(
