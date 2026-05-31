@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesWebSocketFormatter
+from rotator_library.transaction_logger import TransactionLogger
 
 
 def _event_names(events: list[str]) -> list[str]:
@@ -84,3 +85,18 @@ def test_transport_formatters_expose_sse_and_websocket_seam() -> None:
     assert websocket.future_supported is True
     with pytest.raises(NotImplementedError):
         websocket.format_event("response.created", {})
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    _ = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient(), transaction_logger=logger)]
+
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "stream_started" in trace_text
+    assert "stream_first_byte" in trace_text
+    assert "stream_first_visible_output" in trace_text
+    assert "stream_completed" in trace_text
+    assert "stream_metrics_final" in trace_text

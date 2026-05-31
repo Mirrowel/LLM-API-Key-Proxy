@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import Any, AsyncGenerator, Optional
 
 from ..protocols import ProtocolContext
+from ..streaming import StreamEvent, StreamMonitor
 from ..protocols.responses import ResponsesProtocol
 from .bridge import ResponsesBridge
 from .store import InMemoryResponsesStore, ResponsesStore
@@ -136,10 +137,29 @@ class ResponsesService:
         state = ResponsesStreamState(response_id=response_id, model=unified.model)
         usage = None
         item_started = False
+        monitor = StreamMonitor(clock=time.monotonic)
+        self._trace(
+            transaction_logger,
+            "stream_started",
+            {"event": StreamEvent("started", protocol="responses").to_dict(), "metrics": monitor.metrics.to_dict()},
+            direction="stream",
+            stage="client",
+            metadata={"transport": "sse"},
+        )
         yield formatter.format_event("response.created", response_created_payload(response_id, unified.model))
         try:
             chat_stream = await client.acompletion(request=request, **chat_kwargs)
             async for raw_chunk in chat_stream:
+                if monitor.metrics.first_byte_at is None:
+                    monitor.record_event(StreamEvent("raw_chunk", protocol="responses", raw=raw_chunk))
+                    self._trace(
+                        transaction_logger,
+                        "stream_first_byte",
+                        {"metrics": monitor.metrics.to_dict()},
+                        direction="stream",
+                        stage="provider",
+                        metadata={"transport": "sse"},
+                    )
                 self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 chunk = parse_chat_sse_chunk(raw_chunk)
                 if not chunk or chunk.get("type") == "done":
@@ -162,6 +182,24 @@ class ResponsesService:
                     output_item_id=state.output_item_id,
                 )
                 event = output_text_delta_payload(state, delta)
+                first_visible = monitor.metrics.first_visible_output_at is None
+                monitor.record_event(
+                    StreamEvent(
+                        "delta",
+                        protocol="responses",
+                        data=event,
+                        visible_output=True,
+                    )
+                )
+                if first_visible:
+                    self._trace(
+                        transaction_logger,
+                        "stream_first_visible_output",
+                        {"event": event, "metrics": monitor.metrics.to_dict()},
+                        direction="stream",
+                        stage="final",
+                        metadata={"transport": "sse"},
+                    )
                 self._trace(transaction_logger, "formatted_responses_stream_event", event, direction="stream", stage="final")
                 yield formatter.format_event("response.output_text.delta", event)
 
@@ -172,11 +210,37 @@ class ResponsesService:
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             await self._store_stream_response(stream_request, completed, parent)
             self._trace(transaction_logger, "stored_responses_stream_response", completed, direction="metadata", stage="final")
+            monitor.complete()
+            self._trace(
+                transaction_logger,
+                "stream_completed",
+                {"metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="final",
+                metadata={"transport": "sse"},
+            )
+            self._trace(
+                transaction_logger,
+                "stream_metrics_final",
+                {"metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="final",
+                metadata={"transport": "sse"},
+            )
             yield formatter.format_event("response.completed", completed)
             yield formatter.done()
         except Exception as exc:
+            monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
+            self._trace(
+                transaction_logger,
+                "stream_metrics_final",
+                {"metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="final",
+                metadata={"transport": "sse", "failed": True},
+            )
             yield formatter.format_event("response.failed", failed)
             yield formatter.done()
 
