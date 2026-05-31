@@ -91,6 +91,44 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
 
 
 @pytest.mark.asyncio
+async def test_native_provider_default_field_cache_persists_across_requests() -> None:
+    rule = FieldCacheRule(
+        name="reasoning",
+        source="response",
+        path="choices.0.message.reasoning_content",
+        inject=FieldCacheInjection(target="request", path="metadata.reasoning_content"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        field_cache_rules=(rule,),
+    )
+    first_client = FakeHTTPClient(
+        {
+            "id": "chat_1",
+            "model": "gpt-test",
+            "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "cached-state"}}],
+        }
+    )
+    second_client = FakeHTTPClient(
+        {
+            "id": "chat_2",
+            "model": "gpt-test",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        }
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute({"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}, context, NativeHTTPTransport(first_client))
+    await executor.execute({"model": "gpt-test", "messages": [{"role": "user", "content": "again"}]}, context, NativeHTTPTransport(second_client))
+
+    assert second_client.calls[0]["json"]["metadata"]["reasoning_content"] == "cached-state"
+
+
+@pytest.mark.asyncio
 async def test_native_provider_executor_logs_transform_errors(tmp_path) -> None:
     logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
     context = NativeProviderContext(

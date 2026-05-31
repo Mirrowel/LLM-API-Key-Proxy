@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
-from ..field_cache import FieldCacheEngine
+from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..protocols import get_protocol
 from ..usage.accounting import extract_usage_record
 from .context import NativeProviderContext
@@ -19,13 +19,13 @@ from .streaming import stream_event_payload
 class NativeProviderExecutor:
     """Run one native provider request through protocol/adapter/cache passes.
 
-    This executor is intentionally not wired into the live client path yet. Phase
-    5 providers can test native behavior here first, then later phases can route
-    declared providers into it without disturbing undeclared providers.
+    The default field-cache store is process-local per executor. That preserves
+    provider protocol state across native requests without adding a database;
+    production callers can still inject a persistent store when needed.
     """
 
     def __init__(self, *, field_cache_store: Any = None) -> None:
-        self.field_cache_store = field_cache_store
+        self.field_cache_store = field_cache_store or InMemoryFieldCacheStore()
 
     async def execute(self, raw_request: dict[str, Any], context: NativeProviderContext, transport: NativeHTTPTransport) -> dict[str, Any]:
         """Execute a non-streaming native provider request."""
