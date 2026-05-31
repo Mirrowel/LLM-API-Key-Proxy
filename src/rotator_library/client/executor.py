@@ -1071,7 +1071,6 @@ class RequestExecutor:
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
-        last_stream_error_payload: Optional[Dict[str, Any]] = None
 
         while time.time() < deadline:
             # Check for untried credentials
@@ -1335,6 +1334,7 @@ class RequestExecutor:
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
+        last_stream_error_payload: Optional[Dict[str, Any]] = None
 
         try:
             while time.time() < deadline:

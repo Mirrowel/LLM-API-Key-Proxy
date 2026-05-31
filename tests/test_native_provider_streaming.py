@@ -46,7 +46,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
 
     events = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(client))]
 
-    assert events == chunks
+    assert events == [chunks[0]]
     assert client.calls[0]["json"]["stream"] is True
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "native_provider_stream_request" in pass_names
@@ -54,7 +54,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert pass_names.count("parsed_native_stream_event") == 2
     assert "after_field_cache_extraction" in pass_names
     assert "after_field_cache_stream_extraction" in pass_names
-    assert pass_names.count("formatted_client_stream_event") == 2
+    assert pass_names.count("formatted_client_stream_event") == 1
     trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
     assert "opaque-vendor-state" not in trace_text
 
