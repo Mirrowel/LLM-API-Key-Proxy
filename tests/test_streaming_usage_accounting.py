@@ -56,6 +56,11 @@ async def _request_cost_comment_chunks():
     yield {"id": "chunk_1", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
 
+async def _estimated_cost_comment_chunks():
+    yield ': cost {"estimated_cost":0.045,"source":"reference_estimate"}\n\n'
+    yield {"id": "chunk_1", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
 async def _top_level_cost_usage_sse_chunks():
     yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1},"total_cost":0.055}\n\n'
 
@@ -171,6 +176,15 @@ async def test_streaming_reference_request_cost_comment_updates_approx_cost() ->
     _ = [chunk async for chunk in StreamingHandler().wrap_stream(_request_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
 
     assert cred_context.success_kwargs["approx_cost"] == 0.044
+
+
+@pytest.mark.asyncio
+async def test_streaming_estimated_cost_comment_updates_approx_cost() -> None:
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_estimated_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["approx_cost"] == 0.045
 
 
 @pytest.mark.asyncio

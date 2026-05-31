@@ -918,7 +918,7 @@ def _responses_sse_cost_usage(chunk: Any) -> Optional[dict[str, Any]]:
         payload = {"provider_reported_cost": payload, "source": "responses_sse_cost"}
     if not isinstance(payload, dict):
         return None
-    cost = payload.get("provider_reported_cost", payload.get("request_cost_usd", payload.get("total_cost", payload.get("cost"))))
+    cost = payload.get("provider_reported_cost", payload.get("request_cost_usd", payload.get("total_cost", payload.get("cost", payload.get("estimated_cost")))))
     if cost is None:
         return None
     return {
@@ -935,7 +935,7 @@ def _responses_chunk_usage(chunk: dict[str, Any]) -> Any:
     if not isinstance(usage, dict):
         return usage
     merged = dict(usage)
-    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
         if key in chunk and key not in merged:
             merged[key] = deepcopy(chunk[key])
     return merged
@@ -981,10 +981,10 @@ def _merge_responses_stream_usage(primary: Any, fallback_cost: Any) -> Any:
     if not isinstance(fallback_cost, dict):
         return primary
     merged = deepcopy(primary)
-    has_cost = any(key in merged for key in ("cost_details", "cost", "total_cost", "provider_reported_cost"))
+    has_cost = any(key in merged for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd"))
     if has_cost:
         return merged
-    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "currency"):
+    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency"):
         if key in fallback_cost:
             merged[key] = deepcopy(fallback_cost[key])
     return merged
@@ -1015,7 +1015,7 @@ def _usage_to_responses_stream(usage: Any) -> Any:
     completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
     if isinstance(completion_details, dict):
         result["output_tokens_details"] = {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)}
-    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "currency"):
+    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency"):
         if key in usage:
             result[key] = deepcopy(usage[key])
     return result

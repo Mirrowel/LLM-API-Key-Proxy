@@ -157,6 +157,16 @@ class RequestCostCommentStreamingClient:
         return chunks()
 
 
+class EstimatedCostCommentStreamingClient:
+    async def acompletion(self, **kwargs):
+        async def chunks():
+            yield ': cost {"estimated_cost":0.024,"source":"reference_estimate"}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"priced"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return chunks()
+
+
 class TopLevelUsageCostStreamingClient:
     async def acompletion(self, **kwargs):
         async def chunks():
@@ -317,6 +327,19 @@ async def test_stream_response_preserves_reference_request_cost_comment() -> Non
     stored = await store.get(response_id)
     assert stored is not None
     assert stored.usage["cost_details"]["request_cost_usd"] == 0.023
+
+
+@pytest.mark.asyncio
+async def test_stream_response_preserves_estimated_cost_comment() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, EstimatedCostCommentStreamingClient())]
+
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stored is not None
+    assert stored.usage["cost_details"]["estimated_cost"] == 0.024
 
 
 @pytest.mark.asyncio

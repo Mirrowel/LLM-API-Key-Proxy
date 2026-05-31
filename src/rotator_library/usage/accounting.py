@@ -129,7 +129,7 @@ def _merge_top_level_cost_fields(usage: dict[str, Any], response: dict[str, Any]
     """Copy sibling cost metadata into a nested usage payload."""
 
     merged = dict(usage)
-    for key in ("cost", "total_cost", "cost_details", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+    for key in ("cost", "total_cost", "estimated_cost", "cost_details", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
         if key in response and key not in merged:
             merged[key] = response[key]
     return merged
@@ -173,6 +173,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
         "costMetadata",
         "provider_reported_cost",
         "request_cost_usd",
+        "estimated_cost",
         "total_cost",
         "currency",
     ):
@@ -301,7 +302,7 @@ def _extract_cost(data: dict[str, Any]) -> tuple[Optional[float], str, Optional[
             raw_cost = breakdown_total
             breakdown_used = True
     if raw_cost is None:
-        raw_cost = data.get("provider_reported_cost", data.get("request_cost_usd", data.get("total_cost", data.get("cost"))))
+        raw_cost = data.get("provider_reported_cost", data.get("request_cost_usd", data.get("total_cost", data.get("cost", data.get("estimated_cost")))))
     cost_value = _float_or_none(raw_cost)
     currency = str(cost_payload.get("currency") or data.get("currency") or "USD")
     source = cost_payload.get("source") or ("provider_reported_breakdown" if breakdown_used else ("provider_reported" if cost_value is not None else None))
@@ -336,7 +337,6 @@ def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
         "audio_output_cost",
         "data_storage_cost",
         "estimated_cost",
-        "cost_in_usd_ticks",
         "request_cost",
         "web_search_cost",
         "search_cost",
@@ -345,6 +345,10 @@ def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
         if value is not None:
             total += value
             found = True
+    ticks = _float_or_none(payload.get("cost_in_usd_ticks"))
+    if ticks is not None:
+        total += ticks / 10_000_000_000
+        found = True
     return total if found else None
 
 

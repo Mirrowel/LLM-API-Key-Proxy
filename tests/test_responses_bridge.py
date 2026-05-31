@@ -187,6 +187,23 @@ def test_bridge_preserves_chat_response_top_level_cost_with_usage() -> None:
     assert response["usage"]["cost_details"]["total_cost"] == 0.012
 
 
+def test_bridge_preserves_chat_response_estimated_cost_with_usage() -> None:
+    protocol = ResponsesProtocol()
+    bridge = ResponsesBridge(protocol)
+    unified = protocol.parse_request({"model": "gpt-test", "input": "Hello"})
+    chat_response = {
+        "id": "chat_1",
+        "model": "gpt-test",
+        "choices": [{"message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        "estimated_cost": 0.013,
+    }
+
+    response = bridge.from_chat_response(chat_response, unified)
+
+    assert response["usage"]["cost_details"]["estimated_cost"] == 0.013
+
+
 def test_bridge_converts_chat_tool_calls_to_responses_output_items() -> None:
     protocol = ResponsesProtocol()
     bridge = ResponsesBridge(protocol)
