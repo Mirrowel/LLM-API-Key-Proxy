@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
-from ..protocols import get_protocol
+from ..protocols import get_protocol, serialize_value
 from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from .context import NativeProviderContext
@@ -194,19 +194,32 @@ def _redact_field_cache_paths(data: Any, context: NativeProviderContext, directi
 
     if not context.field_cache_rules:
         return data
-    redacted = deepcopy(data)
+    redacted = serialize_value(deepcopy(data))
     for rule in context.field_cache_rules:
         paths: list[str] = []
         if direction == "request" and rule.inject:
             paths.append(rule.inject.path)
         if direction in {"response", "stream"}:
             paths.append(rule.path)
-        for path in paths:
+        for path in _trace_redaction_paths(paths, direction=direction):
             try:
-                _redact_path(redacted, parse_path(path))
+                tokens = parse_path(path)
+                _redact_path(redacted, tokens)
+                _redact_leaf_key(redacted, tokens)
             except (FieldCachePathError, TypeError, ValueError):
                 continue
     return redacted
+
+
+def _trace_redaction_paths(paths: list[str], *, direction: str) -> list[str]:
+    """Return configured paths plus raw-stream envelope fallbacks for traces."""
+
+    expanded: list[str] = []
+    for path in paths:
+        expanded.append(path)
+        if direction == "stream" and path.startswith("raw."):
+            expanded.append(path[4:])
+    return expanded
 
 
 def _redact_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
@@ -243,3 +256,20 @@ def _redact_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
                     _redact_path(item, rest)
                 else:
                     value[index] = REDACTED
+
+
+def _redact_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    """Redact the configured terminal key wherever stream traces duplicate it."""
+
+    leaf = next((token.value for token in reversed(tokens) if token.kind == "key"), None)
+    if not leaf:
+        return
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if key == leaf:
+                value[key] = REDACTED
+            else:
+                _redact_leaf_key(item, tokens)
+    elif isinstance(value, list):
+        for item in value:
+            _redact_leaf_key(item, tokens)

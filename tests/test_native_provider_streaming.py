@@ -32,11 +32,14 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
         model="gpt-test",
         protocol_name="openai_chat",
         endpoint="https://example.test/chat",
-        field_cache_rules=(FieldCacheRule(name="stream_reasoning", source="stream_event", path="raw.choices.0.delta.reasoning_content", allow_missing_session=True),),
+        field_cache_rules=(
+            FieldCacheRule(name="stream_reasoning", source="stream_event", path="raw.choices.0.delta.reasoning_content", allow_missing_session=True),
+            FieldCacheRule(name="stream_vendor_state", source="stream_event", path="raw.choices.0.delta.vendor_state", allow_missing_session=True),
+        ),
         transaction_logger=logger,
     )
     chunks = [
-        {"choices": [{"delta": {"content": "hi", "reasoning_content": "hidden"}}]},
+        {"choices": [{"delta": {"content": "hi", "reasoning_content": "hidden", "vendor_state": "opaque-vendor-state"}}]},
         "[DONE]",
     ]
     client = FakeStreamingClient(chunks)
@@ -52,6 +55,8 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert "after_field_cache_extraction" in pass_names
     assert "after_field_cache_stream_extraction" in pass_names
     assert pass_names.count("formatted_client_stream_event") == 2
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "opaque-vendor-state" not in trace_text
 
 
 @pytest.mark.asyncio
