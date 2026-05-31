@@ -107,8 +107,12 @@ class OllamaProtocol(ProtocolAdapter):
             payload["response"] = _ollama_response_text(unified_response)
         if unified_response.usage and isinstance(unified_response.usage.raw, dict):
             for key, value in unified_response.usage.raw.items():
-                if key.endswith("count") or key.endswith("duration"):
+                if key.endswith("duration"):
                     payload[key] = deepcopy(value)
+            if unified_response.usage.input_tokens:
+                payload["prompt_eval_count"] = unified_response.usage.input_tokens
+            if unified_response.usage.output_tokens:
+                payload["eval_count"] = unified_response.usage.output_tokens
         return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:

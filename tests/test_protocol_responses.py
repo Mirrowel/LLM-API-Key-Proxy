@@ -60,7 +60,7 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
             "input_tokens": 10,
             "output_tokens": 5,
             "total_tokens": 18,
-            "input_tokens_details": {"cached_tokens": 3},
+            "input_tokens_details": {"cached_tokens": 3, "cache_creation_tokens": 2},
             "output_tokens_details": {"reasoning_tokens": 3},
             "cost_details": {"total_cost": 0.02, "currency": "USD"},
         },
@@ -77,6 +77,7 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
     assert unified.usage.input_tokens == 10
     assert unified.usage.reasoning_tokens == 3
     assert unified.usage.cache_read_tokens == 3
+    assert unified.usage.cache_write_tokens == 2
     assert unified.usage.cost is not None
     assert unified.usage.cost.provider_reported_cost == 0.02
 
@@ -84,7 +85,7 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
     assert formatted["usage"]["input_tokens"] == 10
     assert formatted["usage"]["output_tokens"] == 5
     assert formatted["usage"]["total_tokens"] == 18
-    assert formatted["usage"]["input_tokens_details"] == {"cached_tokens": 3}
+    assert formatted["usage"]["input_tokens_details"] == {"cached_tokens": 3, "cache_creation_tokens": 2}
     assert formatted["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
     assert formatted["usage"]["cost_details"]["total_cost"] == 0.02
     assert "raw" not in formatted["usage"]

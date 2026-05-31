@@ -270,16 +270,20 @@ class OpenAIChatProtocol(ProtocolAdapter):
         content = self._format_content(message.content)
         if content is not None:
             payload["content"] = content
-        legacy_function_call = message.extra.get("function_call")
+        extra = deepcopy(message.extra)
+        legacy_function_call = extra.get("function_call")
         if message.tool_calls and not legacy_function_call:
             payload["tool_calls"] = [self._format_tool_call(call) for call in message.tool_calls]
+        elif message.tool_calls and legacy_function_call:
+            call = message.tool_calls[0]
+            extra["function_call"] = {"name": call.name or "", "arguments": _format_arguments(call.arguments)}
         if message.reasoning:
             # OpenAI-compatible providers use multiple names for reasoning text.
             # Prefer the common extension field while keeping all blocks in extra.
             text = "".join(block.text or "" for block in message.reasoning if block.text)
             if text:
                 payload["reasoning_content"] = text
-        payload.update(deepcopy(message.extra))
+        payload.update(extra)
         return payload
 
     def _parse_message_tool_calls(self, payload: dict[str, Any]) -> list[ToolCall]:

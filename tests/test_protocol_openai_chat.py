@@ -164,8 +164,12 @@ def test_openai_legacy_function_call_is_unified_and_round_trips() -> None:
 
     assert unified.messages[0].tool_calls[0].name == "lookup"
     assert unified.messages[0].tool_calls[0].extra["legacy_function_call"] is True
+    unified.messages[0].tool_calls[0].arguments = {"q": "changed"}
     assert rebuilt["messages"][0]["function_call"] == {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
     assert "tool_calls" not in rebuilt["messages"][0]
+
+    rebuilt = adapter.build_request(unified)
+    assert rebuilt["messages"][0]["function_call"] == {"name": "lookup", "arguments": "{\"q\":\"changed\"}"}
 
 
 def test_openai_chat_stream_event_parses_sse_delta_and_done() -> None:

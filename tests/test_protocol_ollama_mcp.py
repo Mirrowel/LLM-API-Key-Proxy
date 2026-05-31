@@ -47,13 +47,14 @@ def test_ollama_format_response_uses_mutated_unified_fields() -> None:
 
     generate = adapter.parse_response({"model": "llama3", "response": "before", "eval_count": 2})
     generate.output[0] = "after"
+    generate.usage.output_tokens = 5
 
     embeddings = adapter.parse_response({"model": "llama3", "embedding": [0.1, 0.2]})
     embeddings.data = [0.3, 0.4]
 
     assert adapter.format_response(chat)["message"]["content"] == "after"
     assert adapter.format_response(generate)["response"] == "after"
-    assert adapter.format_response(generate)["eval_count"] == 2
+    assert adapter.format_response(generate)["eval_count"] == 5
     assert adapter.format_response(embeddings)["embedding"] == [0.3, 0.4]
 
 
