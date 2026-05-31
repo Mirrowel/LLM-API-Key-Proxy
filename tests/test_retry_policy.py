@@ -98,6 +98,7 @@ def test_shared_classifier_handles_structured_dict_type_and_code_text() -> None:
     assert classify_error({"error": {"type": "authentication"}}).error_type == "authentication"
     assert classify_error({"error": {"code": "permission_denied"}}).error_type == "forbidden"
     assert classify_error({"error": {"code": "context_length_exceeded"}}).error_type == "context_window_exceeded"
+    assert classify_error({"error": {"status_code": 400, "code": "context_length_exceeded"}}).error_type == "context_window_exceeded"
     assert classify_error({"error": {"type": "rate_limit"}}).error_type == "rate_limit"
 
 
