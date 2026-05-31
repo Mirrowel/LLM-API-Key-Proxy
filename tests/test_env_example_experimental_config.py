@@ -35,4 +35,23 @@ def test_env_example_documents_experimental_config_knobs() -> None:
         assert key in text
 
     assert "Do not put API keys" in text
-    assert "PROVIDER_COOLDOWN_DEFAULT_SECONDS=30" in text
+    for default_line in (
+        "PROVIDER_COOLDOWN_MIN_SECONDS=10",
+        "PROVIDER_COOLDOWN_DEFAULT_SECONDS=30",
+        "PROVIDER_COOLDOWN_ON_QUOTA=false",
+        "PROVIDER_BACKOFF_WINDOW_SECONDS=60",
+        "PROVIDER_BACKOFF_THRESHOLD=3",
+        "PROVIDER_BACKOFF_BASE_SECONDS=0",
+        "PROVIDER_BACKOFF_MAX_SECONDS=300",
+        "FAILURE_HISTORY_MAX_ENTRIES=200",
+        "RESPONSES_STORE_TTL_SECONDS=0",
+        "RESPONSES_STORE_MAX_ITEMS=0",
+        "RESPONSES_STORE_FAILED=true",
+        "RESPONSES_STORE_IN_PROGRESS=false",
+        "STREAM_TRACE_METRICS=true",
+        "STREAM_TTFB_TIMEOUT_SECONDS=0",
+        "STREAM_STALL_TIMEOUT_SECONDS=0",
+        "STREAM_HEARTBEAT_INTERVAL_SECONDS=0",
+        "STREAM_CANCEL_UPSTREAM_ON_DISCONNECT=true",
+    ):
+        assert default_line in text

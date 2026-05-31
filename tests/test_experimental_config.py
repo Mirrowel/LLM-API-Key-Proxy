@@ -99,7 +99,7 @@ def test_new_config_sections_still_reject_secret_like_keys() -> None:
         load_config_from_mapping({"responses": {"store": {"authorization": "hidden"}}})
 
 
-@pytest.mark.parametrize("secret_key", ["secret_key", "secret-key", "apiKey", "client-secret"])
+@pytest.mark.parametrize("secret_key", ["secret_key", "secret-key", "apiKey", "client-secret", "oauth_token", "oauthToken", "oauth-token", "id_token", "oauth_token_secret"])
 def test_secret_key_variants_are_rejected(secret_key: str) -> None:
     with pytest.raises(ExperimentalConfigError):
         load_config_from_mapping({"retry": {secret_key: "hidden"}})
@@ -214,6 +214,18 @@ def test_field_cache_rules_reject_non_list_model_rules() -> None:
 
     with pytest.raises(ExperimentalConfigError, match="model rules"):
         parse_field_cache_rules(config, "provider", "model")
+
+
+def test_field_cache_rules_reject_malformed_nested_shapes() -> None:
+    bad_inject = load_config_from_mapping({"field_cache": {"provider": {"*": [{"name": "bad", "source": "response", "path": "x", "inject": "not-object"}]}}})
+
+    with pytest.raises(ExperimentalConfigError, match="inject"):
+        parse_field_cache_rules(bad_inject, "provider", "model")
+
+    bad_metadata = load_config_from_mapping({"field_cache": {"provider": {"*": [{"name": "bad", "source": "response", "path": "x", "metadata": "not-object"}]}}})
+
+    with pytest.raises(ExperimentalConfigError, match="metadata"):
+        parse_field_cache_rules(bad_metadata, "provider", "model")
 
 
 def test_env_price_key_sanitizes_provider_and_model() -> None:
