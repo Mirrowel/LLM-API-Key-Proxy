@@ -31,3 +31,12 @@ def test_mcp_jsonrpc_round_trip_and_error_preservation() -> None:
     assert rebuilt == request
     assert adapter.format_response(response)["result"] == {"content": []}
     assert adapter.format_response(error)["error"]["message"] == "failed"
+
+
+def test_mcp_preserves_notifications_and_falsey_params() -> None:
+    adapter = get_protocol("mcp")
+    notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    false_params = {"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": False}
+
+    assert adapter.build_request(adapter.parse_request(notification)) == notification
+    assert adapter.build_request(adapter.parse_request(false_params)) == false_params

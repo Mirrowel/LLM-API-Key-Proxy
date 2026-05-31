@@ -15,7 +15,7 @@ from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
-from .operation import OPERATION_COUNT_TOKENS, OPERATION_MESSAGES
+from .operation import OPERATION_COUNT_TOKENS, OPERATION_MESSAGES, OPERATION_UNKNOWN, normalize_operation
 from .types import (
     ContentBlock,
     ProtocolContext,
@@ -62,6 +62,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
         return UnifiedRequest(
+            operation=_operation_from_context(context, OPERATION_MESSAGES),
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=[self._parse_message(message) for message in request.get("messages") or []],
             system=self._parse_system(request.get("system")),
@@ -101,6 +102,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
         self._promote_message_blocks(message)
         return UnifiedResponse(
+            operation=_response_operation(response, context),
             id=response.get("id"),
             model=response.get("model") or getattr(context, "model", None),
             messages=[message] if response else [],
@@ -129,20 +131,20 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_MESSAGES, raw=deepcopy(raw_event))
         data = _as_dict(event)
         event_type = str(data.get("type") or "chunk")
 
         if event_type == "error" or data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="error", operation=OPERATION_MESSAGES, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "message_start":
             response = self.parse_response(data.get("message") or {}, context)
-            return UnifiedStreamEvent(type="message_start", message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="message_start", operation=OPERATION_MESSAGES, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "message_delta":
-            return UnifiedStreamEvent(type="message_delta", usage=self.extract_usage(data.get("usage") or {}, context), raw=deepcopy(raw_event), extra={"payload": data, "stop_reason": (data.get("delta") or {}).get("stop_reason")})
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_MESSAGES, usage=self.extract_usage(data.get("usage") or {}, context), raw=deepcopy(raw_event), extra={"payload": data, "stop_reason": (data.get("delta") or {}).get("stop_reason")})
         if event_type in {"content_block_start", "content_block_delta", "content_block_stop"}:
             return self._parse_content_stream_event(data, raw_event)
-        return UnifiedStreamEvent(type=event_type, raw=deepcopy(raw_event), extra={"payload": data})
+        return UnifiedStreamEvent(type=event_type, operation=OPERATION_MESSAGES, raw=deepcopy(raw_event), extra={"payload": data})
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
@@ -322,7 +324,28 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 content_block = ContentBlock(type=str(delta_type), reasoning=reasoning, raw=deepcopy(delta))
         message = UnifiedMessage(role="assistant", content=[content_block] if content_block else [])
         self._promote_message_blocks(message)
-        return UnifiedStreamEvent(type=str(data.get("type") or "content_block_delta"), delta=message, raw=deepcopy(raw_event), extra={"payload": data, "index": data.get("index")})
+        return UnifiedStreamEvent(type=str(data.get("type") or "content_block_delta"), operation=OPERATION_MESSAGES, delta=message, raw=deepcopy(raw_event), extra={"payload": data, "index": data.get("index")})
+
+
+def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation != OPERATION_UNKNOWN:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation != OPERATION_UNKNOWN:
+            return operation
+    return default
+
+
+def _response_operation(response: dict[str, Any], context: ProtocolContext | None) -> str:
+    requested = _operation_from_context(context, OPERATION_MESSAGES)
+    if requested == OPERATION_COUNT_TOKENS:
+        return OPERATION_COUNT_TOKENS
+    if "input_tokens" in response and not response.get("content") and not response.get("id"):
+        return OPERATION_COUNT_TOKENS
+    return OPERATION_MESSAGES
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

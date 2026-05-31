@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from rotator_library.protocols import (
     OPERATION_CHAT,
+    OPERATION_COUNT_TOKENS,
     OPERATION_EMBEDDINGS,
+    OPERATION_MESSAGES,
+    OPERATION_RESPONSES,
     OPERATION_UNKNOWN,
     ProtocolAdapter,
+    ProtocolContext,
     UnifiedRequest,
     UnifiedResponse,
     get_protocol,
@@ -62,3 +66,28 @@ def test_protocols_advertise_supported_operations() -> None:
     assert get_protocol("openai_chat").supports_operation(OPERATION_CHAT)
     assert not get_protocol("openai_chat").supports_operation(OPERATION_EMBEDDINGS)
     assert get_protocol("litellm_fallback").supports_operation(OPERATION_UNKNOWN)
+
+
+def test_core_protocols_stamp_parsed_operation_fields() -> None:
+    chat = get_protocol("openai_chat").parse_request({"model": "m", "messages": []})
+    messages = get_protocol("anthropic_messages").parse_request({"model": "m", "messages": []})
+    responses = get_protocol("responses").parse_request({"model": "m", "input": "hi"})
+    gemini = get_protocol("gemini").parse_request({"contents": []})
+
+    assert chat.operation == OPERATION_CHAT
+    assert messages.operation == OPERATION_MESSAGES
+    assert responses.operation == OPERATION_RESPONSES
+    assert gemini.operation == OPERATION_CHAT
+
+
+def test_count_tokens_operation_can_be_context_selected() -> None:
+    context = ProtocolContext(provider_options={"operation": OPERATION_COUNT_TOKENS})
+    anthropic = get_protocol("anthropic_messages").parse_response({"input_tokens": 12}, context)
+    gemini = get_protocol("gemini").parse_response({"totalTokens": 14}, context)
+
+    assert anthropic.operation == OPERATION_COUNT_TOKENS
+    assert anthropic.usage is not None
+    assert anthropic.usage.input_tokens == 12
+    assert gemini.operation == OPERATION_COUNT_TOKENS
+    assert gemini.usage is not None
+    assert gemini.usage.total_tokens == 14

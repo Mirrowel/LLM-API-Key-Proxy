@@ -67,7 +67,7 @@ class OpenAIImagesProtocol(ProtocolAdapter):
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = raw_response if isinstance(raw_response, dict) else {}
         return UnifiedResponse(
-            operation=OPERATION_IMAGE_GENERATION,
+            operation=_context_operation(context, OPERATION_IMAGE_GENERATION),
             model=response.get("model") or getattr(context, "model", None),
             data=deepcopy(response.get("data") or []),
             raw=deepcopy(raw_response),
@@ -91,3 +91,15 @@ def _image_operation(request: dict[str, Any]) -> str:
     if "image" in request:
         return OPERATION_IMAGE_VARIATION
     return OPERATION_IMAGE_GENERATION
+
+
+def _context_operation(context: ProtocolContext | None, default: str) -> str:
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation in {OPERATION_IMAGE_GENERATION, OPERATION_IMAGE_EDIT, OPERATION_IMAGE_VARIATION}:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation in {OPERATION_IMAGE_GENERATION, OPERATION_IMAGE_EDIT, OPERATION_IMAGE_VARIATION}:
+            return operation
+    return default
