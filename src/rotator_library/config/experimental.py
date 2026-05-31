@@ -22,7 +22,7 @@ from ..field_cache import FieldCacheInjection, FieldCacheRule
 from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
-_KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers"}
+_KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
 _SECRET_KEY_PARTS = ("api_key", "authorization", "access_token", "refresh_token", "client_secret", "bearer_token", "password")
 
 
@@ -44,13 +44,15 @@ class ExperimentalConfig:
     streaming: dict[str, Any] = field(default_factory=dict)
     field_cache: dict[str, Any] = field(default_factory=dict)
     providers: dict[str, Any] = field(default_factory=dict)
+    retry: dict[str, Any] = field(default_factory=dict)
+    responses: dict[str, Any] = field(default_factory=dict)
     unknown_sections: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     path: Optional[str] = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.routing or self.pricing or self.streaming or self.field_cache or self.providers or self.unknown_sections)
+        return not (self.routing or self.pricing or self.streaming or self.field_cache or self.providers or self.retry or self.responses or self.unknown_sections)
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,20 @@ class StreamRuntimeSettings:
     heartbeat_seconds: Optional[float] = None
     cancel_upstream_on_disconnect: bool = True
     trace_metrics: bool = True
+
+
+@dataclass(frozen=True)
+class RetryRuntimeSettings:
+    """Runtime retry/cooldown settings layered from JSON and env."""
+
+    provider_cooldown_min_seconds: int = 10
+    provider_cooldown_default_seconds: int = 30
+    provider_cooldown_on_quota: bool = False
+    provider_backoff_window_seconds: int = 60
+    provider_backoff_threshold: int = 3
+    provider_backoff_base_seconds: Optional[int] = None
+    provider_backoff_max_seconds: int = 300
+    failure_history_max_entries: int = 200
 
 
 def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Mapping[str, str] | None = None) -> ExperimentalConfig:
@@ -91,6 +107,8 @@ def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Ma
         streaming=_dict_section(data, "streaming"),
         field_cache=_dict_section(data, "field_cache"),
         providers=_dict_section(data, "providers"),
+        retry=_dict_section(data, "retry"),
+        responses=_dict_section(data, "responses"),
         unknown_sections=unknown,
         warnings=warnings,
         path=str(resolved),
@@ -108,6 +126,8 @@ def load_config_from_mapping(data: Mapping[str, Any]) -> ExperimentalConfig:
         streaming=_dict_section(data, "streaming"),
         field_cache=_dict_section(data, "field_cache"),
         providers=_dict_section(data, "providers"),
+        retry=_dict_section(data, "retry"),
+        responses=_dict_section(data, "responses"),
         unknown_sections={key: value for key, value in data.items() if key not in _KNOWN_SECTIONS},
         warnings=warnings,
     )
@@ -159,6 +179,53 @@ def get_stream_runtime_settings(
         heartbeat_seconds=_optional_positive_float(_env_or_json(source, "STREAM_HEARTBEAT_INTERVAL_SECONDS", streaming, "heartbeat_interval_seconds", default=_env_or_json(source, "STREAM_HEARTBEAT_SECONDS", streaming, "heartbeat_seconds")), "STREAM_HEARTBEAT_INTERVAL_SECONDS"),
         cancel_upstream_on_disconnect=as_bool(_env_or_json(source, "STREAM_CANCEL_UPSTREAM_ON_DISCONNECT", streaming, "cancel_upstream_on_disconnect", default=True), name="STREAM_CANCEL_UPSTREAM_ON_DISCONNECT"),
         trace_metrics=as_bool(_env_or_json(source, "STREAM_TRACE_METRICS", streaming, "trace_metrics", default=True), name="STREAM_TRACE_METRICS"),
+    )
+
+
+def get_retry_runtime_settings(
+    *,
+    config: ExperimentalConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> RetryRuntimeSettings:
+    """Return retry/cooldown settings with environment overriding JSON."""
+
+    source = env if env is not None else os.environ
+    active = config if config is not None else load_experimental_config(env=source)
+    retry = active.retry if isinstance(active.retry, dict) else {}
+    cooldown = retry.get("provider_cooldown", {}) if isinstance(retry.get("provider_cooldown"), dict) else retry
+    backoff = retry.get("backoff", {}) if isinstance(retry.get("backoff"), dict) else retry
+    return RetryRuntimeSettings(
+        provider_cooldown_min_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_COOLDOWN_MIN_SECONDS", cooldown, "provider_cooldown_min_seconds", default=10), name="PROVIDER_COOLDOWN_MIN_SECONDS")),
+        provider_cooldown_default_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_COOLDOWN_DEFAULT_SECONDS", cooldown, "provider_cooldown_default_seconds", default=30), name="PROVIDER_COOLDOWN_DEFAULT_SECONDS")),
+        provider_cooldown_on_quota=as_bool(_env_or_json(source, "PROVIDER_COOLDOWN_ON_QUOTA", cooldown, "provider_cooldown_on_quota", default=False), name="PROVIDER_COOLDOWN_ON_QUOTA"),
+        provider_backoff_window_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_BACKOFF_WINDOW_SECONDS", backoff, "provider_backoff_window_seconds", default=60), name="PROVIDER_BACKOFF_WINDOW_SECONDS")),
+        provider_backoff_threshold=max(1, as_int(_env_or_json(source, "PROVIDER_BACKOFF_THRESHOLD", backoff, "provider_backoff_threshold", default=3), name="PROVIDER_BACKOFF_THRESHOLD")),
+        provider_backoff_base_seconds=_optional_positive_int(_env_or_json(source, "PROVIDER_BACKOFF_BASE_SECONDS", backoff, "provider_backoff_base_seconds"), "PROVIDER_BACKOFF_BASE_SECONDS"),
+        provider_backoff_max_seconds=max(1, as_int(_env_or_json(source, "PROVIDER_BACKOFF_MAX_SECONDS", backoff, "provider_backoff_max_seconds", default=300), name="PROVIDER_BACKOFF_MAX_SECONDS")),
+        failure_history_max_entries=max(1, as_int(_env_or_json(source, "FAILURE_HISTORY_MAX_ENTRIES", backoff, "failure_history_max_entries", default=200), name="FAILURE_HISTORY_MAX_ENTRIES")),
+    )
+
+
+def get_responses_store_settings(
+    *,
+    config: ExperimentalConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Any:
+    """Return Responses store settings with environment overriding JSON."""
+
+    from ..responses import ResponsesStoreSettings
+
+    source = env if env is not None else os.environ
+    active = config if config is not None else load_experimental_config(env=source)
+    responses = active.responses if isinstance(active.responses, dict) else {}
+    store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
+    ttl_seconds = _optional_positive_int(_env_or_json(source, "RESPONSES_STORE_TTL_SECONDS", store, "ttl_seconds"), "RESPONSES_STORE_TTL_SECONDS")
+    max_items = _optional_positive_int(_env_or_json(source, "RESPONSES_STORE_MAX_ITEMS", store, "max_items"), "RESPONSES_STORE_MAX_ITEMS")
+    return ResponsesStoreSettings(
+        ttl_seconds=ttl_seconds,
+        max_items=max_items,
+        store_failed=as_bool(_env_or_json(source, "RESPONSES_STORE_FAILED", store, "store_failed", default=True), name="RESPONSES_STORE_FAILED"),
+        store_in_progress=as_bool(_env_or_json(source, "RESPONSES_STORE_IN_PROGRESS", store, "store_in_progress", default=False), name="RESPONSES_STORE_IN_PROGRESS"),
     )
 
 
@@ -293,6 +360,13 @@ def _optional_positive_float(value: Any, name: str) -> Optional[float]:
     parsed = as_float(value, name=name)
     # Zero and negative values mean "not configured" for timeout-like knobs.
     # Runtime enforcement is intentionally disabled by default.
+    return parsed if parsed > 0 else None
+
+
+def _optional_positive_int(value: Any, name: str) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    parsed = as_int(value, name=name)
     return parsed if parsed > 0 else None
 
 

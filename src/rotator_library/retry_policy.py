@@ -138,7 +138,8 @@ class FailureHistory:
     """
 
     def __init__(self, *, max_entries: int | None = None, clock: Any = None) -> None:
-        self.max_entries = max(1, max_entries if max_entries is not None else _env_int("FAILURE_HISTORY_MAX_ENTRIES", 200))
+        settings = _retry_settings()
+        self.max_entries = max(1, max_entries if max_entries is not None else settings.failure_history_max_entries)
         self._entries: deque[FailureHistoryEntry] = deque(maxlen=self.max_entries)
         self._clock = clock or time.time
 
@@ -165,10 +166,11 @@ class FailureHistory:
     def backoff_for(self, *, provider: Optional[str], error_type: str, scope: str, model: Optional[str], default_duration: int) -> BackoffDecision:
         """Return bounded backoff for repeated transient failures."""
 
-        window = _env_int("PROVIDER_BACKOFF_WINDOW_SECONDS", 60)
-        threshold = max(1, _env_int("PROVIDER_BACKOFF_THRESHOLD", 3))
-        base = max(1, _env_int("PROVIDER_BACKOFF_BASE_SECONDS", default_duration))
-        max_seconds = max(base, _env_int("PROVIDER_BACKOFF_MAX_SECONDS", 300))
+        settings = _retry_settings()
+        window = settings.provider_backoff_window_seconds
+        threshold = max(1, settings.provider_backoff_threshold)
+        base = max(1, settings.provider_backoff_base_seconds or default_duration)
+        max_seconds = max(base, settings.provider_backoff_max_seconds)
         now = float(self._clock())
         recent = [
             entry
@@ -207,10 +209,8 @@ def is_model_capacity_error(error: Any) -> bool:
 def provider_cooldown_env() -> tuple[int, int, bool]:
     """Read provider-cooldown env controls with conservative defaults."""
 
-    min_seconds = _env_int("PROVIDER_COOLDOWN_MIN_SECONDS", 10)
-    default_seconds = _env_int("PROVIDER_COOLDOWN_DEFAULT_SECONDS", DEFAULT_PROVIDER_COOLDOWN_DEFAULT_SECONDS)
-    cooldown_on_quota = os.environ.get("PROVIDER_COOLDOWN_ON_QUOTA", "").strip().lower() in {"1", "true", "yes", "on"}
-    return max(0, min_seconds), max(0, default_seconds), cooldown_on_quota
+    settings = _retry_settings()
+    return settings.provider_cooldown_min_seconds, settings.provider_cooldown_default_seconds, settings.provider_cooldown_on_quota
 
 
 def is_target_failover_eligible(
@@ -230,3 +230,11 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _retry_settings() -> Any:
+    """Load retry settings lazily to avoid config import cycles at startup."""
+
+    from .config.experimental import get_retry_runtime_settings
+
+    return get_retry_runtime_settings()
