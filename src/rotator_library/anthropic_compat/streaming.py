@@ -67,6 +67,7 @@ async def anthropic_streaming_wrapper(
     accumulated_thinking = ""  # Track accumulated thinking for logging
     stop_reason_final = "end_turn"  # Track final stop reason for logging
     upstream_closed = False
+    stream_iterator = openai_stream.__aiter__()
 
     def trace_frame(pass_name: str, frame: str, payload: Any | None = None) -> str:
         """Trace one Anthropic stream conversion frame and return it for yield."""
@@ -90,13 +91,15 @@ async def anthropic_streaming_wrapper(
         if upstream_closed:
             return
         upstream_closed = True
-        close = getattr(openai_stream, "aclose", None)
-        if callable(close):
-            await close()
-        else:
-            sync_close = getattr(openai_stream, "close", None)
+        for candidate in (stream_iterator, openai_stream):
+            close = getattr(candidate, "aclose", None)
+            if callable(close):
+                await close()
+                break
+            sync_close = getattr(candidate, "close", None)
             if callable(sync_close):
                 sync_close()
+                break
         if transaction_logger:
             transaction_logger.log_transform_pass(
                 "anthropic_stream_upstream_closed",
@@ -109,7 +112,7 @@ async def anthropic_streaming_wrapper(
             )
 
     try:
-        async for chunk_str in openai_stream:
+        async for chunk_str in stream_iterator:
             if transaction_logger:
                 transaction_logger.log_transform_pass(
                     "anthropic_stream_source_chunk",

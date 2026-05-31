@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -21,6 +22,42 @@ class FakeStreamingClient:
             yield "data: [DONE]\n\n"
 
         return chunks()
+
+
+class DelayedCloseableStream:
+    def __init__(self, chunks: list[str], delays: list[float]) -> None:
+        self.chunks = chunks
+        self.delays = delays
+        self.index = 0
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.index >= len(self.chunks):
+            raise StopAsyncIteration
+        delay = self.delays[self.index]
+        chunk = self.chunks[self.index]
+        self.index += 1
+        await asyncio.sleep(delay)
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class DelayedStreamingClient:
+    def __init__(self, stream: DelayedCloseableStream) -> None:
+        self.stream = stream
+
+    async def acompletion(self, **kwargs):
+        return self.stream
+
+
+class DisconnectRequest:
+    async def is_disconnected(self) -> bool:
+        return True
 
 
 class FailingStreamingClient:
@@ -245,10 +282,76 @@ async def test_stream_response_failure_trace_scrubs_header_like_secret_text(tmp_
 
 def test_transport_formatters_expose_sse_and_websocket_seam() -> None:
     assert ResponsesSSEFormatter().transport == "sse"
+    assert ResponsesSSEFormatter().format_stream_event(ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})) == ": heartbeat\n\n"
     websocket = ResponsesWebSocketFormatter()
     assert websocket.transport == "websocket"
     assert websocket.future_supported is True
     assert websocket.format_stream_event(ResponsesStreamEvent("response.created", {"id": "resp"})) == '{"event": "response.created", "data": {"id": "resp"}}'
+
+
+@pytest.mark.asyncio
+async def test_stream_response_emits_non_visible_heartbeat(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    stream = DelayedCloseableStream(
+        ['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"],
+        [0.03, 0.0],
+    )
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))]
+
+    assert ": heartbeat\n\n" in events
+    assert "event: response.output_text.delta" in "".join(events)
+
+
+@pytest.mark.asyncio
+async def test_stream_response_ttfb_timeout_closes_upstream(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.01")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [0.05])
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))]
+
+    event_text = "".join(events)
+    assert stream.closed is True
+    assert "event: response.failed" in event_text
+    assert "ttfb" in event_text.lower()
+    assert event_text.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_stream_response_stall_timeout_preserves_partial_output(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT_SECONDS", "0.01")
+    stream = DelayedCloseableStream(
+        ['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', 'data: {"choices":[{"delta":{"content":"late"}}]}\n\n'],
+        [0.0, 0.05],
+    )
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))]
+
+    event_text = "".join(events)
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stream.closed is True
+    assert "event: response.failed" in event_text
+    assert "stall" in event_text.lower()
+    assert stored is not None
+    assert stored.output_items[0]["content"][0]["text"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_stream_events_disconnect_closes_upstream(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_CANCEL_UPSTREAM_ON_DISCONNECT", "true")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [0.05])
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [event async for event in service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream), request=DisconnectRequest())]
+
+    assert [event.event_name for event in events] == ["response.created"]
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio

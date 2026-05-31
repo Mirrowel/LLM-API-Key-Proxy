@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Optional
 
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
+from ..config.experimental import get_stream_runtime_settings
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
@@ -156,6 +158,16 @@ class ResponsesService:
                 metadata={"event_name": event.event_name, "terminal": event.terminal, "transport": transport},
                 scrub_strings=True,
             )
+            if event.heartbeat:
+                self._trace(
+                    transaction_logger,
+                    "responses_sse_formatted_heartbeat",
+                    formatted,
+                    direction="stream",
+                    stage="final",
+                    metadata={"transport": transport},
+                    scrub_strings=True,
+                )
             yield formatted
 
     async def validate_stream_request(self, raw_request: dict[str, Any]) -> None:
@@ -218,6 +230,88 @@ class ResponsesService:
         usage = None
         item_started = False
         monitor = StreamMonitor(clock=time.monotonic)
+        stream_settings = get_stream_runtime_settings()
+        chat_stream = None
+        stream_iterator = None
+        upstream_closed = False
+        pending_next_task = None
+
+        async def close_upstream(reason: str) -> None:
+            """Best-effort close for upstream Responses bridge streams."""
+
+            nonlocal upstream_closed
+            if upstream_closed:
+                return
+            upstream_closed = True
+            for candidate in (stream_iterator, chat_stream):
+                if candidate is None:
+                    continue
+                try:
+                    closer = getattr(candidate, "aclose", None)
+                    if callable(closer):
+                        await closer()
+                        self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
+                        return
+                    closer = getattr(candidate, "close", None)
+                    if callable(closer):
+                        closer()
+                        self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
+                        return
+                except Exception as exc:
+                    self._trace(transaction_logger, "responses_stream_upstream_close_failed", {"reason": reason, "error_type": type(exc).__name__}, direction="stream", stage="provider", metadata={"transport": transport})
+                    return
+
+        async def next_upstream_chunk(*, first: bool) -> tuple[str, Any]:
+            """Return the next upstream chunk or a control marker."""
+
+            timeout = stream_settings.ttfb_timeout_seconds if first else stream_settings.stall_timeout_seconds
+            heartbeat = stream_settings.heartbeat_seconds
+            started_at = time.monotonic()
+            last_heartbeat_at = started_at
+            nonlocal pending_next_task
+            if pending_next_task is None or pending_next_task.done():
+                pending_next_task = asyncio.create_task(stream_iterator.__anext__())
+            next_task = pending_next_task
+            while True:
+                if request is not None and await request.is_disconnected():
+                    self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected"}, direction="stream", stage="client", metadata={"transport": transport})
+                    if stream_settings.cancel_upstream_on_disconnect:
+                        next_task.cancel()
+                        pending_next_task = None
+                        await close_upstream("client_disconnected")
+                    return "disconnect", None
+                elapsed = time.monotonic() - started_at
+                waits = []
+                if timeout is not None:
+                    remaining_timeout = timeout - elapsed
+                    if remaining_timeout <= 0:
+                        next_task.cancel()
+                        pending_next_task = None
+                        await close_upstream("ttfb_timeout" if first else "stall_timeout")
+                        raise ResponsesServiceError(
+                            f"Responses stream {'TTFB' if first else 'stall'} timeout",
+                            status_code=504,
+                            error_type="api_connection",
+                        )
+                    waits.append(remaining_timeout)
+                if heartbeat is not None:
+                    remaining_heartbeat = heartbeat - (time.monotonic() - last_heartbeat_at)
+                    if remaining_heartbeat <= 0:
+                        last_heartbeat_at = time.monotonic()
+                        return "heartbeat", None
+                    waits.append(remaining_heartbeat)
+                wait_timeout = min(waits) if waits else None
+                if wait_timeout is None:
+                    chunk = await next_task
+                    pending_next_task = None
+                    return "chunk", chunk
+                done, _ = await asyncio.wait({next_task}, timeout=wait_timeout)
+                if done:
+                    pending_next_task = None
+                    return "chunk", next_task.result()
+                if heartbeat is not None and time.monotonic() - last_heartbeat_at >= heartbeat:
+                    last_heartbeat_at = time.monotonic()
+                    return "heartbeat", None
         if transaction_logger:
             self._trace(
                 transaction_logger,
@@ -233,7 +327,20 @@ class ResponsesService:
         yield ResponsesStreamEvent("response.created", created)
         try:
             chat_stream = await client.acompletion(request=request, **chat_kwargs)
-            async for raw_chunk in chat_stream:
+            stream_iterator = chat_stream.__aiter__()
+            first_chunk = True
+            while True:
+                try:
+                    marker, raw_chunk = await next_upstream_chunk(first=first_chunk)
+                except StopAsyncIteration:
+                    break
+                if marker == "disconnect":
+                    return
+                if marker == "heartbeat":
+                    self._trace(transaction_logger, "responses_stream_heartbeat", {"comment": "heartbeat"}, direction="stream", stage="transport", metadata={"transport": transport})
+                    yield ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})
+                    continue
+                first_chunk = False
                 if monitor.metrics.first_byte_at is None:
                     monitor.record_event(StreamEvent("raw_chunk", protocol="responses", raw=raw_chunk))
                     if transaction_logger:
@@ -331,7 +438,7 @@ class ResponsesService:
             yield ResponsesStreamEvent("done", {}, terminal=True)
         except Exception as exc:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
-            failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
+            failed = response_failed_payload(response_id, unified.model, _stream_failure_error(exc))
             if state.output_text:
                 failed["output"] = [output_item_done_payload(state)["item"]]
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
@@ -351,6 +458,9 @@ class ResponsesService:
             yield ResponsesStreamEvent("response.failed", failed)
             self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
             yield ResponsesStreamEvent("done", {}, terminal=True)
+        finally:
+            if chat_stream is not None and not upstream_closed:
+                await close_upstream("wrapper_exit")
 
     async def get_response(self, response_id: str) -> dict[str, Any]:
         """Return a stored response payload or raise a 404-compatible error."""
@@ -660,6 +770,20 @@ def _stream_error_message(chunk: dict[str, Any]) -> str:
             return str(message)
     message = chunk.get("message")
     return str(message) if message else "Upstream stream error"
+
+
+def _stream_failure_error(exc: Exception) -> dict[str, Any]:
+    """Return a client-safe Responses stream failure object."""
+
+    error_type = getattr(exc, "error_type", None) or exc.__class__.__name__
+    result = {"message": str(exc), "type": str(error_type)}
+    if isinstance(exc, ResponsesServiceError) and error_type == "api_connection":
+        text = str(exc).lower()
+        if "ttfb" in text:
+            result["timeout_type"] = "ttfb"
+        elif "stall" in text:
+            result["timeout_type"] = "stall"
+    return result
 
 
 def _chunk_text_delta(chunk: dict[str, Any]) -> str:
