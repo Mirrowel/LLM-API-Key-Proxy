@@ -31,27 +31,30 @@ def clone_context_for_target(
 
     kwargs: dict[str, Any] = dict(context.kwargs)
     kwargs["model"] = target.prefixed_model
+    next_usage_key = usage_manager_key if usage_manager_key is not None else target.provider
     return replace(
         context,
         model=target.prefixed_model,
         provider=target.provider,
         kwargs=kwargs,
         credentials=list(credentials) if credentials is not None else list(context.credentials),
-        usage_manager_key=usage_manager_key if usage_manager_key is not None else target.provider,
+        usage_manager_key=next_usage_key,
         provider_config=provider_config if provider_config is not None else context.provider_config,
         credential_secrets=dict(credential_secrets) if credential_secrets is not None else dict(context.credential_secrets),
         routing_target_index=target_index,
-        session_tracking_namespace=_namespace_for_target(context.session_tracking_namespace, target),
+        session_tracking_namespace=_namespace_for_target(context.session_tracking_namespace, target, scope_key=next_usage_key),
     )
 
 
-def _namespace_for_target(namespace: str | None, target: RouteTarget) -> str | None:
+def _namespace_for_target(namespace: str | None, target: RouteTarget, *, scope_key: str) -> str | None:
     """Rewrite standard session namespaces for the fallback target provider/model."""
 
     if not namespace or ":provider:" not in namespace or ":model:" not in namespace:
         return namespace
     prefix, _, rest = namespace.partition(":provider:")
+    if not prefix.startswith("scope:"):
+        return namespace
     _provider, sep, _model = rest.partition(":model:")
     if not sep:
         return namespace
-    return f"{prefix}:provider:{target.provider}:model:{target.prefixed_model}"
+    return f"scope:{scope_key}:provider:{target.provider}:model:{target.prefixed_model}"

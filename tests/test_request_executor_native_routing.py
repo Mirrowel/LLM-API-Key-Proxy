@@ -388,6 +388,16 @@ def test_auto_native_selection_honors_provider_opt_out() -> None:
     ) is False
 
 
+def test_auto_native_streaming_selection_honors_provider_opt_out() -> None:
+    assert executor_module._should_use_native_streaming(
+        NativeOptOutPlugin(),
+        "provider/gpt-test",
+        parse_route_target("provider/gpt-test"),
+        "auto",
+        "provider",
+    ) is False
+
+
 def test_native_request_payload_drops_litellm_only_fields() -> None:
     payload = executor_module._native_request_payload(
         {
