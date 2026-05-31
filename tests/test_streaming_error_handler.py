@@ -43,6 +43,7 @@ def test_streaming_error_decision_starts_cooldown_before_visible_output() -> Non
     assert decision.action == "rotate"
     assert decision.start_provider_cooldown is True
     assert decision.provider_cooldown_duration == 60
+    assert decision.provider_cooldown_scope == "provider"
 
 
 def test_streaming_error_decision_blocks_after_visible_output_and_skips_cooldown() -> None:
@@ -75,3 +76,21 @@ def test_streaming_error_decision_allows_reasoning_only_retry_when_enabled() -> 
     )
 
     assert decision.action == "retry_same"
+
+
+def test_streaming_error_decision_reports_model_cooldown_scope() -> None:
+    decision = decide_streaming_error_action(
+        Exception("MODEL_CAPACITY_EXHAUSTED"),
+        provider="openai",
+        model="gpt-5",
+        last_streamed_chunk=None,
+        attempt=1,
+        max_retries=2,
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        provider_cooldown_default_seconds=30,
+    )
+
+    assert decision.start_provider_cooldown is True
+    assert decision.provider_cooldown_scope == "model"
+    assert decision.provider_cooldown_model == "gpt-5"

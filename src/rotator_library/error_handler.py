@@ -1090,6 +1090,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 503,
         )
 
+    if "model_capacity_exhausted" in error_text.lower() or "model capacity" in error_text.lower() or "capacity exhausted" in error_text.lower():
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=status_code or 503,
+        )
+
     # Fallback for any other unclassified errors
     return ClassifiedError(
         error_type="unknown", original_exception=e, status_code=status_code
