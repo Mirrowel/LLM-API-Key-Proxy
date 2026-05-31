@@ -41,6 +41,8 @@ def test_bridge_adds_parent_response_messages_for_previous_response_id() -> None
         {"role": "user", "content": "Continue"},
     ]
     assert kwargs["_responses_bridge"]["previous_response_id"] == "resp_parent"
+    assert kwargs["_session_tracking_hints"]["strong_anchors"] == ["responses_previous_response_id:resp_parent"]
+    assert kwargs["_session_tracking_hints"]["affinity_key"] == "responses_previous_response_id:resp_parent"
 
 
 def test_bridge_preserves_tool_definitions() -> None:
