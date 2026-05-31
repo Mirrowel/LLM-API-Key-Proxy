@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
@@ -71,6 +72,19 @@ class NativeProviderExecutor:
                 model=context.model,
                 source="native_provider_response",
             )
+            raw_usage_record = extract_usage_record(
+                raw_response,
+                provider=context.provider,
+                model=context.model,
+                source="native_provider_raw_response",
+            )
+            if usage_record.provider_reported_cost is None and raw_usage_record.provider_reported_cost is not None:
+                usage_record = replace(
+                    usage_record,
+                    provider_reported_cost=raw_usage_record.provider_reported_cost,
+                    cost_currency=raw_usage_record.cost_currency,
+                    cost_source=raw_usage_record.cost_source,
+                )
             cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
             self._trace(
                 context,

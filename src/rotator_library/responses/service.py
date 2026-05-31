@@ -623,4 +623,7 @@ def _usage_to_responses_stream(usage: Any) -> Any:
     completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
     if isinstance(completion_details, dict):
         result["output_tokens_details"] = {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)}
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "currency"):
+        if key in usage:
+            result[key] = deepcopy(usage[key])
     return result
