@@ -166,6 +166,30 @@ class SessionTrackerTests(unittest.TestCase):
 
         self.assertEqual(inferred.session_id, continued.session_id)
 
+    def test_response_id_anchor_bridges_responses_previous_response_id(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        inferred = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "Start a Responses API conversation."}]},
+            provider="openai",
+            model="gpt-test",
+        )
+        tracker.record_response(
+            inferred.session_id,
+            provider="openai",
+            model="gpt-test",
+            response={"id": "resp_parent", "object": "response"},
+        )
+
+        continued = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "Continue."}]},
+            provider="openai",
+            model="gpt-test",
+            hints={"strong_anchors": ["responses_previous_response_id:resp_parent"]},
+        )
+
+        self.assertEqual(inferred.session_id, continued.session_id)
+        self.assertEqual(continued.confidence, "strong")
+
     def test_compaction_probe_detects_user_summary_from_prior_response(self):
         tracker = SessionTracker(ttl_seconds=3600)
         request = {

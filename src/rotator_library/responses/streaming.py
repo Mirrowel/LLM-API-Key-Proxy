@@ -83,14 +83,24 @@ def parse_chat_sse_chunk(chunk: Any) -> dict[str, Any] | None:
     text = chunk.strip()
     if not text:
         return None
-    if text.startswith("data:"):
-        text = text[len("data:") :].strip()
+    event_name = None
+    data_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            event_name = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+    if data_lines:
+        text = "\n".join(data_lines).strip()
     if text == "[DONE]":
         return {"type": "done"}
     try:
-        return json.loads(text)
+        payload = json.loads(text)
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, dict) and event_name and payload.get("type") is None:
+        payload["type"] = event_name
+    return payload if isinstance(payload, dict) else None
 
 
 def response_created_payload(response_id: str, model: str) -> dict[str, Any]:

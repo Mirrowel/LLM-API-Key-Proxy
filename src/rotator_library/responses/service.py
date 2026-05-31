@@ -103,6 +103,7 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
 
         response_payload = self.bridge.from_chat_response(chat_response, unified)
+        _record_responses_session_anchor(session_info, response_payload)
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
@@ -212,8 +213,8 @@ class ResponsesService:
                 if not chunk or chunk.get("type") == "done":
                     continue
                 self._trace(transaction_logger, "parsed_unified_stream_event", chunk, direction="stream", stage="protocol")
-                if chunk.get("error") is not None:
-                    raise ResponsesServiceError("Upstream stream error", status_code=502, error_type="upstream_error")
+                if chunk.get("error") is not None or chunk.get("type") == "error":
+                    raise ResponsesServiceError(_stream_error_message(chunk), status_code=502, error_type="upstream_error")
                 if chunk.get("usage"):
                     usage = chunk["usage"]
                 delta = _chunk_text_delta(chunk)
@@ -251,7 +252,7 @@ class ResponsesService:
                             metadata={"transport": transport},
                         )
                 self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": transport})
-                await self._store_stream_current_state(stream_request, _current_stream_payload(state), parent, transaction_logger=transaction_logger)
+                await self._store_stream_current_state(stream_request, _current_stream_payload(state), parent, transaction_logger=transaction_logger, session_info=session_info)
                 yield ResponsesStreamEvent("response.output_text.delta", event)
 
             if not item_started:
@@ -262,6 +263,7 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
+            _record_responses_session_anchor(session_info, completed)
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
             stored = await self._store_stream_response(stream_request, completed, parent, session_info=session_info)
             if stored:
@@ -476,12 +478,13 @@ class ResponsesService:
         parent: Optional[StoredResponse],
         *,
         transaction_logger: Optional[Any],
+        session_info: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Optionally persist in-progress stream state for retrieval surfaces."""
 
         if not self.store_settings.store_in_progress or not raw_request.get("store", True):
             return False
-        await self.store.save(self._stored_response(raw_request, response_payload, parent))
+        await self.store.save(self._stored_response(raw_request, response_payload, parent, session_info=session_info))
         self._trace(
             transaction_logger,
             "responses_stored_stream_current_state",
@@ -541,6 +544,10 @@ def _capture_request_context(session_info: dict[str, Any]):
         session_info["session_affinity_key"] = getattr(context, "session_affinity_key", None)
         session_info["scope_key"] = getattr(context, "usage_manager_key", None)
         session_info["classifier"] = getattr(context, "classifier", None)
+        session_info["session_tracker"] = getattr(context, "session_tracker", None)
+        session_info["provider"] = getattr(context, "provider", None)
+        session_info["model"] = getattr(context, "model", None)
+        session_info["tracking_namespace"] = getattr(context, "session_tracking_namespace", None)
 
     return capture
 
@@ -558,6 +565,35 @@ def _responses_session_hints(previous_response_id: Optional[str], parent: Option
         return None
     parent_affinity = parent.metadata.get("session_affinity_key") if parent else None
     return responses_session_hints(previous_response_id, affinity_key=parent_affinity) or fallback
+
+
+def _record_responses_session_anchor(session_info: dict[str, Any], response_payload: dict[str, Any]) -> None:
+    """Record emitted Responses IDs as response-derived session evidence."""
+
+    tracker = session_info.get("session_tracker")
+    session_id = session_info.get("session_id")
+    if not tracker or not session_id or not response_payload.get("id"):
+        return
+    tracker.record_response(
+        session_id,
+        provider=session_info.get("provider"),
+        model=session_info.get("model"),
+        scope_key=session_info.get("scope_key"),
+        tracking_namespace=session_info.get("tracking_namespace"),
+        response={"id": response_payload.get("id"), "object": "response"},
+    )
+
+
+def _stream_error_message(chunk: dict[str, Any]) -> str:
+    """Return a compact, client-safe message for upstream stream error chunks."""
+
+    error = chunk.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("type")
+        if message:
+            return str(message)
+    message = chunk.get("message")
+    return str(message) if message else "Upstream stream error"
 
 
 def _chunk_text_delta(chunk: dict[str, Any]) -> str:
