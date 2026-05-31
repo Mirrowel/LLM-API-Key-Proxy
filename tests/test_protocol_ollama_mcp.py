@@ -40,6 +40,23 @@ def test_ollama_chat_generate_and_stream_shapes() -> None:
     assert chunk.usage.output_tokens == 2
 
 
+def test_ollama_format_response_uses_mutated_unified_fields() -> None:
+    adapter = get_protocol("ollama")
+    chat = adapter.parse_response({"model": "llama3", "message": {"role": "assistant", "content": "before"}, "done": True})
+    chat.messages[0].content[0].text = "after"
+
+    generate = adapter.parse_response({"model": "llama3", "response": "before", "eval_count": 2})
+    generate.output[0] = "after"
+
+    embeddings = adapter.parse_response({"model": "llama3", "embedding": [0.1, 0.2]})
+    embeddings.data = [0.3, 0.4]
+
+    assert adapter.format_response(chat)["message"]["content"] == "after"
+    assert adapter.format_response(generate)["response"] == "after"
+    assert adapter.format_response(generate)["eval_count"] == 2
+    assert adapter.format_response(embeddings)["embedding"] == [0.3, 0.4]
+
+
 def test_mcp_jsonrpc_round_trip_and_error_preservation() -> None:
     adapter = get_protocol("mcp")
     request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "lookup"}}

@@ -150,7 +150,7 @@ class ResponsesProtocol(ProtocolAdapter):
             "model": unified_response.model,
             "status": unified_response.stop_reason,
             "output": output,
-            "usage": unified_response.usage.to_dict() if unified_response.usage else None,
+            "usage": _format_responses_usage(unified_response.usage),
         }
         payload.update(deepcopy(unified_response.extra))
         return {k: v for k, v in payload.items() if v is not None}
@@ -390,3 +390,41 @@ def _reasoning_text(item: dict[str, Any]) -> str | None:
 
 def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:
     return {k: deepcopy(v) for k, v in payload.items() if k not in keys}
+
+
+def _format_responses_usage(usage: Usage | None) -> dict[str, Any] | None:
+    """Format normalized usage using OpenAI Responses public field names."""
+
+    if usage is None:
+        return None
+    payload: dict[str, Any] = {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens or (usage.input_tokens + usage.output_tokens),
+    }
+    input_details: dict[str, Any] = {}
+    if usage.cache_read_tokens:
+        input_details["cached_tokens"] = usage.cache_read_tokens
+    if usage.cache_write_tokens:
+        # OpenAI Responses does not have a universal cache-write field, but this
+        # extension keeps provider-reported cache creation visible without
+        # leaking the unified internal `cache_write_tokens` key.
+        input_details["cache_creation_tokens"] = usage.cache_write_tokens
+    if input_details:
+        payload["input_tokens_details"] = input_details
+    output_details: dict[str, Any] = {}
+    if usage.reasoning_tokens:
+        output_details["reasoning_tokens"] = usage.reasoning_tokens
+    if output_details:
+        payload["output_tokens_details"] = output_details
+    if usage.cost:
+        cost_details: dict[str, Any] = dict(usage.cost.metadata)
+        if usage.cost.provider_reported_cost is not None:
+            cost_details["total_cost"] = usage.cost.provider_reported_cost
+        elif usage.cost.estimated_cost is not None:
+            cost_details["estimated_cost"] = usage.cost.estimated_cost
+        cost_details["currency"] = usage.cost.currency
+        if usage.cost.source:
+            cost_details["source"] = usage.cost.source
+        payload["cost_details"] = cost_details
+    return payload

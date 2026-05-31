@@ -167,7 +167,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "created": unified_response.metadata.get("created"),
             "model": unified_response.model,
             "choices": choices,
-            "usage": unified_response.usage.to_dict() if unified_response.usage else None,
+            "usage": _format_openai_usage(unified_response.usage),
         }
         payload.update(deepcopy(unified_response.extra))
         return {k: v for k, v in payload.items() if v is not None}
@@ -255,7 +255,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             content=self._parse_content(payload.get("content")),
             name=payload.get("name"),
             tool_call_id=payload.get("tool_call_id"),
-            tool_calls=[self._parse_tool_call(call) for call in payload.get("tool_calls") or []],
+            tool_calls=self._parse_message_tool_calls(payload),
             reasoning=reasoning,
             raw=deepcopy(message),
             extra={k: deepcopy(v) for k, v in payload.items() if k not in {"role", "content", "name", "tool_call_id", "tool_calls", "reasoning", "reasoning_content"}},
@@ -270,7 +270,8 @@ class OpenAIChatProtocol(ProtocolAdapter):
         content = self._format_content(message.content)
         if content is not None:
             payload["content"] = content
-        if message.tool_calls:
+        legacy_function_call = message.extra.get("function_call")
+        if message.tool_calls and not legacy_function_call:
             payload["tool_calls"] = [self._format_tool_call(call) for call in message.tool_calls]
         if message.reasoning:
             # OpenAI-compatible providers use multiple names for reasoning text.
@@ -280,6 +281,26 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 payload["reasoning_content"] = text
         payload.update(deepcopy(message.extra))
         return payload
+
+    def _parse_message_tool_calls(self, payload: dict[str, Any]) -> list[ToolCall]:
+        """Return modern and legacy OpenAI function calls as unified tools."""
+
+        modern_calls = payload.get("tool_calls") or []
+        if modern_calls:
+            return [self._parse_tool_call(call) for call in modern_calls]
+        legacy_call = payload.get("function_call")
+        if isinstance(legacy_call, dict):
+            return [
+                ToolCall(
+                    id=None,
+                    name=legacy_call.get("name"),
+                    arguments=legacy_call.get("arguments"),
+                    type="function",
+                    raw=deepcopy(legacy_call),
+                    extra={"legacy_function_call": True},
+                )
+            ]
+        return []
 
     def _parse_content(self, content: Any) -> list[ContentBlock]:
         if content is None:
@@ -424,6 +445,41 @@ def _format_arguments(arguments: Any) -> str:
     if isinstance(arguments, str):
         return arguments
     return json.dumps(serialize_value(arguments), separators=(",", ":"))
+
+
+def _format_openai_usage(usage: Usage | None) -> dict[str, Any] | None:
+    """Format normalized usage using OpenAI Chat's public field names."""
+
+    if usage is None:
+        return None
+    payload: dict[str, Any] = {
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens or (usage.input_tokens + usage.output_tokens),
+    }
+    prompt_details: dict[str, Any] = {}
+    if usage.cache_read_tokens:
+        prompt_details["cached_tokens"] = usage.cache_read_tokens
+    if usage.cache_write_tokens:
+        prompt_details["cache_creation_tokens"] = usage.cache_write_tokens
+    if prompt_details:
+        payload["prompt_tokens_details"] = prompt_details
+    completion_details: dict[str, Any] = {}
+    if usage.reasoning_tokens:
+        completion_details["reasoning_tokens"] = usage.reasoning_tokens
+    if completion_details:
+        payload["completion_tokens_details"] = completion_details
+    if usage.cost:
+        cost_details: dict[str, Any] = dict(usage.cost.metadata)
+        if usage.cost.provider_reported_cost is not None:
+            cost_details["total_cost"] = usage.cost.provider_reported_cost
+        elif usage.cost.estimated_cost is not None:
+            cost_details["estimated_cost"] = usage.cost.estimated_cost
+        cost_details["currency"] = usage.cost.currency
+        if usage.cost.source:
+            cost_details["source"] = usage.cost.source
+        payload["cost_details"] = cost_details
+    return payload
 
 
 def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:

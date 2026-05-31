@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 from .base import ProtocolAdapter
 from .operation import OPERATION_EMBEDDINGS, OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, normalize_operation
-from .types import ContentBlock, ProtocolContext, UnifiedMessage, UnifiedRequest, UnifiedResponse, UnifiedStreamEvent, Usage
+from .types import ContentBlock, ProtocolContext, UnifiedMessage, UnifiedRequest, UnifiedResponse, UnifiedStreamEvent, Usage, first_text
 
 _OPTION_FIELDS = {"options", "format", "keep_alive", "template", "context", "raw", "suffix"}
 _CORE_FIELDS = {"operation", "model", "messages", "prompt", "input", "stream", "system", *_OPTION_FIELDS}
@@ -84,6 +84,33 @@ class OllamaProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"model", "message", "response", "embeddings", "embedding", "prompt_eval_count", "eval_count", "total_duration", "load_duration", "prompt_eval_duration", "eval_duration"}},
         )
 
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        """Format a unified response back to an Ollama response shape.
+
+        Ollama responses are often mutated by adapters after parsing. Do not
+        return `raw` wholesale here; rebuild the public fields from unified state
+        and then merge preserved extras/timing values.
+        """
+
+        payload = deepcopy(unified_response.extra)
+        if unified_response.model:
+            payload["model"] = unified_response.model
+        operation = unified_response.operation or _ollama_operation(payload, context)
+        if operation == OPERATION_OLLAMA_CHAT:
+            if unified_response.messages:
+                payload["message"] = _message_to_ollama(unified_response.messages[0])
+        elif operation == OPERATION_EMBEDDINGS:
+            raw = unified_response.raw if isinstance(unified_response.raw, dict) else {}
+            key = "embedding" if "embedding" in raw and "embeddings" not in raw else "embeddings"
+            payload[key] = deepcopy(unified_response.data)
+        else:
+            payload["response"] = _ollama_response_text(unified_response)
+        if unified_response.usage and isinstance(unified_response.usage.raw, dict):
+            for key, value in unified_response.usage.raw.items():
+                if key.endswith("count") or key.endswith("duration"):
+                    payload[key] = deepcopy(value)
+        return {k: v for k, v in payload.items() if v is not None}
+
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         data = _json_event(raw_event)
         if not isinstance(data, dict):
@@ -126,6 +153,16 @@ def _message_to_ollama(message: UnifiedMessage) -> dict[str, Any]:
     payload = {"role": message.role, "content": "".join(block.text or "" for block in message.content if block.type == "text")}
     payload.update(deepcopy(message.extra))
     return payload
+
+
+def _ollama_response_text(response: UnifiedResponse) -> str:
+    if response.output:
+        return "".join(str(item) for item in response.output if item is not None)
+    if response.messages:
+        text = first_text(response.messages[0].content)
+        if text is not None:
+            return text
+    return ""
 
 
 def _json_event(raw_event: Any) -> Any:

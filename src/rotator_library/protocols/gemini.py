@@ -55,7 +55,7 @@ class GeminiProtocol(ProtocolAdapter):
     name: ClassVar[str] = "gemini"
     aliases: ClassVar[tuple[str, ...]] = ("google_gemini", "generate_content")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
-    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT, OPERATION_COUNT_TOKENS)
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT, OPERATION_COUNT_TOKENS, "generate", "stream_generate")
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
@@ -356,7 +356,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
-    supported = {OPERATION_CHAT, OPERATION_COUNT_TOKENS}
+    supported = {OPERATION_CHAT, OPERATION_COUNT_TOKENS, "generate", "stream_generate"}
     if context and isinstance(context.provider_options, dict):
         operation = normalize_operation(context.provider_options.get("operation"))
         if operation in supported:
@@ -374,7 +374,7 @@ def _response_operation(response: dict[str, Any], context: ProtocolContext | Non
         return OPERATION_COUNT_TOKENS
     if "totalTokens" in response and "candidates" not in response:
         return OPERATION_COUNT_TOKENS
-    return OPERATION_CHAT
+    return requested if requested in {"generate", "stream_generate"} else OPERATION_CHAT
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
