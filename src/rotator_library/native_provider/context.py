@@ -26,6 +26,7 @@ class NativeProviderContext:
     model: str
     protocol_name: str
     endpoint: str
+    operation: str = "chat"
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -49,7 +50,8 @@ class NativeProviderContext:
             session_id=self.session_id,
             credential_stable_id=self.credential_id,
             transport=self.transport,
-            metadata=dict(self.metadata),
+            provider_options={"operation": self.operation},
+            metadata={"operation": self.operation, **dict(self.metadata)},
         )
 
     def adapter_context(self) -> AdapterContext:
@@ -64,7 +66,7 @@ class NativeProviderContext:
             scope_key=self.scope_key,
             classifier=self.classifier,
             transport=self.transport,
-            metadata=dict(self.metadata),
+            metadata={"operation": self.operation, **dict(self.metadata)},
             adapter_config=dict(self.adapter_config),
             transaction_logger=self.transaction_logger,
         )
@@ -79,5 +81,5 @@ class NativeProviderContext:
             session_id=self.session_id,
             conversation_id=self.scope_key,
             classifier=self.classifier,
-            metadata=dict(self.metadata),
+            metadata={"operation": self.operation, **dict(self.metadata)},
         )

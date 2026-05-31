@@ -373,6 +373,40 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         return self.native_streaming_supported
 
+    def get_native_operation(self, model: str = "", request: Optional[Dict[str, Any]] = None, stream: bool = False) -> str:
+        """Return the provider-native operation for a request.
+
+        Providers that expose native protocols often use operation names that are
+        not simply ``chat``: Anthropic-compatible providers use ``messages``,
+        Responses providers use ``responses``, and Gemini-style providers use a
+        generate operation. The default stays ``chat`` so existing OpenAI-chat
+        providers remain compatible unless they opt in to something richer.
+        """
+
+        return "chat"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Return the upstream model name for native provider calls.
+
+        The proxy-facing model commonly includes a provider prefix such as
+        ``provider/model``. Native upstream APIs usually expect only ``model``.
+        Providers may override this for aliases, but stripping the first prefix
+        is the safe default for native execution.
+        """
+
+        return model.split("/", 1)[1] if "/" in model else model
+
+    def prepare_native_request(self, request: Dict[str, Any], model: str = "", operation: str = "") -> Dict[str, Any]:
+        """Return a provider-adjusted native request payload.
+
+        This hook is intentionally limited to payload shape/model aliases and is
+        called before protocol parsing. It must not add credentials; auth belongs
+        in ``get_native_headers()`` so traces never mix request payloads with
+        secrets.
+        """
+
+        return dict(request)
+
     def get_model_pricing(self, model: str = "") -> Optional[Any]:
         """Return optional local pricing metadata for advisory cost tracking.
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Antigravity provider integration skeleton restored from safe retired pieces."""
+"""Antigravity provider integration restored from safe retired pieces."""
 
 from __future__ import annotations
 
@@ -68,6 +68,7 @@ class AntigravityProvider(ProviderInterface):
             metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
         ),
     )
+    native_streaming_supported = True
     model_quota_groups = {
         "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash"],
         "claude": ["claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"],
@@ -107,6 +108,35 @@ class AntigravityProvider(ProviderInterface):
             "Accept": "text/event-stream",
             **ANTIGRAVITY_HEADERS,
         }
+
+    def get_native_operation(self, model: str = "", request: dict[str, Any] | None = None, stream: bool = False) -> str:
+        """Return the Gemini generate operation used by Antigravity endpoints."""
+
+        return "stream_generate" if stream else "generate"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Strip the proxy prefix and map public aliases to upstream names."""
+
+        clean = model.split("/", 1)[1] if model.startswith("antigravity/") else model
+        return self._alias_to_internal(clean)
+
+    def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
+        """Return a request with the upstream Antigravity model name.
+
+        The provider intentionally keeps this to model alias handling only. Device
+        profile and fingerprint behavior stays out of the active integration until
+        it is verified against current service behavior.
+        """
+
+        prepared = dict(request)
+        if model:
+            prepared["model"] = model
+        return prepared
+
+    def supports_native_streaming(self, model: str = "", operation: str = "generate") -> bool:
+        """Return true for the tested stream-generate endpoint only."""
+
+        return operation == "stream_generate"
 
     def get_native_endpoint(self, model: str = "", operation: str = "generate") -> str:
         """Return Antigravity internal operation endpoints."""

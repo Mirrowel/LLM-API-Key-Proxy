@@ -50,6 +50,15 @@ def test_codex_provider_builds_native_headers_and_endpoint(monkeypatch) -> None:
     assert provider.get_native_headers("token") == {"Authorization": "Bearer token", "content-type": "application/json"}
 
 
+def test_codex_native_operation_model_and_stream_support() -> None:
+    provider = CodexProvider()
+
+    assert provider.get_native_operation("gpt-5.1-codex", {}, stream=False) == "responses"
+    assert provider.normalize_native_model("codex/gpt-5.1-codex") == "gpt-5.1-codex"
+    assert provider.supports_native_streaming("gpt-5.1-codex", operation="responses") is True
+    assert provider.supports_native_streaming("gpt-5.1-codex", operation="chat") is False
+
+
 @pytest.mark.asyncio
 async def test_codex_provider_get_models_filters_codex_models(monkeypatch) -> None:
     monkeypatch.setenv("CODEX_API_BASE", "https://codex.test")

@@ -60,7 +60,18 @@ def test_antigravity_model_aliases_and_tracking_normalization() -> None:
     provider = AntigravityProvider()
 
     assert provider._alias_to_internal("claude-sonnet-4.5") == "claude-sonnet-4-5"
+    assert provider.normalize_native_model("antigravity/claude-sonnet-4.5") == "claude-sonnet-4-5"
     assert provider.normalize_model_for_tracking("antigravity/claude-sonnet-4-5") == "antigravity/claude-sonnet-4.5"
+
+
+def test_antigravity_native_operation_model_and_stream_support() -> None:
+    provider = AntigravityProvider()
+
+    assert provider.get_native_operation("gemini-3-flash", {}, stream=False) == "generate"
+    assert provider.get_native_operation("gemini-3-flash", {}, stream=True) == "stream_generate"
+    assert provider.supports_native_streaming("gemini-3-flash", operation="stream_generate") is True
+    assert provider.supports_native_streaming("gemini-3-flash", operation="generate") is False
+    assert provider.prepare_native_request({"model": "antigravity/gemini-3-pro-low"}, model="gemini-3-pro-preview", operation="generate")["model"] == "gemini-3-pro-preview"
 
 
 @pytest.mark.asyncio

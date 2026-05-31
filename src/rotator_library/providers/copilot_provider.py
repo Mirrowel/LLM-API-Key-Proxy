@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Copilot provider integration skeleton for native OpenAI Chat execution."""
+"""Copilot provider integration for native OpenAI Chat execution."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class CopilotProvider(ProviderInterface):
     adapter_names = ("suppress_developer_role",)
     field_cache_rules: tuple = ()
     default_rotation_mode = "sequential"
+    native_streaming_supported = True
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """Fetch Copilot-visible models with a safe fallback list."""
@@ -56,6 +57,21 @@ class CopilotProvider(ProviderInterface):
             "content-type": "application/json",
             "Copilot-Integration-Id": os.getenv("COPILOT_INTEGRATION_ID", "llm-api-key-proxy"),
         }
+
+    def get_native_operation(self, model: str = "", request: dict | None = None, stream: bool = False) -> str:
+        """Copilot exposes an OpenAI-compatible chat operation."""
+
+        return "chat"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Strip the proxy provider prefix before sending upstream."""
+
+        return model.split("/", 1)[1] if model.startswith("copilot/") else model
+
+    def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
+        """Return true for OpenAI Chat SSE streams."""
+
+        return operation == "chat"
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
         """Return the Copilot endpoint for a native operation."""
