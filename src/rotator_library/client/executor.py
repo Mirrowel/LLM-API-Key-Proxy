@@ -1676,6 +1676,21 @@ class RequestExecutor:
 
                                     continue  # Retry
 
+                                except RoutingExecutionError as e:
+                                    if e.error_type == "configuration_error":
+                                        raise
+                                    last_exception = e
+                                    classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(last_streamed_chunk):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context)
+                                    log_failure(api_key=cred, model=model, attempt=attempt + 1, error=e, request_headers=request_headers)
+                                    error_accumulator.record_error(cred, classified, str(e)[:150])
+                                    if not should_rotate_on_error(classified):
+                                        cred_context.mark_failure(classified)
+                                        raise
+                                    cred_context.mark_failure(classified)
+                                    break
+
                                 except Exception as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
@@ -1733,6 +1748,9 @@ class RequestExecutor:
 
                         except PreRequestCallbackError:
                             raise
+                        except RoutingExecutionError as exc:
+                            if exc.error_type == "configuration_error":
+                                raise
                         except Exception:
                             # Let context manager handle cleanup
                             pass
