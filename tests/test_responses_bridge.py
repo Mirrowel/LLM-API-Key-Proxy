@@ -72,6 +72,26 @@ def test_bridge_replays_parent_input_and_output_lineage() -> None:
     ]
 
 
+def test_bridge_replays_parent_tool_call_outputs() -> None:
+    protocol = ResponsesProtocol()
+    bridge = ResponsesBridge(protocol)
+    unified = protocol.parse_request({"model": "gpt-test", "input": "Continue"})
+    lineage = [
+        {
+            "request": {"model": "gpt-test", "input": "Use tool"},
+            "response": {"output": [{"id": "call_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}]},
+        }
+    ]
+
+    kwargs = bridge.to_chat_kwargs(unified, parent_responses=lineage)
+
+    assert kwargs["messages"] == [
+        {"role": "user", "content": "Use tool"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "user", "content": "Continue"},
+    ]
+
+
 def test_bridge_preserves_tool_definitions() -> None:
     protocol = ResponsesProtocol()
     bridge = ResponsesBridge(protocol)
