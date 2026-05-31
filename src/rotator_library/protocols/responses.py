@@ -186,7 +186,7 @@ class ResponsesProtocol(ProtocolAdapter):
         cost = None
         cost_details = usage.get("cost_details")
         if isinstance(cost_details, dict):
-            provider_cost = cost_details.get("total_cost") or cost_details.get("cost")
+            provider_cost = cost_details.get("total_cost") or cost_details.get("request_cost_usd") or cost_details.get("cost")
             cost = CostDetails(
                 provider_reported_cost=float(provider_cost) if provider_cost is not None else None,
                 currency=str(cost_details.get("currency") or "USD"),

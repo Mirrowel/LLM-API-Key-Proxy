@@ -310,6 +310,13 @@ def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -
     selected = event_record if _usage_record_has_values(event_record) else base
     if not _usage_record_has_values(selected) and _usage_record_has_values(raw_record):
         selected = raw_record
+    if selected.provider_reported_cost is None and base.provider_reported_cost is not None:
+        selected = replace(
+            selected,
+            provider_reported_cost=base.provider_reported_cost,
+            cost_currency=base.cost_currency,
+            cost_source=base.cost_source,
+        )
     if selected.provider_reported_cost is None and raw_record.provider_reported_cost is not None:
         selected = replace(
             selected,

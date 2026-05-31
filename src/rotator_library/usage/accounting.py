@@ -129,7 +129,7 @@ def _merge_top_level_cost_fields(usage: dict[str, Any], response: dict[str, Any]
     """Copy sibling cost metadata into a nested usage payload."""
 
     merged = dict(usage)
-    for key in ("cost", "total_cost", "cost_details", "provider_reported_cost", "currency", "costMetadata"):
+    for key in ("cost", "total_cost", "cost_details", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
         if key in response and key not in merged:
             merged[key] = response[key]
     return merged
@@ -172,6 +172,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
         "cost_details",
         "costMetadata",
         "provider_reported_cost",
+        "request_cost_usd",
         "total_cost",
         "currency",
     ):
@@ -285,7 +286,7 @@ def _extract_cost(data: dict[str, Any]) -> tuple[Optional[float], str, Optional[
 
     cost_payload = _as_dict(data.get("cost") or data.get("cost_details") or data.get("costMetadata") or {})
     raw_cost = (
-        cost_payload.get("provider_reported_cost")
+        cost_payload.get("provider_reported_cost", cost_payload.get("request_cost_usd"))
         if cost_payload
         else None
     )
@@ -300,7 +301,7 @@ def _extract_cost(data: dict[str, Any]) -> tuple[Optional[float], str, Optional[
             raw_cost = breakdown_total
             breakdown_used = True
     if raw_cost is None:
-        raw_cost = data.get("provider_reported_cost", data.get("total_cost", data.get("cost")))
+        raw_cost = data.get("provider_reported_cost", data.get("request_cost_usd", data.get("total_cost", data.get("cost"))))
     cost_value = _float_or_none(raw_cost)
     currency = str(cost_payload.get("currency") or data.get("currency") or "USD")
     source = cost_payload.get("source") or ("provider_reported_breakdown" if breakdown_used else ("provider_reported" if cost_value is not None else None))
@@ -317,10 +318,19 @@ def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
         "prompt_cost",
         "cache_read_cost",
         "cache_write_cost",
+        "cached_input_cost",
+        "cache_write_input_cost",
         "output_cost",
         "completion_cost",
+        "completions_cost",
         "reasoning_cost",
         "thinking_cost",
+        "upstream_inference_cost",
+        "upstream_inference_prompt_cost",
+        "upstream_inference_completions_cost",
+        "request_cost",
+        "web_search_cost",
+        "search_cost",
     ):
         value = _float_or_none(payload.get(key))
         if value is not None:

@@ -119,6 +119,8 @@ def _sse_json(chunk: str, *, malformed_is_visible: bool) -> dict[str, Any] | obj
     except json.JSONDecodeError:
         return _MALFORMED_VISIBLE if malformed_is_visible else None
     if not isinstance(parsed, dict):
+        if event_type == "cost":
+            return {"event_type": "cost", "value": parsed}
         return _MALFORMED_VISIBLE if malformed_is_visible else None
     if event_type and "event_type" not in parsed:
         parsed["event_type"] = event_type

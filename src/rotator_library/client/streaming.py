@@ -741,8 +741,16 @@ def _usage_from_sse_string(chunk: str) -> Optional[dict[str, Any]]:
         data = json.loads(payload)
     except json.JSONDecodeError:
         return None
-    usage = data.get("usage") if isinstance(data, dict) else None
-    return usage if isinstance(usage, dict) else None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    merged = dict(usage)
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+        if key in data and key not in merged:
+            merged[key] = data[key]
+    return merged
 
 
 def _usage_record_from_sse_cost_chunk(chunk: Any, *, model: str) -> UsageRecord:
@@ -758,7 +766,7 @@ def _usage_record_from_sse_cost_chunk(chunk: Any, *, model: str) -> UsageRecord:
     if not isinstance(cost_payload, dict):
         return UsageRecord(source="stream_cost_event", model=model)
     return extract_usage_record(
-        {"usage": {"provider_reported_cost": cost_payload.get("provider_reported_cost", cost_payload.get("total_cost", cost_payload.get("cost"))), "currency": cost_payload.get("currency", "USD"), "cost_details": cost_payload}},
+        {"usage": {"provider_reported_cost": cost_payload.get("provider_reported_cost", cost_payload.get("request_cost_usd", cost_payload.get("total_cost", cost_payload.get("cost")))), "currency": cost_payload.get("currency", "USD"), "cost_details": cost_payload}},
         model=model,
         source="stream_cost_event",
     )

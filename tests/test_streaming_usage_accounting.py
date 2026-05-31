@@ -46,6 +46,20 @@ async def _cost_event_chunks():
     yield {"id": "chunk_1", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
 
+async def _scalar_cost_event_chunks():
+    yield "event: cost\ndata: 0.033\n\n"
+    yield {"id": "chunk_1", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
+async def _request_cost_comment_chunks():
+    yield ': cost {"request_cost_usd":0.044,"source":"reference_sse"}\n\n'
+    yield {"id": "chunk_1", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
+async def _top_level_cost_usage_sse_chunks():
+    yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1},"total_cost":0.055}\n\n'
+
+
 async def _cost_comment_overridden_by_final_usage_chunks():
     yield ': cost 0.042\n\n'
     yield {
@@ -135,6 +149,33 @@ async def test_streaming_cost_event_updates_approx_cost() -> None:
     _ = [chunk async for chunk in StreamingHandler().wrap_stream(_cost_event_chunks(), "cred", "gpt-test", cred_context=cred_context)]
 
     assert cred_context.success_kwargs["approx_cost"] == 0.021
+
+
+@pytest.mark.asyncio
+async def test_streaming_scalar_cost_event_updates_approx_cost() -> None:
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_scalar_cost_event_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["approx_cost"] == 0.033
+
+
+@pytest.mark.asyncio
+async def test_streaming_reference_request_cost_comment_updates_approx_cost() -> None:
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_request_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["approx_cost"] == 0.044
+
+
+@pytest.mark.asyncio
+async def test_streaming_sse_usage_preserves_top_level_cost() -> None:
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_top_level_cost_usage_sse_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["approx_cost"] == 0.055
 
 
 @pytest.mark.asyncio
