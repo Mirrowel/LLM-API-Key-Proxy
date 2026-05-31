@@ -64,6 +64,8 @@ async def test_request_builder_populates_fallback_group_targets_from_env(monkeyp
     assert context.provider == "codex"
     assert context.model == "codex/gpt-5.1-codex"
     assert context.routing_group_name == "code_chain"
+    assert context.routing_group is not None
+    assert context.routing_group.name == "code_chain"
     assert [target.prefixed_model for target in context.routing_targets] == ["codex/gpt-5.1-codex", "openai/gpt-5.1"]
     assert context.routing_targets[1].metadata["request_scope"]["credentials"] == ["openai-cred"]
 

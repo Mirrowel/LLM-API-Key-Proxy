@@ -111,6 +111,7 @@ class RoutingDecision:
     requested_model: str
     targets: tuple[RouteTarget, ...]
     group_name: str | None = None
+    group: FallbackGroup | None = None
     selected_target_index: int = 0
     reason: str = "direct"
 

@@ -24,7 +24,7 @@ class FallbackResolver:
             group = self.config.fallback_groups.get(group_name)
             if not group:
                 raise RoutingConfigError(f"unknown fallback group {group_name}")
-            return RoutingDecision(requested_model=requested_model, group_name=group.name, targets=group.targets, reason="model_route_group")
+            return RoutingDecision(requested_model=requested_model, group_name=group.name, group=group, targets=group.targets, reason="model_route_group")
         if route:
             return RoutingDecision(requested_model=requested_model, targets=(parse_route_target(route),), reason="model_route_target")
         if "/" in requested_model:

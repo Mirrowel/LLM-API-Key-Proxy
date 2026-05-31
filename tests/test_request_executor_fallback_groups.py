@@ -8,6 +8,7 @@ import pytest
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
 from rotator_library.routing import parse_route_target
+from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -17,7 +18,7 @@ class ClassifiedFailure(Exception):
         self.error_type = error_type
 
 
-def _context(*, routing_targets=None, logger=None) -> RequestContext:
+def _context(*, routing_targets=None, logger=None, routing_group=None) -> RequestContext:
     return RequestContext(
         model="code",
         provider="requested",
@@ -28,6 +29,7 @@ def _context(*, routing_targets=None, logger=None) -> RequestContext:
         transaction_logger=logger,
         routing_targets=routing_targets,
         routing_group_name="code_chain" if routing_targets else None,
+        routing_group=routing_group,
     )
 
 
@@ -94,6 +96,36 @@ async def test_non_streaming_fallback_group_stops_on_permanent_error() -> None:
         )
 
     assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_fallback_group_honors_group_override() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_execute(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            raise ClassifiedFailure("authentication")
+        return {"id": "ok", "model": context.model}
+
+    executor._execute_non_streaming = MethodType(fake_execute, executor)
+
+    targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
+    result = await executor._execute_non_streaming_with_fallback(
+        _context(
+            routing_targets=targets,
+            routing_group=FallbackGroup(
+                name="code_chain",
+                targets=targets,
+                failover_on=frozenset({"authentication"}),
+                stop_on=frozenset({"validation"}),
+            ),
+        )
+    )
+
+    assert result == {"id": "ok", "model": "openai/gpt-5.1"}
+    assert attempts == ["codex", "openai"]
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import pytest
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
 from rotator_library.routing import parse_route_target
+from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -18,6 +19,7 @@ class StreamFailure(Exception):
 
 
 def _context(*, logger=None) -> RequestContext:
+    targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
     return RequestContext(
         model="code",
         provider="requested",
@@ -26,9 +28,29 @@ def _context(*, logger=None) -> RequestContext:
         credentials=["cred-a"],
         deadline=9999999999.0,
         transaction_logger=logger,
-        routing_targets=(parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1")),
+        routing_targets=targets,
         routing_group_name="code_chain",
+        routing_group=FallbackGroup(name="code_chain", targets=targets, failover_on=frozenset({"authentication", "rate_limit"}), stop_on=frozenset({"validation"})),
     )
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_honors_group_override_before_output() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_stream(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            raise StreamFailure("authentication")
+        yield "data: [DONE]\n\n"
+
+    executor._execute_streaming = MethodType(fake_stream, executor)
+
+    chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
+
+    assert attempts == ["codex", "openai"]
+    assert chunks == ["data: [DONE]\n\n"]
 
 
 @pytest.mark.asyncio
