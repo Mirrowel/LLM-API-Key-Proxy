@@ -14,10 +14,12 @@ class ClassifiedFailure(Exception):
 
 
 def _decision() -> RoutingDecision:
+    targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
     return RoutingDecision(
         requested_model="code",
         group_name="code_chain",
-        targets=(parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1")),
+        targets=targets,
+        group=FallbackGroup(name="code_chain", targets=targets),
         reason="model_route_group",
     )
 
@@ -114,5 +116,22 @@ async def test_attempt_runner_respects_never_streaming_policy() -> None:
 
     with pytest.raises(FallbackExhaustedError):
         await FallbackAttemptRunner().run_group(_decision(), group, attempt, stream=True)
+
+    assert calls == [0]
+
+
+@pytest.mark.asyncio
+async def test_attempt_runner_run_uses_decision_group_streaming_policy() -> None:
+    decision = _decision()
+    never_group = FallbackGroup(name="code_chain", targets=decision.targets, failover_on=frozenset({"rate_limit"}), streaming_policy="never")
+    decision = RoutingDecision(requested_model=decision.requested_model, group_name=decision.group_name, targets=decision.targets, group=never_group)
+    calls = []
+
+    async def attempt(target, index):
+        calls.append(index)
+        raise ClassifiedFailure("rate_limit")
+
+    with pytest.raises(FallbackExhaustedError):
+        await FallbackAttemptRunner().run(decision, attempt, stream=True)
 
     assert calls == [0]

@@ -759,12 +759,23 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     if isinstance(e, dict):
         payload = e.get("error", e)
         if isinstance(payload, dict):
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
             code = payload.get("code")
+            status_value = payload.get("status_code") or payload.get("status") or details.get("status_code") or details.get("status") or code
             status = str(payload.get("status", "")).upper()
             try:
-                status_code = int(code) if code is not None else None
+                status_code = int(status_value) if status_value is not None else None
             except (TypeError, ValueError):
                 status_code = None
+            if status_code == 400:
+                return ClassifiedError(error_type="invalid_request", original_exception=e, status_code=status_code)
+            if status_code == 401:
+                return ClassifiedError(error_type="authentication", original_exception=e, status_code=status_code)
+            if status_code == 403:
+                return ClassifiedError(error_type="forbidden", original_exception=e, status_code=status_code)
+            if status_code == 429:
+                body = str(payload).lower()
+                return ClassifiedError(error_type="quota_exceeded" if "quota" in body or "resource_exhausted" in body else "rate_limit", original_exception=e, status_code=status_code)
             if (status_code is not None and status_code >= 500) or status in {
                 "INTERNAL",
                 "UNAVAILABLE",

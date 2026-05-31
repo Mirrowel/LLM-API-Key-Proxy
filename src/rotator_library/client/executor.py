@@ -1844,7 +1844,8 @@ class RequestExecutor:
 
         except Exception as e:
             lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
-            error_data = {"error": {"message": str(e), "type": "proxy_internal_error"}}
+            classified = classify_error(e, context.provider)
+            error_data = {"error": {"message": "Streaming request failed", "type": classified.error_type, "details": {"status_code": classified.status_code}}}
             for line in self._terminal_stream_error_lines(context, error_data):
                 yield line
 
@@ -2739,8 +2740,9 @@ def _stream_chunk_error_type(chunk: str) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
     event_type = normalize_route_error_type(str(payload.get("event_type") or payload.get("type") or ""))
-    if event_type == "error" and isinstance(payload.get("error"), dict):
-        return _route_error_type_from_response({"error": payload["error"]}) or "server_error"
+    if event_type == "error":
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        return _route_error_type_from_response({"error": error}) or "server_error"
     if event_type == "response.failed":
         error = payload.get("error") if isinstance(payload.get("error"), dict) else {"type": "server_error"}
         return _route_error_type_from_response({"error": error}) or "server_error"

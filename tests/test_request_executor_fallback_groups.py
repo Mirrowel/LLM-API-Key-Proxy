@@ -99,7 +99,7 @@ async def test_non_streaming_fallback_group_stops_on_permanent_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_fallback_group_honors_group_override() -> None:
+async def test_non_streaming_fallback_group_hard_stops_group_override() -> None:
     executor = RequestExecutor.__new__(RequestExecutor)
     attempts = []
 
@@ -112,20 +112,20 @@ async def test_non_streaming_fallback_group_honors_group_override() -> None:
     executor._execute_non_streaming = MethodType(fake_execute, executor)
 
     targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
-    result = await executor._execute_non_streaming_with_fallback(
-        _context(
-            routing_targets=targets,
-            routing_group=FallbackGroup(
-                name="code_chain",
-                targets=targets,
-                failover_on=frozenset({"authentication"}),
-                stop_on=frozenset({"validation"}),
-            ),
+    with pytest.raises(ClassifiedFailure):
+        await executor._execute_non_streaming_with_fallback(
+            _context(
+                routing_targets=targets,
+                routing_group=FallbackGroup(
+                    name="code_chain",
+                    targets=targets,
+                    failover_on=frozenset({"authentication"}),
+                    stop_on=frozenset({"validation"}),
+                ),
+            )
         )
-    )
 
-    assert result == {"id": "ok", "model": "openai/gpt-5.1"}
-    assert attempts == ["codex", "openai"]
+    assert attempts == ["codex"]
 
 
 @pytest.mark.asyncio

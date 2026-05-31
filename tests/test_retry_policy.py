@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from rotator_library.error_handler import ClassifiedError, PreRequestCallbackError
+from rotator_library.error_handler import ClassifiedError, PreRequestCallbackError, classify_error
 from rotator_library.retry_policy import (
     classify_route_error,
     decide_provider_cooldown,
@@ -86,3 +86,9 @@ def test_provider_cooldown_is_conservative_for_quota_by_default() -> None:
     assert disabled.should_start is False
     assert disabled.reason == "quota_cooldown_disabled"
     assert enabled.should_start is True
+
+
+def test_shared_classifier_handles_structured_dict_status_codes() -> None:
+    assert classify_error({"error": {"status": 401}}).error_type == "authentication"
+    assert classify_error({"error": {"details": {"status_code": 403}}}).error_type == "forbidden"
+    assert classify_error({"error": {"code": 429}}).error_type == "rate_limit"

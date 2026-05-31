@@ -38,7 +38,7 @@ class FallbackAttemptRunner:
     async def run(self, decision: RoutingDecision, attempt: AttemptCallback, *, stream: bool = False) -> Any:
         """Try targets in order until one succeeds or fallback is exhausted."""
 
-        return await self.run_group(decision, None, attempt, stream=stream)
+        return await self.run_group(decision, decision.group, attempt, stream=stream)
 
     async def run_group(
         self,
