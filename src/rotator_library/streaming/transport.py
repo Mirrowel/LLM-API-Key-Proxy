@@ -24,6 +24,17 @@ class SSEStreamFormatter:
     def format_done(self) -> str:
         return "data: [DONE]\n\n"
 
+    def format_heartbeat(self, comment: str = "heartbeat") -> str:
+        """Return an SSE comment heartbeat frame.
+
+        Comment frames keep HTTP connections active without becoming model
+        output, so routing/session code must continue treating them as
+        non-visible stream data.
+        """
+
+        safe_comment = comment.replace("\r", " ").replace("\n", " ")
+        return f": {safe_comment}\n\n"
+
     def is_terminal_event(self, event: StreamEvent) -> bool:
         return event.event_type in {"completed", "cancelled", "error"}
 
@@ -43,6 +54,11 @@ class WebSocketStreamFormatter:
     def format_done(self) -> dict:
         return {"type": "completed", "payload": {"done": True}}
 
+    def format_heartbeat(self) -> dict:
+        """Return the future WebSocket heartbeat message shape."""
+
+        return {"type": "heartbeat", "payload": {"visible_output": False}}
+
     def is_terminal_event(self, event: StreamEvent) -> bool:
         return event.event_type in {"completed", "cancelled", "error"}
 
@@ -60,6 +76,11 @@ class JSONLineStreamFormatter:
 
     def format_done(self) -> str:
         return json.dumps({"event_type": "completed", "done": True}) + "\n"
+
+    def format_heartbeat(self) -> str:
+        """Return a JSONL heartbeat record for test transports."""
+
+        return json.dumps({"event_type": "heartbeat", "visible_output": False}) + "\n"
 
     def is_terminal_event(self, event: StreamEvent) -> bool:
         return event.event_type in {"completed", "cancelled", "error"}

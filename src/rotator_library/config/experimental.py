@@ -57,14 +57,15 @@ class ExperimentalConfig:
 class StreamRuntimeSettings:
     """Runtime stream observability settings.
 
-    Timeout and heartbeat values are parsed here for future enforcement, but
-    Phase 10 only wires `trace_metrics` into runtime behavior. This avoids
-    surprising long-running reasoning streams while still validating config.
+    Timeout and heartbeat values default to disabled so existing long-running
+    reasoning streams keep working. Operators can opt into active stream
+    hardening through env or JSON config without changing provider code.
     """
 
     ttfb_timeout_seconds: Optional[float] = None
     stall_timeout_seconds: Optional[float] = None
     heartbeat_seconds: Optional[float] = None
+    cancel_upstream_on_disconnect: bool = True
     trace_metrics: bool = True
 
 
@@ -155,7 +156,8 @@ def get_stream_runtime_settings(
     return StreamRuntimeSettings(
         ttfb_timeout_seconds=_optional_positive_float(_env_or_json(source, "STREAM_TTFB_TIMEOUT_SECONDS", streaming, "ttfb_timeout_seconds"), "STREAM_TTFB_TIMEOUT_SECONDS"),
         stall_timeout_seconds=_optional_positive_float(_env_or_json(source, "STREAM_STALL_TIMEOUT_SECONDS", streaming, "stall_timeout_seconds"), "STREAM_STALL_TIMEOUT_SECONDS"),
-        heartbeat_seconds=_optional_positive_float(_env_or_json(source, "STREAM_HEARTBEAT_SECONDS", streaming, "heartbeat_seconds"), "STREAM_HEARTBEAT_SECONDS"),
+        heartbeat_seconds=_optional_positive_float(_env_or_json(source, "STREAM_HEARTBEAT_INTERVAL_SECONDS", streaming, "heartbeat_interval_seconds", default=_env_or_json(source, "STREAM_HEARTBEAT_SECONDS", streaming, "heartbeat_seconds")), "STREAM_HEARTBEAT_INTERVAL_SECONDS"),
+        cancel_upstream_on_disconnect=as_bool(_env_or_json(source, "STREAM_CANCEL_UPSTREAM_ON_DISCONNECT", streaming, "cancel_upstream_on_disconnect", default=True), name="STREAM_CANCEL_UPSTREAM_ON_DISCONNECT"),
         trace_metrics=as_bool(_env_or_json(source, "STREAM_TRACE_METRICS", streaming, "trace_metrics", default=True), name="STREAM_TRACE_METRICS"),
     )
 
