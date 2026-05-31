@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from rotator_library.adapters import PayloadAdapter, register_adapter
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.protocols import ProtocolError
@@ -208,6 +209,134 @@ async def test_native_provider_executor_rejects_unsupported_operation_before_tra
         )
 
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_native_runtime_executes_unified_request_source_and_target() -> None:
+    rule = FieldCacheRule(
+        name="unified_request_state",
+        source="unified_request",
+        path="metadata.client_state",
+        inject=FieldCacheInjection(target="unified_request", path="metadata.cached_client_state"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        field_cache_rules=(rule,),
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute(
+        {"model": "gpt-test", "messages": [], "metadata": {"client_state": "state-a"}},
+        context,
+        NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "choices": []})),
+    )
+    second_client = FakeHTTPClient({"id": "chat_2", "choices": []})
+    await executor.execute(
+        {"model": "gpt-test", "messages": [], "metadata": {}},
+        context,
+        NativeHTTPTransport(second_client),
+    )
+
+    assert second_client.calls[0]["json"]["metadata"]["cached_client_state"] == "state-a"
+
+
+@pytest.mark.asyncio
+async def test_native_runtime_executes_unified_response_source() -> None:
+    rule = FieldCacheRule(
+        name="response_object",
+        source="unified_response",
+        path="metadata.object",
+        inject=FieldCacheInjection(target="request", path="metadata.cached_object"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        field_cache_rules=(rule,),
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "object": "chat.completion", "choices": []})))
+    second_client = FakeHTTPClient({"id": "chat_2", "choices": []})
+    await executor.execute({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(second_client))
+
+    assert second_client.calls[0]["json"]["metadata"]["cached_object"] == "chat.completion"
+
+
+@pytest.mark.asyncio
+async def test_native_runtime_executes_metadata_target_before_adapters() -> None:
+    class MetadataEchoAdapter(PayloadAdapter):
+        name = "test_metadata_echo"
+        supported_stages = ("request",)
+
+        async def transform_request(self, payload, context):
+            payload.setdefault("metadata", {})["adapter_seen_state"] = context.metadata.get("cached_state")
+            return payload
+
+    register_adapter(MetadataEchoAdapter, replace=True)
+    rule = FieldCacheRule(
+        name="metadata_state",
+        source="response",
+        path="choices.0.message.reasoning_content",
+        inject=FieldCacheInjection(target="metadata", path="cached_state"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        adapter_names=("test_metadata_echo",),
+        field_cache_rules=(rule,),
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "meta-state"}}]})))
+    second_client = FakeHTTPClient({"id": "chat_2", "choices": []})
+    await executor.execute({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(second_client))
+
+    assert second_client.calls[0]["json"]["metadata"]["adapter_seen_state"] == "meta-state"
+
+
+@pytest.mark.asyncio
+async def test_native_adapter_generic_traces_are_suppressed_for_field_cache_safety(tmp_path) -> None:
+    logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
+    rule = FieldCacheRule(
+        name="hidden_state",
+        source="response",
+        path="choices.0.message.reasoning_content",
+        inject=FieldCacheInjection(target="request", path="metadata.hidden_state"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        adapter_names=("model_override",),
+        adapter_config={"model_override": {"model": "provider/gpt-test"}},
+        field_cache_rules=(rule,),
+        transaction_logger=logger,
+    )
+
+    await NativeProviderExecutor().execute(
+        {"model": "gpt-test", "messages": []},
+        context,
+        NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "opaque-state"}}]})),
+    )
+
+    entries = _trace_entries(logger.log_dir)
+    pass_names = [entry["pass_name"] for entry in entries]
+    assert "before_adapter_chain" not in pass_names
+    assert "after_adapter" not in pass_names
+    assert "after_request_adapter_chain" in pass_names
+    assert "opaque-state" not in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

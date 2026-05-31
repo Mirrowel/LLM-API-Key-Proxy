@@ -41,6 +41,8 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
     for scope in rule.scope:
         value = context.value_for_scope(scope)
         if value is None or value == "":
+            if scope == "credential":
+                return None
             if scope == "session" and not rule.allow_missing_session:
                 return None
             value = "_none"
