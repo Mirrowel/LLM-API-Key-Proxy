@@ -535,9 +535,12 @@ class RotatingClient:
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Union[Any, AsyncGenerator[str, None]]:
+        request_context_callback = kwargs.pop("_request_context_callback", None)
         context = await self._request_builder.build_completion_context(
             request, pre_request_callback, kwargs
         )
+        if callable(request_context_callback):
+            request_context_callback(context)
         return await self._executor.execute(context)
 
     async def aembedding(

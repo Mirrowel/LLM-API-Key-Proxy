@@ -1056,6 +1056,7 @@ async def responses_create(
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
         if request_data.get("stream"):
+            await service.validate_stream_request(request_data)
             return StreamingResponse(
                 service.stream_response(request_data, client, request=request, transaction_logger=transaction_logger),
                 media_type="text/event-stream",

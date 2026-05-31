@@ -23,6 +23,32 @@ class FakeClient:
         }
 
 
+class FakeInternalClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._request_builder = object()
+        self._executor = object()
+
+    async def acompletion(self, **kwargs):
+        callback = kwargs.pop("_request_context_callback", None)
+        hints = kwargs.pop("_session_tracking_hints", None)
+        if callback:
+            callback(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "session_id": "session-parent",
+                        "session_affinity_key": "affinity-parent",
+                        "usage_manager_key": "scope-parent",
+                        "classifier": "global",
+                    },
+                )()
+            )
+        self.internal_hints = hints
+        return await super().acompletion(**kwargs)
+
+
 def _trace_entries(log_dir):
     return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
@@ -117,6 +143,54 @@ async def test_previous_response_id_loads_parent_context() -> None:
         {"role": "assistant", "content": "Earlier"},
         {"role": "user", "content": "Continue"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_internal_session_hints_do_not_leak_to_direct_clients_or_traces(tmp_path) -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    await store.save(
+        StoredResponse(
+            id="resp_parent",
+            model="gpt-test",
+            status="completed",
+            response={"id": "resp_parent", "object": "response", "output": []},
+            metadata={"session_affinity_key": "affinity-parent"},
+        )
+    )
+    client = FakeClient()
+
+    await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client, transaction_logger=logger)
+
+    assert "_session_tracking_hints" not in client.calls[0]
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "_session_tracking_hints" not in trace_text
+    assert "has_session_hints" in trace_text
+
+
+@pytest.mark.asyncio
+async def test_internal_client_context_metadata_is_stored_with_response() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    await store.save(
+        StoredResponse(
+            id="resp_parent",
+            model="gpt-test",
+            status="completed",
+            response={"id": "resp_parent", "object": "response", "output": []},
+            metadata={"session_affinity_key": "affinity-parent"},
+        )
+    )
+    client = FakeInternalClient()
+
+    response = await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client)
+    stored = await store.get(response["id"])
+
+    assert client.internal_hints["affinity_key"] == "affinity-parent"
+    assert stored is not None
+    assert stored.session_id == "session-parent"
+    assert stored.metadata["session_affinity_key"] == "affinity-parent"
 
 
 @pytest.mark.asyncio
