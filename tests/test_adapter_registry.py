@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rotator_library.adapters import (
@@ -12,6 +14,11 @@ from rotator_library.adapters import (
     resolve_adapter_name,
     run_adapter_chain,
 )
+from rotator_library.transaction_logger import TransactionLogger
+
+
+def _trace_entries(log_dir):
+    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
 def test_adapter_registry_auto_discovers_builtins_and_aliases() -> None:
@@ -120,3 +127,23 @@ async def test_adapter_chain_order_is_preserved() -> None:
 
     assert result["model"] == "native"
     assert result["messages"][0]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_adapter_chain_traces_final_summary(tmp_path) -> None:
+    logger = TransactionLogger("native", "native/test", parent_dir=tmp_path)
+    payload = {"model": "public", "messages": []}
+    context = AdapterContext(
+        adapter_config={"model_override": {"model": "native"}},
+        transaction_logger=logger,
+        protocol="openai_chat",
+    )
+
+    result = await run_adapter_chain([get_adapter("model_override")], payload, context, stage="request")
+
+    assert result["model"] == "native"
+    entries = _trace_entries(logger.log_dir)
+    pass_names = [entry["pass_name"] for entry in entries]
+    assert pass_names == ["before_adapter_chain", "after_adapter", "after_adapter_chain"]
+    assert entries[-1]["metadata"]["adapter_count"] == 1
+    assert entries[-1]["metadata"]["changed"] is True

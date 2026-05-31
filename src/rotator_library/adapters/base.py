@@ -107,6 +107,7 @@ async def run_adapter_chain(
     """
 
     current = payload if mutate else deepcopy(payload)
+    original = deepcopy(current)
     adapter_names = [adapter.name for adapter in adapters]
     _trace(context, "before_adapter_chain", current, stage=stage, metadata={"adapters": adapter_names})
     for adapter in adapters:
@@ -132,5 +133,11 @@ async def run_adapter_chain(
             stage=stage,
             metadata={"adapter": adapter.name, "adapter_stage": stage, "changed": current != before},
         )
-    _trace(context, "after_adapter_chain", current, stage=stage, metadata={"adapters": adapter_names})
+    _trace(
+        context,
+        "after_adapter_chain",
+        current,
+        stage=stage,
+        metadata={"adapters": adapter_names, "adapter_stage": stage, "adapter_count": len(adapter_names), "changed": original != current},
+    )
     return current
