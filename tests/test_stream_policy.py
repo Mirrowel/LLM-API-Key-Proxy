@@ -29,5 +29,6 @@ def test_visible_output_detection_for_chat_chunks() -> None:
 def test_visible_output_detection_for_responses_events() -> None:
     assert is_visible_stream_output('data: {"event_type":"response.output_text.delta","delta":"hi"}\n\n', protocol="responses") is True
     assert is_visible_stream_output('data: {"event_type":"response.output_text.delta","delta":"hi"}\n\n') is True
+    assert is_visible_stream_output('data: {"event_type":"response.function_call_arguments.delta","delta":"{\\"x\\":"}\n\n') is True
     assert is_visible_stream_output('data: {"event_type":"response.failed","error":{"message":"x"}}\n\n', protocol="responses") is False
     assert is_visible_stream_output('event: response.failed\ndata: {"error":{"message":"x"}}\n\n', protocol="responses") is False

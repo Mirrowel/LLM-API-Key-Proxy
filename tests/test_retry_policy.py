@@ -92,3 +92,17 @@ def test_shared_classifier_handles_structured_dict_status_codes() -> None:
     assert classify_error({"error": {"status": 401}}).error_type == "authentication"
     assert classify_error({"error": {"details": {"status_code": 403}}}).error_type == "forbidden"
     assert classify_error({"error": {"code": 429}}).error_type == "rate_limit"
+
+
+def test_shared_classifier_handles_structured_dict_type_and_code_text() -> None:
+    assert classify_error({"error": {"type": "authentication"}}).error_type == "authentication"
+    assert classify_error({"error": {"code": "permission_denied"}}).error_type == "forbidden"
+    assert classify_error({"error": {"code": "context_length_exceeded"}}).error_type == "context_window_exceeded"
+    assert classify_error({"error": {"type": "rate_limit"}}).error_type == "rate_limit"
+
+
+def test_shared_classifier_preserves_explicit_error_type_attributes() -> None:
+    class ConfigurationFailure(Exception):
+        error_type = "configuration_error"
+
+    assert classify_error(ConfigurationFailure("raw secret message")).error_type == "configuration_error"

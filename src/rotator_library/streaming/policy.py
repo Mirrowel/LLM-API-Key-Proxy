@@ -132,6 +132,8 @@ def _responses_visible(data: dict[str, Any]) -> bool:
     event_type = data.get("event_type") or data.get("type")
     if event_type == "response.output_text.delta":
         return bool(str(data.get("delta", "")).strip())
+    if isinstance(event_type, str) and ("function_call" in event_type or "tool_call" in event_type):
+        return _has_visible_text(data.get("delta")) or _has_visible_text(data.get("arguments")) or _has_visible_text(data.get("item"))
     if event_type == "response.failed":
         return False
     return False
