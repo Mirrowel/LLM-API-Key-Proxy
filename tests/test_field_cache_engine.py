@@ -186,6 +186,28 @@ async def test_field_cache_trace_omits_raw_sample_values(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_field_cache_error_trace_omits_raw_payload_values(tmp_path) -> None:
+    class FailingStore(InMemoryFieldCacheStore):
+        async def set(self, key, value, *, append=False):
+            raise RuntimeError("store failed")
+
+    logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
+    engine = FieldCacheEngine([_reasoning_rule()], store=FailingStore())
+
+    with pytest.raises(RuntimeError):
+        await engine.extract(
+            "response",
+            {"choices": [{"message": {"reasoning_content": "provider-signature-secret"}}]},
+            _context(),
+            transaction_logger=logger,
+        )
+
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "provider-signature-secret" not in trace_text
+    assert "payload_type" in trace_text
+
+
+@pytest.mark.asyncio
 async def test_field_cache_traces_start_and_complete_even_without_matching_rules(tmp_path) -> None:
     logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
     engine = FieldCacheEngine([])

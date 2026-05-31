@@ -38,13 +38,14 @@ def test_sanitize_for_trace_redacts_sensitive_keys_recursively() -> None:
 
 
 def test_scrub_sensitive_text_targets_header_like_fragments_only() -> None:
-    text = "normal token text remains\nAuthorization: Bearer abc123\nset-cookie: sid=secret"
+    text = "normal token text remains\nAuthorization: Bearer abc123\nset-cookie: sid=secret\n{'Authorization': 'Bearer quoted'}"
 
     scrubbed = scrub_sensitive_text(text)
 
     assert "normal token text remains" in scrubbed
     assert "Authorization: [REDACTED]" in scrubbed
     assert "set-cookie: [REDACTED]" in scrubbed
+    assert "quoted" not in scrubbed
 
 
 def test_sanitize_for_trace_extracts_sdk_like_objects_before_repr() -> None:

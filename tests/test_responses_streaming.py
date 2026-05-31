@@ -96,7 +96,7 @@ async def test_stream_response_failure_trace_scrubs_header_like_secret_text(tmp_
         chunk
         async for chunk in service.stream_response(
             {"model": "gpt-test", "input": "Hello", "stream": True},
-            FailingStreamingClient("Authorization: Bearer secret-token"),
+            FailingStreamingClient("{'Authorization': 'Bearer secret-token'}"),
             transaction_logger=logger,
         )
     ]
@@ -128,6 +128,7 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "stream_first_visible_output" in trace_text
     assert "stream_completed" in trace_text
     assert "stream_metrics_final" in trace_text
+    assert "stream_done_event" in trace_text
     assert "responses_stream_event_created" in trace_text
     assert "responses_stream_event_output_text_delta" in trace_text
     assert "responses_stream_event_completed" in trace_text
