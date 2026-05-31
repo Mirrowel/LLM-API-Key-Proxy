@@ -132,11 +132,13 @@ class AntigravityProvider(ProviderInterface):
 
         prepared = dict(request)
         public_model = str(request.get("_proxy_model") or request.get("model") or "")
-        if model:
-            prepared["model"] = model
-        prepared.pop("_proxy_model", None)
         thinking_level = _thinking_level_from_model(public_model)
+        if model:
+            prepared["model"] = _model_with_thinking_variant(model, thinking_level)
+        prepared.pop("_proxy_model", None)
         if thinking_level:
+            generation_config = prepared.setdefault("generationConfig", {})
+            generation_config.setdefault("thinkingConfig", {})["thinkingLevel"] = thinking_level
             prepared.setdefault("metadata", {})["thinking_level"] = thinking_level
         if "contents" not in prepared and isinstance(prepared.get("messages"), list):
             prepared["contents"] = [_message_to_gemini_content(message) for message in prepared.pop("messages")]
@@ -228,3 +230,9 @@ def _thinking_level_from_model(model: str) -> Optional[str]:
     if clean.endswith("-high"):
         return "high"
     return None
+
+
+def _model_with_thinking_variant(model: str, thinking_level: Optional[str]) -> str:
+    if model == "gemini-3-pro-preview" and thinking_level in {"low", "high"}:
+        return f"gemini-3-pro-{thinking_level}"
+    return model

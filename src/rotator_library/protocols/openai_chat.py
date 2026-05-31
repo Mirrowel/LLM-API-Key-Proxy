@@ -209,7 +209,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
         if unified_event.type == "done":
             return "data: [DONE]\n\n"
-        if unified_event.raw is not None:
+        if unified_event.raw is not None and (context is None or context.source_protocol in {None, "openai_chat"}):
             payload = deepcopy(unified_event.raw)
             if unified_event.delta is not None and isinstance(payload, dict) and isinstance(payload.get("choices"), list) and payload["choices"]:
                 choice = payload["choices"][0]
@@ -220,6 +220,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         formatted_delta.pop("role", None)
                     choice["delta"] = formatted_delta
             return payload
+        if unified_event.delta is not None:
+            delta = _format_response_message(self._format_message(unified_event.delta), unified_event.delta)
+            if unified_event.extra.get("finish_reason") is None:
+                delta.pop("role", None)
+            payload = {
+                "id": unified_event.extra.get("id"),
+                "object": "chat.completion.chunk",
+                "model": unified_event.extra.get("model"),
+                "choices": [{"index": 0, "delta": delta, "finish_reason": unified_event.extra.get("finish_reason")}],
+                "usage": _format_openai_usage(unified_event.usage),
+            }
+            return f"data: {json.dumps({k: v for k, v in payload.items() if v is not None})}\n\n"
         return f"data: {json.dumps(unified_event.to_dict())}\n\n"
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:

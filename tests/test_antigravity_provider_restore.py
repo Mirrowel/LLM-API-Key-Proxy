@@ -74,7 +74,9 @@ def test_antigravity_native_operation_model_and_stream_support() -> None:
     assert provider.get_native_operation("gemini-3-flash", {}, stream=True) == "stream_generate"
     assert provider.supports_native_streaming("gemini-3-flash", operation="stream_generate") is False
     assert provider.supports_native_streaming("gemini-3-flash", operation="generate") is False
-    assert provider.prepare_native_request({"model": "antigravity/gemini-3-pro-low"}, model="gemini-3-pro-preview", operation="generate")["model"] == "gemini-3-pro-preview"
+    prepared = provider.prepare_native_request({"model": "antigravity/gemini-3-pro-low"}, model="gemini-3-pro-preview", operation="generate")
+    assert prepared["model"] == "gemini-3-pro-low"
+    assert prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
 
 
 def test_antigravity_prepare_native_request_converts_messages_to_gemini_contents() -> None:

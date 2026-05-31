@@ -113,6 +113,30 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_native_cross_protocol_stream_formats_openai_chat_sse() -> None:
+    context = NativeProviderContext(
+        provider="claude_code",
+        model="claude-sonnet-4-5",
+        protocol_name="anthropic_messages",
+        client_protocol_name="openai_chat",
+        endpoint="https://example.test/messages",
+        operation="messages",
+    )
+    chunks = [
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+        "[DONE]",
+    ]
+
+    events = [event async for event in NativeProviderExecutor().stream({"model": "claude-sonnet-4-5", "messages": [], "max_tokens": 1}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
+
+    assert events[0].startswith("data: ")
+    payload = json.loads(events[0][len("data: ") :].strip())
+    assert payload["object"] == "chat.completion.chunk"
+    assert payload["choices"][0]["delta"]["content"] == "hi"
+    assert "content_block_delta" not in events[0]
+
+
+@pytest.mark.asyncio
 async def test_native_provider_stream_extracts_unified_stream_events_for_later_requests() -> None:
     rule = FieldCacheRule(
         name="unified_stream_text",

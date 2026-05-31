@@ -112,6 +112,11 @@ class NativePluginWithStreamVendorRule(NativePlugin):
         )
 
 
+class NativeOptOutPlugin(NativePlugin):
+    def should_use_native_protocol(self, model="", operation="chat", *, stream=False, execution="auto"):
+        return False
+
+
 class CustomPlugin:
     def __init__(self):
         self.calls = []
@@ -364,10 +369,23 @@ def test_antigravity_alias_normalization_preserves_thinking_level() -> None:
     prepared = provider.prepare_native_request(request, model=provider.normalize_native_model("antigravity/gemini-3-pro-low"), operation="generate")
 
     assert provider.normalize_native_model("antigravity/gemini-3-pro-low") == "gemini-3-pro-preview"
+    assert prepared["model"] == "gemini-3-pro-low"
+    assert prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
     assert prepared["metadata"]["thinking_level"] == "low"
     assert "_proxy_model" not in prepared
     assert "messages" not in prepared
     assert prepared["contents"][0]["parts"][0]["text"] == "hi"
+
+
+def test_auto_native_selection_honors_provider_opt_out() -> None:
+    assert executor_module._should_use_native_protocol(
+        NativeOptOutPlugin(),
+        "provider/gpt-test",
+        None,
+        {"model": "provider/gpt-test", "messages": []},
+        stream=False,
+        execution="auto",
+    ) is False
 
 
 def test_native_request_payload_drops_litellm_only_fields() -> None:
