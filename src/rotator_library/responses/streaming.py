@@ -22,6 +22,19 @@ class ResponsesStreamState:
     output_item_id: str = "msg_0"
 
 
+@dataclass(frozen=True)
+class ResponsesStreamEvent:
+    """Transport-neutral Responses stream event.
+
+    Service code yields these events. Formatters decide how to serialize them for
+    SSE, WebSocket, or future transports without duplicating protocol logic.
+    """
+
+    event_name: str
+    payload: dict[str, Any]
+    terminal: bool = False
+
+
 class ResponsesSSEFormatter:
     """Format Responses API events as HTTP Server-Sent Events."""
 
@@ -29,6 +42,13 @@ class ResponsesSSEFormatter:
 
     def format_event(self, event_name: str, payload: dict[str, Any]) -> str:
         return f"event: {event_name}\ndata: {json.dumps(serialize_value(payload), ensure_ascii=False)}\n\n"
+
+    def format_stream_event(self, event: ResponsesStreamEvent) -> str:
+        """Format one transport-neutral event for HTTP SSE."""
+
+        if event.terminal:
+            return self.done()
+        return self.format_event(event.event_name, event.payload)
 
     def done(self) -> str:
         """Return the final compatibility sentinel used by many SSE clients."""
@@ -43,7 +63,14 @@ class ResponsesWebSocketFormatter:
     future_supported = True
 
     def format_event(self, event_name: str, payload: dict[str, Any]) -> str:
-        raise NotImplementedError("Responses WebSocket transport is planned but not implemented yet")
+        return json.dumps({"event": event_name, "data": serialize_value(payload)}, ensure_ascii=False)
+
+    def format_stream_event(self, event: ResponsesStreamEvent) -> str:
+        """Format one transport-neutral event as a WebSocket message payload."""
+
+        if event.terminal:
+            return json.dumps({"event": "done", "data": {}}, ensure_ascii=False)
+        return self.format_event(event.event_name, event.payload)
 
 
 def parse_chat_sse_chunk(chunk: Any) -> dict[str, Any] | None:
