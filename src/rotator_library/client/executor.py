@@ -151,6 +151,7 @@ class RequestExecutor:
         self._litellm_logger_fn = litellm_logger_fn
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
+        self._native_executor = NativeProviderExecutor()
 
     def _get_transient_retry_delay(self) -> float:
         """Small jittered delay used before transient retries and rotations."""
@@ -609,9 +610,18 @@ class RequestExecutor:
                 _target_trace(target) if target else {"provider": provider, "model": model},
                 metadata={"protocol": native_context.protocol_name},
             )
-            return await NativeProviderExecutor().execute(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
+            return await self._get_native_executor().execute(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
 
         return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+
+    def _get_native_executor(self) -> NativeProviderExecutor:
+        """Return the shared native executor for process-local field-cache state."""
+
+        native_executor = getattr(self, "_native_executor", None)
+        if native_executor is None:
+            native_executor = NativeProviderExecutor()
+            self._native_executor = native_executor
+        return native_executor
 
     async def _execute_litellm_request(
         self,
@@ -1319,8 +1329,33 @@ class RequestExecutor:
                                         context, kwargs
                                     )
 
+                                    target = _current_route_target(context)
+                                    execution = target.execution if target else "auto"
+
                                     # Make the API call
-                                    if plugin and plugin.has_custom_logic():
+                                    if execution == "native" or (
+                                        execution == "auto"
+                                        and plugin
+                                        and _provider_native_protocol(plugin, model, target)
+                                        and _provider_supports_native_streaming(plugin, model)
+                                    ):
+                                        native_context = self._build_native_provider_context(
+                                            provider,
+                                            model,
+                                            plugin,
+                                            credential_secret,
+                                            cred_context.stable_id,
+                                            context,
+                                            target,
+                                        )
+                                        self._log_routing_trace(
+                                            context,
+                                            "routing_native_stream_execution_selected",
+                                            _target_trace(target) if target else {"provider": provider, "model": model},
+                                            metadata={"protocol": native_context.protocol_name},
+                                        )
+                                        stream = self._get_native_executor().stream(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
+                                    elif plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = credential_secret
                                         self._log_executor_trace(
                                             context,
@@ -2167,6 +2202,21 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     return None
 
 
+def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
+    """Return whether a provider declares native streaming support."""
+
+    support = getattr(plugin, "supports_native_streaming", None)
+    if not callable(support):
+        return False
+    try:
+        return bool(support(model=model, operation="chat"))
+    except TypeError:
+        try:
+            return bool(support(model))
+        except TypeError:
+            return bool(support())
+
+
 def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[Any, ...]:
     """Merge provider-declared and JSON-configured field-cache rules.
 
@@ -2182,8 +2232,7 @@ def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[A
 
         configured = list(parse_field_cache_rules(load_experimental_config(), provider, model))
     except Exception as exc:
-        lib_logger.debug("Failed to load configured field-cache rules for %s/%s: %s", provider, model, exc)
-        configured = []
+        raise RoutingExecutionError(f"Invalid field-cache configuration for {provider}/{model}", error_type="configuration_error") from exc
     if not configured:
         return tuple(declared)
     merged: dict[str, Any] = {getattr(rule, "name", str(index)): rule for index, rule in enumerate(declared)}

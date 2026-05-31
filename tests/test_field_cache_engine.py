@@ -273,6 +273,32 @@ async def test_in_memory_store_expires_ttl_values() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_cache_field_store_expires_ttl_values(monkeypatch) -> None:
+    class FakeProviderCache:
+        def __init__(self) -> None:
+            self.values = {}
+
+        async def retrieve_async(self, key: str):
+            return self.values.get(key)
+
+        async def store_async(self, key: str, value: str) -> None:
+            json.loads(value)
+            self.values[key] = value
+
+        async def clear(self) -> None:
+            self.values.clear()
+
+    now = 100.0
+    monkeypatch.setattr("rotator_library.field_cache.store.time.time", lambda: now)
+    store = ProviderCacheFieldStore(FakeProviderCache())
+
+    await store.set("key", "value", ttl_seconds=5)
+    assert await store.get("key") == "value"
+    now = 106.0
+    assert await store.get("key") is None
+
+
+@pytest.mark.asyncio
 async def test_in_memory_store_returns_deep_copies() -> None:
     store = InMemoryFieldCacheStore()
     await store.set("key", {"nested": []})
@@ -309,6 +335,23 @@ async def test_last_user_turn_uses_latest_user_message() -> None:
 
     assert operations[0].changed is True
     assert updated["metadata"]["signature"] == "last-user"
+
+
+@pytest.mark.asyncio
+async def test_last_mode_preserves_list_valued_field() -> None:
+    rule = FieldCacheRule(
+        name="list_value",
+        source="response",
+        path="metadata.signatures",
+        inject=FieldCacheInjection(target="request", path="metadata.signatures"),
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"metadata": {"signatures": ["a", "b"]}}, _context(session_id=None))
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
+
+    assert updated["metadata"]["signatures"] == ["a", "b"]
 
 
 @pytest.mark.asyncio
@@ -374,6 +417,52 @@ async def test_per_tool_call_correlates_sibling_id_and_value_for_injection() -> 
 
     assert operations[0].hit is True
     assert updated["metadata"]["signature"] == "sig-b"
+
+
+@pytest.mark.asyncio
+async def test_per_tool_call_as_list_injects_matching_values() -> None:
+    rule = FieldCacheRule(
+        name="tool_signature",
+        source="response",
+        path="tool_calls.*",
+        mode="per_tool_call",
+        inject=FieldCacheInjection(target="request", path="metadata.signatures", as_list=True),
+        allow_missing_session=True,
+        metadata={"tool_call_id_path": "id", "inject_tool_call_id_path": "tool_ids.*"},
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"tool_calls": [{"id": "a", "signature": "sig-a"}, {"id": "b", "signature": "sig-b"}]}, _context(session_id=None))
+    updated, _ = await engine.inject("request", {"metadata": {}, "tool_ids": ["a", "b"]}, _context(session_id=None))
+
+    assert updated["metadata"]["signatures"] == [{"id": "a", "signature": "sig-a"}, {"id": "b", "signature": "sig-b"}]
+
+
+@pytest.mark.asyncio
+async def test_engine_supports_legacy_store_without_ttl_keyword() -> None:
+    class LegacyStore:
+        def __init__(self) -> None:
+            self.values = {}
+
+        async def get(self, key):
+            return self.values.get(key)
+
+        async def set(self, key, value):
+            self.values[key] = value
+
+        async def append(self, key, values):
+            self.values.setdefault(key, []).extend(values)
+            return self.values[key]
+
+        async def clear(self):
+            self.values.clear()
+
+    engine = FieldCacheEngine([_reasoning_rule()], store=LegacyStore())
+
+    await engine.extract("response", {"choices": [{"message": {"reasoning_content": "legacy"}}]}, _context())
+    updated, _ = await engine.inject("request", {"messages": [{}]}, _context())
+
+    assert updated["messages"][-1]["reasoning_content"] == "legacy"
 
 
 @pytest.mark.asyncio

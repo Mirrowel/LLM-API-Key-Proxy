@@ -173,10 +173,10 @@ class FieldCacheEngine:
 
     async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any], payload: Any, operation: FieldCacheOperation) -> bool:
         if rule.mode == "all":
-            await self.store.append(cache_key, values, ttl_seconds=rule.ttl_seconds)
+            await self._store_append(cache_key, values, ttl_seconds=rule.ttl_seconds)
             return True
         if rule.mode == "last":
-            await self.store.set(cache_key, values[-1], ttl_seconds=rule.ttl_seconds)
+            await self._store_set(cache_key, _wrap_cached_value(values[-1]), ttl_seconds=rule.ttl_seconds)
             return True
         if rule.mode in {"last_user_turn", "last_assistant_turn"}:
             role = "user" if rule.mode == "last_user_turn" else "assistant"
@@ -187,7 +187,7 @@ class FieldCacheEngine:
                 return False
             operation.matched = len(turn_values)
             operation.sample_values = _sample_values(turn_values)
-            await self.store.set(cache_key, turn_values[-1], ttl_seconds=rule.ttl_seconds)
+            await self._store_set(cache_key, _wrap_cached_value(turn_values[-1]), ttl_seconds=rule.ttl_seconds)
             return True
         if rule.mode == "per_tool_call":
             stored = _tool_call_values(rule, payload, values)
@@ -197,9 +197,23 @@ class FieldCacheEngine:
                 return False
             operation.matched = len(stored)
             operation.sample_values = _sample_values(list(stored.values()))
-            await self.store.set(cache_key, stored, ttl_seconds=rule.ttl_seconds)
+            await self._store_set(cache_key, stored, ttl_seconds=rule.ttl_seconds)
             return True
         raise ValueError(f"Unsupported field-cache mode: {rule.mode}")
+
+    async def _store_set(self, cache_key: str, value: Any, *, ttl_seconds: Optional[int]) -> None:
+        try:
+            await self.store.set(cache_key, value, ttl_seconds=ttl_seconds)
+        except TypeError:
+            # Preserve compatibility with simple injected stores that implement
+            # the original set(key, value) shape. TTL is best-effort there.
+            await self.store.set(cache_key, value)
+
+    async def _store_append(self, cache_key: str, values: list[Any], *, ttl_seconds: Optional[int]) -> None:
+        try:
+            await self.store.append(cache_key, values, ttl_seconds=ttl_seconds)
+        except TypeError:
+            await self.store.append(cache_key, values)
 
     def _injection_value(self, rule: FieldCacheRule, cached: Any, payload: Any, context: FieldCacheContext, operation: FieldCacheOperation) -> Any:
         """Select the cached value to inject for the rule's mode.
@@ -218,7 +232,7 @@ class FieldCacheEngine:
                 operation.skipped = True
                 operation.reason = "tool_call_id_not_found"
                 return None
-            matches = [cached[str(tool_id)] for tool_id in ids if str(tool_id) in cached]
+            matches = [_unwrap_cached_value(cached[str(tool_id)]) for tool_id in ids if str(tool_id) in cached]
             if not matches:
                 operation.skipped = True
                 operation.reason = "tool_call_cache_miss"
@@ -232,7 +246,7 @@ class FieldCacheEngine:
             return None
         if rule.inject and (rule.inject.as_list or rule.mode == "all"):
             return cached if isinstance(cached, list) else [cached]
-        return _last_value(cached)
+        return _unwrap_cached_value(cached)
 
     def _trace(
         self,
@@ -320,6 +334,18 @@ def _last_value(value: Any) -> Any:
     if isinstance(value, list):
         return value[-1] if value else None
     return value
+
+
+def _wrap_cached_value(value: Any) -> dict[str, Any]:
+    """Wrap one extracted value so list-valued fields stay intact on injection."""
+
+    return {"__field_cache_value__": True, "value": deepcopy(value)}
+
+
+def _unwrap_cached_value(value: Any) -> Any:
+    if isinstance(value, dict) and value.get("__field_cache_value__") is True:
+        return deepcopy(value.get("value"))
+    return _last_value(value)
 
 
 def _turn_values(rule: FieldCacheRule, payload: Any, role: str) -> list[Any]:

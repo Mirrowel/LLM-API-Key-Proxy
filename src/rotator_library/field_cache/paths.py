@@ -138,17 +138,21 @@ def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_on
             current = current[key]
             continue
         if token.kind == "index":
-            if not isinstance(current, list) or not current:
+            if not isinstance(current, list) or (not current and not (is_last and insert)):
                 raise FieldCachePathError("Cannot inject into missing or empty list")
             list_index = int(token.value)
+            if is_last and insert:
+                if list_index < 0:
+                    list_index = max(0, len(current) + list_index)
+                if not (0 <= list_index <= len(current)):
+                    raise FieldCachePathError(f"List index out of range for field-cache insertion: {list_index}")
+                if when_missing_only:
+                    return False
+                current.insert(list_index, injected_value)
+                return True
             if not (-len(current) <= list_index < len(current)):
                 raise FieldCachePathError(f"List index out of range for field-cache injection: {list_index}")
             if is_last:
-                if insert:
-                    if when_missing_only:
-                        return False
-                    current.insert(list_index, injected_value)
-                    return True
                 if when_missing_only and current[list_index] is not None:
                     return False
                 changed = current[list_index] != injected_value

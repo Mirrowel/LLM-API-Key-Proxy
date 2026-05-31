@@ -34,6 +34,8 @@ def test_sanitize_for_trace_redacts_sensitive_keys_recursively() -> None:
     assert sanitized["headers"]["Cookie"] == REDACTED
     assert sanitized["headers"]["normal"] == "token in normal text"
     assert sanitized["items"][0]["refresh_token"] == REDACTED
+    assert sanitize_for_trace({"reasoning_content": "provider-state"})["reasoning_content"] == REDACTED
+    assert sanitize_for_trace({"thoughtSignature": "provider-state"})["thoughtSignature"] == REDACTED
     assert sanitized["items"][0]["text"] == "token should remain in value"
 
 

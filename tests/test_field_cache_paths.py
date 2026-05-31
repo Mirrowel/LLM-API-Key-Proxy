@@ -63,6 +63,15 @@ def test_inject_path_can_insert_at_final_list_index() -> None:
     assert payload["messages"] == [{"role": "system"}, {"role": "user"}]
 
 
+def test_inject_path_can_insert_into_empty_list() -> None:
+    payload = {"messages": []}
+
+    changed = inject_path(payload, "messages.0", {"role": "system"}, insert=True)
+
+    assert changed is True
+    assert payload["messages"] == [{"role": "system"}]
+
+
 def test_inject_path_rejects_wildcards_and_missing_lists() -> None:
     with pytest.raises(FieldCachePathError):
         inject_path({"choices": []}, "choices.*.message.reasoning_content", "x")
