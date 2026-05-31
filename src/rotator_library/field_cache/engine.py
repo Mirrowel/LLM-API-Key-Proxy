@@ -55,11 +55,10 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
 class FieldCacheEngine:
     """Apply field-cache extraction and injection rules.
 
-    The engine is isolated from request execution in Phase 3. It defaults to
-    copying payloads before injection so tests and future providers can reason
-    about mutations explicitly. Turn-specific and per-tool modes are validated
-    but limited until later phases add richer conversation indexing and
-    per-tool-call injection targets.
+    The engine preserves provider protocol state; it is not session tracking.
+    It defaults to copying payloads before injection so providers can opt into
+    mutation explicitly. Turn and tool-call modes skip safely when the requested
+    context cannot be inferred rather than silently falling back to `last`.
     """
 
     def __init__(self, rules: Iterable[FieldCacheRule], store: Optional[FieldCacheStore] = None) -> None:
@@ -103,9 +102,8 @@ class FieldCacheEngine:
                 values = extract_path(payload, rule.path)
                 operation.matched = len(values)
                 operation.sample_values = _sample_values(values)
-                if values:
-                    await self._store_values(rule, operation.cache_key, values)
-                    operation.changed = True
+                if values or rule.mode in {"last_user_turn", "last_assistant_turn", "per_tool_call"}:
+                    operation.changed = await self._store_values(rule, operation.cache_key, values, payload, operation)
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_extract", exc, payload, rule)
                 raise
@@ -146,12 +144,17 @@ class FieldCacheEngine:
                     self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
                     continue
                 operation.hit = True
-                value = cached if rule.inject.as_list or rule.mode == "all" else _last_value(cached)
+                value = self._injection_value(rule, cached, updated, context, operation)
+                if operation.skipped:
+                    operations.append(operation)
+                    self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+                    continue
                 operation.changed = inject_path(
                     updated,
                     rule.inject.path,
                     value,
                     when_missing_only=rule.inject.when_missing_only,
+                    insert=rule.inject.insert,
                 )
                 operation.sample_values = _sample_values(value if isinstance(value, list) else [value])
             except Exception as exc:
@@ -168,23 +171,68 @@ class FieldCacheEngine:
     def _rules_for_injection(self, target: str) -> list[FieldCacheRule]:
         return [rule for rule in self.rules if rule.enabled and rule.inject and rule.inject.target == target]
 
-    async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any]) -> None:
+    async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any], payload: Any, operation: FieldCacheOperation) -> bool:
         if rule.mode == "all":
-            await self.store.append(cache_key, values)
-            return
-        if rule.mode in {"last", "last_user_turn", "last_assistant_turn"}:
-            await self.store.set(cache_key, values[-1])
-            return
+            await self.store.append(cache_key, values, ttl_seconds=rule.ttl_seconds)
+            return True
+        if rule.mode == "last":
+            await self.store.set(cache_key, values[-1], ttl_seconds=rule.ttl_seconds)
+            return True
+        if rule.mode in {"last_user_turn", "last_assistant_turn"}:
+            role = "user" if rule.mode == "last_user_turn" else "assistant"
+            turn_values = _turn_values(rule, payload, role)
+            if not turn_values:
+                operation.skipped = True
+                operation.reason = "turn_context_not_found"
+                return False
+            operation.matched = len(turn_values)
+            operation.sample_values = _sample_values(turn_values)
+            await self.store.set(cache_key, turn_values[-1], ttl_seconds=rule.ttl_seconds)
+            return True
         if rule.mode == "per_tool_call":
-            tool_path = rule.metadata.get("tool_call_id_path")
-            stored = {}
-            for value in values:
-                tool_ids = extract_path(value, tool_path) if tool_path else []
-                if tool_ids:
-                    stored[str(tool_ids[0])] = value
-            await self.store.set(cache_key, stored)
-            return
+            stored = _tool_call_values(rule, payload, values)
+            if not stored:
+                operation.skipped = True
+                operation.reason = "tool_call_id_not_found"
+                return False
+            operation.matched = len(stored)
+            operation.sample_values = _sample_values(list(stored.values()))
+            await self.store.set(cache_key, stored, ttl_seconds=rule.ttl_seconds)
+            return True
         raise ValueError(f"Unsupported field-cache mode: {rule.mode}")
+
+    def _injection_value(self, rule: FieldCacheRule, cached: Any, payload: Any, context: FieldCacheContext, operation: FieldCacheOperation) -> Any:
+        """Select the cached value to inject for the rule's mode.
+
+        Per-tool-call maps require a current tool-call ID so the engine never
+        injects an arbitrary provider signature into the wrong tool result.
+        """
+
+        if rule.mode == "per_tool_call":
+            if not isinstance(cached, dict):
+                operation.skipped = True
+                operation.reason = "invalid_tool_call_cache"
+                return None
+            ids = _injection_tool_ids(rule, payload, context)
+            if not ids:
+                operation.skipped = True
+                operation.reason = "tool_call_id_not_found"
+                return None
+            matches = [cached[str(tool_id)] for tool_id in ids if str(tool_id) in cached]
+            if not matches:
+                operation.skipped = True
+                operation.reason = "tool_call_cache_miss"
+                return None
+            if rule.inject and rule.inject.as_list:
+                return matches
+            if len(matches) == 1:
+                return matches[0]
+            operation.skipped = True
+            operation.reason = "ambiguous_tool_call_values"
+            return None
+        if rule.inject and (rule.inject.as_list or rule.mode == "all"):
+            return cached if isinstance(cached, list) else [cached]
+        return _last_value(cached)
 
     def _trace(
         self,
@@ -272,6 +320,74 @@ def _last_value(value: Any) -> Any:
     if isinstance(value, list):
         return value[-1] if value else None
     return value
+
+
+def _turn_values(rule: FieldCacheRule, payload: Any, role: str) -> list[Any]:
+    """Return values from the latest turn matching `role`.
+
+    Rules can provide explicit turn paths for provider-specific payloads. The
+    default handles the common `messages[*]` shape used by OpenAI-compatible and
+    Responses-like requests.
+    """
+
+    container_path = rule.metadata.get("turn_container_path", "messages")
+    role_path = rule.metadata.get("turn_role_path", "role")
+    value_path = rule.metadata.get("turn_value_path") or _message_relative_path(rule.path, container_path)
+    if not value_path:
+        return []
+    turns = extract_path(payload, str(container_path))
+    if len(turns) == 1 and isinstance(turns[0], list):
+        turns = turns[0]
+    latest: list[Any] = []
+    for turn in turns:
+        roles = extract_path(turn, str(role_path))
+        if roles and str(roles[0]) == role:
+            values = extract_path(turn, str(value_path))
+            if values:
+                latest = values
+    return latest
+
+
+def _message_relative_path(path: str, container_path: str) -> Optional[str]:
+    prefixes = (f"{container_path}.*.", f"{container_path}[-1].")
+    for prefix in prefixes:
+        if path.startswith(prefix):
+            return path[len(prefix) :]
+    return None
+
+
+def _tool_call_values(rule: FieldCacheRule, payload: Any, values: list[Any]) -> dict[str, Any]:
+    """Correlate cached values to provider tool-call IDs."""
+
+    container_path = rule.metadata.get("tool_container_path")
+    tool_id_path = rule.metadata.get("tool_call_id_path")
+    tool_value_path = rule.metadata.get("tool_value_path")
+    stored: dict[str, Any] = {}
+    if container_path and tool_value_path:
+        containers = extract_path(payload, str(container_path))
+        if len(containers) == 1 and isinstance(containers[0], list):
+            containers = containers[0]
+        for container in containers:
+            tool_ids = extract_path(container, str(tool_id_path)) if tool_id_path else []
+            tool_values = extract_path(container, str(tool_value_path))
+            if tool_ids and tool_values:
+                stored[str(tool_ids[0])] = tool_values[-1]
+        return stored
+    for value in values:
+        tool_ids = extract_path(value, str(tool_id_path)) if tool_id_path else []
+        if tool_ids:
+            stored[str(tool_ids[0])] = value
+    return stored
+
+
+def _injection_tool_ids(rule: FieldCacheRule, payload: Any, context: FieldCacheContext) -> list[str]:
+    configured = context.metadata.get("tool_call_id")
+    if configured:
+        return [str(configured)]
+    inject_path_value = rule.metadata.get("inject_tool_call_id_path")
+    if inject_path_value:
+        return [str(value) for value in extract_path(payload, str(inject_path_value))]
+    return []
 
 
 def _trace_direction(pass_name: str, source: str, metadata: dict[str, Any]) -> str:

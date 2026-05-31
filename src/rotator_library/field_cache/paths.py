@@ -103,12 +103,14 @@ def _extract_token(value: Any, token: PathToken) -> list[Any]:
     raise FieldCachePathError(f"Unknown path token: {token}")
 
 
-def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_only: bool = False) -> bool:
+def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_only: bool = False, insert: bool = False) -> bool:
     """Inject a value at a simple path, creating dict containers as needed.
 
     Wildcard injection is rejected because creating multiple branches can be
     ambiguous and provider-specific. List indexes must already exist; this keeps
     mutation predictable for message-tail use cases like `messages[-1].field`.
+    `insert=True` is intentionally limited to final list-index tokens so rules
+    cannot accidentally create provider-specific list structures.
     """
 
     tokens = parse_path(path)
@@ -124,6 +126,8 @@ def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_on
                 raise FieldCachePathError(f"Cannot inject key {token.value!r} into non-dict value")
             key = str(token.value)
             if is_last:
+                if insert:
+                    raise FieldCachePathError("insert=True requires a final list index token")
                 if when_missing_only and key in current:
                     return False
                 changed = current.get(key) != injected_value
@@ -140,6 +144,11 @@ def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_on
             if not (-len(current) <= list_index < len(current)):
                 raise FieldCachePathError(f"List index out of range for field-cache injection: {list_index}")
             if is_last:
+                if insert:
+                    if when_missing_only:
+                        return False
+                    current.insert(list_index, injected_value)
+                    return True
                 if when_missing_only and current[list_index] is not None:
                     return False
                 changed = current[list_index] != injected_value

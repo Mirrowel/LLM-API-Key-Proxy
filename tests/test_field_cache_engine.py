@@ -188,7 +188,7 @@ async def test_field_cache_trace_omits_raw_sample_values(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_field_cache_error_trace_omits_raw_payload_values(tmp_path) -> None:
     class FailingStore(InMemoryFieldCacheStore):
-        async def set(self, key, value, *, append=False):
+        async def set(self, key, value, *, ttl_seconds=None):
             raise RuntimeError("store failed")
 
     logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
@@ -262,6 +262,17 @@ async def test_provider_cache_field_store_wraps_json_string_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_memory_store_expires_ttl_values() -> None:
+    now = 100.0
+    store = InMemoryFieldCacheStore(clock=lambda: now)
+
+    await store.set("key", "value", ttl_seconds=5)
+    assert await store.get("key") == "value"
+    now = 106.0
+    assert await store.get("key") is None
+
+
+@pytest.mark.asyncio
 async def test_in_memory_store_returns_deep_copies() -> None:
     store = InMemoryFieldCacheStore()
     await store.set("key", {"nested": []})
@@ -269,3 +280,135 @@ async def test_in_memory_store_returns_deep_copies() -> None:
     value["nested"].append("mutated")
 
     assert await store.get("key") == {"nested": []}
+
+
+@pytest.mark.asyncio
+async def test_last_user_turn_uses_latest_user_message() -> None:
+    rule = FieldCacheRule(
+        name="user_signature",
+        source="request",
+        path="messages.*.metadata.signature",
+        mode="last_user_turn",
+        inject=FieldCacheInjection(target="request", path="metadata.signature"),
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule])
+
+    operations = await engine.extract(
+        "request",
+        {
+            "messages": [
+                {"role": "user", "metadata": {"signature": "first-user"}},
+                {"role": "assistant", "metadata": {"signature": "assistant"}},
+                {"role": "user", "metadata": {"signature": "last-user"}},
+            ]
+        },
+        _context(session_id=None),
+    )
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
+
+    assert operations[0].changed is True
+    assert updated["metadata"]["signature"] == "last-user"
+
+
+@pytest.mark.asyncio
+async def test_last_assistant_turn_skips_without_turn_context() -> None:
+    rule = FieldCacheRule(
+        name="assistant_signature",
+        source="response",
+        path="choices.*.message.signature",
+        mode="last_assistant_turn",
+        inject=FieldCacheInjection(target="request", path="metadata.signature"),
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule])
+
+    operations = await engine.extract("response", {"choices": [{"message": {"signature": "sig"}}]}, _context(session_id=None))
+
+    assert operations[0].skipped is True
+    assert operations[0].reason == "turn_context_not_found"
+
+
+@pytest.mark.asyncio
+async def test_turn_mode_uses_metadata_configured_relative_paths() -> None:
+    rule = FieldCacheRule(
+        name="assistant_signature",
+        source="response",
+        path="unused.global.path",
+        mode="last_assistant_turn",
+        inject=FieldCacheInjection(target="request", path="metadata.signature"),
+        allow_missing_session=True,
+        metadata={"turn_container_path": "messages", "turn_role_path": "kind", "turn_value_path": "parts.*.signature"},
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract(
+        "response",
+        {"messages": [{"kind": "assistant", "parts": [{"signature": "first"}]}, {"kind": "assistant", "parts": [{"signature": "second"}]}]},
+        _context(session_id=None),
+    )
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
+
+    assert updated["metadata"]["signature"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_per_tool_call_correlates_sibling_id_and_value_for_injection() -> None:
+    rule = FieldCacheRule(
+        name="tool_signature",
+        source="response",
+        path="tool_calls.*.signature",
+        mode="per_tool_call",
+        inject=FieldCacheInjection(target="request", path="metadata.signature"),
+        allow_missing_session=True,
+        metadata={
+            "tool_container_path": "tool_calls",
+            "tool_call_id_path": "id",
+            "tool_value_path": "signature",
+        },
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"tool_calls": [{"id": "call_a", "signature": "sig-a"}, {"id": "call_b", "signature": "sig-b"}]}, _context(session_id=None))
+    updated, operations = await engine.inject("request", {"metadata": {}}, _context(session_id=None, metadata={"tool_call_id": "call_b"}))
+
+    assert operations[0].hit is True
+    assert updated["metadata"]["signature"] == "sig-b"
+
+
+@pytest.mark.asyncio
+async def test_per_tool_call_skips_when_current_tool_id_is_ambiguous() -> None:
+    rule = FieldCacheRule(
+        name="tool_signature",
+        source="response",
+        path="tool_calls.*",
+        mode="per_tool_call",
+        inject=FieldCacheInjection(target="request", path="metadata.signature"),
+        allow_missing_session=True,
+        metadata={"tool_call_id_path": "id"},
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"tool_calls": [{"id": "call_a", "signature": "sig-a"}]}, _context(session_id=None))
+    updated, operations = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
+
+    assert operations[0].skipped is True
+    assert operations[0].reason == "tool_call_id_not_found"
+    assert updated == {"metadata": {}}
+
+
+@pytest.mark.asyncio
+async def test_insert_injection_adds_list_entry() -> None:
+    rule = FieldCacheRule(
+        name="prefix_message",
+        source="response",
+        path="message",
+        inject=FieldCacheInjection(target="request", path="messages.0", insert=True),
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"message": {"role": "system", "content": "cached"}}, _context(session_id=None))
+    updated, _ = await engine.inject("request", {"messages": [{"role": "user", "content": "hi"}]}, _context(session_id=None))
+
+    assert updated["messages"] == [{"role": "system", "content": "cached"}, {"role": "user", "content": "hi"}]
