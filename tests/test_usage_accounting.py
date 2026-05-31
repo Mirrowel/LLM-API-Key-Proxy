@@ -66,6 +66,12 @@ def test_reference_request_cost_usd_is_preserved() -> None:
     assert record.provider_reported_cost == 0.019
 
 
+def test_top_level_estimated_cost_is_preserved() -> None:
+    record = extract_usage_record({"usage": {"prompt_tokens": 1, "completion_tokens": 1}, "estimated_cost": 0.027})
+
+    assert record.provider_reported_cost == 0.027
+
+
 def test_structured_cost_breakdown_without_total_is_summed() -> None:
     record = extract_usage_record(
         {
@@ -94,7 +100,7 @@ def test_reference_extended_cost_breakdown_aliases_are_summed() -> None:
                     "audio_input_cost": 0.004,
                     "data_storage_cost": 0.005,
                     "estimated_cost": 0.006,
-                    "cost_in_usd_ticks": 0.007,
+                    "cost_in_usd_ticks": 70_000_000,
                 },
             }
         }
