@@ -55,6 +55,20 @@ class EventErrorStreamingClient:
         return chunks()
 
 
+class FailingStore:
+    async def save(self, response):
+        raise RuntimeError("store failed Authorization: Bearer secret-token")
+
+    async def get(self, response_id):
+        return None
+
+    async def delete(self, response_id):
+        return False
+
+    async def list_input_items(self, response_id):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_stream_response_emits_responses_sse_events_and_stores_final_response() -> None:
     store = InMemoryResponsesStore()
@@ -166,6 +180,48 @@ async def test_stream_events_can_store_in_progress_state() -> None:
 
     assert stored is not None
     assert stored.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_store_failures_emit_store_specific_trace(tmp_path) -> None:
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    service = ResponsesService(store=FailingStore())
+
+    with pytest.raises(RuntimeError):
+        _ = [
+            chunk
+            async for chunk in service.stream_response(
+                {"model": "gpt-test", "input": "Hello", "stream": True},
+                FakeStreamingClient(),
+                transaction_logger=logger,
+            )
+        ]
+
+    entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
+    assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_response" for entry in errors)
+    assert "secret-token" not in json.dumps(errors)
+
+
+@pytest.mark.asyncio
+async def test_stream_current_state_store_failures_emit_store_specific_trace(tmp_path) -> None:
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    service = ResponsesService(store=FailingStore(), store_settings=ResponsesStoreSettings(store_in_progress=True))
+
+    with pytest.raises(RuntimeError):
+        _ = [
+            event
+            async for event in service.stream_events(
+                {"model": "gpt-test", "input": "Hello", "stream": True},
+                FakeStreamingClient(),
+                transaction_logger=logger,
+            )
+        ]
+
+    entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
+    assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_current_state" for entry in errors)
+    assert "secret-token" not in json.dumps(errors)
 
 
 @pytest.mark.asyncio

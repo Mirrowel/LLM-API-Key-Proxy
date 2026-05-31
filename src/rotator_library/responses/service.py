@@ -300,7 +300,7 @@ class ResponsesService:
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             _record_responses_session_anchor(session_info, completed)
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
-            stored = await self._store_stream_response(stream_request, completed, parent, session_info=session_info)
+            stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info)
             if stored:
                 self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
             else:
@@ -333,7 +333,7 @@ class ResponsesService:
             if state.output_text:
                 failed["output"] = [output_item_done_payload(state)["item"]]
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
-            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, session_info=session_info)
+            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info)
             if stored:
                 self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("id"), "status": "failed"}, direction="metadata", stage="final")
             self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": transport}, scrub_strings=True)
@@ -498,13 +498,19 @@ class ResponsesService:
         parent: Optional[StoredResponse],
         *,
         failed: bool = False,
+        transaction_logger: Optional[Any] = None,
         session_info: Optional[dict[str, Any]] = None,
     ) -> bool:
         if not raw_request.get("store", True):
             return False
         if failed and not self.store_settings.store_failed:
             return False
-        await self.store.save(self._stored_response(raw_request, response_payload, parent, session_info=session_info))
+        stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+        try:
+            await self.store.save(stored)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_store_stream_response", exc, stored.to_dict())
+            raise
         return True
 
     async def _store_stream_current_state(
@@ -520,7 +526,12 @@ class ResponsesService:
 
         if not self.store_settings.store_in_progress or not raw_request.get("store", True):
             return False
-        await self.store.save(self._stored_response(raw_request, response_payload, parent, session_info=session_info))
+        stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+        try:
+            await self.store.save(stored)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_store_stream_current_state", exc, stored.to_dict())
+            raise
         self._trace(
             transaction_logger,
             "responses_stored_stream_current_state",
