@@ -20,6 +20,8 @@ class StreamingErrorDecision:
     action: str
     start_provider_cooldown: bool = False
     provider_cooldown_duration: int = 0
+    provider_cooldown_scope: str = "provider"
+    provider_cooldown_model: str | None = None
     reason: str = ""
 
 
@@ -35,6 +37,7 @@ def decide_streaming_error_action(
     provider_cooldown_default_seconds: int,
     cooldown_on_quota: bool = False,
     allow_reasoning_only_retry: bool = False,
+    model: str | None = None,
 ) -> StreamingErrorDecision:
     """Classify a stream failure without sleeping or mutating state.
 
@@ -51,6 +54,8 @@ def decide_streaming_error_action(
         provider_cooldown_default_seconds=provider_cooldown_default_seconds,
         cooldown_on_quota=cooldown_on_quota,
         last_streamed_chunk=last_streamed_chunk,
+        model=model,
+        original_error=error,
     )
     if not should_rotate_on_error(classified):
         return _decision(classified, "fail", cooldown, "non_rotatable")
@@ -69,6 +74,8 @@ def _cooldown_decision(
     provider_cooldown_default_seconds: int,
     cooldown_on_quota: bool,
     last_streamed_chunk: str | None,
+    model: str | None,
+    original_error: Exception,
 ) -> ProviderCooldownDecision:
     if is_visible_stream_output(last_streamed_chunk):
         return ProviderCooldownDecision(False, reason="visible_output")
@@ -78,6 +85,8 @@ def _cooldown_decision(
         provider_cooldown_min_seconds=provider_cooldown_min_seconds,
         default_duration=provider_cooldown_default_seconds,
         cooldown_on_quota=cooldown_on_quota,
+        model=model,
+        original_error=original_error,
     )
 
 
@@ -92,5 +101,7 @@ def _decision(
         action=action,
         start_provider_cooldown=cooldown.should_start,
         provider_cooldown_duration=cooldown.duration,
+        provider_cooldown_scope=cooldown.scope,
+        provider_cooldown_model=cooldown.model,
         reason=reason if not cooldown.should_start else f"{reason};cooldown:{cooldown.reason}",
     )
