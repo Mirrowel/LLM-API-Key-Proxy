@@ -55,7 +55,7 @@ def test_codex_native_operation_model_and_stream_support() -> None:
 
     assert provider.get_native_operation("gpt-5.1-codex", {}, stream=False) == "responses"
     assert provider.normalize_native_model("codex/gpt-5.1-codex") == "gpt-5.1-codex"
-    assert provider.supports_native_streaming("gpt-5.1-codex", operation="responses") is True
+    assert provider.supports_native_streaming("gpt-5.1-codex", operation="responses") is False
     assert provider.supports_native_streaming("gpt-5.1-codex", operation="chat") is False
 
 

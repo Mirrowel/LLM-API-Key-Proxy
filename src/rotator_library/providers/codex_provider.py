@@ -23,7 +23,7 @@ class CodexProvider(ProviderInterface):
     provider_env_name = "codex"
     protocol_name = "responses"
     adapter_names: tuple[str, ...] = ()
-    native_streaming_supported = True
+    native_streaming_supported = False
     field_cache_rules = (
         FieldCacheRule(
             name="codex_previous_response_id",
@@ -71,9 +71,9 @@ class CodexProvider(ProviderInterface):
         return model.split("/", 1)[1] if model.startswith("codex/") else model
 
     def supports_native_streaming(self, model: str = "", operation: str = "responses") -> bool:
-        """Return true for tested Responses stream payloads."""
+        """Return false until the generic native stream wrapper is compatible."""
 
-        return operation == "responses"
+        return False
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
         """Convert chat-style proxy input into Responses API input.

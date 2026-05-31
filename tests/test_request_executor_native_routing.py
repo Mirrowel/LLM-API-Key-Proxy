@@ -339,8 +339,25 @@ async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -
     assert response["candidates"][0]["content"]["parts"][0]["text"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:streamGenerateContent?alt=sse"
     assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
-    assert http_client.calls[0]["json"]["contents"][0]["parts"][0]["text"] == "hi"
-    assert "messages" not in http_client.calls[0]["json"]
+    assert http_client.calls[0]["json"]["request"]["contents"][0]["parts"][0]["text"] == "hi"
+    assert http_client.calls[0]["json"]["requestType"] == "CHAT_COMPLETION"
+    assert "requestId" in http_client.calls[0]["json"]
+    assert "messages" not in http_client.calls[0]["json"]["request"]
+
+
+def test_native_request_payload_drops_litellm_only_fields() -> None:
+    payload = executor_module._native_request_payload(
+        {
+            "model": "provider/gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "custom_llm_provider": "openai",
+            "api_base": "https://litellm-only.test",
+            "transaction_context": {"id": "trace"},
+            "litellm_call_id": "call",
+        }
+    )
+
+    assert payload == {"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]}
 
 
 def test_native_context_raises_on_invalid_field_cache_config(monkeypatch, tmp_path) -> None:

@@ -29,7 +29,7 @@ class CopilotProvider(ProviderInterface):
     adapter_names = ("suppress_developer_role",)
     field_cache_rules: tuple = ()
     default_rotation_mode = "sequential"
-    native_streaming_supported = True
+    native_streaming_supported = False
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """Fetch Copilot-visible models with a safe fallback list."""
@@ -69,9 +69,9 @@ class CopilotProvider(ProviderInterface):
         return model.split("/", 1)[1] if model.startswith("copilot/") else model
 
     def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
-        """Return true for OpenAI Chat SSE streams."""
+        """Return false until the generic native stream wrapper is compatible."""
 
-        return operation == "chat"
+        return False
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
         """Return the Copilot endpoint for a native operation."""

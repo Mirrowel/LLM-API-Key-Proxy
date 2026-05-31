@@ -677,7 +677,7 @@ class RequestExecutor:
             raise RoutingExecutionError(f"Provider {provider} has no native endpoint/header helpers")
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
-        request_payload = dict(raw_request or {})
+        request_payload = _native_request_payload(raw_request or {})
         if native_model:
             request_payload["model"] = native_model
         operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
@@ -2296,6 +2296,34 @@ def _strip_provider_prefix(model: str) -> str:
     """Return model without the proxy-facing provider prefix."""
 
     return model.split("/", 1)[1] if "/" in model else model
+
+
+_NATIVE_REQUEST_DROP_KEYS = {
+    "api_base",
+    "api_key",
+    "api_type",
+    "api_version",
+    "base_url",
+    "custom_llm_provider",
+    "drop_params",
+    "logger_fn",
+    "litellm_call_id",
+    "mock_response",
+    "organization",
+    "project",
+    "transaction_context",
+}
+
+
+def _native_request_payload(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return provider-visible kwargs for native protocol parsing.
+
+    Full executor calls prepare kwargs for LiteLLM before execution-mode routing.
+    Native providers must not receive LiteLLM-only routing, logging, or transport
+    controls because protocol adapters preserve unknown fields intentionally.
+    """
+
+    return {key: deepcopy(value) for key, value in kwargs.items() if key not in _NATIVE_REQUEST_DROP_KEYS and not key.startswith("litellm_")}
 
 
 def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
