@@ -307,8 +307,8 @@ class NativeProviderExecutor:
 def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -> Any:
     """Merge native stream usage, preserving raw provider cost when needed."""
 
-    selected = event_record if _usage_record_has_values(event_record) else base
-    if not _usage_record_has_values(selected) and _usage_record_has_values(raw_record):
+    selected = event_record if _usage_record_has_token_values(event_record) else base
+    if not _usage_record_has_token_values(selected) and _usage_record_has_token_values(raw_record):
         selected = raw_record
     if selected.provider_reported_cost is None and base.provider_reported_cost is not None:
         selected = replace(
@@ -336,6 +336,17 @@ def _usage_record_has_values(record: Any) -> bool:
         or record.cache_write_tokens
         or record.raw_total_tokens
         or record.provider_reported_cost is not None
+    )
+
+
+def _usage_record_has_token_values(record: Any) -> bool:
+    return bool(
+        record.input_tokens
+        or record.completion_tokens
+        or record.reasoning_tokens
+        or record.cache_read_tokens
+        or record.cache_write_tokens
+        or record.raw_total_tokens
     )
 
 

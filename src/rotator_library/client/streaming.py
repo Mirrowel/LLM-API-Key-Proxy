@@ -510,8 +510,9 @@ class StreamingHandler:
         else:
             chunk_dict = chunk
 
-        # Extract metadata before modifying
-        usage = chunk_dict.get("usage")
+        # Extract metadata before modifying. Providers can report cost as a
+        # sibling of `usage`, so keep those fields attached for normalization.
+        usage = _usage_from_chunk_dict(chunk_dict)
         finish_reason = None
         chunk_has_tool_calls = False
 
@@ -565,7 +566,7 @@ class StreamingHandler:
                 # INTERMEDIATE CHUNK: Never emit finish_reason
                 choice["finish_reason"] = None
 
-        usage = chunk_dict.get("usage")
+        usage = _usage_from_chunk_dict(chunk_dict)
         if isinstance(usage, dict):
             normalize_usage_for_response(usage, model)
 
@@ -750,6 +751,21 @@ def _usage_from_sse_string(chunk: str) -> Optional[dict[str, Any]]:
     for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
         if key in data and key not in merged:
             merged[key] = data[key]
+    return merged
+
+
+def _usage_from_chunk_dict(chunk: Any) -> Optional[dict[str, Any]]:
+    """Return dict chunk usage with top-level provider cost siblings."""
+
+    if not isinstance(chunk, dict):
+        return None
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    merged = dict(usage)
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+        if key in chunk and key not in merged:
+            merged[key] = chunk[key]
     return merged
 
 
