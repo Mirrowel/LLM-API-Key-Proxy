@@ -162,3 +162,27 @@ async def test_non_streaming_fallback_group_emits_routing_trace(tmp_path) -> Non
     assert "routing_target_attempt_failed" in pass_names
     assert "routing_fallback_selected" in pass_names
     assert "routing_target_attempt_succeeded" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_fallback_group_records_usage_only_on_successful_target() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+    recorded = []
+
+    async def fake_execute(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            raise ClassifiedFailure("rate_limit")
+        recorded.append(context.provider)
+        return {"id": "ok", "model": context.model}
+
+    executor._execute_non_streaming = MethodType(fake_execute, executor)
+
+    result = await executor._execute_non_streaming_with_fallback(
+        _context(routing_targets=(parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1")))
+    )
+
+    assert result == {"id": "ok", "model": "openai/gpt-5.1"}
+    assert attempts == ["codex", "openai"]
+    assert recorded == ["openai"]

@@ -402,8 +402,15 @@ def _chunk_text_delta(chunk: dict[str, Any]) -> str:
 def _usage_to_responses_stream(usage: Any) -> Any:
     if not isinstance(usage, dict):
         return usage
-    return {
+    result = {
         "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
         "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
         "total_tokens": usage.get("total_tokens", 0),
     }
+    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    if isinstance(prompt_details, dict):
+        result["input_tokens_details"] = {"cached_tokens": prompt_details.get("cached_tokens", 0)}
+    completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
+    if isinstance(completion_details, dict):
+        result["output_tokens_details"] = {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)}
+    return result

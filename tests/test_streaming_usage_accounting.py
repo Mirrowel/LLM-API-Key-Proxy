@@ -30,6 +30,11 @@ async def _usage_chunks():
     }
 
 
+async def _zero_usage_chunks():
+    yield {"id": "chunk_1", "choices": [{"delta": {"content": "hi"}}]}
+    yield {"id": "chunk_2", "choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+
 @pytest.mark.asyncio
 async def test_streaming_usage_uses_normalized_accounting_and_trace(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
@@ -59,3 +64,16 @@ async def test_streaming_usage_skip_cost_returns_zero() -> None:
     _ = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "gpt-test", cred_context=cred_context, skip_cost_calculation=True)]
 
     assert cred_context.success_kwargs["approx_cost"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_streaming_without_usage_still_marks_success_with_zero_usage() -> None:
+    cred_context = FakeCredentialContext()
+
+    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_zero_usage_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+
+    assert cred_context.success_kwargs["prompt_tokens"] == 0
+    assert cred_context.success_kwargs["completion_tokens"] == 0
+    assert cred_context.success_kwargs["thinking_tokens"] == 0
+    assert cred_context.success_kwargs["prompt_tokens_cache_read"] == 0
+    assert cred_context.success_kwargs["prompt_tokens_cache_write"] == 0

@@ -20,8 +20,6 @@ import re
 import time
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
-import litellm
-
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 from ..core.utils import normalize_usage_for_response
@@ -502,26 +500,6 @@ class StreamingHandler:
                 pass
 
         return None
-
-    def _calculate_stream_cost(
-        self,
-        model: str,
-        prompt_tokens: int,
-        completion_tokens: int,
-    ) -> float:
-        try:
-            model_info = litellm.get_model_info(model)
-            input_cost = model_info.get("input_cost_per_token")
-            output_cost = model_info.get("output_cost_per_token")
-            total_cost = 0.0
-            if input_cost:
-                total_cost += prompt_tokens * input_cost
-            if output_cost:
-                total_cost += completion_tokens * output_cost
-            return total_cost
-        except Exception as exc:
-            lib_logger.debug(f"Stream cost calculation failed for {model}: {exc}")
-            return 0.0
 
     def _calculate_stream_cost_breakdown(
         self,
