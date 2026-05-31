@@ -276,6 +276,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     protocol_name: Optional[str] = None
     adapter_names: Tuple[str, ...] = ()
     field_cache_rules: Tuple[Any, ...] = ()
+    native_streaming_supported: bool = False
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -361,6 +362,16 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
 
         return tuple(self.field_cache_rules)
+
+    def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
+        """Return whether this provider explicitly supports native streaming.
+
+        The default is intentionally false. Phase 8 keeps live streaming
+        conservative: providers must opt in before routed streaming can use the
+        native stream executor instead of current custom/LiteLLM behavior.
+        """
+
+        return self.native_streaming_supported
 
     async def acompletion(
         self, client: httpx.AsyncClient, **kwargs
