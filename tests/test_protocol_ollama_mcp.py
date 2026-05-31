@@ -1,18 +1,23 @@
 from __future__ import annotations
 
-from rotator_library.protocols import OPERATION_MCP, OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, get_protocol
+from rotator_library.protocols import OPERATION_EMBEDDINGS, OPERATION_MCP, OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, get_protocol
 
 
 def test_ollama_chat_generate_and_stream_shapes() -> None:
     adapter = get_protocol("ollama")
     chat = adapter.parse_request({"model": "llama3", "messages": [{"role": "user", "content": "hi"}], "stream": True})
     generate = adapter.parse_request({"model": "llama3", "prompt": "write", "options": {"temperature": 0.1}})
+    embeddings = adapter.parse_request({"model": "llama3", "operation": OPERATION_EMBEDDINGS, "prompt": "embed this"})
+    final_chat = adapter.parse_response({"model": "llama3", "message": {"role": "assistant", "content": "hello"}, "done": True})
     chunk = adapter.parse_stream_event('{"model":"llama3","response":"he","done":false,"eval_count":2}')
 
     assert chat.operation == OPERATION_OLLAMA_CHAT
     assert adapter.build_request(chat)["messages"][0]["content"] == "hi"
     assert generate.operation == OPERATION_OLLAMA_GENERATE
     assert adapter.build_request(generate)["prompt"] == "write"
+    assert embeddings.operation == OPERATION_EMBEDDINGS
+    assert adapter.build_request(embeddings)["prompt"] == "embed this"
+    assert final_chat.messages[0].content[0].text == "hello"
     assert chunk.delta is not None
     assert chunk.delta.content[0].text == "he"
     assert chunk.usage is not None
