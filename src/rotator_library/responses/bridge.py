@@ -187,12 +187,32 @@ def _tool_to_chat(tool: ToolDefinition) -> dict[str, Any]:
 def _parent_output_to_messages(output: list[Any]) -> list[dict[str, Any]]:
     messages = []
     for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if not isinstance(item, dict):
             continue
-        text = _responses_content_to_text(item.get("content") or [])
-        if text:
-            messages.append({"role": item.get("role") or "assistant", "content": text})
+        if item.get("type") == "message":
+            text = _responses_content_to_text(item.get("content") or [])
+            if text:
+                messages.append({"role": item.get("role") or "assistant", "content": text})
+        elif item.get("type") in {"function_call", "custom_tool_call"}:
+            tool_call = _responses_tool_call_to_chat(item)
+            if tool_call:
+                messages.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
     return messages
+
+
+def _responses_tool_call_to_chat(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a stored Responses tool-call item to OpenAI chat shape."""
+
+    call_id = item.get("call_id") or item.get("id")
+    name = item.get("name") or item.get("tool_name") or item.get("type")
+    arguments = item.get("arguments", item.get("input", ""))
+    if call_id is None or name is None:
+        return None
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": str(name), "arguments": arguments if isinstance(arguments, str) else serialize_value(arguments)},
+    }
 
 
 def _parent_request_to_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
