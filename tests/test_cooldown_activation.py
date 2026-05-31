@@ -36,6 +36,41 @@ async def test_start_cooldown_extends_but_does_not_shorten() -> None:
     assert after_longer > after_shorter
 
 
+@pytest.mark.asyncio
+async def test_model_cooldown_is_independent_from_provider_cooldown() -> None:
+    manager = CooldownManager()
+
+    await manager.start_scoped_cooldown("provider", 30, model="model-a", scope="model", reason="capacity")
+
+    assert await manager.is_scoped_cooling_down("provider", model="model-a", scope="model") is True
+    assert await manager.is_scoped_cooling_down("provider", model="model-b", scope="model") is False
+    assert await manager.is_cooling_down("provider") is False
+
+
+@pytest.mark.asyncio
+async def test_max_remaining_uses_provider_or_model_scope() -> None:
+    manager = CooldownManager()
+
+    await manager.start_cooldown("provider", 1)
+    await manager.start_scoped_cooldown("provider", 30, model="model-a", scope="model")
+
+    assert await manager.get_max_remaining("provider", model="model-a") > 20
+    assert 0 < await manager.get_max_remaining("provider", model="model-b") <= 1
+
+
+@pytest.mark.asyncio
+async def test_cooldown_snapshot_reports_scopes() -> None:
+    manager = CooldownManager()
+
+    await manager.start_scoped_cooldown("provider", 30, model="model-a", scope="model", reason="capacity")
+    snapshot = await manager.snapshot()
+
+    assert snapshot[0].provider == "provider"
+    assert snapshot[0].scope == "model"
+    assert snapshot[0].model == "model-a"
+    assert snapshot[0].reason == "capacity"
+
+
 def _classified(error_type: str, retry_after=None) -> ClassifiedError:
     return ClassifiedError(error_type, original_exception=Exception(error_type), retry_after=retry_after)
 
