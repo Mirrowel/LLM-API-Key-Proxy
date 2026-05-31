@@ -1196,6 +1196,12 @@ class RequestExecutor:
                                     last_exception = e
                                     original = getattr(e, "data", e)
                                     classified = classify_error(original, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk
+                                    ):
+                                        await self._maybe_start_provider_cooldown(
+                                            provider, classified, context=context
+                                        )
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1281,6 +1287,12 @@ class RequestExecutor:
                                 except (RateLimitError, httpx.HTTPStatusError) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk
+                                    ):
+                                        await self._maybe_start_provider_cooldown(
+                                            provider, classified, context=context
+                                        )
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1356,6 +1368,12 @@ class RequestExecutor:
                                 ) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk
+                                    ):
+                                        await self._maybe_start_provider_cooldown(
+                                            provider, classified, context=context
+                                        )
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1392,6 +1410,12 @@ class RequestExecutor:
                                 except Exception as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk
+                                    ):
+                                        await self._maybe_start_provider_cooldown(
+                                            provider, classified, context=context
+                                        )
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -2047,3 +2071,9 @@ def _stream_chunk_is_visible_output(chunk: str) -> bool:
         if isinstance(data, dict) and "error" in data:
             return False
     return True
+
+
+def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str]) -> bool:
+    """Return whether a streaming failure occurred before visible output."""
+
+    return last_streamed_chunk is None or not _stream_chunk_is_visible_output(last_streamed_chunk)
