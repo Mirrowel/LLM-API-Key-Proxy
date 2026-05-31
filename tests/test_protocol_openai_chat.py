@@ -135,6 +135,38 @@ def test_openai_chat_response_extracts_usage_cost_and_reasoning() -> None:
     assert unified.usage.cost is not None
     assert unified.usage.cost.provider_reported_cost == 0.01
 
+    formatted = adapter.format_response(unified)
+    assert formatted["usage"]["prompt_tokens"] == 10
+    assert formatted["usage"]["completion_tokens"] == 5
+    assert formatted["usage"]["total_tokens"] == 18
+    assert formatted["usage"]["prompt_tokens_details"] == {"cached_tokens": 3, "cache_creation_tokens": 2}
+    assert formatted["usage"]["completion_tokens_details"] == {"reasoning_tokens": 3}
+    assert formatted["usage"]["cost_details"]["total_cost"] == 0.01
+    assert "input_tokens" not in formatted["usage"]
+    assert "output_tokens" not in formatted["usage"]
+
+
+def test_openai_legacy_function_call_is_unified_and_round_trips() -> None:
+    adapter = get_protocol("openai_chat")
+    raw = {
+        "model": "openai/gpt-test",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": None,
+                "function_call": {"name": "lookup", "arguments": "{\"q\":\"x\"}"},
+            }
+        ],
+    }
+
+    unified = adapter.parse_request(raw)
+    rebuilt = adapter.build_request(unified)
+
+    assert unified.messages[0].tool_calls[0].name == "lookup"
+    assert unified.messages[0].tool_calls[0].extra["legacy_function_call"] is True
+    assert rebuilt["messages"][0]["function_call"] == {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+    assert "tool_calls" not in rebuilt["messages"][0]
+
 
 def test_openai_chat_stream_event_parses_sse_delta_and_done() -> None:
     adapter = get_protocol("openai_chat")

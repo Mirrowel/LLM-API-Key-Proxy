@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
-from ..protocols import get_protocol, serialize_value
+from ..protocols import ProtocolError, get_protocol, serialize_value
 from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
@@ -37,6 +37,7 @@ class NativeProviderExecutor:
 
         logger = context.transaction_logger
         protocol = get_protocol(context.protocol_name)
+        self._ensure_supported_operation(protocol, context)
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
@@ -113,6 +114,7 @@ class NativeProviderExecutor:
 
         logger = context.transaction_logger
         protocol = get_protocol(context.protocol_name)
+        self._ensure_supported_operation(protocol, context)
         self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
@@ -198,6 +200,19 @@ class NativeProviderExecutor:
                 **(metadata or {}),
             },
             snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _ensure_supported_operation(protocol: Any, context: NativeProviderContext) -> None:
+        """Fail before transport when provider and protocol operations disagree."""
+
+        if protocol.supports_operation(context.operation):
+            return
+        raise ProtocolError(
+            f"provider {context.provider} requested unsupported operation {context.operation!r}",
+            protocol=protocol.name,
+            pass_name="native_operation_check",
+            payload={"provider": context.provider, "model": context.model, "operation": context.operation},
         )
 
 

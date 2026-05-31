@@ -80,6 +80,16 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
     assert unified.usage.cost is not None
     assert unified.usage.cost.provider_reported_cost == 0.02
 
+    formatted = adapter.format_response(unified)
+    assert formatted["usage"]["input_tokens"] == 10
+    assert formatted["usage"]["output_tokens"] == 5
+    assert formatted["usage"]["total_tokens"] == 18
+    assert formatted["usage"]["input_tokens_details"] == {"cached_tokens": 3}
+    assert formatted["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
+    assert formatted["usage"]["cost_details"]["total_cost"] == 0.02
+    assert "raw" not in formatted["usage"]
+    assert "extra" not in formatted["usage"]
+
 
 def test_responses_format_preserves_unknown_output_items() -> None:
     adapter = get_protocol("responses")

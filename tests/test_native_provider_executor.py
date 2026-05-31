@@ -6,6 +6,7 @@ import pytest
 
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from rotator_library.protocols import ProtocolError
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -186,3 +187,24 @@ async def test_native_provider_executor_logs_transform_errors(tmp_path) -> None:
 
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "transform_log_error" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_native_provider_executor_rejects_unsupported_operation_before_transport() -> None:
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        operation="embeddings",
+        endpoint="https://example.test/chat",
+    )
+    client = FakeHTTPClient({"id": "should_not_call"})
+
+    with pytest.raises(ProtocolError, match="unsupported operation"):
+        await NativeProviderExecutor().execute(
+            {"model": "gpt-test", "messages": []},
+            context,
+            NativeHTTPTransport(client),
+        )
+
+    assert client.calls == []
