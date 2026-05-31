@@ -43,6 +43,29 @@ def test_env_pricing_overrides_json_pricing() -> None:
     assert cost.input_cost == 40.0
 
 
+def test_invalid_env_pricing_falls_back_to_json_pricing() -> None:
+    config = load_config_from_mapping({"pricing": {"openai": {"gpt-test": {"input": 1.0}}}})
+    env = {env_price_key("openai", "gpt-test", "input"): "not-a-number"}
+
+    cost = CostCalculator(config=config, env=env, use_litellm_fallback=False).calculate(_usage(), model="openai/gpt-test")
+
+    assert cost.pricing_source == "json_config"
+    assert cost.input_cost == 10.0
+
+
+def test_mixed_invalid_env_pricing_uses_valid_components() -> None:
+    env = {
+        env_price_key("openai", "gpt-test", "input"): "not-a-number",
+        env_price_key("openai", "gpt-test", "output"): "2.0",
+    }
+
+    cost = CostCalculator(env=env, use_litellm_fallback=False).calculate(_usage(), model="openai/gpt-test")
+
+    assert cost.pricing_source == "env"
+    assert cost.input_cost == 0.0
+    assert cost.output_cost == 10.0
+
+
 def test_provider_pricing_beats_env_and_json_pricing() -> None:
     config = load_config_from_mapping({"pricing": {"openai": {"gpt-test": {"input": 1.0}}}})
     env = {env_price_key("openai", "gpt-test", "input"): "4.0"}

@@ -55,3 +55,15 @@ def test_json_route_rejects_unknown_group() -> None:
 
     with pytest.raises(RoutingConfigError):
         load_routing_config_from_env({}, config=experimental)
+
+
+def test_json_route_rejects_invalid_direct_target() -> None:
+    experimental = load_config_from_mapping({"routing": {"model_routes": {"code": "not-a-target"}}})
+
+    with pytest.raises(RoutingConfigError):
+        load_routing_config_from_env({}, config=experimental)
+
+
+def test_env_route_rejects_invalid_direct_target() -> None:
+    with pytest.raises(RoutingConfigError):
+        load_routing_config_from_env({"MODEL_ROUTE_CODE": "not-a-target"}, config=load_config_from_mapping({}))

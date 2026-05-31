@@ -330,7 +330,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         native protocol parsing/building.
         """
 
-        return self.protocol_name
+        configured = self._get_runtime_config(model).protocol_name
+        return configured or self.protocol_name
 
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.
@@ -340,7 +341,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         global adapter registry.
         """
 
-        return tuple(self.adapter_names)
+        configured = self._get_runtime_config(model).adapter_names
+        return tuple(configured) if configured is not None else tuple(self.adapter_names)
 
     def get_adapter_config(self, model: str = "") -> Dict[str, Dict[str, Any]]:
         """Return adapter-specific config keyed by adapter name.
@@ -350,7 +352,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         config loading and validation.
         """
 
-        return {}
+        return dict(self._get_runtime_config(model).adapter_config)
 
     def get_field_cache_rules(self, model: str = "") -> Tuple[Any, ...]:
         """Return field-cache rules for provider-specific protocol state.
@@ -361,7 +363,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         decides continuity and credential affinity.
         """
 
-        return tuple(self.field_cache_rules)
+        configured = self._get_runtime_config(model).field_cache_rules
+        return tuple(self.field_cache_rules) + tuple(configured)
 
     def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
         """Return whether this provider explicitly supports native streaming.
@@ -371,7 +374,31 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         native stream executor instead of current custom/LiteLLM behavior.
         """
 
-        return self.native_streaming_supported
+        configured = self._get_runtime_config(model).native_streaming_supported
+        if configured is None:
+            return self.native_streaming_supported
+        return bool(configured and self.supports_native_operation(model, operation))
+
+    def _get_runtime_config(self, model: str = "") -> Any:
+        """Return optional JSON runtime config for this provider.
+
+        The helper keeps config loading lazy so provider imports do not depend on
+        the experimental config layer during startup discovery.
+        """
+
+        from ..config.experimental import get_provider_runtime_config
+
+        return get_provider_runtime_config(self._provider_config_key(), model)
+
+    def _provider_config_key(self) -> str:
+        """Return the JSON providers-section key for this provider."""
+
+        if self.provider_env_name:
+            return self.provider_env_name.lower()
+        name = self.__class__.__name__
+        if name.endswith("Provider"):
+            name = name[: -len("Provider")]
+        return name.lower()
 
     def supports_native_operation(self, model: str = "", operation: str = "chat") -> bool:
         """Return whether this provider supports a native operation."""
@@ -757,12 +784,17 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Env format: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
         Set empty string to disable a default group.
         """
-        if not self.provider_env_name or not self.model_quota_groups:
-            return self.model_quota_groups
+        configured_groups = self._get_runtime_config().model_quota_groups
+        base_groups: QuotaGroupMap = {
+            group: list(models)
+            for group, models in (configured_groups if configured_groups is not None else self.model_quota_groups).items()
+        }
+        if not self.provider_env_name:
+            return base_groups
 
         result: QuotaGroupMap = {}
 
-        for group_name, default_models in self.model_quota_groups.items():
+        for group_name, default_models in base_groups.items():
             env_key = (
                 f"QUOTA_GROUPS_{self.provider_env_name.upper()}_{group_name.upper()}"
             )
