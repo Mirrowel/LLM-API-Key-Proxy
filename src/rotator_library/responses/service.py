@@ -90,7 +90,8 @@ class ResponsesService:
         )
 
         chat_response = await client.acompletion(request=request, **chat_kwargs)
-        self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
+        if transaction_logger:
+            self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
 
         response_payload = self.bridge.from_chat_response(chat_response, unified)
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
@@ -240,6 +241,7 @@ class ResponsesService:
             )
             self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": "sse"})
             yield formatter.format_event("response.completed", completed)
+            self._trace(transaction_logger, "stream_done_event", {"raw": formatter.done()}, direction="stream", stage="final", metadata={"transport": "sse"})
             yield formatter.done()
         except Exception as exc:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
@@ -255,6 +257,7 @@ class ResponsesService:
                 metadata={"transport": "sse", "failed": True},
             )
             yield formatter.format_event("response.failed", failed)
+            self._trace(transaction_logger, "stream_done_event", {"raw": formatter.done()}, direction="stream", stage="final", metadata={"transport": "sse", "failed": True})
             yield formatter.done()
 
     async def get_response(self, response_id: str) -> dict[str, Any]:

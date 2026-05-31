@@ -191,7 +191,7 @@ class ProviderTransforms:
                     credential_id=credential_id,
                     transport=transport,
                     changed_from_previous=(before != kwargs) if before is not None else None,
-                    metadata={"model_options": deepcopy(model_options), **trace_metadata},
+                    metadata={"model_options": deepcopy(model_options) if transaction_logger else None, **trace_metadata},
                 )
 
         # 4. Apply LiteLLM conversion if config available

@@ -262,7 +262,7 @@ class FieldCacheEngine:
         transaction_logger.log_transform_error(
             pass_name,
             error,
-            payload=payload,
+            payload=_payload_shape(payload),
             stage="adapter",
             metadata={"rule_name": rule.name, "path": rule.path, "mode": rule.mode},
         )
