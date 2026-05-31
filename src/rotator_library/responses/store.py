@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from .types import StoredResponse
@@ -85,6 +86,9 @@ class ProviderCacheResponsesStore:
 
     async def save(self, response: StoredResponse) -> None:
         await self._cache.store_async(self._key(response.id), json.dumps(response.to_dict(), ensure_ascii=False))
+        flush = getattr(self._cache, "_save_to_disk", None)
+        if callable(flush):
+            await flush()
 
     async def get(self, response_id: str) -> Optional[StoredResponse]:
         raw = await self._cache.retrieve_async(self._key(response_id))
@@ -113,3 +117,28 @@ class ProviderCacheResponsesStore:
     def _key(self, response_id: str) -> str:
         safe_id = response_id.replace("/", "_").replace("\\", "_").replace(":", "_")
         return f"{self._prefix}:{safe_id}"
+
+
+def create_configured_responses_store(*, config: Any = None, env: Any = None) -> ResponsesStore:
+    """Create the configured Responses store backend.
+
+    Memory remains the default. The provider-cache backend uses the existing JSON
+    cache implementation so durable storage does not require a new database.
+    """
+
+    from ..config.experimental import get_responses_store_runtime_settings, get_responses_store_settings
+    from ..providers.provider_cache import create_provider_cache
+
+    runtime = get_responses_store_runtime_settings(config=config, env=env)
+    settings = get_responses_store_settings(config=config, env=env)
+    if runtime.backend == "memory":
+        return InMemoryResponsesStore(max_items=settings.max_items)
+    cache_dir = Path(runtime.cache_dir) if runtime.cache_dir else None
+    provider_cache = create_provider_cache(
+        runtime.cache_name,
+        cache_dir=cache_dir,
+        memory_ttl_seconds=runtime.cache_memory_ttl_seconds,
+        disk_ttl_seconds=runtime.cache_disk_ttl_seconds,
+        env_prefix=f"{runtime.cache_name.upper().replace('-', '_')}_CACHE",
+    )
+    return ProviderCacheResponsesStore(provider_cache, prefix=runtime.cache_prefix)

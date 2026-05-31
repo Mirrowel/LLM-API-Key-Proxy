@@ -151,8 +151,43 @@ async def test_previous_response_id_loads_parent_context() -> None:
     await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client)
 
     assert client.calls[0]["messages"] == [
+        {"role": "user", "content": "Earlier"},
         {"role": "assistant", "content": "Earlier"},
         {"role": "user", "content": "Continue"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_previous_response_id_loads_full_lineage_oldest_first() -> None:
+    store = InMemoryResponsesStore()
+    await store.save(
+        StoredResponse(
+            id="resp_grandparent",
+            model="gpt-test",
+            status="completed",
+            request={"model": "gpt-test", "input": "First"},
+            response={"id": "resp_grandparent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First answer"}]}]},
+        )
+    )
+    await store.save(
+        StoredResponse(
+            id="resp_parent",
+            model="gpt-test",
+            status="completed",
+            request={"model": "gpt-test", "input": "Second", "previous_response_id": "resp_grandparent"},
+            response={"id": "resp_parent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second answer"}]}]},
+        )
+    )
+    client = FakeClient()
+
+    await ResponsesService(store=store).create_response({"model": "gpt-test", "input": "Third", "previous_response_id": "resp_parent"}, client)
+
+    assert client.calls[0]["messages"] == [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "First answer"},
+        {"role": "user", "content": "Second"},
+        {"role": "assistant", "content": "Second answer"},
+        {"role": "user", "content": "Third"},
     ]
 
 

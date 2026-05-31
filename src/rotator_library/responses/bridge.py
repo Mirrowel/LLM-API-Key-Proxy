@@ -53,6 +53,7 @@ class ResponsesBridge:
         unified: UnifiedRequest,
         *,
         parent_response: Optional[dict[str, Any]] = None,
+        parent_responses: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Convert a parsed Responses request to chat-completions kwargs."""
 
@@ -60,7 +61,11 @@ class ResponsesBridge:
         system_text = _blocks_to_text(unified.system)
         if system_text:
             messages.append({"role": "system", "content": system_text})
-        if parent_response:
+        if parent_responses is not None:
+            for parent in parent_responses:
+                messages.extend(_parent_request_to_messages(parent.get("request") or {}))
+                messages.extend(_parent_output_to_messages(parent.get("output") or parent.get("response", {}).get("output") or []))
+        elif parent_response:
             messages.extend(_parent_output_to_messages(parent_response.get("output") or []))
         messages.extend(_message_to_chat(message) for message in unified.messages)
         kwargs: dict[str, Any] = {
@@ -188,6 +193,35 @@ def _parent_output_to_messages(output: list[Any]) -> list[dict[str, Any]]:
         if text:
             messages.append({"role": item.get("role") or "assistant", "content": text})
     return messages
+
+
+def _parent_request_to_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replay convertible parent Responses input items as chat messages."""
+
+    if not isinstance(request, dict):
+        return []
+    protocol = ResponsesProtocol()
+    try:
+        unified = protocol.parse_request(request)
+    except Exception:
+        return _raw_input_to_messages(request.get("input"))
+    return [_message_to_chat(message) for message in unified.messages]
+
+
+def _raw_input_to_messages(value: Any) -> list[dict[str, Any]]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if isinstance(value, list):
+        messages: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict) and item.get("role") and item.get("content") is not None:
+                messages.append({"role": item.get("role"), "content": item.get("content")})
+        return messages
+    return []
 
 
 def _chat_message_to_output_items(message: dict[str, Any], index: int) -> list[dict[str, Any]]:

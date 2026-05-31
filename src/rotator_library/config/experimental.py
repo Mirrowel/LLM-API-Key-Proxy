@@ -85,6 +85,18 @@ class RetryRuntimeSettings:
     failure_history_max_entries: int = 200
 
 
+@dataclass(frozen=True)
+class ResponsesStoreRuntimeSettings:
+    """Runtime backend selection for Responses storage."""
+
+    backend: str = "memory"
+    cache_name: str = "responses"
+    cache_prefix: str = "responses"
+    cache_dir: Optional[str] = None
+    cache_memory_ttl_seconds: int = 3600
+    cache_disk_ttl_seconds: int = 172800
+
+
 def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Mapping[str, str] | None = None) -> ExperimentalConfig:
     """Load optional JSON config from an explicit path or config env var."""
 
@@ -226,6 +238,30 @@ def get_responses_store_settings(
         max_items=max_items,
         store_failed=as_bool(_env_or_json(source, "RESPONSES_STORE_FAILED", store, "store_failed", default=True), name="RESPONSES_STORE_FAILED"),
         store_in_progress=as_bool(_env_or_json(source, "RESPONSES_STORE_IN_PROGRESS", store, "store_in_progress", default=False), name="RESPONSES_STORE_IN_PROGRESS"),
+    )
+
+
+def get_responses_store_runtime_settings(
+    *,
+    config: ExperimentalConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ResponsesStoreRuntimeSettings:
+    """Return Responses store backend settings with env overriding JSON."""
+
+    source = env if env is not None else os.environ
+    active = config if config is not None else load_experimental_config(env=source)
+    responses = active.responses if isinstance(active.responses, dict) else {}
+    store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
+    backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="memory")).strip().lower()
+    if backend not in {"memory", "provider_cache"}:
+        raise ExperimentalConfigError("RESPONSES_STORE_BACKEND must be 'memory' or 'provider_cache'")
+    return ResponsesStoreRuntimeSettings(
+        backend=backend,
+        cache_name=str(_env_or_json(source, "RESPONSES_STORE_CACHE_NAME", store, "cache_name", default="responses")),
+        cache_prefix=str(_env_or_json(source, "RESPONSES_STORE_CACHE_PREFIX", store, "cache_prefix", default="responses")),
+        cache_dir=_optional_string(_env_or_json(source, "RESPONSES_STORE_CACHE_DIR", store, "cache_dir")),
+        cache_memory_ttl_seconds=max(1, _int_setting(source, "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS", store, "cache_memory_ttl_seconds", 3600)),
+        cache_disk_ttl_seconds=max(1, _int_setting(source, "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS", store, "cache_disk_ttl_seconds", 172800)),
     )
 
 
@@ -405,6 +441,12 @@ def _optional_positive_int(value: Any, name: str) -> Optional[int]:
         return None
     parsed = as_int(value, name=name)
     return parsed if parsed > 0 else None
+
+
+def _optional_string(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:

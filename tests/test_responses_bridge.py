@@ -46,6 +46,32 @@ def test_bridge_adds_parent_response_messages_for_previous_response_id() -> None
     assert "session_scope" not in kwargs["_session_tracking_hints"]
 
 
+def test_bridge_replays_parent_input_and_output_lineage() -> None:
+    protocol = ResponsesProtocol()
+    bridge = ResponsesBridge(protocol)
+    unified = protocol.parse_request({"model": "gpt-test", "input": "Now"})
+    lineage = [
+        {
+            "request": {"model": "gpt-test", "input": "First user"},
+            "response": {"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First assistant"}]}]},
+        },
+        {
+            "request": {"model": "gpt-test", "input": "Second user", "previous_response_id": "resp_1"},
+            "response": {"output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second assistant"}]}]},
+        },
+    ]
+
+    kwargs = bridge.to_chat_kwargs(unified, parent_responses=lineage)
+
+    assert kwargs["messages"] == [
+        {"role": "user", "content": "First user"},
+        {"role": "assistant", "content": "First assistant"},
+        {"role": "user", "content": "Second user"},
+        {"role": "assistant", "content": "Second assistant"},
+        {"role": "user", "content": "Now"},
+    ]
+
+
 def test_bridge_preserves_tool_definitions() -> None:
     protocol = ResponsesProtocol()
     bridge = ResponsesBridge(protocol)

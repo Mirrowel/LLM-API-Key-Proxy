@@ -49,7 +49,7 @@ def test_post_responses_missing_model_returns_400() -> None:
     response = client.post("/v1/responses", json={"input": "hello"})
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["type"] == "invalid_request_error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_post_responses_stream_missing_model_returns_400_before_sse() -> None:
@@ -58,7 +58,7 @@ def test_post_responses_stream_missing_model_returns_400_before_sse() -> None:
     response = client.post("/v1/responses", json={"input": "hello", "stream": True})
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["type"] == "invalid_request_error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_post_responses_stream_missing_previous_response_returns_404_before_sse() -> None:
@@ -67,7 +67,7 @@ def test_post_responses_stream_missing_previous_response_returns_404_before_sse(
     response = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello", "stream": True, "previous_response_id": "missing"})
 
     assert response.status_code == 404
-    assert response.json()["detail"]["error"]["type"] == "not_found_error"
+    assert response.json()["error"]["type"] == "not_found_error"
 
 
 def test_get_delete_and_input_items_routes() -> None:
@@ -86,6 +86,7 @@ def test_get_delete_and_input_items_routes() -> None:
     assert deleted.status_code == 200
     assert deleted.json() == {"id": created["id"], "object": "response.deleted", "deleted": True}
     assert missing.status_code == 404
+    assert missing.json()["error"]["type"] == "not_found_error"
 
 
 def test_post_responses_stream_returns_sse_events() -> None:
