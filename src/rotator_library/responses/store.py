@@ -32,11 +32,14 @@ class InMemoryResponsesStore:
     later configuration code when disk persistence is desired.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_items: int | None = None) -> None:
         self._responses: dict[str, StoredResponse] = {}
+        self.max_items = max_items if max_items and max_items > 0 else None
 
     async def save(self, response: StoredResponse) -> None:
+        self._prune_expired()
         self._responses[response.id] = StoredResponse.from_dict(response.to_dict())
+        self._prune_overflow()
 
     async def get(self, response_id: str) -> Optional[StoredResponse]:
         response = self._responses.get(response_id)
@@ -55,6 +58,18 @@ class InMemoryResponsesStore:
         if response is None:
             return None
         return deepcopy(response.input_items)
+
+    def _prune_expired(self) -> None:
+        for response_id, response in list(self._responses.items()):
+            if response.is_expired():
+                self._responses.pop(response_id, None)
+
+    def _prune_overflow(self) -> None:
+        if not self.max_items:
+            return
+        while len(self._responses) > self.max_items:
+            oldest_id = min(self._responses.values(), key=lambda response: response.created_at).id
+            self._responses.pop(oldest_id, None)
 
 
 class ProviderCacheResponsesStore:

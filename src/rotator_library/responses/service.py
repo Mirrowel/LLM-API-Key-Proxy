@@ -26,7 +26,7 @@ from .streaming import (
     response_created_payload,
     response_failed_payload,
 )
-from .types import StoredResponse
+from .types import ResponsesStoreSettings, StoredResponse
 from .types import generate_response_id
 
 
@@ -53,10 +53,12 @@ class ResponsesService:
         protocol: Optional[ResponsesProtocol] = None,
         bridge: Optional[ResponsesBridge] = None,
         store: Optional[ResponsesStore] = None,
+        store_settings: Optional[ResponsesStoreSettings] = None,
     ) -> None:
+        self.store_settings = store_settings or ResponsesStoreSettings()
         self.protocol = protocol or ResponsesProtocol()
         self.bridge = bridge or ResponsesBridge(self.protocol)
-        self.store = store or InMemoryResponsesStore()
+        self.store = store or InMemoryResponsesStore(max_items=self.store_settings.max_items)
 
     async def create_response(
         self,
@@ -253,6 +255,9 @@ class ResponsesService:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
+            stored = await self._store_stream_response(stream_request, failed, parent, failed=True)
+            if stored:
+                self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("id"), "status": "failed"}, direction="metadata", stage="final")
             self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"}, scrub_strings=True)
             if transaction_logger:
                 self._trace(
@@ -329,7 +334,11 @@ class ResponsesService:
             input_items=_input_items(raw_request),
             output_items=deepcopy(response_payload.get("output") or []),
             usage=deepcopy(response_payload.get("usage")) if isinstance(response_payload.get("usage"), dict) else None,
-            metadata={"previous_response_id": parent.id if parent else raw_request.get("previous_response_id")},
+            metadata={
+                "previous_response_id": parent.id if parent else raw_request.get("previous_response_id"),
+                "response_id": response_payload.get("id"),
+            },
+            expires_at=_expires_at(self.store_settings),
         )
 
     @staticmethod
@@ -400,8 +409,12 @@ class ResponsesService:
         raw_request: dict[str, Any],
         response_payload: dict[str, Any],
         parent: Optional[StoredResponse],
+        *,
+        failed: bool = False,
     ) -> bool:
         if not raw_request.get("store", True):
+            return False
+        if failed and not self.store_settings.store_failed:
             return False
         await self.store.save(self._stored_response(raw_request, response_payload, parent))
         return True
@@ -412,6 +425,15 @@ def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     if value is None:
         return []
     return deepcopy(value if isinstance(value, list) else [value])
+
+
+def _expires_at(settings: ResponsesStoreSettings) -> Optional[float]:
+    """Return the expiration timestamp for a new stored response, if enabled."""
+
+    ttl = settings.ttl_seconds
+    if ttl is None or ttl <= 0:
+        return None
+    return time.time() + ttl
 
 
 def _chunk_text_delta(chunk: dict[str, Any]) -> str:

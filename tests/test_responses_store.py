@@ -62,6 +62,25 @@ async def test_in_memory_store_returns_copies_and_expires() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_memory_store_prunes_oldest_when_max_items_exceeded() -> None:
+    store = InMemoryResponsesStore(max_items=2)
+    first = _stored("resp_first")
+    first.created_at = 1
+    second = _stored("resp_second")
+    second.created_at = 2
+    third = _stored("resp_third")
+    third.created_at = 3
+
+    await store.save(first)
+    await store.save(second)
+    await store.save(third)
+
+    assert await store.get("resp_first") is None
+    assert await store.get("resp_second") is not None
+    assert await store.get("resp_third") is not None
+
+
+@pytest.mark.asyncio
 async def test_provider_cache_store_serializes_json_and_does_not_clear_without_key_delete() -> None:
     class FakeProviderCache:
         def __init__(self) -> None:

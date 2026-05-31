@@ -5,7 +5,7 @@ import json
 import pytest
 
 import rotator_library.responses.service as responses_service_module
-from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, StoredResponse
+from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, ResponsesStoreSettings, StoredResponse
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -49,6 +49,43 @@ async def test_store_false_does_not_persist_response() -> None:
     response = await service.create_response({"model": "gpt-test", "input": "Hello", "store": False}, FakeClient())
 
     assert await store.get(response["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_create_response_applies_storage_ttl() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store, store_settings=ResponsesStoreSettings(ttl_seconds=60))
+
+    response = await service.create_response({"model": "gpt-test", "input": "Hello"}, FakeClient())
+    stored = await store.get(response["id"])
+
+    assert stored is not None
+    assert stored.expires_at is not None
+    assert stored.expires_at > stored.created_at
+    assert stored.metadata["response_id"] == response["id"]
+
+
+@pytest.mark.asyncio
+async def test_service_default_store_honors_max_items() -> None:
+    class SequencedClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = 0
+
+        async def acompletion(self, **kwargs):
+            self.index += 1
+            response = await super().acompletion(**kwargs)
+            response["id"] = f"chat_response_{self.index}"
+            return response
+
+    service = ResponsesService(store_settings=ResponsesStoreSettings(max_items=1))
+    client = SequencedClient()
+
+    first = await service.create_response({"model": "gpt-test", "input": "one"}, client)
+    second = await service.create_response({"model": "gpt-test", "input": "two"}, client)
+
+    assert await service.store.get(first["id"]) is None
+    assert await service.store.get(second["id"]) is not None
 
 
 @pytest.mark.asyncio
