@@ -68,7 +68,7 @@ class OpenAIAudioProtocol(ProtocolAdapter):
         if isinstance(raw_response, dict):
             response = raw_response
             return UnifiedResponse(
-                operation=normalize_operation(response.get("operation")),
+                operation=_context_operation(context, normalize_operation(response.get("operation"))),
                 model=response.get("model") or getattr(context, "model", None),
                 output=[deepcopy(response["text"])] if "text" in response else [],
                 data=deepcopy(response.get("data") or []),
@@ -77,7 +77,8 @@ class OpenAIAudioProtocol(ProtocolAdapter):
                 extra={k: deepcopy(v) for k, v in response.items() if k not in {"operation", "model", "text", "data", "content_type"}},
             )
         content_type = "text/plain" if isinstance(raw_response, str) else "application/octet-stream"
-        return UnifiedResponse(content_type=content_type, raw=deepcopy(raw_response), output=[deepcopy(raw_response)] if isinstance(raw_response, str) else [])
+        default_operation = OPERATION_AUDIO_TRANSCRIPTION if isinstance(raw_response, str) else OPERATION_SPEECH
+        return UnifiedResponse(operation=_context_operation(context, default_operation), content_type=content_type, raw=deepcopy(raw_response), output=[deepcopy(raw_response)] if isinstance(raw_response, str) else [])
 
 
 def _audio_operation(request: dict[str, Any]) -> str:
@@ -87,3 +88,15 @@ def _audio_operation(request: dict[str, Any]) -> str:
     if "voice" in request or ("input" in request and "file" not in request):
         return OPERATION_SPEECH
     return OPERATION_AUDIO_TRANSCRIPTION
+
+
+def _context_operation(context: ProtocolContext | None, default: str) -> str:
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation in {OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH}:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation in {OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH}:
+            return operation
+    return default

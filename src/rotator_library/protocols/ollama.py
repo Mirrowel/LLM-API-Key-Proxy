@@ -23,7 +23,7 @@ class OllamaProtocol(ProtocolAdapter):
     name: ClassVar[str] = "ollama"
     aliases: ClassVar[tuple[str, ...]] = ("ollama_native",)
     supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_OLLAMA_CHAT, OPERATION_OLLAMA_GENERATE, OPERATION_EMBEDDINGS)
-    supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse", "jsonl")
+    supported_transports: ClassVar[tuple[str, ...]] = ("http", "jsonl")
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
@@ -68,13 +68,13 @@ class OllamaProtocol(ProtocolAdapter):
             data=deepcopy(response.get("embeddings") or response.get("embedding") or []),
             usage=_ollama_usage(response),
             raw=deepcopy(raw_response),
-            extra=deepcopy(response),
+            extra={k: deepcopy(v) for k, v in response.items() if k not in {"model", "message", "response", "embeddings", "embedding", "prompt_eval_count", "eval_count"}},
         )
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         data = _json_event(raw_event)
         if not isinstance(data, dict):
-            return UnifiedStreamEvent(type="metadata", raw=deepcopy(raw_event), extra={"unparsed": True})
+            return UnifiedStreamEvent(type="metadata", operation=OPERATION_OLLAMA_GENERATE, raw=deepcopy(raw_event), extra={"unparsed": True})
         event_type = "done" if data.get("done") else "message_delta"
         delta = None
         if isinstance(data.get("message"), dict):
@@ -90,7 +90,7 @@ def _ollama_operation(request: dict[str, Any]) -> str:
         return explicit
     if "messages" in request or "message" in request:
         return OPERATION_OLLAMA_CHAT
-    if "embeddings" in request or "embedding" in request or "input" in request:
+    if "embeddings" in request or "embedding" in request or "input" in request or request.get("endpoint") == "embeddings":
         return OPERATION_EMBEDDINGS
     return OPERATION_OLLAMA_GENERATE
 

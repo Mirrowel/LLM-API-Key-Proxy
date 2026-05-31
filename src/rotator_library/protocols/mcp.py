@@ -27,19 +27,22 @@ class MCPProtocol(ProtocolAdapter):
     name: ClassVar[str] = "mcp"
     aliases: ClassVar[tuple[str, ...]] = ("model_context_protocol", "jsonrpc_mcp")
     supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_MCP,)
-    supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
-    future_transports: ClassVar[tuple[str, ...]] = ("websocket",)
+    supported_transports: ClassVar[tuple[str, ...]] = ("http",)
+    future_transports: ClassVar[tuple[str, ...]] = ("sse", "websocket")
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
         metadata = {
             "jsonrpc": request.get("jsonrpc", "2.0"),
-            "id": deepcopy(request.get("id")),
             "method": request.get("method"),
+            "has_id": "id" in request,
+            "has_params": "params" in request,
         }
+        if "id" in request:
+            metadata["id"] = deepcopy(request.get("id"))
         return UnifiedRequest(
             operation=OPERATION_MCP,
-            input=deepcopy(request.get("params") or {}),
+            input=deepcopy(request.get("params")) if "params" in request else None,
             metadata=metadata,
             raw=deepcopy(raw_request),
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
@@ -49,16 +52,19 @@ class MCPProtocol(ProtocolAdapter):
         payload = {
             "jsonrpc": unified_request.metadata.get("jsonrpc", "2.0"),
             "method": unified_request.metadata.get("method"),
-            "params": deepcopy(unified_request.input or {}),
         }
-        if "id" in unified_request.metadata:
+        if unified_request.metadata.get("has_params", True):
+            payload["params"] = deepcopy(unified_request.input)
+        if unified_request.metadata.get("has_id"):
             payload["id"] = deepcopy(unified_request.metadata.get("id"))
         payload.update(deepcopy(unified_request.extra))
         return payload
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = raw_response if isinstance(raw_response, dict) else {}
-        metadata = {"jsonrpc": response.get("jsonrpc", "2.0"), "id": deepcopy(response.get("id"))}
+        metadata = {"jsonrpc": response.get("jsonrpc", "2.0"), "has_id": "id" in response}
+        if "id" in response:
+            metadata["id"] = deepcopy(response.get("id"))
         extra = {k: deepcopy(v) for k, v in response.items() if k not in _RESPONSE_CORE_FIELDS}
         if "error" in response:
             # JSON-RPC errors are not provider exceptions here; they are protocol
@@ -74,7 +80,7 @@ class MCPProtocol(ProtocolAdapter):
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         payload = {"jsonrpc": unified_response.metadata.get("jsonrpc", "2.0")}
-        if "id" in unified_response.metadata:
+        if unified_response.metadata.get("has_id"):
             payload["id"] = deepcopy(unified_response.metadata.get("id"))
         if unified_response.extra.get("error") is not None:
             payload["error"] = deepcopy(unified_response.extra["error"])
@@ -85,4 +91,4 @@ class MCPProtocol(ProtocolAdapter):
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         data = raw_event if isinstance(raw_event, dict) else {"event": raw_event}
-        return UnifiedStreamEvent(type=str(data.get("method") or data.get("type") or "message"), operation=OPERATION_MCP, raw=deepcopy(raw_event), extra=deepcopy(data))
+        return UnifiedStreamEvent(type=str(data.get("method") or data.get("type") or "message"), operation=OPERATION_MCP, error=deepcopy(data.get("error")), raw=deepcopy(raw_event), extra=deepcopy(data))

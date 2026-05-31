@@ -19,7 +19,7 @@ PROTOCOL_PLUGINS: dict[str, Type[ProtocolAdapter]] = {}
 PROTOCOL_ALIASES: dict[str, str] = {}
 _PROTOCOL_INSTANCES: dict[str, ProtocolAdapter] = {}
 
-_INFRASTRUCTURE_MODULES = {"base", "registry", "types"}
+_INFRASTRUCTURE_MODULES = {"base", "operation", "registry", "types"}
 
 
 def register_protocol(protocol_class: Type[ProtocolAdapter], *, replace: bool = False) -> Type[ProtocolAdapter]:

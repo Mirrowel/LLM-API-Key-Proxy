@@ -76,6 +76,7 @@ class ResponsesProtocol(ProtocolAdapter):
         request = dict(raw_request or {})
         generation_params = {k: deepcopy(request[k]) for k in _GENERATION_PARAMS if k in request and k != "instructions"}
         return UnifiedRequest(
+            operation=OPERATION_RESPONSES,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=self._parse_input(request.get("input")),
             system=text_blocks(request.get("instructions")) if request.get("instructions") is not None else [],
@@ -119,6 +120,7 @@ class ResponsesProtocol(ProtocolAdapter):
                     parsed.extra["_output_index"] = index
                     messages.append(parsed)
         return UnifiedResponse(
+            operation=OPERATION_RESPONSES,
             id=response.get("id"),
             model=response.get("model") or getattr(context, "model", None),
             messages=messages,
@@ -156,21 +158,21 @@ class ResponsesProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_RESPONSES, raw=deepcopy(raw_event))
         data = _as_dict(event)
         event_type = str(data.get("type") or data.get("event") or "chunk")
         if event_type in {"error", "response.error"} or data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="error", operation=OPERATION_RESPONSES, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
             response = self.parse_response(data.get("response") or {}, context)
-            return UnifiedStreamEvent(type=event_type, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "response.output_text.delta":
             message = UnifiedMessage(role="assistant", content=text_blocks(data.get("delta") or ""))
-            return UnifiedStreamEvent(type="message_delta", delta=message, raw=deepcopy(raw_event), extra={"payload": data, "output_index": data.get("output_index"), "content_index": data.get("content_index")})
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, delta=message, raw=deepcopy(raw_event), extra={"payload": data, "output_index": data.get("output_index"), "content_index": data.get("content_index")})
         if event_type in {"response.output_item.added", "response.output_item.done"} and isinstance(data.get("item"), dict):
             message = self._parse_output_item(data["item"])
-            return UnifiedStreamEvent(type=event_type, message=message, raw=deepcopy(raw_event), extra={"payload": data})
-        return UnifiedStreamEvent(type=event_type, raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, message=message, raw=deepcopy(raw_event), extra={"payload": data})
+        return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, raw=deepcopy(raw_event), extra={"payload": data})
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):

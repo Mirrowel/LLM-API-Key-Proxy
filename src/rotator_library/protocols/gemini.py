@@ -15,7 +15,7 @@ from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
-from .operation import OPERATION_CHAT, OPERATION_COUNT_TOKENS
+from .operation import OPERATION_CHAT, OPERATION_COUNT_TOKENS, OPERATION_UNKNOWN, normalize_operation
 from .types import (
     ContentBlock,
     ProtocolContext,
@@ -62,6 +62,7 @@ class GeminiProtocol(ProtocolAdapter):
         generation_config = deepcopy(request.get("generationConfig") or request.get("generation_config") or {})
         safety_settings = deepcopy(request.get("safetySettings") or request.get("safety_settings") or [])
         return UnifiedRequest(
+            operation=_operation_from_context(context, OPERATION_CHAT),
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=[self._parse_content(content) for content in request.get("contents") or []],
             system=self._parse_system(request.get("systemInstruction") or request.get("system_instruction")),
@@ -107,6 +108,7 @@ class GeminiProtocol(ProtocolAdapter):
             if candidate.get("finishReason") is not None:
                 stop_reason = candidate.get("finishReason")
         return UnifiedResponse(
+            operation=_response_operation(response, context),
             id=response.get("responseId") or response.get("id"),
             model=response.get("modelVersion") or getattr(context, "model", None),
             messages=messages,
@@ -138,12 +140,13 @@ class GeminiProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, raw=deepcopy(raw_event))
         data = _as_dict(event)
         response = self.parse_response(data, context)
         message = response.messages[0] if response.messages else None
         return UnifiedStreamEvent(
             type="message_delta" if message else "chunk",
+            operation=response.operation,
             delta=message,
             usage=response.usage,
             raw=deepcopy(raw_event),
@@ -155,7 +158,7 @@ class GeminiProtocol(ProtocolAdapter):
             return raw_or_unified.usage
         payload = _as_dict(raw_or_unified)
         usage = payload.get("usageMetadata") if isinstance(payload.get("usageMetadata"), dict) else payload
-        if not isinstance(usage, dict) or not any(key.endswith("TokenCount") for key in usage):
+        if not isinstance(usage, dict) or (not any(key.endswith("TokenCount") for key in usage) and "totalTokens" not in usage):
             return None
         input_tokens = int(usage.get("promptTokenCount") or 0)
         output_tokens = int(usage.get("candidatesTokenCount") or 0)
@@ -163,7 +166,7 @@ class GeminiProtocol(ProtocolAdapter):
         return Usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            total_tokens=int(usage.get("totalTokenCount") or input_tokens + output_tokens + reasoning_tokens),
+            total_tokens=int(usage.get("totalTokenCount") or usage.get("totalTokens") or input_tokens + output_tokens + reasoning_tokens),
             cache_read_tokens=int(usage.get("cachedContentTokenCount") or 0),
             reasoning_tokens=reasoning_tokens,
             raw=deepcopy(usage),
@@ -343,6 +346,27 @@ def _as_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, "dict"):
         return value.dict()
     return {}
+
+
+def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation != OPERATION_UNKNOWN:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation != OPERATION_UNKNOWN:
+            return operation
+    return default
+
+
+def _response_operation(response: dict[str, Any], context: ProtocolContext | None) -> str:
+    requested = _operation_from_context(context, OPERATION_CHAT)
+    if requested == OPERATION_COUNT_TOKENS:
+        return OPERATION_COUNT_TOKENS
+    if "totalTokens" in response and "candidates" not in response:
+        return OPERATION_COUNT_TOKENS
+    return OPERATION_CHAT
 
 
 def _decode_sse_data(raw_event: Any) -> Any:

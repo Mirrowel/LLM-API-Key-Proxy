@@ -93,6 +93,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
         extra = {k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS}
 
         return UnifiedRequest(
+            operation=OPERATION_CHAT,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=messages,
             tools=tools,
@@ -135,6 +136,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 stop_reason = choice.get("finish_reason")
 
         return UnifiedResponse(
+            operation=OPERATION_CHAT,
             id=response.get("id"),
             model=response.get("model") or getattr(context, "model", None),
             messages=messages,
@@ -173,10 +175,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, raw=deepcopy(raw_event))
         data = _as_dict(event)
         if data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})
 
         delta_message = None
         finish_reason = None
@@ -192,6 +194,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
         usage = self.extract_usage(data, context)
         return UnifiedStreamEvent(
             type="message_delta" if delta_message else "chunk",
+            operation=OPERATION_CHAT,
             delta=delta_message,
             usage=usage,
             raw=deepcopy(raw_event),
