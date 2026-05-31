@@ -55,9 +55,28 @@ class DelayedStreamingClient:
         return self.stream
 
 
+class SlowAcquireStreamingClient:
+    def __init__(self, stream: DelayedCloseableStream, delay: float) -> None:
+        self.stream = stream
+        self.delay = delay
+
+    async def acompletion(self, **kwargs):
+        await asyncio.sleep(self.delay)
+        return self.stream
+
+
 class DisconnectRequest:
     async def is_disconnected(self) -> bool:
         return True
+
+
+class DisconnectAfterAcquireRequest:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def is_disconnected(self) -> bool:
+        self.calls += 1
+        return self.calls > 1
 
 
 class FailingStreamingClient:
@@ -321,6 +340,47 @@ async def test_stream_response_ttfb_timeout_closes_upstream(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_stream_response_heartbeat_does_not_reset_ttfb_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.03")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [0.1])
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))]
+
+    event_text = "".join(events)
+    assert ": heartbeat\n\n" in events
+    assert stream.closed is True
+    assert "event: response.failed" in event_text
+    assert "ttfb" in event_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_response_acquire_wait_honors_ttfb_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.01")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [0.0])
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, SlowAcquireStreamingClient(stream, 0.05))]
+
+    event_text = "".join(events)
+    assert "event: response.failed" in event_text
+    assert "ttfb" in event_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_response_acquire_wait_can_emit_heartbeat(monkeypatch) -> None:
+    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
+    stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"], [0.0, 0.0])
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, SlowAcquireStreamingClient(stream, 0.03))]
+
+    assert ": heartbeat\n\n" in events
+    assert "event: response.completed" in "".join(events)
+
+
+@pytest.mark.asyncio
 async def test_stream_response_stall_timeout_preserves_partial_output(monkeypatch) -> None:
     monkeypatch.setenv("STREAM_STALL_TIMEOUT_SECONDS", "0.01")
     stream = DelayedCloseableStream(
@@ -348,7 +408,7 @@ async def test_stream_events_disconnect_closes_upstream(monkeypatch) -> None:
     stream = DelayedCloseableStream(['data: {"choices":[{"delta":{"content":"late"}}]}\n\n'], [0.05])
     service = ResponsesService(store=InMemoryResponsesStore())
 
-    events = [event async for event in service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream), request=DisconnectRequest())]
+    events = [event async for event in service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream), request=DisconnectAfterAcquireRequest())]
 
     assert [event.event_name for event in events] == ["response.created"]
     assert stream.closed is True
