@@ -235,6 +235,24 @@ class ResponsesService:
         stream_iterator = None
         upstream_closed = False
         pending_next_task = None
+        pending_next_started_at = None
+        pending_next_last_heartbeat_at = None
+        acquire_task = None
+        acquire_started_at = None
+        acquire_last_heartbeat_at = None
+
+        async def cancel_task(task: Any) -> None:
+            """Cancel and await an in-flight stream task before closing its source."""
+
+            if task is None or task.done():
+                return
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                return
+            except Exception:
+                return
 
         async def close_upstream(reason: str) -> None:
             """Best-effort close for upstream Responses bridge streams."""
@@ -242,41 +260,47 @@ class ResponsesService:
             nonlocal upstream_closed
             if upstream_closed:
                 return
-            upstream_closed = True
+            attempted = False
             for candidate in (stream_iterator, chat_stream):
                 if candidate is None:
                     continue
+                attempted = True
                 try:
                     closer = getattr(candidate, "aclose", None)
                     if callable(closer):
                         await closer()
+                        upstream_closed = True
                         self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
                         return
                     closer = getattr(candidate, "close", None)
                     if callable(closer):
                         closer()
+                        upstream_closed = True
                         self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
                         return
                 except Exception as exc:
                     self._trace(transaction_logger, "responses_stream_upstream_close_failed", {"reason": reason, "error_type": type(exc).__name__}, direction="stream", stage="provider", metadata={"transport": transport})
-                    return
+                    continue
+            if attempted:
+                self._trace(transaction_logger, "responses_stream_upstream_close_failed", {"reason": reason, "error_type": "no_close_method"}, direction="stream", stage="provider", metadata={"transport": transport})
 
         async def next_upstream_chunk(*, first: bool) -> tuple[str, Any]:
             """Return the next upstream chunk or a control marker."""
 
             timeout = stream_settings.ttfb_timeout_seconds if first else stream_settings.stall_timeout_seconds
             heartbeat = stream_settings.heartbeat_seconds
-            started_at = time.monotonic()
-            last_heartbeat_at = started_at
-            nonlocal pending_next_task
+            nonlocal pending_next_task, pending_next_started_at, pending_next_last_heartbeat_at
             if pending_next_task is None or pending_next_task.done():
                 pending_next_task = asyncio.create_task(stream_iterator.__anext__())
+                pending_next_started_at = time.monotonic()
+                pending_next_last_heartbeat_at = pending_next_started_at
             next_task = pending_next_task
+            started_at = pending_next_started_at or time.monotonic()
             while True:
                 if request is not None and await request.is_disconnected():
                     self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected"}, direction="stream", stage="client", metadata={"transport": transport})
                     if stream_settings.cancel_upstream_on_disconnect:
-                        next_task.cancel()
+                        await cancel_task(next_task)
                         pending_next_task = None
                         await close_upstream("client_disconnected")
                     return "disconnect", None
@@ -285,7 +309,7 @@ class ResponsesService:
                 if timeout is not None:
                     remaining_timeout = timeout - elapsed
                     if remaining_timeout <= 0:
-                        next_task.cancel()
+                        await cancel_task(next_task)
                         pending_next_task = None
                         await close_upstream("ttfb_timeout" if first else "stall_timeout")
                         raise ResponsesServiceError(
@@ -295,23 +319,86 @@ class ResponsesService:
                         )
                     waits.append(remaining_timeout)
                 if heartbeat is not None:
+                    last_heartbeat_at = pending_next_last_heartbeat_at or started_at
                     remaining_heartbeat = heartbeat - (time.monotonic() - last_heartbeat_at)
                     if remaining_heartbeat <= 0:
-                        last_heartbeat_at = time.monotonic()
+                        pending_next_last_heartbeat_at = time.monotonic()
                         return "heartbeat", None
                     waits.append(remaining_heartbeat)
                 wait_timeout = min(waits) if waits else None
                 if wait_timeout is None:
                     chunk = await next_task
                     pending_next_task = None
+                    pending_next_started_at = None
+                    pending_next_last_heartbeat_at = None
                     return "chunk", chunk
                 done, _ = await asyncio.wait({next_task}, timeout=wait_timeout)
                 if done:
                     pending_next_task = None
+                    pending_next_started_at = None
+                    pending_next_last_heartbeat_at = None
                     return "chunk", next_task.result()
+                last_heartbeat_at = pending_next_last_heartbeat_at or started_at
                 if heartbeat is not None and time.monotonic() - last_heartbeat_at >= heartbeat:
-                    last_heartbeat_at = time.monotonic()
+                    pending_next_last_heartbeat_at = time.monotonic()
                     return "heartbeat", None
+
+        async def acquire_upstream_stream() -> tuple[str, Any]:
+            """Acquire the upstream stream under the same TTFB/disconnect policy."""
+
+            nonlocal acquire_task, acquire_started_at, acquire_last_heartbeat_at
+            if acquire_task is None or acquire_task.done():
+                acquire_task = asyncio.create_task(client.acompletion(request=request, **chat_kwargs))
+                acquire_started_at = time.monotonic()
+                acquire_last_heartbeat_at = acquire_started_at
+            task = acquire_task
+            started_at = acquire_started_at or time.monotonic()
+            timeout = stream_settings.ttfb_timeout_seconds
+            heartbeat = stream_settings.heartbeat_seconds
+            while True:
+                if request is not None and await request.is_disconnected():
+                    self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected", "phase": "acquire"}, direction="stream", stage="client", metadata={"transport": transport})
+                    await cancel_task(task)
+                    acquire_task = None
+                    acquire_started_at = None
+                    acquire_last_heartbeat_at = None
+                    return "disconnect", None
+                waits = []
+                elapsed = time.monotonic() - started_at
+                if timeout is not None:
+                    remaining_timeout = timeout - elapsed
+                    if remaining_timeout <= 0:
+                        await cancel_task(task)
+                        acquire_task = None
+                        acquire_started_at = None
+                        acquire_last_heartbeat_at = None
+                        raise ResponsesServiceError("Responses stream TTFB timeout", status_code=504, error_type="api_connection")
+                    waits.append(remaining_timeout)
+                if heartbeat is not None:
+                    last_heartbeat_at = acquire_last_heartbeat_at or started_at
+                    remaining_heartbeat = heartbeat - (time.monotonic() - last_heartbeat_at)
+                    if remaining_heartbeat <= 0:
+                        acquire_last_heartbeat_at = time.monotonic()
+                        return "heartbeat", None
+                    waits.append(remaining_heartbeat)
+                wait_timeout = min(waits) if waits else None
+                if wait_timeout is None:
+                    stream = await task
+                    acquire_task = None
+                    acquire_started_at = None
+                    acquire_last_heartbeat_at = None
+                    return "stream", stream
+                done, _ = await asyncio.wait({task}, timeout=wait_timeout)
+                if done:
+                    acquire_task = None
+                    acquire_started_at = None
+                    acquire_last_heartbeat_at = None
+                    return "stream", task.result()
+                last_heartbeat_at = acquire_last_heartbeat_at or started_at
+                if heartbeat is not None and time.monotonic() - last_heartbeat_at >= heartbeat:
+                    acquire_last_heartbeat_at = time.monotonic()
+                    return "heartbeat", None
+
         if transaction_logger:
             self._trace(
                 transaction_logger,
@@ -326,7 +413,15 @@ class ResponsesService:
         await self._store_stream_current_state(stream_request, created, parent, transaction_logger=transaction_logger)
         yield ResponsesStreamEvent("response.created", created)
         try:
-            chat_stream = await client.acompletion(request=request, **chat_kwargs)
+            while chat_stream is None:
+                marker, acquired = await acquire_upstream_stream()
+                if marker == "disconnect":
+                    return
+                if marker == "heartbeat":
+                    self._trace(transaction_logger, "responses_stream_heartbeat", {"comment": "heartbeat", "phase": "acquire"}, direction="stream", stage="transport", metadata={"transport": transport})
+                    yield ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})
+                    continue
+                chat_stream = acquired
             stream_iterator = chat_stream.__aiter__()
             first_chunk = True
             while True:
