@@ -1071,6 +1071,7 @@ class RequestExecutor:
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
+        last_stream_error_payload: Optional[Dict[str, Any]] = None
 
         while time.time() < deadline:
             # Check for untried credentials
@@ -1548,6 +1549,7 @@ class RequestExecutor:
                                     last_exception = e
                                     original = getattr(e, "data", e)
                                     classified = classify_error(original, provider)
+                                    last_stream_error_payload = _streamed_error_payload(e, classified)
                                     if _can_start_stream_provider_cooldown(
                                         last_streamed_chunk,
                                         emitted_output=stream_visible_output_emitted,
@@ -1859,6 +1861,8 @@ class RequestExecutor:
             # All credentials exhausted or timeout
             error_accumulator.timeout_occurred = time.time() >= deadline
             error_data = error_accumulator.build_client_error_response()
+            if last_stream_error_payload:
+                _merge_stream_error_details(error_data, last_stream_error_payload)
             for line in self._terminal_stream_error_lines(context, error_data):
                 yield line
 
@@ -2887,3 +2891,19 @@ def _streamed_error_payload(error: StreamedAPIError, classified: Any) -> Dict[st
             }
         }
     return {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type, "details": {"status_code": classified.status_code}}}
+
+
+def _merge_stream_error_details(error_data: Dict[str, Any], stream_error: Dict[str, Any]) -> None:
+    """Preserve structured stream timeout metadata in aggregate stream errors."""
+
+    target = error_data.get("error") if isinstance(error_data, dict) else None
+    source = stream_error.get("error") if isinstance(stream_error, dict) else None
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    details = source.get("details")
+    if not isinstance(details, dict) or "timeout_type" not in details:
+        return
+    merged = dict(target.get("details") or {}) if isinstance(target.get("details"), dict) else {}
+    merged.update(details)
+    target["details"] = merged
+    target["type"] = source.get("type") or target.get("type")

@@ -207,10 +207,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
         )
 
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
-        if unified_event.raw is not None:
-            return deepcopy(unified_event.raw)
         if unified_event.type == "done":
             return "data: [DONE]\n\n"
+        if unified_event.raw is not None:
+            return deepcopy(unified_event.raw)
         return f"data: {json.dumps(unified_event.to_dict())}\n\n"
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:

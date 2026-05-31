@@ -78,6 +78,8 @@ def _parse_stream_line(line: Any) -> Any:
     text = text.strip()
     if not text:
         return None
+    if text.startswith(":"):
+        return None
     if text.startswith("data:"):
         text = text[len("data:") :].strip()
     if text == "[DONE]":
