@@ -63,7 +63,7 @@ from ..core.constants import (
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
-from ..retry_policy import decide_provider_cooldown, provider_cooldown_env
+from ..retry_policy import FailureHistory, decide_provider_cooldown, provider_cooldown_env
 from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
@@ -155,6 +155,7 @@ class RequestExecutor:
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
         self._native_executor = NativeProviderExecutor()
+        self._failure_history = FailureHistory()
 
     def _get_transient_retry_delay(self) -> float:
         """Small jittered delay used before transient retries and rotations."""
@@ -1078,7 +1079,7 @@ class RequestExecutor:
                 break
 
             # Wait for provider cooldown
-            await self._wait_for_cooldown(provider, deadline)
+            await self._wait_for_cooldown(provider, deadline, model=model, context=context)
 
             # Acquire credential using context manager
             try:
@@ -1347,7 +1348,7 @@ class RequestExecutor:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
-                await self._wait_for_cooldown(provider, deadline)
+                await self._wait_for_cooldown(provider, deadline, model=model, context=context)
 
                 # Acquire credential using context manager
                 try:
@@ -1540,9 +1541,7 @@ class RequestExecutor:
                                     if _can_start_stream_provider_cooldown(
                                         last_streamed_chunk
                                     ):
-                                        await self._maybe_start_provider_cooldown(
-                                            provider, classified, context=context
-                                        )
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=original)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1631,9 +1630,7 @@ class RequestExecutor:
                                     if _can_start_stream_provider_cooldown(
                                         last_streamed_chunk
                                     ):
-                                        await self._maybe_start_provider_cooldown(
-                                            provider, classified, context=context
-                                        )
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1712,9 +1709,7 @@ class RequestExecutor:
                                     if _can_start_stream_provider_cooldown(
                                         last_streamed_chunk
                                     ):
-                                        await self._maybe_start_provider_cooldown(
-                                            provider, classified, context=context
-                                        )
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1754,7 +1749,7 @@ class RequestExecutor:
                                     last_exception = e
                                     classified = classify_error(e, provider)
                                     if _can_start_stream_provider_cooldown(last_streamed_chunk):
-                                        await self._maybe_start_provider_cooldown(provider, classified, context=context)
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(api_key=cred, model=model, attempt=attempt + 1, error=e, request_headers=request_headers)
                                     error_accumulator.record_error(cred, classified, str(e)[:150])
                                     if not should_rotate_on_error(classified):
@@ -1769,9 +1764,7 @@ class RequestExecutor:
                                     if _can_start_stream_provider_cooldown(
                                         last_streamed_chunk
                                     ):
-                                        await self._maybe_start_provider_cooldown(
-                                            provider, classified, context=context
-                                        )
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1881,9 +1874,12 @@ class RequestExecutor:
         self,
         provider: str,
         deadline: float,
+        *,
+        model: Optional[str] = None,
+        context: Optional[RequestContext] = None,
     ) -> None:
         """
-        Wait for provider-level cooldown to end.
+        Wait for provider/model cooldown to end.
 
         Args:
             provider: Provider name
@@ -1892,7 +1888,10 @@ class RequestExecutor:
         if not self._cooldown:
             return
 
-        remaining = await self._cooldown.get_remaining_cooldown(provider)
+        if hasattr(self._cooldown, "get_max_remaining"):
+            remaining = await self._cooldown.get_max_remaining(provider, model=model)
+        else:
+            remaining = await self._cooldown.get_remaining_cooldown(provider)
         if remaining > 0:
             budget = deadline - time.time()
             if remaining > budget:
@@ -1901,6 +1900,7 @@ class RequestExecutor:
                 )
                 return  # Will fail on no keys available
             lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
+            self._log_cooldown_wait_trace(context, provider, model, remaining)
             await asyncio.sleep(remaining)
 
     async def _handle_error_with_context(
@@ -1962,7 +1962,7 @@ class RequestExecutor:
             cred_context.mark_failure(classified)
             return ErrorAction.FAIL
 
-        await self._maybe_start_provider_cooldown(provider, classified, context=context)
+        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=error)
 
         # Check if should retry same key (including small cooldown auto-retry)
         small_cooldown_threshold = int(
@@ -2015,6 +2015,8 @@ class RequestExecutor:
         classified: ClassifiedError,
         *,
         context: Optional[RequestContext],
+        model: Optional[str] = None,
+        original_error: Any = None,
     ) -> None:
         """Start provider-wide cooldown for large provider-level throttles.
 
@@ -2037,6 +2039,9 @@ class RequestExecutor:
             provider_cooldown_min_seconds=min_seconds,
             default_duration=default_seconds,
             cooldown_on_quota=cooldown_on_quota,
+            model=model,
+            original_error=original_error,
+            failure_history=getattr(self, "_failure_history", None),
         )
         if not decision.should_start:
             self._log_provider_cooldown_trace(
@@ -2046,10 +2051,19 @@ class RequestExecutor:
                 classified,
                 decision.duration,
                 decision.reason,
+                scope=decision.scope,
+                model=decision.model,
+                backoff_level=decision.backoff_level,
             )
             return
         try:
-            await self._cooldown.start_cooldown(provider, decision.duration)
+            if hasattr(self._cooldown, "start_scoped_cooldown"):
+                await self._cooldown.start_scoped_cooldown(provider, decision.duration, model=decision.model, scope=decision.scope, reason=decision.reason)
+            else:
+                await self._cooldown.start_cooldown(provider, decision.duration)
+            history = getattr(self, "_failure_history", None)
+            if history is not None:
+                history.record(provider=provider, model=decision.model, error_type=classified.error_type, scope=decision.scope, duration=decision.duration, reason=decision.reason)
             self._log_provider_cooldown_trace(
                 context,
                 "provider_cooldown_started",
@@ -2057,6 +2071,9 @@ class RequestExecutor:
                 classified,
                 decision.duration,
                 decision.reason,
+                scope=decision.scope,
+                model=decision.model,
+                backoff_level=decision.backoff_level,
             )
         except Exception as exc:
             lib_logger.debug("Failed to start provider cooldown for %s: %s", provider, exc)
@@ -2069,21 +2086,43 @@ class RequestExecutor:
         classified: ClassifiedError,
         duration: int,
         reason: str,
+        *,
+        scope: str = "provider",
+        model: Optional[str] = None,
+        backoff_level: int = 0,
     ) -> None:
         if not context or not context.transaction_logger:
             return
         context.transaction_logger.log_transform_pass(
             pass_name,
-            {"provider": provider, "error_type": classified.error_type, "duration": duration},
+            {"provider": provider, "model": model, "scope": scope, "error_type": classified.error_type, "duration": duration},
             direction="metadata",
             stage="retry",
             metadata={
                 "provider": provider,
                 "duration": duration,
+                "scope": scope,
+                "model": model,
+                "backoff_level": backoff_level,
                 "error_type": classified.error_type,
                 "retry_after_present": classified.retry_after is not None,
                 "reason": reason,
             },
+            snapshot=False,
+        )
+
+    @staticmethod
+    def _log_cooldown_wait_trace(context: Optional[RequestContext], provider: str, model: Optional[str], remaining: float) -> None:
+        """Trace cooldown waits without exposing credentials or payloads."""
+
+        if not context or not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            "cooldown_wait",
+            {"provider": provider, "model": model, "remaining": remaining},
+            direction="metadata",
+            stage="retry",
+            metadata={"provider": provider, "model": model, "remaining": remaining},
             snapshot=False,
         )
 
