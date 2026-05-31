@@ -88,8 +88,11 @@ class OpenAIAudioProtocol(ProtocolAdapter):
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         if isinstance(raw_response, dict):
             response = raw_response
+            operation = normalize_operation(response.get("operation"))
+            if operation == "unknown":
+                operation = OPERATION_AUDIO_TRANSCRIPTION
             return UnifiedResponse(
-                operation=_context_operation(context, normalize_operation(response.get("operation"))),
+                operation=_context_operation(context, operation),
                 model=response.get("model") or getattr(context, "model", None),
                 output=[deepcopy(response["text"])] if "text" in response else [],
                 data=deepcopy(response.get("data") or []),
@@ -98,6 +101,8 @@ class OpenAIAudioProtocol(ProtocolAdapter):
                 extra={k: deepcopy(v) for k, v in response.items() if k not in {"operation", "model", "text", "data", "content_type"}},
             )
         content_type = "text/plain" if isinstance(raw_response, str) else "application/octet-stream"
+        # Providers normally return transcription text as JSON/text and speech as
+        # bytes. Context can still override this heuristic for unusual endpoints.
         default_operation = OPERATION_AUDIO_TRANSCRIPTION if isinstance(raw_response, str) else OPERATION_SPEECH
         return UnifiedResponse(operation=_context_operation(context, default_operation), content_type=content_type, raw=deepcopy(raw_response), output=[deepcopy(raw_response)] if isinstance(raw_response, str) else [])
 

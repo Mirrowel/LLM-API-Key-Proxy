@@ -5,7 +5,8 @@
 
 This is not a full MCP proxy implementation. It gives the native protocol layer a
 lossless request/response carrier for future MCP gateway work, keeping method,
-params, ids, results, and errors intact for transform logging and routing.
+params, ids, results, errors, and JSON-RPC batch arrays intact for transform
+logging and routing.
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ class MCPProtocol(ProtocolAdapter):
     future_transports: ClassVar[tuple[str, ...]] = ("sse", "websocket")
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
+        if isinstance(raw_request, list):
+            return UnifiedRequest(operation=OPERATION_MCP, input=deepcopy(raw_request), metadata={"batch": True}, raw=deepcopy(raw_request))
         request = dict(raw_request or {})
         metadata = {
             "jsonrpc": request.get("jsonrpc", "2.0"),
@@ -48,7 +51,9 @@ class MCPProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> Any:
+        if unified_request.metadata.get("batch"):
+            return deepcopy(unified_request.input or [])
         payload = {
             "jsonrpc": unified_request.metadata.get("jsonrpc", "2.0"),
             "method": unified_request.metadata.get("method"),
@@ -61,6 +66,8 @@ class MCPProtocol(ProtocolAdapter):
         return payload
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
+        if isinstance(raw_response, list):
+            return UnifiedResponse(operation=OPERATION_MCP, data=deepcopy(raw_response), metadata={"batch": True}, raw=deepcopy(raw_response))
         response = raw_response if isinstance(raw_response, dict) else {}
         metadata = {"jsonrpc": response.get("jsonrpc", "2.0"), "has_id": "id" in response}
         if "id" in response:
@@ -78,7 +85,9 @@ class MCPProtocol(ProtocolAdapter):
             extra=extra,
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> Any:
+        if unified_response.metadata.get("batch"):
+            return deepcopy(unified_response.data)
         payload = {"jsonrpc": unified_response.metadata.get("jsonrpc", "2.0")}
         if unified_response.metadata.get("has_id"):
             payload["id"] = deepcopy(unified_response.metadata.get("id"))

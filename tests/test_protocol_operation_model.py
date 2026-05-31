@@ -88,6 +88,8 @@ def test_count_tokens_operation_can_be_context_selected() -> None:
     assert anthropic.operation == OPERATION_COUNT_TOKENS
     assert anthropic.usage is not None
     assert anthropic.usage.input_tokens == 12
+    assert get_protocol("anthropic_messages").format_response(anthropic) == {"input_tokens": 12}
     assert gemini.operation == OPERATION_COUNT_TOKENS
     assert gemini.usage is not None
     assert gemini.usage.total_tokens == 14
+    assert get_protocol("gemini").format_response(gemini) == {"totalTokens": 14}
