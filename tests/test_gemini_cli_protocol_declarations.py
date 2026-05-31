@@ -12,6 +12,8 @@ async def test_gemini_cli_declares_gemini_protocol_without_changing_custom_logic
     assert provider.has_custom_logic() is True
     assert provider.get_protocol_name("gemini-3-flash-preview") == "gemini"
     assert provider.get_adapter_names("gemini-3-flash-preview") == ()
+    assert provider.supports_native_streaming("gemini-3-flash-preview", operation="generate") is False
+    assert provider.normalize_native_model("gemini_cli/gemini-3-flash-preview") == "gemini-3-flash-preview"
 
 
 @pytest.mark.asyncio
