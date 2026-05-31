@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesStoreSettings, ResponsesWebSocketFormatter
+from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesStoreSettings, ResponsesStreamEvent, ResponsesWebSocketFormatter
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -104,6 +104,20 @@ async def test_stream_response_can_skip_failed_storage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_events_can_store_in_progress_state() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store, store_settings=ResponsesStoreSettings(store_in_progress=True))
+    stream = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient())
+
+    created = await anext(stream)
+    stored = await store.get(created.payload["id"])
+    await stream.aclose()
+
+    assert stored is not None
+    assert stored.status == "in_progress"
+
+
+@pytest.mark.asyncio
 async def test_stream_response_failure_trace_scrubs_header_like_secret_text(tmp_path) -> None:
     logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
     service = ResponsesService(store=InMemoryResponsesStore())
@@ -127,8 +141,7 @@ def test_transport_formatters_expose_sse_and_websocket_seam() -> None:
     websocket = ResponsesWebSocketFormatter()
     assert websocket.transport == "websocket"
     assert websocket.future_supported is True
-    with pytest.raises(NotImplementedError):
-        websocket.format_event("response.created", {})
+    assert websocket.format_stream_event(ResponsesStreamEvent("response.created", {"id": "resp"})) == '{"event": "response.created", "data": {"id": "resp"}}'
 
 
 @pytest.mark.asyncio
@@ -148,3 +161,22 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "responses_stream_event_created" in trace_text
     assert "responses_stream_event_output_text_delta" in trace_text
     assert "responses_stream_event_completed" in trace_text
+
+
+@pytest.mark.asyncio
+async def test_stream_events_are_transport_neutral_and_sse_wraps_them() -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    events = [event async for event in service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient())]
+    sse = [ResponsesSSEFormatter().format_stream_event(event) for event in events]
+
+    assert [event.event_name for event in events if not event.terminal] == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert events[-1].terminal is True
+    assert "".join(sse).endswith("data: [DONE]\n\n")
