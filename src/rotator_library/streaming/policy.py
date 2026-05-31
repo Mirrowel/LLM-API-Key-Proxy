@@ -63,6 +63,9 @@ def is_visible_stream_output(chunk: Optional[str], *, protocol: str = "openai_ch
         return False
     if data.get("error"):
         return False
+    event_type = data.get("event_type") or data.get("type")
+    if isinstance(event_type, str) and event_type.startswith("response."):
+        return _responses_visible(data)
     if protocol == "responses":
         return _responses_visible(data)
     return _openai_chat_visible(data)
