@@ -174,7 +174,7 @@ class FailureHistory:
             entry
             for entry in self._entries
             if now - entry.timestamp <= window
-            and (provider is None or entry.provider == provider)
+            and entry.provider == provider
             and entry.error_type == error_type
             and entry.scope == scope
             and (scope != "model" or entry.model == model)

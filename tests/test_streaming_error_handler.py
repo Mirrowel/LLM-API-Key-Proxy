@@ -62,6 +62,23 @@ def test_streaming_error_decision_blocks_after_visible_output_and_skips_cooldown
     assert decision.start_provider_cooldown is False
 
 
+def test_streaming_error_decision_blocks_after_prior_visible_output() -> None:
+    decision = decide_streaming_error_action(
+        _rate_limit(60),
+        provider="openai",
+        last_streamed_chunk='data: {"usage":{"total_tokens":1}}\n\n',
+        emitted_output=True,
+        attempt=0,
+        max_retries=2,
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        provider_cooldown_default_seconds=30,
+    )
+
+    assert decision.action == "fallback_blocked_after_output"
+    assert decision.start_provider_cooldown is False
+
+
 def test_streaming_error_decision_allows_reasoning_only_retry_when_enabled() -> None:
     decision = decide_streaming_error_action(
         _rate_limit(3),
