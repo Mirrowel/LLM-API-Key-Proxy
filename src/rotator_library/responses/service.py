@@ -78,12 +78,20 @@ class ResponsesService:
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
         self._trace(transaction_logger, "responses_raw_request", raw_request, direction="request", stage="client")
-        unified = self.protocol.parse_request(raw_request, ProtocolContext(source_protocol="responses"))
+        try:
+            unified = self.protocol.parse_request(raw_request, ProtocolContext(source_protocol="responses"))
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_parse_request", exc, raw_request)
+            raise
         if transaction_logger:
             self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
 
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
-        chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+        try:
+            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
+            raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
         session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
@@ -129,7 +137,17 @@ class ResponsesService:
 
         formatter = ResponsesSSEFormatter()
         async for event in self.stream_events(raw_request, client, request=request, transaction_logger=transaction_logger, transport=transport):
-            yield formatter.format_stream_event(event)
+            formatted = formatter.format_stream_event(event)
+            self._trace(
+                transaction_logger,
+                "responses_sse_formatted_event",
+                formatted,
+                direction="stream",
+                stage="final",
+                metadata={"event_name": event.event_name, "terminal": event.terminal, "transport": transport},
+                scrub_strings=True,
+            )
+            yield formatted
 
     async def validate_stream_request(self, raw_request: dict[str, Any]) -> None:
         """Validate stream-only preconditions before an HTTP response starts."""
@@ -156,11 +174,19 @@ class ResponsesService:
         stream_request = dict(raw_request)
         stream_request["stream"] = True
         self._trace(transaction_logger, "responses_raw_request", stream_request, direction="request", stage="client")
-        unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport=transport))
+        try:
+            unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport=transport))
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_parse_request", exc, stream_request)
+            raise
         if transaction_logger:
             self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
-        chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+        try:
+            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
+            raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
         session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)

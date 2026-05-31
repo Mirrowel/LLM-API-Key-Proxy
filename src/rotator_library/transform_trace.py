@@ -37,8 +37,11 @@ _SENSITIVE_KEYS = frozenset(
         "x-api-key",
         "x-goog-api-key",
         "openai-api-key",
+        "api-key",
+        "api-secret",
         "access-token",
         "refresh-token",
+        "id-token",
         "client-secret",
         "password",
         "secret",
@@ -71,7 +74,8 @@ _SENSITIVE_TEXT_RE = re.compile(
 
 
 def _normalise_key(key: Any) -> str:
-    return str(key).strip().lower().replace("_", "-")
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", str(key).strip())
+    return camel_split.lower().replace("_", "-")
 
 
 def scrub_sensitive_text(value: str) -> str:

@@ -119,7 +119,26 @@ class ProviderTransforms:
             if transform_provider == provider or transform_provider in model.lower():
                 for transform in transforms:
                     before = deepcopy(kwargs) if transaction_logger else None
-                    result = transform(kwargs, model, provider)
+                    try:
+                        result = transform(kwargs, model, provider)
+                    except Exception as exc:
+                        if transaction_logger:
+                            transaction_logger.log_transform_error(
+                                "builtin_provider_transform",
+                                exc,
+                                payload=before if before is not None else kwargs,
+                                stage="client",
+                                transport=transport,
+                                metadata={
+                                    "provider": provider,
+                                    "model": model,
+                                    "credential_id": credential_id,
+                                    "transform_provider": transform_provider,
+                                    "transform_name": getattr(transform, "__name__", repr(transform)),
+                                    **trace_metadata,
+                                },
+                            )
+                        raise
                     if result:
                         modifications.append(result)
                         _trace_transform_pass(

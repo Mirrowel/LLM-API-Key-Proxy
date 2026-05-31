@@ -210,7 +210,16 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if unified_event.type == "done":
             return "data: [DONE]\n\n"
         if unified_event.raw is not None:
-            return deepcopy(unified_event.raw)
+            payload = deepcopy(unified_event.raw)
+            if unified_event.delta is not None and isinstance(payload, dict) and isinstance(payload.get("choices"), list) and payload["choices"]:
+                choice = payload["choices"][0]
+                if isinstance(choice, dict):
+                    formatted_delta = self._format_message(unified_event.delta)
+                    original_delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                    if "role" not in original_delta:
+                        formatted_delta.pop("role", None)
+                    choice["delta"] = formatted_delta
+            return payload
         return f"data: {json.dumps(unified_event.to_dict())}\n\n"
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
