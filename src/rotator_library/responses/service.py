@@ -75,7 +75,8 @@ class ResponsesService:
 
         self._trace(transaction_logger, "responses_raw_request", raw_request, direction="request", stage="client")
         unified = self.protocol.parse_request(raw_request, ProtocolContext(source_protocol="responses"))
-        self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
+        if transaction_logger:
+            self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
 
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
@@ -122,7 +123,8 @@ class ResponsesService:
         stream_request["stream"] = True
         self._trace(transaction_logger, "responses_raw_request", stream_request, direction="request", stage="client")
         unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport="sse"))
-        self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
+        if transaction_logger:
+            self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
@@ -141,14 +143,15 @@ class ResponsesService:
         usage = None
         item_started = False
         monitor = StreamMonitor(clock=time.monotonic)
-        self._trace(
-            transaction_logger,
-            "stream_started",
-            {"event": StreamEvent("started", protocol="responses").to_dict(), "metrics": monitor.metrics.to_dict()},
-            direction="stream",
-            stage="client",
-            metadata={"transport": "sse"},
-        )
+        if transaction_logger:
+            self._trace(
+                transaction_logger,
+                "stream_started",
+                {"event": StreamEvent("started", protocol="responses").to_dict(), "metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="client",
+                metadata={"transport": "sse"},
+            )
         created = response_created_payload(response_id, unified.model)
         self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": "sse"})
         yield formatter.format_event("response.created", created)
@@ -157,14 +160,15 @@ class ResponsesService:
             async for raw_chunk in chat_stream:
                 if monitor.metrics.first_byte_at is None:
                     monitor.record_event(StreamEvent("raw_chunk", protocol="responses", raw=raw_chunk))
-                    self._trace(
-                        transaction_logger,
-                        "stream_first_byte",
-                        {"metrics": monitor.metrics.to_dict()},
-                        direction="stream",
-                        stage="provider",
-                        metadata={"transport": "sse"},
-                    )
+                    if transaction_logger:
+                        self._trace(
+                            transaction_logger,
+                            "stream_first_byte",
+                            {"metrics": monitor.metrics.to_dict()},
+                            direction="stream",
+                            stage="provider",
+                            metadata={"transport": "sse"},
+                        )
                 self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 chunk = parse_chat_sse_chunk(raw_chunk)
                 if not chunk or chunk.get("type") == "done":
@@ -197,14 +201,15 @@ class ResponsesService:
                     )
                 )
                 if first_visible:
-                    self._trace(
-                        transaction_logger,
-                        "stream_first_visible_output",
-                        {"event": event, "metrics": monitor.metrics.to_dict()},
-                        direction="stream",
-                        stage="final",
-                        metadata={"transport": "sse"},
-                    )
+                    if transaction_logger:
+                        self._trace(
+                            transaction_logger,
+                            "stream_first_visible_output",
+                            {"event": event, "metrics": monitor.metrics.to_dict()},
+                            direction="stream",
+                            stage="final",
+                            metadata={"transport": "sse"},
+                        )
                 self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": "sse"})
                 yield formatter.format_event("response.output_text.delta", event)
 
@@ -223,22 +228,23 @@ class ResponsesService:
             else:
                 self._trace(transaction_logger, "responses_store_skipped", {"response_id": completed.get("id")}, direction="metadata", stage="final")
             monitor.complete()
-            self._trace(
-                transaction_logger,
-                "stream_completed",
-                {"metrics": monitor.metrics.to_dict()},
-                direction="stream",
-                stage="final",
-                metadata={"transport": "sse"},
-            )
-            self._trace(
-                transaction_logger,
-                "stream_metrics_final",
-                {"metrics": monitor.metrics.to_dict()},
-                direction="stream",
-                stage="final",
-                metadata={"transport": "sse"},
-            )
+            if transaction_logger:
+                self._trace(
+                    transaction_logger,
+                    "stream_completed",
+                    {"metrics": monitor.metrics.to_dict()},
+                    direction="stream",
+                    stage="final",
+                    metadata={"transport": "sse"},
+                )
+                self._trace(
+                    transaction_logger,
+                    "stream_metrics_final",
+                    {"metrics": monitor.metrics.to_dict()},
+                    direction="stream",
+                    stage="final",
+                    metadata={"transport": "sse"},
+                )
             self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": "sse"})
             yield formatter.format_event("response.completed", completed)
             self._trace(transaction_logger, "stream_done_event", {"raw": formatter.done()}, direction="stream", stage="final", metadata={"transport": "sse"})
@@ -248,14 +254,15 @@ class ResponsesService:
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
             self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"}, scrub_strings=True)
-            self._trace(
-                transaction_logger,
-                "stream_metrics_final",
-                {"metrics": monitor.metrics.to_dict()},
-                direction="stream",
-                stage="final",
-                metadata={"transport": "sse", "failed": True},
-            )
+            if transaction_logger:
+                self._trace(
+                    transaction_logger,
+                    "stream_metrics_final",
+                    {"metrics": monitor.metrics.to_dict()},
+                    direction="stream",
+                    stage="final",
+                    metadata={"transport": "sse", "failed": True},
+                )
             yield formatter.format_event("response.failed", failed)
             self._trace(transaction_logger, "stream_done_event", {"raw": formatter.done()}, direction="stream", stage="final", metadata={"transport": "sse", "failed": True})
             yield formatter.done()

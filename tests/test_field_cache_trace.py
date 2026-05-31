@@ -55,15 +55,19 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
     pass_names = [entry["pass_name"] for entry in entries]
     assert updated["messages"][-1]["reasoning_content"] == "hidden"
     assert pass_names == [
+        "field_cache_extraction_start",
         "before_field_cache_extraction",
         "after_field_cache_extraction",
+        "field_cache_extraction_complete",
+        "field_cache_injection_start",
         "before_field_cache_injection",
         "after_field_cache_injection",
+        "field_cache_injection_complete",
     ]
-    assert entries[1]["metadata"]["rule_name"] == "reasoning_content"
-    assert entries[1]["metadata"]["matched"] == 1
-    assert entries[3]["metadata"]["hit"] is True
-    assert entries[3]["metadata"]["changed"] is True
+    assert entries[2]["metadata"]["rule_name"] == "reasoning_content"
+    assert entries[2]["metadata"]["matched"] == 1
+    assert entries[6]["metadata"]["hit"] is True
+    assert entries[6]["metadata"]["changed"] is True
 
 
 @pytest.mark.asyncio
