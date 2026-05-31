@@ -12,9 +12,9 @@ from .base import ProtocolAdapter
 from .operation import OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH, normalize_operation
 from .types import ProtocolContext, UnifiedRequest, UnifiedResponse
 
-_AUDIO_OPTION_FIELDS = {"language", "prompt", "response_format", "temperature", "timestamp_granularities"}
+_AUDIO_OPTION_FIELDS = {"language", "response_format", "temperature", "timestamp_granularities"}
 _SPEECH_OPTION_FIELDS = {"voice", "response_format", "speed"}
-_CORE_FIELDS = {"operation", "model", "file", "input", *_AUDIO_OPTION_FIELDS, *_SPEECH_OPTION_FIELDS}
+_CORE_FIELDS = {"operation", "model", "file", "input", "prompt", *_AUDIO_OPTION_FIELDS, *_SPEECH_OPTION_FIELDS}
 
 
 class OpenAIAudioProtocol(ProtocolAdapter):
@@ -36,7 +36,7 @@ class OpenAIAudioProtocol(ProtocolAdapter):
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
-        operation = _audio_operation(request)
+        operation = _audio_operation(request, context)
         files = []
         if "file" in request:
             files.append({"field": "file", "value": deepcopy(request["file"])})
@@ -64,6 +64,27 @@ class OpenAIAudioProtocol(ProtocolAdapter):
         payload.update(deepcopy(unified_request.extra))
         return payload
 
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> Any:
+        """Format audio responses without forcing binary/text payloads into JSON.
+
+        Speech endpoints can return raw audio bytes while transcription endpoints
+        can return JSON or plain text depending on `response_format`. Returning
+        the preserved raw body for non-dict responses keeps the protocol adapter
+        honest until a transport layer decides headers and streaming behavior.
+        """
+
+        if unified_response.raw is not None and not isinstance(unified_response.raw, dict):
+            return deepcopy(unified_response.raw)
+        payload: dict[str, Any] = {}
+        if unified_response.output:
+            payload["text"] = deepcopy(unified_response.output[0])
+        if unified_response.data:
+            payload["data"] = deepcopy(unified_response.data)
+        if unified_response.content_type:
+            payload["content_type"] = unified_response.content_type
+        payload.update(deepcopy(unified_response.extra))
+        return payload
+
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         if isinstance(raw_response, dict):
             response = raw_response
@@ -81,10 +102,13 @@ class OpenAIAudioProtocol(ProtocolAdapter):
         return UnifiedResponse(operation=_context_operation(context, default_operation), content_type=content_type, raw=deepcopy(raw_response), output=[deepcopy(raw_response)] if isinstance(raw_response, str) else [])
 
 
-def _audio_operation(request: dict[str, Any]) -> str:
+def _audio_operation(request: dict[str, Any], context: ProtocolContext | None = None) -> str:
     explicit = normalize_operation(request.get("operation"))
     if explicit in {OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH}:
         return explicit
+    contextual = _context_operation(context, "unknown")
+    if contextual in {OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH}:
+        return contextual
     if "voice" in request or ("input" in request and "file" not in request):
         return OPERATION_SPEECH
     return OPERATION_AUDIO_TRANSCRIPTION
