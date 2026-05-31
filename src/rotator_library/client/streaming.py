@@ -17,6 +17,7 @@ import codecs
 import json
 import logging
 import re
+import time
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import litellm
@@ -24,6 +25,7 @@ import litellm
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 from ..core.utils import normalize_usage_for_response
+from ..streaming import StreamEvent, StreamMonitor, stream_event_from_sse_chunk
 
 if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
@@ -50,6 +52,7 @@ class StreamingHandler:
         cred_context: Optional["CredentialContext"] = None,
         skip_cost_calculation: bool = False,
         response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        transaction_logger: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a LiteLLM stream with error handling and usage tracking.
@@ -81,6 +84,13 @@ class StreamingHandler:
         thinking_tokens = 0
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
+        monitor = StreamMonitor(clock=time.monotonic)
+        self._log_stream_lifecycle(
+            transaction_logger,
+            "stream_started",
+            monitor,
+            StreamEvent("started", protocol="openai_chat"),
+        )
 
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
@@ -97,6 +107,20 @@ class StreamingHandler:
 
                     chunk = await stream_iterator.__anext__()
 
+                    raw_event = StreamEvent(
+                        "raw_chunk",
+                        protocol="openai_chat",
+                        raw=chunk,
+                        data={"chunk_index": monitor.metrics.chunk_count + 1},
+                    )
+                    if monitor.metrics.first_byte_at is None:
+                        self._log_stream_lifecycle(
+                            transaction_logger,
+                            "stream_first_byte",
+                            monitor,
+                            raw_event,
+                        )
+
                     # Clear error buffer on successful chunk receipt
                     error_buffer.reset()
 
@@ -112,6 +136,19 @@ class StreamingHandler:
                         assistant_parts,
                         tool_call_ids,
                     )
+                    event = stream_event_from_sse_chunk(processed.sse_string)
+                    first_visible = (
+                        event.visible_output
+                        and monitor.metrics.first_visible_output_at is None
+                    )
+                    monitor.record_event(event)
+                    if first_visible:
+                        self._log_stream_lifecycle(
+                            transaction_logger,
+                            "stream_first_visible_output",
+                            monitor,
+                            event,
+                        )
 
                     # Update tracking state
                     if processed.has_tool_calls:
@@ -221,6 +258,7 @@ class StreamingHandler:
                         )
 
                     # Not a JSON-related error, re-raise
+                    monitor.metrics.error_count += 1
                     raise
 
         except StreamedAPIError:
@@ -268,8 +306,56 @@ class StreamingHandler:
                         }
                     )
 
+                monitor.complete()
+                self._log_stream_lifecycle(
+                    transaction_logger,
+                    "stream_completed",
+                    monitor,
+                    StreamEvent("completed", protocol="openai_chat"),
+                )
+                self._log_stream_lifecycle(
+                    transaction_logger,
+                    "stream_metrics_final",
+                    monitor,
+                    StreamEvent("metadata", protocol="openai_chat"),
+                )
+
                 # Yield [DONE] for completed streams
                 yield "data: [DONE]\n\n"
+
+            elif request and await request.is_disconnected():
+                monitor.cancel()
+                self._log_stream_lifecycle(
+                    transaction_logger,
+                    "stream_cancelled",
+                    monitor,
+                    StreamEvent("cancelled", protocol="openai_chat"),
+                )
+
+    @staticmethod
+    def _log_stream_lifecycle(
+        transaction_logger: Optional[Any],
+        pass_name: str,
+        monitor: StreamMonitor,
+        event: StreamEvent,
+    ) -> None:
+        """Emit stream lifecycle metrics without affecting stream delivery."""
+
+        if not transaction_logger:
+            return
+        try:
+            transaction_logger.log_transform_pass(
+                pass_name,
+                {"event": event.to_dict(), "metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="client",
+                protocol=event.protocol,
+                transport="sse",
+                metadata={"event_type": event.event_type},
+                snapshot=False,
+            )
+        except Exception as exc:
+            lib_logger.debug("Stream lifecycle trace failed: %s", exc)
 
     def _collect_session_response_anchors(
         self,

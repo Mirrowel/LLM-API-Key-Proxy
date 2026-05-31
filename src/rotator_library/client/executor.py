@@ -1168,6 +1168,7 @@ class RequestExecutor:
                                         response_callback=lambda response: self._record_session_response(
                                             context, response
                                         ),
+                                        transaction_logger=context.transaction_logger,
                                     )
 
                                     lib_logger.info(
