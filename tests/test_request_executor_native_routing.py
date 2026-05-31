@@ -123,6 +123,15 @@ class CustomPlugin:
         self.calls.append(kwargs)
         return {"id": "custom"}
 
+    def get_protocol_name(self, model=""):
+        return "gemini"
+
+    def get_native_endpoint(self, model="", operation="chat"):
+        return "https://native.test/should-not-run"
+
+    def get_native_headers(self, credential_identifier, model="", operation="chat"):
+        return {"Authorization": f"Bearer {credential_identifier}"}
+
 
 def _context(target=None) -> RequestContext:
     return RequestContext(
@@ -172,6 +181,22 @@ async def test_native_declared_provider_uses_native_executor_in_auto_mode() -> N
     assert http_client.calls[0]["headers"]["X-Operation"] == "chat"
     assert http_client.calls[0]["headers"]["X-Model"] == "gpt-test"
     assert http_client.calls[0]["json"]["model"] == "gpt-test"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_prefers_custom_logic_over_native_declaration() -> None:
+    http_client = FakeHTTPClient()
+    plugin = CustomPlugin()
+    context = _context(parse_route_target("provider/gpt-test"))
+    context.routing_target_index = 0
+
+    response = await _executor(http_client)._execute_provider_request(
+        "provider", "provider/gpt-test", plugin, "secret", "stable", dict(context.kwargs), context
+    )
+
+    assert response == {"id": "custom"}
+    assert plugin.calls[0]["credential_identifier"] == "secret"
+    assert http_client.calls == []
 
 
 @pytest.mark.asyncio
