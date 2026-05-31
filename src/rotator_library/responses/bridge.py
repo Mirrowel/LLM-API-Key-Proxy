@@ -139,6 +139,12 @@ def responses_session_hints(previous_response_id: Optional[str], *, affinity_key
 
 
 def _message_to_chat(message: UnifiedMessage) -> dict[str, Any]:
+    if message.role == "tool":
+        result = _tool_result_from_message(message)
+        payload = {"role": "tool", "content": result["content"]}
+        if result.get("tool_call_id"):
+            payload["tool_call_id"] = result["tool_call_id"]
+        return payload
     payload = {"role": message.role, "content": _blocks_to_chat_content(message.content)}
     if message.name:
         payload["name"] = message.name
@@ -147,6 +153,17 @@ def _message_to_chat(message: UnifiedMessage) -> dict[str, Any]:
     if message.tool_calls:
         payload["tool_calls"] = [call.to_dict() for call in message.tool_calls]
     return payload
+
+
+def _tool_result_from_message(message: UnifiedMessage) -> dict[str, Any]:
+    for block in message.content:
+        if block.tool_result is not None:
+            content = block.tool_result.content
+            return {
+                "tool_call_id": message.tool_call_id or block.tool_result.tool_call_id,
+                "content": content if isinstance(content, str) else serialize_value(content),
+            }
+    return {"tool_call_id": message.tool_call_id, "content": _blocks_to_chat_content(message.content)}
 
 
 def _blocks_to_chat_content(blocks: list[ContentBlock]) -> Any:
