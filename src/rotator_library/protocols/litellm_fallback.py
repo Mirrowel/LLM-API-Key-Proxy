@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from .base import ProtocolAdapter
+from .operation import OPERATION_UNKNOWN
 
 
 class LiteLLMFallbackProtocol(ProtocolAdapter):
@@ -26,3 +27,4 @@ class LiteLLMFallbackProtocol(ProtocolAdapter):
     name: ClassVar[str] = "litellm_fallback"
     aliases: ClassVar[tuple[str, ...]] = ("litellm", "fallback")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_UNKNOWN,)

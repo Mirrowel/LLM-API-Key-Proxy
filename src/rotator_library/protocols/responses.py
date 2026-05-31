@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
+from .operation import OPERATION_RESPONSES
 from .types import (
     ContentBlock,
     CostDetails,
@@ -68,6 +69,7 @@ class ResponsesProtocol(ProtocolAdapter):
     name: ClassVar[str] = "responses"
     aliases: ClassVar[tuple[str, ...]] = ("openai_responses", "response_api")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_RESPONSES,)
     future_transports: ClassVar[tuple[str, ...]] = ("websocket",)
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:

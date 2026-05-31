@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
+from .operation import OPERATION_COUNT_TOKENS, OPERATION_MESSAGES
 from .types import (
     ContentBlock,
     ProtocolContext,
@@ -56,6 +57,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     name: ClassVar[str] = "anthropic_messages"
     aliases: ClassVar[tuple[str, ...]] = ("anthropic", "messages", "claude_messages")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_MESSAGES, OPERATION_COUNT_TOKENS)
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
