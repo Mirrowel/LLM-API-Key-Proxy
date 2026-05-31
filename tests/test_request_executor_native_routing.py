@@ -77,6 +77,19 @@ class NativePluginWithRule(NativePlugin):
         )
 
 
+class NativePluginWithVendorRule(NativePlugin):
+    def get_field_cache_rules(self, model=""):
+        return (
+            FieldCacheRule(
+                name="vendor_state",
+                source="response",
+                path="choices.0.message.vendor_state",
+                inject=FieldCacheInjection(target="request", path="metadata.vendor_state"),
+                allow_missing_session=True,
+            ),
+        )
+
+
 class CustomPlugin:
     def __init__(self):
         self.calls = []
@@ -194,6 +207,16 @@ def test_native_context_raises_on_invalid_field_cache_config(monkeypatch, tmp_pa
         _executor()._build_native_provider_context("provider", "provider/gpt-test", NativePlugin(), "secret", "stable", _context(), None)
 
     assert exc.value.error_type == "configuration_error"
+
+
+def test_executor_trace_redaction_uses_native_field_cache_response_paths() -> None:
+    context = _context(parse_route_target("provider/gpt-test"))
+    payload = {"choices": [{"message": {"role": "assistant", "content": "ok", "vendor_state": "opaque-vendor-state"}}]}
+
+    redacted = executor_module._redact_context_field_cache_paths(payload, context, "response", NativePluginWithVendorRule())
+
+    assert redacted["choices"][0]["message"]["vendor_state"] == "[REDACTED]"
+    assert payload["choices"][0]["message"]["vendor_state"] == "opaque-vendor-state"
 
 
 @pytest.mark.asyncio

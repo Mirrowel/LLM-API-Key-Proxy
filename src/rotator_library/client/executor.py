@@ -67,6 +67,8 @@ from ..retry_policy import decide_provider_cooldown, provider_cooldown_env
 from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
+from ..transform_trace import REDACTED
 from ..usage.accounting import UsageRecord, extract_usage_record
 from ..usage.costs import CostBreakdown, CostCalculator
 
@@ -1084,10 +1086,11 @@ class RequestExecutor:
                                     kwargs,
                                     context,
                                 )
+                                trace_response = _redact_context_field_cache_paths(response, context, "response", plugin)
                                 self._log_executor_trace(
                                     context,
                                     "raw_provider_response",
-                                    response,
+                                    trace_response,
                                     direction="response",
                                     stage="provider",
                                     credential_id=cred_context.stable_id,
@@ -1132,6 +1135,7 @@ class RequestExecutor:
                                             if hasattr(response, "model_dump")
                                             else response
                                         )
+                                        response_data = _redact_context_field_cache_paths(response_data, context, "response", plugin)
                                         context.transaction_logger.log_response(
                                             response_data
                                         )
@@ -1141,10 +1145,11 @@ class RequestExecutor:
                                         )
 
                                 normalized_response = self._normalize_response_usage(response, model)
+                                trace_normalized_response = _redact_context_field_cache_paths(normalized_response, context, "response", plugin)
                                 self._log_executor_trace(
                                     context,
                                     "post_usage_normalization_response",
-                                    normalized_response,
+                                    trace_normalized_response,
                                     direction="response",
                                     stage="final",
                                     credential_id=cred_context.stable_id,
@@ -2260,6 +2265,73 @@ def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
             return bool(support(model))
         except TypeError:
             return bool(support())
+
+
+def _redact_context_field_cache_paths(payload: Any, context: RequestContext, direction: str, plugin: Any) -> Any:
+    """Redact configured field-cache paths before executor-level traces.
+
+    Native provider execution already redacts its internal trace passes. The
+    client executor also logs returned responses, so it must apply the same
+    rule-aware redaction there without mutating the client-facing response.
+    """
+
+    if direction not in {"response", "stream"} or not plugin or not _provider_native_protocol(plugin, context.model, _current_route_target(context)):
+        return payload
+    try:
+        rules = _merged_field_cache_rules(context.provider, context.model, plugin)
+    except RoutingExecutionError:
+        raise
+    except Exception:
+        return payload
+    if not rules:
+        return payload
+    redacted = deepcopy(payload)
+    for rule in rules:
+        if direction == "response" and getattr(rule, "source", None) not in {"response", "unified_response"}:
+            continue
+        if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event"}:
+            continue
+        try:
+            _redact_trace_path(redacted, parse_path(rule.path))
+        except (FieldCachePathError, TypeError, ValueError):
+            continue
+    return redacted
+
+
+def _redact_trace_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    if not tokens:
+        return
+    token = tokens[0]
+    rest = tokens[1:]
+    if token.kind == "key":
+        if isinstance(value, dict) and token.value in value:
+            if rest:
+                _redact_trace_path(value[token.value], rest)
+            else:
+                value[token.value] = REDACTED
+        return
+    if token.kind == "index":
+        if isinstance(value, list) and value:
+            index = int(token.value)
+            if -len(value) <= index < len(value):
+                if rest:
+                    _redact_trace_path(value[index], rest)
+                else:
+                    value[index] = REDACTED
+        return
+    if token.kind == "wildcard":
+        if isinstance(value, dict):
+            for key in list(value.keys()):
+                if rest:
+                    _redact_trace_path(value[key], rest)
+                else:
+                    value[key] = REDACTED
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if rest:
+                    _redact_trace_path(item, rest)
+                else:
+                    value[index] = REDACTED
 
 
 def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[Any, ...]:
