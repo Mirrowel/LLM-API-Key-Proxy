@@ -1845,64 +1845,6 @@ class RequestExecutor:
             snapshot=False,
         )
 
-    def _legacy_extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
-        """Previous extraction logic kept temporarily for comparison/debugging."""
-
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_tokens = 0
-        cache_write_tokens = 0
-        thinking_tokens = 0
-
-        if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-
-            prompt_details = getattr(response.usage, "prompt_tokens_details", None)
-            if prompt_details:
-                if isinstance(prompt_details, dict):
-                    cached_tokens = prompt_details.get("cached_tokens", 0) or 0
-                    cache_write_tokens = (
-                        prompt_details.get("cache_creation_tokens", 0) or 0
-                    )
-                else:
-                    cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
-                    cache_write_tokens = (
-                        getattr(prompt_details, "cache_creation_tokens", 0) or 0
-                    )
-
-            completion_details = getattr(
-                response.usage, "completion_tokens_details", None
-            )
-            if completion_details:
-                if isinstance(completion_details, dict):
-                    thinking_tokens = completion_details.get("reasoning_tokens", 0) or 0
-                else:
-                    thinking_tokens = (
-                        getattr(completion_details, "reasoning_tokens", 0) or 0
-                    )
-
-            cache_read_tokens = getattr(response.usage, "cache_read_tokens", None)
-            if cache_read_tokens is not None:
-                cached_tokens = cache_read_tokens or 0
-            cache_creation_tokens = getattr(
-                response.usage, "cache_creation_tokens", None
-            )
-            if cache_creation_tokens is not None:
-                cache_write_tokens = cache_creation_tokens or 0
-
-            if thinking_tokens and completion_tokens >= thinking_tokens:
-                completion_tokens = completion_tokens - thinking_tokens
-
-        uncached_prompt = max(0, prompt_tokens - cached_tokens)
-        return (
-            uncached_prompt,
-            completion_tokens,
-            cached_tokens,
-            cache_write_tokens,
-            thinking_tokens,
-        )
-
     @staticmethod
     def _normalize_response_usage(response: Any, model: str) -> Any:
         """
@@ -1915,28 +1857,6 @@ class RequestExecutor:
         if hasattr(response, "usage") and response.usage:
             normalize_usage_for_response(response.usage, model)
         return response
-
-    def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
-        plugin = self._get_plugin_instance(provider)
-        if plugin and getattr(plugin, "skip_cost_calculation", False):
-            return 0.0
-
-        try:
-            if isinstance(response, litellm.EmbeddingResponse):
-                model_info = litellm.get_model_info(model)
-                input_cost = model_info.get("input_cost_per_token")
-                if input_cost:
-                    return (response.usage.prompt_tokens or 0) * input_cost
-                return 0.0
-
-            cost = litellm.completion_cost(
-                completion_response=response,
-                model=model,
-            )
-            return float(cost) if cost is not None else 0.0
-        except Exception as exc:
-            lib_logger.debug(f"Cost calculation failed for {model}: {exc}")
-            return 0.0
 
     async def _transaction_logging_stream_wrapper(
         self,

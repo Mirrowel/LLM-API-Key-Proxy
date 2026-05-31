@@ -22,6 +22,15 @@ class FakeUsageClient:
         }
 
 
+class FakeStreamingUsageClient:
+    async def acompletion(self, **kwargs):
+        async def gen():
+            yield 'data: {"id":"chunk_1","choices":[{"delta":{"content":"hi"}}]}\n\n'
+            yield 'data: {"id":"chunk_2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"completion_tokens_details":{"reasoning_tokens":3}}}\n\n'
+
+        return gen()
+
+
 @pytest.mark.asyncio
 async def test_responses_create_traces_normalized_usage(tmp_path) -> None:
     logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
@@ -34,3 +43,14 @@ async def test_responses_create_traces_normalized_usage(tmp_path) -> None:
     assert usage_entries
     assert usage_entries[-1]["data"]["usage"]["completion_tokens"] == 5
     assert usage_entries[-1]["data"]["usage"]["reasoning_tokens"] == 3
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_preserves_usage_details_in_completed_event() -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    chunks = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "hello", "stream": True}, FakeStreamingUsageClient())]
+    completed = [chunk for chunk in chunks if "response.completed" in chunk][0]
+    payload = json.loads(completed.split("data: ", 1)[1])
+
+    assert payload["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
