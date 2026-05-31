@@ -657,6 +657,7 @@ class RequestExecutor:
         credential_id: str,
         context: RequestContext,
         target: Optional[RouteTarget],
+        transport: str = "http",
     ) -> NativeProviderContext:
         """Build native provider context from provider declarations."""
 
@@ -679,6 +680,7 @@ class RequestExecutor:
             session_id=context.session_id,
             scope_key=context.usage_manager_key,
             classifier=context.classifier,
+            transport=transport,
             adapter_names=tuple(plugin.get_adapter_names(model) if hasattr(plugin, "get_adapter_names") else ()),
             adapter_config=dict(plugin.get_adapter_config(model) if hasattr(plugin, "get_adapter_config") else {}),
             field_cache_rules=_merged_field_cache_rules(provider, model, plugin),
@@ -1150,6 +1152,27 @@ class RequestExecutor:
                                 )
                                 return normalized_response
 
+                            except RoutingExecutionError as e:
+                                if e.error_type == "configuration_error":
+                                    raise
+                                last_exception = e
+                                action = await self._handle_error_with_context(
+                                    e,
+                                    cred_context,
+                                    model,
+                                    provider,
+                                    attempt,
+                                    error_accumulator,
+                                    retry_state,
+                                    request_headers,
+                                    context,
+                                )
+                                if action == ErrorAction.RETRY_SAME:
+                                    continue
+                                elif action == ErrorAction.ROTATE:
+                                    break
+                                else:
+                                    raise
                             except Exception as e:
                                 last_exception = e
                                 action = await self._handle_error_with_context(
@@ -1173,6 +1196,9 @@ class RequestExecutor:
 
                     except PreRequestCallbackError:
                         raise
+                    except RoutingExecutionError as exc:
+                        if exc.error_type == "configuration_error":
+                            raise
                     except Exception:
                         # Let context manager handle cleanup
                         pass
@@ -1347,6 +1373,7 @@ class RequestExecutor:
                                             cred_context.stable_id,
                                             context,
                                             target,
+                                            transport="sse",
                                         )
                                         self._log_routing_trace(
                                             context,

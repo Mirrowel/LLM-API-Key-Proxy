@@ -244,8 +244,11 @@ class FieldCacheEngine:
             operation.skipped = True
             operation.reason = "ambiguous_tool_call_values"
             return None
-        if rule.inject and (rule.inject.as_list or rule.mode == "all"):
+        if rule.mode == "all":
             return cached if isinstance(cached, list) else [cached]
+        if rule.inject and rule.inject.as_list:
+            unwrapped = _unwrap_cached_value(cached)
+            return unwrapped if isinstance(unwrapped, list) else [unwrapped]
         return _unwrap_cached_value(cached)
 
     def _trace(
@@ -397,12 +400,12 @@ def _tool_call_values(rule: FieldCacheRule, payload: Any, values: list[Any]) -> 
             tool_ids = extract_path(container, str(tool_id_path)) if tool_id_path else []
             tool_values = extract_path(container, str(tool_value_path))
             if tool_ids and tool_values:
-                stored[str(tool_ids[0])] = tool_values[-1]
+                stored[str(tool_ids[0])] = _wrap_cached_value(tool_values[-1])
         return stored
     for value in values:
         tool_ids = extract_path(value, str(tool_id_path)) if tool_id_path else []
         if tool_ids:
-            stored[str(tool_ids[0])] = value
+            stored[str(tool_ids[0])] = _wrap_cached_value(value)
     return stored
 
 

@@ -355,6 +355,23 @@ async def test_last_mode_preserves_list_valued_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_as_list_unwraps_last_mode_value_envelope() -> None:
+    rule = FieldCacheRule(
+        name="value",
+        source="response",
+        path="value",
+        inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"value": "sig"}, _context(session_id=None))
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
+
+    assert updated["metadata"]["values"] == ["sig"]
+
+
+@pytest.mark.asyncio
 async def test_last_assistant_turn_skips_without_turn_context() -> None:
     rule = FieldCacheRule(
         name="assistant_signature",
@@ -436,6 +453,25 @@ async def test_per_tool_call_as_list_injects_matching_values() -> None:
     updated, _ = await engine.inject("request", {"metadata": {}, "tool_ids": ["a", "b"]}, _context(session_id=None))
 
     assert updated["metadata"]["signatures"] == [{"id": "a", "signature": "sig-a"}, {"id": "b", "signature": "sig-b"}]
+
+
+@pytest.mark.asyncio
+async def test_per_tool_call_preserves_list_valued_match() -> None:
+    rule = FieldCacheRule(
+        name="tool_signatures",
+        source="response",
+        path="tool_calls.*.signatures",
+        mode="per_tool_call",
+        inject=FieldCacheInjection(target="request", path="metadata.signatures"),
+        allow_missing_session=True,
+        metadata={"tool_container_path": "tool_calls", "tool_call_id_path": "id", "tool_value_path": "signatures"},
+    )
+    engine = FieldCacheEngine([rule])
+
+    await engine.extract("response", {"tool_calls": [{"id": "call", "signatures": ["a", "b"]}]}, _context(session_id=None))
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None, metadata={"tool_call_id": "call"}))
+
+    assert updated["metadata"]["signatures"] == ["a", "b"]
 
 
 @pytest.mark.asyncio
