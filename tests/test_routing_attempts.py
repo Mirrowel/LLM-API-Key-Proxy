@@ -63,7 +63,7 @@ def test_clone_context_for_target_rewrites_standard_session_namespace() -> None:
 
     cloned = clone_context_for_target(original, parse_route_target("anthropic/claude"))
 
-    assert cloned.session_tracking_namespace == "scope:openai:provider:anthropic:model:anthropic/claude"
+    assert cloned.session_tracking_namespace == "scope:anthropic:provider:anthropic:model:anthropic/claude"
 
 
 def test_clone_context_for_target_preserves_custom_session_namespace() -> None:

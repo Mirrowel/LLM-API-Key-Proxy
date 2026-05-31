@@ -2515,7 +2515,11 @@ def _should_use_native_streaming(plugin: Any, model: str, target: Optional[Route
             f"Provider {provider} does not support native streaming for {model}",
             error_type="configuration_error",
         )
-    return bool(execution == "auto" and plugin and _provider_native_protocol(plugin, model, target) and _provider_supports_native_streaming(plugin, model))
+    if execution != "auto" or not plugin:
+        return False
+    if not _should_use_native_protocol(plugin, model, target, {"model": model, "stream": True}, stream=True, execution=execution):
+        return False
+    return _provider_supports_native_streaming(plugin, model)
 
 
 def _redact_context_field_cache_paths(payload: Any, context: RequestContext, direction: str, plugin: Any) -> Any:
