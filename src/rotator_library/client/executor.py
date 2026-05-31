@@ -2270,7 +2270,9 @@ class RequestExecutor:
         dicts (streaming) and pydantic objects (non-streaming).
         Internal tracking values from UsageRecord accounting are unaffected.
         """
-        if hasattr(response, "usage") and response.usage:
+        if isinstance(response, dict):
+            normalize_usage_for_response(response.get("usage"), model)
+        elif hasattr(response, "usage") and response.usage:
             normalize_usage_for_response(response.usage, model)
         return response
 
