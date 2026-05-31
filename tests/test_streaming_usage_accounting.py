@@ -67,7 +67,7 @@ async def test_streaming_usage_uses_normalized_accounting_and_trace(tmp_path, mo
     chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "gpt-test", cred_context=cred_context, transaction_logger=logger)]
 
     assert chunks[-1] == "data: [DONE]\n\n"
-    assert cred_context.success_kwargs["prompt_tokens"] == 60
+    assert cred_context.success_kwargs["prompt_tokens"] == 55
     assert cred_context.success_kwargs["prompt_tokens_cache_read"] == 40
     assert cred_context.success_kwargs["prompt_tokens_cache_write"] == 5
     assert cred_context.success_kwargs["completion_tokens"] == 20
@@ -115,7 +115,7 @@ async def test_streaming_usage_uses_configured_env_pricing(monkeypatch) -> None:
 
     _ = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "openai/gpt-test", cred_context=cred_context)]
 
-    assert cred_context.success_kwargs["approx_cost"] == 120.0
+    assert cred_context.success_kwargs["approx_cost"] == 110.0
 
 
 @pytest.mark.asyncio

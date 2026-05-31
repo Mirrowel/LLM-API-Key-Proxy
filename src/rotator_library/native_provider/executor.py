@@ -162,10 +162,16 @@ class NativeProviderExecutor:
             await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
+            usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 event = protocol.parse_stream_event(raw_chunk, protocol_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
+                usage_record = _merge_stream_usage_records(
+                    usage_record,
+                    extract_usage_record(serialize_value(event), provider=context.provider, model=context.model, source="native_stream_event"),
+                    extract_usage_record(raw_chunk, provider=context.provider, model=context.model, source="native_raw_stream_event"),
+                )
                 if event.type == "done":
                     event_payload = stream_event_payload(event)
                     self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
@@ -194,6 +200,15 @@ class NativeProviderExecutor:
                 formatted = response_protocol.format_stream_event(event, context.protocol_context(target_protocol=response_protocol.name))
                 self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
                 yield formatted
+            cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
+            self._trace(
+                context,
+                "usage_accounting_summary",
+                {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
+                direction="metadata",
+                stage="final",
+                snapshot=False,
+            )
         except Exception as exc:
             if logger:
                 logger.log_transform_error(
@@ -287,6 +302,34 @@ class NativeProviderExecutor:
         if injected == serialized:
             return unified_request
         return _hydrate_unified_request(unified_request, injected)
+
+
+def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -> Any:
+    """Merge native stream usage, preserving raw provider cost when needed."""
+
+    selected = event_record if _usage_record_has_values(event_record) else base
+    if not _usage_record_has_values(selected) and _usage_record_has_values(raw_record):
+        selected = raw_record
+    if selected.provider_reported_cost is None and raw_record.provider_reported_cost is not None:
+        selected = replace(
+            selected,
+            provider_reported_cost=raw_record.provider_reported_cost,
+            cost_currency=raw_record.cost_currency,
+            cost_source=raw_record.cost_source,
+        )
+    return selected
+
+
+def _usage_record_has_values(record: Any) -> bool:
+    return bool(
+        record.input_tokens
+        or record.completion_tokens
+        or record.reasoning_tokens
+        or record.cache_read_tokens
+        or record.cache_write_tokens
+        or record.raw_total_tokens
+        or record.provider_reported_cost is not None
+    )
 
 
 def _redact_field_cache_paths(data: Any, context: NativeProviderContext, direction: str) -> Any:

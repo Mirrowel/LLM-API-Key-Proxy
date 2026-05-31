@@ -23,9 +23,12 @@ def can_retry_stream_after_error(last_streamed_chunk: Optional[str], allow_reaso
         return True
     if is_stream_heartbeat_or_comment(last_streamed_chunk):
         return True
+    metadata = _sse_json(last_streamed_chunk, malformed_is_visible=False)
+    if isinstance(metadata, dict) and (metadata.get("event_type") or metadata.get("type")) == "cost":
+        return True
     if not allow_reasoning_only_retry:
         return False
-    data = _sse_json(last_streamed_chunk, malformed_is_visible=False)
+    data = metadata
     if data is None:
         return False
 

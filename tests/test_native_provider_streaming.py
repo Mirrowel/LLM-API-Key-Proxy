@@ -61,6 +61,39 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_native_provider_stream_traces_usage_accounting_summary(tmp_path) -> None:
+    logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        transaction_logger=logger,
+    )
+    chunks = [
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 3,
+                "cost_details": {"total_cost": 0.04, "currency": "USD", "source": "stream_usage"},
+            },
+        },
+        "[DONE]",
+    ]
+
+    _ = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
+
+    entries = _trace_entries(logger.log_dir)
+    summaries = [entry for entry in entries if entry["pass_name"] == "usage_accounting_summary"]
+    assert summaries
+    assert summaries[-1]["data"]["usage"]["input_tokens"] == 2
+    assert summaries[-1]["data"]["usage"]["completion_tokens"] == 3
+    assert summaries[-1]["data"]["usage"]["provider_reported_cost"] == 0.04
+    assert summaries[-1]["data"]["cost"]["provider_reported_cost"] == 0.04
+
+
+@pytest.mark.asyncio
 async def test_native_provider_stream_logs_errors(tmp_path) -> None:
     class BrokenClient:
         async def stream_json_lines(self, endpoint, *, headers, json):
