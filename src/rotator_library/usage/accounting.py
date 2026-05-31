@@ -314,6 +314,21 @@ def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
 
     total = 0.0
     found = False
+    upstream_total = _float_or_none(payload.get("upstream_inference_cost"))
+    if upstream_total is not None:
+        total += upstream_total
+        found = True
+    else:
+        for key in (
+            "upstream_inference_prompt_cost",
+            "upstream_inference_completions_cost",
+            "upstream_inference_input_cost",
+            "upstream_inference_output_cost",
+        ):
+            value = _float_or_none(payload.get(key))
+            if value is not None:
+                total += value
+                found = True
     for key in (
         "input_cost",
         "prompt_cost",
@@ -326,11 +341,6 @@ def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
         "completions_cost",
         "reasoning_cost",
         "thinking_cost",
-        "upstream_inference_cost",
-        "upstream_inference_prompt_cost",
-        "upstream_inference_completions_cost",
-        "upstream_inference_input_cost",
-        "upstream_inference_output_cost",
         "image_input_cost",
         "image_output_cost",
         "audio_input_cost",
