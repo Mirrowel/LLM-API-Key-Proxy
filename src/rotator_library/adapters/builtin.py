@@ -162,7 +162,9 @@ class AntigravityEnvelopeAdapter(PayloadAdapter):
     supported_stages = ("request",)
 
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
-        if not isinstance(payload, dict) or "request" in payload:
+        if not isinstance(payload, dict):
+            return payload
+        if _looks_like_antigravity_envelope(payload):
             return payload
         config = context.config_for(self.name)
         model = payload.get("model") or context.model
@@ -178,6 +180,12 @@ class AntigravityEnvelopeAdapter(PayloadAdapter):
         if project:
             envelope["project"] = project
         return {key: value for key, value in envelope.items() if value is not None}
+
+
+def _looks_like_antigravity_envelope(payload: dict[str, Any]) -> bool:
+    """Return whether a payload already has the controlled envelope shape."""
+
+    return "request" in payload and "requestType" in payload and "requestId" in payload
 
 
 def _delete_simple_path(payload: dict[str, Any], path: str) -> None:

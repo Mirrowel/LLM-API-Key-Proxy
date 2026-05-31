@@ -114,6 +114,31 @@ async def test_field_rename_adapter_copies_and_moves_configured_fields() -> None
 
 
 @pytest.mark.asyncio
+async def test_antigravity_envelope_wraps_user_request_key() -> None:
+    adapter = get_adapter("antigravity_envelope")
+
+    result = await adapter.transform_request(
+        {"model": "gemini-3-flash", "request": {"user_supplied": True}, "contents": [{"parts": [{"text": "hi"}]}]},
+        AdapterContext(adapter_config={"antigravity_envelope": {"request_type": "CHAT_COMPLETION", "user_agent": "test-agent"}}),
+    )
+
+    assert result["requestType"] == "CHAT_COMPLETION"
+    assert result["requestId"]
+    assert result["request"]["request"] == {"user_supplied": True}
+    assert result["request"]["contents"][0]["parts"][0]["text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_envelope_is_idempotent_for_controlled_envelope() -> None:
+    adapter = get_adapter("antigravity_envelope")
+    payload = {"model": "gemini-3-flash", "request": {"contents": []}, "requestType": "CHAT_COMPLETION", "requestId": "id"}
+
+    result = await adapter.transform_request(payload, AdapterContext())
+
+    assert result == payload
+
+
+@pytest.mark.asyncio
 async def test_adapter_chain_order_is_preserved() -> None:
     payload = {"model": "public", "messages": [{"role": "developer", "content": "rules"}]}
     context = AdapterContext(adapter_config={"model_override": {"model": "native"}})
