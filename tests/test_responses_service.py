@@ -117,6 +117,7 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
         "responses_bridge_chat_request",
         "raw_chat_bridge_response",
         "parsed_unified_response",
+        "usage_accounting_summary",
         "stored_responses_response",
         "final_responses_response",
     ]

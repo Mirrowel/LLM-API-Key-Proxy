@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine
 from ..protocols import get_protocol
+from ..usage.accounting import extract_usage_record
 from .context import NativeProviderContext
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
@@ -54,6 +55,20 @@ class NativeProviderExecutor:
             self._trace(context, "parsed_native_provider_response", provider_response, direction="response", stage="protocol")
             provider_response = await run_adapter_chain(adapters, provider_response, context.adapter_context(), stage="response")
             await cache_engine.extract("response", provider_response, context.field_cache_context(), transaction_logger=logger)
+            usage_record = extract_usage_record(
+                provider_response,
+                provider=context.provider,
+                model=context.model,
+                source="native_provider_response",
+            )
+            self._trace(
+                context,
+                "usage_accounting_summary",
+                {"usage": usage_record.to_dict()},
+                direction="metadata",
+                stage="final",
+                snapshot=False,
+            )
             self._trace(context, "final_client_response", provider_response, direction="response", stage="final")
             return provider_response
         except Exception as exc:
