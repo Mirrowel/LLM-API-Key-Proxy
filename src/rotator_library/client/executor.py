@@ -671,7 +671,7 @@ class RequestExecutor:
             classifier=context.classifier,
             adapter_names=tuple(plugin.get_adapter_names(model) if hasattr(plugin, "get_adapter_names") else ()),
             adapter_config=dict(plugin.get_adapter_config(model) if hasattr(plugin, "get_adapter_config") else {}),
-            field_cache_rules=tuple(plugin.get_field_cache_rules(model) if hasattr(plugin, "get_field_cache_rules") else ()),
+            field_cache_rules=_merged_field_cache_rules(provider, model, plugin),
             transaction_logger=context.transaction_logger,
         )
 
@@ -2165,6 +2165,36 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     if plugin and hasattr(plugin, "get_protocol_name"):
         return plugin.get_protocol_name(model)
     return None
+
+
+def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[Any, ...]:
+    """Merge provider-declared and JSON-configured field-cache rules.
+
+    Provider declarations are the safe default. Optional JSON config can add or
+    replace rules by name so operators can tune protocol-state preservation per
+    provider/model without editing provider code. The import is local to keep the
+    experimental config layer out of executor module initialization.
+    """
+
+    declared = list(plugin.get_field_cache_rules(model) if plugin and hasattr(plugin, "get_field_cache_rules") else ())
+    try:
+        from ..config.experimental import load_experimental_config, parse_field_cache_rules
+
+        configured = list(parse_field_cache_rules(load_experimental_config(), provider, model))
+    except Exception as exc:
+        lib_logger.debug("Failed to load configured field-cache rules for %s/%s: %s", provider, model, exc)
+        configured = []
+    if not configured:
+        return tuple(declared)
+    merged: dict[str, Any] = {getattr(rule, "name", str(index)): rule for index, rule in enumerate(declared)}
+    order = [getattr(rule, "name", str(index)) for index, rule in enumerate(declared)]
+    for rule in configured:
+        name = getattr(rule, "name", "")
+        if name and name not in merged:
+            order.append(name)
+        if name:
+            merged[name] = rule
+    return tuple(merged[name] for name in order if name in merged)
 
 
 def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
