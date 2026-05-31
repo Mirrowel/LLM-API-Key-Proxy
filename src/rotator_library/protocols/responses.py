@@ -198,6 +198,7 @@ class ResponsesProtocol(ProtocolAdapter):
             output_tokens=int(usage.get("output_tokens") or 0),
             total_tokens=int(usage.get("total_tokens") or 0),
             cache_read_tokens=int(input_details.get("cached_tokens") or 0),
+            cache_write_tokens=int(input_details.get("cache_creation_tokens") or usage.get("cache_creation_tokens") or 0),
             reasoning_tokens=int(output_details.get("reasoning_tokens") or 0),
             cost=cost,
             raw=deepcopy(usage),
