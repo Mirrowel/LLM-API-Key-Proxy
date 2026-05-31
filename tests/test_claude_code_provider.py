@@ -75,7 +75,7 @@ def test_claude_code_native_operation_model_and_stream_support() -> None:
 
     assert provider.get_native_operation("claude-sonnet-4-5", {}, stream=False) == "messages"
     assert provider.normalize_native_model("claude_code/claude-sonnet-4-5") == "claude-sonnet-4-5"
-    assert provider.supports_native_streaming("claude-sonnet-4-5", operation="messages") is True
+    assert provider.supports_native_streaming("claude-sonnet-4-5", operation="messages") is False
     assert provider.supports_native_streaming("claude-sonnet-4-5", operation="chat") is False
 
 

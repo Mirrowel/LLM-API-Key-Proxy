@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+from uuid import uuid4
 
 from ..field_cache.paths import extract_path, inject_path
 from .base import AdapterContext, PayloadAdapter
@@ -147,6 +148,36 @@ class FieldRenameAdapter(PayloadAdapter):
             if rule.get("move"):
                 _delete_simple_path(updated, rule["source_path"])
         return updated
+
+
+class AntigravityEnvelopeAdapter(PayloadAdapter):
+    """Wrap Gemini payloads in the Antigravity internal request envelope.
+
+    The active provider restores only stable envelope fields. Device profiles,
+    fingerprints, and other volatile client-emulation fields are intentionally
+    not generated here until they are verified against current service behavior.
+    """
+
+    name = "antigravity_envelope"
+    supported_stages = ("request",)
+
+    async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
+        if not isinstance(payload, dict) or "request" in payload:
+            return payload
+        config = context.config_for(self.name)
+        model = payload.get("model") or context.model
+        request_payload = {key: deepcopy(value) for key, value in payload.items() if key != "model"}
+        envelope = {
+            "model": model,
+            "request": request_payload,
+            "requestType": config.get("request_type", "CHAT_COMPLETION"),
+            "requestId": str(uuid4()),
+            "userAgent": config.get("user_agent"),
+        }
+        project = config.get("project")
+        if project:
+            envelope["project"] = project
+        return {key: value for key, value in envelope.items() if value is not None}
 
 
 def _delete_simple_path(payload: dict[str, Any], path: str) -> None:

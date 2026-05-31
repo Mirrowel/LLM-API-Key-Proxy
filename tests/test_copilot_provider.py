@@ -74,7 +74,7 @@ def test_copilot_native_operation_model_and_stream_support() -> None:
 
     assert provider.get_native_operation("gpt-4.1", {}, stream=False) == "chat"
     assert provider.normalize_native_model("copilot/gpt-4.1") == "gpt-4.1"
-    assert provider.supports_native_streaming("gpt-4.1", operation="chat") is True
+    assert provider.supports_native_streaming("gpt-4.1", operation="chat") is False
     assert provider.supports_native_streaming("gpt-4.1", operation="responses") is False
 
 

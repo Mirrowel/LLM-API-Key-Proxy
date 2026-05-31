@@ -29,7 +29,7 @@ class ClaudeCodeProvider(ProviderInterface):
     provider_env_name = "claude_code"
     protocol_name = "anthropic_messages"
     adapter_names = ("suppress_developer_role",)
-    native_streaming_supported = True
+    native_streaming_supported = False
     field_cache_rules = (
         FieldCacheRule(
             name="claude_code_thinking_signature",
@@ -86,9 +86,9 @@ class ClaudeCodeProvider(ProviderInterface):
         return model.split("/", 1)[1] if model.startswith("claude_code/") else model
 
     def supports_native_streaming(self, model: str = "", operation: str = "messages") -> bool:
-        """Return true for the tested Anthropic Messages stream operation."""
+        """Return false until the generic native stream wrapper is compatible."""
 
-        return operation == "messages"
+        return False
 
     def get_native_endpoint(self, model: str = "", operation: str = "messages") -> str:
         """Return the provider endpoint for a native operation."""

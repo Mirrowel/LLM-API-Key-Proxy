@@ -56,7 +56,7 @@ class AntigravityProvider(ProviderInterface):
 
     provider_env_name = "antigravity"
     protocol_name = "gemini"
-    adapter_names: tuple[str, ...] = ()
+    adapter_names: tuple[str, ...] = ("antigravity_envelope",)
     field_cache_rules = (
         FieldCacheRule(
             name="antigravity_thought_signature",
@@ -68,7 +68,7 @@ class AntigravityProvider(ProviderInterface):
             metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
         ),
     )
-    native_streaming_supported = True
+    native_streaming_supported = False
     model_quota_groups = {
         "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash"],
         "claude": ["claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"],
@@ -136,9 +136,9 @@ class AntigravityProvider(ProviderInterface):
         return prepared
 
     def supports_native_streaming(self, model: str = "", operation: str = "generate") -> bool:
-        """Return true for the tested stream-generate endpoint only."""
+        """Return false until native stream wrapping is provider-safe."""
 
-        return operation == "stream_generate"
+        return False
 
     def get_native_endpoint(self, model: str = "", operation: str = "generate") -> str:
         """Return Antigravity internal operation endpoints."""
@@ -148,9 +148,15 @@ class AntigravityProvider(ProviderInterface):
         return f"{self.get_api_base()}:streamGenerateContent?alt=sse"
 
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
-        """Configure minimal payload path copies needed by native tests."""
+        """Configure the safe Antigravity internal request envelope."""
 
-        return {}
+        return {
+            "antigravity_envelope": {
+                "project": os.getenv("ANTIGRAVITY_PROJECT", ""),
+                "user_agent": ANTIGRAVITY_HEADERS["User-Agent"],
+                "request_type": os.getenv("ANTIGRAVITY_REQUEST_TYPE", "CHAT_COMPLETION"),
+            }
+        }
 
     def get_model_tier_requirement(self, model: str) -> Optional[int]:
         """Antigravity exposes no restored model-tier restriction."""
