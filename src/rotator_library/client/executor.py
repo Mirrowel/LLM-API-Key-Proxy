@@ -77,7 +77,7 @@ from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
-from ..streaming.policy import can_retry_stream_after_error, is_visible_stream_output
+from ..streaming.policy import can_retry_stream_after_error, is_stream_heartbeat_or_comment, is_visible_stream_output
 
 if TYPE_CHECKING:
     from ..usage import UsageManager
@@ -863,6 +863,9 @@ class RequestExecutor:
             )
             try:
                 async for chunk in self._execute_streaming(target_context):
+                    if is_stream_heartbeat_or_comment(chunk):
+                        yield chunk
+                        continue
                     chunk_error_type = _stream_chunk_error_type(chunk)
                     if chunk_error_type and not emitted_output:
                         terminal_error_type = chunk_error_type
@@ -1527,13 +1530,15 @@ class RequestExecutor:
                                             context=context,
                                             plugin=plugin,
                                         ):
-                                            last_streamed_chunk = chunk
+                                            if not is_stream_heartbeat_or_comment(chunk):
+                                                last_streamed_chunk = chunk
                                             if _stream_chunk_is_visible_output(chunk):
                                                 stream_visible_output_emitted = True
                                             yield chunk
                                     else:
                                         async for chunk in base_stream:
-                                            last_streamed_chunk = chunk
+                                            if not is_stream_heartbeat_or_comment(chunk):
+                                                last_streamed_chunk = chunk
                                             if _stream_chunk_is_visible_output(chunk):
                                                 stream_visible_output_emitted = True
                                             yield chunk
@@ -1586,12 +1591,7 @@ class RequestExecutor:
 
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
-                                        error_data = {
-                                            "error": {
-                                                "message": "Upstream stream failed after output began",
-                                                "type": classified.error_type,
-                                            }
-                                        }
+                                        error_data = _streamed_error_payload(e, classified)
                                         for line in self._terminal_stream_error_lines(context, error_data):
                                             yield line
                                         return
@@ -2871,3 +2871,19 @@ def _can_retry_stream_after_error(last_streamed_chunk: Optional[str], allow_reas
     if emitted_output:
         return False
     return can_retry_stream_after_error(last_streamed_chunk, allow_reasoning_only_retry)
+
+
+def _streamed_error_payload(error: StreamedAPIError, classified: Any) -> Dict[str, Any]:
+    """Return a terminal stream error while preserving structured timeout data."""
+
+    data = getattr(error, "data", None)
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        source = data["error"]
+        return {
+            "error": {
+                "message": source.get("message") or "Upstream stream failed after output began",
+                "type": source.get("type") or classified.error_type,
+                "details": source.get("details") or {"status_code": classified.status_code},
+            }
+        }
+    return {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type, "details": {"status_code": classified.status_code}}}

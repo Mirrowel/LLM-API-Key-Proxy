@@ -107,7 +107,7 @@ class StreamingHandler:
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
 
-        async def close_upstream(reason: str) -> None:
+        async def close_upstream(reason: str, *, force: bool = False) -> None:
             """Best-effort close for upstream async streams.
 
             Client disconnects and timeout failures should not leave provider
@@ -116,7 +116,7 @@ class StreamingHandler:
             """
 
             nonlocal upstream_closed
-            if upstream_closed or not stream_settings.cancel_upstream_on_disconnect:
+            if upstream_closed or (not force and not stream_settings.cancel_upstream_on_disconnect):
                 return
             upstream_closed = True
             for candidate in (stream_iterator, stream):
@@ -150,8 +150,25 @@ class StreamingHandler:
                     try:
                         while True:
                             wait_seconds = _next_stream_wait_seconds(monitor, stream_settings, last_heartbeat_at)
-                            done, _ = await asyncio.wait({next_task}, timeout=wait_seconds)
-                            if done:
+                            wait_tasks = {next_task}
+                            disconnect_task = None
+                            if request is not None:
+                                disconnect_task = asyncio.create_task(request.is_disconnected())
+                                wait_tasks.add(disconnect_task)
+                            done, _ = await asyncio.wait(wait_tasks, timeout=wait_seconds)
+                            if disconnect_task is not None:
+                                if disconnect_task in done and disconnect_task.result():
+                                    stream_cancelled = True
+                                    next_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                        await next_task
+                                    await close_upstream("client_disconnect")
+                                    return
+                                if not disconnect_task.done():
+                                    disconnect_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError):
+                                        await disconnect_task
+                            if next_task in done:
                                 chunk = next_task.result()
                                 break
 
@@ -160,7 +177,7 @@ class StreamingHandler:
                                 next_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                                     await next_task
-                                await close_upstream(timeout_error[0])
+                                await close_upstream(timeout_error[0], force=True)
                                 self._log_stream_lifecycle(lifecycle_logger, timeout_error[2], monitor, StreamEvent("error", protocol="openai_chat", data={"error": timeout_error[1]}))
                                 raise StreamedAPIError(timeout_error[1]["message"], data={"error": timeout_error[1]})
 
@@ -293,12 +310,12 @@ class StreamingHandler:
 
                     # Not a JSON-related error, re-raise
                     monitor.metrics.error_count += 1
-                    await close_upstream("stream_exception")
+                    await close_upstream("stream_exception", force=True)
                     raise
 
         except StreamedAPIError:
             # Re-raise for retry loop
-            await close_upstream("streamed_api_error")
+            await close_upstream("streamed_api_error", force=True)
             raise
 
         except asyncio.CancelledError:
@@ -310,7 +327,7 @@ class StreamingHandler:
                 monitor,
                 StreamEvent("cancelled", protocol="openai_chat", data={"reason": "task_cancelled"}),
             )
-            await close_upstream("task_cancelled")
+            await close_upstream("task_cancelled", force=True)
             raise
 
         finally:
@@ -385,7 +402,7 @@ class StreamingHandler:
                 )
                 await close_upstream("client_disconnect")
             elif stream_cancelled:
-                await close_upstream("stream_cancelled")
+                await close_upstream("stream_cancelled", force=True)
 
     @staticmethod
     def _log_stream_lifecycle(
