@@ -52,7 +52,13 @@ class NativePlugin:
         return "https://native.test/chat"
 
     def get_native_headers(self, credential_identifier, model="", operation="chat"):
-        return {"Authorization": f"Bearer {credential_identifier}"}
+        return {"Authorization": f"Bearer {credential_identifier}", "X-Operation": operation, "X-Model": model}
+
+    def get_native_operation(self, model="", request=None, stream=False):
+        return "messages" if stream else "chat"
+
+    def normalize_native_model(self, model=""):
+        return model.split("/", 1)[1] if "/" in model else model
 
     def get_adapter_names(self, model=""):
         return ()
@@ -147,6 +153,9 @@ async def test_native_declared_provider_uses_native_executor_in_auto_mode() -> N
     assert response["id"] == "chat_native"
     assert http_client.calls[0]["endpoint"] == "https://native.test/chat"
     assert http_client.calls[0]["headers"]["Authorization"] == "Bearer secret"
+    assert http_client.calls[0]["headers"]["X-Operation"] == "chat"
+    assert http_client.calls[0]["headers"]["X-Model"] == "gpt-test"
+    assert http_client.calls[0]["json"]["model"] == "gpt-test"
 
 
 @pytest.mark.asyncio

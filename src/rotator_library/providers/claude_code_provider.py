@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Claude Code provider integration skeleton for native protocol execution."""
+"""Claude Code provider integration for native Anthropic Messages execution."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class ClaudeCodeProvider(ProviderInterface):
     provider_env_name = "claude_code"
     protocol_name = "anthropic_messages"
     adapter_names = ("suppress_developer_role",)
+    native_streaming_supported = True
     field_cache_rules = (
         FieldCacheRule(
             name="claude_code_thinking_signature",
@@ -73,6 +74,21 @@ class ClaudeCodeProvider(ProviderInterface):
             "anthropic-version": os.getenv("CLAUDE_CODE_ANTHROPIC_VERSION", "2023-06-01"),
             "content-type": "application/json",
         }
+
+    def get_native_operation(self, model: str = "", request: dict[str, Any] | None = None, stream: bool = False) -> str:
+        """Claude Code uses the Anthropic Messages operation for completions."""
+
+        return "messages"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Strip the proxy provider prefix before sending upstream."""
+
+        return model.split("/", 1)[1] if model.startswith("claude_code/") else model
+
+    def supports_native_streaming(self, model: str = "", operation: str = "messages") -> bool:
+        """Return true for the tested Anthropic Messages stream operation."""
+
+        return operation == "messages"
 
     def get_native_endpoint(self, model: str = "", operation: str = "messages") -> str:
         """Return the provider endpoint for a native operation."""

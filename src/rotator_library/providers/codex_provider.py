@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Codex provider integration skeleton for native Responses execution."""
+"""Codex provider integration for native Responses execution."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class CodexProvider(ProviderInterface):
     provider_env_name = "codex"
     protocol_name = "responses"
     adapter_names: tuple[str, ...] = ()
+    native_streaming_supported = True
     field_cache_rules = (
         FieldCacheRule(
             name="codex_previous_response_id",
@@ -58,6 +59,21 @@ class CodexProvider(ProviderInterface):
         """Return headers for Codex native HTTP calls."""
 
         return {"Authorization": f"Bearer {credential_identifier}", "content-type": "application/json"}
+
+    def get_native_operation(self, model: str = "", request: dict | None = None, stream: bool = False) -> str:
+        """Codex native calls use the Responses operation."""
+
+        return "responses"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Strip the proxy provider prefix before sending upstream."""
+
+        return model.split("/", 1)[1] if model.startswith("codex/") else model
+
+    def supports_native_streaming(self, model: str = "", operation: str = "responses") -> bool:
+        """Return true for tested Responses stream payloads."""
+
+        return operation == "responses"
 
     def get_native_endpoint(self, model: str = "", operation: str = "responses") -> str:
         """Return the native Codex endpoint for an operation."""

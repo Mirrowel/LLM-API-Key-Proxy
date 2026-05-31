@@ -70,6 +70,15 @@ def test_claude_code_provider_builds_native_headers_and_endpoint(monkeypatch) ->
     }
 
 
+def test_claude_code_native_operation_model_and_stream_support() -> None:
+    provider = ClaudeCodeProvider()
+
+    assert provider.get_native_operation("claude-sonnet-4-5", {}, stream=False) == "messages"
+    assert provider.normalize_native_model("claude_code/claude-sonnet-4-5") == "claude-sonnet-4-5"
+    assert provider.supports_native_streaming("claude-sonnet-4-5", operation="messages") is True
+    assert provider.supports_native_streaming("claude-sonnet-4-5", operation="chat") is False
+
+
 @pytest.mark.asyncio
 async def test_claude_code_provider_get_models_uses_mocked_models_endpoint(monkeypatch) -> None:
     monkeypatch.setenv("CLAUDE_CODE_API_BASE", "https://claude-code.test")

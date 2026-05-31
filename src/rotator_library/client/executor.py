@@ -597,7 +597,7 @@ class RequestExecutor:
             return await plugin.acompletion(self._http_client, **kwargs)
 
         if execution == "native" or (execution == "auto" and _provider_native_protocol(plugin, model, target)):
-            native_context = self._build_native_provider_context(
+            native_context, native_request = self._build_native_provider_context(
                 provider,
                 model,
                 plugin,
@@ -605,14 +605,16 @@ class RequestExecutor:
                 credential_id,
                 context,
                 target,
+                raw_request=kwargs,
+                return_request=True,
             )
             self._log_routing_trace(
                 context,
                 "routing_native_execution_selected",
                 _target_trace(target) if target else {"provider": provider, "model": model},
-                metadata={"protocol": native_context.protocol_name},
+                metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
             )
-            return await self._get_native_executor().execute(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
+            return await self._get_native_executor().execute(native_request, native_context, NativeHTTPTransport(self._http_client))
 
         return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
 
@@ -659,8 +661,11 @@ class RequestExecutor:
         credential_id: str,
         context: RequestContext,
         target: Optional[RouteTarget],
+        raw_request: Optional[Dict[str, Any]] = None,
         transport: str = "http",
-    ) -> NativeProviderContext:
+        stream: bool = False,
+        return_request: bool = False,
+    ) -> NativeProviderContext | tuple[NativeProviderContext, Dict[str, Any]]:
         """Build native provider context from provider declarations."""
 
         if not plugin:
@@ -670,24 +675,48 @@ class RequestExecutor:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
         if not hasattr(plugin, "get_native_endpoint") or not hasattr(plugin, "get_native_headers"):
             raise RoutingExecutionError(f"Provider {provider} has no native endpoint/header helpers")
-        endpoint = plugin.get_native_endpoint(model=model, operation="chat")
-        headers = plugin.get_native_headers(credential_secret, model=model, operation="chat")
-        return NativeProviderContext(
+        public_model = model
+        native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+        request_payload = dict(raw_request or {})
+        if native_model:
+            request_payload["model"] = native_model
+        operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+        if hasattr(plugin, "prepare_native_request"):
+            prepared = plugin.prepare_native_request(request_payload, model=native_model, operation=operation)
+            if prepared is not request_payload:
+                request_payload = dict(prepared)
+            self._log_executor_trace(
+                context,
+                "provider_native_request_prepared",
+                request_payload,
+                direction="request",
+                stage="provider",
+                credential_id=credential_id,
+                metadata={"provider": provider, "model": public_model, "native_model": native_model, "operation": operation},
+            )
+        endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
+        headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
+        native_context = NativeProviderContext(
             provider=provider,
-            model=model,
+            model=native_model,
             protocol_name=protocol_name,
             endpoint=endpoint,
+            operation=operation,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
             scope_key=context.usage_manager_key,
             classifier=context.classifier,
             transport=transport,
-            adapter_names=tuple(plugin.get_adapter_names(model) if hasattr(plugin, "get_adapter_names") else ()),
-            adapter_config=dict(plugin.get_adapter_config(model) if hasattr(plugin, "get_adapter_config") else {}),
-            field_cache_rules=_merged_field_cache_rules(provider, model, plugin),
+            adapter_names=tuple(plugin.get_adapter_names(native_model) if hasattr(plugin, "get_adapter_names") else ()),
+            adapter_config=dict(plugin.get_adapter_config(native_model) if hasattr(plugin, "get_adapter_config") else {}),
+            field_cache_rules=_merged_field_cache_rules(provider, public_model, plugin),
             transaction_logger=context.transaction_logger,
+            metadata={"public_model": public_model},
         )
+        if return_request:
+            return native_context, request_payload
+        return native_context
 
     async def execute(
         self,
@@ -1370,7 +1399,7 @@ class RequestExecutor:
                                         and _provider_native_protocol(plugin, model, target)
                                         and _provider_supports_native_streaming(plugin, model)
                                     ):
-                                        native_context = self._build_native_provider_context(
+                                        native_context, native_request = self._build_native_provider_context(
                                             provider,
                                             model,
                                             plugin,
@@ -1378,15 +1407,18 @@ class RequestExecutor:
                                             cred_context.stable_id,
                                             context,
                                             target,
+                                            raw_request=kwargs,
                                             transport="sse",
+                                            stream=True,
+                                            return_request=True,
                                         )
                                         self._log_routing_trace(
                                             context,
                                             "routing_native_stream_execution_selected",
                                             _target_trace(target) if target else {"provider": provider, "model": model},
-                                            metadata={"protocol": native_context.protocol_name},
+                                            metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
                                         )
-                                        stream = self._get_native_executor().stream(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
+                                        stream = self._get_native_executor().stream(native_request, native_context, NativeHTTPTransport(self._http_client))
                                     elif plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = credential_secret
                                         self._log_executor_trace(
@@ -2260,14 +2292,27 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     return None
 
 
+def _strip_provider_prefix(model: str) -> str:
+    """Return model without the proxy-facing provider prefix."""
+
+    return model.split("/", 1)[1] if "/" in model else model
+
+
 def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
     """Return whether a provider declares native streaming support."""
 
     support = getattr(plugin, "supports_native_streaming", None)
     if not callable(support):
         return False
+    operation = "chat"
+    resolver = getattr(plugin, "get_native_operation", None)
+    if callable(resolver):
+        try:
+            operation = resolver(model, {"model": model, "stream": True}, stream=True)
+        except TypeError:
+            operation = resolver(model)
     try:
-        return bool(support(model=model, operation="chat"))
+        return bool(support(model=model, operation=operation))
     except TypeError:
         try:
             return bool(support(model))

@@ -69,6 +69,15 @@ def test_copilot_provider_builds_native_headers_and_endpoint(monkeypatch) -> Non
     }
 
 
+def test_copilot_native_operation_model_and_stream_support() -> None:
+    provider = CopilotProvider()
+
+    assert provider.get_native_operation("gpt-4.1", {}, stream=False) == "chat"
+    assert provider.normalize_native_model("copilot/gpt-4.1") == "gpt-4.1"
+    assert provider.supports_native_streaming("gpt-4.1", operation="chat") is True
+    assert provider.supports_native_streaming("gpt-4.1", operation="responses") is False
+
+
 @pytest.mark.asyncio
 async def test_copilot_provider_get_models_uses_mocked_endpoint(monkeypatch) -> None:
     monkeypatch.setenv("COPILOT_API_BASE", "https://copilot.test")
