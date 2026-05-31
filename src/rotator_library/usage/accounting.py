@@ -114,8 +114,25 @@ def _unwrap_usage(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, dict):
-        return value.get("usage", value)
+        if "usage" in value:
+            usage = _as_dict(value.get("usage"))
+            return _merge_top_level_cost_fields(usage, value)
+        return value
+    data = _as_dict(value)
+    if "usage" in data:
+        usage = _as_dict(data.get("usage"))
+        return _merge_top_level_cost_fields(usage, data)
     return getattr(value, "usage", value)
+
+
+def _merge_top_level_cost_fields(usage: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    """Copy sibling cost metadata into a nested usage payload."""
+
+    merged = dict(usage)
+    for key in ("cost", "total_cost", "cost_details", "provider_reported_cost", "currency", "costMetadata"):
+        if key in response and key not in merged:
+            merged[key] = response[key]
+    return merged
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -133,6 +150,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in (
         "prompt_tokens",
+        "usage",
         "completion_tokens",
         "total_tokens",
         "prompt_tokens_details",
@@ -189,7 +207,7 @@ def _from_openai_like_usage(data: dict[str, Any], *, provider: Optional[str], mo
     )
     if reasoning and completion_tokens >= reasoning:
         completion_tokens -= reasoning
-    input_tokens = max(0, prompt_tokens - cache_read)
+    input_tokens = max(0, prompt_tokens - cache_read - cache_write)
     cost = _extract_cost(data)
     return UsageRecord(
         input_tokens=input_tokens,
@@ -271,16 +289,44 @@ def _extract_cost(data: dict[str, Any]) -> tuple[Optional[float], str, Optional[
         if cost_payload
         else None
     )
+    breakdown_used = False
     if raw_cost is None and cost_payload:
         raw_cost = cost_payload.get("total_cost", cost_payload.get("total"))
     if raw_cost is None and cost_payload:
         raw_cost = cost_payload.get("cost")
+    if raw_cost is None and cost_payload:
+        breakdown_total = _sum_cost_breakdown(cost_payload)
+        if breakdown_total is not None:
+            raw_cost = breakdown_total
+            breakdown_used = True
     if raw_cost is None:
         raw_cost = data.get("provider_reported_cost", data.get("total_cost", data.get("cost")))
     cost_value = _float_or_none(raw_cost)
     currency = str(cost_payload.get("currency") or data.get("currency") or "USD")
-    source = cost_payload.get("source") or ("provider_reported" if cost_value is not None else None)
+    source = cost_payload.get("source") or ("provider_reported_breakdown" if breakdown_used else ("provider_reported" if cost_value is not None else None))
     return cost_value, currency, str(source) if source else None
+
+
+def _sum_cost_breakdown(payload: dict[str, Any]) -> Optional[float]:
+    """Sum structured provider cost buckets when no total is reported."""
+
+    total = 0.0
+    found = False
+    for key in (
+        "input_cost",
+        "prompt_cost",
+        "cache_read_cost",
+        "cache_write_cost",
+        "output_cost",
+        "completion_cost",
+        "reasoning_cost",
+        "thinking_cost",
+    ):
+        value = _float_or_none(payload.get(key))
+        if value is not None:
+            total += value
+            found = True
+    return total if found else None
 
 
 def _looks_like_gemini(data: dict[str, Any]) -> bool:

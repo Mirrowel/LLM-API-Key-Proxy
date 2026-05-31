@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from copy import deepcopy
 from typing import Any, AsyncGenerator, Optional
@@ -459,6 +460,11 @@ class ResponsesService:
                             metadata={"transport": transport},
                         )
                 self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
+                cost_usage = _responses_sse_cost_usage(raw_chunk)
+                if cost_usage is not None:
+                    usage = _merge_responses_stream_usage(usage, cost_usage)
+                    self._trace(transaction_logger, "responses_stream_cost_event", cost_usage, direction="stream", stage="metadata", metadata={"transport": transport})
+                    continue
                 chunk = parse_chat_sse_chunk(raw_chunk)
                 if not chunk or chunk.get("type") == "done":
                     continue
@@ -466,7 +472,7 @@ class ResponsesService:
                 if chunk.get("error") is not None or chunk.get("type") == "error":
                     raise ResponsesServiceError(_stream_error_message(chunk), status_code=502, error_type="upstream_error")
                 if chunk.get("usage"):
-                    usage = chunk["usage"]
+                    usage = _merge_responses_stream_usage(chunk["usage"], usage)
                 delta = _chunk_text_delta(chunk)
                 if not delta:
                     continue
@@ -898,6 +904,77 @@ def _stream_failure_error(exc: Exception) -> dict[str, Any]:
         elif "stall" in text:
             result["timeout_type"] = "stall"
     return result
+
+
+def _responses_sse_cost_usage(chunk: Any) -> Optional[dict[str, Any]]:
+    """Extract Responses stream cost metadata from SSE comments/events."""
+
+    if not isinstance(chunk, str):
+        return None
+    payload = _responses_sse_cost_payload(chunk)
+    if payload is None:
+        return None
+    if isinstance(payload, (int, float, str)):
+        payload = {"provider_reported_cost": payload, "source": "responses_sse_cost"}
+    if not isinstance(payload, dict):
+        return None
+    cost = payload.get("provider_reported_cost", payload.get("total_cost", payload.get("cost")))
+    if cost is None:
+        return None
+    return {
+        "provider_reported_cost": cost,
+        "currency": payload.get("currency", "USD"),
+        "cost_details": payload,
+    }
+
+
+def _responses_sse_cost_payload(chunk: str) -> Any:
+    event_type = None
+    data_lines: list[str] = []
+    for line in chunk.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(":"):
+            comment = stripped[1:].strip()
+            if comment.startswith("cost"):
+                return _parse_cost_text(comment[4:].strip())
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if event_type == "cost" and data_lines:
+        return _parse_cost_text("\n".join(data_lines).strip())
+    return None
+
+
+def _parse_cost_text(text: str) -> Any:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+
+def _merge_responses_stream_usage(primary: Any, fallback_cost: Any) -> Any:
+    """Merge earlier stream cost metadata into later token usage when needed."""
+
+    if not isinstance(primary, dict):
+        return fallback_cost if primary is None else primary
+    if not isinstance(fallback_cost, dict):
+        return primary
+    merged = deepcopy(primary)
+    has_cost = any(key in merged for key in ("cost_details", "cost", "total_cost", "provider_reported_cost"))
+    if has_cost:
+        return merged
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "currency"):
+        if key in fallback_cost:
+            merged[key] = deepcopy(fallback_cost[key])
+    return merged
 
 
 def _chunk_text_delta(chunk: dict[str, Any]) -> str:

@@ -127,6 +127,36 @@ class EventErrorStreamingClient:
         return chunks()
 
 
+class CostCommentStreamingClient:
+    async def acompletion(self, **kwargs):
+        async def chunks():
+            yield ': cost {"total_cost":0.031,"currency":"USD","source":"responses_sse"}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"priced"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return chunks()
+
+
+class CostEventStreamingClient:
+    async def acompletion(self, **kwargs):
+        async def chunks():
+            yield 'event: cost\ndata: {"total_cost":0.017,"currency":"EUR","source":"responses_event_cost"}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"priced"}}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return chunks()
+
+
+class CostCommentFinalOverrideStreamingClient:
+    async def acompletion(self, **kwargs):
+        async def chunks():
+            yield ': cost 0.031\n\n'
+            yield 'data: {"choices":[{"delta":{"content":"priced"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"cost_details":{"total_cost":0.062,"source":"final_usage"}}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return chunks()
+
+
 class FailingStore:
     async def save(self, response):
         raise RuntimeError("store failed Authorization: Bearer secret-token")
@@ -227,6 +257,48 @@ async def test_stream_response_event_error_frames_are_failed() -> None:
     assert "event: response.failed" in event_text
     assert stored is not None
     assert stored.response["error"]["message"] == "event failed"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_preserves_sse_cost_comment() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, CostCommentStreamingClient())]
+
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stored is not None
+    assert stored.usage["cost_details"]["total_cost"] == 0.031
+    assert stored.usage["cost_details"]["source"] == "responses_sse"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_preserves_sse_cost_event() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, CostEventStreamingClient())]
+
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stored is not None
+    assert stored.usage["cost_details"]["total_cost"] == 0.017
+    assert stored.usage["cost_details"]["currency"] == "EUR"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_final_usage_cost_overrides_sse_cost_comment() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, CostCommentFinalOverrideStreamingClient())]
+
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert stored is not None
+    assert stored.usage["cost_details"]["total_cost"] == 0.062
+    assert stored.usage["cost_details"]["source"] == "final_usage"
 
 
 @pytest.mark.asyncio

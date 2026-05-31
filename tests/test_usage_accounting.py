@@ -21,13 +21,14 @@ def test_openai_dict_usage_extracts_cache_and_reasoning_without_double_counting(
         model="gpt-test",
     )
 
-    assert record.input_tokens == 60
+    assert record.input_tokens == 55
     assert record.cache_read_tokens == 40
     assert record.cache_write_tokens == 5
     assert record.completion_tokens == 20
     assert record.reasoning_tokens == 10
     assert record.output_tokens == 30
     assert record.raw_total_tokens == 130
+    assert record.total_tokens == 130
 
 
 def test_openai_usage_extracts_provider_reported_cost_details() -> None:
@@ -46,6 +47,34 @@ def test_openai_usage_extracts_provider_reported_cost_details() -> None:
     assert record.cost_source == "provider_usage"
 
 
+def test_top_level_cost_is_preserved_when_usage_exists() -> None:
+    record = extract_usage_record(
+        {
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "total_cost": 0.03,
+            "currency": "EUR",
+        }
+    )
+
+    assert record.provider_reported_cost == 0.03
+    assert record.cost_currency == "EUR"
+
+
+def test_structured_cost_breakdown_without_total_is_summed() -> None:
+    record = extract_usage_record(
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cost_details": {"input_cost": 0.01, "output_cost": 0.02, "reasoning_cost": 0.003},
+            }
+        }
+    )
+
+    assert record.provider_reported_cost == 0.033
+    assert record.cost_source == "provider_reported_breakdown"
+
+
 def test_openai_object_usage_extracts_attributes() -> None:
     response = SimpleNamespace(
         usage=SimpleNamespace(
@@ -58,7 +87,7 @@ def test_openai_object_usage_extracts_attributes() -> None:
 
     record = extract_usage_record(response)
 
-    assert record.input_tokens == 10
+    assert record.input_tokens == 9
     assert record.cache_read_tokens == 2
     assert record.cache_write_tokens == 1
     assert record.completion_tokens == 4
