@@ -99,6 +99,29 @@ def test_new_config_sections_still_reject_secret_like_keys() -> None:
         load_config_from_mapping({"responses": {"store": {"authorization": "hidden"}}})
 
 
+@pytest.mark.parametrize("secret_key", ["secret_key", "secret-key", "apiKey", "client-secret"])
+def test_secret_key_variants_are_rejected(secret_key: str) -> None:
+    with pytest.raises(ExperimentalConfigError):
+        load_config_from_mapping({"retry": {secret_key: "hidden"}})
+
+
+def test_retry_runtime_settings_malformed_env_preserves_defaults() -> None:
+    config = load_config_from_mapping({"retry": {"provider_cooldown_default_seconds": 45}})
+
+    settings = get_retry_runtime_settings(
+        config=config,
+        env={
+            "PROVIDER_COOLDOWN_DEFAULT_SECONDS": "not-an-int",
+            "PROVIDER_COOLDOWN_ON_QUOTA": "not-a-bool",
+            "PROVIDER_BACKOFF_BASE_SECONDS": "not-an-int",
+        },
+    )
+
+    assert settings.provider_cooldown_default_seconds == 30
+    assert settings.provider_cooldown_on_quota is False
+    assert settings.provider_backoff_base_seconds is None
+
+
 def test_field_cache_rules_parse_wildcard_then_model_specific() -> None:
     config = load_config_from_mapping(
         {
@@ -176,6 +199,20 @@ def test_field_cache_rule_rejects_invalid_config_values() -> None:
     )
 
     with pytest.raises(ValueError, match="Unsupported field-cache source"):
+        parse_field_cache_rules(config, "provider", "model")
+
+
+def test_field_cache_rules_reject_malformed_shapes() -> None:
+    config = load_config_from_mapping({"field_cache": {"provider": {"*": ["not-a-rule"]}}})
+
+    with pytest.raises(ExperimentalConfigError, match="rule entries"):
+        parse_field_cache_rules(config, "provider", "model")
+
+
+def test_field_cache_rules_reject_non_list_model_rules() -> None:
+    config = load_config_from_mapping({"field_cache": {"provider": {"*": {"name": "bad"}}}})
+
+    with pytest.raises(ExperimentalConfigError, match="model rules"):
         parse_field_cache_rules(config, "provider", "model")
 
 
