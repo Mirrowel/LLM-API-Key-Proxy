@@ -5,6 +5,7 @@ import json
 import pytest
 
 from rotator_library.client.executor import RequestExecutor
+from rotator_library.client.transforms import ProviderTransforms
 from rotator_library.transaction_logger import ProviderLogger, TransactionLogger
 from rotator_library.transform_trace import REDACTED
 
@@ -140,3 +141,55 @@ def test_log_transform_error_uses_standard_shape_and_scrubs_text(tmp_path) -> No
     assert entries[0]["pass_name"] == "transform_log_error"
     assert entries[0]["data"]["failed_pass_name"] == "after_field_cache_injection"
     assert "secret" not in json.dumps(entries[0]["data"])
+
+
+@pytest.mark.asyncio
+async def test_provider_transforms_trace_each_live_boundary(tmp_path) -> None:
+    class HookPlugin:
+        async def transform_request(self, kwargs, model, credential):
+            kwargs["hooked"] = credential
+            return ["hooked request"]
+
+        def get_model_options(self, model):
+            return {"reasoning_effort": "low", "temperature": 0.2}
+
+    class Config:
+        def convert_for_litellm(self, provider_override=None, **kwargs):
+            converted = dict(kwargs)
+            converted["converted_for_litellm"] = True
+            return converted
+
+    logger = TransactionLogger("dedaluslabs", "dedaluslabs/test", parent_dir=tmp_path)
+    transforms = ProviderTransforms(
+        {"dedaluslabs": HookPlugin()},
+        provider_config=Config(),
+    )
+
+    result = await transforms.apply(
+        "dedaluslabs",
+        "dedaluslabs/test",
+        "secret-credential",
+        {"model": "dedaluslabs/test", "tool_choice": "auto"},
+        transaction_logger=logger,
+        credential_id="stable_cred",
+        transport="http",
+        trace_metadata={"scope_key": "scope"},
+    )
+
+    assert "tool_choice" not in result
+    assert result["hooked"] == "secret-credential"
+    assert result["reasoning_effort"] == "low"
+    assert result["converted_for_litellm"] is True
+    entries = _trace_entries(logger.log_dir)
+    pass_names = [entry["pass_name"] for entry in entries]
+    assert pass_names == [
+        "pre_provider_transform_request",
+        "after_builtin_provider_transform",
+        "after_provider_hook_transform",
+        "after_provider_model_options",
+        "before_litellm_conversion",
+        "after_litellm_conversion",
+    ]
+    assert all(entry["credential_id"] == "stable_cred" for entry in entries)
+    assert entries[1]["metadata"]["transform_provider"] == "dedaluslabs"
+    assert entries[-1]["changed_from_previous"] is True

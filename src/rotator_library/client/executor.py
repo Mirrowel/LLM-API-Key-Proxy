@@ -372,6 +372,8 @@ class RequestExecutor:
         model: str,
         cred: str,
         context: "RequestContext",
+        *,
+        credential_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Prepare request kwargs with transforms, sanitization, and provider params.
@@ -392,6 +394,14 @@ class RequestExecutor:
             cred,
             context.kwargs.copy(),
             provider_config_override=context.provider_config,
+            transaction_logger=context.transaction_logger,
+            credential_id=credential_id,
+            transport="sse" if context.streaming else "http",
+            trace_metadata={
+                "session_id": context.session_id,
+                "scope_key": context.usage_manager_key,
+                "classifier": context.classifier,
+            },
         )
 
         # Sanitize request payload
@@ -881,7 +891,11 @@ class RequestExecutor:
                     try:
                         # Prepare request kwargs
                         kwargs = await self._prepare_request_kwargs(
-                            provider, model, cred, context
+                            provider,
+                            model,
+                            cred,
+                            context,
+                            credential_id=cred_context.stable_id,
                         )
 
                         # Log transformed request if it differs from original
@@ -1100,7 +1114,11 @@ class RequestExecutor:
                         try:
                             # Prepare request kwargs
                             kwargs = await self._prepare_request_kwargs(
-                                provider, model, cred, context
+                                provider,
+                                model,
+                                cred,
+                                context,
+                                credential_id=cred_context.stable_id,
                             )
 
                             # Log transformed request if it differs from original
