@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator, Optional
 
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
+from ..usage.accounting import extract_usage_record
 from ..protocols.responses import ResponsesProtocol
 from .bridge import ResponsesBridge
 from .store import InMemoryResponsesStore, ResponsesStore
@@ -93,6 +94,7 @@ class ResponsesService:
 
         response_payload = self.bridge.from_chat_response(chat_response, unified)
         self._trace(transaction_logger, "parsed_unified_response", response_payload, direction="response", stage="protocol")
+        self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
         if raw_request.get("store", True):
             stored = self._stored_response(raw_request, response_payload, parent)
@@ -208,6 +210,7 @@ class ResponsesService:
             done_item = output_item_done_payload(state)
             yield formatter.format_event("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
+            self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
             await self._store_stream_response(stream_request, completed, parent)
             self._trace(transaction_logger, "stored_responses_stream_response", completed, direction="metadata", stage="final")
             monitor.complete()
@@ -343,6 +346,29 @@ class ResponsesService:
     def _log_transform_error(transaction_logger: Optional[Any], pass_name: str, error: BaseException, payload: Any) -> None:
         if transaction_logger:
             transaction_logger.log_transform_error(pass_name, error, payload=payload, stage="adapter", protocol="responses")
+
+    def _trace_responses_usage(
+        self,
+        transaction_logger: Optional[Any],
+        response_payload: dict[str, Any],
+        model: str,
+        *,
+        source: str,
+    ) -> None:
+        """Trace normalized Responses usage without changing stored payloads."""
+
+        usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
+        if not usage:
+            return
+        record = extract_usage_record(usage, provider="responses", model=model, source=source)
+        self._trace(
+            transaction_logger,
+            "usage_accounting_summary",
+            {"usage": record.to_dict()},
+            direction="metadata",
+            stage="final",
+            metadata={"source": source},
+        )
 
     async def _store_stream_response(
         self,
