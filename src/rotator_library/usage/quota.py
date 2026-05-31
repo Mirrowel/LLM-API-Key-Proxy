@@ -58,7 +58,12 @@ def build_quota_snapshots(
     quota_group: Optional[str] = None,
     include_credentials: bool = True,
 ) -> list[QuotaSnapshot]:
-    """Build read-only quota snapshots from credential states."""
+    """Build read-only request/token quota snapshots from credential states.
+
+    The current usage state stores request/token windows, not a reliable
+    provider-cost ledger. Snapshots therefore avoid inventing cost totals; cost
+    reporting can be added later only if the underlying state owns that data.
+    """
 
     snapshots: list[QuotaSnapshot] = []
     for stable_id, state in states.items():
@@ -113,6 +118,7 @@ def _snapshots_for_windows(
             remaining=window.remaining,
             reset_at=window.reset_at,
             source=source,
+            metadata={"scope": "request_token_window"},
         )
         for window in windows.values()
     ]

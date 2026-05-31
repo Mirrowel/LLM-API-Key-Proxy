@@ -23,6 +23,13 @@ class FakeClient:
         }
 
 
+class FakeCostClient(FakeClient):
+    async def acompletion(self, **kwargs):
+        response = await super().acompletion(**kwargs)
+        response["usage"]["cost_details"] = {"total_cost": 0.033, "source": "responses_provider"}
+        return response
+
+
 class FakeInternalClient(FakeClient):
     def __init__(self) -> None:
         super().__init__()
@@ -282,6 +289,18 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
         "responses_stored_response",
         "responses_final_response",
     ]
+
+
+@pytest.mark.asyncio
+async def test_service_usage_trace_includes_provider_reported_cost(tmp_path) -> None:
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    await service.create_response({"model": "gpt-test", "input": "Hello"}, FakeCostClient(), transaction_logger=logger)
+
+    usage_entry = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"][-1]
+    assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.033
+    assert usage_entry["metadata"]["pricing_source"] == "usage.cost_details"
 
 
 def test_trace_responses_usage_returns_before_conversion_without_logger(monkeypatch) -> None:

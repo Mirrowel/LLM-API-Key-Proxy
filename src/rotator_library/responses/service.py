@@ -12,6 +12,7 @@ from typing import Any, AsyncGenerator, Optional
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
 from ..usage.accounting import extract_usage_record
+from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
 from .bridge import ResponsesBridge, responses_session_hints
 from .store import InMemoryResponsesStore, ResponsesStore
@@ -446,13 +447,14 @@ class ResponsesService:
         if not usage:
             return
         record = extract_usage_record(usage, provider="responses", model=model, source=source)
+        cost_breakdown = CostCalculator().calculate(record, model=model, provider="responses")
         self._trace(
             transaction_logger,
             "usage_accounting_summary",
-            {"usage": record.to_dict()},
+            {"usage": record.to_dict(), "cost": cost_breakdown.to_dict()},
             direction="metadata",
             stage="final",
-            metadata={"source": source},
+            metadata={"source": source, "pricing_source": cost_breakdown.pricing_source},
         )
 
     async def _store_stream_response(

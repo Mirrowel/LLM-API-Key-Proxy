@@ -59,6 +59,7 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
         "id": "chat_1",
         "model": "provider/gpt-test",
         "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "hidden"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost_details": {"total_cost": 0.01, "source": "native_provider"}},
     }
     client = FakeHTTPClient(response)
 
@@ -89,6 +90,8 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
     assert "field_cache_extraction_start" in pass_names
     assert "after_field_cache_extraction" in pass_names
     assert "field_cache_extraction_complete" in pass_names
+    usage_entries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"]
+    assert usage_entries[-1]["data"]["cost"]["provider_reported_cost"] == 0.01
     assert "final_client_response" in pass_names
 
 

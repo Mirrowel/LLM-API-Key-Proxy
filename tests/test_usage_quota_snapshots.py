@@ -24,6 +24,8 @@ def test_build_quota_snapshots_for_model_window() -> None:
     assert snapshot.used == 3
     assert snapshot.remaining == 7
     assert snapshot.credential_id != "credential-secret"
+    assert snapshot.metadata == {"scope": "request_token_window"}
+    assert "cost_used" not in snapshot.to_dict()
 
 
 def test_build_quota_snapshots_for_group_window_without_credentials() -> None:
