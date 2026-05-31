@@ -75,6 +75,15 @@ def test_load_routing_config_rejects_hard_stop_failover() -> None:
             }
         )
 
+    with pytest.raises(RoutingConfigError):
+        load_routing_config_from_env(
+            {
+                "FALLBACK_GROUPS": "chain",
+                "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
+                "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "pre_request_callback",
+            }
+        )
+
 
 def test_load_routing_config_rejects_unknown_streaming_policy() -> None:
     with pytest.raises(RoutingConfigError):

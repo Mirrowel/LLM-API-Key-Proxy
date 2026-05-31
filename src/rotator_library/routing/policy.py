@@ -17,6 +17,7 @@ _ALIASES = {
     "validation": "invalid_request",
     "permanent": "invalid_request",
     "context_length": "context_window_exceeded",
+    "pre_request_callback": "pre_request_callback_error",
     "configuration": "configuration_error",
     "config": "configuration_error",
     "quota": "quota_exceeded",
@@ -24,6 +25,14 @@ _ALIASES = {
     "transient": "server_error",
     "network": "api_connection",
     "connection": "api_connection",
+    "400": "invalid_request",
+    "401": "authentication",
+    "403": "forbidden",
+    "429": "rate_limit",
+    "500": "server_error",
+    "502": "server_error",
+    "503": "server_error",
+    "504": "server_error",
 }
 
 

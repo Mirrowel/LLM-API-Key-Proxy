@@ -925,11 +925,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 original_exception=e,
                 status_code=status_code,
             )
-            return ClassifiedError(
-                error_type="invalid_request",
-                original_exception=e,
-                status_code=status_code,
-            )
         if 400 <= status_code < 500:
             # Other 4xx errors - generally client errors
             return ClassifiedError(

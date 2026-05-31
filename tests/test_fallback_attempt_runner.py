@@ -61,7 +61,7 @@ async def test_attempt_runner_stops_on_permanent_error() -> None:
         await FallbackAttemptRunner().run(_decision(), attempt)
 
     assert len(exc.value.attempts) == 1
-    assert exc.value.attempts[0].error_type == "validation"
+    assert exc.value.attempts[0].error_type == "invalid_request"
 
 
 @pytest.mark.asyncio
@@ -77,7 +77,7 @@ async def test_attempt_runner_blocks_stream_fallback_after_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_attempt_runner_honors_group_policy_overrides() -> None:
+async def test_attempt_runner_hard_stops_group_policy_overrides() -> None:
     group = FallbackGroup(
         name="custom",
         targets=_decision().targets,
@@ -92,7 +92,27 @@ async def test_attempt_runner_honors_group_policy_overrides() -> None:
             raise ClassifiedFailure("authentication")
         return {"target": target.prefixed_model}
 
-    result = await FallbackAttemptRunner().run_group(_decision(), group, attempt)
+    with pytest.raises(FallbackExhaustedError):
+        await FallbackAttemptRunner().run_group(_decision(), group, attempt)
 
-    assert result == {"target": "openai/gpt-5.1"}
-    assert calls == [0, 1]
+    assert calls == [0]
+
+
+@pytest.mark.asyncio
+async def test_attempt_runner_respects_never_streaming_policy() -> None:
+    group = FallbackGroup(
+        name="custom",
+        targets=_decision().targets,
+        failover_on=frozenset({"rate_limit"}),
+        streaming_policy="never",
+    )
+    calls = []
+
+    async def attempt(target, index):
+        calls.append(index)
+        raise ClassifiedFailure("rate_limit")
+
+    with pytest.raises(FallbackExhaustedError):
+        await FallbackAttemptRunner().run_group(_decision(), group, attempt, stream=True)
+
+    assert calls == [0]

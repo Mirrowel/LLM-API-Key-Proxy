@@ -843,6 +843,8 @@ class RequestExecutor:
         )
         for index, target in enumerate(targets):
             emitted_output = False
+            pending_chunks: List[str] = []
+            terminal_error_type: Optional[str] = None
             target_context = clone_context_for_target(
                 context,
                 target,
@@ -860,9 +862,42 @@ class RequestExecutor:
             )
             try:
                 async for chunk in self._execute_streaming(target_context):
+                    chunk_error_type = _stream_chunk_error_type(chunk)
+                    if chunk_error_type and not emitted_output:
+                        terminal_error_type = chunk_error_type
+                        pending_chunks.append(chunk)
+                        continue
                     if _stream_chunk_is_visible_output(chunk):
+                        for pending in pending_chunks:
+                            yield pending
+                        pending_chunks.clear()
                         emitted_output = True
-                    yield chunk
+                        yield chunk
+                        continue
+                    pending_chunks.append(chunk)
+                if terminal_error_type and not emitted_output:
+                    error_type = terminal_error_type
+                    self._log_routing_trace(
+                        context,
+                        "routing_stream_target_attempt_failed",
+                        _target_trace(target),
+                        metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output, "terminal_error_frame": True},
+                    )
+                    target_failures.append(_target_failure_summary(target, error_type))
+                    if index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
+                        self._log_routing_trace(
+                            context,
+                            "routing_fallback_selected",
+                            _target_trace(targets[index + 1]),
+                            metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type, "stream": True},
+                        )
+                        continue
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True, "streaming_policy": _group_streaming_policy(context.routing_group), "fallback_targets": target_failures})
+                    for pending in pending_chunks:
+                        yield pending
+                    return
+                for pending in pending_chunks:
+                    yield pending
                 self._log_routing_trace(
                     context,
                     "routing_stream_target_attempt_succeeded",
@@ -2561,7 +2596,7 @@ def _route_status_code_from_response(response: Any) -> Optional[int]:
         return None
     error = response["error"]
     details = error.get("details") if isinstance(error.get("details"), dict) else {}
-    for candidate in (details.get("status_code"), error.get("status_code"), error.get("code")):
+    for candidate in (details.get("status_code"), details.get("status"), error.get("status_code"), error.get("status"), error.get("code")):
         try:
             return int(candidate)
         except (TypeError, ValueError):
@@ -2625,6 +2660,10 @@ def _structured_error_candidates(error: Dict[str, Any], details: Dict[str, Any])
         details.get("error_type"),
         details.get("status"),
     ]
+    for abnormal in details.get("abnormal_errors") or []:
+        if isinstance(abnormal, dict):
+            values.append(abnormal.get("error_type"))
+            values.append(abnormal.get("status_code"))
     status_code = _route_status_code_from_response({"error": error})
     if status_code == 400:
         values.append("invalid_request")
@@ -2685,6 +2724,62 @@ def _stream_chunk_is_visible_output(chunk: str) -> bool:
     """
 
     return is_visible_stream_output(chunk)
+
+
+def _stream_chunk_error_type(chunk: str) -> Optional[str]:
+    """Return a route error type for terminal stream error frames.
+
+    Per-target stream executors can emit a structured error SSE and `[DONE]`
+    instead of raising. Fallback wrappers must treat those frames as target
+    failures before visible output, while still forwarding them if no fallback is
+    available.
+    """
+
+    payload = _stream_chunk_payload(chunk)
+    if not isinstance(payload, dict):
+        return None
+    event_type = normalize_route_error_type(str(payload.get("event_type") or payload.get("type") or ""))
+    if event_type == "error" and isinstance(payload.get("error"), dict):
+        return _route_error_type_from_response({"error": payload["error"]}) or "server_error"
+    if event_type == "response.failed":
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {"type": "server_error"}
+        return _route_error_type_from_response({"error": error}) or "server_error"
+    if isinstance(payload.get("error"), dict):
+        return _route_error_type_from_response({"error": payload["error"]}) or "server_error"
+    return None
+
+
+def _stream_chunk_payload(chunk: str) -> Optional[Dict[str, Any]]:
+    """Parse a minimal SSE payload for routing decisions only."""
+
+    text = str(chunk or "").strip()
+    if not text:
+        return None
+    event_type = None
+    data_lines: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":"):
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if not data_lines:
+        return {"event_type": event_type} if event_type else None
+    data = "\n".join(data_lines).strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if event_type and "event_type" not in parsed:
+        parsed["event_type"] = event_type
+    return parsed
 
 
 def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str]) -> bool:
