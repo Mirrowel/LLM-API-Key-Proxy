@@ -21,10 +21,13 @@ def test_heartbeat_comments_do_not_block_stream_retry() -> None:
 
 def test_cost_events_do_not_count_as_visible_output() -> None:
     cost_event = 'event: cost\ndata: {"total_cost":0.01}\n\n'
+    scalar_cost_event = "event: cost\ndata: 0.01\n\n"
 
     assert is_visible_stream_output(cost_event) is False
     assert is_visible_stream_output(cost_event, protocol="responses") is False
     assert can_retry_stream_after_error(cost_event, False) is True
+    assert is_visible_stream_output(scalar_cost_event) is False
+    assert can_retry_stream_after_error(scalar_cost_event, False) is True
 
 
 def test_visible_output_detection_for_chat_chunks() -> None:

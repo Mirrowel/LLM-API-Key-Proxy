@@ -60,13 +60,19 @@ def test_top_level_cost_is_preserved_when_usage_exists() -> None:
     assert record.cost_currency == "EUR"
 
 
+def test_reference_request_cost_usd_is_preserved() -> None:
+    record = extract_usage_record({"usage": {"prompt_tokens": 1, "completion_tokens": 1}, "request_cost_usd": 0.019})
+
+    assert record.provider_reported_cost == 0.019
+
+
 def test_structured_cost_breakdown_without_total_is_summed() -> None:
     record = extract_usage_record(
         {
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
-                "cost_details": {"input_cost": 0.01, "output_cost": 0.02, "reasoning_cost": 0.003},
+                "cost_details": {"cached_input_cost": 0.01, "upstream_inference_cost": 0.02, "web_search_cost": 0.003},
             }
         }
     )

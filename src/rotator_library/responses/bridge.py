@@ -113,7 +113,7 @@ class ResponsesBridge:
             "model": response.get("model") or unified_request.model,
             "status": _status_from_chat(response),
             "output": output,
-            "usage": _usage_to_responses(response.get("usage")),
+            "usage": _usage_to_responses(response),
         }
         if unified_request.metadata:
             responses_payload["metadata"] = deepcopy(unified_request.metadata)
@@ -309,6 +309,12 @@ def _status_from_chat(response: dict[str, Any]) -> str:
 
 
 def _usage_to_responses(usage: Any) -> Any:
+    if isinstance(usage, dict) and isinstance(usage.get("usage"), dict):
+        nested = dict(usage["usage"])
+        for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+            if key in usage and key not in nested:
+                nested[key] = deepcopy(usage[key])
+        usage = nested
     if not isinstance(usage, dict):
         return usage
     result = {
@@ -322,9 +328,11 @@ def _usage_to_responses(usage: Any) -> Any:
     completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
     if isinstance(completion_details, dict):
         result["output_tokens_details"] = {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)}
-    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "currency"):
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
         if key in usage:
             result[key] = deepcopy(usage[key])
+    if "request_cost_usd" in result and "cost_details" not in result:
+        result["cost_details"] = {"request_cost_usd": result["request_cost_usd"]}
     return result
 
 

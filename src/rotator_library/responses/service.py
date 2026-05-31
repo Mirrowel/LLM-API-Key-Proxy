@@ -472,7 +472,7 @@ class ResponsesService:
                 if chunk.get("error") is not None or chunk.get("type") == "error":
                     raise ResponsesServiceError(_stream_error_message(chunk), status_code=502, error_type="upstream_error")
                 if chunk.get("usage"):
-                    usage = _merge_responses_stream_usage(chunk["usage"], usage)
+                    usage = _merge_responses_stream_usage(_responses_chunk_usage(chunk), usage)
                 delta = _chunk_text_delta(chunk)
                 if not delta:
                     continue
@@ -918,7 +918,7 @@ def _responses_sse_cost_usage(chunk: Any) -> Optional[dict[str, Any]]:
         payload = {"provider_reported_cost": payload, "source": "responses_sse_cost"}
     if not isinstance(payload, dict):
         return None
-    cost = payload.get("provider_reported_cost", payload.get("total_cost", payload.get("cost")))
+    cost = payload.get("provider_reported_cost", payload.get("request_cost_usd", payload.get("total_cost", payload.get("cost"))))
     if cost is None:
         return None
     return {
@@ -926,6 +926,19 @@ def _responses_sse_cost_usage(chunk: Any) -> Optional[dict[str, Any]]:
         "currency": payload.get("currency", "USD"),
         "cost_details": payload,
     }
+
+
+def _responses_chunk_usage(chunk: dict[str, Any]) -> Any:
+    """Return stream chunk usage with sibling cost metadata preserved."""
+
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict):
+        return usage
+    merged = dict(usage)
+    for key in ("cost_details", "cost", "total_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+        if key in chunk and key not in merged:
+            merged[key] = deepcopy(chunk[key])
+    return merged
 
 
 def _responses_sse_cost_payload(chunk: str) -> Any:
