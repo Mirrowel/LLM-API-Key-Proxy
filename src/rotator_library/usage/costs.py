@@ -40,12 +40,15 @@ class CostBreakdown:
     cache_write_cost: float = 0.0
     output_cost: float = 0.0
     reasoning_cost: float = 0.0
+    provider_reported_cost: float = 0.0
     currency: str = "USD"
     pricing_source: str = "unavailable"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_cost(self) -> float:
+        if self.provider_reported_cost:
+            return self.provider_reported_cost
         return self.input_cost + self.cache_read_cost + self.cache_write_cost + self.output_cost + self.reasoning_cost
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,6 +58,7 @@ class CostBreakdown:
             "cache_write_cost": self.cache_write_cost,
             "output_cost": self.output_cost,
             "reasoning_cost": self.reasoning_cost,
+            "provider_reported_cost": self.provider_reported_cost,
             "total_cost": self.total_cost,
             "currency": self.currency,
             "pricing_source": self.pricing_source,
@@ -76,6 +80,13 @@ class CostCalculator:
 
         if self.provider_plugin and getattr(self.provider_plugin, "skip_cost_calculation", False):
             return CostBreakdown(pricing_source="skipped", metadata={"reason": "provider_skip_cost_calculation"})
+        if usage.provider_reported_cost is not None:
+            return CostBreakdown(
+                provider_reported_cost=usage.provider_reported_cost,
+                currency=usage.cost_currency,
+                pricing_source=usage.cost_source or "provider_reported",
+                metadata={"actual_provider_reported": True},
+            )
         pricing = self._provider_pricing(model)
         if pricing:
             return _calculate_from_pricing(usage, pricing)
