@@ -767,8 +767,9 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code = int(status_value) if status_value is not None else None
             except (TypeError, ValueError):
                 status_code = None
+            structured_type = _classify_structured_error_text(payload, details)
             if status_code == 400:
-                return ClassifiedError(error_type="invalid_request", original_exception=e, status_code=status_code)
+                return ClassifiedError(error_type=structured_type or "invalid_request", original_exception=e, status_code=status_code)
             if status_code == 401:
                 return ClassifiedError(error_type="authentication", original_exception=e, status_code=status_code)
             if status_code == 403:
@@ -776,7 +777,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             if status_code == 429:
                 body = str(payload).lower()
                 return ClassifiedError(error_type="quota_exceeded" if "quota" in body or "resource_exhausted" in body else "rate_limit", original_exception=e, status_code=status_code)
-            structured_type = _classify_structured_error_text(payload, details)
             if structured_type:
                 return ClassifiedError(error_type=structured_type, original_exception=e, status_code=status_code)
             if (status_code is not None and status_code >= 500) or status in {
