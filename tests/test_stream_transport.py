@@ -10,11 +10,18 @@ def test_sse_formatter_outputs_named_event() -> None:
     assert "data:" in formatted
 
 
+def test_sse_formatter_outputs_comment_heartbeat() -> None:
+    formatted = SSEStreamFormatter().format_heartbeat("keepalive")
+
+    assert formatted == ": keepalive\n\n"
+
+
 def test_websocket_formatter_exposes_future_transport_shape() -> None:
     formatted = WebSocketStreamFormatter().format_event(StreamEvent("delta", data={"text": "hi"}))
 
     assert formatted["type"] == "delta"
     assert formatted["payload"]["transport"] == "sse"
+    assert WebSocketStreamFormatter().format_heartbeat()["type"] == "heartbeat"
 
 
 def test_jsonl_formatter_outputs_one_line_json() -> None:
@@ -22,3 +29,4 @@ def test_jsonl_formatter_outputs_one_line_json() -> None:
 
     assert formatted.endswith("\n")
     assert "metadata" in formatted
+    assert "heartbeat" in JSONLineStreamFormatter().format_heartbeat()
