@@ -56,6 +56,7 @@ class StreamingHandler:
         cred_context: Optional["CredentialContext"] = None,
         skip_cost_calculation: bool = False,
         response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        success_callback: Optional[Callable[[], None]] = None,
         transaction_logger: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """
@@ -362,6 +363,8 @@ class StreamingHandler:
                         prompt_tokens_cache_write=prompt_tokens_cache_write,
                         approx_cost=cost_breakdown.total_cost,
                     )
+                if success_callback:
+                    success_callback()
 
                 if response_callback and (assistant_parts or tool_call_ids):
                     # Intentionally only record response anchors after a complete

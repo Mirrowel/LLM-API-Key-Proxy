@@ -113,10 +113,15 @@ def decide_provider_cooldown(
     if error_type in {"server_error", "api_connection"} and default_duration >= provider_cooldown_min_seconds:
         backoff_level = 0
         duration = int(default_duration)
-        if failure_history is not None:
-            backoff = failure_history.backoff_for(provider=provider, error_type=error_type, scope=scope, model=model if scope == "model" else None, default_duration=duration)
-            duration = backoff.duration
-            backoff_level = backoff.level
+        if scope == "model":
+            return ProviderCooldownDecision(True, duration=duration, reason="model_capacity_cooldown", scope=scope, model=model, backoff_level=backoff_level)
+        if failure_history is None:
+            return ProviderCooldownDecision(False, reason="missing_failure_history", scope=scope, model=model if scope == "model" else None)
+        backoff = failure_history.backoff_for(provider=provider, error_type=error_type, scope=scope, model=model if scope == "model" else None, default_duration=duration)
+        duration = backoff.duration
+        backoff_level = backoff.level
+        if backoff_level <= 0:
+            return ProviderCooldownDecision(False, reason="transient_backoff_threshold_not_met", scope=scope, model=model if scope == "model" else None)
         return ProviderCooldownDecision(True, duration=duration, reason="model_capacity_cooldown" if scope == "model" else "default_transient_cooldown", scope=scope, model=model if scope == "model" else None, backoff_level=backoff_level)
     return ProviderCooldownDecision(False, reason="missing_retry_after")
 
@@ -162,6 +167,22 @@ class FailureHistory:
         """Return recent entries for tests and future read-only reporting."""
 
         return tuple(self._entries)
+
+    def clear(self, *, provider: str, model: Optional[str] = None, scope: Optional[str] = None, error_type: Optional[str] = None) -> None:
+        """Clear matching failure entries after a successful provider/model call."""
+
+        kept = [
+            entry
+            for entry in self._entries
+            if not (
+                entry.provider == provider
+                and (scope is None or entry.scope == scope)
+                and (error_type is None or entry.error_type == error_type)
+                and (entry.scope != "model" or model is None or entry.model == model)
+            )
+        ]
+        self._entries.clear()
+        self._entries.extend(kept)
 
     def backoff_for(self, *, provider: Optional[str], error_type: str, scope: str, model: Optional[str], default_duration: int) -> BackoffDecision:
         """Return bounded backoff for repeated transient failures."""
