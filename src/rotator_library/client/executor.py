@@ -1457,6 +1457,8 @@ class RequestExecutor:
                                             base_stream,
                                             context.transaction_logger,
                                             context.kwargs,
+                                            context=context,
+                                            plugin=plugin,
                                         ):
                                             last_streamed_chunk = chunk
                                             yield chunk
@@ -2141,6 +2143,9 @@ class RequestExecutor:
         stream: AsyncGenerator[str, None],
         transaction_logger: TransactionLogger,
         request_kwargs: Dict[str, Any],
+        *,
+        context: Optional[RequestContext] = None,
+        plugin: Any = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a stream to log chunks and final response to TransactionLogger.
@@ -2158,9 +2163,10 @@ class RequestExecutor:
         chunks = []
 
         async for sse_line in stream:
+            trace_sse_line = _redact_stream_sse_for_trace(sse_line, context, plugin)
             transaction_logger.log_transform_pass(
                 "raw_stream_chunk",
-                sse_line,
+                trace_sse_line,
                 direction="stream",
                 stage="client",
                 transport="sse",
@@ -2169,7 +2175,7 @@ class RequestExecutor:
             if sse_line.startswith("data: [DONE]"):
                 transaction_logger.log_transform_pass(
                     "stream_done_event",
-                    {"raw": sse_line},
+                    {"raw": trace_sse_line},
                     direction="stream",
                     stage="final",
                     transport="sse",
@@ -2186,11 +2192,12 @@ class RequestExecutor:
                     if content:
                         chunk_data = json.loads(content)
                         chunks.append(chunk_data)
-                        transaction_logger.log_stream_chunk(chunk_data)
+                        trace_chunk_data = _redact_context_field_cache_paths(chunk_data, context, "stream", plugin) if context else chunk_data
+                        transaction_logger.log_stream_chunk(trace_chunk_data)
                         if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
                             transaction_logger.log_transform_pass(
                                 "stream_error_event",
-                                chunk_data,
+                                trace_chunk_data,
                                 direction="stream",
                                 stage="client",
                                 transport="sse",
@@ -2205,14 +2212,15 @@ class RequestExecutor:
         if chunks:
             try:
                 final_response = TransactionLogger.assemble_streaming_response(chunks)
+                trace_final_response = _redact_context_field_cache_paths(final_response, context, "stream", plugin) if context else final_response
                 transaction_logger.log_transform_pass(
                     "assembled_stream_response",
-                    final_response,
+                    trace_final_response,
                     direction="response",
                     stage="client",
                     transport="sse",
                 )
-                transaction_logger.log_response(final_response)
+                transaction_logger.log_response(trace_final_response)
             except Exception as e:
                 lib_logger.debug(
                     f"Failed to assemble/log final streaming response: {e}"
@@ -2289,13 +2297,28 @@ def _redact_context_field_cache_paths(payload: Any, context: RequestContext, dir
     for rule in rules:
         if direction == "response" and getattr(rule, "source", None) not in {"response", "unified_response"}:
             continue
-        if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event"}:
+        if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event", "response", "unified_response"}:
             continue
         try:
             _redact_trace_path(redacted, parse_path(rule.path))
         except (FieldCachePathError, TypeError, ValueError):
             continue
     return redacted
+
+
+def _redact_stream_sse_for_trace(sse_line: str, context: Optional[RequestContext], plugin: Any) -> str:
+    """Return a trace-only SSE line with configured native cache paths redacted."""
+
+    if not context or not isinstance(sse_line, str) or not sse_line.startswith("data: ") or sse_line.startswith("data: [DONE]"):
+        return sse_line
+    try:
+        payload = json.loads(sse_line[6:].strip())
+    except json.JSONDecodeError:
+        return sse_line
+    redacted = _redact_context_field_cache_paths(payload, context, "stream", plugin)
+    if redacted is payload:
+        return sse_line
+    return f"data: {json.dumps(redacted, separators=(',', ':'))}\n\n"
 
 
 def _redact_trace_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
