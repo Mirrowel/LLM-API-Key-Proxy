@@ -35,6 +35,15 @@ class FailingStreamingClient:
         return chunks()
 
 
+class ErrorChunkStreamingClient:
+    async def acompletion(self, **kwargs):
+        async def chunks():
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            yield 'data: {"error":{"message":"provider failed"}}\n\n'
+
+        return chunks()
+
+
 @pytest.mark.asyncio
 async def test_stream_response_emits_responses_sse_events_and_stores_final_response() -> None:
     store = InMemoryResponsesStore()
@@ -90,6 +99,22 @@ async def test_stream_response_errors_emit_failed_event() -> None:
     stored = await store.get(response_id)
     assert stored is not None
     assert stored.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_error_chunks_store_failed_with_partial_output() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, ErrorChunkStreamingClient())]
+
+    event_text = "".join(events)
+    response_id = events[0].split('"id": "')[1].split('"')[0]
+    stored = await store.get(response_id)
+    assert "event: response.failed" in event_text
+    assert stored is not None
+    assert stored.status == "failed"
+    assert stored.output_items[0]["content"][0]["text"] == "partial"
 
 
 @pytest.mark.asyncio

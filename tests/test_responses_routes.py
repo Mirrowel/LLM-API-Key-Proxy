@@ -52,6 +52,24 @@ def test_post_responses_missing_model_returns_400() -> None:
     assert response.json()["detail"]["error"]["type"] == "invalid_request_error"
 
 
+def test_post_responses_stream_missing_model_returns_400_before_sse() -> None:
+    client = _client()
+
+    response = client.post("/v1/responses", json={"input": "hello", "stream": True})
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"]["type"] == "invalid_request_error"
+
+
+def test_post_responses_stream_missing_previous_response_returns_404_before_sse() -> None:
+    client = _client()
+
+    response = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello", "stream": True, "previous_response_id": "missing"})
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"]["type"] == "not_found_error"
+
+
 def test_get_delete_and_input_items_routes() -> None:
     client = _client()
     created = client.post("/v1/responses", json={"model": "gpt-test", "input": ["hello"]}).json()

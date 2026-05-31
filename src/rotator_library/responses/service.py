@@ -13,7 +13,7 @@ from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
 from ..usage.accounting import extract_usage_record
 from ..protocols.responses import ResponsesProtocol
-from .bridge import ResponsesBridge
+from .bridge import ResponsesBridge, responses_session_hints
 from .store import InMemoryResponsesStore, ResponsesStore
 from .streaming import (
     ResponsesSSEFormatter,
@@ -84,13 +84,18 @@ class ResponsesService:
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
+        session_hints = chat_kwargs.pop("_session_tracking_hints", None)
+        session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
+        session_info: dict[str, Any] = {}
+        chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
+        trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
         self._trace(
             transaction_logger,
             "responses_bridge_chat_request",
-            chat_kwargs,
+            trace_chat_kwargs,
             direction="request",
             stage="adapter",
-            metadata={"bridge_metadata": bridge_metadata},
+            metadata={"bridge_metadata": {**bridge_metadata, "has_session_hints": bool(session_hints)}},
         )
 
         chat_response = await client.acompletion(request=request, **chat_kwargs)
@@ -102,7 +107,7 @@ class ResponsesService:
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
         if raw_request.get("store", True):
-            stored = self._stored_response(raw_request, response_payload, parent)
+            stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
             await self.store.save(stored)
             self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
@@ -116,12 +121,22 @@ class ResponsesService:
         *,
         request: Optional[Any] = None,
         transaction_logger: Optional[Any] = None,
+        transport: str = "sse",
     ) -> AsyncGenerator[str, None]:
         """Stream a Responses API request as HTTP SSE events."""
 
         formatter = ResponsesSSEFormatter()
-        async for event in self.stream_events(raw_request, client, request=request, transaction_logger=transaction_logger):
+        async for event in self.stream_events(raw_request, client, request=request, transaction_logger=transaction_logger, transport=transport):
             yield formatter.format_stream_event(event)
+
+    async def validate_stream_request(self, raw_request: dict[str, Any]) -> None:
+        """Validate stream-only preconditions before an HTTP response starts."""
+
+        if not raw_request.get("model"):
+            raise ResponsesServiceError("'model' is required", status_code=400)
+        previous_response_id = raw_request.get("previous_response_id")
+        if previous_response_id:
+            await self._load_previous_response(str(previous_response_id), None)
 
     async def stream_events(
         self,
@@ -130,6 +145,7 @@ class ResponsesService:
         *,
         request: Optional[Any] = None,
         transaction_logger: Optional[Any] = None,
+        transport: str = "sse",
     ) -> AsyncGenerator[ResponsesStreamEvent, None]:
         """Yield transport-neutral Responses events for streaming transports."""
 
@@ -138,20 +154,25 @@ class ResponsesService:
         stream_request = dict(raw_request)
         stream_request["stream"] = True
         self._trace(transaction_logger, "responses_raw_request", stream_request, direction="request", stage="client")
-        unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport="sse"))
+        unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport=transport))
         if transaction_logger:
             self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
         parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
         chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_response=parent.response if parent else None)
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
+        session_hints = chat_kwargs.pop("_session_tracking_hints", None)
+        session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
+        session_info: dict[str, Any] = {}
+        chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
         chat_kwargs["stream"] = True
+        trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
         self._trace(
             transaction_logger,
             "responses_bridge_chat_request",
-            chat_kwargs,
+            trace_chat_kwargs,
             direction="request",
             stage="adapter",
-            metadata={"bridge_metadata": bridge_metadata, "transport": "sse"},
+            metadata={"bridge_metadata": {**bridge_metadata, "has_session_hints": bool(session_hints)}, "transport": transport},
         )
 
         response_id = generate_response_id()
@@ -166,10 +187,10 @@ class ResponsesService:
                 {"event": StreamEvent("started", protocol="responses").to_dict(), "metrics": monitor.metrics.to_dict()},
                 direction="stream",
                 stage="client",
-                metadata={"transport": "sse"},
+                metadata={"transport": transport},
             )
         created = response_created_payload(response_id, unified.model)
-        self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": "sse"})
+        self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": transport})
         await self._store_stream_current_state(stream_request, created, parent, transaction_logger=transaction_logger)
         yield ResponsesStreamEvent("response.created", created)
         try:
@@ -184,13 +205,15 @@ class ResponsesService:
                             {"metrics": monitor.metrics.to_dict()},
                             direction="stream",
                             stage="provider",
-                            metadata={"transport": "sse"},
+                            metadata={"transport": transport},
                         )
                 self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 chunk = parse_chat_sse_chunk(raw_chunk)
                 if not chunk or chunk.get("type") == "done":
                     continue
                 self._trace(transaction_logger, "parsed_unified_stream_event", chunk, direction="stream", stage="protocol")
+                if chunk.get("error") is not None:
+                    raise ResponsesServiceError("Upstream stream error", status_code=502, error_type="upstream_error")
                 if chunk.get("usage"):
                     usage = chunk["usage"]
                 delta = _chunk_text_delta(chunk)
@@ -199,7 +222,7 @@ class ResponsesService:
                 if not item_started:
                     item_started = True
                     added = output_item_added_payload(state)
-                    self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": "sse"})
+                    self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
                     yield ResponsesStreamEvent("response.output_item.added", added)
                 state = ResponsesStreamState(
                     response_id=state.response_id,
@@ -225,22 +248,22 @@ class ResponsesService:
                             {"event": event, "metrics": monitor.metrics.to_dict()},
                             direction="stream",
                             stage="final",
-                            metadata={"transport": "sse"},
+                            metadata={"transport": transport},
                         )
-                self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": "sse"})
+                self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": transport})
                 await self._store_stream_current_state(stream_request, _current_stream_payload(state), parent, transaction_logger=transaction_logger)
                 yield ResponsesStreamEvent("response.output_text.delta", event)
 
             if not item_started:
                 added = output_item_added_payload(state)
-                self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": "sse"})
+                self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
                 yield ResponsesStreamEvent("response.output_item.added", added)
             done_item = output_item_done_payload(state)
-            self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": "sse"})
+            self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
-            stored = await self._store_stream_response(stream_request, completed, parent)
+            stored = await self._store_stream_response(stream_request, completed, parent, session_info=session_info)
             if stored:
                 self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
             else:
@@ -253,7 +276,7 @@ class ResponsesService:
                     {"metrics": monitor.metrics.to_dict()},
                     direction="stream",
                     stage="final",
-                    metadata={"transport": "sse"},
+                    metadata={"transport": transport},
                 )
                 self._trace(
                     transaction_logger,
@@ -261,20 +284,22 @@ class ResponsesService:
                     {"metrics": monitor.metrics.to_dict()},
                     direction="stream",
                     stage="final",
-                    metadata={"transport": "sse"},
+                    metadata={"transport": transport},
                 )
-            self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": "sse"})
+            self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.completed", completed)
-            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": "sse"})
+            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("done", {}, terminal=True)
         except Exception as exc:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, {"message": str(exc), "type": exc.__class__.__name__})
+            if state.output_text:
+                failed["output"] = [output_item_done_payload(state)["item"]]
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
-            stored = await self._store_stream_response(stream_request, failed, parent, failed=True)
+            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, session_info=session_info)
             if stored:
                 self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("id"), "status": "failed"}, direction="metadata", stage="final")
-            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": "sse"}, scrub_strings=True)
+            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": transport}, scrub_strings=True)
             if transaction_logger:
                 self._trace(
                     transaction_logger,
@@ -282,10 +307,10 @@ class ResponsesService:
                     {"metrics": monitor.metrics.to_dict()},
                     direction="stream",
                     stage="final",
-                    metadata={"transport": "sse", "failed": True},
+                    metadata={"transport": transport, "failed": True},
                 )
             yield ResponsesStreamEvent("response.failed", failed)
-            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": "sse", "failed": True})
+            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
             yield ResponsesStreamEvent("done", {}, terminal=True)
 
     async def get_response(self, response_id: str) -> dict[str, Any]:
@@ -339,7 +364,11 @@ class ResponsesService:
         raw_request: dict[str, Any],
         response_payload: dict[str, Any],
         parent: Optional[StoredResponse],
+        *,
+        session_info: Optional[dict[str, Any]] = None,
     ) -> StoredResponse:
+        session_info = session_info or {}
+        session_affinity_key = session_info.get("session_affinity_key") or (parent.metadata.get("session_affinity_key") if parent else None)
         return StoredResponse(
             id=str(response_payload["id"]),
             created_at=float(response_payload.get("created_at") or time.time()),
@@ -353,7 +382,11 @@ class ResponsesService:
             metadata={
                 "previous_response_id": parent.id if parent else raw_request.get("previous_response_id"),
                 "response_id": response_payload.get("id"),
+                "session_affinity_key": session_affinity_key,
             },
+            session_id=session_info.get("session_id") or (parent.session_id if parent else None),
+            scope_key=session_info.get("scope_key") or (parent.scope_key if parent else None),
+            classifier=session_info.get("classifier") or (parent.classifier if parent else None),
             expires_at=_expires_at(self.store_settings),
         )
 
@@ -427,12 +460,13 @@ class ResponsesService:
         parent: Optional[StoredResponse],
         *,
         failed: bool = False,
+        session_info: Optional[dict[str, Any]] = None,
     ) -> bool:
         if not raw_request.get("store", True):
             return False
         if failed and not self.store_settings.store_failed:
             return False
-        await self.store.save(self._stored_response(raw_request, response_payload, parent))
+        await self.store.save(self._stored_response(raw_request, response_payload, parent, session_info=session_info))
         return True
 
     async def _store_stream_current_state(
@@ -480,6 +514,50 @@ def _expires_at(settings: ResponsesStoreSettings) -> Optional[float]:
     if ttl is None or ttl <= 0:
         return None
     return time.time() + ttl
+
+
+def _internal_client_kwargs(client: Any, session_hints: Any, session_info: dict[str, Any]) -> dict[str, Any]:
+    """Return hidden kwargs only for the internal RotatingClient path."""
+
+    if not _supports_internal_context_kwargs(client):
+        return {}
+    kwargs: dict[str, Any] = {"_request_context_callback": _capture_request_context(session_info)}
+    if session_hints:
+        kwargs["_session_tracking_hints"] = session_hints
+    return kwargs
+
+
+def _supports_internal_context_kwargs(client: Any) -> bool:
+    """Return whether a client is the proxy's internal rotating client."""
+
+    return hasattr(client, "_request_builder") and hasattr(client, "_executor")
+
+
+def _capture_request_context(session_info: dict[str, Any]):
+    """Build a callback that records non-secret request context metadata."""
+
+    def capture(context: Any) -> None:
+        session_info["session_id"] = getattr(context, "session_id", None)
+        session_info["session_affinity_key"] = getattr(context, "session_affinity_key", None)
+        session_info["scope_key"] = getattr(context, "usage_manager_key", None)
+        session_info["classifier"] = getattr(context, "classifier", None)
+
+    return capture
+
+
+def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return trace/provider-visible kwargs without proxy-internal controls."""
+
+    return {key: deepcopy(value) for key, value in kwargs.items() if not key.startswith("_")}
+
+
+def _responses_session_hints(previous_response_id: Optional[str], parent: Optional[StoredResponse], fallback: Any) -> Any:
+    """Prefer parent stored affinity when building Responses continuation hints."""
+
+    if not previous_response_id:
+        return None
+    parent_affinity = parent.metadata.get("session_affinity_key") if parent else None
+    return responses_session_hints(previous_response_id, affinity_key=parent_affinity) or fallback
 
 
 def _chunk_text_delta(chunk: dict[str, Any]) -> str:

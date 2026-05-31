@@ -121,7 +121,7 @@ def _chat_generation_key(key: str) -> str:
     return key
 
 
-def responses_session_hints(previous_response_id: Optional[str]) -> dict[str, Any] | None:
+def responses_session_hints(previous_response_id: Optional[str], *, affinity_key: Optional[str] = None) -> dict[str, Any] | None:
     """Return proxy-internal sticky routing evidence for Responses continuations."""
 
     if not previous_response_id:
@@ -129,7 +129,7 @@ def responses_session_hints(previous_response_id: Optional[str]) -> dict[str, An
     anchor = f"responses_previous_response_id:{previous_response_id}"
     return {
         "strong_anchors": [anchor],
-        "affinity_key": anchor,
+        "affinity_key": affinity_key or anchor,
         "session_scope": "responses",
     }
 
