@@ -290,13 +290,18 @@ class ResponsesService:
             timeout = stream_settings.ttfb_timeout_seconds if first else stream_settings.stall_timeout_seconds
             heartbeat = stream_settings.heartbeat_seconds
             nonlocal pending_next_task, pending_next_started_at, pending_next_last_heartbeat_at
-            if pending_next_task is None or pending_next_task.done():
+            if pending_next_task is None:
                 pending_next_task = asyncio.create_task(stream_iterator.__anext__())
                 pending_next_started_at = time.monotonic()
                 pending_next_last_heartbeat_at = pending_next_started_at
             next_task = pending_next_task
             started_at = pending_next_started_at or time.monotonic()
             while True:
+                if next_task.done():
+                    pending_next_task = None
+                    pending_next_started_at = None
+                    pending_next_last_heartbeat_at = None
+                    return "chunk", next_task.result()
                 if request is not None and await request.is_disconnected():
                     self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected"}, direction="stream", stage="client", metadata={"transport": transport})
                     if stream_settings.cancel_upstream_on_disconnect:
@@ -347,7 +352,7 @@ class ResponsesService:
             """Acquire the upstream stream under the same TTFB/disconnect policy."""
 
             nonlocal acquire_task, acquire_started_at, acquire_last_heartbeat_at
-            if acquire_task is None or acquire_task.done():
+            if acquire_task is None:
                 acquire_task = asyncio.create_task(client.acompletion(request=request, **chat_kwargs))
                 acquire_started_at = time.monotonic()
                 acquire_last_heartbeat_at = acquire_started_at
@@ -356,6 +361,11 @@ class ResponsesService:
             timeout = stream_settings.ttfb_timeout_seconds
             heartbeat = stream_settings.heartbeat_seconds
             while True:
+                if task.done():
+                    acquire_task = None
+                    acquire_started_at = None
+                    acquire_last_heartbeat_at = None
+                    return "stream", task.result()
                 if request is not None and await request.is_disconnected():
                     self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected", "phase": "acquire"}, direction="stream", stage="client", metadata={"transport": transport})
                     await cancel_task(task)
@@ -554,6 +564,8 @@ class ResponsesService:
             self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
             yield ResponsesStreamEvent("done", {}, terminal=True)
         finally:
+            await cancel_task(pending_next_task)
+            await cancel_task(acquire_task)
             if chat_stream is not None and not upstream_closed:
                 await close_upstream("wrapper_exit")
 
