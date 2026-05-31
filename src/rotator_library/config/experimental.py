@@ -23,7 +23,7 @@ from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
 _KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
-_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "password")
+_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "password")
 
 
 class ExperimentalConfigError(ValueError):
@@ -418,6 +418,8 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
             insert=as_bool(inject_data.get("insert", False), name="field_cache.inject.insert"),
             as_list=as_bool(inject_data.get("as_list", False), name="field_cache.inject.as_list"),
         )
+    elif inject_data is not None:
+        raise ExperimentalConfigError("field_cache.inject must be an object")
     elif data.get("target_path"):
         inject = FieldCacheInjection(target=str(data.get("target", "request")), path=str(data["target_path"]))
     scope = data.get("scope", ("provider", "model", "classifier", "session"))
@@ -437,13 +439,19 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
             inject=inject,
             enabled=as_bool(data.get("enabled", True), name="field_cache.enabled"),
             ttl_seconds=int(data["ttl_seconds"]) if data.get("ttl_seconds") is not None else None,
-            metadata=dict(data.get("metadata", {})) if isinstance(data.get("metadata", {}), dict) else {},
+            metadata=_metadata_dict(data.get("metadata", {})),
             allow_missing_session=as_bool(data.get("allow_missing_session", False), name="field_cache.allow_missing_session"),
         )
     except KeyError as exc:
         raise ExperimentalConfigError(f"Missing field-cache rule key {exc.args[0]}") from exc
     except ValueError as exc:
         raise ExperimentalConfigError(str(exc)) from exc
+
+
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    raise ExperimentalConfigError("field_cache.metadata must be an object")
 
 
 def _env_part(value: str) -> str:
