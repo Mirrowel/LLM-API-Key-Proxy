@@ -43,6 +43,16 @@ def test_antigravity_provider_restores_safe_declarations() -> None:
     assert rules[0].scope == ("provider", "model", "credential", "session")
 
 
+def test_antigravity_quota_groups_are_model_family_scoped() -> None:
+    groups = AntigravityProvider.model_quota_groups
+
+    assert groups["gemini_3_pro"] == ["gemini-3-pro-preview", "gemini-3-pro-low", "gemini-3-pro-high"]
+    assert groups["gemini_3_flash"] == ["gemini-3-flash"]
+    assert groups["gemini_2_5_flash"] == ["gemini-2.5-flash"]
+    assert groups["gemini_2_5_flash_lite"] == ["gemini-2.5-flash-lite"]
+    assert groups["claude_sonnet_4_5"] == ["claude-sonnet-4.5"]
+
+
 def test_antigravity_provider_builds_static_headers_without_device_profile(monkeypatch) -> None:
     monkeypatch.setenv("ANTIGRAVITY_API_BASE", "https://antigravity.test/v1internal")
     provider = AntigravityProvider()

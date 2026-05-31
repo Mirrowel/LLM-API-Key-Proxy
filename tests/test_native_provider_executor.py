@@ -270,6 +270,38 @@ async def test_native_runtime_executes_unified_response_source() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_response_source_extracts_raw_provider_response_before_client_formatting() -> None:
+    rule = FieldCacheRule(
+        name="anthropic_signature",
+        source="response",
+        path="content.*.signature",
+        mode="all",
+        inject=FieldCacheInjection(target="request", path="metadata.signatures", as_list=True),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="claude_code",
+        model="claude-sonnet-4-5",
+        protocol_name="anthropic_messages",
+        client_protocol_name="openai_chat",
+        endpoint="https://example.test/messages",
+        operation="messages",
+        field_cache_rules=(rule,),
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute(
+        {"model": "claude-sonnet-4-5", "messages": [], "max_tokens": 1},
+        context,
+        NativeHTTPTransport(FakeHTTPClient({"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "ok", "signature": "sig-1"}]})),
+    )
+    second_client = FakeHTTPClient({"id": "msg_2", "type": "message", "role": "assistant", "content": []})
+    await executor.execute({"model": "claude-sonnet-4-5", "messages": [], "max_tokens": 1}, context, NativeHTTPTransport(second_client))
+
+    assert second_client.calls[0]["json"]["metadata"]["signatures"] == ["sig-1"]
+
+
+@pytest.mark.asyncio
 async def test_native_runtime_executes_metadata_target_before_adapters() -> None:
     class MetadataEchoAdapter(PayloadAdapter):
         name = "test_metadata_echo"

@@ -68,6 +68,7 @@ from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..transform_trace import REDACTED
 from ..usage.accounting import UsageRecord, extract_usage_record
@@ -2470,14 +2471,13 @@ def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
         try:
             operation = resolver(model, {"model": model, "stream": True}, stream=True)
         except TypeError:
-            operation = resolver(model)
-    try:
-        return bool(support(model=model, operation=operation))
-    except TypeError:
-        try:
-            return bool(support(model))
-        except TypeError:
-            return bool(support())
+            try:
+                operation = resolver(model)
+            except Exception:
+                return False
+        except Exception:
+            return False
+    return native_provider_supports_streaming(plugin, model=model, operation=operation)
 
 
 def _should_use_native_streaming(plugin: Any, model: str, target: Optional[RouteTarget], execution: str, provider: str) -> bool:
