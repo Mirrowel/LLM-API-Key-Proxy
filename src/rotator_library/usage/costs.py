@@ -65,16 +65,21 @@ class CostBreakdown:
 class CostCalculator:
     """Calculate advisory costs without replacing usage tracking."""
 
-    def __init__(self, *, provider_plugin: Any = None, use_litellm_fallback: bool = True) -> None:
+    def __init__(self, *, provider_plugin: Any = None, use_litellm_fallback: bool = True, config: Any = None, env: Any = None) -> None:
         self.provider_plugin = provider_plugin
         self.use_litellm_fallback = use_litellm_fallback
+        self.config = config
+        self.env = env
 
-    def calculate(self, usage: UsageRecord, *, model: str, response: Any = None) -> CostBreakdown:
+    def calculate(self, usage: UsageRecord, *, model: str, response: Any = None, provider: str | None = None) -> CostBreakdown:
         """Return an advisory cost breakdown for a normalized usage record."""
 
         if self.provider_plugin and getattr(self.provider_plugin, "skip_cost_calculation", False):
             return CostBreakdown(pricing_source="skipped", metadata={"reason": "provider_skip_cost_calculation"})
         pricing = self._provider_pricing(model)
+        if pricing:
+            return _calculate_from_pricing(usage, pricing)
+        pricing = self._configured_pricing(provider or usage.provider or _provider_from_model(model), model)
         if pricing:
             return _calculate_from_pricing(usage, pricing)
         if self.use_litellm_fallback:
@@ -95,6 +100,13 @@ class CostCalculator:
         if isinstance(pricing, dict):
             return ModelPricing(**pricing)
         return None
+
+    def _configured_pricing(self, provider: str | None, model: str) -> Optional[ModelPricing]:
+        if not provider:
+            return None
+        from ..config.experimental import get_configured_model_pricing
+
+        return get_configured_model_pricing(provider, _model_without_provider(provider, model), config=self.config, env=self.env)
 
     @staticmethod
     def _litellm_cost(usage: UsageRecord, *, model: str, response: Any = None) -> Optional[CostBreakdown]:
@@ -134,3 +146,12 @@ def _calculate_from_pricing(usage: UsageRecord, pricing: ModelPricing) -> CostBr
         currency=pricing.currency,
         pricing_source=pricing.source,
     )
+
+
+def _provider_from_model(model: str) -> Optional[str]:
+    return model.split("/", 1)[0] if "/" in model else None
+
+
+def _model_without_provider(provider: str, model: str) -> str:
+    prefix = f"{provider}/"
+    return model[len(prefix) :] if model.startswith(prefix) else model
