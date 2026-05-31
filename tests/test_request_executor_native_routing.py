@@ -8,6 +8,10 @@ from rotator_library.client import executor as executor_module
 from rotator_library.client.executor import RequestExecutor, RoutingExecutionError
 from rotator_library.core.types import RequestContext
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
+from rotator_library.providers.antigravity_provider import AntigravityProvider
+from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
+from rotator_library.providers.codex_provider import CodexProvider
+from rotator_library.providers.copilot_provider import CopilotProvider
 from rotator_library.routing import parse_route_target
 
 
@@ -132,6 +136,18 @@ def _context(target=None) -> RequestContext:
     )
 
 
+def _provider_context(provider: str, model: str, kwargs: dict, target=None) -> RequestContext:
+    return RequestContext(
+        model=model,
+        provider=provider,
+        kwargs=kwargs,
+        streaming=False,
+        credentials=["cred"],
+        deadline=9999999999.0,
+        routing_targets=(target,) if target else None,
+    )
+
+
 def _executor(http_client=None) -> RequestExecutor:
     executor = RequestExecutor.__new__(RequestExecutor)
     executor._http_client = http_client or FakeHTTPClient()
@@ -217,6 +233,89 @@ def test_native_context_merges_json_field_cache_rules(monkeypatch, tmp_path) -> 
 
     assert [rule.name for rule in native_context.field_cache_rules] == ["state", "extra"]
     assert native_context.field_cache_rules[0].path == "json.path"
+
+
+@pytest.mark.asyncio
+async def test_claude_code_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_API_BASE", "https://claude-code.test")
+    http_client = SequencedHTTPClient([
+        {"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 1, "output_tokens": 1}}
+    ])
+    provider = ClaudeCodeProvider()
+    target = parse_route_target("claude_code/claude-sonnet-4-5")
+    context = _provider_context(
+        "claude_code",
+        "claude_code/claude-sonnet-4-5",
+        {"model": "claude_code/claude-sonnet-4-5", "messages": [{"role": "developer", "content": "rules"}, {"role": "user", "content": "hi"}]},
+        target,
+    )
+    context.routing_target_index = 0
+
+    response = await _executor(http_client)._execute_provider_request("claude_code", context.model, provider, "secret", "stable", dict(context.kwargs), context)
+
+    assert response["id"] == "msg_1"
+    assert http_client.calls[0]["endpoint"] == "https://claude-code.test/v1/messages"
+    assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
+    assert http_client.calls[0]["json"]["messages"][0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_API_BASE", "https://codex.test")
+    http_client = SequencedHTTPClient([
+        {"id": "resp_1", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}]}
+    ])
+    provider = CodexProvider()
+    target = parse_route_target("codex/gpt-5.1-codex")
+    context = _provider_context("codex", "codex/gpt-5.1-codex", {"model": "codex/gpt-5.1-codex", "messages": [{"role": "user", "content": "hi"}]}, target)
+    context.routing_target_index = 0
+
+    response = await _executor(http_client)._execute_provider_request("codex", context.model, provider, "secret", "stable", dict(context.kwargs), context)
+
+    assert response["id"] == "resp_1"
+    assert http_client.calls[0]["endpoint"] == "https://codex.test/v1/responses"
+    assert http_client.calls[0]["json"]["model"] == "gpt-5.1-codex"
+    assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "text", "text": "hi"}]
+    assert "messages" not in http_client.calls[0]["json"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    monkeypatch.setenv("COPILOT_API_BASE", "https://copilot.test")
+    http_client = SequencedHTTPClient([
+        {"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    ])
+    provider = CopilotProvider()
+    target = parse_route_target("copilot/gpt-4.1")
+    context = _provider_context("copilot", "copilot/gpt-4.1", {"model": "copilot/gpt-4.1", "messages": [{"role": "developer", "content": "rules"}, {"role": "user", "content": "hi"}]}, target)
+    context.routing_target_index = 0
+
+    response = await _executor(http_client)._execute_provider_request("copilot", context.model, provider, "secret", "stable", dict(context.kwargs), context)
+
+    assert response["id"] == "chat_1"
+    assert http_client.calls[0]["endpoint"] == "https://copilot.test/chat/completions"
+    assert http_client.calls[0]["json"]["model"] == "gpt-4.1"
+    assert http_client.calls[0]["json"]["messages"][0]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    monkeypatch.setenv("ANTIGRAVITY_API_BASE", "https://antigravity.test/v1internal")
+    http_client = SequencedHTTPClient([
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 2}}
+    ])
+    provider = AntigravityProvider()
+    target = parse_route_target("antigravity/claude-sonnet-4.5")
+    context = _provider_context("antigravity", "antigravity/claude-sonnet-4.5", {"model": "antigravity/claude-sonnet-4.5", "messages": [{"role": "user", "content": "hi"}]}, target)
+    context.routing_target_index = 0
+
+    response = await _executor(http_client)._execute_provider_request("antigravity", context.model, provider, "secret", "stable", dict(context.kwargs), context)
+
+    assert response["candidates"][0]["content"]["parts"][0]["text"] == "ok"
+    assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:streamGenerateContent?alt=sse"
+    assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
+    assert http_client.calls[0]["json"]["contents"][0]["parts"][0]["text"] == "hi"
+    assert "messages" not in http_client.calls[0]["json"]
 
 
 def test_native_context_raises_on_invalid_field_cache_config(monkeypatch, tmp_path) -> None:

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import Any, List
 
 import httpx
 
@@ -75,6 +75,22 @@ class CodexProvider(ProviderInterface):
 
         return operation == "responses"
 
+    def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
+        """Convert chat-style proxy input into Responses API input.
+
+        Direct `/v1/responses` calls already provide `input`; routed chat calls
+        usually provide `messages`. Converting here keeps the reusable Responses
+        protocol focused on its native shape while still making Codex mock-live
+        through the generic native executor.
+        """
+
+        prepared = dict(request)
+        if model:
+            prepared["model"] = model
+        if "input" not in prepared and isinstance(prepared.get("messages"), list):
+            prepared["input"] = [_message_to_responses_input(message) for message in prepared.pop("messages")]
+        return prepared
+
     def get_native_endpoint(self, model: str = "", operation: str = "responses") -> str:
         """Return the native Codex endpoint for an operation."""
 
@@ -86,3 +102,11 @@ class CodexProvider(ProviderInterface):
         if model.startswith("codex/"):
             return model
         return f"codex/{model}"
+
+
+def _message_to_responses_input(message: Any) -> dict[str, Any]:
+    """Return a minimal Responses input item from an OpenAI-style message."""
+
+    if not isinstance(message, dict):
+        return {"role": "user", "content": str(message)}
+    return {"role": message.get("role", "user"), "content": message.get("content", "")}

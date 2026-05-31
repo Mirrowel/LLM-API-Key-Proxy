@@ -74,6 +74,23 @@ def test_antigravity_native_operation_model_and_stream_support() -> None:
     assert provider.prepare_native_request({"model": "antigravity/gemini-3-pro-low"}, model="gemini-3-pro-preview", operation="generate")["model"] == "gemini-3-pro-preview"
 
 
+def test_antigravity_prepare_native_request_converts_messages_to_gemini_contents() -> None:
+    provider = AntigravityProvider()
+
+    prepared = provider.prepare_native_request(
+        {"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]},
+        model="gemini-3-flash",
+        operation="generate",
+    )
+
+    assert prepared["model"] == "gemini-3-flash"
+    assert prepared["contents"] == [
+        {"role": "user", "parts": [{"text": "hello"}]},
+        {"role": "model", "parts": [{"text": "hi"}]},
+    ]
+    assert "messages" not in prepared
+
+
 @pytest.mark.asyncio
 async def test_antigravity_get_models_filters_and_aliases_mocked_response(monkeypatch) -> None:
     monkeypatch.setenv("ANTIGRAVITY_API_BASE", "https://antigravity.test/v1internal")
