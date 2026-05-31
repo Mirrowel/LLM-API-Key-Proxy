@@ -62,5 +62,6 @@ def test_policy_normalizes_user_facing_aliases() -> None:
     assert normalize_route_error_type("auth") == "authentication"
     assert normalize_route_error_type("permission-denied") == "forbidden"
     assert normalize_route_error_type("bad request") == "invalid_request"
+    assert normalize_route_error_type("context_length_exceeded") == "context_window_exceeded"
     assert FallbackPolicy().should_fallback("network") is True
     assert FallbackPolicy().should_fallback("validation") is False
