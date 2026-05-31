@@ -23,7 +23,7 @@ from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
 _KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
-_SECRET_KEY_PARTS = ("api_key", "authorization", "access_token", "refresh_token", "client_secret", "bearer_token", "password")
+_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "password")
 
 
 class ExperimentalConfigError(ValueError):
@@ -195,14 +195,14 @@ def get_retry_runtime_settings(
     cooldown = retry.get("provider_cooldown", {}) if isinstance(retry.get("provider_cooldown"), dict) else retry
     backoff = retry.get("backoff", {}) if isinstance(retry.get("backoff"), dict) else retry
     return RetryRuntimeSettings(
-        provider_cooldown_min_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_COOLDOWN_MIN_SECONDS", cooldown, "provider_cooldown_min_seconds", default=10), name="PROVIDER_COOLDOWN_MIN_SECONDS")),
-        provider_cooldown_default_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_COOLDOWN_DEFAULT_SECONDS", cooldown, "provider_cooldown_default_seconds", default=30), name="PROVIDER_COOLDOWN_DEFAULT_SECONDS")),
-        provider_cooldown_on_quota=as_bool(_env_or_json(source, "PROVIDER_COOLDOWN_ON_QUOTA", cooldown, "provider_cooldown_on_quota", default=False), name="PROVIDER_COOLDOWN_ON_QUOTA"),
-        provider_backoff_window_seconds=max(0, as_int(_env_or_json(source, "PROVIDER_BACKOFF_WINDOW_SECONDS", backoff, "provider_backoff_window_seconds", default=60), name="PROVIDER_BACKOFF_WINDOW_SECONDS")),
-        provider_backoff_threshold=max(1, as_int(_env_or_json(source, "PROVIDER_BACKOFF_THRESHOLD", backoff, "provider_backoff_threshold", default=3), name="PROVIDER_BACKOFF_THRESHOLD")),
-        provider_backoff_base_seconds=_optional_positive_int(_env_or_json(source, "PROVIDER_BACKOFF_BASE_SECONDS", backoff, "provider_backoff_base_seconds"), "PROVIDER_BACKOFF_BASE_SECONDS"),
-        provider_backoff_max_seconds=max(1, as_int(_env_or_json(source, "PROVIDER_BACKOFF_MAX_SECONDS", backoff, "provider_backoff_max_seconds", default=300), name="PROVIDER_BACKOFF_MAX_SECONDS")),
-        failure_history_max_entries=max(1, as_int(_env_or_json(source, "FAILURE_HISTORY_MAX_ENTRIES", backoff, "failure_history_max_entries", default=200), name="FAILURE_HISTORY_MAX_ENTRIES")),
+        provider_cooldown_min_seconds=max(0, _int_setting(source, "PROVIDER_COOLDOWN_MIN_SECONDS", cooldown, "provider_cooldown_min_seconds", 10)),
+        provider_cooldown_default_seconds=max(0, _int_setting(source, "PROVIDER_COOLDOWN_DEFAULT_SECONDS", cooldown, "provider_cooldown_default_seconds", 30)),
+        provider_cooldown_on_quota=_bool_setting(source, "PROVIDER_COOLDOWN_ON_QUOTA", cooldown, "provider_cooldown_on_quota", False),
+        provider_backoff_window_seconds=max(0, _int_setting(source, "PROVIDER_BACKOFF_WINDOW_SECONDS", backoff, "provider_backoff_window_seconds", 60)),
+        provider_backoff_threshold=max(1, _int_setting(source, "PROVIDER_BACKOFF_THRESHOLD", backoff, "provider_backoff_threshold", 3)),
+        provider_backoff_base_seconds=_optional_int_setting(source, "PROVIDER_BACKOFF_BASE_SECONDS", backoff, "provider_backoff_base_seconds"),
+        provider_backoff_max_seconds=max(1, _int_setting(source, "PROVIDER_BACKOFF_MAX_SECONDS", backoff, "provider_backoff_max_seconds", 300)),
+        failure_history_max_entries=max(1, _int_setting(source, "FAILURE_HISTORY_MAX_ENTRIES", backoff, "failure_history_max_entries", 200)),
     )
 
 
@@ -240,7 +240,7 @@ def parse_field_cache_rules(config: ExperimentalConfig, provider: str, model: st
 
     provider_rules = config.field_cache.get(provider, {}) if isinstance(config.field_cache, dict) else {}
     if not isinstance(provider_rules, dict):
-        return ()
+        raise ExperimentalConfigError("field_cache provider section must be an object")
     raw_rules: list[Any] = []
     keys = ["*"]
     if "/" in model:
@@ -250,7 +250,14 @@ def parse_field_cache_rules(config: ExperimentalConfig, provider: str, model: st
         value = provider_rules.get(key, [])
         if isinstance(value, list):
             raw_rules.extend(value)
-    return tuple(_field_cache_rule_from_dict(rule) for rule in raw_rules if isinstance(rule, dict))
+        elif value not in (None, []):
+            raise ExperimentalConfigError("field_cache model rules must be a list")
+    parsed_rules = []
+    for rule in raw_rules:
+        if not isinstance(rule, dict):
+            raise ExperimentalConfigError("field_cache rule entries must be objects")
+        parsed_rules.append(_field_cache_rule_from_dict(rule))
+    return tuple(parsed_rules)
 
 
 def as_bool(value: Any, *, name: str) -> bool:
@@ -314,7 +321,9 @@ def _reject_secret_keys(value: Any, path: str = "config") -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
             key_text = str(key).lower()
-            if any(part in key_text for part in _SECRET_KEY_PARTS):
+            compact_key = re.sub(r"[^a-z0-9]+", "", key_text)
+            underscored_key = re.sub(r"[^a-z0-9]+", "_", key_text)
+            if any(part in key_text or part in compact_key or part in underscored_key for part in _SECRET_KEY_PARTS):
                 raise ExperimentalConfigError(f"Unsafe secret-like key in JSON config at {path}.{key}")
             _reject_secret_keys(nested, f"{path}.{key}")
     elif isinstance(value, list):
@@ -352,6 +361,34 @@ def _env_or_json(env: Mapping[str, str], env_key: str, data: Mapping[str, Any], 
     if env_key in env:
         return env[env_key]
     return data.get(json_key, default)
+
+
+def _int_setting(env: Mapping[str, str], env_key: str, data: Mapping[str, Any], json_key: str, default: int) -> int:
+    if env_key in env:
+        try:
+            return int(env.get(env_key) or default)
+        except (TypeError, ValueError):
+            return default
+    return as_int(data.get(json_key, default), name=env_key)
+
+
+def _optional_int_setting(env: Mapping[str, str], env_key: str, data: Mapping[str, Any], json_key: str) -> Optional[int]:
+    if env_key in env:
+        try:
+            parsed = int(env.get(env_key) or 0)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+    return _optional_positive_int(data.get(json_key), env_key)
+
+
+def _bool_setting(env: Mapping[str, str], env_key: str, data: Mapping[str, Any], json_key: str, default: bool) -> bool:
+    if env_key in env:
+        try:
+            return as_bool(env.get(env_key), name=env_key)
+        except ExperimentalConfigError:
+            return default
+    return as_bool(data.get(json_key, default), name=env_key)
 
 
 def _optional_positive_float(value: Any, name: str) -> Optional[float]:
