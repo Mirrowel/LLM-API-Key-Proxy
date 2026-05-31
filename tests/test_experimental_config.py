@@ -86,6 +86,23 @@ def test_field_cache_rules_match_unprefixed_model_alias() -> None:
     assert [rule.name for rule in rules] == ["signature"]
 
 
+def test_field_cache_rule_rejects_invalid_config_values() -> None:
+    config = load_config_from_mapping(
+        {
+            "field_cache": {
+                "provider": {
+                    "*": [
+                        {"name": "bad_source", "source": "not_a_source", "path": "x"},
+                    ]
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="Unsupported field-cache source"):
+        parse_field_cache_rules(config, "provider", "model")
+
+
 def test_env_price_key_sanitizes_provider_and_model() -> None:
     assert env_price_key("openai", "gpt-5.1-mini", "cache_read") == "MODEL_PRICE_OPENAI_GPT_5_1_MINI_CACHE_READ"
 

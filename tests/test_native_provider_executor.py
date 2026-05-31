@@ -131,6 +131,42 @@ async def test_native_provider_default_field_cache_persists_across_requests() ->
 
 
 @pytest.mark.asyncio
+async def test_native_provider_trace_redacts_configured_injection_paths(tmp_path) -> None:
+    logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
+    rule = FieldCacheRule(
+        name="state",
+        source="response",
+        path="choices.0.message.reasoning_content",
+        inject=FieldCacheInjection(target="request", path="metadata.state"),
+        allow_missing_session=True,
+    )
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        field_cache_rules=(rule,),
+        transaction_logger=logger,
+    )
+    executor = NativeProviderExecutor()
+
+    await executor.execute(
+        {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        context,
+        NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "opaque-state"}}]})),
+    )
+    await executor.execute(
+        {"model": "gpt-test", "messages": [{"role": "user", "content": "again"}]},
+        context,
+        NativeHTTPTransport(FakeHTTPClient({"id": "chat_2", "choices": [{"message": {"role": "assistant", "content": "ok"}}]})),
+    )
+
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "opaque-state" not in trace_text
+    assert '"state": "[REDACTED]"' in trace_text
+
+
+@pytest.mark.asyncio
 async def test_native_provider_executor_logs_transform_errors(tmp_path) -> None:
     logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
     context = NativeProviderContext(

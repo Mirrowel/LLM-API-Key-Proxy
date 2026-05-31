@@ -21,6 +21,9 @@ FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn",
 FieldCacheScope = Literal["provider", "model", "credential", "session", "conversation", "classifier"]
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "classifier", "session")
+_VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
+_VALID_TARGETS = {"request", "unified_request", "metadata"}
+_VALID_SCOPES = {"provider", "model", "credential", "session", "conversation", "classifier"}
 
 
 @dataclass(frozen=True)
@@ -59,8 +62,15 @@ class FieldCacheRule:
             raise ValueError("FieldCacheRule.name must be non-empty and filesystem-safe")
         if self.mode not in {"last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"}:
             raise ValueError(f"Unsupported field-cache mode: {self.mode}")
+        if self.source not in _VALID_SOURCES:
+            raise ValueError(f"Unsupported field-cache source: {self.source}")
+        if self.inject and self.inject.target not in _VALID_TARGETS:
+            raise ValueError(f"Unsupported field-cache injection target: {self.inject.target}")
         if not self.scope:
             raise ValueError("FieldCacheRule.scope must contain at least one dimension")
+        invalid_scopes = [scope for scope in self.scope if scope not in _VALID_SCOPES]
+        if invalid_scopes:
+            raise ValueError(f"Unsupported field-cache scope: {invalid_scopes[0]}")
 
 
 @dataclass(frozen=True)

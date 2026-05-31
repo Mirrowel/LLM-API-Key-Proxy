@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
+from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import get_protocol
+from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from .context import NativeProviderContext
 from .http import NativeHTTPTransport
@@ -162,7 +165,7 @@ class NativeProviderExecutor:
             return
         context.transaction_logger.log_transform_pass(
             pass_name,
-            data,
+            _redact_field_cache_paths(data, context, direction),
             direction=direction,
             stage=stage,
             protocol=context.protocol_name,
@@ -178,3 +181,65 @@ class NativeProviderExecutor:
             },
             snapshot=snapshot,
         )
+
+
+def _redact_field_cache_paths(data: Any, context: NativeProviderContext, direction: str) -> Any:
+    """Redact configured cache paths before broad native payload traces.
+
+    Field-cache rules can inject opaque state under arbitrary configured keys,
+    so key-based trace redaction is not enough. Native traces apply the active
+    rules' source and injection paths to a copy before handing data to the normal
+    transaction trace sanitizer.
+    """
+
+    if not context.field_cache_rules:
+        return data
+    redacted = deepcopy(data)
+    for rule in context.field_cache_rules:
+        paths: list[str] = []
+        if direction == "request" and rule.inject:
+            paths.append(rule.inject.path)
+        if direction in {"response", "stream"}:
+            paths.append(rule.path)
+        for path in paths:
+            try:
+                _redact_path(redacted, parse_path(path))
+            except (FieldCachePathError, TypeError, ValueError):
+                continue
+    return redacted
+
+
+def _redact_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    if not tokens:
+        return
+    token = tokens[0]
+    rest = tokens[1:]
+    if token.kind == "key":
+        if isinstance(value, dict) and token.value in value:
+            if rest:
+                _redact_path(value[token.value], rest)
+            else:
+                value[token.value] = REDACTED
+        return
+    if token.kind == "index":
+        if isinstance(value, list) and value:
+            index = int(token.value)
+            if -len(value) <= index < len(value):
+                if rest:
+                    _redact_path(value[index], rest)
+                else:
+                    value[index] = REDACTED
+        return
+    if token.kind == "wildcard":
+        if isinstance(value, dict):
+            for key in list(value.keys()):
+                if rest:
+                    _redact_path(value[key], rest)
+                else:
+                    value[key] = REDACTED
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if rest:
+                    _redact_path(item, rest)
+                else:
+                    value[index] = REDACTED
