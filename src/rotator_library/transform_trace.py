@@ -50,6 +50,18 @@ _SENSITIVE_KEYS = frozenset(
         "thought-signature",
         "thoughtsignature",
         "signature",
+        "state",
+        "provider-state",
+        "provider-session-id",
+        "providersessionid",
+        "prompt-cache-key",
+        "promptcachekey",
+        "cache-key",
+        "cachekey",
+        "thinking-signatures",
+        "thinkingsignatures",
+        "thought-signatures",
+        "thoughtsignatures",
     }
 )
 
