@@ -124,6 +124,28 @@ async def test_stream_wrapper_records_error_events(tmp_path) -> None:
     assert "stream_done_event" in pass_names
 
 
+def test_executor_terminal_stream_errors_are_traced(tmp_path) -> None:
+    class Context:
+        pass
+
+    context = Context()
+    context.transaction_logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+    context.streaming = True
+    context.provider = "openai"
+    context.model = "openai/gpt-test"
+    context.session_id = None
+    context.usage_manager_key = "openai"
+    context.classifier = None
+
+    executor = RequestExecutor.__new__(RequestExecutor)
+
+    lines = executor._terminal_stream_error_lines(context, {"error": {"type": "proxy_error"}})
+
+    assert lines[-1] == "data: [DONE]\n\n"
+    pass_names = [entry["pass_name"] for entry in _trace_entries(context.transaction_logger.log_dir)]
+    assert pass_names == ["stream_error_event", "stream_done_event"]
+
+
 def test_transaction_logger_disabled_writes_no_trace(tmp_path) -> None:
     logger = TransactionLogger("openai", "openai/gpt-test", enabled=False, parent_dir=tmp_path)
 
@@ -211,3 +233,27 @@ async def test_provider_transforms_trace_each_live_boundary(tmp_path) -> None:
     assert all(entry["credential_id"] == "stable_cred" for entry in entries)
     assert entries[1]["metadata"]["transform_provider"] == "dedaluslabs"
     assert entries[-1]["changed_from_previous"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_transforms_do_not_deepcopy_for_trace_when_disabled() -> None:
+    class NoCopyValue:
+        def __deepcopy__(self, memo):
+            raise AssertionError("trace comparison should not copy when tracing is disabled")
+
+    class HookPlugin:
+        async def transform_request(self, kwargs, model, credential):
+            kwargs["hooked"] = True
+            return ["hooked request"]
+
+    transforms = ProviderTransforms({"dedaluslabs": HookPlugin()})
+
+    result = await transforms.apply(
+        "dedaluslabs",
+        "dedaluslabs/test",
+        "secret-credential",
+        {"model": "dedaluslabs/test", "tool_choice": "auto", "opaque": NoCopyValue()},
+    )
+
+    assert "tool_choice" not in result
+    assert result["hooked"] is True

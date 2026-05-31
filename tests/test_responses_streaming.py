@@ -22,10 +22,15 @@ class FakeStreamingClient:
 
 
 class FailingStreamingClient:
+    def __init__(self, message: str = "stream exploded") -> None:
+        self.message = message
+
     async def acompletion(self, **kwargs):
+        message = self.message
+
         async def chunks():
             yield 'data: {"choices":[{"delta":{"content":"before"}}]}\n\n'
-            raise RuntimeError("stream exploded")
+            raise RuntimeError(message)
 
         return chunks()
 
@@ -56,14 +61,18 @@ async def test_stream_response_emits_responses_sse_events_and_stores_final_respo
 
 
 @pytest.mark.asyncio
-async def test_stream_response_store_false_does_not_persist() -> None:
+async def test_stream_response_store_false_does_not_persist(tmp_path) -> None:
     store = InMemoryResponsesStore()
     service = ResponsesService(store=store)
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
 
-    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True, "store": False}, FakeStreamingClient())]
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True, "store": False}, FakeStreamingClient(), transaction_logger=logger)]
 
     response_id = events[0].split('"id": "')[1].split('"')[0]
     assert await store.get(response_id) is None
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "responses_store_skipped" in trace_text
+    assert "responses_stored_stream_response" not in trace_text
 
 
 @pytest.mark.asyncio
@@ -76,6 +85,25 @@ async def test_stream_response_errors_emit_failed_event() -> None:
     assert "event: response.failed" in event_text
     assert "stream exploded" in event_text
     assert event_text.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_stream_response_failure_trace_scrubs_header_like_secret_text(tmp_path) -> None:
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    _ = [
+        chunk
+        async for chunk in service.stream_response(
+            {"model": "gpt-test", "input": "Hello", "stream": True},
+            FailingStreamingClient("Authorization: Bearer secret-token"),
+            transaction_logger=logger,
+        )
+    ]
+
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "secret-token" not in trace_text
+    assert "[REDACTED]" in trace_text
 
 
 def test_transport_formatters_expose_sse_and_websocket_seam() -> None:

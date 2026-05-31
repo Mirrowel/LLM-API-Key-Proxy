@@ -199,7 +199,7 @@ class FieldCacheEngine:
             return
         transaction_logger.log_transform_pass(
             pass_name,
-            payload,
+            _payload_shape(payload),
             direction=_trace_direction(pass_name, rule.source, extra_metadata),
             stage="adapter",
             metadata={
@@ -214,7 +214,10 @@ class FieldCacheEngine:
                 "hit": operation.hit,
                 "skipped": operation.skipped,
                 "reason": operation.reason,
-                "sample_values": operation.sample_values[:3],
+                # Cached fields can include provider signatures or session keys.
+                # Trace only shape/count metadata; keep raw samples out of logs.
+                "sample_value_count": len(operation.sample_values),
+                "sample_value_types": [type(value).__name__ for value in operation.sample_values[:3]],
                 **extra_metadata,
             },
             snapshot=rule.source != "stream_event",
@@ -237,8 +240,8 @@ class FieldCacheEngine:
             return
         transaction_logger.log_transform_pass(
             pass_name,
-            payload,
-            direction="request" if target else "response" if source == "response" else "stream" if source == "stream_event" else "metadata",
+            _payload_shape(payload),
+            direction="request" if target or source == "request" else "response" if source == "response" else "stream" if source == "stream_event" else "metadata",
             stage="adapter",
             metadata={
                 "source": source,
@@ -294,3 +297,18 @@ def _sample_values(values: list[Any], *, max_items: int = 3, max_text: int = 500
         else:
             samples.append(value)
     return samples
+
+
+def _payload_shape(payload: Any) -> dict[str, Any]:
+    """Return non-sensitive payload shape metadata for cache traces.
+
+    Cache rules often target provider signatures, session IDs, and other opaque
+    state. Logging full payloads would expose exactly the fields the cache is
+    designed to preserve, so field-cache traces record structure only.
+    """
+
+    if isinstance(payload, dict):
+        return {"payload_type": "dict", "keys": sorted(str(key) for key in payload.keys())[:20]}
+    if isinstance(payload, list):
+        return {"payload_type": "list", "length": len(payload)}
+    return {"payload_type": type(payload).__name__}

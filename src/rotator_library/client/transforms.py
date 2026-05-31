@@ -118,7 +118,7 @@ class ProviderTransforms:
             # Check if transform applies (provider match or model contains pattern)
             if transform_provider == provider or transform_provider in model.lower():
                 for transform in transforms:
-                    before = deepcopy(kwargs)
+                    before = deepcopy(kwargs) if transaction_logger else None
                     result = transform(kwargs, model, provider)
                     if result:
                         modifications.append(result)
@@ -130,7 +130,7 @@ class ProviderTransforms:
                             model=model,
                             credential_id=credential_id,
                             transport=transport,
-                            changed_from_previous=before != kwargs,
+                            changed_from_previous=(before != kwargs) if before is not None else None,
                             metadata={
                                 "transform_provider": transform_provider,
                                 "transform_name": getattr(transform, "__name__", repr(transform)),
@@ -143,11 +143,11 @@ class ProviderTransforms:
         plugin = self._get_plugin_instance(provider)
         if plugin and hasattr(plugin, "transform_request"):
             try:
-                before = deepcopy(kwargs)
+                before = deepcopy(kwargs) if transaction_logger else None
                 hook_result = await plugin.transform_request(kwargs, model, credential)
                 if hook_result:
                     modifications.extend(hook_result)
-                if hook_result or before != kwargs:
+                if hook_result or (before is not None and before != kwargs):
                     _trace_transform_pass(
                         transaction_logger,
                         "after_provider_hook_transform",
@@ -156,7 +156,7 @@ class ProviderTransforms:
                         model=model,
                         credential_id=credential_id,
                         transport=transport,
-                        changed_from_previous=before != kwargs,
+                        changed_from_previous=(before != kwargs) if before is not None else None,
                         metadata={"modifications": hook_result or [], **trace_metadata},
                     )
             except Exception as e:
@@ -167,14 +167,15 @@ class ProviderTransforms:
                         e,
                         payload=kwargs,
                         stage="client",
-                        metadata={"provider": provider, "model": model, **trace_metadata},
+                        transport=transport,
+                        metadata={"provider": provider, "model": model, "credential_id": credential_id, **trace_metadata},
                     )
 
         # 3. Apply model-specific options from provider
         if plugin and hasattr(plugin, "get_model_options"):
             model_options = plugin.get_model_options(model)
             if model_options:
-                before = deepcopy(kwargs)
+                before = deepcopy(kwargs) if transaction_logger else None
                 for key, value in model_options.items():
                     if key == "reasoning_effort":
                         kwargs["reasoning_effort"] = value
@@ -189,13 +190,13 @@ class ProviderTransforms:
                     model=model,
                     credential_id=credential_id,
                     transport=transport,
-                    changed_from_previous=before != kwargs,
+                    changed_from_previous=(before != kwargs) if before is not None else None,
                     metadata={"model_options": deepcopy(model_options), **trace_metadata},
                 )
 
         # 4. Apply LiteLLM conversion if config available
         if self._config and hasattr(self._config, "convert_for_litellm"):
-            before = deepcopy(kwargs)
+            before = deepcopy(kwargs) if transaction_logger else None
             _trace_transform_pass(
                 transaction_logger,
                 "before_litellm_conversion",
@@ -218,7 +219,7 @@ class ProviderTransforms:
                 model=model,
                 credential_id=credential_id,
                 transport=transport,
-                changed_from_previous=before != kwargs,
+                changed_from_previous=(before != kwargs) if before is not None else None,
                 metadata={"provider_config_override": bool(provider_config_override), **trace_metadata},
             )
 

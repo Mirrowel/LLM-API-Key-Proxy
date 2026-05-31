@@ -405,15 +405,48 @@ class RequestExecutor:
             },
         )
 
-        # Sanitize request payload
+        # Sanitize request payload. Some provider compatibility fields are
+        # intentionally removed here, so record it as its own transform pass.
+        before_sanitize = deepcopy(kwargs) if context.transaction_logger else None
         kwargs = sanitize_request_payload(kwargs, model)
+        self._log_executor_trace(
+            context,
+            "after_request_sanitization",
+            kwargs,
+            direction="request",
+            stage="client",
+            credential_id=credential_id,
+            changed_from_previous=(before_sanitize != kwargs) if before_sanitize is not None else None,
+            metadata={"provider": provider, "model": model},
+        )
 
         # Apply provider-specific LiteLLM params
+        before_params = deepcopy(kwargs) if context.transaction_logger else None
         self._apply_litellm_provider_params(provider, kwargs)
+        self._log_executor_trace(
+            context,
+            "after_litellm_provider_params",
+            kwargs,
+            direction="request",
+            stage="client",
+            credential_id=credential_id,
+            changed_from_previous=(before_params != kwargs) if before_params is not None else None,
+            metadata={"provider": provider, "model": model},
+        )
 
         # Add transaction context for provider logging
         if context.transaction_logger:
             kwargs["transaction_context"] = context.transaction_logger.get_context()
+            self._log_executor_trace(
+                context,
+                "after_transaction_context_attached",
+                kwargs,
+                direction="request",
+                stage="client",
+                credential_id=credential_id,
+                changed_from_previous=True,
+                metadata={"provider": provider, "model": model},
+            )
 
         return kwargs
 
@@ -497,9 +530,9 @@ class RequestExecutor:
         """
         if context.pre_request_callback:
             try:
-                before = deepcopy(kwargs)
+                before = deepcopy(kwargs) if context.transaction_logger else None
                 await context.pre_request_callback(context.request, kwargs)
-                if before != kwargs:
+                if before is not None and before != kwargs:
                     self._log_executor_trace(
                         context,
                         "after_pre_request_callback",
@@ -530,7 +563,7 @@ class RequestExecutor:
         execution = target.execution if target else "auto"
         self._log_executor_trace(
             context,
-            "provider_execution_request",
+            "pre_provider_execution_request",
             kwargs,
             direction="request",
             stage="provider",
@@ -543,12 +576,21 @@ class RequestExecutor:
                 "routing_litellm_fallback",
                 _target_trace(target) if target else {"provider": provider, "model": model},
             )
-            return await self._execute_litellm_request(kwargs, credential_secret)
+            return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
 
         if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
             if not plugin or not plugin.has_custom_logic():
                 raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
             kwargs["credential_identifier"] = credential_secret
+            self._log_executor_trace(
+                context,
+                "provider_execution_request",
+                kwargs,
+                direction="request",
+                stage="provider",
+                credential_id=credential_id,
+                metadata={"execution": "custom", "provider": provider, "model": model},
+            )
             return await plugin.acompletion(self._http_client, **kwargs)
 
         if execution == "native" or (execution == "auto" and _provider_native_protocol(plugin, model, target)):
@@ -569,14 +611,31 @@ class RequestExecutor:
             )
             return await NativeProviderExecutor().execute(dict(kwargs), native_context, NativeHTTPTransport(self._http_client))
 
-        return await self._execute_litellm_request(kwargs, credential_secret)
+        return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
 
-    async def _execute_litellm_request(self, kwargs: Dict[str, Any], credential_secret: str) -> Any:
+    async def _execute_litellm_request(
+        self,
+        kwargs: Dict[str, Any],
+        credential_secret: str,
+        *,
+        context: Optional[RequestContext] = None,
+        credential_id: Optional[str] = None,
+    ) -> Any:
         """Execute the existing LiteLLM request path."""
 
         kwargs["api_key"] = credential_secret
         self._apply_litellm_logger(kwargs)
         kwargs.pop("transaction_context", None)
+        if context:
+            self._log_executor_trace(
+                context,
+                "provider_execution_request",
+                kwargs,
+                direction="request",
+                stage="provider",
+                credential_id=credential_id,
+                metadata={"execution": "litellm", "provider": context.provider, "model": context.model},
+            )
         return await litellm.acompletion(**kwargs)
 
     def _build_native_provider_context(
@@ -843,6 +902,29 @@ class RequestExecutor:
             },
             snapshot=snapshot,
         )
+
+    def _terminal_stream_error_lines(self, context: RequestContext, error_data: Dict[str, Any]) -> Tuple[str, str]:
+        """Return executor-created terminal SSE lines and trace them first."""
+
+        error_line = f"data: {json.dumps(error_data)}\n\n"
+        done_line = "data: [DONE]\n\n"
+        self._log_executor_trace(
+            context,
+            "stream_error_event",
+            error_data,
+            direction="stream",
+            stage="client",
+            snapshot=False,
+        )
+        self._log_executor_trace(
+            context,
+            "stream_done_event",
+            {"raw": done_line},
+            direction="stream",
+            stage="final",
+            snapshot=False,
+        )
+        return error_line, done_line
 
     async def _prepare_execution(
         self,
@@ -1130,8 +1212,8 @@ class RequestExecutor:
                     "type": "proxy_error",
                 }
             }
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data):
+                yield line
             return
 
         error_accumulator = RequestErrorAccumulator()
@@ -1353,8 +1435,8 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
+                                            for line in self._terminal_stream_error_lines(context, error_data):
+                                                yield line
                                             return
                                     else:
                                         retry_state.reset_quota_failures()
@@ -1374,8 +1456,8 @@ class RequestExecutor:
                                                 "type": classified.error_type,
                                             }
                                         }
-                                        yield f"data: {json.dumps(error_data)}\n\n"
-                                        yield "data: [DONE]\n\n"
+                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                            yield line
                                         return
 
                                     small_cooldown_threshold = int(
@@ -1444,8 +1526,8 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
+                                            for line in self._terminal_stream_error_lines(context, error_data):
+                                                yield line
                                             return
                                     else:
                                         retry_state.reset_quota_failures()
@@ -1599,20 +1681,20 @@ class RequestExecutor:
             # All credentials exhausted or timeout
             error_accumulator.timeout_occurred = time.time() >= deadline
             error_data = error_accumulator.build_client_error_response()
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data):
+                yield line
 
         except NoAvailableKeysError as e:
             lib_logger.error(f"No keys available: {e}")
             error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data):
+                yield line
 
         except Exception as e:
             lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
             error_data = {"error": {"message": str(e), "type": "proxy_internal_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data):
+                yield line
 
     def _apply_litellm_provider_params(
         self, provider: str, kwargs: Dict[str, Any]
