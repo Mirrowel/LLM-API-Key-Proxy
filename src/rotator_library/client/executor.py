@@ -620,6 +620,7 @@ class RequestExecutor:
             return await self._execute_non_streaming(context)
         policy = FallbackPolicy()
         last_failure: Any = None
+        target_failures: List[Dict[str, Any]] = []
         self._log_routing_trace(
             context,
             "routing_decision",
@@ -653,8 +654,9 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
                 )
+                target_failures.append(_target_failure_summary(target, error_type, str(exc)))
                 if index >= len(targets) - 1 or not policy.should_fallback(error_type, group=context.routing_group):
-                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
                     raise
                 self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                 continue
@@ -668,11 +670,12 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type},
                 )
+                target_failures.append(_target_failure_summary(target, error_type, _route_error_message_from_response(result)))
                 if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group):
                     self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                     continue
-                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
-                return result
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
+                return _with_fallback_summary(result, target_failures)
 
             self._log_routing_trace(
                 context,
@@ -1982,6 +1985,43 @@ def _route_error_type_from_response(response: Any) -> Optional[str]:
     if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
         return "rate_limit"
     return None
+
+
+def _route_error_message_from_response(response: Any) -> str:
+    """Extract a short non-secret message from a structured proxy error."""
+
+    if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return ""
+    message = str(response["error"].get("message", ""))
+    return message[:150]
+
+
+def _target_failure_summary(target: RouteTarget, error_type: str, message: str = "") -> Dict[str, Any]:
+    """Return a client-safe fallback target failure summary."""
+
+    return {
+        "target": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "error_type": error_type,
+        # Provider error text can contain raw upstream payload fragments or
+        # credential-like identifiers. Keep the cross-target summary structural;
+        # detailed per-credential errors remain in the existing sanitized error
+        # accumulator.
+        "message": "",
+    }
+
+
+def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]]) -> Any:
+    """Attach fallback target summaries to a structured error response."""
+
+    if not target_failures or not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return response
+    details = response["error"].setdefault("details", {})
+    if isinstance(details, dict):
+        details["fallback_targets"] = list(target_failures)
+    return response
 
 
 def _stream_chunk_is_visible_output(chunk: str) -> bool:
