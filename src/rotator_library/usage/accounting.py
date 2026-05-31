@@ -36,6 +36,9 @@ class UsageRecord:
     source: str = "unknown"
     provider: Optional[str] = None
     model: Optional[str] = None
+    provider_reported_cost: Optional[float] = None
+    cost_currency: str = "USD"
+    cost_source: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -74,6 +77,9 @@ class UsageRecord:
             "source": self.source,
             "provider": self.provider,
             "model": self.model,
+            "provider_reported_cost": self.provider_reported_cost,
+            "cost_currency": self.cost_currency,
+            "cost_source": self.cost_source,
             "metadata": serialize_value(self.metadata),
         }
 
@@ -115,6 +121,9 @@ def _unwrap_usage(value: Any) -> Any:
 def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
+    if hasattr(value, "to_dict"):
+        dumped = value.to_dict()
+        return dumped if isinstance(dumped, dict) else {}
     if hasattr(value, "model_dump"):
         dumped = value.model_dump()
         return dumped if isinstance(dumped, dict) else {}
@@ -141,6 +150,12 @@ def _as_dict(value: Any) -> dict[str, Any]:
         "cache_write_tokens",
         "reasoning_tokens",
         "thinking_tokens",
+        "cost",
+        "cost_details",
+        "costMetadata",
+        "provider_reported_cost",
+        "total_cost",
+        "currency",
     ):
         if hasattr(value, key):
             result[key] = getattr(value, key)
@@ -175,6 +190,7 @@ def _from_openai_like_usage(data: dict[str, Any], *, provider: Optional[str], mo
     if reasoning and completion_tokens >= reasoning:
         completion_tokens -= reasoning
     input_tokens = max(0, prompt_tokens - cache_read)
+    cost = _extract_cost(data)
     return UsageRecord(
         input_tokens=input_tokens,
         completion_tokens=completion_tokens,
@@ -185,6 +201,9 @@ def _from_openai_like_usage(data: dict[str, Any], *, provider: Optional[str], mo
         source=source,
         provider=provider,
         model=model,
+        provider_reported_cost=cost[0],
+        cost_currency=cost[1],
+        cost_source=cost[2],
         metadata={"shape": "openai_like"},
     )
 
@@ -197,6 +216,7 @@ def _from_anthropic_usage(data: dict[str, Any], *, provider: Optional[str], mode
     reasoning = _int(data.get("reasoning_tokens", data.get("thinking_tokens", 0)))
     if reasoning and output_tokens >= reasoning:
         output_tokens -= reasoning
+    cost = _extract_cost(data)
     return UsageRecord(
         input_tokens=input_tokens,
         completion_tokens=output_tokens,
@@ -207,6 +227,9 @@ def _from_anthropic_usage(data: dict[str, Any], *, provider: Optional[str], mode
         source=source,
         provider=provider,
         model=model,
+        provider_reported_cost=cost[0],
+        cost_currency=cost[1],
+        cost_source=cost[2],
         metadata={"shape": "anthropic"},
     )
 
@@ -218,6 +241,7 @@ def _from_gemini_usage(data: dict[str, Any], *, provider: Optional[str], model: 
     completion = _int(data.get("candidatesTokenCount", data.get("completion_tokens", 0)))
     if reasoning and completion >= reasoning:
         completion -= reasoning
+    cost = _extract_cost(data)
     return UsageRecord(
         input_tokens=max(0, prompt_tokens - cache_read),
         completion_tokens=completion,
@@ -227,8 +251,36 @@ def _from_gemini_usage(data: dict[str, Any], *, provider: Optional[str], model: 
         source=source,
         provider=provider,
         model=model,
+        provider_reported_cost=cost[0],
+        cost_currency=cost[1],
+        cost_source=cost[2],
         metadata={"shape": "gemini"},
     )
+
+
+def _extract_cost(data: dict[str, Any]) -> tuple[Optional[float], str, Optional[str]]:
+    """Extract actual provider-reported cost without guessing prices.
+
+    Advisory pricing belongs in `usage.costs`. This helper only preserves cost
+    values explicitly reported by a provider or protocol adapter.
+    """
+
+    cost_payload = _as_dict(data.get("cost") or data.get("cost_details") or data.get("costMetadata") or {})
+    raw_cost = (
+        cost_payload.get("provider_reported_cost")
+        if cost_payload
+        else None
+    )
+    if raw_cost is None and cost_payload:
+        raw_cost = cost_payload.get("total_cost", cost_payload.get("total"))
+    if raw_cost is None and cost_payload:
+        raw_cost = cost_payload.get("cost")
+    if raw_cost is None:
+        raw_cost = data.get("provider_reported_cost", data.get("total_cost", data.get("cost")))
+    cost_value = _float_or_none(raw_cost)
+    currency = str(cost_payload.get("currency") or data.get("currency") or "USD")
+    source = cost_payload.get("source") or ("provider_reported" if cost_value is not None else None)
+    return cost_value, currency, str(source) if source else None
 
 
 def _looks_like_gemini(data: dict[str, Any]) -> bool:
@@ -244,3 +296,12 @@ def _int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None

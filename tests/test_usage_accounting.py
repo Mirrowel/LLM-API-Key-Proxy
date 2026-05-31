@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from rotator_library.protocols.types import CostDetails, Usage
 from rotator_library.usage.accounting import UsageRecord, extract_usage_record
 
 
@@ -27,6 +28,22 @@ def test_openai_dict_usage_extracts_cache_and_reasoning_without_double_counting(
     assert record.reasoning_tokens == 10
     assert record.output_tokens == 30
     assert record.raw_total_tokens == 130
+
+
+def test_openai_usage_extracts_provider_reported_cost_details() -> None:
+    record = extract_usage_record(
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cost_details": {"total_cost": 0.0123, "currency": "EUR", "source": "provider_usage"},
+            }
+        }
+    )
+
+    assert record.provider_reported_cost == 0.0123
+    assert record.cost_currency == "EUR"
+    assert record.cost_source == "provider_usage"
 
 
 def test_openai_object_usage_extracts_attributes() -> None:
@@ -83,6 +100,33 @@ def test_gemini_usage_metadata_extracts_thought_and_cached_tokens() -> None:
     assert record.completion_tokens == 20
     assert record.reasoning_tokens == 5
     assert record.metadata["shape"] == "gemini"
+
+
+def test_gemini_usage_extracts_cost_metadata() -> None:
+    record = extract_usage_record(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "totalTokenCount": 1,
+                "costMetadata": {"cost": "0.004", "currency": "USD", "source": "gemini_usage"},
+            }
+        }
+    )
+
+    assert record.provider_reported_cost == 0.004
+    assert record.cost_source == "gemini_usage"
+
+
+def test_protocol_usage_cost_details_are_preserved() -> None:
+    record = extract_usage_record(
+        Usage(input_tokens=2, output_tokens=3, cost=CostDetails(provider_reported_cost=0.02, currency="GBP", source="protocol_usage"))
+    )
+
+    assert record.input_tokens == 2
+    assert record.completion_tokens == 3
+    assert record.provider_reported_cost == 0.02
+    assert record.cost_currency == "GBP"
+    assert record.cost_source == "protocol_usage"
 
 
 def test_responses_usage_extracts_nested_details() -> None:
