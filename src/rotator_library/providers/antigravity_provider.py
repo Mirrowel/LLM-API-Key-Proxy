@@ -70,8 +70,13 @@ class AntigravityProvider(ProviderInterface):
     )
     native_streaming_supported = False
     model_quota_groups = {
-        "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-pro-preview", "gemini-3-flash"],
-        "claude": ["claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"],
+        "gemini_3_pro": ["gemini-3-pro-preview", "gemini-3-pro-low", "gemini-3-pro-high"],
+        "gemini_3_flash": ["gemini-3-flash"],
+        "gemini_2_5_flash": ["gemini-2.5-flash"],
+        "gemini_2_5_flash_lite": ["gemini-2.5-flash-lite"],
+        "claude_sonnet_4_5": ["claude-sonnet-4.5"],
+        "claude_opus_4_5": ["claude-opus-4.5"],
+        "claude_opus_4_6": ["claude-opus-4.6"],
     }
     default_rotation_mode = "sequential"
 

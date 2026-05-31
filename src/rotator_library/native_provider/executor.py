@@ -69,6 +69,8 @@ class NativeProviderExecutor:
             self._trace(context, "native_provider_request", provider_request, direction="request", stage="provider")
             raw_response = await transport.post_json(context.endpoint, headers=context.headers, payload=provider_request)
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
+            await cache_engine.extract("response", raw_response, context.field_cache_context(), transaction_logger=logger)
+            self._trace(context, "after_response_field_cache_extraction", {"source": "response", "payload": "raw_provider_response"}, direction="response", stage="adapter", snapshot=False)
             unified_response = protocol.parse_response(raw_response, protocol_context)
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
@@ -82,7 +84,6 @@ class NativeProviderExecutor:
             adapter_context.transaction_logger = None
             provider_response = await run_adapter_chain(adapters, provider_response, adapter_context, stage="response")
             self._trace(context, "after_response_adapter_chain", provider_response, direction="response", stage="adapter")
-            await cache_engine.extract("response", provider_response, context.field_cache_context(), transaction_logger=logger)
             usage_record = extract_usage_record(
                 provider_response,
                 provider=context.provider,
