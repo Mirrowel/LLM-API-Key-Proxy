@@ -91,6 +91,7 @@ class RequestContext:
     classifier: Optional[str] = None
     routing_targets: Optional[Any] = None
     routing_group_name: Optional[str] = None
+    routing_group: Optional[Any] = None
     routing_target_index: int = 0
     routing_attempt_history: List[Dict[str, Any]] = field(default_factory=list)
 

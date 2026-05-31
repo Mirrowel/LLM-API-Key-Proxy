@@ -220,6 +220,7 @@ class RequestContextBuilder:
             classifier=scope["classifier"],
             routing_targets=routing_targets,
             routing_group_name=routing_decision.group_name if routing_decision else None,
+            routing_group=routing_decision.group if routing_decision else None,
         )
 
     async def build_embedding_context(

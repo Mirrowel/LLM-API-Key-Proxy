@@ -653,7 +653,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
                 )
-                if index >= len(targets) - 1 or not policy.should_fallback(error_type):
+                if index >= len(targets) - 1 or not policy.should_fallback(error_type, group=context.routing_group):
                     self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
                     raise
                 self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
@@ -668,7 +668,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "error_type": error_type},
                 )
-                if index < len(targets) - 1 and policy.should_fallback(error_type):
+                if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group):
                     self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                     continue
                 self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type})
@@ -746,7 +746,7 @@ class RequestExecutor:
                         metadata={"target_index": index, "error_type": error_type},
                     )
                     raise
-                if index < len(targets) - 1 and policy.should_fallback(error_type, stream=True, emitted_output=False):
+                if index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False):
                     self._log_routing_trace(
                         context,
                         "routing_fallback_selected",
