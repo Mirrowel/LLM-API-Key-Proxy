@@ -111,14 +111,22 @@ class ResponsesService:
         if transaction_logger:
             self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
 
-        response_payload = self.bridge.from_chat_response(chat_response, unified)
+        try:
+            response_payload = self.bridge.from_chat_response(chat_response, unified)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, "responses_bridge_chat_response", exc, self._response_to_dict(chat_response))
+            raise
         _record_responses_session_anchor(session_info, response_payload)
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
         if raw_request.get("store", True):
             stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-            await self.store.save(stored)
+            try:
+                await self.store.save(stored)
+            except Exception as exc:
+                self._log_transform_error(transaction_logger, "responses_store_response", exc, stored.to_dict())
+                raise
             self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")

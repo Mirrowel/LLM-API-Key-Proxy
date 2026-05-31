@@ -97,7 +97,7 @@ class StreamingHandler:
         upstream_closed = False
         stream_cancelled = False
         last_heartbeat_at = monitor.metrics.started_at
-        lifecycle_logger = transaction_logger if stream_settings.trace_metrics else None
+        lifecycle_logger = transaction_logger
         self._log_stream_lifecycle(
             lifecycle_logger,
             "stream_started",

@@ -1198,23 +1198,6 @@ class RequestExecutor:
                                     f"Recorded usage from response object for key {mask_credential(cred)}"
                                 )
 
-                                # Log response if transaction logging enabled
-                                if context.transaction_logger:
-                                    try:
-                                        response_data = (
-                                            response.model_dump()
-                                            if hasattr(response, "model_dump")
-                                            else response
-                                        )
-                                        response_data = _redact_context_field_cache_paths(response_data, context, "response", plugin)
-                                        context.transaction_logger.log_response(
-                                            response_data
-                                        )
-                                    except Exception as log_err:
-                                        lib_logger.debug(
-                                            f"Failed to log response: {log_err}"
-                                        )
-
                                 normalized_response = self._normalize_response_usage(response, model)
                                 trace_normalized_response = _redact_context_field_cache_paths(normalized_response, context, "response", plugin)
                                 self._log_executor_trace(
@@ -1226,6 +1209,16 @@ class RequestExecutor:
                                     credential_id=cred_context.stable_id,
                                     metadata={"provider": provider, "model": model},
                                 )
+                                # Legacy response.json and final_client_response must
+                                # reflect the same post-normalization payload returned
+                                # to the caller, not the pre-accounting SDK object.
+                                if context.transaction_logger:
+                                    try:
+                                        context.transaction_logger.log_response(trace_normalized_response)
+                                    except Exception as log_err:
+                                        lib_logger.debug(
+                                            f"Failed to log response: {log_err}"
+                                        )
                                 return normalized_response
 
                             except RoutingExecutionError as e:
@@ -1491,8 +1484,8 @@ class RequestExecutor:
 
                                     self._log_executor_trace(
                                         context,
-                                        "raw_provider_stream_response",
-                                        stream,
+                                        "provider_stream_opened",
+                                        {"stream_type": f"{type(stream).__module__}.{type(stream).__name__}"},
                                         direction="response",
                                         stage="provider",
                                         credential_id=cred_context.stable_id,
