@@ -121,16 +121,18 @@ class AntigravityProvider(ProviderInterface):
         return self._alias_to_internal(clean)
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
-        """Return a request with the upstream Antigravity model name.
+        """Return a request with the upstream model and Gemini contents shape.
 
-        The provider intentionally keeps this to model alias handling only. Device
-        profile and fingerprint behavior stays out of the active integration until
-        it is verified against current service behavior.
+        The provider intentionally keeps this to model alias and message-shape
+        handling only. Device profile and fingerprint behavior stays out of the
+        active integration until it is verified against current service behavior.
         """
 
         prepared = dict(request)
         if model:
             prepared["model"] = model
+        if "contents" not in prepared and isinstance(prepared.get("messages"), list):
+            prepared["contents"] = [_message_to_gemini_content(message) for message in prepared.pop("messages")]
         return prepared
 
     def supports_native_streaming(self, model: str = "", operation: str = "generate") -> bool:
@@ -189,3 +191,14 @@ class AntigravityProvider(ProviderInterface):
             if public not in EXCLUDED_MODELS and public in AVAILABLE_MODELS and public not in result:
                 result.append(public)
         return result
+
+
+def _message_to_gemini_content(message: Any) -> dict[str, Any]:
+    """Return a minimal Gemini content item from an OpenAI-style message."""
+
+    if not isinstance(message, dict):
+        return {"role": "user", "parts": [{"text": str(message)}]}
+    role = "model" if message.get("role") == "assistant" else "user"
+    content = message.get("content", "")
+    parts = content if isinstance(content, list) else [{"text": str(content)}]
+    return {"role": role, "parts": parts}

@@ -59,6 +59,20 @@ def test_codex_native_operation_model_and_stream_support() -> None:
     assert provider.supports_native_streaming("gpt-5.1-codex", operation="chat") is False
 
 
+def test_codex_prepare_native_request_converts_messages_to_responses_input() -> None:
+    provider = CodexProvider()
+
+    prepared = provider.prepare_native_request(
+        {"model": "codex/gpt-5.1-codex", "messages": [{"role": "user", "content": "hello"}]},
+        model="gpt-5.1-codex",
+        operation="responses",
+    )
+
+    assert prepared["model"] == "gpt-5.1-codex"
+    assert prepared["input"] == [{"role": "user", "content": "hello"}]
+    assert "messages" not in prepared
+
+
 @pytest.mark.asyncio
 async def test_codex_provider_get_models_filters_codex_models(monkeypatch) -> None:
     monkeypatch.setenv("CODEX_API_BASE", "https://codex.test")
