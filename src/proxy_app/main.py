@@ -597,7 +597,9 @@ async def lifespan(app: FastAPI):
     # Phase 4 Responses API compatibility service. It currently bridges through
     # the existing chat-completions client path; later native providers can reuse
     # the same route/storage surface without changing clients.
-    app.state.responses_service = ResponsesService()
+    from rotator_library.config.experimental import get_responses_store_settings
+
+    app.state.responses_service = ResponsesService(store_settings=get_responses_store_settings())
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -674,7 +676,9 @@ def get_responses_service(request: Request) -> ResponsesService:
 
     service = getattr(request.app.state, "responses_service", None)
     if service is None:
-        service = ResponsesService()
+        from rotator_library.config.experimental import get_responses_store_settings
+
+        service = ResponsesService(store_settings=get_responses_store_settings())
         request.app.state.responses_service = service
     return service
 
