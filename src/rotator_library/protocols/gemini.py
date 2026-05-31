@@ -122,8 +122,10 @@ class GeminiProtocol(ProtocolAdapter):
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         if unified_response.operation == OPERATION_COUNT_TOKENS:
             usage = unified_response.usage
-            payload = {"totalTokens": usage.total_tokens if usage else 0}
-            payload.update(deepcopy(unified_response.extra))
+            payload = deepcopy(unified_response.extra)
+            # Normalized usage wins over raw preserved fields so later adapters
+            # can correct counts without stale provider keys shadowing them.
+            payload["totalTokens"] = usage.total_tokens if usage else 0
             return payload
         candidates = []
         for index, message in enumerate(unified_response.messages):
@@ -354,13 +356,14 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
+    supported = {OPERATION_CHAT, OPERATION_COUNT_TOKENS}
     if context and isinstance(context.provider_options, dict):
         operation = normalize_operation(context.provider_options.get("operation"))
-        if operation != OPERATION_UNKNOWN:
+        if operation in supported:
             return operation
     if context and isinstance(context.metadata, dict):
         operation = normalize_operation(context.metadata.get("operation"))
-        if operation != OPERATION_UNKNOWN:
+        if operation in supported:
             return operation
     return default
 
