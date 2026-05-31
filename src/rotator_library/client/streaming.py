@@ -13,7 +13,9 @@ Handles:
 - Client disconnect handling
 """
 
+import asyncio
 import codecs
+import contextlib
 import json
 import logging
 import re
@@ -24,6 +26,7 @@ from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 from ..core.utils import normalize_usage_for_response
 from ..streaming import StreamEvent, StreamMonitor, stream_event_from_sse_chunk
+from ..streaming.transport import SSEStreamFormatter
 from ..usage.accounting import UsageRecord, extract_usage_record
 from ..usage.costs import CostBreakdown, CostCalculator
 
@@ -89,6 +92,10 @@ class StreamingHandler:
         from ..config.experimental import get_stream_runtime_settings
 
         stream_settings = get_stream_runtime_settings()
+        formatter = SSEStreamFormatter()
+        upstream_closed = False
+        stream_cancelled = False
+        last_heartbeat_at = monitor.metrics.started_at
         lifecycle_logger = transaction_logger if stream_settings.trace_metrics else None
         self._log_stream_lifecycle(
             lifecycle_logger,
@@ -100,6 +107,35 @@ class StreamingHandler:
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
 
+        async def close_upstream(reason: str) -> None:
+            """Best-effort close for upstream async streams.
+
+            Client disconnects and timeout failures should not leave provider
+            HTTP streams running in the background. Close failures are logged as
+            lifecycle metadata only and never replace the original stream error.
+            """
+
+            nonlocal upstream_closed
+            if upstream_closed or not stream_settings.cancel_upstream_on_disconnect:
+                return
+            upstream_closed = True
+            for candidate in (stream_iterator, stream):
+                try:
+                    closer = getattr(candidate, "aclose", None)
+                    if closer:
+                        await closer()
+                        self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_cancelled", monitor, StreamEvent("cancelled", protocol="openai_chat", data={"reason": reason}))
+                        return
+                    closer = getattr(candidate, "close", None)
+                    if closer:
+                        closer()
+                        self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_cancelled", monitor, StreamEvent("cancelled", protocol="openai_chat", data={"reason": reason}))
+                        return
+                except Exception as exc:
+                    lib_logger.debug("Failed to close upstream stream: %s", exc)
+                    self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_close_failed", monitor, StreamEvent("error", protocol="openai_chat", data={"reason": reason, "error_type": type(exc).__name__}))
+                    return
+
         try:
             while True:
                 try:
@@ -110,7 +146,35 @@ class StreamingHandler:
                         )
                         break
 
-                    chunk = await stream_iterator.__anext__()
+                    next_task = asyncio.create_task(stream_iterator.__anext__())
+                    try:
+                        while True:
+                            wait_seconds = _next_stream_wait_seconds(monitor, stream_settings, last_heartbeat_at)
+                            done, _ = await asyncio.wait({next_task}, timeout=wait_seconds)
+                            if done:
+                                chunk = next_task.result()
+                                break
+
+                            timeout_error = _stream_timeout_error(monitor, stream_settings)
+                            if timeout_error:
+                                next_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                    await next_task
+                                await close_upstream(timeout_error[0])
+                                self._log_stream_lifecycle(lifecycle_logger, timeout_error[2], monitor, StreamEvent("error", protocol="openai_chat", data={"error": timeout_error[1]}))
+                                raise StreamedAPIError(timeout_error[1]["message"], data={"error": timeout_error[1]})
+
+                            if _heartbeat_due(monitor, stream_settings, last_heartbeat_at):
+                                heartbeat = formatter.format_heartbeat()
+                                last_heartbeat_at = time.monotonic()
+                                self._log_stream_lifecycle(lifecycle_logger, "stream_heartbeat", monitor, StreamEvent("heartbeat", protocol="openai_chat", visible_output=False))
+                                yield heartbeat
+                    except Exception:
+                        if not next_task.done():
+                            next_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                await next_task
+                        raise
 
                     raw_event = StreamEvent(
                         "raw_chunk",
@@ -229,10 +293,24 @@ class StreamingHandler:
 
                     # Not a JSON-related error, re-raise
                     monitor.metrics.error_count += 1
+                    await close_upstream("stream_exception")
                     raise
 
         except StreamedAPIError:
             # Re-raise for retry loop
+            await close_upstream("streamed_api_error")
+            raise
+
+        except asyncio.CancelledError:
+            stream_cancelled = True
+            monitor.cancel()
+            self._log_stream_lifecycle(
+                lifecycle_logger,
+                "stream_cancelled",
+                monitor,
+                StreamEvent("cancelled", protocol="openai_chat", data={"reason": "task_cancelled"}),
+            )
+            await close_upstream("task_cancelled")
             raise
 
         finally:
@@ -297,6 +375,7 @@ class StreamingHandler:
                 yield "data: [DONE]\n\n"
 
             elif request and await request.is_disconnected():
+                stream_cancelled = True
                 monitor.cancel()
                 self._log_stream_lifecycle(
                     lifecycle_logger,
@@ -304,6 +383,9 @@ class StreamingHandler:
                     monitor,
                     StreamEvent("cancelled", protocol="openai_chat"),
                 )
+                await close_upstream("client_disconnect")
+            elif stream_cancelled:
+                await close_upstream("stream_cancelled")
 
     @staticmethod
     def _log_stream_lifecycle(
@@ -540,6 +622,68 @@ class StreamingHandler:
             },
             snapshot=False,
         )
+
+
+def _next_stream_wait_seconds(
+    monitor: StreamMonitor,
+    settings: Any,
+    last_heartbeat_at: float,
+) -> Optional[float]:
+    """Return the next active stream policy deadline.
+
+    A pending upstream `__anext__()` task is not cancelled for heartbeats. The
+    handler waits until the nearest policy deadline, emits heartbeat metadata if
+    needed, and keeps waiting on the same upstream task.
+    """
+
+    candidates: list[float] = []
+    now = time.monotonic()
+    if settings.heartbeat_seconds:
+        candidates.append(max(0.0, last_heartbeat_at + settings.heartbeat_seconds - now))
+    if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
+        candidates.append(max(0.0, monitor.metrics.started_at + settings.ttfb_timeout_seconds - now))
+    if settings.stall_timeout_seconds and monitor.metrics.first_byte_at is not None:
+        last_chunk_at = monitor.metrics.last_chunk_at or monitor.metrics.first_byte_at
+        candidates.append(max(0.0, last_chunk_at + settings.stall_timeout_seconds - now))
+    return min(candidates) if candidates else None
+
+
+def _heartbeat_due(monitor: StreamMonitor, settings: Any, last_heartbeat_at: float) -> bool:
+    """Return whether a heartbeat should be emitted while upstream is idle."""
+
+    if not settings.heartbeat_seconds:
+        return False
+    return time.monotonic() - last_heartbeat_at >= settings.heartbeat_seconds
+
+
+def _stream_timeout_error(monitor: StreamMonitor, settings: Any) -> Optional[tuple[str, dict[str, Any], str]]:
+    """Return a structured stream timeout error when a configured deadline expires."""
+
+    now = time.monotonic()
+    if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
+        if now - monitor.metrics.started_at >= settings.ttfb_timeout_seconds:
+            return (
+                "ttfb_timeout",
+                {
+                    "message": "Stream timed out before first byte",
+                    "type": "api_connection",
+                    "details": {"timeout_type": "ttfb", "timeout_seconds": settings.ttfb_timeout_seconds},
+                },
+                "stream_ttfb_timeout",
+            )
+    if settings.stall_timeout_seconds and monitor.metrics.first_byte_at is not None:
+        last_chunk_at = monitor.metrics.last_chunk_at or monitor.metrics.first_byte_at
+        if now - last_chunk_at >= settings.stall_timeout_seconds:
+            return (
+                "stall_timeout",
+                {
+                    "message": "Stream stalled while waiting for provider data",
+                    "type": "api_connection",
+                    "details": {"timeout_type": "stall", "timeout_seconds": settings.stall_timeout_seconds},
+                },
+                "stream_stall_timeout",
+            )
+    return None
 
 
 class StreamBuffer:
