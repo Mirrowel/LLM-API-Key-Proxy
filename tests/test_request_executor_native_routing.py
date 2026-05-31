@@ -279,8 +279,10 @@ async def test_claude_code_provider_runs_mock_live_native_request(monkeypatch) -
     response = await _executor(http_client)._execute_provider_request("claude_code", context.model, provider, "secret", "stable", dict(context.kwargs), context)
 
     assert response["id"] == "msg_1"
+    assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://claude-code.test/v1/messages"
     assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
+    assert http_client.calls[0]["json"]["max_tokens"] == 4096
     assert http_client.calls[0]["json"]["messages"][0]["role"] == "user"
 
 
@@ -298,6 +300,7 @@ async def test_codex_provider_runs_mock_live_native_request(monkeypatch) -> None
     response = await _executor(http_client)._execute_provider_request("codex", context.model, provider, "secret", "stable", dict(context.kwargs), context)
 
     assert response["id"] == "resp_1"
+    assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://codex.test/v1/responses"
     assert http_client.calls[0]["json"]["model"] == "gpt-5.1-codex"
     assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "text", "text": "hi"}]
@@ -336,13 +339,35 @@ async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -
 
     response = await _executor(http_client)._execute_provider_request("antigravity", context.model, provider, "secret", "stable", dict(context.kwargs), context)
 
-    assert response["candidates"][0]["content"]["parts"][0]["text"] == "ok"
+    assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:generateContent"
     assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
     assert http_client.calls[0]["json"]["request"]["contents"][0]["parts"][0]["text"] == "hi"
     assert http_client.calls[0]["json"]["requestType"] == "CHAT_COMPLETION"
     assert "requestId" in http_client.calls[0]["json"]
-    assert "messages" not in http_client.calls[0]["json"]["request"]
+
+
+def test_claude_code_header_modes(monkeypatch) -> None:
+    provider = ClaudeCodeProvider()
+
+    monkeypatch.setenv("CLAUDE_CODE_AUTH_HEADER", "auto")
+    assert provider.get_native_headers("sk-ant-test")["x-api-key"] == "sk-ant-test"
+    assert provider.get_native_headers("oauth-token")["Authorization"] == "Bearer oauth-token"
+    monkeypatch.setenv("CLAUDE_CODE_AUTH_HEADER", "x-api-key")
+    assert provider.get_native_headers("any-token")["x-api-key"] == "any-token"
+
+
+def test_antigravity_alias_normalization_preserves_thinking_level() -> None:
+    provider = AntigravityProvider()
+    request = {"_proxy_model": "antigravity/gemini-3-pro-low", "model": "gemini-3-pro-preview", "messages": [{"role": "user", "content": "hi"}]}
+
+    prepared = provider.prepare_native_request(request, model=provider.normalize_native_model("antigravity/gemini-3-pro-low"), operation="generate")
+
+    assert provider.normalize_native_model("antigravity/gemini-3-pro-low") == "gemini-3-pro-preview"
+    assert prepared["metadata"]["thinking_level"] == "low"
+    assert "_proxy_model" not in prepared
+    assert "messages" not in prepared
+    assert prepared["contents"][0]["parts"][0]["text"] == "hi"
 
 
 def test_native_request_payload_drops_litellm_only_fields() -> None:

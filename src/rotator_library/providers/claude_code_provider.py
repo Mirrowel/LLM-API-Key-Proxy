@@ -69,11 +69,17 @@ class ClaudeCodeProvider(ProviderInterface):
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "messages") -> dict[str, str]:
         """Return headers for native mocked HTTP requests."""
 
-        return {
-            "Authorization": f"Bearer {credential_identifier}",
+        mode = os.getenv("CLAUDE_CODE_AUTH_HEADER", "auto").strip().lower()
+        use_api_key = mode == "x-api-key" or (mode == "auto" and credential_identifier.startswith("sk-ant-"))
+        headers = {
             "anthropic-version": os.getenv("CLAUDE_CODE_ANTHROPIC_VERSION", "2023-06-01"),
             "content-type": "application/json",
         }
+        if use_api_key:
+            headers["x-api-key"] = credential_identifier
+        else:
+            headers["Authorization"] = f"Bearer {credential_identifier}"
+        return headers
 
     def get_native_operation(self, model: str = "", request: dict[str, Any] | None = None, stream: bool = False) -> str:
         """Claude Code uses the Anthropic Messages operation for completions."""
@@ -89,6 +95,13 @@ class ClaudeCodeProvider(ProviderInterface):
         """Return false until the generic native stream wrapper is compatible."""
 
         return False
+
+    def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "messages") -> dict[str, Any]:
+        """Ensure Anthropic Messages-required fields are present."""
+
+        prepared = dict(request)
+        prepared.setdefault("max_tokens", int(os.getenv("CLAUDE_CODE_MAX_TOKENS", "4096")))
+        return prepared
 
     def get_native_endpoint(self, model: str = "", operation: str = "messages") -> str:
         """Return the provider endpoint for a native operation."""

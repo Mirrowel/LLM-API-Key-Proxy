@@ -157,7 +157,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             choices.append(
                 {
                     "index": index,
-                    "message": self._format_message(message),
+                    "message": _format_response_message(self._format_message(message), message),
                     "finish_reason": unified_response.stop_reason,
                 }
             )
@@ -493,6 +493,27 @@ def _format_openai_usage(usage: Usage | None) -> dict[str, Any] | None:
             cost_details["source"] = usage.cost.source
         payload["cost_details"] = cost_details
     return payload
+
+
+def _format_response_message(payload: dict[str, Any], message: UnifiedMessage) -> dict[str, Any]:
+    """Return Chat Completions response-message shape.
+
+    Request messages may legitimately preserve content-part arrays. Assistant
+    response messages from non-chat native protocols often arrive as text parts;
+    Chat Completions clients expect the final message content to be a string in
+    that common case.
+    """
+
+    if payload.get("content") is not None and message.content:
+        if all(block.type in {"text", "input_text", "output_text"} and not block.extra for block in message.content):
+            payload = dict(payload)
+            payload["content"] = _first_response_text(message.content) or ""
+    return payload
+
+
+def _first_response_text(blocks: Iterable[ContentBlock]) -> Optional[str]:
+    parts = [block.text for block in blocks if block.type in {"text", "input_text", "output_text"} and block.text]
+    return "".join(parts) if parts else first_text(blocks)
 
 
 def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:

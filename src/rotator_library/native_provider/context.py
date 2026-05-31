@@ -27,6 +27,7 @@ class NativeProviderContext:
     protocol_name: str
     endpoint: str
     operation: str = "chat"
+    client_protocol_name: Optional[str] = None
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -46,7 +47,7 @@ class NativeProviderContext:
             provider=self.provider,
             model=self.model,
             source_protocol=self.protocol_name,
-            target_protocol=target_protocol or self.protocol_name,
+            target_protocol=target_protocol or self.client_protocol_name or self.protocol_name,
             session_id=self.session_id,
             credential_stable_id=self.credential_id,
             transport=self.transport,

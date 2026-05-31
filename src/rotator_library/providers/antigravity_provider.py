@@ -131,8 +131,13 @@ class AntigravityProvider(ProviderInterface):
         """
 
         prepared = dict(request)
+        public_model = str(request.get("_proxy_model") or request.get("model") or "")
         if model:
             prepared["model"] = model
+        prepared.pop("_proxy_model", None)
+        thinking_level = _thinking_level_from_model(public_model)
+        if thinking_level:
+            prepared.setdefault("metadata", {})["thinking_level"] = thinking_level
         if "contents" not in prepared and isinstance(prepared.get("messages"), list):
             prepared["contents"] = [_message_to_gemini_content(message) for message in prepared.pop("messages")]
         return prepared
@@ -183,7 +188,9 @@ class AntigravityProvider(ProviderInterface):
 
     @staticmethod
     def _alias_to_internal(alias: str) -> str:
-        return MODEL_ALIAS_REVERSE.get(alias, alias)
+        if alias in {"rev19-uic3-1p", "gemini-3-pro-image", "gemini-3-pro-low", "gemini-3-pro-high"}:
+            return MODEL_ALIAS_MAP.get(alias, alias)
+        return MODEL_ALIAS_REVERSE.get(alias, MODEL_ALIAS_MAP.get(alias, alias))
 
     @staticmethod
     def _api_to_user_model(internal: str) -> str:
@@ -212,3 +219,12 @@ def _message_to_gemini_content(message: Any) -> dict[str, Any]:
     content = message.get("content", "")
     parts = content if isinstance(content, list) else [{"text": str(content)}]
     return {"role": role, "parts": parts}
+
+
+def _thinking_level_from_model(model: str) -> Optional[str]:
+    clean = model.split("/", 1)[1] if model.startswith("antigravity/") else model
+    if clean.endswith("-low"):
+        return "low"
+    if clean.endswith("-high"):
+        return "high"
+    return None
