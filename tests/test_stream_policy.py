@@ -19,6 +19,9 @@ def test_visible_output_detection_for_chat_chunks() -> None:
     assert is_visible_stream_output('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n') is True
     assert is_visible_stream_output('data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1"}]}}]}\n\n') is True
     assert is_visible_stream_output('data: {"error":{"type":"rate_limit"}}\n\n') is False
+    assert is_visible_stream_output('event: error\ndata: {"type":"error","error":{"message":"x"}}\n\n') is False
+    assert is_visible_stream_output('data: {"type":"error","error":{"message":"x"}}\n\n') is False
+    assert is_visible_stream_output(': heartbeat\n\n') is False
     assert is_visible_stream_output("data: [DONE]\n\n") is False
     assert is_visible_stream_output("not-sse") is True
 
@@ -26,3 +29,4 @@ def test_visible_output_detection_for_chat_chunks() -> None:
 def test_visible_output_detection_for_responses_events() -> None:
     assert is_visible_stream_output('data: {"event_type":"response.output_text.delta","delta":"hi"}\n\n', protocol="responses") is True
     assert is_visible_stream_output('data: {"event_type":"response.failed","error":{"message":"x"}}\n\n', protocol="responses") is False
+    assert is_visible_stream_output('event: response.failed\ndata: {"error":{"message":"x"}}\n\n', protocol="responses") is False

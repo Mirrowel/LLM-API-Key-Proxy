@@ -73,16 +73,39 @@ _MALFORMED_VISIBLE = object()
 
 def _sse_json(chunk: str, *, malformed_is_visible: bool) -> dict[str, Any] | object | None:
     payload = chunk.strip()
-    if not payload.startswith("data:"):
-        return _MALFORMED_VISIBLE if malformed_is_visible and payload else None
-    payload = payload[5:].strip()
+    if not payload:
+        return None
+    if all(line.startswith(":") for line in payload.splitlines() if line.strip()):
+        return None
+    event_type = None
+    data_lines: list[str] = []
+    for line in payload.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":"):
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+            continue
+        return _MALFORMED_VISIBLE if malformed_is_visible else None
+    if not data_lines:
+        if event_type in {"error", "response.failed"}:
+            return {"event_type": event_type}
+        return None
+    payload = "\n".join(data_lines).strip()
     if not payload or payload == "[DONE]":
         return None
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError:
         return _MALFORMED_VISIBLE if malformed_is_visible else None
-    return parsed if isinstance(parsed, dict) else (_MALFORMED_VISIBLE if malformed_is_visible else None)
+    if not isinstance(parsed, dict):
+        return _MALFORMED_VISIBLE if malformed_is_visible else None
+    if event_type and "event_type" not in parsed:
+        parsed["event_type"] = event_type
+    return parsed
 
 
 def _openai_chat_visible(data: dict[str, Any]) -> bool:
