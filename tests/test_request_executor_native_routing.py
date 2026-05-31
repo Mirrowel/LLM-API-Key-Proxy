@@ -337,7 +337,7 @@ async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -
     response = await _executor(http_client)._execute_provider_request("antigravity", context.model, provider, "secret", "stable", dict(context.kwargs), context)
 
     assert response["candidates"][0]["content"]["parts"][0]["text"] == "ok"
-    assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:streamGenerateContent?alt=sse"
+    assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:generateContent"
     assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
     assert http_client.calls[0]["json"]["request"]["contents"][0]["parts"][0]["text"] == "hi"
     assert http_client.calls[0]["json"]["requestType"] == "CHAT_COMPLETION"
@@ -358,6 +358,23 @@ def test_native_request_payload_drops_litellm_only_fields() -> None:
     )
 
     assert payload == {"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_explicit_native_streaming_fails_when_provider_does_not_support_it() -> None:
+    target = parse_route_target("provider/gpt-test@native")
+
+    with pytest.raises(RoutingExecutionError) as exc:
+        executor_module._should_use_native_streaming(NativePlugin(), "provider/gpt-test", target, "native", "provider")
+
+    assert exc.value.error_type == "configuration_error"
+
+
+def test_antigravity_cache_injection_targets_safe_envelope() -> None:
+    provider = AntigravityProvider()
+
+    rules = provider.get_field_cache_rules("gemini-3-flash")
+
+    assert rules[0].inject.path == "request.metadata.thoughtSignatures"
 
 
 def test_native_context_raises_on_invalid_field_cache_config(monkeypatch, tmp_path) -> None:
