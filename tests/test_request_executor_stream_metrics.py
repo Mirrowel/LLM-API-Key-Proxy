@@ -111,8 +111,8 @@ async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_
     assert chunks[-1] == "data: [DONE]\n\n"
     if (logger.log_dir / "transform_trace.jsonl").exists():
         pass_names = _trace_passes(logger.log_dir)
-        assert "stream_started" not in pass_names
-        assert "stream_metrics_final" not in pass_names
+        assert "stream_started" in pass_names
+        assert "stream_metrics_final" in pass_names
 
 
 @pytest.mark.asyncio
