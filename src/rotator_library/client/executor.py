@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from typing import (
     Any,
     AsyncGenerator,
@@ -496,7 +497,18 @@ class RequestExecutor:
         """
         if context.pre_request_callback:
             try:
+                before = deepcopy(kwargs)
                 await context.pre_request_callback(context.request, kwargs)
+                if before != kwargs:
+                    self._log_executor_trace(
+                        context,
+                        "after_pre_request_callback",
+                        kwargs,
+                        direction="request",
+                        stage="client",
+                        changed_from_previous=True,
+                        snapshot=True,
+                    )
             except Exception as e:
                 if self._abort_on_callback_error:
                     raise PreRequestCallbackError(str(e)) from e
@@ -516,6 +528,15 @@ class RequestExecutor:
 
         target = _current_route_target(context)
         execution = target.execution if target else "auto"
+        self._log_executor_trace(
+            context,
+            "provider_execution_request",
+            kwargs,
+            direction="request",
+            stage="provider",
+            credential_id=credential_id,
+            metadata={"execution": execution, "provider": provider, "model": model},
+        )
         if execution == "litellm_fallback":
             self._log_routing_trace(
                 context,
@@ -787,6 +808,42 @@ class RequestExecutor:
             snapshot=False,
         )
 
+    @staticmethod
+    def _log_executor_trace(
+        context: RequestContext,
+        pass_name: str,
+        data: Any,
+        *,
+        direction: str,
+        stage: str,
+        credential_id: Optional[str] = None,
+        changed_from_previous: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        snapshot: bool = True,
+    ) -> None:
+        """Record live executor trace boundaries without affecting requests."""
+
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            data,
+            direction=direction,
+            stage=stage,
+            credential_id=credential_id,
+            transport="sse" if context.streaming else "http",
+            changed_from_previous=changed_from_previous,
+            metadata={
+                "provider": context.provider,
+                "model": context.model,
+                "session_id": context.session_id,
+                "scope_key": context.usage_manager_key,
+                "classifier": context.classifier,
+                **(metadata or {}),
+            },
+            snapshot=snapshot,
+        )
+
     async def _prepare_execution(
         self,
         context: RequestContext,
@@ -933,6 +990,15 @@ class RequestExecutor:
                                     kwargs,
                                     context,
                                 )
+                                self._log_executor_trace(
+                                    context,
+                                    "raw_provider_response",
+                                    response,
+                                    direction="response",
+                                    stage="provider",
+                                    credential_id=cred_context.stable_id,
+                                    metadata={"provider": provider, "model": model},
+                                )
 
                                 # Success! Extract token usage if available
                                 usage_record, cost_breakdown = self._account_for_response_usage(
@@ -980,7 +1046,17 @@ class RequestExecutor:
                                             f"Failed to log response: {log_err}"
                                         )
 
-                                return self._normalize_response_usage(response, model)
+                                normalized_response = self._normalize_response_usage(response, model)
+                                self._log_executor_trace(
+                                    context,
+                                    "post_usage_normalization_response",
+                                    normalized_response,
+                                    direction="response",
+                                    stage="final",
+                                    credential_id=cred_context.stable_id,
+                                    metadata={"provider": provider, "model": model},
+                                )
+                                return normalized_response
 
                             except Exception as e:
                                 last_exception = e
@@ -1164,6 +1240,15 @@ class RequestExecutor:
                                     # Make the API call
                                     if plugin and plugin.has_custom_logic():
                                         kwargs["credential_identifier"] = credential_secret
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "custom_stream", "provider": provider, "model": model},
+                                        )
                                         stream = await plugin.acompletion(
                                             self._http_client, **kwargs
                                         )
@@ -1173,7 +1258,27 @@ class RequestExecutor:
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "litellm_stream", "provider": provider, "model": model},
+                                        )
                                         stream = await litellm.acompletion(**kwargs)
+
+                                    self._log_executor_trace(
+                                        context,
+                                        "raw_provider_stream_response",
+                                        stream,
+                                        direction="response",
+                                        stage="provider",
+                                        credential_id=cred_context.stable_id,
+                                        metadata={"provider": provider, "model": model},
+                                        snapshot=False,
+                                    )
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion
@@ -1894,6 +1999,15 @@ class RequestExecutor:
                 transport="sse",
                 snapshot=False,
             )
+            if sse_line.startswith("data: [DONE]"):
+                transaction_logger.log_transform_pass(
+                    "stream_done_event",
+                    {"raw": sse_line},
+                    direction="stream",
+                    stage="final",
+                    transport="sse",
+                    snapshot=False,
+                )
             yield sse_line
 
             # Parse and accumulate for final logging
@@ -1906,6 +2020,15 @@ class RequestExecutor:
                         chunk_data = json.loads(content)
                         chunks.append(chunk_data)
                         transaction_logger.log_stream_chunk(chunk_data)
+                        if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
+                            transaction_logger.log_transform_pass(
+                                "stream_error_event",
+                                chunk_data,
+                                direction="stream",
+                                stage="client",
+                                transport="sse",
+                                snapshot=False,
+                            )
                 except json.JSONDecodeError:
                     lib_logger.debug(
                         f"Failed to parse chunk for logging: {sse_line[:100]}"

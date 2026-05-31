@@ -102,8 +102,26 @@ async def test_stream_wrapper_records_raw_parsed_and_assembled_trace(tmp_path) -
     pass_names = [entry["pass_name"] for entry in entries]
     assert pass_names.count("raw_stream_chunk") == 3
     assert pass_names.count("parsed_stream_chunk") == 2
+    assert pass_names.count("stream_done_event") == 1
     assert "assembled_stream_response" in pass_names
     assert "final_client_response" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_stream_wrapper_records_error_events(tmp_path) -> None:
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+    executor = RequestExecutor.__new__(RequestExecutor)
+
+    async def stream():
+        yield 'data: {"error":{"type":"rate_limit","message":"slow down"}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    chunks = [chunk async for chunk in executor._transaction_logging_stream_wrapper(stream(), logger, {})]
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
+    assert "stream_error_event" in pass_names
+    assert "stream_done_event" in pass_names
 
 
 def test_transaction_logger_disabled_writes_no_trace(tmp_path) -> None:
