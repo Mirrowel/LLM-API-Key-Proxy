@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from .error_handler import ClassifiedError, classify_error, should_retry_same_key, should_rotate_on_error
 from .routing import FallbackPolicy
@@ -30,6 +32,22 @@ class ProviderCooldownDecision:
     should_start: bool
     duration: int = 0
     reason: str = "not_applicable"
+    scope: str = "provider"
+    model: Optional[str] = None
+    backoff_level: int = 0
+
+
+@dataclass(frozen=True)
+class FailureHistoryEntry:
+    """One sanitized provider/model failure event kept in memory only."""
+
+    timestamp: float
+    provider: str
+    model: Optional[str]
+    error_type: str
+    scope: str
+    duration: int
+    reason: str
 
 
 def classify_route_error(error: BaseException, provider: Optional[str] = None) -> str:
@@ -62,6 +80,9 @@ def decide_provider_cooldown(
     provider_cooldown_min_seconds: int,
     default_duration: int = DEFAULT_PROVIDER_COOLDOWN_DEFAULT_SECONDS,
     cooldown_on_quota: bool = False,
+    model: Optional[str] = None,
+    original_error: Any = None,
+    failure_history: "FailureHistory | None" = None,
 ) -> ProviderCooldownDecision:
     """Return whether a provider-wide cooldown should be activated.
 
@@ -76,6 +97,7 @@ def decide_provider_cooldown(
         return ProviderCooldownDecision(False, reason="quota_cooldown_disabled")
     if error_type not in {"rate_limit", "server_error", "api_connection", "quota_exceeded"}:
         return ProviderCooldownDecision(False, reason="non_provider_cooldown_error")
+    scope = "model" if model and is_model_capacity_error(original_error or classified_error.original_exception) else "provider"
 
     retry_after = classified_error.retry_after
     if retry_after is not None:
@@ -85,11 +107,99 @@ def decide_provider_cooldown(
             return ProviderCooldownDecision(False, reason="small_retry_after")
         if retry_after < provider_cooldown_min_seconds:
             return ProviderCooldownDecision(False, reason="below_provider_cooldown_minimum")
-        return ProviderCooldownDecision(True, duration=int(retry_after), reason="retry_after")
+        return ProviderCooldownDecision(True, duration=int(retry_after), reason="retry_after", scope=scope, model=model if scope == "model" else None)
 
     if error_type in {"server_error", "api_connection"} and default_duration >= provider_cooldown_min_seconds:
-        return ProviderCooldownDecision(True, duration=int(default_duration), reason="default_transient_cooldown")
+        backoff_level = 0
+        duration = int(default_duration)
+        if failure_history is not None:
+            backoff = failure_history.backoff_for(error_type=error_type, scope=scope, model=model if scope == "model" else None, default_duration=duration)
+            duration = backoff.duration
+            backoff_level = backoff.level
+        return ProviderCooldownDecision(True, duration=duration, reason="model_capacity_cooldown" if scope == "model" else "default_transient_cooldown", scope=scope, model=model if scope == "model" else None, backoff_level=backoff_level)
     return ProviderCooldownDecision(False, reason="missing_retry_after")
+
+
+@dataclass(frozen=True)
+class BackoffDecision:
+    """Bounded backoff duration derived from recent transient failures."""
+
+    duration: int
+    level: int = 0
+
+
+class FailureHistory:
+    """Bounded in-memory provider/model failure history.
+
+    This is intentionally process-local. It provides enough recent context for
+    conservative cooldown backoff and future observability without introducing a
+    persistence layer or changing credential usage accounting.
+    """
+
+    def __init__(self, *, max_entries: int | None = None, clock: Any = None) -> None:
+        self.max_entries = max(1, max_entries if max_entries is not None else _env_int("FAILURE_HISTORY_MAX_ENTRIES", 200))
+        self._entries: deque[FailureHistoryEntry] = deque(maxlen=self.max_entries)
+        self._clock = clock or time.time
+
+    def record(self, *, provider: str, model: Optional[str], error_type: str, scope: str, duration: int, reason: str) -> None:
+        """Record one sanitized cooldown/failure event."""
+
+        self._entries.append(
+            FailureHistoryEntry(
+                timestamp=float(self._clock()),
+                provider=provider,
+                model=model,
+                error_type=error_type,
+                scope=scope,
+                duration=duration,
+                reason=reason,
+            )
+        )
+
+    def snapshot(self) -> tuple[FailureHistoryEntry, ...]:
+        """Return recent entries for tests and future read-only reporting."""
+
+        return tuple(self._entries)
+
+    def backoff_for(self, *, error_type: str, scope: str, model: Optional[str], default_duration: int) -> BackoffDecision:
+        """Return bounded backoff for repeated transient failures."""
+
+        window = _env_int("PROVIDER_BACKOFF_WINDOW_SECONDS", 60)
+        threshold = max(1, _env_int("PROVIDER_BACKOFF_THRESHOLD", 3))
+        base = max(1, _env_int("PROVIDER_BACKOFF_BASE_SECONDS", default_duration))
+        max_seconds = max(base, _env_int("PROVIDER_BACKOFF_MAX_SECONDS", 300))
+        now = float(self._clock())
+        recent = [
+            entry
+            for entry in self._entries
+            if now - entry.timestamp <= window
+            and entry.error_type == error_type
+            and entry.scope == scope
+            and (scope != "model" or entry.model == model)
+        ]
+        if len(recent) + 1 < threshold:
+            return BackoffDecision(default_duration, level=0)
+        level = len(recent) + 1 - threshold + 1
+        return BackoffDecision(min(max_seconds, base * (2 ** (level - 1))), level=level)
+
+
+def is_model_capacity_error(error: Any) -> bool:
+    """Return whether an error indicates model/deployment capacity exhaustion."""
+
+    if error is None:
+        return False
+    if isinstance(error, dict):
+        text = str(error).lower()
+    else:
+        parts = [str(error)]
+        response = getattr(error, "response", None)
+        if response is not None:
+            parts.append(str(getattr(response, "text", "")))
+        body = getattr(error, "body", None)
+        if body is not None:
+            parts.append(str(body))
+        text = " ".join(parts).lower()
+    return "model_capacity_exhausted" in text or "model capacity" in text or "capacity exhausted" in text
 
 
 def provider_cooldown_env() -> tuple[int, int, bool]:

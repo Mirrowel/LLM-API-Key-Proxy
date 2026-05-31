@@ -4,8 +4,10 @@ import asyncio
 
 from rotator_library.error_handler import ClassifiedError, PreRequestCallbackError, classify_error
 from rotator_library.retry_policy import (
+    FailureHistory,
     classify_route_error,
     decide_provider_cooldown,
+    is_model_capacity_error,
     is_target_failover_eligible,
     should_retry_same_credential,
     should_rotate_credential,
@@ -68,6 +70,7 @@ def test_provider_cooldown_uses_large_retry_after_not_small_retry_after() -> Non
     assert small.reason == "small_retry_after"
     assert large.should_start is True
     assert large.duration == 60
+    assert large.scope == "provider"
 
 
 def test_provider_cooldown_is_conservative_for_quota_by_default() -> None:
@@ -86,6 +89,55 @@ def test_provider_cooldown_is_conservative_for_quota_by_default() -> None:
     assert disabled.should_start is False
     assert disabled.reason == "quota_cooldown_disabled"
     assert enabled.should_start is True
+
+
+def test_model_capacity_error_uses_model_scoped_cooldown() -> None:
+    error = Exception("503 MODEL_CAPACITY_EXHAUSTED")
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=30,
+        model="gpt-test",
+        original_error=error,
+    )
+
+    assert is_model_capacity_error(error) is True
+    assert decision.should_start is True
+    assert decision.scope == "model"
+    assert decision.model == "gpt-test"
+    assert decision.reason == "model_capacity_cooldown"
+
+
+def test_failure_history_escalates_repeated_transient_backoff(monkeypatch) -> None:
+    now = 1000.0
+    history = FailureHistory(clock=lambda: now)
+    monkeypatch.setenv("PROVIDER_BACKOFF_THRESHOLD", "3")
+    monkeypatch.setenv("PROVIDER_BACKOFF_BASE_SECONDS", "10")
+    monkeypatch.setenv("PROVIDER_BACKOFF_MAX_SECONDS", "40")
+    history.record(provider="openai", model=None, error_type="server_error", scope="provider", duration=10, reason="test")
+    history.record(provider="openai", model=None, error_type="server_error", scope="provider", duration=10, reason="test")
+
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        failure_history=history,
+    )
+
+    assert decision.duration == 10
+    assert decision.backoff_level == 1
+    history.record(provider="openai", model=None, error_type="server_error", scope="provider", duration=10, reason="test")
+    decision = decide_provider_cooldown(
+        _classified("server_error"),
+        small_cooldown_threshold=10,
+        provider_cooldown_min_seconds=10,
+        default_duration=10,
+        failure_history=history,
+    )
+    assert decision.duration == 20
+    assert decision.backoff_level == 2
 
 
 def test_shared_classifier_handles_structured_dict_status_codes() -> None:
