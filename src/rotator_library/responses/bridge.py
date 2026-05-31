@@ -130,7 +130,6 @@ def responses_session_hints(previous_response_id: Optional[str], *, affinity_key
     return {
         "strong_anchors": [anchor],
         "affinity_key": affinity_key or anchor,
-        "session_scope": "responses",
     }
 
 
