@@ -81,6 +81,28 @@ def test_structured_cost_breakdown_without_total_is_summed() -> None:
     assert record.cost_source == "provider_reported_breakdown"
 
 
+def test_reference_extended_cost_breakdown_aliases_are_summed() -> None:
+    record = extract_usage_record(
+        {
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cost_details": {
+                    "upstream_inference_input_cost": 0.01,
+                    "upstream_inference_output_cost": 0.02,
+                    "image_input_cost": 0.003,
+                    "audio_input_cost": 0.004,
+                    "data_storage_cost": 0.005,
+                    "estimated_cost": 0.006,
+                    "cost_in_usd_ticks": 0.007,
+                },
+            }
+        }
+    )
+
+    assert record.provider_reported_cost == 0.055
+
+
 def test_openai_object_usage_extracts_attributes() -> None:
     response = SimpleNamespace(
         usage=SimpleNamespace(
