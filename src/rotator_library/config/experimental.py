@@ -173,7 +173,11 @@ def parse_field_cache_rules(config: ExperimentalConfig, provider: str, model: st
     if not isinstance(provider_rules, dict):
         return ()
     raw_rules: list[Any] = []
-    for key in ("*", model):
+    keys = ["*"]
+    if "/" in model:
+        keys.append(model.split("/", 1)[1])
+    keys.append(model)
+    for key in dict.fromkeys(keys):
         value = provider_rules.get(key, [])
         if isinstance(value, list):
             raw_rules.extend(value)

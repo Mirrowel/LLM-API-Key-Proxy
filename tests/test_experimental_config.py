@@ -70,6 +70,22 @@ def test_field_cache_rules_parse_wildcard_then_model_specific() -> None:
     assert rules[0].inject is not None
 
 
+def test_field_cache_rules_match_unprefixed_model_alias() -> None:
+    config = load_config_from_mapping(
+        {
+            "field_cache": {
+                "gemini_cli": {
+                    "gemini-3": [{"name": "signature", "source": "response", "path": "sig"}],
+                }
+            }
+        }
+    )
+
+    rules = parse_field_cache_rules(config, "gemini_cli", "gemini_cli/gemini-3")
+
+    assert [rule.name for rule in rules] == ["signature"]
+
+
 def test_env_price_key_sanitizes_provider_and_model() -> None:
     assert env_price_key("openai", "gpt-5.1-mini", "cache_read") == "MODEL_PRICE_OPENAI_GPT_5_1_MINI_CACHE_READ"
 

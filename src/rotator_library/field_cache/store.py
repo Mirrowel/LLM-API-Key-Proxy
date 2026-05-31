@@ -12,6 +12,8 @@ from typing import Any, Callable, Protocol
 
 from ..protocols import serialize_value
 
+_TTL_ENVELOPE_MARKER = "__llm_proxy_field_cache_ttl_v1__"
+
 
 class FieldCacheStore(Protocol):
     """Minimal async store interface used by `FieldCacheEngine`."""
@@ -89,7 +91,7 @@ class ProviderCacheFieldStore:
         if raw is None:
             return None
         value = json.loads(raw)
-        if isinstance(value, dict) and value.get("__field_cache_wrapped__") is True:
+        if isinstance(value, dict) and value.get(_TTL_ENVELOPE_MARKER) is True:
             expires_at = value.get("expires_at")
             if isinstance(expires_at, (int, float)) and expires_at <= time.time():
                 return None
@@ -99,7 +101,7 @@ class ProviderCacheFieldStore:
     async def set(self, key: str, value: Any, *, ttl_seconds: int | None = None) -> None:
         payload = serialize_value(value)
         if ttl_seconds is not None and ttl_seconds > 0:
-            payload = {"__field_cache_wrapped__": True, "expires_at": time.time() + ttl_seconds, "value": payload}
+            payload = {_TTL_ENVELOPE_MARKER: True, "expires_at": time.time() + ttl_seconds, "value": payload}
         await self._cache.store_async(key, json.dumps(payload, ensure_ascii=False))
 
     async def append(self, key: str, values: list[Any], *, ttl_seconds: int | None = None) -> list[Any]:

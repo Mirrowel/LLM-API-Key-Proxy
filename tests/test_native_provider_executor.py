@@ -70,6 +70,8 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
 
     assert result["id"] == "chat_1"
     assert client.calls[0]["json"]["model"] == "provider/gpt-test"
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "hidden" not in trace_text
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "native_protocol_selected" in pass_names
     assert "raw_native_client_request" in pass_names

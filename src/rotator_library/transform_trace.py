@@ -43,6 +43,13 @@ _SENSITIVE_KEYS = frozenset(
         "password",
         "secret",
         "token",
+        # Provider protocol-state fields can contain opaque signatures or
+        # reasoning continuations that field-cache rules preserve and re-inject.
+        "reasoning-content",
+        "reasoningcontent",
+        "thought-signature",
+        "thoughtsignature",
+        "signature",
     }
 )
 
@@ -109,8 +116,13 @@ def sanitize_for_trace(value: Any, *, scrub_strings: bool = False) -> Any:
 
     if isinstance(value, Mapping):
         sanitized = {}
+        block_type = str(value.get("type", "")).lower()
+        source_field = str(value.get("source_field", "")).lower()
+        if not source_field and isinstance(value.get("extra"), Mapping):
+            source_field = str(value["extra"].get("source_field", "")).lower()
+        is_reasoning_block = "reasoning" in block_type or source_field in {"reasoning_content", "thoughtsignature", "thought_signature", "signature"}
         for key, item in value.items():
-            if _normalise_key(key) in _SENSITIVE_KEYS:
+            if _normalise_key(key) in _SENSITIVE_KEYS or (is_reasoning_block and _normalise_key(key) == "text"):
                 sanitized[str(key)] = REDACTED
             else:
                 sanitized[str(key)] = sanitize_for_trace(item, scrub_strings=scrub_strings)

@@ -31,6 +31,16 @@ class FakeHTTPClient:
         return FakeNativeResponse({"id": "chat_native", "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
 
 
+class SequencedHTTPClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def post(self, endpoint, *, headers, json):
+        self.calls.append({"endpoint": endpoint, "headers": headers, "json": json})
+        return FakeNativeResponse(self.responses.pop(0))
+
+
 class NativePlugin:
     def has_custom_logic(self):
         return False
@@ -60,8 +70,9 @@ class NativePluginWithRule(NativePlugin):
             FieldCacheRule(
                 name="state",
                 source="response",
-                path="provider.path",
+                path="choices.0.message.reasoning_content",
                 inject=FieldCacheInjection(target="request", path="metadata.state"),
+                allow_missing_session=True,
             ),
         )
 
@@ -113,6 +124,24 @@ async def test_native_declared_provider_uses_native_executor_in_auto_mode() -> N
     assert http_client.calls[0]["headers"]["Authorization"] == "Bearer secret"
 
 
+@pytest.mark.asyncio
+async def test_request_executor_reuses_native_field_cache_store() -> None:
+    http_client = SequencedHTTPClient(
+        [
+            {"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "cached"}}]},
+            {"id": "chat_2", "choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        ]
+    )
+    executor = _executor(http_client)
+    context = _context(parse_route_target("provider/gpt-test"))
+    context.routing_target_index = 0
+
+    await executor._execute_provider_request("provider", "provider/gpt-test", NativePluginWithRule(), "secret", "stable", dict(context.kwargs), context)
+    await executor._execute_provider_request("provider", "provider/gpt-test", NativePluginWithRule(), "secret", "stable", dict(context.kwargs), context)
+
+    assert http_client.calls[1]["json"]["metadata"]["state"] == "cached"
+
+
 def test_native_context_merges_json_field_cache_rules(monkeypatch, tmp_path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -154,6 +183,17 @@ def test_native_context_merges_json_field_cache_rules(monkeypatch, tmp_path) -> 
 
     assert [rule.name for rule in native_context.field_cache_rules] == ["state", "extra"]
     assert native_context.field_cache_rules[0].path == "json.path"
+
+
+def test_native_context_raises_on_invalid_field_cache_config(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"field_cache": {"provider": {"*": [{"name": "bad", "source": "response"}]}}}), encoding="utf-8")
+    monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", str(config_path))
+
+    with pytest.raises(RoutingExecutionError) as exc:
+        _executor()._build_native_provider_context("provider", "provider/gpt-test", NativePlugin(), "secret", "stable", _context(), None)
+
+    assert exc.value.error_type == "configuration_error"
 
 
 @pytest.mark.asyncio
