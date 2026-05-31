@@ -46,3 +46,42 @@ def test_load_routing_config_rejects_duplicate_group_names() -> None:
 def test_load_routing_config_rejects_unknown_group_route() -> None:
     with pytest.raises(RoutingConfigError):
         load_routing_config_from_env({"MODEL_ROUTE_CODEX": "group:missing"})
+
+
+def test_load_routing_config_parses_group_policy_overrides() -> None:
+    config = load_routing_config_from_env(
+        {
+            "FALLBACK_GROUPS": "chain",
+            "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
+            "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "network,transient",
+            "FALLBACK_GROUP_CHAIN_STOP_ON": "validation",
+            "FALLBACK_GROUP_CHAIN_STREAMING_POLICY": "never",
+        }
+    )
+
+    group = config.fallback_groups["chain"]
+    assert group.failover_on == frozenset({"api_connection", "server_error"})
+    assert group.stop_on == frozenset({"invalid_request"})
+    assert group.streaming_policy == "never"
+
+
+def test_load_routing_config_rejects_hard_stop_failover() -> None:
+    with pytest.raises(RoutingConfigError):
+        load_routing_config_from_env(
+            {
+                "FALLBACK_GROUPS": "chain",
+                "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
+                "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "auth",
+            }
+        )
+
+
+def test_load_routing_config_rejects_unknown_streaming_policy() -> None:
+    with pytest.raises(RoutingConfigError):
+        load_routing_config_from_env(
+            {
+                "FALLBACK_GROUPS": "chain",
+                "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
+                "FALLBACK_GROUP_CHAIN_STREAMING_POLICY": "always",
+            }
+        )

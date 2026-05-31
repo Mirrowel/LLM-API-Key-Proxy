@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from rotator_library.routing import FallbackPolicy, parse_route_target
+from rotator_library.routing.policy import normalize_route_error_type
 from rotator_library.routing.types import FallbackGroup
 
 
@@ -33,13 +34,33 @@ def test_policy_allows_stream_fallback_before_visible_output() -> None:
     assert FallbackPolicy().should_fallback("rate_limit", stream=True, emitted_output=False) is True
 
 
-def test_policy_respects_group_overrides() -> None:
+def test_policy_respects_safe_group_overrides() -> None:
     group = FallbackGroup(
         name="auth_safe",
         targets=(parse_route_target("a/model"), parse_route_target("b/model")),
-        failover_on=frozenset({"auth"}),
+        failover_on=frozenset({"network"}),
         stop_on=frozenset({"validation"}),
     )
 
-    assert FallbackPolicy().should_fallback("auth", group=group) is True
+    assert FallbackPolicy().should_fallback("api_connection", group=group) is True
     assert FallbackPolicy().should_fallback("validation", group=group) is False
+
+
+def test_policy_hard_stops_cannot_be_overridden_by_group_failover() -> None:
+    group = FallbackGroup(
+        name="unsafe",
+        targets=(parse_route_target("a/model"), parse_route_target("b/model")),
+        failover_on=frozenset({"auth", "configuration"}),
+        stop_on=frozenset(),
+    )
+
+    assert FallbackPolicy().should_fallback("authentication", group=group) is False
+    assert FallbackPolicy().should_fallback("configuration_error", group=group) is False
+
+
+def test_policy_normalizes_user_facing_aliases() -> None:
+    assert normalize_route_error_type("auth") == "authentication"
+    assert normalize_route_error_type("permission-denied") == "forbidden"
+    assert normalize_route_error_type("bad request") == "invalid_request"
+    assert FallbackPolicy().should_fallback("network") is True
+    assert FallbackPolicy().should_fallback("validation") is False

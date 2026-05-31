@@ -8,7 +8,8 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from .types import DEFAULT_FAILOVER_ON, DEFAULT_STOP_ON, FallbackGroup, RouteTarget, RoutingConfig
+from .policy import normalize_route_error_set
+from .types import DEFAULT_FAILOVER_ON, DEFAULT_STOP_ON, HARD_STOP_ON, FallbackGroup, RouteTarget, RoutingConfig
 
 
 class RoutingConfigError(ValueError):
@@ -57,7 +58,10 @@ def load_routing_config_from_env(env: Mapping[str, str] | None = None, config: o
         target_specs = _csv(source.get(key, ""))
         if not target_specs:
             raise RoutingConfigError(f"fallback group {name} has no targets")
-        groups[name] = FallbackGroup(name=name, targets=tuple(parse_route_target(spec) for spec in target_specs))
+        failover_on = _policy_set(source.get(f"{key}_FAILOVER_ON"), DEFAULT_FAILOVER_ON, name)
+        stop_on = _policy_set(source.get(f"{key}_STOP_ON"), DEFAULT_STOP_ON, name, allow_hard_stop=True)
+        streaming_policy = _streaming_policy(source.get(f"{key}_STREAMING_POLICY", "pre_output_only"), name)
+        groups[name] = FallbackGroup(name=name, targets=tuple(parse_route_target(spec) for spec in target_specs), failover_on=failover_on, stop_on=stop_on, streaming_policy=streaming_policy)
 
     model_routes: dict[str, str] = _model_routes_from_json_config(config)
     for key, value in source.items():
@@ -87,8 +91,9 @@ def _groups_from_json_config(config: object) -> dict[str, FallbackGroup]:
         groups[str(name)] = FallbackGroup(
             name=str(name),
             targets=tuple(parse_route_target(str(spec)) for spec in raw_targets),
-            failover_on=_string_set(raw_group.get("failover_on"), DEFAULT_FAILOVER_ON),
-            stop_on=_string_set(raw_group.get("stop_on"), DEFAULT_STOP_ON),
+            failover_on=_policy_set(raw_group.get("failover_on"), DEFAULT_FAILOVER_ON, str(name)),
+            stop_on=_policy_set(raw_group.get("stop_on"), DEFAULT_STOP_ON, str(name), allow_hard_stop=True),
+            streaming_policy=_streaming_policy(raw_group.get("streaming_policy", "pre_output_only"), str(name)),
             max_targets=int(raw_group["max_targets"]) if raw_group.get("max_targets") is not None else None,
             metadata=dict(raw_group.get("metadata", {})) if isinstance(raw_group.get("metadata", {}), Mapping) else {},
         )
@@ -119,6 +124,21 @@ def _string_set(value: object, default: frozenset[str]) -> frozenset[str]:
     if isinstance(value, list):
         return frozenset(str(item) for item in value)
     raise RoutingConfigError("routing policy lists must be strings or arrays")
+
+
+def _policy_set(value: object, default: frozenset[str], group_name: str, *, allow_hard_stop: bool = False) -> frozenset[str]:
+    values = normalize_route_error_set(_string_set(value, default))
+    unsafe = values & HARD_STOP_ON
+    if unsafe and not allow_hard_stop:
+        raise RoutingConfigError(f"fallback group {group_name} failover_on cannot include hard-stop errors: {', '.join(sorted(unsafe))}")
+    return values
+
+
+def _streaming_policy(value: object, group_name: str):
+    policy = str(value or "pre_output_only").strip().lower()
+    if policy not in {"pre_output_only", "never"}:
+        raise RoutingConfigError(f"fallback group {group_name} has unsupported streaming_policy {value!r}")
+    return policy
 
 
 def _csv(value: str) -> list[str]:

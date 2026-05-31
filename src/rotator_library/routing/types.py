@@ -42,6 +42,18 @@ DEFAULT_STOP_ON = frozenset(
         "pre_request_callback",
     }
 )
+HARD_STOP_ON = frozenset(
+    {
+        "authentication",
+        "forbidden",
+        "invalid_request",
+        "context_window_exceeded",
+        "credential_reauth_needed",
+        "pre_request_callback_error",
+        "cancelled",
+        "configuration_error",
+    }
+)
 
 
 @dataclass(frozen=True)
