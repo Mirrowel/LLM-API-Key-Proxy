@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
+from .operation import OPERATION_CHAT, OPERATION_COUNT_TOKENS
 from .types import (
     ContentBlock,
     ProtocolContext,
@@ -54,6 +55,7 @@ class GeminiProtocol(ProtocolAdapter):
     name: ClassVar[str] = "gemini"
     aliases: ClassVar[tuple[str, ...]] = ("google_gemini", "generate_content")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT, OPERATION_COUNT_TOKENS)
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})

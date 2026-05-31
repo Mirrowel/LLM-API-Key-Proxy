@@ -13,6 +13,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, ClassVar
 
+from .operation import OPERATION_UNKNOWN, normalize_operation
 from .types import (
     ProtocolContext,
     ProtocolError,
@@ -36,6 +37,7 @@ class ProtocolAdapter:
     aliases: ClassVar[tuple[str, ...]] = ()
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
     future_transports: ClassVar[tuple[str, ...]] = ()
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_UNKNOWN,)
 
     def supports_transport(self, transport_name: str) -> bool:
         """Return whether this protocol can format the requested transport."""
@@ -47,15 +49,34 @@ class ProtocolAdapter:
 
         return transport_name in self.future_transports
 
+    def supports_operation(self, operation_name: str) -> bool:
+        """Return whether this adapter natively models an operation.
+
+        Operation names are string based so custom protocols can add their own
+        values. The default base adapter only claims ``unknown`` and keeps raw
+        payloads intact; concrete adapters should list every operation they can
+        parse/build without relying on LiteLLM.
+        """
+
+        return normalize_operation(operation_name) in self.supported_operations
+
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         """Parse a raw client/provider request into a unified request."""
 
         request = dict(raw_request or {})
         return UnifiedRequest(
+            operation=normalize_operation(request.get("operation")),
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             stream=bool(request.get("stream", False)),
+            input=deepcopy(request.get("input")),
+            modalities=list(request.get("modalities") or []),
+            files=list(request.get("files") or []),
             raw=deepcopy(raw_request),
-            extra={k: deepcopy(v) for k, v in request.items() if k not in {"model", "stream"}},
+            extra={
+                k: deepcopy(v)
+                for k, v in request.items()
+                if k not in {"operation", "model", "stream", "input", "modalities", "files"}
+            },
         )
 
     def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
@@ -76,6 +97,14 @@ class ProtocolAdapter:
                 payload=unified_request.raw,
             )
         payload = {"model": unified_request.model, "stream": unified_request.stream}
+        if unified_request.operation != OPERATION_UNKNOWN:
+            payload["operation"] = unified_request.operation
+        if unified_request.input is not None:
+            payload["input"] = deepcopy(unified_request.input)
+        if unified_request.modalities:
+            payload["modalities"] = deepcopy(unified_request.modalities)
+        if unified_request.files:
+            payload["files"] = deepcopy(unified_request.files)
         payload.update(deepcopy(unified_request.extra))
         return payload
 
@@ -84,8 +113,11 @@ class ProtocolAdapter:
 
         response = raw_response if isinstance(raw_response, dict) else {}
         return UnifiedResponse(
+            operation=normalize_operation(response.get("operation") if isinstance(response, dict) else None),
             id=response.get("id") if isinstance(response, dict) else None,
             model=response.get("model") if isinstance(response, dict) else getattr(context, "model", None),
+            data=deepcopy(response.get("data") or []) if isinstance(response, dict) else [],
+            content_type=response.get("content_type") if isinstance(response, dict) else None,
             raw=deepcopy(raw_response),
             extra=deepcopy(response) if isinstance(response, dict) else {},
         )
@@ -96,10 +128,16 @@ class ProtocolAdapter:
         if isinstance(unified_response.raw, dict):
             return deepcopy(unified_response.raw)
         payload = deepcopy(unified_response.extra)
+        if unified_response.operation != OPERATION_UNKNOWN:
+            payload.setdefault("operation", unified_response.operation)
         if unified_response.id is not None:
             payload.setdefault("id", unified_response.id)
         if unified_response.model is not None:
             payload.setdefault("model", unified_response.model)
+        if unified_response.data:
+            payload.setdefault("data", deepcopy(unified_response.data))
+        if unified_response.content_type is not None:
+            payload.setdefault("content_type", unified_response.content_type)
         return payload
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:

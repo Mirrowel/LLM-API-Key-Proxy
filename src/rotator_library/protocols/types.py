@@ -19,6 +19,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Mapping, Optional
 
+from .operation import OPERATION_UNKNOWN
+
 
 JsonObject = dict[str, Any]
 
@@ -250,11 +252,15 @@ class UnifiedMessage(ProtocolSerializable):
 class UnifiedRequest(ProtocolSerializable):
     """A request after parsing from a client or provider protocol."""
 
+    operation: str = OPERATION_UNKNOWN
     model: str = ""
     messages: list[UnifiedMessage] = field(default_factory=list)
     system: list[ContentBlock] = field(default_factory=list)
     tools: list[ToolDefinition] = field(default_factory=list)
     stream: bool = False
+    input: Any = None
+    modalities: list[str] = field(default_factory=list)
+    files: list[Any] = field(default_factory=list)
     generation_params: JsonObject = field(default_factory=dict)
     response_format: Any = None
     previous_response_id: Optional[str] = None
@@ -263,11 +269,15 @@ class UnifiedRequest(ProtocolSerializable):
     extra: JsonObject = field(default_factory=dict)
 
     _fields: ClassVar[tuple[str, ...]] = (
+        "operation",
         "model",
         "messages",
         "system",
         "tools",
         "stream",
+        "input",
+        "modalities",
+        "files",
         "generation_params",
         "response_format",
         "previous_response_id",
@@ -281,10 +291,13 @@ class UnifiedRequest(ProtocolSerializable):
 class UnifiedResponse(ProtocolSerializable):
     """A complete provider/client response in protocol-neutral form."""
 
+    operation: str = OPERATION_UNKNOWN
     id: Optional[str] = None
     model: Optional[str] = None
     messages: list[UnifiedMessage] = field(default_factory=list)
     output: list[Any] = field(default_factory=list)
+    data: list[Any] = field(default_factory=list)
+    content_type: Optional[str] = None
     stop_reason: Optional[str] = None
     usage: Optional[Usage] = None
     metadata: JsonObject = field(default_factory=dict)
@@ -292,10 +305,13 @@ class UnifiedResponse(ProtocolSerializable):
     extra: JsonObject = field(default_factory=dict)
 
     _fields: ClassVar[tuple[str, ...]] = (
+        "operation",
         "id",
         "model",
         "messages",
         "output",
+        "data",
+        "content_type",
         "stop_reason",
         "usage",
         "metadata",
@@ -313,6 +329,7 @@ class UnifiedStreamEvent(ProtocolSerializable):
     """
 
     type: str
+    operation: str = OPERATION_UNKNOWN
     delta: Optional[UnifiedMessage] = None
     message: Optional[UnifiedMessage] = None
     tool_call: Optional[ToolCall] = None
@@ -323,6 +340,7 @@ class UnifiedStreamEvent(ProtocolSerializable):
 
     _fields: ClassVar[tuple[str, ...]] = (
         "type",
+        "operation",
         "delta",
         "message",
         "tool_call",
