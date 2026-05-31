@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from rotator_library.client.executor import RequestExecutor
+from rotator_library.client.executor import RequestExecutor, _can_start_stream_provider_cooldown
 from rotator_library.cooldown_manager import CooldownManager
 from rotator_library.core.types import RequestContext
 from rotator_library.error_handler import ClassifiedError
@@ -88,3 +88,9 @@ async def test_small_retry_after_skips_provider_cooldown(monkeypatch) -> None:
     )
 
     assert cooldown.started == []
+
+
+def test_streaming_provider_cooldown_gate_allows_only_pre_output_failures() -> None:
+    assert _can_start_stream_provider_cooldown(None) is True
+    assert _can_start_stream_provider_cooldown('data: {"error":{"type":"rate_limit"}}\n\n') is True
+    assert _can_start_stream_provider_cooldown('data: {"choices":[{"delta":{"content":"visible"}}]}\n\n') is False
