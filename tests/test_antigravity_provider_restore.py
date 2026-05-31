@@ -49,10 +49,13 @@ def test_antigravity_provider_builds_static_headers_without_device_profile(monke
 
     headers = provider.get_native_headers("token")
 
-    assert provider.get_native_endpoint(operation="generate") == "https://antigravity.test/v1internal:streamGenerateContent?alt=sse"
+    assert provider.get_native_endpoint(operation="generate") == "https://antigravity.test/v1internal:generateContent"
+    assert provider.get_native_endpoint(operation="stream_generate") == "https://antigravity.test/v1internal:streamGenerateContent?alt=sse"
     assert provider.get_native_endpoint(operation="models") == "https://antigravity.test/v1internal:fetchAvailableModels"
     assert headers["Authorization"] == "Bearer token"
     assert headers["X-Goog-Api-Client"] == "google-cloud-sdk vscode_cloudshelleditor/0.1"
+    assert "Accept" not in headers
+    assert provider.get_native_headers("token", operation="stream_generate")["Accept"] == "text/event-stream"
     assert "X-Client-Device-Id" not in headers
 
 

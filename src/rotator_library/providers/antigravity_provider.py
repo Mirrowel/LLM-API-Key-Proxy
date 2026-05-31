@@ -64,7 +64,7 @@ class AntigravityProvider(ProviderInterface):
             path="candidates.*.content.parts.*.thoughtSignature",
             mode="all",
             scope=("provider", "model", "credential", "session"),
-            inject=FieldCacheInjection(target="request", path="metadata.thoughtSignatures", as_list=True),
+            inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
             metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
         ),
     )
@@ -102,12 +102,14 @@ class AntigravityProvider(ProviderInterface):
         is verified with tests.
         """
 
-        return {
+        headers = {
             "Authorization": f"Bearer {credential_identifier}",
             "Content-Type": "application/json",
-            "Accept": "text/event-stream",
             **ANTIGRAVITY_HEADERS,
         }
+        if operation == "stream_generate":
+            headers["Accept"] = "text/event-stream"
+        return headers
 
     def get_native_operation(self, model: str = "", request: dict[str, Any] | None = None, stream: bool = False) -> str:
         """Return the Gemini generate operation used by Antigravity endpoints."""
@@ -145,7 +147,9 @@ class AntigravityProvider(ProviderInterface):
 
         if operation == "models":
             return f"{self.get_api_base()}:fetchAvailableModels"
-        return f"{self.get_api_base()}:streamGenerateContent?alt=sse"
+        if operation == "stream_generate":
+            return f"{self.get_api_base()}:streamGenerateContent?alt=sse"
+        return f"{self.get_api_base()}:generateContent"
 
     def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
         """Configure the safe Antigravity internal request envelope."""

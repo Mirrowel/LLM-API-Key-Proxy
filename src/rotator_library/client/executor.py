@@ -1393,12 +1393,7 @@ class RequestExecutor:
                                     execution = target.execution if target else "auto"
 
                                     # Make the API call
-                                    if execution == "native" or (
-                                        execution == "auto"
-                                        and plugin
-                                        and _provider_native_protocol(plugin, model, target)
-                                        and _provider_supports_native_streaming(plugin, model)
-                                    ):
+                                    if _should_use_native_streaming(plugin, model, target, execution, provider):
                                         native_context, native_request = self._build_native_provider_context(
                                             provider,
                                             model,
@@ -2346,6 +2341,24 @@ def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
             return bool(support(model))
         except TypeError:
             return bool(support())
+
+
+def _should_use_native_streaming(plugin: Any, model: str, target: Optional[RouteTarget], execution: str, provider: str) -> bool:
+    """Return whether streaming may use the native executor.
+
+    Explicit `@native` routing is still constrained by provider capability.
+    Falling through to native streaming when a provider has not opted in is unsafe
+    because the generic stream wrapper currently expects LiteLLM-shaped chunks.
+    """
+
+    if execution == "native":
+        if _provider_supports_native_streaming(plugin, model):
+            return True
+        raise RoutingExecutionError(
+            f"Provider {provider} does not support native streaming for {model}",
+            error_type="configuration_error",
+        )
+    return bool(execution == "auto" and plugin and _provider_native_protocol(plugin, model, target) and _provider_supports_native_streaming(plugin, model))
 
 
 def _redact_context_field_cache_paths(payload: Any, context: RequestContext, direction: str, plugin: Any) -> Any:
