@@ -6,6 +6,8 @@ from rotator_library.config.experimental import (
     ExperimentalConfigError,
     as_int,
     env_price_key,
+    get_responses_store_settings,
+    get_retry_runtime_settings,
     get_stream_runtime_settings,
     load_config_from_mapping,
     load_experimental_config,
@@ -50,6 +52,51 @@ def test_stream_runtime_settings_env_overrides_json() -> None:
 
     assert settings.trace_metrics is False
     assert settings.stall_timeout_seconds == 30
+
+
+def test_retry_runtime_settings_env_overrides_json() -> None:
+    config = load_config_from_mapping(
+        {
+            "retry": {
+                "provider_cooldown": {"provider_cooldown_min_seconds": 20, "provider_cooldown_on_quota": True},
+                "backoff": {"provider_backoff_threshold": 4, "failure_history_max_entries": 50},
+            }
+        }
+    )
+
+    settings = get_retry_runtime_settings(config=config, env={"PROVIDER_COOLDOWN_MIN_SECONDS": "5"})
+
+    assert settings.provider_cooldown_min_seconds == 5
+    assert settings.provider_cooldown_on_quota is True
+    assert settings.provider_backoff_threshold == 4
+    assert settings.failure_history_max_entries == 50
+
+
+def test_responses_store_settings_env_overrides_json() -> None:
+    config = load_config_from_mapping(
+        {
+            "responses": {
+                "store": {
+                    "ttl_seconds": 60,
+                    "max_items": 10,
+                    "store_failed": False,
+                    "store_in_progress": True,
+                }
+            }
+        }
+    )
+
+    settings = get_responses_store_settings(config=config, env={"RESPONSES_STORE_MAX_ITEMS": "5", "RESPONSES_STORE_FAILED": "true"})
+
+    assert settings.ttl_seconds == 60
+    assert settings.max_items == 5
+    assert settings.store_failed is True
+    assert settings.store_in_progress is True
+
+
+def test_new_config_sections_still_reject_secret_like_keys() -> None:
+    with pytest.raises(ExperimentalConfigError):
+        load_config_from_mapping({"responses": {"store": {"authorization": "hidden"}}})
 
 
 def test_field_cache_rules_parse_wildcard_then_model_specific() -> None:
