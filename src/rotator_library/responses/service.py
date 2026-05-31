@@ -240,6 +240,7 @@ class ResponsesService:
         acquire_task = None
         acquire_started_at = None
         acquire_last_heartbeat_at = None
+        ttfb_started_at = time.monotonic()
 
         async def cancel_task(task: Any) -> None:
             """Cancel and await an in-flight stream task before closing its source."""
@@ -295,7 +296,7 @@ class ResponsesService:
                 pending_next_started_at = time.monotonic()
                 pending_next_last_heartbeat_at = pending_next_started_at
             next_task = pending_next_task
-            started_at = pending_next_started_at or time.monotonic()
+            started_at = ttfb_started_at if first else (pending_next_started_at or time.monotonic())
             while True:
                 if next_task.done():
                     pending_next_task = None
@@ -354,7 +355,7 @@ class ResponsesService:
             nonlocal acquire_task, acquire_started_at, acquire_last_heartbeat_at
             if acquire_task is None:
                 acquire_task = asyncio.create_task(client.acompletion(request=request, **chat_kwargs))
-                acquire_started_at = time.monotonic()
+                acquire_started_at = ttfb_started_at
                 acquire_last_heartbeat_at = acquire_started_at
             task = acquire_task
             started_at = acquire_started_at or time.monotonic()
@@ -564,6 +565,12 @@ class ResponsesService:
             self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
             yield ResponsesStreamEvent("done", {}, terminal=True)
         finally:
+            if chat_stream is None and acquire_task is not None and acquire_task.done() and not acquire_task.cancelled():
+                try:
+                    chat_stream = acquire_task.result()
+                    stream_iterator = chat_stream.__aiter__()
+                except Exception:
+                    chat_stream = None
             await cancel_task(pending_next_task)
             await cancel_task(acquire_task)
             if chat_stream is not None and not upstream_closed:
