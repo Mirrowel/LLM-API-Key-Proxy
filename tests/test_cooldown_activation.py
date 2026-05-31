@@ -14,9 +14,18 @@ from rotator_library.transaction_logger import TransactionLogger
 class FakeCooldown:
     def __init__(self) -> None:
         self.started = []
+        self.scoped_started = []
+        self.waits = []
 
     async def start_cooldown(self, provider, duration):
         self.started.append((provider, duration))
+
+    async def start_scoped_cooldown(self, provider, duration, *, model=None, scope="provider", reason=None):
+        self.scoped_started.append((provider, duration, model, scope, reason))
+
+    async def get_max_remaining(self, provider, *, model=None):
+        self.waits.append((provider, model))
+        return 0
 
 
 @pytest.mark.asyncio
@@ -78,6 +87,9 @@ def _classified(error_type: str, retry_after=None) -> ClassifiedError:
 def _executor(cooldown) -> RequestExecutor:
     executor = RequestExecutor.__new__(RequestExecutor)
     executor._cooldown = cooldown
+    from rotator_library.retry_policy import FailureHistory
+
+    executor._failure_history = FailureHistory()
     return executor
 
 
@@ -106,7 +118,7 @@ async def test_large_retry_after_starts_provider_cooldown_and_traces(tmp_path, m
         context=_context(logger),
     )
 
-    assert cooldown.started == [("openai", 60)]
+    assert cooldown.scoped_started == [("openai", 60, None, "provider", "retry_after")]
     trace = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
     assert "provider_cooldown_started" in trace
 
@@ -123,6 +135,35 @@ async def test_small_retry_after_skips_provider_cooldown(monkeypatch) -> None:
     )
 
     assert cooldown.started == []
+    assert cooldown.scoped_started == []
+
+
+@pytest.mark.asyncio
+async def test_model_capacity_starts_model_scoped_cooldown(monkeypatch) -> None:
+    monkeypatch.setenv("PROVIDER_COOLDOWN_DEFAULT_SECONDS", "30")
+    monkeypatch.setenv("PROVIDER_COOLDOWN_MIN_SECONDS", "10")
+    cooldown = FakeCooldown()
+    executor = _executor(cooldown)
+
+    await executor._maybe_start_provider_cooldown(
+        "openai",
+        _classified("server_error"),
+        context=None,
+        model="gpt-5",
+        original_error=Exception("MODEL_CAPACITY_EXHAUSTED"),
+    )
+
+    assert cooldown.scoped_started == [("openai", 30, "gpt-5", "model", "model_capacity_cooldown")]
+    assert executor._failure_history.snapshot()[0].scope == "model"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cooldown_uses_model_scope_when_available() -> None:
+    cooldown = FakeCooldown()
+
+    await _executor(cooldown)._wait_for_cooldown("openai", 9999999999.0, model="gpt-5")
+
+    assert cooldown.waits == [("openai", "gpt-5")]
 
 
 def test_streaming_provider_cooldown_gate_allows_only_pre_output_failures() -> None:
