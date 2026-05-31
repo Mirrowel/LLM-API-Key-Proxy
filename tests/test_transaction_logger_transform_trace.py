@@ -183,6 +183,20 @@ def test_log_transform_error_uses_standard_shape_and_scrubs_text(tmp_path) -> No
     assert "secret" not in json.dumps(entries[0]["data"])
 
 
+def test_trace_redacts_camel_case_secret_keys(tmp_path) -> None:
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+
+    logger.log_transform_pass(
+        "camel_secret_payload",
+        {"apiKey": "a", "accessToken": "b", "refreshToken": "c", "clientSecret": "d", "idToken": "e"},
+        direction="request",
+        stage="client",
+    )
+
+    data = _trace_entries(logger.log_dir)[0]["data"]
+    assert set(data.values()) == {REDACTED}
+
+
 @pytest.mark.asyncio
 async def test_provider_transforms_trace_each_live_boundary(tmp_path) -> None:
     class HookPlugin:
@@ -233,6 +247,31 @@ async def test_provider_transforms_trace_each_live_boundary(tmp_path) -> None:
     assert all(entry["credential_id"] == "stable_cred" for entry in entries)
     assert entries[1]["metadata"]["transform_provider"] == "dedaluslabs"
     assert entries[-1]["changed_from_previous"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_builtin_transform_errors_are_traced(tmp_path) -> None:
+    def broken_transform(kwargs, model, provider):
+        raise RuntimeError("bad apiKey: secret")
+
+    logger = TransactionLogger("broken", "broken/test", parent_dir=tmp_path)
+    transforms = ProviderTransforms({})
+    transforms._transforms["broken"] = [broken_transform]
+
+    with pytest.raises(RuntimeError):
+        await transforms.apply(
+            "broken",
+            "broken/test",
+            "cred",
+            {"model": "broken/test", "apiKey": "secret"},
+            transaction_logger=logger,
+            credential_id="cred_1",
+        )
+
+    entries = _trace_entries(logger.log_dir)
+    error_entry = [entry for entry in entries if entry["pass_name"] == "transform_log_error"][-1]
+    assert error_entry["data"]["failed_pass_name"] == "builtin_provider_transform"
+    assert "secret" not in json.dumps(error_entry["data"])
 
 
 @pytest.mark.asyncio

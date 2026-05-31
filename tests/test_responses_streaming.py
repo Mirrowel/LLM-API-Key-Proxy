@@ -212,6 +212,7 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "responses_stream_event_created" in trace_text
     assert "responses_stream_event_output_text_delta" in trace_text
     assert "responses_stream_event_completed" in trace_text
+    assert "responses_sse_formatted_event" in trace_text
     usage_entry = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines() if '"usage_accounting_summary"' in line][-1]
     assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.044
 

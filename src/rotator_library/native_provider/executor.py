@@ -141,10 +141,19 @@ class NativeProviderExecutor:
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
                 event = protocol.parse_stream_event(raw_chunk, protocol_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
+                if event.type == "done":
+                    event_payload = stream_event_payload(event)
+                    self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
+                    break
+                adapter_context = context.adapter_context()
+                # Native stream traces apply field-cache path redaction below.
+                # Suppress generic adapter-chain snapshots here so provider state
+                # cannot leak before rule-aware redaction runs.
+                adapter_context.transaction_logger = None
+                event = await run_adapter_chain(adapters, event, adapter_context, stage="stream_event")
+                self._trace(context, "after_stream_event_adapter_chain", event, direction="stream", stage="adapter", snapshot=False)
                 event_payload = stream_event_payload(event)
                 self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
-                if event.type == "done":
-                    break
                 await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
                 self._trace(
                     context,

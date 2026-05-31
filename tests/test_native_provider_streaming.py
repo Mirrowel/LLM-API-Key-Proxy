@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from rotator_library.adapters import PayloadAdapter, register_adapter
 from rotator_library.field_cache import FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.transaction_logger import TransactionLogger
@@ -74,3 +75,38 @@ async def test_native_provider_stream_logs_errors(tmp_path) -> None:
 
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "transform_log_error" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) -> None:
+    class StreamTextAdapter(PayloadAdapter):
+        name = "test_stream_text_adapter"
+        supported_stages = ("stream_event",)
+
+        async def transform_stream_event(self, payload, context):
+            payload.delta.content[0].text = "adapted"
+            return payload
+
+    register_adapter(StreamTextAdapter, replace=True)
+    logger = TransactionLogger("native", "gpt-test", parent_dir=tmp_path)
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+        adapter_names=("test_stream_text_adapter",),
+        transaction_logger=logger,
+    )
+
+    events = [
+        event
+        async for event in NativeProviderExecutor().stream(
+            {"model": "gpt-test", "messages": []},
+            context,
+            NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "before"}}]}, "[DONE]"])),
+        )
+    ]
+
+    assert events[0]["choices"][0]["delta"]["content"] == "adapted"
+    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
+    assert "after_stream_event_adapter_chain" in pass_names
