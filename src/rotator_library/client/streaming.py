@@ -26,6 +26,8 @@ from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 from ..core.utils import normalize_usage_for_response
 from ..streaming import StreamEvent, StreamMonitor, stream_event_from_sse_chunk
+from ..usage.accounting import UsageRecord, extract_usage_record
+from ..usage.costs import CostBreakdown, CostCalculator
 
 if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
@@ -82,6 +84,7 @@ class StreamingHandler:
         prompt_tokens_uncached = 0
         completion_tokens = 0
         thinking_tokens = 0
+        usage_record = UsageRecord(source="stream")
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
         monitor = StreamMonitor(clock=time.monotonic)
@@ -158,52 +161,17 @@ class StreamingHandler:
                         # Only update if not already tool_calls (highest priority)
                         accumulated_finish_reason = processed.finish_reason
                     if processed.usage and isinstance(processed.usage, dict):
-                        # Extract token counts from final chunk
-                        prompt_tokens = processed.usage.get("prompt_tokens", 0)
-                        completion_tokens = processed.usage.get("completion_tokens", 0)
-                        prompt_details = processed.usage.get("prompt_tokens_details")
-                        if prompt_details:
-                            if isinstance(prompt_details, dict):
-                                prompt_tokens_cached = (
-                                    prompt_details.get("cached_tokens", 0) or 0
-                                )
-                                prompt_tokens_cache_write = (
-                                    prompt_details.get("cache_creation_tokens", 0) or 0
-                                )
-                            else:
-                                prompt_tokens_cached = (
-                                    getattr(prompt_details, "cached_tokens", 0) or 0
-                                )
-                                prompt_tokens_cache_write = (
-                                    getattr(prompt_details, "cache_creation_tokens", 0)
-                                    or 0
-                                )
-                        completion_details = processed.usage.get(
-                            "completion_tokens_details"
+                        usage_record = extract_usage_record(
+                            processed.usage,
+                            model=model,
+                            source="stream_final_chunk",
                         )
-                        if completion_details:
-                            if isinstance(completion_details, dict):
-                                thinking_tokens = (
-                                    completion_details.get("reasoning_tokens", 0) or 0
-                                )
-                            else:
-                                thinking_tokens = (
-                                    getattr(completion_details, "reasoning_tokens", 0)
-                                    or 0
-                                )
-                        if processed.usage.get("cache_read_tokens") is not None:
-                            prompt_tokens_cached = (
-                                processed.usage.get("cache_read_tokens") or 0
-                            )
-                        if processed.usage.get("cache_creation_tokens") is not None:
-                            prompt_tokens_cache_write = (
-                                processed.usage.get("cache_creation_tokens") or 0
-                            )
-                        if thinking_tokens and completion_tokens >= thinking_tokens:
-                            completion_tokens = completion_tokens - thinking_tokens
-                        prompt_tokens_uncached = max(
-                            0, prompt_tokens - prompt_tokens_cached
-                        )
+                        prompt_tokens = usage_record.input_tokens + usage_record.cache_read_tokens
+                        completion_tokens = usage_record.completion_tokens
+                        thinking_tokens = usage_record.reasoning_tokens
+                        prompt_tokens_cached = usage_record.cache_read_tokens
+                        prompt_tokens_cache_write = usage_record.cache_write_tokens
+                        prompt_tokens_uncached = usage_record.prompt_tokens_for_mark_success
 
                     yield processed.sse_string
 
@@ -269,20 +237,23 @@ class StreamingHandler:
             # Record usage if stream completed
             if stream_completed:
                 if cred_context:
-                    approx_cost = 0.0
-                    if not skip_cost_calculation:
-                        approx_cost = self._calculate_stream_cost(
-                            model,
-                            prompt_tokens_uncached + prompt_tokens_cached,
-                            completion_tokens + thinking_tokens,
-                        )
+                    cost_breakdown = self._calculate_stream_cost_breakdown(
+                        model,
+                        usage_record,
+                        skip_cost_calculation=skip_cost_calculation,
+                    )
+                    self._log_stream_usage_accounting(
+                        transaction_logger,
+                        usage_record,
+                        cost_breakdown,
+                    )
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens_uncached,
                         completion_tokens=completion_tokens,
                         thinking_tokens=thinking_tokens,
                         prompt_tokens_cache_read=prompt_tokens_cached,
                         prompt_tokens_cache_write=prompt_tokens_cache_write,
-                        approx_cost=approx_cost,
+                        approx_cost=cost_breakdown.total_cost,
                     )
 
                 if response_callback and (assistant_parts or tool_call_ids):
@@ -551,6 +522,42 @@ class StreamingHandler:
         except Exception as exc:
             lib_logger.debug(f"Stream cost calculation failed for {model}: {exc}")
             return 0.0
+
+    def _calculate_stream_cost_breakdown(
+        self,
+        model: str,
+        usage_record: UsageRecord,
+        *,
+        skip_cost_calculation: bool,
+    ) -> CostBreakdown:
+        """Calculate advisory stream cost through the shared cost helper."""
+
+        if skip_cost_calculation:
+            return CostBreakdown(pricing_source="skipped")
+        return CostCalculator().calculate(usage_record, model=model)
+
+    @staticmethod
+    def _log_stream_usage_accounting(
+        transaction_logger: Optional[Any],
+        usage_record: UsageRecord,
+        cost_breakdown: CostBreakdown,
+    ) -> None:
+        """Trace normalized stream usage without affecting stream delivery."""
+
+        if not transaction_logger:
+            return
+        transaction_logger.log_transform_pass(
+            "usage_accounting_summary",
+            {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
+            direction="metadata",
+            stage="final",
+            transport="sse",
+            metadata={
+                "source": usage_record.source,
+                "pricing_source": cost_breakdown.pricing_source,
+            },
+            snapshot=False,
+        )
 
 
 class StreamBuffer:
