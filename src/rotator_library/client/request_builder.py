@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 from ..core.types import RequestContext
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
 from ..routing.types import RouteTarget, RoutingDecision
+from ..session_tracking import SessionTrackingHints
 from ..transaction_logger import TransactionLogger
 
 
@@ -37,13 +38,14 @@ class RequestContextBuilder:
         self._get_provider_instance = get_provider_instance
 
     @staticmethod
-    def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool]:
+    def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool, Any]:
         classifier = kwargs.pop("classifier", None)
         request_api_keys = kwargs.pop("api_keys", None)
         request_providers = kwargs.pop("providers", None)
         private = bool(kwargs.pop("private", False))
+        session_tracking_hints = kwargs.pop("_session_tracking_hints", None)
         kwargs.pop("model_filters", None)
-        return classifier, request_api_keys, request_providers, private
+        return classifier, request_api_keys, request_providers, private, session_tracking_hints
 
     @staticmethod
     def _provider_from_model(model: str) -> str:
@@ -129,13 +131,47 @@ class RequestContextBuilder:
             )
             return None
 
+    @staticmethod
+    def _merge_session_hints(*hints: Any) -> Any:
+        """Merge proxy-internal and provider session evidence.
+
+        Internal hints are removed from request kwargs before provider execution.
+        They let services such as Responses expose stable continuation IDs to the
+        centralized tracker without adding provider-visible payload fields.
+        """
+
+        merged = SessionTrackingHints()
+        seen = False
+        for hint in hints:
+            if not hint:
+                continue
+            if isinstance(hint, dict):
+                hint = SessionTrackingHints(
+                    strong_anchors=list(hint.get("strong_anchors") or []),
+                    medium_anchors=list(hint.get("medium_anchors") or []),
+                    weak_anchors=list(hint.get("weak_anchors") or []),
+                    affinity_key=hint.get("affinity_key"),
+                    session_scope=hint.get("session_scope"),
+                )
+            if not isinstance(hint, SessionTrackingHints):
+                continue
+            seen = True
+            merged.strong_anchors.extend(hint.strong_anchors)
+            merged.medium_anchors.extend(hint.medium_anchors)
+            merged.weak_anchors.extend(hint.weak_anchors)
+            if not merged.affinity_key and hint.affinity_key:
+                merged.affinity_key = hint.affinity_key
+            if not merged.session_scope and hint.session_scope:
+                merged.session_scope = hint.session_scope
+        return merged if seen else None
+
     async def build_completion_context(
         self,
         request: Optional[Any],
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
-        classifier, request_api_keys, request_providers, private = self._pop_scope_kwargs(
+        classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
         model = kwargs.get("model", "")
@@ -189,7 +225,10 @@ class RequestContextBuilder:
             provider=provider,
             model=resolved_model,
             scope_key=scope["usage_manager_key"],
-            hints=await self._get_session_hints(provider, resolved_model, kwargs),
+            hints=self._merge_session_hints(
+                internal_session_hints,
+                await self._get_session_hints(provider, resolved_model, kwargs),
+            ),
         )
         if transaction_logger:
             transaction_logger.set_trace_context(
@@ -229,7 +268,7 @@ class RequestContextBuilder:
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
-        classifier, request_api_keys, request_providers, private = self._pop_scope_kwargs(
+        classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
         model = kwargs.get("model", "")
@@ -252,7 +291,10 @@ class RequestContextBuilder:
             provider=provider,
             model=model,
             scope_key=scope["usage_manager_key"],
-            hints=await self._get_session_hints(provider, model, kwargs),
+            hints=self._merge_session_hints(
+                internal_session_hints,
+                await self._get_session_hints(provider, model, kwargs),
+            ),
         )
 
         return RequestContext(
