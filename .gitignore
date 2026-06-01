@@ -143,3 +143,13 @@ tests/*
 !tests/test_session_tracking.py
 !tests/test_selection_engine.py
 docs/ignored/
+.env
+.agent/
+.private/
+
+# Web UI
+webui/node_modules/
+webui/dist/
+
+# Command Code session files
+command_code_cookies.json
