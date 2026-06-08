@@ -28,7 +28,7 @@ This project consists of two components:
 |----------|-------------|
 | **GitHub Copilot** | OAuth Device Flow with plan-based model filtering (free/pro/business/enterprise), premium interaction quota tracking |
 | **NanoGPT** | Native Anthropic message routing, streaming fallback, embedding dispatch |
-| **Kilocode** | OpenAI-compatible provider with frequent free model offerings |
+| **Kilocode** | OpenAI-compatible provider with credit balance tracking via web session cookie |
 | **Chutes** | Dollar credit quota tracking with sliding window, tool-calling support |
 | **Lightning AI** | Dollar credit quotas with date-based parsing |
 | **Vertex AI** | Express Mode API key auth via `x-goog-api-key`, curated model list (Vertex has no `/v1/models` endpoint) |
