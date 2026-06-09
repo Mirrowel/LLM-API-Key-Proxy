@@ -9,9 +9,8 @@ usage tracking, limits, and credential selection.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.constants import (
     DEFAULT_MAX_CONCURRENT_PER_KEY,
@@ -332,6 +331,9 @@ class CredentialState:
 
     # Fair cycle state (keyed by model/group)
     fair_cycle: Dict[str, FairCycleState] = field(default_factory=dict)
+
+    # RPD (requests-per-day) counters: model -> {count, period_start, reset_at}
+    rpd_counters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Active requests (for concurrent request limiting)
     active_requests: int = 0

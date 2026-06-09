@@ -210,7 +210,16 @@ class UsageManager:
             window_definitions=self._config.windows or get_default_windows()
         )
         self._tracking = TrackingEngine(self._window_manager, self._config)
-        self._limits = LimitEngine(self._config, self._window_manager)
+        self._limits = LimitEngine(
+            self._config,
+            self._window_manager,
+            monthly_budgets=self._config.monthly_budgets or None,
+            monthly_budget_reset_day=self._config.monthly_budget_reset_day,
+            rpd_limits=self._config.rpd_limits or None,
+            rpd_aliases=self._config.rpd_aliases or None,
+            rpd_reset_tz=self._config.rpd_reset_tz,
+            rpd_reset_hour=self._config.rpd_reset_hour,
+        )
         self._selection = SelectionEngine(
             self._config, self._limits, self._window_manager
         )
@@ -1164,6 +1173,18 @@ class UsageManager:
                 "last_used_at": cp_last_used_at,
             }
 
+            # Monthly budget status
+            if self._limits.monthly_budget_checker:
+                cred_stats["monthly_budget"] = (
+                    self._limits.monthly_budget_checker.get_budget_status(state)
+                )
+
+            # RPD status
+            if self._limits.rpd_checker:
+                cred_stats["rpd_limits"] = (
+                    self._limits.rpd_checker.get_all_rpd_status(state)
+                )
+
             # --- Accumulate provider-level totals (global/lifetime) ---
             stats["total_requests"] += state.totals.request_count
             stats["tokens"]["output"] += state.totals.output_tokens
@@ -1674,6 +1695,7 @@ class UsageManager:
                     current.totals = loaded_state.totals
                     current.cooldowns = loaded_state.cooldowns
                     current.fair_cycle = loaded_state.fair_cycle
+                    current.rpd_counters = loaded_state.rpd_counters
                     current.last_updated = loaded_state.last_updated
                 else:
                     # New credential from disk, add it
@@ -2459,6 +2481,10 @@ class UsageManager:
                 response_headers=response_headers,
                 request_count=request_count,
             )
+
+            # Increment RPD counter if tracker is active
+            if self._limits.rpd_checker:
+                self._limits.rpd_checker.record_request(state, normalized_model)
 
             # Apply custom cap cooldown if exceeded
             cap_result = self._limits.custom_cap_checker.check(

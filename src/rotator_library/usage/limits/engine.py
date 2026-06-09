@@ -11,7 +11,7 @@ if a credential is available for use.
 import logging
 from typing import Dict, List, Optional
 
-from ..types import CredentialState, LimitCheckResult, LimitResult
+from ..types import CredentialState, LimitCheckResult
 from ..config import ProviderUsageConfig
 from ..tracking.windows import WindowManager
 from .base import LimitChecker
@@ -20,7 +20,8 @@ from .window_limits import WindowLimitChecker
 from .cooldowns import CooldownChecker
 from .fair_cycle import FairCycleChecker
 from .custom_caps import CustomCapChecker
-from ...error_handler import mask_credential
+from .monthly_budget import MonthlyBudgetChecker
+from .rpd_limit import RPDLimitChecker
 from ...error_handler import mask_credential
 
 lib_logger = logging.getLogger("rotator_library")
@@ -38,6 +39,12 @@ class LimitEngine:
         self,
         config: ProviderUsageConfig,
         window_manager: WindowManager,
+        monthly_budgets: Optional[Dict[str, float]] = None,
+        monthly_budget_reset_day: int = 1,
+        rpd_limits: Optional[Dict[str, int]] = None,
+        rpd_aliases: Optional[Dict[str, str]] = None,
+        rpd_reset_tz: str = "America/Los_Angeles",
+        rpd_reset_hour: int = 0,
     ):
         """
         Initialize limit engine.
@@ -45,6 +52,12 @@ class LimitEngine:
         Args:
             config: Provider usage configuration
             window_manager: WindowManager for window-based checks
+            monthly_budgets: Optional provider -> budget mapping for monthly budget checker
+            monthly_budget_reset_day: Day of month for budget reset (1-28)
+            rpd_limits: Optional model -> daily RPD limit mapping
+            rpd_aliases: Optional alias -> canonical model mapping for RPD
+            rpd_reset_tz: Timezone for RPD reset
+            rpd_reset_hour: Hour for RPD reset (default 0 = midnight)
         """
         self._config = config
         self._window_manager = window_manager
@@ -62,6 +75,26 @@ class LimitEngine:
         self._window_checker = WindowLimitChecker(window_manager)
         if config.window_limits_enabled:
             self._checkers.append(self._window_checker)
+
+        # Monthly budget checker (before custom caps — hard spend guard)
+        self._monthly_budget_checker: Optional[MonthlyBudgetChecker] = None
+        if monthly_budgets:
+            self._monthly_budget_checker = MonthlyBudgetChecker(
+                budgets=monthly_budgets,
+                reset_day=monthly_budget_reset_day,
+            )
+            self._checkers.append(self._monthly_budget_checker)
+
+        # RPD limit checker (per-model daily request cap)
+        self._rpd_checker: Optional[RPDLimitChecker] = None
+        if rpd_limits:
+            self._rpd_checker = RPDLimitChecker(
+                rpd_limits=rpd_limits,
+                aliases=rpd_aliases,
+                reset_tz=rpd_reset_tz,
+                reset_hour=rpd_reset_hour,
+            )
+            self._checkers.append(self._rpd_checker)
 
         # Custom caps and fair cycle always active
         self._custom_cap_checker = CustomCapChecker(config.custom_caps, window_manager)
@@ -219,6 +252,16 @@ class LimitEngine:
     def fair_cycle_checker(self) -> FairCycleChecker:
         """Get the fair cycle checker."""
         return self._fair_cycle_checker
+
+    @property
+    def monthly_budget_checker(self) -> Optional[MonthlyBudgetChecker]:
+        """Get the monthly budget checker (may be None if not configured)."""
+        return self._monthly_budget_checker
+
+    @property
+    def rpd_checker(self) -> Optional[RPDLimitChecker]:
+        """Get the RPD limit checker (may be None if not configured)."""
+        return self._rpd_checker
 
     def add_checker(self, checker: LimitChecker) -> None:
         """

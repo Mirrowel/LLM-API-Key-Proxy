@@ -10,15 +10,13 @@ Uses only httpx + rich (no heavy rotator_library imports).
 
 import os
 import re
-import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
@@ -130,6 +128,35 @@ def _fmt_compact(value: Optional[int]) -> str:
     if value >= 100_000:
         return f"{value / 1_000:.0f}k"
     return str(value)
+
+
+def _shorten_model_name(model: str) -> str:
+    """Shorten a model name for compact RPD display.
+
+    gemini-3.5-flash -> flash, gemini-3.1-flash-lite -> flash-lite,
+    gemini-embedding-2 -> embedding-2, gemma-4-31b-it -> gemma-4-31b
+    """
+    m = model.lower()
+    # Strip -it suffix (instruction-tuned variant)
+    if m.endswith("-it"):
+        m = m[:-3]
+    # gemini-*-flash-lite* -> flash-lite
+    if "flash-lite" in m:
+        return "flash-lite"
+    # *flash* (but not flash-lite already handled) -> flash
+    if "flash" in m:
+        return "flash"
+    # gemini-embedding-* -> embedding-{suffix}
+    if "embedding" in m:
+        parts = m.split("embedding")
+        suffix = parts[-1].lstrip("-") if len(parts) > 1 else ""
+        return f"embedding-{suffix}" if suffix else "embedding"
+    # gemma-4-26b, gemma-4-31b -> keep as-is (already short)
+    if m.startswith("gemma-"):
+        return m
+    # Fallback: last two segments
+    parts = m.split("-")
+    return "-".join(parts[-2:]) if len(parts) > 2 else m
 
 
 def format_time_ago(timestamp: Optional[float]) -> str:
@@ -1018,15 +1045,82 @@ class QuotaViewer:
                     for quota_line in quota_lines[1:]:
                         table.add_row("", "", quota_line, "", "", "")
                 else:
-                    # No quota groups
-                    table.add_row(
-                        provider,
-                        str(cred_count),
-                        "-",
-                        str(total_requests),
-                        token_str,
-                        cost_str,
-                    )
+                    # No quota groups — check for budget/RPD summary
+                    extra_lines = []
+                    credentials = prov_stats.get("credentials", {})
+                    cred_values = credentials.values() if isinstance(credentials, dict) else credentials
+
+                    # Aggregate monthly budget across credentials
+                    budget_total = 0.0
+                    budget_spent = 0.0
+                    has_budget = False
+                    for c in cred_values:
+                        mb = c.get("monthly_budget") if isinstance(c, dict) else None
+                        if mb:
+                            has_budget = True
+                            budget_total += mb.get("budget", 0)
+                            budget_spent += mb.get("spent", 0)
+                    if has_budget:
+                        budget_remaining = budget_total - budget_spent
+                        budget_pct = round(budget_remaining / budget_total * 100, 1) if budget_total > 0 else 0
+                        color = "green" if budget_pct > 30 else ("yellow" if budget_pct > 10 else "red")
+                        bar = create_progress_bar(budget_pct, QUOTA_BAR_WIDTH)
+                        extra_lines.append(
+                            f"[{color}]{'monthly($):':<{QUOTA_NAME_WIDTH}}"
+                            f"{'${:.0f}/${:.0f}'.format(budget_remaining, budget_total):>{QUOTA_USAGE_WIDTH}} "
+                            f"{budget_pct:>{QUOTA_PCT_WIDTH - 1}.0f}% {bar}[/{color}]"
+                        )
+
+                    # Per-model RPD lines (aggregate across all credentials)
+                    cred_values2 = list(credentials.values() if isinstance(credentials, dict) else credentials)
+                    rpd_agg: Dict[str, Dict[str, int]] = {}
+                    for c in cred_values2:
+                        rpd = c.get("rpd_limits") if isinstance(c, dict) else None
+                        if not rpd:
+                            continue
+                        for model_name, info in rpd.items():
+                            if model_name not in rpd_agg:
+                                rpd_agg[model_name] = {"used": 0, "limit": 0}
+                            rpd_agg[model_name]["used"] += info.get("used", 0)
+                            rpd_agg[model_name]["limit"] += info.get("limit", 0)
+
+                    for model_name in sorted(rpd_agg, key=lambda m: (
+                        rpd_agg[m]["limit"] - rpd_agg[m]["used"]
+                    ) / max(rpd_agg[m]["limit"], 1)):
+                        agg = rpd_agg[model_name]
+                        limit = agg["limit"]
+                        used = agg["used"]
+                        rpd_remaining = max(0, limit - used)
+                        rpd_pct = round(rpd_remaining / limit * 100, 1) if limit > 0 else 0
+                        color = "green" if rpd_pct > 30 else ("yellow" if rpd_pct > 10 else "red")
+                        bar = create_progress_bar(rpd_pct, QUOTA_BAR_WIDTH)
+                        short = _shorten_model_name(model_name) + ":"
+                        extra_lines.append(
+                            f"[{color}]{short:<{QUOTA_NAME_WIDTH}}"
+                            f"{_fmt_compact(rpd_remaining) + '/' + _fmt_compact(limit):>{QUOTA_USAGE_WIDTH}} "
+                            f"{rpd_pct:>{QUOTA_PCT_WIDTH - 1}.0f}% {bar}[/{color}]"
+                        )
+
+                    if extra_lines:
+                        table.add_row(
+                            provider,
+                            str(cred_count),
+                            extra_lines[0],
+                            str(total_requests),
+                            token_str,
+                            cost_str,
+                        )
+                        for el in extra_lines[1:]:
+                            table.add_row("", "", el, "", "", "")
+                    else:
+                        table.add_row(
+                            provider,
+                            str(cred_count),
+                            "-",
+                            str(total_requests),
+                            token_str,
+                            cost_str,
+                        )
 
 
             self.console.print(table)
@@ -1499,6 +1593,83 @@ class QuotaViewer:
                         line += f" [dim]{max_info}[/dim]"
 
                     content_lines.append(line)
+
+        # Monthly budget
+        monthly_budget = cred.get("monthly_budget")
+        if monthly_budget:
+            budget = monthly_budget.get("budget", 0)
+            spent = monthly_budget.get("spent", 0)
+            remaining = monthly_budget.get("remaining", 0)
+            pct_used = monthly_budget.get("percent_used", 0)
+            reset_at = monthly_budget.get("reset_at")
+            reset_day = monthly_budget.get("reset_day", 1)
+
+            remaining_pct = max(0, 100 - pct_used)
+            bar = create_progress_bar(remaining_pct)
+            if remaining_pct <= 0:
+                color = "red"
+            elif remaining_pct < 20:
+                color = "yellow"
+            else:
+                color = "green"
+
+            budget_label = f"monthly($) (day {reset_day})"
+            usage_str = f"${remaining:.2f}/${budget:.2f}"
+            pct_str = f"{remaining_pct:.0f}%"
+
+            line = f"  [{color}]{budget_label:<{DETAIL_GROUP_NAME_WIDTH}} {usage_str:<{DETAIL_USAGE_WIDTH}} {pct_str:>{DETAIL_PCT_WIDTH}} {bar}[/{color}]"
+            if reset_at:
+                countdown = format_time_remaining(reset_at)
+                if countdown and countdown != "now":
+                    line += f"  Resets in {countdown}"
+                elif countdown == "now":
+                    line += f"  Resets now"
+
+            content_lines.append("")
+            content_lines.append("[bold]Monthly Budget:[/bold]")
+            content_lines.append(line)
+
+        # RPD limits
+        rpd_limits = cred.get("rpd_limits")
+        if rpd_limits:
+            content_lines.append("")
+            content_lines.append(f"[bold]RPD Limits ({len(rpd_limits)} models):[/bold]")
+            first_reset = None
+            for model_name, info in sorted(
+                rpd_limits.items(),
+                key=lambda x: (x[1].get("remaining", 0) / max(x[1].get("limit", 1), 1))
+            ):
+                limit = info.get("limit", 0)
+                used = info.get("used", 0)
+                rpd_remaining = info.get("remaining", 0)
+
+                if first_reset is None:
+                    first_reset = info.get("reset_at")
+
+                if limit == 0:
+                    rpd_pct = 0
+                    color = "red"
+                    usage_str = "blocked"
+                else:
+                    rpd_pct = round(rpd_remaining / limit * 100, 1)
+                    if rpd_pct <= 0:
+                        color = "red"
+                    elif rpd_pct < 20:
+                        color = "yellow"
+                    else:
+                        color = "green"
+                    usage_str = f"{used}/{limit}"
+
+                bar = create_progress_bar(rpd_pct)
+                pct_str = f"{rpd_pct:.0f}%"
+                short_name = _shorten_model_name(model_name)
+                line = f"  [{color}]{short_name:<{DETAIL_GROUP_NAME_WIDTH}} {usage_str:<{DETAIL_USAGE_WIDTH}} {pct_str:>{DETAIL_PCT_WIDTH}} {bar}[/{color}]"
+                content_lines.append(line)
+
+            if first_reset:
+                countdown = format_time_remaining(first_reset)
+                if countdown and countdown != "now":
+                    content_lines.append(f"  [dim]Resets in {countdown}[/dim]")
 
         # Model usage (show if no group usage, or if toggle enabled via config)
         model_usage = cred.get("model_usage", {})

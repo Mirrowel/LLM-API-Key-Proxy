@@ -21,6 +21,9 @@ class GeminiProvider(ProviderInterface):
     Provider implementation for the Google Gemini API.
     """
 
+    # RPD tracking is fully env-driven. See README.md for configuration.
+    # No hardcoded defaults — set RPD_LIMIT_GOOGLE_* env vars to activate.
+
     @staticmethod
     def parse_quota_error(error: Exception, error_body: Optional[str] = None) -> Optional[Dict[str, Any]]:
         return parse_google_quota_error(error, error_body)

@@ -13,7 +13,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from ..types import (
     WindowStats,
@@ -23,8 +23,6 @@ from ..types import (
     CredentialState,
     CooldownInfo,
     FairCycleState,
-    GlobalFairCycleState,
-    StorageSchema,
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 from ...error_handler import mask_credential
@@ -443,6 +441,9 @@ class UsageStorage:
             if optimal_concurrent <= 0:
                 optimal_concurrent = -1
 
+            # Parse RPD counters
+            rpd_counters = data.get("rpd_counters", {})
+
             return CredentialState(
                 stable_id=stable_id,
                 provider=data.get("provider", "unknown"),
@@ -455,6 +456,7 @@ class UsageStorage:
                 totals=totals,
                 cooldowns=cooldowns,
                 fair_cycle=fair_cycle,
+                rpd_counters=rpd_counters,
                 active_requests=0,  # Always starts at 0
                 optimal_concurrent=optimal_concurrent,
                 max_concurrent=max_concurrent,
@@ -515,6 +517,7 @@ class UsageStorage:
             "totals": self._serialize_total_stats(state.totals),
             "cooldowns": cooldowns,
             "fair_cycle": fair_cycle,
+            "rpd_counters": state.rpd_counters,
             "optimal_concurrent": state.optimal_concurrent,
             "max_concurrent": state.max_concurrent,
             "created_at": state.created_at,

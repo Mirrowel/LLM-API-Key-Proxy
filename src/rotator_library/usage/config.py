@@ -514,6 +514,16 @@ class ProviderUsageConfig:
     # Default False: only API errors (cooldowns) should block, not local tracking
     window_limits_enabled: bool = False
 
+    # Monthly budget (per-credential spend cap)
+    monthly_budgets: Dict[str, float] = field(default_factory=dict)
+    monthly_budget_reset_day: int = 1
+
+    # RPD limits (per-model daily request caps)
+    rpd_limits: Dict[str, int] = field(default_factory=dict)
+    rpd_aliases: Dict[str, str] = field(default_factory=dict)
+    rpd_reset_tz: str = "America/Los_Angeles"
+    rpd_reset_hour: int = 0
+
     # Window definitions
     windows: List[WindowDefinition] = field(default_factory=list)
 
@@ -747,6 +757,19 @@ def load_provider_usage_config(
                         )
                         if cap is not None:
                             config.custom_caps.append(cap)
+
+        # Monthly budget from provider defaults
+        if hasattr(plugin_class, "default_monthly_budget"):
+            budget_config = plugin_class.default_monthly_budget
+            if isinstance(budget_config, dict):
+                if "budget" in budget_config:
+                    config.monthly_budgets[provider] = float(budget_config["budget"])
+                if "reset_day" in budget_config:
+                    config.monthly_budget_reset_day = int(budget_config["reset_day"])
+            elif isinstance(budget_config, (int, float)):
+                config.monthly_budgets[provider] = float(budget_config)
+
+        # RPD limits are fully env-driven (no class-level defaults).
 
         # Windows
         if hasattr(plugin_class, "usage_window_definitions"):
@@ -990,6 +1013,61 @@ def load_provider_usage_config(
                 cap = CustomCapConfig.from_dict(tier_key, model_or_group, cap_config)
                 if cap is not None:
                     config.custom_caps.append(cap)
+
+    # Monthly budget from env
+    env_budget = os.getenv(f"MONTHLY_BUDGET_{provider_upper}")
+    if env_budget:
+        try:
+            config.monthly_budgets[provider] = float(env_budget)
+        except ValueError:
+            lib_logger.warning(f"Invalid MONTHLY_BUDGET_{provider_upper}='{env_budget}'")
+    env_budget_day = os.getenv(f"MONTHLY_BUDGET_RESET_DAY_{provider_upper}")
+    if env_budget_day:
+        try:
+            config.monthly_budget_reset_day = max(1, min(28, int(env_budget_day)))
+        except ValueError:
+            pass
+
+    # RPD limits from env: RPD_LIMIT_{PROVIDER}_{MODEL}=value
+    # Model aliases from env: RPD_ALIAS_{PROVIDER}_{ALIAS_MODEL}=canonical_model
+    # Reset settings: RPD_RESET_TZ_{PROVIDER}, RPD_RESET_HOUR_{PROVIDER}
+    rpd_limit_prefix = f"RPD_LIMIT_{provider_upper}_"
+    rpd_alias_prefix = f"RPD_ALIAS_{provider_upper}_"
+    for env_key, env_value in os.environ.items():
+        if env_key.startswith(rpd_limit_prefix):
+            model_part = env_key[len(rpd_limit_prefix):].lower().replace("_", "-")
+            try:
+                config.rpd_limits[model_part] = int(env_value)
+            except ValueError:
+                lib_logger.warning(f"Invalid {env_key}='{env_value}'")
+        elif env_key.startswith(rpd_alias_prefix):
+            alias_model = env_key[len(rpd_alias_prefix):].lower().replace("_", "-")
+            canonical = env_value.strip().lower()
+            if canonical:
+                config.rpd_aliases[alias_model] = canonical
+
+    # Resolve aliases in rpd_limits: if a limit key has an alias,
+    # move that limit to the canonical name so lookups work after resolution.
+    for alias_model, canonical in list(config.rpd_aliases.items()):
+        if alias_model in config.rpd_limits and canonical not in config.rpd_limits:
+            config.rpd_limits[canonical] = config.rpd_limits.pop(alias_model)
+
+    if config.rpd_limits:
+        lib_logger.info(
+            f"RPD tracking enabled for {provider}: "
+            f"{len(config.rpd_limits)} model limit(s), "
+            f"{len(config.rpd_aliases)} alias(es)"
+        )
+
+    env_rpd_tz = os.getenv(f"RPD_RESET_TZ_{provider_upper}")
+    if env_rpd_tz:
+        config.rpd_reset_tz = env_rpd_tz
+    env_rpd_hour = os.getenv(f"RPD_RESET_HOUR_{provider_upper}")
+    if env_rpd_hour:
+        try:
+            config.rpd_reset_hour = int(env_rpd_hour)
+        except ValueError:
+            pass
 
     # Derive fair cycle enabled from rotation mode if not explicitly set
     if config.fair_cycle.enabled is None:
