@@ -28,8 +28,8 @@ export interface ModelList {
   data: ModelCard[]
 }
 
-export async function getModels(): Promise<ModelList> {
-  return apiFetch("/v1/models")
+export async function getModels(refresh = false): Promise<ModelList> {
+  return apiFetch(`/v1/models${refresh ? "?refresh=true" : ""}`)
 }
 
 export async function getProviders(): Promise<string[]> {

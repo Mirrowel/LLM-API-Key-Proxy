@@ -69,6 +69,8 @@ def _register_providers():
                 provider_name = module_name.replace("_provider", "")
                 if provider_name == "nvidia":
                     provider_name = "nvidia_nim"
+                elif provider_name == "x_ai":
+                    provider_name = "x-ai"
                 PROVIDER_PLUGINS[provider_name] = attribute
                 if provider_name == "gemini":
                     PROVIDER_PLUGINS["google"] = attribute

@@ -64,6 +64,7 @@ OAUTH_FRIENDLY_NAMES = {
     "codex": "OpenAI Codex",
     "anthropic": "Claude / Claude Code (Pro & Max)",
     "copilot": "GitHub Copilot",
+    "x-ai": "xAI Grok",
 }
 
 

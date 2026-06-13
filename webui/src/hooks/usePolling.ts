@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react"
 
 interface UsePollingOptions<T> {
-  fetcher: () => Promise<T>
+  fetcher: (...args: any[]) => Promise<T>
   interval?: number
   enabled?: boolean
 }
@@ -14,12 +14,12 @@ export function usePolling<T>({ fetcher, interval = 10000, enabled = true }: Use
   const hasFetchedRef = useRef(false)
   fetcherRef.current = fetcher
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (...args: any[]) => {
     if (!hasFetchedRef.current) {
       setLoading(true)
     }
     try {
-      const result = await fetcherRef.current()
+      const result = await fetcherRef.current(...args)
       setData(result)
       setError(null)
     } catch (e) {

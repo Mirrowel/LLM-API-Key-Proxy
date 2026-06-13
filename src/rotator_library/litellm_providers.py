@@ -1010,7 +1010,7 @@ SCRAPED_PROVIDERS: dict[str, dict] = {
         "features": ['streaming', 'embeddings', 'deployment_spaces', 'zen_api_key'],
         "model_count": 9,
     },
-    "xai": {
+    "x-ai": {
         "display_name": 'xAI',
         "route": 'xai/',
         "api_key_env_vars": ['XAI_API_KEY'],

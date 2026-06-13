@@ -47,7 +47,7 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "gemini": {
         "category": "popular",
     },
-    "xai": {
+    "x-ai": {
         "category": "popular",
     },
     "deepseek": {

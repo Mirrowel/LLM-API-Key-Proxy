@@ -25,9 +25,6 @@ import httpx
 import litellm
 from litellm.litellm_core_utils.token_counter import token_counter
 
-from ..core.types import RequestContext
-from ..core.errors import mask_credential
-from ..core.config import ConfigLoader
 from ..core.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_GLOBAL_TIMEOUT,
@@ -605,6 +602,8 @@ class RotatingClient:
         model = kwargs.pop("model", "")
         provider = model.split("/")[0] if "/" in model else ""
 
+        is_x_ai = (provider == "x-ai")
+
         if not provider:
             alias_targets = self._alias_registry.resolve(model)
             if alias_targets:
@@ -624,9 +623,36 @@ class RotatingClient:
                 f"Invalid model format or no credentials for provider: {model}"
             )
 
-        return await self._execute_with_fallback(
+        result = await self._execute_with_fallback(
             model, provider, request, pre_request_callback, **kwargs,
         )
+
+        if is_x_ai:
+            is_streaming = kwargs.get("stream", False)
+            if is_streaming:
+                async def _rewrite_stream(stream):
+                    async for chunk in stream:
+                        if isinstance(chunk, str) and chunk.startswith("data: "):
+                            content = chunk[len("data: "):].strip()
+                            if content != "[DONE]":
+                                try:
+                                    parsed = json.loads(content)
+                                    if "model" in parsed and isinstance(parsed["model"], str):
+                                        model_name = parsed["model"]
+                                        if not model_name.startswith("x-ai/"):
+                                            if model_name.startswith("xai/"):
+                                                parsed["model"] = "x-ai/" + model_name[4:]
+                                            else:
+                                                parsed["model"] = "x-ai/" + model_name
+                                            chunk = f"data: {json.dumps(parsed)}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+                        yield chunk
+                return _rewrite_stream(result)
+            else:
+                return self._rewrite_response_model(result, "xai/", "x-ai/")
+
+        return result
 
     async def _execute_with_fallback(
         self,
@@ -767,20 +793,42 @@ class RotatingClient:
 
         return _inner()
 
+    def _rewrite_response_model(self, response: Any, from_prefix: str, to_prefix: str) -> Any:
+        def _rewrite(model_str: str) -> str:
+            if model_str.startswith(to_prefix):
+                return model_str
+            if model_str.startswith(from_prefix):
+                return to_prefix + model_str[len(from_prefix):]
+            return to_prefix + model_str
+
+        if hasattr(response, "model") and isinstance(response.model, str):
+            response.model = _rewrite(response.model)
+        elif isinstance(response, dict) and "model" in response and isinstance(response["model"], str):
+            response["model"] = _rewrite(response["model"])
+        return response
+
     async def aembedding(
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Any:
+        model = kwargs.get("model", "")
+        is_x_ai = isinstance(model, str) and model.startswith("x-ai/")
         context = await self._request_builder.build_embedding_context(
             request, pre_request_callback, kwargs
         )
-        return await self._executor.execute(context)
+        result = await self._executor.execute(context)
+        if is_x_ai:
+            return self._rewrite_response_model(result, "xai/", "x-ai/")
+        return result
 
     def token_count(self, **kwargs) -> int:
         """Calculate token count for text or messages."""
         model = kwargs.get("model")
+        if isinstance(model, str) and model.startswith("x-ai/"):
+            kwargs["model"] = "xai/" + model[5:]
+            model = kwargs["model"]
         text = kwargs.get("text")
         messages = kwargs.get("messages")
 

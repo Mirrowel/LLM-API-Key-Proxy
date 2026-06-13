@@ -13,7 +13,7 @@ A personal fork of [Mirrowel/LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-
 - **Anthropic API Compatible** — Use Claude Code or any Anthropic SDK client with non-Anthropic providers like Gemini, OpenAI, or custom models
 - **Built-in Resilience** — Automatic key rotation, failover on errors, rate limit handling, and intelligent cooldowns
 - **Classifier-Scoped Routing** — Use isolated per-user/provider credential pools in the library without leaking user keys into global rotation
-- **Exclusive Provider Support** — Includes custom providers not available elsewhere, including **Gemini CLI**
+- **Exclusive Provider Support** — Includes custom providers not available elsewhere, including **Gemini CLI** and **xAI Grok** (OAuth)
 
 ### Additional Providers
 
@@ -26,6 +26,7 @@ A personal fork of [Mirrowel/LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-
 | **Vertex AI** | Express Mode API key auth via `x-goog-api-key`, curated model list (Vertex has no `/v1/models` endpoint) |
 | **Opencode Go** | 3-window quota tracking (`5hr`, `weekly`, `monthly`) via SolidJS scraping, custom OpenAI routing |
 | **Command Code** | Bypasses standard subscription tier limits on chat completions by routing to the CLI endpoint (`/alpha/generate`). Supports dollar credits tracking mapped to cents baseline, 5-minute background refresh, and reasoning/thinking stream translation for `deepseek-v4-pro` and `mimo-v2.5-pro` |
+| **xAI Grok** | OAuth2 PKCE + Device Code flow for SuperGrok/X Premium+ accounts. Dual-endpoint model discovery from `api.x.ai` and `cli-chat-proxy.grok.com`, automatic token refresh, and CLI proxy context window metadata injection |
 
 ### Smart "Latest" Model Aliases
 
@@ -147,7 +148,7 @@ The proxy is powered by a standalone Python library that you can use directly in
 - **Intelligent key selection** with tiered, model-aware locking
 - **Deadline-driven requests** with configurable global timeout
 - **Automatic failover** between keys on errors
-- **OAuth support** for Gemini CLI, Codex, Anthropic, and Copilot
+- **OAuth support** for Gemini CLI, Codex, Anthropic, Copilot, and xAI Grok
 - **Stateless deployment ready** — load credentials from environment variables
 
 ### Basic Usage

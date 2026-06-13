@@ -1536,6 +1536,7 @@ async def list_models(
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_api_key),
     enriched: bool = True,
+    refresh: bool = False,
 ):
     """
     Returns a list of available models in the OpenAI-compatible format.
@@ -1543,8 +1544,19 @@ async def list_models(
     Query Parameters:
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
+        refresh: If True, triggers all providers to refresh their upstream model listings and updates the metadata cache.
     """
-    model_ids = await client.get_all_available_models(grouped=False)
+    if refresh:
+        # Trigger model registry refresh if available
+        if hasattr(request.app.state, "model_info_service"):
+            model_info_service = request.app.state.model_info_service
+            try:
+                await model_info_service.refresh()
+            except Exception as e:
+                logging.error(f"Failed to refresh model info registry: {e}")
+        model_ids = await client.get_all_available_models(grouped=False, force_refresh=True)
+    else:
+        model_ids = await client.get_all_available_models(grouped=False)
 
 
     # Append canonical alias model names (cross-provider routing)
@@ -1582,6 +1594,25 @@ async def list_models(
                                 entry["context_length"] = ctx_win
                                 entry["max_input_tokens"] = ctx_win
             except ImportError:
+                pass
+
+            # Apply xAI CLI proxy context window overrides for models
+            # discovered from cli-chat-proxy.grok.com that have context
+            # metadata not available in external catalogs.
+            try:
+                from rotator_library.providers.x_ai_provider import XAiProvider
+                xai_prov = client._get_provider_instance("x-ai")
+                if isinstance(xai_prov, XAiProvider):
+                    xai_ctx = xai_prov.get_model_context_overrides()
+                    if xai_ctx:
+                        for entry in enriched_data:
+                            eid = entry.get("id", "")
+                            ctx_win = xai_ctx.get(eid)
+                            if ctx_win and not entry.get("context_window"):
+                                entry["context_window"] = ctx_win
+                                entry["context_length"] = ctx_win
+                                entry["max_input_tokens"] = ctx_win
+            except (ImportError, Exception):
                 pass
 
             # For "latest" virtual models, inherit metadata from the
