@@ -9,16 +9,16 @@ inputs:
     description: 'The private key of the GitHub App.'
     required: true
   opencode-api-key:
-    description: 'The default API key, used for providers that do not have one defined in the custom providers JSON.'
+    description: 'Optional API key to apply to the provider inferred from opencode-model.'
     required: false
   opencode-model:
-    description: 'The main model to use (e.g., openai/gpt-4o or a custom one from custom providers JSON).'
+    description: 'The main model to use, in provider/model format (e.g., openai/gpt-4o).'
     required: true
   opencode-fast-model:
     description: 'Optional: The fast model for smaller tasks.'
     required: false
-  custom-providers-json:
-    description: 'Optional: A JSON string defining custom providers. Use minifier to correctly format.'
+  opencode-config-json:
+    description: 'Optional: A complete minified opencode.json used as the base config before model and API key overrides.'
     required: false
 
 outputs:
@@ -47,43 +47,34 @@ runs:
 
     - name: Generate OpenCode Configuration
       shell: bash
+      env:
+        MAIN_MODEL: ${{ inputs.opencode-model }}
+        FAST_MODEL: ${{ inputs.opencode-fast-model }}
+        DEFAULT_API_KEY: ${{ inputs.opencode-api-key }}
       run: |
         set -e # Exit immediately if a command fails
 
-        # --- HARDCODED TOGGLE ---
-        # Set to "true" to add 'reasoning_effort: "high"' to the main model's request body.
-        # Set to "false" to disable.
-        ADD_REASONING_EFFORT="true"
-
         mkdir -p ~/.config/opencode
 
-        # --- INPUTS ---
-        MAIN_MODEL="${{ inputs.opencode-model }}"
-        FAST_MODEL="${{ inputs.opencode-fast-model }}"
-        DEFAULT_API_KEY="${{ inputs.opencode-api-key }}"
-
-        # Use command substitution with a heredoc to safely read the input into a variable.
-        # This is robust against complex characters and avoids creating a giant line of code that can break shell parsers.
-        CUSTOM_PROVIDERS=$(cat <<'EOF'
-        ${{ inputs.custom-providers-json }}
+        # Use the full OpenCode config as the base when supplied. Model inputs below
+        # intentionally override it so workflows can select runtime models per job.
+        BASE_CONFIG=$(cat <<'EOF'
+        ${{ inputs.opencode-config-json }}
         EOF
         )
 
-        # If the input was empty (or just whitespace), the variable will be empty. Set a default.
-        if [ -z "$CUSTOM_PROVIDERS" ]; then
-          CUSTOM_PROVIDERS='{}'
-        fi
-
-        # --- INITIAL CONFIG SETUP ---
-        mkdir -p ~/.config/opencode
-        CONFIG='{"$schema": "https://opencode.ai/config.json", "username": "mirrobot-agent", "autoupdate": true}'
-
-        # Merge custom provider definitions if they are not the empty default
-        if [ "$CUSTOM_PROVIDERS" != "{}" ]; then
-          echo "Custom provider definitions found. Merging into configuration."
-          CONFIG=$(jq --argjson customProviders "$CUSTOM_PROVIDERS" '. * {provider: $customProviders}' <<< "$CONFIG")
+        if [ -z "$(printf '%s' "$BASE_CONFIG" | tr -d '[:space:]')" ]; then
+          CONFIG='{"$schema": "https://opencode.ai/config.json", "username": "mirrobot-agent", "autoupdate": true}'
         else
-          echo "No custom provider definitions supplied."
+          if ! CONFIG=$(jq -c . <<< "$BASE_CONFIG"); then
+            echo "::error::Configuration error: opencode-config-json must be valid JSON."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "object"' <<< "$CONFIG" >/dev/null; then
+            echo "::error::Configuration error: opencode-config-json must be a JSON object."
+            exit 1
+          fi
         fi
 
         # --- MODULAR FUNCTION TO CONFIGURE A MODEL ---
@@ -91,43 +82,19 @@ runs:
           local model_string="$1"
           local config_key="$2"
           local provider="${model_string%%/*}"
-          local model_name="${model_string#*/}"
 
-          # echo "--- Configuring ${config_key} with '${model_string}' ---"
+          if [[ "$model_string" != */* ]]; then
+            echo "::error::Configuration error: ${config_key} must use provider/model format."
+            exit 1
+          fi
 
-          # Check if the provider exists in the custom definitions
-          if jq -e --arg provider "$provider" '. | has($provider)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
-            echo "Provider found in custom definitions."
+          CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
 
-            # CASE 2: Provider exists, but the model does not. This is an error.
-            if ! jq -e --arg provider "$provider" --arg modelName "$model_name" '.[$provider].models | has($modelName)' <<< "$CUSTOM_PROVIDERS" >/dev/null; then
-              echo "::error::Configuration error: Provider is defined, but model is not found within it. Aborting."
-              exit 1
-            fi
-
-            # CASE 1: Provider and model both exist. Use it as is.
-            # echo "Model '$model_name' also found. Setting '${config_key}' to '${model_string}'."
-            CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
-
-          else
-            # CASE 3: Provider does not exist in custom definitions. Treat as a standard provider.
-            echo "Provider not found in custom definitions. Configuring as a standard provider."
-            
-            CONFIG=$(jq --arg key "$config_key" --arg val "$model_string" '.[$key] = $val' <<< "$CONFIG")
-            
-            echo "Setting default API key for provider."
+          if [[ -n "$DEFAULT_API_KEY" ]]; then
             CONFIG=$(jq \
               --arg provider "$provider" \
               --arg apiKey "$DEFAULT_API_KEY" \
               '.provider[$provider].options.apiKey = $apiKey' <<< "$CONFIG")
-
-            if [[ "$config_key" == "model" && "$ADD_REASONING_EFFORT" == "true" ]]; then
-              echo "Reasoning effort toggle is ON. Applying to standard provider model."
-              CONFIG=$(jq \
-                --arg provider "$provider" \
-                --arg modelName "$model_name" \
-                '.provider[$provider].models[$modelName].options.reasoningEffort = "high"' <<< "$CONFIG")
-            fi
           fi
         }
 
@@ -138,7 +105,8 @@ runs:
         fi
 
         # --- FINALIZATION ---
-        echo "$CONFIG" > ~/.config/opencode/opencode.json
+        jq -e . <<< "$CONFIG" > ~/.config/opencode/opencode.json
+        chmod 600 ~/.config/opencode/opencode.json
         # echo "--- Generated OpenCode Configuration ---"
         # jq . ~/.config/opencode/opencode.json
         # echo "----------------------------------------"
