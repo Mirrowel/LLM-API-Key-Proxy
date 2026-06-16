@@ -773,6 +773,21 @@ class SessionTracker:
         data = response.model_dump() if hasattr(response, "model_dump") else response
         if not isinstance(data, dict):
             return []
+        anchors: List[SessionAnchor] = []
+        response_id = data.get("id")
+        if response_id:
+            # Responses API continuations identify their parent with
+            # previous_response_id. Record the emitted response id as strong
+            # response evidence so the next request can route back to the exact
+            # session/credential that produced it.
+            anchors.append(
+                SessionAnchor(
+                    self._scoped(namespace, f"provider:responses_previous_response_id:{response_id}"),
+                    "strong",
+                    source="response",
+                    group="responses_previous_response_id",
+                )
+            )
         messages: List[Dict[str, Any]] = []
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
@@ -782,7 +797,9 @@ class SessionTracker:
                 response_message = dict(message)
                 response_message.setdefault("role", "assistant")
                 messages.append(response_message)
-        return self._anchors_from_messages(messages, namespace, source="response") if messages else []
+        if messages:
+            anchors.extend(self._anchors_from_messages(messages, namespace, source="response"))
+        return anchors
 
     def _affinity_from_anchors(
         self,

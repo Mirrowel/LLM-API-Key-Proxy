@@ -759,12 +759,26 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     if isinstance(e, dict):
         payload = e.get("error", e)
         if isinstance(payload, dict):
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
             code = payload.get("code")
+            status_value = payload.get("status_code") or payload.get("status") or details.get("status_code") or details.get("status") or code
             status = str(payload.get("status", "")).upper()
             try:
-                status_code = int(code) if code is not None else None
+                status_code = int(status_value) if status_value is not None else None
             except (TypeError, ValueError):
                 status_code = None
+            structured_type = _classify_structured_error_text(payload, details)
+            if status_code == 400:
+                return ClassifiedError(error_type=structured_type or "invalid_request", original_exception=e, status_code=status_code)
+            if status_code == 401:
+                return ClassifiedError(error_type="authentication", original_exception=e, status_code=status_code)
+            if status_code == 403:
+                return ClassifiedError(error_type="forbidden", original_exception=e, status_code=status_code)
+            if status_code == 429:
+                body = str(payload).lower()
+                return ClassifiedError(error_type="quota_exceeded" if "quota" in body or "resource_exhausted" in body else "rate_limit", original_exception=e, status_code=status_code)
+            if structured_type:
+                return ClassifiedError(error_type=structured_type, original_exception=e, status_code=status_code)
             if (status_code is not None and status_code >= 500) or status in {
                 "INTERNAL",
                 "UNAVAILABLE",
@@ -774,6 +788,14 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     original_exception=e,
                     status_code=status_code or 503,
                 )
+
+    explicit_error_type = getattr(e, "error_type", None)
+    if explicit_error_type:
+        return ClassifiedError(
+            error_type=str(explicit_error_type).strip().lower().replace("-", "_").replace(" ", "_"),
+            original_exception=e,
+            status_code=getattr(e, "status_code", None),
+        )
 
     error_text = str(e)
     error_type_name = type(e).__name__
@@ -925,11 +947,6 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 original_exception=e,
                 status_code=status_code,
             )
-            return ClassifiedError(
-                error_type="invalid_request",
-                original_exception=e,
-                status_code=status_code,
-            )
         if 400 <= status_code < 500:
             # Other 4xx errors - generally client errors
             return ClassifiedError(
@@ -1073,6 +1090,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 503,
         )
 
+    if "model_capacity_exhausted" in error_text.lower() or "model capacity" in error_text.lower() or "capacity exhausted" in error_text.lower():
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=status_code or 503,
+        )
+
     # Fallback for any other unclassified errors
     return ClassifiedError(
         error_type="unknown", original_exception=e, status_code=status_code
@@ -1082,6 +1106,34 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 def is_rate_limit_error(e: Exception) -> bool:
     """Checks if the exception is a rate limit error."""
     return isinstance(e, RateLimitError)
+
+
+def _classify_structured_error_text(payload: dict, details: dict) -> Optional[str]:
+    """Classify structured error type/code/status text without raw messages."""
+
+    values = [payload.get("type"), payload.get("code"), payload.get("status"), details.get("error_type"), details.get("classification"), details.get("status")]
+    normalized = {str(value).strip().lower().replace("-", "_").replace(" ", "_") for value in values if value not in (None, "")}
+    if normalized & {"authentication", "auth", "unauthorized", "invalid_api_key"}:
+        return "authentication"
+    if normalized & {"forbidden", "permission_denied", "access_denied"}:
+        return "forbidden"
+    if normalized & {"context_window_exceeded", "context_length", "context_length_exceeded", "too_many_tokens"}:
+        return "context_window_exceeded"
+    if normalized & {"invalid_request", "bad_request", "validation", "invalid_argument"}:
+        return "invalid_request"
+    if normalized & {"credential_reauth_needed"}:
+        return "credential_reauth_needed"
+    if normalized & {"configuration_error", "config", "configuration"}:
+        return "configuration_error"
+    if normalized & {"rate_limit", "rate_limited", "too_many_requests"}:
+        return "rate_limit"
+    if normalized & {"quota_exceeded", "resource_exhausted", "quota"}:
+        return "quota_exceeded"
+    if normalized & {"server_error", "internal", "unavailable"}:
+        return "server_error"
+    if normalized & {"api_connection", "network", "connection"}:
+        return "api_connection"
+    return None
 
 
 def is_server_error(e: Exception) -> bool:

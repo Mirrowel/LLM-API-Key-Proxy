@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""Claude Code provider integration for native Anthropic Messages execution."""
+
+from __future__ import annotations
+
+import os
+from typing import Any, List
+
+import httpx
+
+from ..field_cache import FieldCacheInjection, FieldCacheRule
+from .provider_interface import ProviderInterface
+
+DEFAULT_API_BASE = "https://api.anthropic.com"
+FALLBACK_MODELS = ["claude_code/claude-sonnet-4-5", "claude_code/claude-opus-4-5"]
+
+
+class ClaudeCodeProvider(ProviderInterface):
+    """Provider declaration for Claude Code style native requests.
+
+    The provider starts as an explicit integration path rather than a guessed live
+    implementation. It declares protocol/adapters/cache rules and exposes mocked
+    auth/model helpers so later native wiring can use it without reintroducing a
+    monolithic provider transform.
+    """
+
+    provider_env_name = "claude_code"
+    protocol_name = "anthropic_messages"
+    adapter_names = ("suppress_developer_role",)
+    native_streaming_supported = False
+    field_cache_rules = (
+        FieldCacheRule(
+            name="claude_code_thinking_signature",
+            source="response",
+            path="content.*.signature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="metadata.thinking_signatures", as_list=True),
+            metadata={"purpose": "preserve Claude thinking signatures for follow-up requests"},
+        ),
+    )
+    default_rotation_mode = "sequential"
+
+    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+        """Fetch provider models with a conservative fallback list.
+
+        Model discovery is intentionally mock-friendly. If the configured service
+        does not expose a standard `/v1/models` response, provider work can later
+        override this without changing protocol declarations.
+        """
+
+        try:
+            response = await client.get(f"{self.get_api_base().rstrip('/')}/v1/models", headers=self.get_native_headers(api_key), timeout=30)
+            response.raise_for_status()
+            models = [item.get("id") for item in response.json().get("data", []) if isinstance(item, dict) and item.get("id")]
+            if models:
+                return [self._with_prefix(model) for model in models]
+        except Exception:
+            return list(FALLBACK_MODELS)
+        return list(FALLBACK_MODELS)
+
+    def get_api_base(self) -> str:
+        """Return the configured Claude Code API base URL."""
+
+        return os.getenv("CLAUDE_CODE_API_BASE", DEFAULT_API_BASE)
+
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "messages") -> dict[str, str]:
+        """Return headers for native mocked HTTP requests."""
+
+        mode = os.getenv("CLAUDE_CODE_AUTH_HEADER", "auto").strip().lower()
+        use_api_key = mode == "x-api-key" or (mode == "auto" and credential_identifier.startswith("sk-ant-"))
+        headers = {
+            "anthropic-version": os.getenv("CLAUDE_CODE_ANTHROPIC_VERSION", "2023-06-01"),
+            "content-type": "application/json",
+        }
+        if use_api_key:
+            headers["x-api-key"] = credential_identifier
+        else:
+            headers["Authorization"] = f"Bearer {credential_identifier}"
+        return headers
+
+    def get_native_operation(self, model: str = "", request: dict[str, Any] | None = None, stream: bool = False) -> str:
+        """Claude Code uses the Anthropic Messages operation for completions."""
+
+        return "messages"
+
+    def normalize_native_model(self, model: str) -> str:
+        """Strip the proxy provider prefix before sending upstream."""
+
+        return model.split("/", 1)[1] if model.startswith("claude_code/") else model
+
+    def supports_native_streaming(self, model: str = "", operation: str = "messages") -> bool:
+        """Return false until the generic native stream wrapper is compatible."""
+
+        if self._get_runtime_config(model).native_streaming_supported is not None:
+            return super().supports_native_streaming(model, operation)
+        return False
+
+    def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "messages") -> dict[str, Any]:
+        """Ensure Anthropic Messages-required fields are present."""
+
+        prepared = dict(request)
+        prepared.setdefault("max_tokens", int(os.getenv("CLAUDE_CODE_MAX_TOKENS", "4096")))
+        return prepared
+
+    def get_native_endpoint(self, model: str = "", operation: str = "messages") -> str:
+        """Return the provider endpoint for a native operation."""
+
+        if operation == "models":
+            return f"{self.get_api_base().rstrip('/')}/v1/models"
+        return f"{self.get_api_base().rstrip('/')}/v1/messages"
+
+    def get_adapter_config(self, model: str = "") -> dict[str, dict[str, Any]]:
+        """Configure adapters without hardcoding provider transforms."""
+
+        config = {"suppress_developer_role": {"mode": "user"}}
+        for adapter, override in super().get_adapter_config(model).items():
+            config.setdefault(adapter, {}).update(override)
+        return config
+
+    @staticmethod
+    def _with_prefix(model: str) -> str:
+        if model.startswith("claude_code/"):
+            return model
+        return f"claude_code/{model}"

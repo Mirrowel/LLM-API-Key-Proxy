@@ -15,6 +15,7 @@ Transforms are applied in a defined order with logging of modifications.
 """
 
 import logging
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 lib_logger = logging.getLogger("rotator_library")
@@ -81,6 +82,11 @@ class ProviderTransforms:
         credential: str,
         kwargs: Dict[str, Any],
         provider_config_override: Optional[Dict[str, Any]] = None,
+        *,
+        transaction_logger: Optional[Any] = None,
+        credential_id: Optional[str] = None,
+        transport: Optional[str] = None,
+        trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Apply all applicable transforms to request kwargs.
@@ -95,42 +101,145 @@ class ProviderTransforms:
             Modified kwargs
         """
         modifications: List[str] = []
+        trace_metadata = dict(trace_metadata or {})
+        _trace_transform_pass(
+            transaction_logger,
+            "pre_provider_transform_request",
+            kwargs,
+            provider=provider,
+            model=model,
+            credential_id=credential_id,
+            transport=transport,
+            metadata={"phase": "start", **trace_metadata},
+        )
 
         # 1. Apply built-in transforms
         for transform_provider, transforms in self._transforms.items():
             # Check if transform applies (provider match or model contains pattern)
             if transform_provider == provider or transform_provider in model.lower():
                 for transform in transforms:
-                    result = transform(kwargs, model, provider)
+                    before = deepcopy(kwargs) if transaction_logger else None
+                    try:
+                        result = transform(kwargs, model, provider)
+                    except Exception as exc:
+                        if transaction_logger:
+                            transaction_logger.log_transform_error(
+                                "builtin_provider_transform",
+                                exc,
+                                payload=before if before is not None else kwargs,
+                                stage="client",
+                                transport=transport,
+                                metadata={
+                                    "provider": provider,
+                                    "model": model,
+                                    "credential_id": credential_id,
+                                    "transform_provider": transform_provider,
+                                    "transform_name": getattr(transform, "__name__", repr(transform)),
+                                    **trace_metadata,
+                                },
+                            )
+                        raise
                     if result:
                         modifications.append(result)
+                        _trace_transform_pass(
+                            transaction_logger,
+                            "after_builtin_provider_transform",
+                            kwargs,
+                            provider=provider,
+                            model=model,
+                            credential_id=credential_id,
+                            transport=transport,
+                            changed_from_previous=(before != kwargs) if before is not None else None,
+                            metadata={
+                                "transform_provider": transform_provider,
+                                "transform_name": getattr(transform, "__name__", repr(transform)),
+                                "modification": result,
+                                **trace_metadata,
+                            },
+                        )
 
         # 2. Apply provider hook transforms (async)
         plugin = self._get_plugin_instance(provider)
         if plugin and hasattr(plugin, "transform_request"):
             try:
+                before = deepcopy(kwargs) if transaction_logger else None
                 hook_result = await plugin.transform_request(kwargs, model, credential)
                 if hook_result:
                     modifications.extend(hook_result)
+                if hook_result or (before is not None and before != kwargs):
+                    _trace_transform_pass(
+                        transaction_logger,
+                        "after_provider_hook_transform",
+                        kwargs,
+                        provider=provider,
+                        model=model,
+                        credential_id=credential_id,
+                        transport=transport,
+                        changed_from_previous=(before != kwargs) if before is not None else None,
+                        metadata={"modifications": hook_result or [], **trace_metadata},
+                    )
             except Exception as e:
                 lib_logger.debug(f"Provider transform_request hook failed: {e}")
+                if transaction_logger:
+                    transaction_logger.log_transform_error(
+                        "provider_hook_transform",
+                        e,
+                        payload=kwargs,
+                        stage="client",
+                        transport=transport,
+                        metadata={"provider": provider, "model": model, "credential_id": credential_id, **trace_metadata},
+                    )
 
         # 3. Apply model-specific options from provider
         if plugin and hasattr(plugin, "get_model_options"):
             model_options = plugin.get_model_options(model)
             if model_options:
+                before = deepcopy(kwargs) if transaction_logger else None
                 for key, value in model_options.items():
                     if key == "reasoning_effort":
                         kwargs["reasoning_effort"] = value
                     elif key not in kwargs:
                         kwargs[key] = value
                 modifications.append(f"applied model options for {model}")
+                _trace_transform_pass(
+                    transaction_logger,
+                    "after_provider_model_options",
+                    kwargs,
+                    provider=provider,
+                    model=model,
+                    credential_id=credential_id,
+                    transport=transport,
+                    changed_from_previous=(before != kwargs) if before is not None else None,
+                    metadata={"model_options": deepcopy(model_options) if transaction_logger else None, **trace_metadata},
+                )
 
         # 4. Apply LiteLLM conversion if config available
         if self._config and hasattr(self._config, "convert_for_litellm"):
+            before = deepcopy(kwargs) if transaction_logger else None
+            _trace_transform_pass(
+                transaction_logger,
+                "before_litellm_conversion",
+                kwargs,
+                provider=provider,
+                model=model,
+                credential_id=credential_id,
+                transport=transport,
+                metadata={"provider_config_override": bool(provider_config_override), **trace_metadata},
+            )
             kwargs = self._config.convert_for_litellm(
                 provider_override=provider_config_override,
                 **kwargs,
+            )
+            _trace_transform_pass(
+                transaction_logger,
+                "after_litellm_conversion",
+                kwargs,
+                provider=provider,
+                model=model,
+                credential_id=credential_id,
+                transport=transport,
+                changed_from_previous=(before != kwargs) if before is not None else None,
+                metadata={"provider_config_override": bool(provider_config_override), **trace_metadata},
             )
 
         if modifications:
@@ -312,3 +421,36 @@ class ProviderTransforms:
     # caused 400 errors on models that don't support those categories (e.g. Gemma).
     # See gemini_provider.py for the full removal comment with previous defaults.
     # =========================================================================
+
+
+def _trace_transform_pass(
+    transaction_logger: Optional[Any],
+    pass_name: str,
+    payload: Dict[str, Any],
+    *,
+    provider: str,
+    model: str,
+    credential_id: Optional[str],
+    transport: Optional[str],
+    metadata: Dict[str, Any],
+    changed_from_previous: Optional[bool] = None,
+) -> None:
+    """Record provider-transform states without changing transform behavior.
+
+    Transform tracing is observability-only. This helper centralizes pass
+    metadata so individual transforms can stay focused on payload mutation while
+    the transaction trace still shows each live request state.
+    """
+
+    if not transaction_logger:
+        return
+    transaction_logger.log_transform_pass(
+        pass_name,
+        payload,
+        direction="request",
+        stage="client",
+        credential_id=credential_id,
+        transport=transport,
+        changed_from_previous=changed_from_previous,
+        metadata={"provider": provider, "model": model, **metadata},
+    )

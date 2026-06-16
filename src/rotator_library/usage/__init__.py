@@ -56,11 +56,21 @@ from .integration.api import UsageAPI
 
 # Main facade (imports components above)
 from .manager import UsageManager, CredentialContext
+from .accounting import UsageRecord, extract_usage_record
+from .costs import CostBreakdown, CostCalculator, ModelPricing
+from .quota import QuotaSnapshot, build_quota_snapshots
 
 __all__ = [
     # Main public API
     "UsageManager",
     "CredentialContext",
+    "UsageRecord",
+    "CostBreakdown",
+    "CostCalculator",
+    "ModelPricing",
+    "QuotaSnapshot",
+    "build_quota_snapshots",
+    "extract_usage_record",
     # Types
     "WindowStats",
     "TotalStats",

@@ -94,9 +94,23 @@ class AnthropicHandler:
                 request.model_dump(exclude_none=True),
                 filename="anthropic_request.json",
             )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_raw_request",
+                request.model_dump(exclude_none=True),
+                direction="request",
+                stage="client",
+            )
 
         # Translate Anthropic request to OpenAI format
         openai_request = translate_anthropic_request(request)
+        _trace_anthropic(
+            anthropic_logger,
+            "anthropic_to_openai_request",
+            openai_request,
+            direction="request",
+            stage="adapter",
+        )
 
         # Pass parent log directory to acompletion for nested logging
         if anthropic_logger and anthropic_logger.log_dir:
@@ -138,8 +152,22 @@ class AnthropicHandler:
                 if hasattr(response, "model_dump")
                 else dict(response)
             )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_openai_response",
+                openai_response,
+                direction="response",
+                stage="provider",
+            )
             anthropic_response = openai_to_anthropic_response(
                 openai_response, original_model
+            )
+            _trace_anthropic(
+                anthropic_logger,
+                "openai_to_anthropic_response",
+                anthropic_response,
+                direction="response",
+                stage="adapter",
             )
 
             # Override the ID with our request ID
@@ -150,6 +178,13 @@ class AnthropicHandler:
                 anthropic_logger.log_response(
                     anthropic_response,
                     filename="anthropic_response.json",
+                )
+                _trace_anthropic(
+                    anthropic_logger,
+                    "anthropic_final_response",
+                    anthropic_response,
+                    direction="response",
+                    stage="final",
                 )
 
             return anthropic_response
@@ -201,3 +236,26 @@ class AnthropicHandler:
         total_tokens = message_tokens + tool_tokens
 
         return {"input_tokens": total_tokens}
+
+
+def _trace_anthropic(
+    logger: Optional[TransactionLogger],
+    pass_name: str,
+    payload: Any,
+    *,
+    direction: str,
+    stage: str,
+    transport: Optional[str] = None,
+) -> None:
+    """Emit an Anthropic compatibility transform trace when logging is enabled."""
+
+    if not logger:
+        return
+    logger.log_transform_pass(
+        pass_name,
+        payload,
+        direction=direction,
+        stage=stage,
+        protocol="anthropic_messages",
+        transport=transport,
+    )

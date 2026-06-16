@@ -29,10 +29,11 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from .transform_trace import TransformTraceWriter, provider_snapshot_namespace
 from .utils.paths import get_logs_dir
 
 lib_logger = logging.getLogger("rotator_library")
@@ -56,6 +57,12 @@ def _get_transactions_dir() -> Path:
     transactions_dir = logs_dir / "transactions"
     transactions_dir.mkdir(parents=True, exist_ok=True)
     return transactions_dir
+
+
+def _utc_timestamp() -> str:
+    """Return an ISO-8601 UTC timestamp for log records."""
+
+    return datetime.now(UTC).isoformat()
 
 
 def _sanitize_name(name: str) -> str:
@@ -90,6 +97,21 @@ class TransactionContext:
     model: str
     """Model name (sanitized for filesystem use)."""
 
+    trace_model: Optional[str] = None
+    """Exact model name used in transform trace entries."""
+
+    session_id: Optional[str] = None
+    """Inferred session id for trace correlation, when available."""
+
+    scope_key: Optional[str] = None
+    """Usage scope key for trace correlation, when available."""
+
+    classifier: Optional[str] = None
+    """Classifier/private routing label for trace correlation, when available."""
+
+    trace_enabled: bool = False
+    """Whether provider loggers should append transform trace entries."""
+
 
 class TransactionLogger:
     """
@@ -112,10 +134,15 @@ class TransactionLogger:
         "request_id",
         "provider",
         "model",
+        "trace_model",
+        "session_id",
+        "scope_key",
+        "classifier",
         "streaming",
         "api_format",
         "_dir_available",
         "_context",
+        "_trace_writer",
     )
 
     def __init__(
@@ -140,6 +167,10 @@ class TransactionLogger:
         self.start_time = time.time()
         self.request_id = str(uuid.uuid4())[:8]  # 8-char short ID
         self.provider = provider
+        self.trace_model = model
+        self.session_id: Optional[str] = None
+        self.scope_key: Optional[str] = None
+        self.classifier: Optional[str] = None
         self.api_format = api_format
 
         # Strip provider prefix from model if present
@@ -153,6 +184,7 @@ class TransactionLogger:
         self.log_dir: Optional[Path] = None
         self._dir_available = False
         self._context: Optional[TransactionContext] = None
+        self._trace_writer: Optional[TransformTraceWriter] = None
 
         if not enabled:
             return
@@ -174,6 +206,14 @@ class TransactionLogger:
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             self._dir_available = True
+            self._trace_writer = TransformTraceWriter(
+                self.log_dir,
+                component="client",
+                provider=provider,
+                model=self.trace_model,
+                request_id=self.request_id,
+                enabled=True,
+            )
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to create directory: {e}")
             self.enabled = False
@@ -192,8 +232,103 @@ class TransactionLogger:
                 enabled=self.enabled,
                 provider=self.provider,
                 model=self.model,
+                trace_model=self.trace_model,
+                session_id=self.session_id,
+                scope_key=self.scope_key,
+                classifier=self.classifier,
+                trace_enabled=bool(self._trace_writer),
             )
         return self._context
+
+    def set_trace_context(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        scope_key: Optional[str] = None,
+        classifier: Optional[str] = None,
+    ) -> None:
+        """Attach routing/session metadata discovered after logger creation."""
+
+        if session_id is not None:
+            self.session_id = session_id
+        if scope_key is not None:
+            self.scope_key = scope_key
+        if classifier is not None:
+            self.classifier = classifier
+        if self._trace_writer:
+            self._trace_writer.update_context(
+                session_id=self.session_id,
+                scope_key=self.scope_key,
+                classifier=self.classifier,
+            )
+        if self._context:
+            self._context.session_id = self.session_id
+            self._context.scope_key = self.scope_key
+            self._context.classifier = self.classifier
+
+    def log_transform_pass(
+        self,
+        pass_name: str,
+        data: Any,
+        *,
+        direction: str,
+        stage: str,
+        protocol: Optional[str] = None,
+        credential_id: Optional[str] = None,
+        transport: Optional[str] = None,
+        changed_from_previous: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        scrub_strings: bool = False,
+        snapshot: bool = True,
+    ) -> None:
+        """Record an additive transform trace entry if tracing is available."""
+
+        if not self.enabled or not self._dir_available or not self._trace_writer:
+            return
+        self._trace_writer.record(
+            pass_name,
+            data,
+            direction=direction,
+            stage=stage,
+            protocol=protocol,
+            credential_id=credential_id,
+            transport=transport,
+            changed_from_previous=changed_from_previous,
+            metadata=metadata,
+            scrub_strings=scrub_strings,
+            snapshot=snapshot,
+        )
+
+    def log_transform_error(
+        self,
+        failed_pass_name: str,
+        error: BaseException,
+        *,
+        payload: Any = None,
+        stage: str = "client",
+        protocol: Optional[str] = None,
+        transport: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record a standardized transform/logging failure without raising."""
+
+        error_data = {
+            "failed_pass_name": failed_pass_name,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "payload": payload,
+        }
+        self.log_transform_pass(
+            "transform_log_error",
+            error_data,
+            direction="error",
+            stage=stage,
+            protocol=protocol,
+            transport=transport,
+            metadata=metadata,
+            scrub_strings=True,
+            snapshot=False,
+        )
 
     def log_request(
         self, request_data: Dict[str, Any], filename: str = "request.json"
@@ -212,15 +347,25 @@ class TransactionLogger:
 
         data = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": _utc_timestamp(),
             "data": request_data,
         }
+        self.log_transform_pass(
+            "raw_client_request",
+            request_data,
+            direction="request",
+            stage="client",
+            transport="sse" if self.streaming else "http",
+        )
         self._write_json(filename, data)
 
     def log_transformed_request(
         self,
         transformed_data: Dict[str, Any],
         original_data: Dict[str, Any],
+        *,
+        credential_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Log the transformed request if it differs from the original.
@@ -239,18 +384,32 @@ class TransactionLogger:
         stripped_transformed = _strip_framework_keys(transformed_data)
         stripped_original = _strip_framework_keys(original_data)
 
+        changed_from_previous: Optional[bool] = None
         try:
-            if json.dumps(stripped_transformed, sort_keys=True, default=str) == json.dumps(
+            changed_from_previous = json.dumps(stripped_transformed, sort_keys=True, default=str) != json.dumps(
                 stripped_original, sort_keys=True, default=str
-            ):
-                return
+            )
         except (TypeError, ValueError):
-            pass
+            changed_from_previous = None
+
+        self.log_transform_pass(
+            "prepared_provider_request",
+            transformed_data,
+            direction="request",
+            stage="client",
+            credential_id=credential_id,
+            transport="sse" if transformed_data.get("stream") else "http",
+            changed_from_previous=changed_from_previous,
+            metadata=metadata,
+        )
+
+        if changed_from_previous is False:
+            return
 
         logged = _strip_framework_keys(transformed_data)
         data = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": _utc_timestamp(),
             "data": logged,
         }
         self._write_json("request_transformed.json", data)
@@ -266,9 +425,17 @@ class TransactionLogger:
             return
 
         log_entry = {
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": _utc_timestamp(),
             "chunk": chunk,
         }
+        self.log_transform_pass(
+            "parsed_stream_chunk",
+            chunk,
+            direction="stream",
+            stage="client",
+            transport="sse",
+            snapshot=False,
+        )
         content = json.dumps(log_entry, ensure_ascii=False) + "\n"
         self._append_text("streaming_chunks.jsonl", content)
 
@@ -296,12 +463,20 @@ class TransactionLogger:
 
         data = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": _utc_timestamp(),
             "status_code": status_code,
             "duration_ms": round(duration_ms),
             "headers": dict(headers) if headers else None,
             "data": response_data,
         }
+        self.log_transform_pass(
+            "final_client_response",
+            response_data,
+            direction="response",
+            stage="final",
+            transport="sse" if self.streaming else "http",
+            metadata={"status_code": status_code, "headers": dict(headers) if headers else None},
+        )
         self._write_json(filename, data)
 
         # Also write metadata
@@ -331,7 +506,7 @@ class TransactionLogger:
 
         metadata = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": _utc_timestamp(),
             "duration_ms": round(duration_ms),
             "status_code": status_code,
             "provider": self.provider,
@@ -543,7 +718,7 @@ class ProviderLogger:
     or add custom methods for provider-specific logging needs.
     """
 
-    __slots__ = ("enabled", "log_dir")
+    __slots__ = ("enabled", "log_dir", "_trace_writer")
 
     def __init__(self, context: Optional[TransactionContext]):
         """
@@ -554,6 +729,7 @@ class ProviderLogger:
         """
         self.enabled = False
         self.log_dir: Optional[Path] = None
+        self._trace_writer: Optional[TransformTraceWriter] = None
 
         if context is None or not context.enabled:
             return
@@ -563,9 +739,45 @@ class ProviderLogger:
 
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+            if getattr(context, "trace_enabled", False):
+                self._trace_writer = TransformTraceWriter(
+                    context.log_dir,
+                    component="provider",
+                    provider=context.provider,
+                    model=context.trace_model or context.model,
+                    request_id=context.request_id,
+                    session_id=context.session_id,
+                    scope_key=context.scope_key,
+                    classifier=context.classifier,
+                    snapshot_namespace=provider_snapshot_namespace(),
+                    enabled=True,
+                )
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to create directory: {e}")
             self.enabled = False
+
+    def _log_transform_pass(
+        self,
+        pass_name: str,
+        data: Any,
+        *,
+        direction: str,
+        stage: str = "provider",
+        transport: Optional[str] = None,
+        scrub_strings: bool = False,
+        snapshot: bool = True,
+    ) -> None:
+        if not self.enabled or not self._trace_writer:
+            return
+        self._trace_writer.record(
+            pass_name,
+            data,
+            direction=direction,
+            stage=stage,
+            transport=transport,
+            scrub_strings=scrub_strings,
+            snapshot=snapshot,
+        )
 
     def log_request(self, payload: Dict[str, Any]) -> None:
         """
@@ -574,6 +786,12 @@ class ProviderLogger:
         Args:
             payload: The transformed request payload
         """
+        self._log_transform_pass(
+            "provider_request_payload",
+            payload,
+            direction="request",
+            transport="http",
+        )
         self._write_json("request_payload.json", payload)
 
     def log_response_chunk(self, chunk: str) -> None:
@@ -583,6 +801,13 @@ class ProviderLogger:
         Args:
             chunk: Raw chunk string from the stream
         """
+        self._log_transform_pass(
+            "provider_raw_stream_chunk",
+            chunk,
+            direction="stream",
+            transport="sse",
+            snapshot=False,
+        )
         self._append_text("response_stream.log", chunk + "\n")
 
     def log_final_response(self, response_data: Dict[str, Any]) -> None:
@@ -592,6 +817,11 @@ class ProviderLogger:
         Args:
             response_data: The complete response data
         """
+        self._log_transform_pass(
+            "provider_final_response",
+            response_data,
+            direction="response",
+        )
         self._write_json("final_response.json", response_data)
 
     def log_error(self, error_message: str) -> None:
@@ -601,7 +831,14 @@ class ProviderLogger:
         Args:
             error_message: The error message to log
         """
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = _utc_timestamp()
+        self._log_transform_pass(
+            "provider_error",
+            {"timestamp_utc": timestamp, "message": error_message},
+            direction="error",
+            scrub_strings=True,
+            snapshot=False,
+        )
         self._append_text("error.log", f"[{timestamp}] {error_message}\n")
 
     def log_extra(self, filename: str, data: Union[Dict[str, Any], str]) -> None:
