@@ -176,13 +176,14 @@ class TestTTLAndPruning:
 
     def test_expired_record_is_pruned(self):
         tracker = SessionTracker(ttl_seconds=1)
-        tracker.infer_session_id({"session_id": "conv-old"})
-        # Wait for expiry
-        time.sleep(1.1)
-        # After expiry, a new request with same ID should get a new session
-        sid_new = tracker.infer_session_id({"session_id": "conv-old"})
-        # Session ID should still be returned (creates new record)
+        sid_old = tracker.infer_session_id({"session_id": "conv-old"})
+        # Advance past TTL without real sleeping
+        with patch("session_tracking.time.time", return_value=time.time() + 2):
+            # After expiry, a new request with same ID should get a new session
+            sid_new = tracker.infer_session_id({"session_id": "conv-old"})
+        # The new session must differ from the expired one (proves pruning)
         assert sid_new is not None
+        assert sid_new != sid_old
 
     def test_different_ttls(self):
         tracker = SessionTracker(ttl_seconds=60)

@@ -85,8 +85,9 @@ class TestCooldownExpiry:
         cm = CooldownManager()
         await cm.start_cooldown("openai", 1)
         assert await cm.is_cooling_down("openai") is True
-        await asyncio.sleep(1.1)
-        assert await cm.is_cooling_down("openai") is False
+        # Patch the clock to advance past expiry without real sleeping
+        with patch("cooldown_manager.time.time", return_value=time.time() + 1.1):
+            assert await cm.is_cooling_down("openai") is False
 
     @pytest.mark.asyncio
     async def test_cooldown_extends_on_new_start(self):
