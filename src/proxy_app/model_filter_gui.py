@@ -2773,6 +2773,10 @@ class ModelFilterGUI(ctk.CTk):
         self._fetch_in_progress: bool = False
         self._preview_after_id: Optional[str] = None
 
+        # AI Assistant state
+        self._ai_chat_window = None
+        self._ai_adapter = None
+
         # Build UI with grid layout for responsive sizing
         self._create_main_layout()
 
@@ -2856,6 +2860,20 @@ class ModelFilterGUI(ctk.CTk):
         )
         help_btn.pack(side="right", padx=(8, 0))
         ToolTip(help_btn, "Help (F1)")
+
+        # AI Assistant button
+        self.ai_btn = ctk.CTkButton(
+            header,
+            text="🤖 AI Assistant",
+            font=(FONT_FAMILY, FONT_SIZE_SMALL),
+            fg_color=ACCENT_BLUE,
+            hover_color="#3a8eef",
+            width=100,
+            height=26,
+            command=self._open_ai_assistant,
+        )
+        self.ai_btn.pack(side="right", padx=(8, 0))
+        ToolTip(self.ai_btn, "Open AI Assistant (Ctrl+I)")
 
         # Refresh button (smaller)
         refresh_btn = ctk.CTkButton(
@@ -3082,6 +3100,7 @@ class ModelFilterGUI(ctk.CTk):
         self.bind("<Control-s>", lambda e: self._save_changes())
         self.bind("<Control-r>", lambda e: self._refresh_models())
         self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
+        self.bind("<Control-i>", lambda e: self._open_ai_assistant())
         self.bind("<F1>", lambda e: self._show_help())
         self.bind("<Escape>", self._on_escape)
 
@@ -3599,6 +3618,44 @@ class ModelFilterGUI(ctk.CTk):
         self.after(2000, self._update_status)
 
     # ─────────────────────────────────────────────────────────────────────────────
+    # AI Assistant
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def _open_ai_assistant(self):
+        """Open the AI Assistant window."""
+        # Check if already open
+        if hasattr(self, "_ai_chat_window") and self._ai_chat_window is not None:
+            try:
+                if self._ai_chat_window.winfo_exists():
+                    self._ai_chat_window.lift()
+                    self._ai_chat_window.focus_force()
+                    return
+            except Exception:
+                pass
+
+        # Import here to avoid circular imports
+        from .ai_assistant.adapters import ModelFilterWindowContext
+        from .ai_assistant.ui import AIChatWindow
+
+        # Create adapter and window
+        self._ai_adapter = ModelFilterWindowContext(self)
+        self._ai_chat_window = AIChatWindow(
+            parent=self,
+            window_adapter=self._ai_adapter,
+            title="AI Assistant - Model Filter Configuration",
+        )
+
+        # Handle window close
+        def on_ai_close():
+            self._ai_chat_window = None
+            self._ai_adapter = None
+
+        self._ai_chat_window.protocol(
+            "WM_DELETE_WINDOW",
+            lambda: (self._ai_chat_window._on_close(), on_ai_close()),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────────
     # Window Close
     # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3610,6 +3667,15 @@ class ModelFilterGUI(ctk.CTk):
                 return
             elif result == "save":
                 self._save_changes()
+
+        # Close AI assistant window if open
+        if self._ai_chat_window is not None:
+            try:
+                self._ai_chat_window._on_close()
+            except Exception:
+                pass
+            self._ai_chat_window = None
+            self._ai_adapter = None
 
         self.destroy()
 
