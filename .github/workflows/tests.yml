@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'src/rotator_library/**'
+      - 'tests/**'
+      - 'pytest.ini'
+      - 'requirements.txt'
+  pull_request:
+    paths:
+      - 'src/rotator_library/**'
+      - 'tests/**'
+      - 'pytest.ini'
+      - 'requirements.txt'
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.12', '3.13']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+          # Install rotator_library dependencies (skip editable install line)
+          grep -v -- '-e src/rotator_library' requirements.txt > temp_requirements.txt
+          pip install -r temp_requirements.txt
+          pip install -e src/rotator_library
+
+      - name: Run tests
+        shell: bash
+        run: pytest -v
