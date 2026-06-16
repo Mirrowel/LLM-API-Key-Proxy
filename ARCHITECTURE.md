@@ -88,10 +88,14 @@
 
 1. `RequestContextBuilder` calls `provider.get_session_tracking_hints()` to collect provider-specific evidence — `src/rotator_library/client/request_builder.py`
 2. `SessionTracker.infer_session()` builds scoped anchors from explicit IDs, message content, tool-call IDs, and provider hints — `src/rotator_library/session_tracking.py`
-3. Anchors are namespaced by scope/provider/model so sticky evidence never leaks between credential pools
-4. `_best_match()` scores anchor overlap against live sessions; confidence is `strong` (any strong match), `probable` (diverse medium evidence), `weak`, or `none`
-5. Compaction detection checks system prompts for summarization markers; compaction lineage is tracked but does not force sticky continuation
-6. Returns `SessionInference` with `session_id`, `affinity_key` (deterministic first-pick hint), confidence, and namespace
+3. System/developer prompts are excluded from continuity anchors to prevent harness-level system prompts from cross-binding independent sessions
+4. Compaction probe anchors are built separately (`_build_compaction_probe_anchors()`) from large early messages or explicit summarization markers; these identify lineage parents but are not stored on the new child session
+5. Normal anchors suppress compaction probe indexes to avoid double-counting summary text as continuity evidence
+6. Anchors are namespaced by scope/provider/model so sticky evidence never leaks between credential pools
+7. `_best_match()` scores anchor overlap against live sessions with comprehensive tiebreaker (score, strong matches, medium matches, group diversity, response matches, last_seen, session_id); confidence is `strong` (any strong match), `probable` (diverse medium evidence), `weak`, or `none`
+8. `_is_compaction_parent_match()` requires response anchor overlap for size-only probes (noisy) or any score > 0 for explicit marker probes
+9. Compaction lineage is tracked via `lineage_parent_session_id` on `SessionInference` but does not force sticky continuation
+10. Returns `SessionInference` with `session_id`, `affinity_key` (deterministic first-pick hint), confidence, and namespace
 
 **Credential Selection:**
 
@@ -99,7 +103,7 @@
 2. `LimitEngine` filters out credentials at capacity — `src/rotator_library/usage/limits/engine.py`
 3. Fair cycle modifier filters exhausted credentials — `src/rotator_library/usage/limits/fair_cycle.py`
 4. Strategy (`BalancedStrategy` or `SequentialStrategy`) picks from remaining, using `session_affinity_key` for deterministic placement when evidence is strong enough — `src/rotator_library/usage/selection/strategies/`
-5. `SequentialStrategy` maintains sticky entries with TTL-based expiry and max-entry trimming — `src/rotator_library/usage/selection/strategies/sequential.py`
+5. `SequentialStrategy` maintains sticky entries with TTL-based expiry, max-entry trimming, and thread-safe access (`threading.RLock`) — `src/rotator_library/usage/selection/strategies/sequential.py`
 
 ## Key Abstractions
 
@@ -127,9 +131,10 @@
 **SessionTracker:**
 - Purpose: TTL-based session inference using scoped, compounding evidence anchors with confidence scoring
 - Location: `src/rotator_library/session_tracking.py`
-- Pattern: Evidence accumulator with thread-safe anchor store, namespace isolation, and optional JSON persistence via `ResilientStateWriter`
-- Key types: `SessionAnchor` (evidence with strength/source), `SessionTrackingHints` (provider evidence), `SessionInference` (result with confidence + affinity)
-- Key methods: `infer_session()`, `record_response()`, `flush()`
+- Pattern: Evidence accumulator with thread-safe anchor store (`threading.RLock` for state, separate `threading.Lock` for save I/O), namespace isolation, schema-versioned JSON persistence via `ResilientStateWriter`
+- Key types: `SessionAnchor` (evidence with strength/source/group), `SessionTrackingHints` (provider evidence), `SessionInference` (result with confidence + affinity + lineage), `_MatchCandidate` (scored candidate with `last_seen` tiebreaker)
+- Key methods: `infer_session()`, `record_response()`, `flush()`, `_build_compaction_probe_anchors()`, `_is_compaction_parent_match()`, `_prepare_save_locked()`, `_write_save_job()`
+- Save I/O: Dirty generation counter (`_dirty_generation`) decouples state mutations from disk writes; `_prepare_save_locked()` snapshots under state lock, `_write_save_job()` writes under separate I/O lock to avoid blocking inference
 
 ## Entry Points
 
@@ -172,4 +177,4 @@
 
 **Background Tasks:** `BackgroundRefresher` manages periodic OAuth token refresh (default 10 min) and provider-specific background jobs (quota refresh, etc.) with independent timers.
 
-**Session Tracking:** Thread-safe (`threading.RLock`), scoped by usage scope/provider/model. Anchor strength levels: `strong` (tool IDs, provider affinity), `medium` (message content hashes, response anchors), `weak` (first-user text, untrusted explicit IDs). Compaction detection tracks lineage without forcing sticky continuation. Configurable via `TRUSTED_SESSION_ID_FIELDS` env var and per-provider `SESSION_STICKY_*` env vars.
+**Session Tracking:** Thread-safe with two-lock design (`threading.RLock` for anchor store, `threading.Lock` for save I/O), scoped by usage scope/provider/model. Anchor strength levels: `strong` (tool IDs, provider affinity), `medium` (message content hashes, response anchors), `weak` (first-user text, untrusted explicit IDs). System/developer prompts excluded from continuity anchors. Compaction detection uses separate probe anchors (`_build_compaction_probe_anchors()`) with response-anchor validation for size-only probes; lineage tracked via `lineage_parent_session_id` without forcing sticky continuation. Persistence uses schema-versioned JSON (`_PERSISTENCE_SCHEMA_VERSION`) with generation-based write deduplication. Configurable via `TRUSTED_SESSION_ID_FIELDS` env var and per-provider `SESSION_STICKY_*` env vars.

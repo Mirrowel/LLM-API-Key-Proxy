@@ -107,7 +107,7 @@ jobs:
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
-          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+          opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
 
       - name: Clear pending bot review
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
