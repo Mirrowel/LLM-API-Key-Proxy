@@ -559,6 +559,7 @@ class BaseQuotaTracker:
                 bucket = self._find_bucket_for_model(quota_data, user_model)
                 reset_timestamp = bucket.get("reset_timestamp") if bucket else None
                 valid_reset_ts = reset_timestamp if remaining < 1.0 else None
+                exhaustion_reason = bucket.get("exhaustion_reason") if bucket else None
 
                 # DEFAULT: Always apply exhaustion if remaining == 0.0 exactly
                 # (API is authoritative for most providers)
@@ -573,6 +574,7 @@ class BaseQuotaTracker:
                     quota_group=quota_group,
                     force=force,
                     apply_exhaustion=apply_exhaustion,
+                    exhaustion_reason=exhaustion_reason,
                 )
                 stored_count += 1
 

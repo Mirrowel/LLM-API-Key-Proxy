@@ -1499,6 +1499,7 @@ class UsageManager:
         quota_group: Optional[str] = None,
         force: bool = False,
         apply_exhaustion: bool = False,
+        exhaustion_reason: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Update quota baseline from provider API response.
@@ -1521,6 +1522,8 @@ class UsageManager:
                 Provider controls when this is set based on its semantics
                 (e.g., providers can choose initial-only or always-on refresh
                 when remaining == 0).
+            exhaustion_reason: Provider-supplied reason for exhausted quota,
+                such as no_reset_time for entitlement/no-access style buckets.
 
         Returns:
             Cooldown info dict if cooldown was applied, None otherwise
@@ -1599,16 +1602,86 @@ class UsageManager:
                     "cooldown_hours": max(0.0, (quota_reset_ts - time.time()) / 3600),
                 }
             else:
-                # ERROR: Provider says exhausted but no reset timestamp!
-                lib_logger.error(
-                    f"Quota exhausted for {cooldown_target} on "
-                    f"{mask_credential(accessor, style='full')} but no reset_timestamp "
-                    f"provided by API - cannot apply cooldown"
+                result = await self._handle_no_reset_quota_exhaustion(
+                    state=state,
+                    accessor=accessor,
+                    model=model,
+                    cooldown_target=cooldown_target,
+                    exhaustion_reason=exhaustion_reason,
                 )
+                if result:
+                    await self._save_if_needed()
+                    return result
 
         await self._save_if_needed()
 
         return None
+
+    async def _handle_no_reset_quota_exhaustion(
+        self,
+        state: CredentialState,
+        accessor: str,
+        model: str,
+        cooldown_target: str,
+        exhaustion_reason: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Handle authoritative quota exhaustion when the API omits reset time.
+
+        Some providers use a zero/null quota bucket with no reset timestamp to
+        indicate that the current account cannot access a model group at all.
+        Provider usage config decides whether that remains warn-only or becomes
+        a scoped fallback cooldown.
+        """
+
+        policy = (self._config.no_reset_exhaustion_policy or "warn_only").lower()
+        configured_duration = max(
+            0, int(self._config.no_reset_exhaustion_cooldown_seconds or 0)
+        )
+
+        if policy == "warn_only" or configured_duration <= 0 and policy == "cooldown":
+            lib_logger.warning(
+                f"Quota exhausted for {cooldown_target} on "
+                f"{mask_credential(accessor, style='full')} but no reset_timestamp "
+                f"provided by API; no fallback cooldown configured"
+            )
+            return None
+
+        if policy not in {"cooldown", "disable_scope"}:
+            lib_logger.warning(
+                f"Quota exhausted for {cooldown_target} on "
+                f"{mask_credential(accessor, style='full')} but no reset_timestamp "
+                f"provided by API; unknown no-reset policy '{policy}'"
+            )
+            return None
+
+        duration = configured_duration
+        if policy == "disable_scope" and duration <= 0:
+            duration = 365 * 24 * 60 * 60
+
+        await self._tracking.apply_cooldown(
+            state=state,
+            reason="quota_no_reset_exhausted",
+            duration=duration,
+            model_or_group=cooldown_target,
+            source="api_quota_no_reset",
+        )
+
+        cooldown_until = time.time() + duration
+        lib_logger.warning(
+            f"Quota exhausted for {cooldown_target} on "
+            f"{mask_credential(accessor, style='full')} with no reset_timestamp "
+            f"provided by API; applying {policy} fallback cooldown for "
+            f"{round(duration / 3600, 2)}h"
+        )
+
+        return {
+            "cooldown_until": cooldown_until,
+            "reason": "quota_no_reset_exhausted",
+            "exhaustion_reason": exhaustion_reason,
+            "model": model,
+            "cooldown_hours": max(0.0, duration / 3600),
+            "policy": policy,
+        }
 
     # =========================================================================
     # WINDOW CLEANUP
