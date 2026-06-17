@@ -28,8 +28,8 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, fields, is_dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -49,6 +49,77 @@ FRAMEWORK_KEYS = frozenset({
 
 def _strip_framework_keys(data: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in data.items() if k not in FRAMEWORK_KEYS}
+
+
+def _make_json_safe(value: Any, _seen: Optional[set[int]] = None) -> Any:
+    """Return a JSON-serializable copy of provider/client logging payloads.
+
+    Provider implementations may hand transaction logging LiteLLM/Pydantic
+    models, dataclasses, paths, timestamps, bytes, or provider-specific helper
+    objects. Logging must never fail the request path, so this function converts
+    common structured objects to their dictionary form and falls back to strings
+    only at unknown leaves.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+
+    seen = _seen if _seen is not None else set()
+    object_id = id(value)
+    if object_id in seen:
+        return "[CIRCULAR]"
+
+    if isinstance(value, dict):
+        seen.add(object_id)
+        try:
+            return {str(k): _make_json_safe(v, seen) for k, v in value.items()}
+        finally:
+            seen.discard(object_id)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seen.add(object_id)
+        try:
+            return [_make_json_safe(item, seen) for item in value]
+        finally:
+            seen.discard(object_id)
+
+    if is_dataclass(value) and not isinstance(value, type):
+        seen.add(object_id)
+        try:
+            return {
+                field.name: _make_json_safe(getattr(value, field.name), seen)
+                for field in fields(value)
+            }
+        finally:
+            seen.discard(object_id)
+
+    for method_name in ("model_dump", "dict", "to_dict"):
+        method = getattr(value, method_name, None)
+        if not callable(method):
+            continue
+        seen.add(object_id)
+        try:
+            try:
+                converted = method()
+            except TypeError:
+                converted = method(exclude_none=False)
+            return _make_json_safe(converted, seen)
+        except Exception:
+            continue
+        finally:
+            seen.discard(object_id)
+
+    return str(value)
 
 
 def _get_transactions_dir() -> Path:
@@ -426,7 +497,7 @@ class TransactionLogger:
 
         log_entry = {
             "timestamp_utc": _utc_timestamp(),
-            "chunk": chunk,
+            "chunk": _make_json_safe(chunk),
         }
         self.log_transform_pass(
             "parsed_stream_chunk",
@@ -461,13 +532,14 @@ class TransactionLogger:
         end_time = time.time()
         duration_ms = (end_time - self.start_time) * 1000
 
+        safe_response = _make_json_safe(response_data)
         data = {
             "request_id": self.request_id,
             "timestamp_utc": _utc_timestamp(),
             "status_code": status_code,
             "duration_ms": round(duration_ms),
-            "headers": dict(headers) if headers else None,
-            "data": response_data,
+            "headers": _make_json_safe(dict(headers)) if headers else None,
+            "data": safe_response,
         }
         self.log_transform_pass(
             "final_client_response",
@@ -480,18 +552,24 @@ class TransactionLogger:
         self._write_json(filename, data)
 
         # Also write metadata
-        self._log_metadata(response_data, status_code, duration_ms)
+        self._log_metadata(safe_response, status_code, duration_ms)
 
     def _log_metadata(
         self, response_data: Dict[str, Any], status_code: int, duration_ms: float
     ) -> None:
         """Log transaction metadata summary."""
+        if not isinstance(response_data, dict):
+            response_data = {"value": response_data}
         usage = response_data.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         model = response_data.get("model", self.model)
         finish_reason = "N/A"
 
         if "choices" in response_data and response_data["choices"]:
-            finish_reason = response_data["choices"][0].get("finish_reason", "N/A")
+            first_choice = response_data["choices"][0]
+            if isinstance(first_choice, dict):
+                finish_reason = first_choice.get("finish_reason", "N/A")
 
         # Check for provider subdirectory
         has_provider_logs = False
@@ -540,7 +618,12 @@ class TransactionLogger:
             return response_data["reasoning"]
 
         if "choices" in response_data and response_data["choices"]:
-            message = response_data["choices"][0].get("message", {})
+            first_choice = response_data["choices"][0]
+            if not isinstance(first_choice, dict):
+                return None
+            message = first_choice.get("message", {})
+            if not isinstance(message, dict):
+                return None
             if "reasoning" in message:
                 return message["reasoning"]
             if "reasoning_content" in message:
@@ -554,7 +637,7 @@ class TransactionLogger:
             return
         try:
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to write {filename}: {e}")
 
@@ -862,7 +945,7 @@ class ProviderLogger:
             return
         try:
             with open(self.log_dir / filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to write {filename}: {e}")
 
