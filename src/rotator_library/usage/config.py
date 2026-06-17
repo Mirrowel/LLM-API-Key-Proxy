@@ -510,6 +510,12 @@ class ProviderUsageConfig:
     # Exhaustion threshold (cooldown must exceed this to count as "exhausted")
     exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
 
+    # Policy for authoritative quota APIs that report exhaustion without a reset
+    # timestamp. Defaults to legacy warn-only behavior; providers with known
+    # entitlement-style semantics can opt into a fallback cooldown.
+    no_reset_exhaustion_policy: str = "warn_only"
+    no_reset_exhaustion_cooldown_seconds: int = 0
+
     # Window limits blocking (if True, block credentials when window quota exhausted locally)
     # Default False: only API errors (cooldowns) should block, not local tracking
     window_limits_enabled: bool = False
@@ -695,6 +701,20 @@ def load_provider_usage_config(
             sticky_max = plugin_class.default_session_sticky_max_entries
             if sticky_max is not None:
                 config.session_sticky_max_entries = max(100, int(sticky_max))
+
+        if hasattr(plugin_class, "default_no_reset_exhaustion_policy"):
+            config.no_reset_exhaustion_policy = str(
+                plugin_class.default_no_reset_exhaustion_policy
+            ).lower()
+
+        if hasattr(plugin_class, "default_no_reset_exhaustion_cooldown_seconds"):
+            try:
+                config.no_reset_exhaustion_cooldown_seconds = max(
+                    0,
+                    int(plugin_class.default_no_reset_exhaustion_cooldown_seconds),
+                )
+            except (TypeError, ValueError):
+                pass
 
         # Fair cycle
         if hasattr(plugin_class, "default_fair_cycle_config"):
@@ -914,6 +934,33 @@ def load_provider_usage_config(
             config.exhaustion_cooldown_threshold = int(env_threshold)
         except ValueError:
             pass
+
+    env_no_reset_policy = os.getenv(f"QUOTA_NO_RESET_EXHAUSTION_POLICY_{provider_upper}")
+    if env_no_reset_policy is None:
+        env_no_reset_policy = os.getenv("QUOTA_NO_RESET_EXHAUSTION_POLICY")
+    if env_no_reset_policy:
+        policy = env_no_reset_policy.strip().lower()
+        if policy in {"warn_only", "cooldown", "disable_scope"}:
+            config.no_reset_exhaustion_policy = policy
+        else:
+            lib_logger.warning(
+                f"Invalid QUOTA_NO_RESET_EXHAUSTION_POLICY_{provider_upper}='{env_no_reset_policy}'. "
+                f"Keeping default '{config.no_reset_exhaustion_policy}'."
+            )
+
+    env_no_reset_cooldown = os.getenv(f"QUOTA_NO_RESET_COOLDOWN_SECONDS_{provider_upper}")
+    if env_no_reset_cooldown is None:
+        env_no_reset_cooldown = os.getenv("QUOTA_NO_RESET_COOLDOWN_SECONDS")
+    if env_no_reset_cooldown:
+        try:
+            config.no_reset_exhaustion_cooldown_seconds = max(
+                0, int(env_no_reset_cooldown)
+            )
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid QUOTA_NO_RESET_COOLDOWN_SECONDS_{provider_upper}='{env_no_reset_cooldown}'. "
+                "Keeping default."
+            )
 
     # Priority multipliers from env
     # Format: CONCURRENCY_MULTIPLIER_{PROVIDER}_PRIORITY_{N}=value

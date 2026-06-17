@@ -194,6 +194,12 @@ class GeminiCliProvider(
         ),
     }
 
+    # retrieveUserQuota can report an exhausted bucket without resetTime when a
+    # project/account has no entitlement for that model group. Treat that as a
+    # scoped fallback cooldown instead of repeatedly retrying and logging errors.
+    default_no_reset_exhaustion_policy = "cooldown"
+    default_no_reset_exhaustion_cooldown_seconds = 24 * 60 * 60
+
     # Model quota groups - models that share quota/cooldown timing
     # Verified 2026-01-07 via quota verification tests
     # Can be overridden via env: QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"
