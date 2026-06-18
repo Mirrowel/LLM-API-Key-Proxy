@@ -1122,9 +1122,13 @@ class UsageManager:
 
             if primary_window_name:
                 # Aggregate primary window data from group_usage (preferred)
-                # or model_usage as fallback
+                # or model_usage as fallback.
+                # Skip stale groups no longer defined by the provider to avoid
+                # double-counting after group renames/merges.
                 seen_groups = set()
                 for group_key, group_stats in state.group_usage.items():
+                    if defined_groups and group_key not in defined_groups:
+                        continue
                     window = self._window_manager.get_active_window(
                         group_stats.windows, primary_window_name
                     )
@@ -1256,9 +1260,13 @@ class UsageManager:
 
             # Add group usage stats
             # Filter out hidden groups (internal routing keys like codex-global)
+            # and stale groups that are no longer defined by the provider
+            # (e.g. after a quota group rename/merge).
 
             for group_key, group_stats in state.group_usage.items():
                 if group_key in hidden_groups:
+                    continue
+                if defined_groups and group_key not in defined_groups:
                     continue
                 group_windows = {}
                 for window_name, window in group_stats.windows.items():

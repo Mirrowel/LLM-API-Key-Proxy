@@ -68,15 +68,15 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-2.5-pro": 250,
         "gemini-3-pro-preview": 250,
         "gemini-3.1-pro-preview": 250,
-        # Flash group - 2.5 (verified: ~0.0667% per request = 1500 requests)
-        # gemini-2.0-flash shares quota with 2.5-flash models
+        # Flash group — all flash models share a single daily quota pool
+        # (verified via matching reset timestamps on live quota API)
         "gemini-2.0-flash": 1500,
         "gemini-2.5-flash": 1500,
         "gemini-2.5-flash-lite": 1500,
-        # 3-Flash group (verified: ~0.0667% per request = 1500 requests)
         "gemini-3-flash-preview": 1500,
         "gemini-3-flash": 1500,
-        # 3.1 Flash Lite group (assumed same as 3-flash until verified)
+        "gemini-3.5-flash": 1500,
+        # 3.1 Flash Lite group (assumed same limits until verified)
         "gemini-3.1-flash-lite": 1500,
         "gemini-3.1-flash-lite-preview": 1500,
     },
@@ -85,14 +85,14 @@ DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
         "gemini-2.5-pro": 100,
         "gemini-3-pro-preview": 100,
         "gemini-3.1-pro-preview": 100,
-        # Flash group - 2.5 (verified: 0.1% per request = 1000 requests)
+        # Flash group — all flash models share a single daily quota pool
         "gemini-2.0-flash": 1000,
         "gemini-2.5-flash": 1000,
         "gemini-2.5-flash-lite": 1000,
-        # 3-Flash group (verified: 0.1% per request = 1000 requests)
         "gemini-3-flash-preview": 1000,
         "gemini-3-flash": 1000,
-        # 3.1 Flash Lite group (assumed same as 3-flash until verified)
+        "gemini-3.5-flash": 1000,
+        # 3.1 Flash Lite group (assumed same limits until verified)
         "gemini-3.1-flash-lite": 1000,
         "gemini-3.1-flash-lite-preview": 1000,
     },

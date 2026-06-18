@@ -75,6 +75,7 @@ AVAILABLE_MODELS = [
     "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
     "gemini-3-flash",
+    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
 ]
@@ -188,18 +189,28 @@ class GeminiCliProvider(
     }
 
     # Model quota groups - models that share quota/cooldown timing
-    # Verified 2026-01-07 via quota verification tests
+    # Google applies a single daily request limit across the entire Gemini model
+    # family (see upstream quota-and-pricing.md). All flash models share one pool.
     # Can be overridden via env: QUOTA_GROUPS_GEMINI_CLI_{GROUP}="model1,model2"
     model_quota_groups: QuotaGroupMap = {
         # Pro models share a quota pool (verified: gemini-2.5-pro and gemini-3-pro-preview)
         "pro": ["gemini-2.5-pro", "gemini-3-pro-preview", "gemini-3.1-pro-preview"],
-        # All 2.x Flash models share a quota pool (verified: 2.0 shares with 2.5)
-        # Note: contrary to PR #62 which claimed 2.0-flash was standalone
-        "25-flash": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        # Gemini 3 Flash models (gemini-3-flash is the GA name for gemini-3-flash-preview)
-        "3-flash": ["gemini-3-flash-preview", "gemini-3-flash"],
-        # Gemini 3.1 Flash Lite models
-        "31-flash-lite": ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"],
+        # All Flash models share a single quota pool across generations.
+        # Verified via matching reset timestamps on live quota API responses.
+        # gemini-3.5-flash maps to gemini-3-flash at the CCPA API level.
+        "flash": [
+            "gemini-2.0-flash",
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-3-flash",
+            "gemini-3.5-flash",
+        ],
+        # All Flash Lite models share a single quota pool.
+        "flash-lite": [
+            "gemini-2.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-flash-lite-preview",
+        ],
     }
 
     # Priority-based concurrency multipliers
@@ -960,7 +971,8 @@ class GeminiCliProvider(
 
         is_gemini_25 = "gemini-2.5" in model
         is_gemini_3 = self._is_gemini_3(model)
-        is_gemini_3_flash = "gemini-3-flash" in model
+        model_base = model.split("/")[-1].replace(":thinking", "")
+        is_gemini_3_flash = "gemini-3-flash" in model_base or "gemini-3.5-flash" in model_base
 
         if not (is_gemini_25 or is_gemini_3):
             return None
@@ -1065,6 +1077,7 @@ class GeminiCliProvider(
         is_gemini_3 = self._is_gemini_3(model_id)
         needs_thought_signature = self._needs_thought_signature(model_id)
 
+        yielded_any = False
         for part in parts:
             delta = {}
 
@@ -1150,9 +1163,6 @@ class GeminiCliProvider(
             if not delta:
                 continue
 
-            # Mark that we have tool calls for accumulator tracking
-            # finish_reason determination is handled by the client
-
             # Mark stream complete if we have usageMetadata
             is_final_chunk = "usageMetadata" in response_data
             if is_final_chunk and accumulator is not None:
@@ -1171,35 +1181,64 @@ class GeminiCliProvider(
 
             if "usageMetadata" in response_data:
                 usage = response_data["usageMetadata"]
-                prompt_tokens = usage.get("promptTokenCount", 0)  # Input
-                thoughts_tokens = usage.get(
-                    "thoughtsTokenCount", 0
-                )  # Output (thinking)
-                candidate_tokens = usage.get(
-                    "candidatesTokenCount", 0
-                )  # Output (content)
-                cached_tokens = usage.get("cachedContentTokenCount", 0)  # Input subset
+                prompt_tokens = usage.get("promptTokenCount", 0)
+                thoughts_tokens = usage.get("thoughtsTokenCount", 0)
+                candidate_tokens = usage.get("candidatesTokenCount", 0)
+                cached_tokens = usage.get("cachedContentTokenCount", 0)
 
                 openai_chunk["usage"] = {
-                    "prompt_tokens": prompt_tokens,  # Input only
-                    "completion_tokens": candidate_tokens
-                    + thoughts_tokens,  # All output
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": candidate_tokens + thoughts_tokens,
                     "total_tokens": usage.get("totalTokenCount", 0),
                 }
 
-                # Add input breakdown: cached tokens
                 if cached_tokens > 0:
                     openai_chunk["usage"]["prompt_tokens_details"] = {
                         "cached_tokens": cached_tokens
                     }
 
-                # Add output breakdown: reasoning tokens
                 if thoughts_tokens > 0:
                     openai_chunk["usage"]["completion_tokens_details"] = {
                         "reasoning_tokens": thoughts_tokens
                     }
 
+            yielded_any = True
             yield openai_chunk
+
+        # The final SSE chunk often contains only a thoughtSignature (no text/
+        # function) so every part is skipped above.  If that chunk carried
+        # usageMetadata we still need to emit it as a usage-only chunk,
+        # otherwise token counts are lost.
+        if not yielded_any and "usageMetadata" in response_data:
+            usage = response_data["usageMetadata"]
+            prompt_tokens = usage.get("promptTokenCount", 0)
+            thoughts_tokens = usage.get("thoughtsTokenCount", 0)
+            candidate_tokens = usage.get("candidatesTokenCount", 0)
+            cached_tokens = usage.get("cachedContentTokenCount", 0)
+
+            usage_block: Dict[str, Any] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": candidate_tokens + thoughts_tokens,
+                "total_tokens": usage.get("totalTokenCount", 0),
+            }
+            if cached_tokens > 0:
+                usage_block["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+            if thoughts_tokens > 0:
+                usage_block["completion_tokens_details"] = {
+                    "reasoning_tokens": thoughts_tokens
+                }
+
+            if accumulator is not None:
+                accumulator["is_complete"] = True
+
+            yield {
+                "choices": [{"index": 0, "delta": {}}],
+                "model": model_id,
+                "object": "chat.completion.chunk",
+                "id": chunk.get("responseId", f"chatcmpl-geminicli-{time.time()}"),
+                "created": int(time.time()),
+                "usage": usage_block,
+            }
 
     def _stream_to_completion_response(
         self, chunks: List[litellm.ModelResponseStream]
